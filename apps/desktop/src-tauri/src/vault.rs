@@ -36,7 +36,7 @@ pub fn get(account: &str) -> Result<Option<String>, VaultError> {
 pub fn delete(account: &str) -> Result<(), VaultError> {
     let e = Entry::new(SERVICE, account)
         .map_err(|source| VaultError::Keychain { account: account.into(), source })?;
-    match e.delete_credential() {
+    match e.delete_password() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(source) => Err(VaultError::Keychain { account: account.into(), source }),
     }

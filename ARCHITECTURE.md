@@ -772,7 +772,7 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 | Playwright + tauri-driver | E2E | Phase 3+; macOS is tauri-driver's weakest platform — UI logic is E2E'd with Playwright against the Vite dev server, true app E2E runs tauri-driver on Linux CI |
 | Rust: reqwest + tokio | `egress-gateway` — all outbound HTTP, streaming | Own client = credential injection + allowlist control |
 | Rust: axum | `local-gateway` — OpenAI-compatible local endpoint, master-key auth | Serves external apps; streams SSE out |
-| Rust: keyring v3 | `keychain-vault` | `keytar` archived Dec 2022 — rejected |
+| Rust: keyring v2 | `keychain-vault` | v3's macOS data-protection keychain breaks unsigned dev builds (secrets unreadable cross-process) — see DECISIONS.md 2026-09-16; revisit at signed-release time. `keytar` archived Dec 2022 — rejected |
 | tauri-plugin-sql (SQLite) | `sql-store` + migrations | Behind `store-port` |
 | quickjs-emscripten | Tier-2 sandbox for generated code adapters | Phase 6 |
 | No telemetry/analytics SDK | — | Deliberate |

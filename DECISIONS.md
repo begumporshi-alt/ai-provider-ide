@@ -74,3 +74,30 @@
   failover-disabled flag (3), openai-compat + anthropic-compat streaming + image url/b64 (4),
   mid-stream cancellation, key-blindness header guard (invariants 1–2), alias auto-derivation
   (§3.4). `pnpm typecheck` + `pnpm test` green workspace-wide.
+
+## 2026-09-16 — keyring v3 -> v2 (macOS data-protection keychain breaks dev builds)
+
+- **Decision:** pin `keyring = "2"` for the vault.
+- **Evidence (live probes, 2026-09-16):** with v3, `set_password` returns Ok but the item is
+  invisible to every other process (`get_password` -> NoEntry from a second run of the SAME
+  binary; `security find-generic-password` sees nothing). v3 defaults to the macOS
+  data-protection keychain, which requires a stable code-signing identity/entitlement —
+  `tauri dev`'s ad-hoc binary has neither. v2 writes the classic file-based login keychain:
+  cross-process reads work, CLI-visible, matches the macos-adhoc-keychain-reject skill.
+  Symptom in-app: every provider key Test failed as `invalid (HTTP 0)` ("secret not found in
+  keychain").
+- **Revisit if:** shipping a signed + entitled release bundle (Developer ID with an
+  application-identifier entitlement) — then v3's DP keychain becomes the better choice.
+  ARCHITECTURE.md §6 amended accordingly.
+- **Note:** secrets written by the v3 build sit orphaned in the DP keychain (unreadable,
+  invisible); harmless, and the user is rotating the real keys anyway.
+
+## 2026-09-16 — smoke-driven fixes from the first live run
+
+- Test-button errors now surface the real message (was: "invalid (HTTP 0)" swallowing the
+  egress error class).
+- `addProvider` is atomic: duplicate slug rejected up front; host-persist failure rolls back
+  the in-memory registry (ghost-provider bug found live: re-adding OpenRouter left an
+  in-memory provider the host refused, "no active manifest").
+- First key on a draft provider promotes it to `pending` so the egress allowlist admits the
+  host immediately (draft hosts were un-routable, Test could never succeed).

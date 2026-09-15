@@ -93,7 +93,7 @@ export function ProvidersScreen() {
                                 setTesting(k.id);
                                 try {
                                   const r = await testKey(k.id);
-                                  setNotice(`${k.label}: ${r.ok ? "valid" : r.rateLimited ? "rate-limited" : `invalid (HTTP ${r.status})`}`);
+                                  setNotice(`${k.label}: ${r.ok ? "valid" : r.rateLimited ? "rate-limited" : `invalid${r.status ? ` (HTTP ${r.status})` : ""} — ${r.message ?? "unknown error"}`}`);
                                   if (r.ok) await refreshCatalog(p.id).catch(() => undefined);
                                 } catch (e) {
                                   setNotice(`${k.label}: ${(e as Error).message}`);

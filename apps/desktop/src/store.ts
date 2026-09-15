@@ -210,19 +210,30 @@ export async function addProvider(input: {
   baseUrl: string;
   manifest: AdapterManifest;
 }): Promise<ProviderRecord> {
+  if (registry.providerBySlug(input.slug)) {
+    throw new Error(`a provider with slug "${input.slug}" already exists — remove it first`);
+  }
   const p = registry.addProvider({
     id: crypto.randomUUID(), slug: input.slug, name: input.name, type: input.type,
     baseUrl: input.baseUrl, status: "draft", rotationStrategy: "round_robin",
   });
-  await invoke("provider_upsert", { p: providerToHost(p) });
-  adapters.register(p.id, input.manifest);
-  await invoke("manifest_upsert_active", {
-    m: {
-      id: crypto.randomUUID(), providerId: p.id, version: 1, origin: "builtin-template",
-      bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
-    },
-  });
-  return p;
+  try {
+    await invoke("provider_upsert", { p: providerToHost(p) });
+    adapters.register(p.id, input.manifest);
+    await invoke("manifest_upsert_active", {
+      m: {
+        id: crypto.randomUUID(), providerId: p.id, version: 1, origin: "builtin-template",
+        bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
+      },
+    });
+    return p;
+  } catch (e) {
+    // Host persist failed (e.g. UNIQUE slug): roll the in-memory state back so the registry
+    // never holds a ghost provider the host doesn't know about.
+    adapters.unregister(p.id);
+    await refreshFromHost().catch(() => undefined);
+    throw e;
+  }
 }
 
 export async function setProviderStatus(id: string, status: ProviderRecord["status"]): Promise<void> {
@@ -245,8 +256,12 @@ export async function deleteProvider(id: string): Promise<void> {
 
 /** Add a key: vault write happens inside registry.addKey via the KeyVaultPort (one call). */
 export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
+  const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });
   await invoke("api_key_upsert", { k: keyToHost(k) });
+  // draft providers aren't host-allowlisted (invariant 3); the first key promotes to
+  // pending so Test works immediately.
+  if (provider?.status === "draft") await setProviderStatus(providerId, "pending");
   return k;
 }
 
@@ -262,7 +277,7 @@ export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): 
 }
 
 /** Spec req. 8: cheap validity ping per key. */
-export async function testKey(keyId: string): Promise<{ ok: boolean; status: number; rateLimited: boolean }> {
+export async function testKey(keyId: string): Promise<{ ok: boolean; status: number; rateLimited: boolean; message?: string }> {
   const k = registry.getKey(keyId);
   if (!k) throw new Error(`unknown key ${keyId}`);
   const { interpreter } = await adapters.forProvider(k.providerId);

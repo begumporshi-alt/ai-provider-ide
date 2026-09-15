@@ -217,14 +217,15 @@ export class ManifestInterpreter {
   }
 
   /** Cheap validity ping — one model-list call (spec req. 8). */
-  async pingKey(secretRef: string, signal?: AbortSignal): Promise<{ ok: boolean; status: number; rateLimited: boolean }> {
-    if (!this.m.endpoints.listModels) return { ok: false, status: 0, rateLimited: false };
+  async pingKey(secretRef: string, signal?: AbortSignal): Promise<{ ok: boolean; status: number; rateLimited: boolean; message?: string }> {
+    if (!this.m.endpoints.listModels) return { ok: false, status: 0, rateLimited: false, message: "provider has no listModels endpoint" };
     try {
       await this.listModels(secretRef, signal);
       return { ok: true, status: 200, rateLimited: false };
     } catch (e) {
       const status = e instanceof ManifestHttpError ? e.status : 0;
-      return { ok: false, status, rateLimited: status === 429 };
+      const message = e instanceof ManifestHttpError ? e.body : String((e as Error)?.message ?? e);
+      return { ok: false, status, rateLimited: status === 429, message: message.slice(0, 300) };
     }
   }
 

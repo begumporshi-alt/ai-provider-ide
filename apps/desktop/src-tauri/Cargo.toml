@@ -27,7 +27,7 @@ tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "
 futures-util = "0.3.34"
 thiserror = "2.0.20"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }
-keyring = "3"
+keyring = "2"
 axum = "0.8"
 async-stream = "0.3"
 rand = "0.8"
