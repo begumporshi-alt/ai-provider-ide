@@ -10,6 +10,12 @@ importers:
 
   apps/desktop:
     dependencies:
+      '@aiprovider/adapter-spec':
+        specifier: workspace:*
+        version: link:../../packages/adapter-spec
+      '@aiprovider/router':
+        specifier: workspace:*
+        version: link:../../packages/router-core
       '@tauri-apps/api':
         specifier: ^2
         version: 2.11.1
