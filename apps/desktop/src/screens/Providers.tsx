@@ -190,10 +190,7 @@ function FirstRunHero({ onAdd }: { onAdd: () => void }) {
 }
 
 function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-  const [custom, setCustom] = useState(false);
-  const [slug, setSlug] = useState("");
-  const [name, setName] = useState("");
-  const [baseUrl, setBaseUrl] = useState("");
+
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
@@ -216,31 +213,9 @@ function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: ()
     }
   }
 
-  async function addCustom() {
-    setBusy(true);
-    setError(null);
-    try {
-      if (!/^https?:\/\//.test(baseUrl)) throw new Error("Base URL must be http(s)");
-      const manifest = PROVIDER_PROFILES["openrouter"]!(); // openai-compat shape; wizard refines in Phase 3
-      await addProvider({
-        slug: slug || name.toLowerCase().replace(/\W+/g, "-"),
-        name: name || "Custom provider",
-        type: "manifest",
-        baseUrl,
-        manifest: { ...manifest, provider: { ...manifest.provider, baseUrl } },
-      });
-      onDone();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
   return (
     <Modal title="Add Provider" onClose={onClose}>
-      {!custom ? (
-        <>
+      <>
           <div className="mb-3 grid gap-2">
             {KNOWN.map((s) => (
               <button
@@ -259,34 +234,20 @@ function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: ()
               </button>
             ))}
           </div>
-          <button className="text-[12px] underline decoration-dotted" style={{ color: "var(--text-dim)" }} onClick={() => setCustom(true)}>
-            Add a custom provider (manual) — the guided auto-setup wizard arrives in Phase 3
+          <button
+            className="flex w-full items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            onClick={() => {
+              onClose();
+              useUi.getState().go("onboarding");
+            }}
+          >
+            <span className="text-[13px] font-medium">Any other provider — guided setup</span>
+            <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>probe → identify → test → enable</span>
           </button>
-        </>
-      ) : (
-        <>
-          <Field label="Name">
-            <input className={inputCls} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="My provider" />
-          </Field>
-          <Field label="Slug">
-            <input className={`${inputCls} mono`} style={inputStyle} value={slug} onChange={(e) => setSlug(e.target.value)} placeholder="myprovider" />
-          </Field>
-          <Field label="Base URL (OpenAI-compatible)">
-            <input className={`${inputCls} mono`} style={inputStyle} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
-          </Field>
-          {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
-          <div className="flex justify-end gap-2">
-            <Button onClick={() => setCustom(false)}>Back</Button>
-            <Button variant="primary" disabled={busy || !name || !baseUrl} onClick={addCustom}>
-              {busy ? "Adding…" : "Add provider"}
-            </Button>
-          </div>
-          <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Treated as OpenAI-compatible until verified. Add a key next, then press Test.
-          </p>
-        </>
-      )}
-      {busy && !custom && <p className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>Registering…</p>}
+      </>
+      {error && <p className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
+      {busy && <p className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>Registering…</p>}
     </Modal>
   );
 }

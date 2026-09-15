@@ -313,6 +313,32 @@ export function listLedger(): LedgerEntry[] {
   return ledger.query();
 }
 
+/** The real egress-backed HttpPort — the onboarding orchestrator probes through it. */
+export function getHttpPort() {
+  return http;
+}
+
+/** Unique slug from a provider name ("My Provider!" -> my-provider, my-provider-2, …). */
+export function uniqueSlug(name: string): string {
+  const base = name.toLowerCase().replace(/\W+/g, "-").replace(/^-+|-+$/g, "") || "provider";
+  let slug = base;
+  let n = 2;
+  while (registry.providerBySlug(slug)) slug = `${base}-${n++}`;
+  return slug;
+}
+
+/** Wizard step 1: create the provider row as `pending` (allowlisted host-side) so probes
+ *  can reach it. Registration of manifest/catalog happens after the contract suite. */
+export async function createPendingProvider(name: string, baseUrl: string): Promise<string> {
+  const slug = uniqueSlug(name);
+  const p = registry.addProvider({
+    id: crypto.randomUUID(), slug, name, type: "manifest",
+    baseUrl, status: "pending", rotationStrategy: "round_robin",
+  });
+  await invoke("provider_upsert", { p: providerToHost(p) });
+  return p.id;
+}
+
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
   return invoke<HostLedgerRow[]>("ledger_recent", { limit: 200 });
 }

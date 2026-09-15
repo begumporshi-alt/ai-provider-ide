@@ -141,3 +141,39 @@ Bugs found & fixed during the live pass (all with regression coverage where appl
 Left for a human (typing into the webview is blocked for automation):
 - Playground chat via the UI (one message closes criterion 4's UI half + a source=ui row)
 - The Stop button mid-stream (cancellation is covered by Rust + core tests)
+
+## 2026-09-16 — Phase 3 (deterministic onboarding) complete + LIVE-verified
+
+Built (§2.1-2.4, deterministic path only — the AI path is Phase 4):
+- probe-runner: free-only GET/POST{} matrix (OPTIONS rejected by the egress method
+  whitelist — POST {} proves route existence + captures the 401 challenge, validation
+  400s never reach a model), bodies reduced to shapes by redaction before anything persists
+- redaction: values -> {key: type} shapes, key-shaped regex scrub, size cap (§2.3)
+- fingerprinter: openai-compat / anthropic-compat / unknown from probe evidence, template
+  pinned to the user baseUrl (§2.4)
+- contract-suite: free checks auto (auth+models), paid checks behind explicit consent
+  (max_tokens:1 text, minimal image only if claimed)
+- onboarding-orchestrator: §2.1 state machine with persistence; onboarding_sessions resume
+  across restarts; unknown dialect -> failed with Phase-4 guidance
+- screen-onboarding wizard: Connect -> Probe -> Identify -> Test -> Review -> Enable,
+  always cancellable (cancellation removes provider row + keychain entry), resume banner
+- Rust: onboarding_save/onboarding_latest_active commands; provider_delete now cascades
+  keychain cleanup (SQL cascade removed rows but left vault entries — §7 hygiene gap)
+
+LIVE-verified end-to-end in the running app (mock provider, resume-driven):
+resume banner -> Test step auto-runs free checks through REAL egress+keychain -> Review
+(2/2) -> Approve & Enable -> provider card Enabled, models_cache populated (mock-fast
+text + sd-mock-1 image), session terminal state enabled.
+
+Live bugs found & fixed during the wizard test:
+- resume provider lookup was by baseUrl alone — ambiguous when providers share a host
+  (it enabled the WRONG provider); now providerId travels in the session detail, with
+  name+baseUrl as a unique-match fallback only
+- resumed sessions could lack a manifest in state while the provider row had one
+  registered; enable now recovers it from the adapter runtime
+- onboarding_save inserts one row per save when no id is tracked; the wizard now reuses
+  the row id
+
+Suites: 48 TS tests (6 + 42) + 19 Rust green; typecheck + key-leak grep clean.
+Criterion 7 status: deterministic path live-proven; the fresh-install (typed) run is a
+one-minute human pass away.

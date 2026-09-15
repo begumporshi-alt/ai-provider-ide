@@ -83,9 +83,20 @@ pub fn provider_delete(
     egress: State<'_, Arc<crate::egress::EgressState>>,
     id: String,
 ) -> Result<(), CommandError> {
+    // §7 hygiene: the SQL cascade removes key ROWS; the keychain entries must go too,
+    // in the same operation.
+    let secret_refs: Vec<String> = {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT secret_ref FROM api_keys WHERE provider_id = ?1")?;
+        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
     {
         let conn = store.conn.lock().unwrap();
         conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?; // cascades (§7)
+    }
+    for account in secret_refs {
+        let _ = crate::vault::delete(&account);
     }
     recompute_allow(&egress, &store);
     Ok(())
@@ -458,4 +469,65 @@ pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandErro
         params![cutoff, month_from],
     )?;
     Ok(())
+}
+
+// ---------- onboarding sessions (§2.1: wizard resumes after restart) ----------
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OnboardingRow {
+    #[serde(default)]
+    pub id: Option<i64>,
+    pub input_json: String,               // {name, baseUrl, docsUrl} — NEVER the key (§2.3)
+    #[serde(default)]
+    pub detail_json: Option<String>,      // redacted report + fingerprint + manifest + contract
+    pub state: String,
+    #[serde(default)]
+    pub outcome: Option<String>,
+}
+
+#[tauri::command]
+pub fn onboarding_save(store: State<'_, Arc<Store>>, row: OnboardingRow) -> Result<i64, CommandError> {
+    let now = now_ms();
+    let conn = store.conn.lock().unwrap();
+    match row.id {
+        Some(id) => {
+            conn.execute(
+                "UPDATE onboarding_sessions SET updated_at=?2, input_json=?3, probe_report_redacted_json=?4, state=?5, outcome=?6 WHERE id=?1",
+                params![id, now, row.input_json, row.detail_json, row.state, row.outcome],
+            )?;
+            Ok(id)
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO onboarding_sessions (created_at, updated_at, input_json, probe_report_redacted_json, state, outcome) VALUES (?1,?1,?2,?3,?4,?5)",
+                params![now, row.input_json, row.detail_json, row.state, row.outcome],
+            )?;
+            Ok(conn.last_insert_rowid())
+        }
+    }
+}
+
+#[tauri::command]
+pub fn onboarding_latest_active(store: State<'_, Arc<Store>>) -> Result<Option<OnboardingRow>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, input_json, COALESCE(probe_report_redacted_json,'null'), state, outcome \
+         FROM onboarding_sessions \
+         WHERE state NOT IN ('enabled','failed') \
+         ORDER BY updated_at DESC LIMIT 1",
+    )?;
+    let mut rows = stmt.query_map([], |r| {
+        Ok(OnboardingRow {
+            id: Some(r.get(0)?),
+            input_json: r.get(1)?,
+            detail_json: Some(r.get(2)?),
+            state: r.get(3)?,
+            outcome: r.get(4)?,
+        })
+    })?;
+    match rows.next() {
+        Some(v) => Ok(Some(v?)),
+        None => Ok(None),
+    }
 }

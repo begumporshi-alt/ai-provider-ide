@@ -12,6 +12,7 @@ import { PlaygroundScreen } from "./screens/Playground";
 import { ActivityScreen } from "./screens/Activity";
 import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
+import { OnboardingScreen } from "./screens/Onboarding";
 
 export default function App() {
   const screen = useUi((s) => s.screen);
@@ -53,6 +54,7 @@ export default function App() {
       {screen === "activity" && <ActivityScreen />}
       {screen === "settings" && <SettingsScreen />}
       {screen === "gateway" && <GatewayScreen />}
+      {screen === "onboarding" && <OnboardingScreen />}
     </Shell>
   );
 }

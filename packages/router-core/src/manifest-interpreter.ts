@@ -224,7 +224,7 @@ export class ManifestInterpreter {
       return { ok: true, status: 200, rateLimited: false };
     } catch (e) {
       const status = e instanceof ManifestHttpError ? e.status : 0;
-      const message = e instanceof ManifestHttpError ? e.body : String((e as Error)?.message ?? e);
+      const message = e instanceof ManifestHttpError ? `HTTP ${e.status}: ${e.body}` : String((e as Error)?.message ?? e);
       return { ok: false, status, rateLimited: status === 429, message: message.slice(0, 300) };
     }
   }

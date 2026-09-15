@@ -14,3 +14,11 @@ export { ModelRouter, type AiTextPort, type RouterSettings, type SystemAiHealth 
 export * from "./ports.js";
 export * from "./domain.js";
 export * from "./errors.js";
+export * from "./redaction.js";
+export { runProbes, type ProbeReport, type ProbeAttempt } from "./probe-runner.js";
+export { fingerprint, type FingerprintResult } from "./fingerprinter.js";
+export { runContractSuite, type ContractReport, type ContractCheck, type ContractOptions } from "./contract-suite.js";
+export {
+  OnboardingOrchestrator, type OnboardingState, type OnboardingInput,
+  type OnboardingSessionData, type OnboardingPersistence,
+} from "./onboarding-orchestrator.js";
