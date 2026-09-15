@@ -60,6 +60,8 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       messages: req.messages,
       model: req.model,
       stream: true,
+      maxTokens: req.maxTokens,
+      temperature: req.temperature,
       signal: opts?.signal,
     });
     return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0);

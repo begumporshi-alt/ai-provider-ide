@@ -60,6 +60,7 @@ impl AllowList {
     pub fn allow(&self, host: &str) {
         self.0.write().unwrap().insert(host.to_lowercase());
     }
+    #[allow(dead_code)] // symmetric API; provider_delete uses recompute_allow instead
     pub fn deny(&self, host: &str) {
         self.0.write().unwrap().remove(&host.to_lowercase());
     }

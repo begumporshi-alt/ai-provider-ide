@@ -3,6 +3,7 @@
  */
 import { useEffect, useState } from "react";
 import { bootstrap } from "./store";
+import { startGatewayBridge } from "./gateway-bridge";
 import { useUi } from "./ui-state";
 import { Shell } from "./components/Shell";
 import { ProvidersScreen } from "./screens/Providers";
@@ -10,6 +11,7 @@ import { ModelsScreen } from "./screens/Models";
 import { PlaygroundScreen } from "./screens/Playground";
 import { ActivityScreen } from "./screens/Activity";
 import { SettingsScreen } from "./screens/Settings";
+import { GatewayScreen } from "./screens/Gateway";
 
 export default function App() {
   const screen = useUi((s) => s.screen);
@@ -18,7 +20,10 @@ export default function App() {
 
   useEffect(() => {
     bootstrap().then(
-      () => setReady(true),
+      async () => {
+        await startGatewayBridge();
+        setReady(true);
+      },
       (e: unknown) => setBootError(String(e)),
     );
   }, []);
@@ -47,6 +52,7 @@ export default function App() {
       {screen === "playground" && <PlaygroundScreen />}
       {screen === "activity" && <ActivityScreen />}
       {screen === "settings" && <SettingsScreen />}
+      {screen === "gateway" && <GatewayScreen />}
     </Shell>
   );
 }

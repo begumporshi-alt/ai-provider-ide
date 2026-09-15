@@ -17,7 +17,13 @@ const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
       { id: "activity", label: "Activity" },
     ],
   },
-  { group: "System", items: [{ id: "settings", label: "Router Settings" }] },
+  {
+    group: "System",
+    items: [
+      { id: "settings", label: "Router Settings" },
+      { id: "gateway", label: "Local Gateway" },
+    ],
+  },
 ];
 
 export function Shell({ children }: { children: ReactNode }) {

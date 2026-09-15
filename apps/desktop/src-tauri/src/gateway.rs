@@ -1,0 +1,748 @@
+//! local-gateway (L0, Phase 2b): OpenAI-compatible HTTP endpoint (axum) bridging external
+//! apps into the webview-hosted router core (§3.3, §3.4, §3.5).
+//!
+//! Security posture (invariants 10, 11, 15, 16):
+//! - binds 127.0.0.1 only;
+//! - every request authenticated by the master key BEFORE any routing work; constant-time
+//!   compare; per-IP exponential backoff on repeated auth failures;
+//! - the master key lives only in the OS keychain (account `masterkey`); reveal is a
+//!   Rust-side copy-to-clipboard (§14) — it never enters webview-observable state;
+//!   rotation overwrites the account, so the old key dies on the NEXT request read (§3.3);
+//! - core unavailable (stale heartbeat): 503 + Retry-After: 1, nothing queued (§3.5);
+//! - capacity: 8 concurrent + 32 queued -> 429 + Retry-After;
+//! - cancellation: client disconnect drops the Slot -> bridge.cancel(id) -> the webview
+//!   aborts the router call -> the provider stream closes.
+
+use std::collections::HashMap;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use axum::extract::State;
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use rand::Rng as _;
+use serde_json::{json, Value};
+use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+
+use crate::vault;
+
+pub const DEFAULT_PORT: u16 = 8787;
+pub const MASTER_ACCOUNT: &str = "masterkey";
+const MAX_TOTAL: usize = 8 + 32; // §3.5: 8 concurrent, queue of 32
+const HEARTBEAT_STALE_MS: u64 = 6_000;
+
+/// Pluggable master-key lookup so the HTTP surface is testable without touching the real
+/// OS keychain. Production passes the vault-backed closure.
+pub type KeyProvider = Arc<dyn Fn() -> Option<String> + Send + Sync + 'static>;
+
+pub fn vault_key_provider() -> KeyProvider {
+    Arc::new(|| vault::get(MASTER_ACCOUNT).ok().flatten())
+}
+
+// ---------- bridge protocol (Rust <-> webview) ----------
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BridgeRequest {
+    pub request_id: u64,
+    pub kind: &'static str, // "chat" | "models" | "image"
+    pub body: Value,
+}
+
+/// Messages the webview bridge sends back for one request.
+#[derive(Debug, Clone)]
+pub enum BridgeMsg {
+    Delta(String),
+    Result(Value),
+    Done,
+    Error { status: u16, message: String },
+}
+
+/// Hand-off surface to the router core. Production emits Tauri events; the Phase-2b
+/// integration test injects a synthetic bridge (the §3.5 entry-gate spike).
+pub trait Bridge: Send + Sync + 'static {
+    fn dispatch(&self, req: BridgeRequest);
+    fn cancel(&self, request_id: u64);
+}
+
+pub struct GatewayCore {
+    next_id: AtomicU64,
+    pending: Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>,
+    permits: Arc<Semaphore>,
+    last_heartbeat: Mutex<Instant>,
+    failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
+    bridge: Arc<dyn Bridge>,
+    key_provider: KeyProvider,
+    running: AtomicBool,
+    port: Mutex<u16>,
+}
+
+impl GatewayCore {
+    pub fn new(bridge: Arc<dyn Bridge>, key_provider: KeyProvider) -> Self {
+        Self {
+            next_id: AtomicU64::new(1),
+            pending: Mutex::new(HashMap::new()),
+            permits: Arc::new(Semaphore::new(MAX_TOTAL)),
+            last_heartbeat: Mutex::new(Instant::now()),
+            failures: Mutex::new(HashMap::new()),
+            bridge,
+            key_provider,
+            running: AtomicBool::new(false),
+            port: Mutex::new(DEFAULT_PORT),
+        }
+    }
+
+    pub fn heartbeat(&self) {
+        *self.last_heartbeat.lock().unwrap() = Instant::now();
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+            && self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(HEARTBEAT_STALE_MS)
+    }
+
+    pub fn set_running(&self, on: bool) {
+        self.running.store(on, Ordering::Relaxed);
+        if on {
+            self.heartbeat();
+        }
+    }
+
+    pub fn port(&self) -> u16 {
+        *self.port.lock().unwrap()
+    }
+
+    /// Webview bridge replies land here (gateway_chunk / gateway_result / gateway_done /
+    /// gateway_error commands). Unknown/stale id = client already gone -> idempotent no-op.
+    pub fn reply(&self, id: u64, msg: BridgeMsg) {
+        let tx = self.pending.lock().unwrap().get(&id).cloned();
+        if let Some(tx) = tx {
+            let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
+            let _ = tx.send(msg);
+            if terminal {
+                self.pending.lock().unwrap().remove(&id);
+            }
+        }
+    }
+
+    fn close(&self, id: u64) {
+        self.pending.lock().unwrap().remove(&id);
+    }
+}
+
+/// RAII slot: permit + registration + receiver, all released on drop — including on client
+/// disconnect mid-stream, which is what makes §3.5 cancellation work.
+struct Slot {
+    core: Arc<GatewayCore>,
+    _permit: OwnedSemaphorePermit,
+    id: u64,
+    rx: mpsc::UnboundedReceiver<BridgeMsg>,
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.core.close(self.id);
+        self.core.bridge.cancel(self.id);
+    }
+}
+
+/// 503 if the core is unreachable, 429 if over capacity, otherwise the Slot.
+fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
+    if !core.is_available() {
+        return Err(err_ra(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "1",
+            openai_error("AI-Provider IDE core unavailable — is the app open?", "service_unavailable", None),
+        ));
+    }
+    let Ok(permit) = core.permits.clone().try_acquire_owned() else {
+        return Err(err_ra(StatusCode::TOO_MANY_REQUESTS, "1", openai_error("router at capacity", "rate_limit", None)));
+    };
+    let id = core.next_id.fetch_add(1, Ordering::Relaxed);
+    let (tx, rx) = mpsc::unbounded_channel();
+    core.pending.lock().unwrap().insert(id, tx);
+    Ok(Slot { core: core.clone(), _permit: permit, id, rx })
+}
+
+// ---------- auth (invariants 10, 11, 15) ----------
+
+fn constant_time_eq(a: &str, b: &str) -> bool {
+    let (a, b) = (a.as_bytes(), b.as_bytes());
+    let mut diff = (a.len() ^ b.len()) as u8;
+    for i in 0..a.len().max(b.len()) {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b.get(i).copied().unwrap_or(0);
+        diff |= x ^ y;
+    }
+    std::hint::black_box(diff == 0)
+}
+
+fn auth_allowed(core: &GatewayCore, ip: IpAddr) -> bool {
+    let f = core.failures.lock().unwrap();
+    match f.get(&ip) {
+        Some((_, until)) => Instant::now() >= *until,
+        None => true,
+    }
+}
+
+fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
+    let mut f = core.failures.lock().unwrap();
+    let e = f.entry(ip).or_insert((0, Instant::now()));
+    e.0 += 1;
+    let delay = Duration::from_millis(500u64.saturating_mul(2u64.pow((e.0 - 1).min(6))));
+    e.1 = Instant::now() + delay;
+}
+
+/// Returns Some(response) to deny, None to allow. Reads the key provider per request so a
+/// rotation/revocation kills the old key instantly (§3.3, criterion 8).
+fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<Response> {
+    if !core.running.load(Ordering::Relaxed) {
+        return Some(err_ra(StatusCode::SERVICE_UNAVAILABLE, "1", openai_error("gateway disabled", "service_unavailable", None)));
+    }
+    if !auth_allowed(core, ip) {
+        return Some(err_ra(StatusCode::TOO_MANY_REQUESTS, "30", openai_error("too many failed auth attempts — backing off", "rate_limit", None)));
+    }
+    let Some(stored) = (core.key_provider)() else {
+        return Some(err(StatusCode::UNAUTHORIZED, openai_error("no master key configured", "invalid_request", Some("invalid_api_key"))));
+    };
+    let presented = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    if constant_time_eq(presented, &stored) {
+        core.failures.lock().unwrap().remove(&ip);
+        None
+    } else {
+        note_auth_failure(core, ip);
+        Some(err(StatusCode::UNAUTHORIZED, openai_error("invalid master key", "invalid_request", Some("invalid_api_key"))))
+    }
+}
+
+fn openai_error(message: &str, kind: &str, code: Option<&str>) -> Value {
+    json!({ "error": { "message": message, "type": kind, "code": code } })
+}
+
+fn err(status: StatusCode, body: Value) -> Response {
+    (status, axum::Json(body)).into_response()
+}
+
+fn err_ra(status: StatusCode, retry: &'static str, body: Value) -> Response {
+    (status, [(header::RETRY_AFTER, retry)], axum::Json(body)).into_response()
+}
+
+fn peer_ip(_headers: &HeaderMap) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST) // loopback bind: single peer namespace (v1)
+}
+
+// ---------- handlers ----------
+
+async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+        return r;
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
+    };
+    // §3.4 compatibility contract: explicit refusal, never a silent drop.
+    for unsupported in ["tools", "tool_choice", "response_format", "functions"] {
+        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                openai_error(&format!("{unsupported} is not supported yet"), "invalid_request", Some("unsupported_parameter")),
+            );
+        }
+    }
+    if req.get("model").and_then(Value::as_str).unwrap_or("").is_empty() {
+        return err(StatusCode::BAD_REQUEST, openai_error("model is required", "invalid_request", None));
+    }
+    let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let id = slot.id;
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req });
+
+    if wants_stream {
+        // Slot (and its Drop -> bridge.cancel) lives inside the SSE stream: axum drops the
+        // stream exactly when the client disconnects or the body finishes.
+        let stream_body = async_stream::stream! {
+            while let Some(msg) = slot.rx.recv().await {
+                match msg {
+                    BridgeMsg::Delta(t) => {
+                        let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk",
+                            "choices": [{ "index": 0, "delta": { "content": t } }] });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
+                    }
+                    BridgeMsg::Result(_) => {}
+                    BridgeMsg::Done => {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
+                        break;
+                    }
+                    BridgeMsg::Error { message, .. } => {
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                            json!({ "error": { "message": message, "type": "upstream_error", "code": null } }).to_string(),
+                        ));
+                        break;
+                    }
+                }
+            }
+            drop(slot);
+        };
+        return Sse::new(stream_body)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response();
+    }
+
+    let mut full = String::new();
+    let mut err_info: Option<(u16, String)> = None;
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Result(v) => {
+                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+            }
+            BridgeMsg::Done => break,
+            BridgeMsg::Error { status, message } => {
+                err_info = Some((status, message));
+                break;
+            }
+        }
+    }
+    drop(slot);
+    match err_info {
+        Some((status, message)) => {
+            let code = match status {
+                404 => StatusCode::NOT_FOUND,
+                429 => StatusCode::TOO_MANY_REQUESTS,
+                401 => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::BAD_GATEWAY,
+            };
+            err(code, openai_error(&message, "upstream_error", None))
+        }
+        None => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({ "id": format!("gw-{id}"), "object": "chat.completion",
+                "choices": [{ "index": 0, "message": { "role": "assistant", "content": full }, "finish_reason": "stop" }] })
+                .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+        return r;
+    }
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let id = slot.id;
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "models", body: json!({}) });
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Result(v) => {
+                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+            }
+            BridgeMsg::Error { message, .. } => {
+                return err(StatusCode::BAD_GATEWAY, openai_error(&message, "upstream_error", None))
+            }
+            BridgeMsg::Done => break,
+            BridgeMsg::Delta(_) => {}
+        }
+    }
+    err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
+}
+
+async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+        return r;
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
+    };
+    if req.get("model").and_then(Value::as_str).unwrap_or("").is_empty()
+        || req.get("prompt").and_then(Value::as_str).unwrap_or("").is_empty()
+    {
+        return err(StatusCode::BAD_REQUEST, openai_error("model and prompt are required", "invalid_request", None));
+    }
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => return r,
+    };
+    let id = slot.id;
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "image", body: req });
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Result(v) => {
+                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+            }
+            BridgeMsg::Error { status, message } => {
+                let code = if status == 404 { StatusCode::NOT_FOUND } else { StatusCode::BAD_GATEWAY };
+                return err(code, openai_error(&message, "upstream_error", None));
+            }
+            BridgeMsg::Done => break,
+            BridgeMsg::Delta(_) => {}
+        }
+    }
+    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
+}
+
+// ---------- master key + server lifecycle ----------
+
+/// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the keychain, return it
+/// exactly once for display (§3.3). Rotation = call again: the old key dies instantly
+/// because every request re-reads the keychain.
+pub fn generate_master_key() -> Result<String, String> {
+    let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
+    let key = format!("sk-aip-{raw}");
+    vault::put(MASTER_ACCOUNT, &key).map_err(|e| e.to_string())?;
+    Ok(key)
+}
+
+pub fn revoke_master_key() -> Result<(), String> {
+    vault::delete(MASTER_ACCOUNT).map_err(|e| e.to_string())
+}
+
+/// Copy the master key to the clipboard host-side (invariant 14: never crosses the DOM).
+pub fn copy_master_key() -> Result<(), String> {
+    let key = vault::get(MASTER_ACCOUNT).map_err(|e| e.to_string())?.ok_or("no master key exists")?;
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(key).map_err(|e| e.to_string())
+}
+
+pub struct ServerHandle {
+    pub shutdown: oneshot::Sender<()>,
+    pub addr: SocketAddr,
+}
+
+/// Spawn the axum server on 127.0.0.1:port (invariant 11). Bind failure is a loud error
+/// with remediation text (invariant 16).
+pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, String> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|e| {
+        format!("cannot bind {addr}: {e} — another process may squat port {port}; change it in Gateway settings")
+    })?;
+    let bound = listener.local_addr().map_err(|e| e.to_string())?;
+    *core.port.lock().unwrap() = bound.port();
+    let app = axum::Router::new()
+        .route("/v1/models", get(models_h))
+        .route("/v1/chat/completions", post(chat_h))
+        .route("/v1/images/generations", post(image_h))
+        .with_state(core);
+    let (tx, rx) = oneshot::channel::<()>();
+    tokio::spawn(async move {
+        let _ = axum::serve(listener, app)
+            .with_graceful_shutdown(async move {
+                let _ = rx.await;
+            })
+            .await;
+    });
+    Ok(ServerHandle { shutdown: tx, addr: bound })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures_util::StreamExt as _;
+
+    /// Synthetic bridge = the §3.5 entry-gate spike: answers chat with deltas + Done,
+    /// models/image with JSON, records cancels. Holds a back-pointer to the core so it can
+    /// reply.
+    struct SynthBridge {
+        core: Mutex<Option<Arc<GatewayCore>>>,
+        cancels: AtomicUsize,
+        slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
+    }
+
+    impl SynthBridge {
+        fn new() -> Self {
+            Self { core: Mutex::new(None), cancels: AtomicUsize::new(0), slow: AtomicUsize::new(0) }
+        }
+        fn attach(&self, core: &Arc<GatewayCore>) {
+            *self.core.lock().unwrap() = Some(core.clone());
+        }
+    }
+
+    impl Bridge for SynthBridge {
+        fn dispatch(&self, req: BridgeRequest) {
+            let core = self.core.lock().unwrap().clone().unwrap();
+            let slow = self.slow.load(Ordering::Relaxed);
+            std::thread::spawn(move || {
+                if slow > 0 {
+                    std::thread::sleep(Duration::from_millis(slow as u64 * 20));
+                }
+                match req.kind {
+                    "chat" => {
+                        core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
+                        core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                        core.reply(req.request_id, BridgeMsg::Done);
+                    }
+                    "models" => {
+                        core.reply(req.request_id, BridgeMsg::Result(json!({
+                            "object": "list",
+                            "data": [{ "id": "openrouter/gpt-4o", "object": "model" }, { "id": "opencode/gpt-4o", "object": "model" }]
+                        })));
+                        core.reply(req.request_id, BridgeMsg::Done);
+                    }
+                    "image" => {
+                        core.reply(req.request_id, BridgeMsg::Result(json!({ "data": [{ "url": "https://img.example/x.png" }] })));
+                        core.reply(req.request_id, BridgeMsg::Done);
+                    }
+                    _ => {}
+                }
+            });
+        }
+        fn cancel(&self, _id: u64) {
+            self.cancels.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    struct TestServer {
+        client: reqwest::Client,
+        base: String,
+        core: Arc<GatewayCore>,
+        bridge: Arc<SynthBridge>,
+        _handle: ServerHandle,
+    }
+
+    /// Key provider backed by a mutable slot — simulates rotate/revoke without the keychain.
+    fn test_core(key: Arc<Mutex<Option<String>>>) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
+        let bridge = Arc::new(SynthBridge::new());
+        let core = Arc::new(GatewayCore::new(
+            bridge.clone(),
+            Arc::new(move || key.lock().unwrap().clone()),
+        ));
+        bridge.attach(&core);
+        (core, bridge)
+    }
+
+    async fn start(key: Arc<Mutex<Option<String>>>) -> TestServer {
+        let (core, bridge) = test_core(key);
+        core.set_running(true);
+        let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+        TestServer {
+            client: reqwest::Client::new(),
+            base: format!("http://{}", handle.addr),
+            core,
+            bridge,
+            _handle: handle,
+        }
+    }
+
+    fn chat_body(stream: bool) -> Value {
+        json!({ "model": "gpt-4o", "messages": [{ "role": "user", "content": "hi" }], "stream": stream })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn criterion8_stream_with_master_key() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let mut stream = res.bytes_stream();
+        let mut acc = String::new();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("[DONE]") {
+                break;
+            }
+        }
+        assert!(acc.contains("Hel"));
+        assert!(acc.contains("lo"));
+        assert!(acc.contains("[DONE]"), "stream must terminate: {acc}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn criterion8_wrong_key_401() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-WRONG")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn criterion8_rotation_kills_old_key_instantly() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-old".to_string())));
+        let s = start(key.clone()).await;
+        // old key works
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-old")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // rotate (overwrite keychain slot)
+        *key.lock().unwrap() = Some("sk-aip-new".to_string());
+        // old key now 401, new key 200 — no restart, per-request read
+        let res_old = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-old")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_old.status(), 401);
+        // invariant 15: the failed attempt put this IP in a short backoff — wait it out
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let res_new = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-new")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res_new.status(), 200);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn non_stream_returns_openai_shape() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["object"], "chat.completion");
+        assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_param_rejected_explicitly() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({ "model": "gpt-4o", "messages": [], "tools": [{}] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert!(body["error"]["message"].as_str().unwrap().contains("not supported"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn merged_models_qualified_ids() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .get(format!("{}/v1/models", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["data"][0]["id"], "openrouter/gpt-4o");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn image_generation_routes() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/images/generations", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({ "model": "dall-e-3", "prompt": "cat" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["data"][0]["url"], "https://img.example/x.png");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn core_down_answers_503_with_retry_after() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.set_running(false);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        assert_eq!(res.headers()["retry-after"], "1");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn client_disconnect_midstream_cancels_bridge() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        // Bridge answers slowly; we drop the response stream after the first chunk.
+        s.bridge.slow.store(100, Ordering::Relaxed); // delay replies ~2s
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // Drop the stream immediately (client disconnect).
+        drop(res);
+        // Slot drop -> cancel must be observed.
+        for _ in 0..50 {
+            if s.bridge.cancels.load(Ordering::Relaxed) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("cancel was never propagated to the bridge");
+    }
+
+    #[test]
+    fn constant_time_eq_basics() {
+        assert!(constant_time_eq("abc", "abc"));
+        assert!(!constant_time_eq("abc", "abd"));
+        assert!(!constant_time_eq("abc", "abcd"));
+    }
+}

@@ -150,6 +150,17 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::aliases_list,
         crate::persist::ledger_append,
         crate::persist::ledger_recent,
-        crate::persist::ledger_rollup_run
+        crate::persist::ledger_rollup_run,
+        crate::gateway_cmds::gateway_status,
+        crate::gateway_cmds::gateway_enable,
+        crate::gateway_cmds::gateway_disable,
+        crate::gateway_cmds::gateway_key_generate,
+        crate::gateway_cmds::gateway_key_copy,
+        crate::gateway_cmds::gateway_key_revoke,
+        crate::gateway_cmds::gateway_heartbeat,
+        crate::gateway_cmds::gateway_chunk,
+        crate::gateway_cmds::gateway_result,
+        crate::gateway_cmds::gateway_done,
+        crate::gateway_cmds::gateway_error
     ]
 }

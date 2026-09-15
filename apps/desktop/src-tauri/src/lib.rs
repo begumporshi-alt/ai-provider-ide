@@ -1,5 +1,7 @@
 mod commands;
 mod egress;
+mod gateway;
+mod gateway_cmds;
 mod persist;
 mod store;
 mod vault;
@@ -70,8 +72,10 @@ pub fn run() {
             probe_key_refs(&store);
             let allow = Arc::new(egress::AllowList(RwLock::new(initial_allow_hosts(&store))));
             let egress_state = Arc::new(egress::EgressState::new(allow, store.clone()));
+            gateway_cmds::run_rollup(&store);
             app.manage(store);
             app.manage(egress_state);
+            gateway_cmds::manage(app)?;
             Ok(())
         })
         .invoke_handler(commands::handlers())

@@ -124,7 +124,7 @@ pub fn sync_allow_for_provider(
 /// and status changes so no stale grant survives — invariant 9).
 pub fn recompute_allow(egress: &crate::egress::EgressState, store: &Store) {
     let desired: std::collections::HashSet<String> = {
-        let mut conn = store.conn.lock().unwrap();
+        let conn = store.conn.lock().unwrap();
         let hosts: Vec<String> = conn
             .prepare("SELECT base_url FROM providers WHERE status IN ('pending','enabled','repairing')")
             .map(|mut stmt| {

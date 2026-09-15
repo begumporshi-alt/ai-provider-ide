@@ -42,6 +42,9 @@ export interface StorePort {
 export interface TextRequest {
   model: string;
   messages: Array<{ role: "user" | "assistant" | "system"; content: string }>;
+  /** §3.4 compatibility contract: both supported, passed through when the manifest allows. */
+  maxTokens?: number;
+  temperature?: number;
 }
 
 export type TextChunk = string;
