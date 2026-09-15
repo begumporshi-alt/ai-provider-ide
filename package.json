@@ -1,0 +1,17 @@
+{
+  "name": "ai-provider-ide",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "pnpm@10.12.4",
+  "scripts": {
+    "typecheck": "pnpm -r typecheck",
+    "test": "pnpm -r test",
+    "lint": "pnpm -r --if-present lint",
+    "key-leak-grep": "bash scripts/key-leak-grep.sh",
+    "dev": "pnpm --filter desktop tauri dev",
+    "build": "pnpm -r build"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}

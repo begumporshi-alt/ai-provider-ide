@@ -1,0 +1,21 @@
+# Node / pnpm
+node_modules/
+dist/
+*.tsbuildinfo
+coverage/
+
+# Rust / Tauri
+target/
+apps/desktop/src-tauri/gen/
+
+# App data / local
+.playwright-mcp/
+.video_agent/
+.DS_Store
+*.local
+
+# Never commit anything that could carry secrets
+.env
+.env.*
+*.pem
+*.key

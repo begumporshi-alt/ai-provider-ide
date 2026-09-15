@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI-Provider IDE — Local Gateway Setup</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-soft:    #7a8399;
+      --color-accent:  #eb6c36;
+      --color-link:    #2e5aa8;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 1000px; width: 100%; }
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+    .sub {
+      font-size: 0.9rem;
+      color: var(--color-muted);
+      margin-bottom: 1.75rem;
+    }
+    svg { width: 100%; min-width: 720px; display: block; }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">AI-Provider IDE · Local Gateway</p>
+    <h1>One endpoint, one master key</h1>
+    <p class="sub">Every app on your machine can use all your providers through one OpenAI-compatible URL — with the same rotation and failover as the IDE itself.</p>
+
+    <svg viewBox="0 0 896 952" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="aip-gateway-title aip-gateway-desc">
+      <title id="aip-gateway-title">Local Gateway master key and endpoint setup flow</title>
+      <desc id="aip-gateway-desc">Setup and request flow for the local gateway: enabling the gateway in settings sets the endpoint URL, a master key is generated and stored in the OS keychain, any app pastes the URL and key, incoming requests are authenticated against the keychain before the Model Router serves them with the usual rotation and failover; invalid keys get a 401.</desc>
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- ══ Arrows (before nodes) ══ -->
+
+      <line x1="360" y1="100" x2="360" y2="140" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <line x1="360" y1="196" x2="360" y2="236" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <line x1="360" y1="300" x2="360" y2="336" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <line x1="360" y1="392" x2="360" y2="432" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <line x1="360" y1="488" x2="360" y2="516" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- Key valid? YES → Model Router -->
+      <line x1="360" y1="604" x2="360" y2="648" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <rect x="368" y="616" width="32" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="384" y="625" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">YES</text>
+
+      <!-- Key valid? NO → 401 rejected -->
+      <line x1="456" y1="560" x2="580" y2="560" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+      <rect x="494" y="540" width="24" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="506" y="549" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">NO</text>
+
+      <line x1="360" y1="712" x2="360" y2="752" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <!-- ══ Nodes ══ -->
+
+      <!-- Start -->
+      <rect x="272" y="44" width="176" height="56" rx="20" fill="#f5f5f5"/>
+      <rect x="272" y="44" width="176" height="56" rx="20" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <text x="360" y="68" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Open Gateway settings</text>
+      <text x="360" y="86" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">inside the IDE</text>
+
+      <!-- Enable & pick port -->
+      <rect x="272" y="140" width="176" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="272" y="140" width="176" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="360" y="166" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Enable &amp; pick port</text>
+      <text x="360" y="184" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">http://127.0.0.1:8787/v1</text>
+
+      <!-- Generate master key (focal) -->
+      <rect x="268" y="236" width="184" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="268" y="236" width="184" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
+      <text x="360" y="266" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Generate master key</text>
+      <text x="360" y="284" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">crypto-random · keychain</text>
+
+      <!-- Connect any app -->
+      <rect x="272" y="336" width="176" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="272" y="336" width="176" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="360" y="362" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Connect any app</text>
+      <text x="360" y="380" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">paste endpoint URL + key</text>
+
+      <!-- App sends request -->
+      <rect x="272" y="432" width="176" height="56" rx="6" fill="#f5f5f5"/>
+      <rect x="272" y="432" width="176" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="360" y="458" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">App sends request</text>
+      <text x="360" y="476" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">POST /v1/chat/completions</text>
+
+      <!-- Decision: key valid? -->
+      <polygon points="360,516 456,560 360,604 264,560" fill="#f5f5f5"/>
+      <polygon points="360,516 456,560 360,604 264,560" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="360" y="558" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Key valid?</text>
+      <text x="360" y="574" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">checked in Rust</text>
+
+      <!-- 401 rejected -->
+      <rect x="580" y="532" width="160" height="56" rx="20" fill="#f5f5f5"/>
+      <rect x="580" y="532" width="160" height="56" rx="20" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="660" y="556" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">401 rejected</text>
+      <text x="660" y="574" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">invalid or revoked key</text>
+
+      <!-- Model Router serves it -->
+      <rect x="272" y="648" width="176" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="272" y="648" width="176" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="360" y="676" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Model Router serves it</text>
+      <text x="360" y="694" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">provider · key · model</text>
+
+      <!-- End -->
+      <rect x="272" y="752" width="176" height="56" rx="20" fill="#f5f5f5"/>
+      <rect x="272" y="752" width="176" height="56" rx="20" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <text x="360" y="776" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Any app · any provider</text>
+      <text x="360" y="794" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">stream · rotate · failover</text>
+
+      <!-- Editorial aside -->
+      <text x="572" y="648" fill="#7a8399" font-size="14" font-family="'Instrument Serif', serif" font-style="italic">Rotate or revoke the master key anytime —</text>
+      <text x="572" y="668" fill="#7a8399" font-size="14" font-family="'Instrument Serif', serif" font-style="italic">old keys stop working instantly.</text>
+
+      <!-- ══ Legend ══ -->
+      <line x1="30" y1="880" x2="866" y2="880" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="30" y="904" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+
+      <rect x="96" y="894" width="28" height="14" rx="7" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <text x="132" y="905" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">START / END</text>
+
+      <rect x="228" y="894" width="20" height="14" rx="2" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="256" y="905" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">STEP</text>
+
+      <rect x="316" y="894" width="20" height="14" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="344" y="905" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">MASTER KEY</text>
+
+      <polygon points="456,892 476,901 456,910 436,901" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <text x="484" y="905" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">DECISION</text>
+    </svg>
+  </div>
+</body>
+</html>
