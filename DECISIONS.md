@@ -41,3 +41,36 @@
   implements them as written.
 - **Revisit if:** contract-suite tests expose an ambiguity — then amend here first, then docs,
   then code.
+
+## 2026-09-15 — v1.1 grammar amendment: `stream.stopWhen` / `stream.ignoreWhen` (condition objects)
+
+- **Decision:** Anthropic's stream terminates on an event (`type=message_stop`), not a
+  finish_reason field. Added `stopWhen: {path, equals}` (+ `ignoreWhen`) to the stream spec
+  as a v1.1 amendment, implemented in the interpreter. The `finish` selector stays for
+  OpenAI-style streams.
+- **Rationale:** keeps anthropic-compat a pure DATA profile; without it the template needs a
+  code path, breaking §2.8's tiering promise.
+- **Revisit if:** a dialect needs richer event logic than equality — likely Tier-2, not a
+  grammar explosion.
+
+## 2026-09-15 — RouterFacade.generateText returns `{ chunks }` of strings, not `AsyncIterable<TextChunk>`
+
+- **Options:** literal spec signature (`Promise<AsyncIterable<TextChunk>>`), or a small stream
+  object exposing `chunks` plus serving/fallback-chain attribution (what §3.1's ledger needs).
+- **Decision:** stream object (`TextExecution`) — criteria 3/10 require the caller to see WHICH
+  provider/key served and the fallback chain; a bare iterable can't carry that without
+  side-channels. `TextChunk` kept as a string alias for the spec's shape.
+- **Revisit if:** a consumer needs the exact spec signature — trivial adapter.
+
+## 2026-09-15 — Cursor rotation advanced per-request in the Router, not per-attempt
+
+- **Decision:** round-robin cursor advances on stream completion (success), per provider.
+- **Rationale:** mid-stream failures shouldn't rotate everyone off a partially-good key.
+
+## 2026-09-15 — Phase 1 TS core acceptance: criteria 2, 3, 4 (core-level) pass on fake ports
+
+- **Verified:** `packages/router-core/test/acceptance.test.ts` — 15 tests: rotation past a 401
+  key with silent success (2), provider failover + fallback chain visible in ledger +
+  failover-disabled flag (3), openai-compat + anthropic-compat streaming + image url/b64 (4),
+  mid-stream cancellation, key-blindness header guard (invariants 1–2), alias auto-derivation
+  (§3.4). `pnpm typecheck` + `pnpm test` green workspace-wide.

@@ -18,3 +18,5 @@ export type ProviderLifecycleState =
   | "repairing";
 
 export type KeyStatus = "active" | "rate-limited" | "invalid";
+
+export * from "./manifest.js";
