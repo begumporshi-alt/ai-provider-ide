@@ -56,9 +56,13 @@ export class ProviderRegistry {
     priority?: number;
   }): Promise<ApiKeyRecord> {
     if (!this.providers.has(input.providerId)) throw new Error(`unknown provider ${input.providerId}`);
-    const secretRef = await this.vault.put(`key:${input.providerId}`, input.secret);
+    // §4 freezes the keychain account format as `key:<keyId>` — the id must be generated
+    // BEFORE the vault write, or every key of a provider would share one account and
+    // silently overwrite each other (diff-review M1).
+    const id = crypto.randomUUID();
+    const secretRef = await this.vault.put(`key:${id}`, input.secret);
     const rec: ApiKeyRecord = {
-      id: crypto.randomUUID(),
+      id,
       providerId: input.providerId,
       label: input.label,
       secretRef,

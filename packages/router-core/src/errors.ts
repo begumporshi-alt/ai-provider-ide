@@ -31,7 +31,7 @@ export function classify(status: number, bodyHint?: "schema" | "not_found" | nul
   if (status === 401 || status === 403) return "AUTH_FAILED";
   if (status === 429) return "RATE_LIMITED";
   if (status === 404) return "NOT_FOUND";
-  if (status === 400) return bodyHint === "schema" ? "BAD_REQUEST_SCHEMA" : "BAD_REQUEST_SCHEMA";
+  if (status === 400) return bodyHint === "not_found" ? "NOT_FOUND" : "BAD_REQUEST_SCHEMA";
   if (status === 408) return "TIMEOUT";
   if (status >= 500) return "SERVER_ERROR";
   return "NETWORK";

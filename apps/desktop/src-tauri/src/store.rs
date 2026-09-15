@@ -183,7 +183,7 @@ pub struct StoreInfo {
 
 pub struct Store {
     pub conn: Mutex<Connection>,
-    path: String,
+    pub(crate) path: String,
 }
 
 impl Store {

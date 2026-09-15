@@ -62,9 +62,9 @@ export class ExecutionEngine {
       for (let i = 0; i < attempts; i++) {
         const c = args.plan[i]!;
         if (args.signal?.aborted) return;
+        let emitted = false;
         try {
           const { interpreter } = await self.adapters.forProvider(c.provider.id);
-          let emitted = false;
           for await (const chunk of interpreter.generateText(
             c.key.secretRef,
             { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature },
@@ -79,7 +79,19 @@ export class ExecutionEngine {
           self.health.recordResult(c.key, "OK");
           return; // success
         } catch (e) {
-          const cls = e instanceof ManifestHttpError ? classify(e.status) : "NETWORK";
+          // Mid-stream errors are drift-class (§2.10), never "OK from status 200"
+          // (diff-review M2): a stream that already yielded text CANNOT be transparently
+          // retried — the consumer would see duplicated output. Fail loud after first byte.
+          if (emitted) {
+            const cls = e instanceof ManifestHttpError ? classify(e.status) === "OK" ? "PARSE_ERROR" : classify(e.status) : "NETWORK";
+            fallbackChain.push({ candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 });
+            throw e;
+          }
+          const cls = e instanceof ManifestHttpError
+            ? e.kind === "mid-stream" || classify(e.status) === "OK"
+              ? "PARSE_ERROR"
+              : classify(e.status)
+            : "NETWORK";
           const outcome: AttemptOutcome = { candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 };
           fallbackChain.push(outcome);
           self.health.recordResult(c.key, cls, outcome.retryAfterMs);

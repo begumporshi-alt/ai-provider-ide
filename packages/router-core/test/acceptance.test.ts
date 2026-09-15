@@ -69,15 +69,16 @@ async function collect(it: AsyncIterable<string>): Promise<string> {
 
 describe("acceptance 2 — key rotation is silent to the caller", () => {
   it("first key 401 -> second key serves; caller sees a normal stream", async () => {
+    let chatCalls = 0;
     const s = makeSetup({
-      responder: (url, init) => {
+      responder: (url) => {
         if (url.endsWith("/models")) return { status: 200, body: { data: [{ id: "gpt-4o" }] } };
-        // key A#1 is invalid; A#2 works
-        if (init.secretRef === "key:pA#1") return { status: 401, body: { error: "bad key" } };
+        // first chat attempt (the first key) fails auth; later ones succeed
+        if (url.endsWith("/chat/completions") && ++chatCalls === 1) return { status: 401, body: { error: "bad key" } };
         return OPENAI_TEXT_OK(url);
       },
     });
-    await addKeys(s, "pA", 2);
+    const ids = await addKeys(s, "pA", 2);
     await addKeys(s, "pB", 1);
     await s.catalog.refreshProvider("pA");
     await s.catalog.refreshProvider("pB");
@@ -85,7 +86,7 @@ describe("acceptance 2 — key rotation is silent to the caller", () => {
     const exec = await s.router.generateText({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
     const text = await collect(exec.chunks);
     expect(text).toBe("Hello");
-    expect(exec.served()?.key.secretRef).toBe("key:pA#2");
+    expect(exec.served()?.key.id).toBe(ids[1]); // second key served
     expect(exec.fallbackChain()).toHaveLength(1);
     expect(exec.fallbackChain()[0]!.cls).toBe("AUTH_FAILED");
 
@@ -207,6 +208,30 @@ describe("cancellation (spec req. 9)", () => {
       if (got.length === 2) ac.abort();
     }
     expect(got.length).toBeLessThanOrEqual(3); // consumed a couple more at most, not all 5
+  });
+});
+
+describe("mid-stream errors (diff-review M2 fix)", () => {
+  it("errorMap event after first chunk fails loud — never retried into duplicate output", async () => {
+    const s = makeSetup({
+      responder: (url) => {
+        if (url.endsWith("/models")) return { status: 200, body: { data: [{ id: "gpt-4o" }] } };
+        return { status: 200, lines: [
+          `data: ${JSON.stringify({ choices: [{ delta: { content: "Hi" } }] })}`,
+          `data: ${JSON.stringify({ error: { message: "upstream exploded" } })}`,
+        ] };
+      },
+    });
+    await addKeys(s, "pA", 1);
+    await addKeys(s, "pB", 1);
+    await s.catalog.refreshProvider("pA");
+    await s.catalog.refreshProvider("pB");
+    const exec = await s.router.generateText({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+    const seen: string[] = [];
+    await expect((async () => {
+      for await (const c of exec.chunks) seen.push(c);
+    })()).rejects.toThrow(/upstream exploded|mid-stream/);
+    expect(seen).toEqual(["Hi"]); // got the first chunk, then a loud error — never a second full completion
   });
 });
 

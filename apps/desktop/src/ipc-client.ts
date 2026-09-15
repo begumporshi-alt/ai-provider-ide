@@ -18,7 +18,15 @@ type StreamEvent =
   | { type: "done" }
   | { type: "error"; message: string };
 
-/** HttpPort over `egress:*` — unary for JSON bodies, Tauri Channel for SSE streams. */
+/**
+ * HttpPort over `egress:*` — unary for JSON bodies, Tauri Channel for SSE streams.
+ *
+ * Streaming contract (diff-review M3): `request()` RESOLVES only after the host has sent
+ * the `headers` event, so `status` is authoritative before the interpreter inspects it —
+ * a real 401/429 on the stream path reaches the health tracker exactly like a 401/429 on
+ * the unary path. The command promise is kept so completion/errors still surface while
+ * lines are consumed.
+ */
 export function createHttpPort(): HttpPort {
   return {
     async request(req) {
@@ -40,75 +48,93 @@ export function createHttpPort(): HttpPort {
           lines: emptyLines(),
         };
       }
-      // SSE: Rust pushes lines through the channel; we bridge them into an async iterable.
+
       const channel = new Channel<StreamEvent>();
       const queue: StreamEvent[] = [];
       let closed = false;
-      let error: string | null = null;
-      let resolve: (() => void) | null = null;
-      const wake = () => {
-        resolve?.();
-        resolve = null;
+      let streamError: { message: string; status?: number } | null = null;
+      let wake: (() => void) | null = null;
+      const notify = () => {
+        wake?.();
+        wake = null;
       };
+      let status = 0;
+      let headers: Record<string, string> = {};
+      let resolveHeaders: () => void = () => {};
+      let rejectHeaders: (e: unknown) => void = () => {};
+      const headersArrived = new Promise<void>((resolve, reject) => {
+        resolveHeaders = resolve;
+        rejectHeaders = reject;
+      });
+
       channel.onmessage = (ev) => {
+        if (ev.type === "headers") {
+          status = ev.status;
+          headers = ev.headers;
+          resolveHeaders();
+          if (status >= 400) {
+            // The host will follow with one error event; queue it too.
+          }
+          return;
+        }
         queue.push(ev);
         if (ev.type === "done") closed = true;
         if (ev.type === "error") {
-          error = ev.message;
+          const m = /^http (\d{3}):/.exec(ev.message);
+          streamError = { message: ev.message, status: m ? Number(m[1]) : undefined };
           closed = true;
+          rejectHeaders(new Error(ev.message)); // headers+error both known -> fail fast
         }
-        wake();
+        notify();
       };
-      const headers: Record<string, string> = {};
-      let status = 0;
-      const settled = new Promise<void>((res) => {
-        // The command promise resolves when the stream task finishes; keep a reference so we
-        // can mark closed even if onmessage races.
-        void invoke("egress_stream", { req: wire, onEvent: channel }).then(
-          () => {
-            closed = true;
-            res();
-            wake();
-          },
-          (e: unknown) => {
-            error = String(e);
-            closed = true;
-            res();
-            wake();
-          },
-        );
-      });
-      void settled;
-      // The host streams the raw HTTP status as the first event before lines.
+
+      // Keep the completion promise; it marks the stream closed even if events race.
+      void invoke("egress_stream", { req: wire, onEvent: channel }).then(
+        () => {
+          closed = true;
+          resolveHeaders();
+          notify();
+        },
+        (e: unknown) => {
+          streamError = { message: String(e) };
+          closed = true;
+          rejectHeaders(e);
+          notify();
+        },
+      );
+
+      // Await authoritative status BEFORE resolving (interpreter reads res.status first).
+      try {
+        await headersArrived;
+      } catch {
+        // fall through: lines generator below throws the real error
+      }
+      if (streamError) {
+        // Error before/without headers: surface as a high status so classify() works.
+        status = status || 599;
+      }
+
       const lines = (async function* () {
+        const getError = () => streamError; // closure read defeats flow-narrowing (mutated by onmessage)
         for (;;) {
           while (queue.length) {
             const ev = queue.shift()!;
-            if (ev.type === "headers") {
-              status = ev.status;
-              Object.assign(headers, ev.headers);
-              continue;
-            }
             if (ev.type === "line") yield ev.text;
-            if (ev.type === "done") return;
-            if (ev.type === "error") throw new Error(ev.message);
+            else if (ev.type === "done") return;
+            else if (ev.type === "error") throw new Error(ev.message);
           }
           if (closed) {
-            if (error) throw new Error(error);
+            const e = getError();
+            if (e) throw new Error(e.message);
             return;
           }
-          if (req.signal?.aborted) {
-            // §3.5 cancellation: stop consuming; the Rust task's stream drops when its
-            // client half is gone.
-            return;
-          }
-          await new Promise<void>((res) => (resolve = res));
+          if (req.signal?.aborted) return; // §3.5: stop consuming -> host cancels upstream
+          await new Promise<void>((res) => (wake = res));
         }
       })();
+
       return {
-        get status() {
-          return status || 200;
-        },
+        status: status || 200,
         headers,
         text: async () => {
           let out = "";
@@ -139,9 +165,8 @@ async function* emptyLines(): AsyncIterable<string> {
 export function createKeyVaultPort(): KeyVaultPort {
   return {
     async put(label, secret) {
-      const account = `key:${label}`;
-      await invoke("vault_put", { account, secret });
-      return account;
+      await invoke("vault_put", { account: label, secret });
+      return label;
     },
     async get() {
       // Intentionally unsupported: TS is key-blind (invariant 2). The egress gateway reads
@@ -154,7 +179,8 @@ export function createKeyVaultPort(): KeyVaultPort {
   };
 }
 
-/** StorePort over `store:*` + `settings:*` — structured commands, no raw SQL (invariant 12). */
+/** StorePort is deliberately NOT exposed to TS persistence: the host owns SQL. Consumers get
+ *  the structured persist commands via the `persist` namespace below instead (invariant 12). */
 export function createStorePort(): StorePort {
   return {
     async query<T>(_sql: string, _params?: unknown[]): Promise<T[]> {
@@ -166,13 +192,11 @@ export function createStorePort(): StorePort {
   };
 }
 
-/** Allowlist hygiene: register a provider baseUrl host with the egress gateway (invariant 3). */
-export async function allowProviderHost(baseUrl: string): Promise<void> {
-  const host = new URL(baseUrl).hostname;
-  await invoke("egress_allow_host", { host });
+/** Host-side allowlist helpers (webview may NOT call these; the commands no longer exist —
+ *  provider CRUD syncs the allowlist host-side). Kept as no-op guards for old call sites. */
+export async function allowProviderHost(_baseUrl: string): Promise<void> {
+  // Intentionally empty: allowlisting happens in provider_upsert (Rust).
 }
-
-export async function denyProviderHost(baseUrl: string): Promise<void> {
-  const host = new URL(baseUrl).hostname;
-  await invoke("egress_deny_host", { host });
+export async function denyProviderHost(_baseUrl: string): Promise<void> {
+  // Intentionally empty: allowlisting happens in provider_delete (Rust).
 }

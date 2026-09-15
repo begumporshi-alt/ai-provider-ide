@@ -4,17 +4,25 @@
 //!
 //! Contract with TS: the interpreter sends auth headers whose value carries the `{{secret}}`
 //! sentinel (e.g. `"Bearer {{secret}}"`). Rust resolves the secretRef from the keychain,
-//! substitutes the sentinel, sends, and drops the value. A header WITHOUT a sentinel is sent
-//! as-is; a request with a secretRef but no sentinel header is an error (the key would be
-//! silently unused — better to fail loud than to send an unauthenticated request).
+//! substitutes the sentinel, sends, and drops the value.
+//!
+//! Trust model (diff-review 2026-09-15, the webview is UNTRUSTED — Tauri 2 does not ACL
+//! app-defined commands):
+//! - `secret_ref` may only be used against the host of its OWN provider (`key:<keyId>` rows
+//!   are joined to providers.base_url and the destination host must match), so a compromised
+//!   webview cannot pair a stolen ref with an attacker URL.
+//! - Redirects are only followed to allowlisted hosts (reqwest's default cross-host
+//!   header-stripping does not cover `x-api-key`, so following off-allowlist would exfil).
+//! - The webview cannot mutate the allowlist; only `provider_upsert`/`provider_delete` do.
 
 use std::collections::HashSet;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
+use crate::store::Store;
 use crate::vault;
 
 pub const SENTINEL: &str = "{{secret}}";
@@ -29,14 +37,22 @@ pub enum EgressError {
     SecretMissing { ref_: String },
     #[error("secretRef given but no header carries the {{secret}} sentinel — refusing to send unauthenticated")]
     SentinelMissing,
+    #[error("secret_ref {ref_} may only be used against its own provider host {expected} (got {got})")]
+    KeyHostMismatch {
+        ref_: String,
+        expected: String,
+        got: String,
+    },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("vault error: {0}")]
     Vault(#[from] vault::VaultError),
+    #[error("store error: {0}")]
+    Store(#[from] crate::store::StoreError),
 }
 
-/// In-memory allowlist of provider hosts, populated from the DB at startup and on every
-/// provider add (user-entered base URLs only — §2.6 "generator cannot change hosts").
+/// In-memory allowlist of provider hosts. Mutated ONLY by provider CRUD commands host-side
+/// (never by the webview).
 #[derive(Default)]
 pub struct AllowList(pub RwLock<HashSet<String>>);
 
@@ -47,9 +63,13 @@ impl AllowList {
     pub fn deny(&self, host: &str) {
         self.0.write().unwrap().remove(&host.to_lowercase());
     }
-    fn contains(&self, host: &str) -> bool {
+    pub fn contains(&self, host: &str) -> bool {
         self.0.read().unwrap().contains(&host.to_lowercase())
     }
+}
+
+pub fn is_local(host: &str) -> bool {
+    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
 }
 
 #[derive(Debug, Deserialize)]
@@ -88,11 +108,38 @@ pub fn check_url(allow: &AllowList, raw: &str) -> Result<reqwest::Url, EgressErr
     let url = reqwest::Url::parse(raw).map_err(|e| EgressError::BadUrl(e.to_string()))?;
     let host = url.host_str().ok_or_else(|| EgressError::BadUrl(raw.into()))?;
     // Localhost providers permitted (§8 note); everything else must be a registered base URL host.
-    let is_local = matches!(host, "127.0.0.1" | "localhost" | "::1");
-    if !is_local && !allow.contains(host) {
+    if !is_local(host) && !allow.contains(host) {
         return Err(EgressError::HostDenied(host.into()));
     }
     Ok(url)
+}
+
+/// Enforce `secret_ref -> own provider host` pairing using the DB (the webview is untrusted).
+pub fn check_secret_host(store: &Store, secret_ref: &str, dest_host: &str) -> Result<(), EgressError> {
+    let conn = store.conn.lock().unwrap();
+    let base: Option<String> = conn
+        .query_row(
+            "SELECT p.base_url FROM api_keys k JOIN providers p ON p.id = k.provider_id WHERE k.secret_ref = ?1",
+            rusqlite::params![secret_ref],
+            |r| r.get(0),
+        )
+        .ok();
+    let Some(base) = base else {
+        // Unknown ref: refuse. It may also simply be deleted — the caller gets a clear error.
+        return Err(EgressError::SecretMissing { ref_: secret_ref.into() });
+    };
+    let expected = reqwest::Url::parse(&base)
+        .ok()
+        .and_then(|u| u.host_str().map(|h| h.to_lowercase()))
+        .unwrap_or_default();
+    if expected != dest_host.to_lowercase() {
+        return Err(EgressError::KeyHostMismatch {
+            ref_: secret_ref.into(),
+            expected,
+            got: dest_host.into(),
+        });
+    }
+    Ok(())
 }
 
 /// Inject the keychain secret into sentinel headers. Returns the mutated map.
@@ -124,11 +171,16 @@ pub fn inject_secret(
 }
 
 async fn build(
-    client: &reqwest::Client,
-    allow: &AllowList,
+    state: &EgressState,
     req: EgressRequest,
 ) -> Result<reqwest::RequestBuilder, EgressError> {
-    let url = check_url(allow, &req.url)?;
+    let url = check_url(&state.allow, &req.url)?;
+    let host = url.host_str().unwrap_or("");
+    // The port of any local provider is allowed, but a NON-local key may only ever meet a
+    // non-local host on its own provider domain.
+    if let Some(r) = &req.secret_ref {
+        check_secret_host(&state.store, r, host)?;
+    }
     let secret = match &req.secret_ref {
         Some(r) => Some(
             vault::get(r)?
@@ -137,8 +189,13 @@ async fn build(
         None => None,
     };
     let headers = inject_secret(req.headers.clone(), secret.as_deref())?;
-    let method: reqwest::Method = req.method.parse().map_err(|_| EgressError::BadUrl("bad method".into()))?;
-    let mut b = client.request(method, url);
+    // TS emits GET/POST only (HttpPort type); shrink the surface.
+    let method: reqwest::Method = match req.method.as_str() {
+        "GET" => reqwest::Method::GET,
+        "POST" => reqwest::Method::POST,
+        _ => return Err(EgressError::BadUrl(format!("method not permitted: {}", req.method))),
+    };
+    let mut b = state.client.request(method, url);
     if let Some(ms) = req.timeout_ms {
         b = b.timeout(std::time::Duration::from_millis(ms));
     }
@@ -152,12 +209,8 @@ async fn build(
 }
 
 /// Unary request (model lists, image generations, contract pings).
-pub async fn request(
-    client: &reqwest::Client,
-    allow: &AllowList,
-    req: EgressRequest,
-) -> Result<EgressResponse, EgressError> {
-    let res = build(client, allow, req).await?.send().await?;
+pub async fn request(state: &EgressState, req: EgressRequest) -> Result<EgressResponse, EgressError> {
+    let res = build(state, req).await?.send().await?;
     let status = res.status().as_u16();
     let headers = res
         .headers()
@@ -168,15 +221,11 @@ pub async fn request(
     Ok(EgressResponse { status, headers, body })
 }
 
-/// SSE streaming request: lines flow through the channel. Cancellation = the client drop of
-/// the channel / task abort closes the provider stream (§3.5 propagates this to the provider).
-pub async fn stream(
-    client: &reqwest::Client,
-    allow: &AllowList,
-    req: EgressRequest,
-    channel: Channel<StreamEvent>,
-) -> Result<(), EgressError> {
-    let b = build(client, allow, req).await?;
+/// SSE streaming request: lines flow through the channel. When the webview stops consuming
+/// (channel send fails), the loop breaks and the reqwest stream future drops — closing the
+/// provider connection (§3.5 cancellation).
+pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<StreamEvent>) -> Result<(), EgressError> {
+    let b = build(state, req).await?;
     match b.send().await {
         Ok(res) => {
             let status = res.status().as_u16();
@@ -185,7 +234,12 @@ pub async fn stream(
                 .iter()
                 .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            let _ = channel.send(StreamEvent::Headers { status, headers });
+            if channel
+                .send(StreamEvent::Headers { status, headers })
+                .is_err()
+            {
+                return Ok(()); // consumer gone; provider stream drops => cancelled
+            }
             if status >= 400 {
                 let body = res.text().await.unwrap_or_default();
                 let _ = channel.send(StreamEvent::Error {
@@ -202,7 +256,9 @@ pub async fn stream(
                         while let Some(pos) = buf.find('\n') {
                             let line = buf[..pos].trim_end_matches('\r').to_string();
                             buf.drain(..=pos);
-                            let _ = channel.send(StreamEvent::Line { text: line });
+                            if channel.send(StreamEvent::Line { text: line }).is_err() {
+                                return Ok(()); // mid-stream disconnect -> cancel upstream
+                            }
                         }
                     }
                     Err(e) => {
@@ -224,20 +280,33 @@ pub async fn stream(
     }
 }
 
-/// Shared client with the §3.6 connect budget; per-request first-byte/idle budgets are applied
-/// in the TS execution loop (Phase 2a) since they depend on stream activity.
-pub fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_secs(10))
-        .tcp_nodelay(true)
-        .build()
-        .expect("reqwest client")
-}
-
-/// Managed state wrapper so commands can share one client + allowlist.
+/// Managed state: the audited trio (client + allowlist + pairing DB).
 pub struct EgressState {
     pub client: reqwest::Client,
-    pub allow: AllowList,
+    pub allow: Arc<AllowList>,
+    pub store: Arc<Store>,
+}
+
+impl EgressState {
+    /// Connect budget per §3.6; redirect policy vetoes any off-allowlist hop (Blocker 1 of
+    /// the Phase 1 diff review).
+    pub fn new(allow: Arc<AllowList>, store: Arc<Store>) -> Self {
+        let _ = &allow;
+        Self {
+            client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                // v1: never follow redirects. API providers don't 3xx on these endpoints, and
+                // reqwest re-sends auth headers (incl. x-api-key, which its default policy does
+                // NOT strip cross-host) to the redirect target — that would exfiltrate the key
+                // (diff-review Blocker 1). A 3xx surfaces as a classified error instead.
+                .redirect(reqwest::redirect::Policy::none())
+                .tcp_nodelay(true)
+                .build()
+                .expect("reqwest client"),
+            allow,
+            store,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -289,5 +358,49 @@ mod tests {
         let mut h = std::collections::BTreeMap::new();
         h.insert("x-api-key".to_string(), "{{secret}}".to_string());
         assert!(matches!(inject_secret(h, None), Err(EgressError::SentinelMissing)));
+    }
+}
+
+#[cfg(test)]
+mod pairing_tests {
+    use super::*;
+
+    fn store_with(provider_url: &str, secret_ref: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("aip-pair-{}-{}", std::process::id(), {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            N.fetch_add(1, Ordering::Relaxed)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).unwrap();
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, created_at, updated_at) VALUES ('p','s','n',?1,'enabled',1,1)",
+            rusqlite::params![provider_url],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (id, provider_id, label, secret_ref, added_at) VALUES ('k','p','l',?1,1)",
+            rusqlite::params![secret_ref],
+        ).unwrap();
+        drop(conn);
+        s
+    }
+
+    #[test]
+    fn secret_ref_may_only_meet_its_own_provider_host() {
+        let s = store_with("https://openrouter.ai/api/v1", "key:k1");
+        assert!(check_secret_host(&s, "key:k1", "openrouter.ai").is_ok());
+        assert!(matches!(
+            check_secret_host(&s, "key:k1", "attacker.tld"),
+            Err(EgressError::KeyHostMismatch { .. })
+        ));
+        let _ = std::fs::remove_dir_all(&s.path);
+    }
+
+    #[test]
+    fn unknown_secret_ref_is_refused() {
+        let s = store_with("https://x.test/v1", "key:k1");
+        assert!(matches!(check_secret_host(&s, "key:evil", "x.test"), Err(EgressError::SecretMissing { .. })));
+        let _ = std::fs::remove_dir_all(&s.path);
     }
 }

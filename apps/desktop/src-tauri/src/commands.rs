@@ -1,5 +1,10 @@
-//! Tauri command surface. Namespaced so capability files can scope them precisely
-//! (invariant 12): vault:*, egress:*, store:*.
+//! Tauri command surface.
+//!
+//! Trust note (diff-review 2026-09-15): Tauri 2 capability files ACL plugin/core commands,
+//! NOT app-defined commands — every command below is callable from the webview. The webview
+//! is therefore treated as UNTRUSTED here: no raw secret reads, no allowlist mutation, no
+//! raw SQL, vault accounts restricted to `key:*`, and egress pairs secret_ref to its own
+//! provider host (see egress.rs).
 
 use std::sync::Arc;
 
@@ -34,6 +39,16 @@ impl From<rusqlite::Error> for CommandError {
     }
 }
 
+/// All webview-facing vault accounts must be provider keys (`key:<keyId>`); the gateway
+/// `masterkey` account is host-only (invariant 10).
+fn check_account(account: &str) -> Result<(), CommandError> {
+    if account.starts_with("key:") {
+        Ok(())
+    } else {
+        Err(CommandError("vault account namespace not permitted".into()))
+    }
+}
+
 // ---------- vault:* ----------
 
 /// Store a provider key. TS never reads the secret back except via the Rust-side one-shot
@@ -41,16 +56,19 @@ impl From<rusqlite::Error> for CommandError {
 /// gateway reads it internally.
 #[tauri::command]
 pub fn vault_put(account: String, secret: String) -> Result<(), CommandError> {
+    check_account(&account)?;
     vault::put(&account, &secret).map_err(Into::into)
 }
 
 #[tauri::command]
 pub fn vault_delete(account: String) -> Result<(), CommandError> {
+    check_account(&account)?;
     vault::delete(&account).map_err(Into::into)
 }
 
 #[tauri::command]
 pub fn vault_has(account: String) -> Result<bool, CommandError> {
+    check_account(&account)?;
     let found = vault::get(&account).map(|v| v.is_some())?;
     Ok(found)
 }
@@ -62,10 +80,7 @@ pub async fn egress_request(
     state: State<'_, Arc<EgressState>>,
     req: EgressRequest,
 ) -> Result<egress::EgressResponse, CommandError> {
-    let client = state.client.clone();
-    let allow = &state.allow;
-    // Run on a blocking-free async path; reqwest handles the runtime.
-    egress::request(&client, allow, req).await.map_err(Into::into)
+    egress::request(&state, req).await.map_err(Into::into)
 }
 
 #[tauri::command]
@@ -74,29 +89,16 @@ pub async fn egress_stream(
     req: EgressRequest,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), CommandError> {
-    let client = state.client.clone();
-    let allow = &state.allow;
-    egress::stream(&client, allow, req, on_event)
+    egress::stream(&state, req, on_event)
         .await
         .map_err(Into::into)
 }
 
-#[tauri::command]
-pub fn egress_allow_host(state: State<'_, Arc<EgressState>>, host: String) -> Result<(), CommandError> {
-    state.allow.allow(&host);
-    Ok(())
-}
-
-#[tauri::command]
-pub fn egress_deny_host(state: State<'_, Arc<EgressState>>, host: String) -> Result<(), CommandError> {
-    state.allow.deny(&host);
-    Ok(())
-}
+// NOTE: no egress_allow_host / egress_deny_host commands. The allowlist is mutated only by
+// provider CRUD host-side (persist.rs) — a compromised webview cannot open new destinations.
 
 // ---------- store:* ----------
 // Narrow surface only: the webview gets structured queries, never raw SQL (invariant 12).
-// v1 ships store_info + key-value settings; richer queries come with the screens that need
-// them (Phase 2a) so the surface never exceeds what the UI actually calls.
 
 #[tauri::command]
 pub fn store_info(store: State<'_, Arc<Store>>) -> Result<store::StoreInfo, CommandError> {
@@ -131,10 +133,23 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         vault_has,
         egress_request,
         egress_stream,
-        egress_allow_host,
-        egress_deny_host,
         store_info,
         settings_set,
-        settings_get
+        settings_get,
+        crate::persist::providers_list,
+        crate::persist::provider_upsert,
+        crate::persist::provider_delete,
+        crate::persist::api_keys_list,
+        crate::persist::api_key_upsert,
+        crate::persist::api_key_delete,
+        crate::persist::manifests_active,
+        crate::persist::manifest_upsert_active,
+        crate::persist::models_cache_replace,
+        crate::persist::models_cache_list,
+        crate::persist::aliases_replace,
+        crate::persist::aliases_list,
+        crate::persist::ledger_append,
+        crate::persist::ledger_recent,
+        crate::persist::ledger_rollup_run
     ]
 }
