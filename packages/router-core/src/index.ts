@@ -1,3 +1,4 @@
+export type { AdapterManifest } from "@aiprovider/adapter-spec";
 export { ManifestInterpreter, ManifestHttpError, type HttpPortLike, type AdapterContext, type ModelEntry, type TextArgs } from "./manifest-interpreter.js";
 export { selectAll, selectOne, parsePath } from "./jsonpath.js";
 export { renderTemplate } from "./template.js";

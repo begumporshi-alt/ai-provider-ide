@@ -32,6 +32,12 @@ export class ProviderRegistry {
     this.providers.set(id, { ...p, status, updatedAt: Date.now() });
   }
 
+  setProviderRotation(id: string, rotationStrategy: ProviderRecord["rotationStrategy"]): void {
+    const p = this.providers.get(id);
+    if (!p) throw new Error(`unknown provider ${id}`);
+    this.providers.set(id, { ...p, rotationStrategy, updatedAt: Date.now() });
+  }
+
   getProvider(id: string): ProviderRecord | undefined {
     return this.providers.get(id);
   }

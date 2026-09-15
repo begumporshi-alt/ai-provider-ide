@@ -19,6 +19,12 @@ export class ModelCatalog {
     private readonly adapters: AdapterRuntime,
   ) {}
 
+  /** Restore a previously fetched catalog at startup (§4 models_cache). */
+  hydrate(rows: CatalogModel[], fetchedByProvider: Record<string, number>): void {
+    this.models = rows;
+    for (const [pid, ts] of Object.entries(fetchedByProvider)) this.fetchedAt.set(pid, ts);
+  }
+
   /** Refresh one provider's catalog; errors leave the stale rows in place (stale-fallback). */
   async refreshProvider(providerId: string, signal?: AbortSignal): Promise<number> {
     const { interpreter } = await this.adapters.forProvider(providerId);

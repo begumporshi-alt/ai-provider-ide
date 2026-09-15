@@ -1,10 +1,13 @@
 /**
  * usage-ledger (L3): append per-request entries + query for the Usage screen (spec req. 11,
- * criterion 10 source attribution). Persisted via StorePort in production; the in-memory mode
- * backs unit tests and the Playground session view.
+ * criterion 10 source attribution).
+ *
+ * Persistence goes through a structured `LedgerSink` — NOT raw SQL. The webview has no SQL
+ * surface (invariant 12) and the host refuses raw `store.execute`, so a raw-SQL StorePort
+ * would throw on every append (diff-review M8). The desktop provides a sink backed by the
+ * fixed `ledger_append` command; unit tests use the in-memory mode only.
  */
 import type { Modality } from "@aiprovider/adapter-spec";
-import type { StorePort } from "./ports.js";
 import type { AttemptOutcome } from "./execution-engine.js";
 
 export type LedgerSource = "ui" | "gateway" | "generator";
@@ -27,28 +30,18 @@ export interface LedgerEntry {
   fallbackChain?: AttemptOutcome[];
 }
 
+/** The host's structured persistence surface for ledger writes (invariant 12). */
+export interface LedgerSink {
+  append(entry: LedgerEntry): Promise<void>;
+}
+
 export class UsageLedger {
   private mem: LedgerEntry[] = [];
-  constructor(private readonly store?: StorePort) {}
+  constructor(private readonly sink?: LedgerSink) {}
 
   async append(e: LedgerEntry): Promise<void> {
     this.mem.push(e);
-    if (this.store) {
-      await this.store.execute(
-        `INSERT INTO ledger (ts, modality, source, provider_id, key_id, requested_model, model,
-            status, http_status, error_class, latency_ms, tokens_in, tokens_out,
-            cost_estimate_micros, fallback_chain_json)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-        [
-          e.ts, e.modality, e.source, e.providerId ?? null, e.keyId ?? null, e.requestedModel,
-          e.model, e.status, e.httpStatus ?? null, e.errorClass ?? null, e.latencyMs ?? null,
-          e.tokensIn, e.tokensOut, e.costEstimateMicros,
-          e.fallbackChain ? JSON.stringify(e.fallbackChain.map((a) => ({
-            provider: a.candidate.provider.slug, key: a.candidate.key.label, cls: a.cls,
-          }))) : null,
-        ],
-      );
-    }
+    if (this.sink) await this.sink.append(e);
   }
 
   query(filter: { since?: number; source?: LedgerSource; providerId?: string } = {}): LedgerEntry[] {
