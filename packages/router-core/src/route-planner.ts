@@ -67,8 +67,9 @@ function resolveWanted(model: string, ctx: PlanContext): WantedRef[] {
     if (p) out.push({ providerId: p.id, nativeId: model.slice(slug.length + 1) });
   }
 
-  // Alias map: every provider carrying the alias, priority order (§3.4 bare-ID rule).
-  const aliasRows = ctx.aliases.filter((a) => a.alias === model).sort((a, b) => b.priority - a.priority);
+  // Alias map: every provider carrying the alias, priority order (§3.4 bare-ID rule):
+  // LOWER priority number = more preferred = primary route; ties keep catalog order.
+  const aliasRows = ctx.aliases.filter((a) => a.alias === model).sort((a, b) => a.priority - b.priority);
   for (const a of aliasRows) out.push({ providerId: a.providerId, nativeId: a.nativeModelId });
 
   // Bare native id present on one or more providers: include all carriers — primary first,

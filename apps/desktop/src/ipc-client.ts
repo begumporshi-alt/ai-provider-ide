@@ -133,10 +133,20 @@ export function createHttpPort(): HttpPort {
         }
       })();
 
+      const waitForClose = async () => {
+        while (!closed) await new Promise<void>((res) => (wake = res));
+      };
       return {
         status: status || 200,
         headers,
         text: async () => {
+          // On an HTTP-error stream the host sends one error event after the headers; wait
+          // for it so the interpreter can wrap it in ManifestHttpError and the engine
+          // classifies 401/429 correctly (the auth breaker depends on this).
+          if ((status || 0) >= 400) {
+            await waitForClose();
+            return streamError?.message ?? "";
+          }
           let out = "";
           for await (const l of lines) out += l + "\n";
           return out;

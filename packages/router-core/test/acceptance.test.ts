@@ -257,6 +257,20 @@ describe("key-blindness (invariants 1–2)", () => {
   });
 });
 
+describe("alias priority ordering (§3.4: first-configured provider is primary)", () => {
+  it("bare model routes to the earlier-cataloged provider first, not the alias-sort reverse", async () => {
+    const s = makeSetup({ responder: OPENAI_TEXT_OK });
+    await addKeys(s, "pA", 1);
+    await addKeys(s, "pB", 1);
+    await s.catalog.refreshProvider("pA"); // cataloged first -> primary
+    await s.catalog.refreshProvider("pB");
+    s.catalog.deriveAutoAliases();
+    const exec = await s.router.generateText({ model: "gpt-4o", messages: [{ role: "user", content: "hi" }] });
+    await collect(exec.chunks);
+    expect(exec.served()?.provider.slug).toBe("openrouter"); // pA, not the reverse
+  });
+});
+
 describe("alias auto-derivation (Phase 1 exit criterion)", () => {
   it("identical native IDs across providers get bare aliases; qualified IDs resolve directly", async () => {
     const s = makeSetup({ responder: OPENAI_TEXT_OK });

@@ -101,3 +101,43 @@
   in-memory provider the host refused, "no active manifest").
 - First key on a draft provider promotes it to `pending` so the egress allowlist admits the
   host immediately (draft hosts were un-routable, Test could never succeed).
+
+## 2026-09-16 — LIVE verification pass (self-driven, mock provider over the real stack)
+
+Method: local mock OpenAI-compatible provider (apps/desktop/e2e/mock-provider.mjs, port
+18787 — localhost is egress-allowlisted by design) + seeded keychain/DB; every request
+still travels the full production path (UI/axum -> router core -> egress -> HTTP).
+
+Verified LIVE in the running app:
+- Criterion 1: 5 provider cards, keys masked (••••ey-A style), lifecycle buttons work
+- Criterion 2 (rotation): dead key A attempted -> AUTH_FAILED -> key B served silently;
+  ledger chain shows it; the request still 'ok'
+- Criterion 3 (failover): mock-1's healthy key disabled -> bare model served by mock2;
+  qualified model mock/mock-fast correctly pinned to mock-1 and failed LOUDLY with a
+  named attempts list (the §3.4 qualified-vs-bare semantics both ways)
+- Criterion 4: streamed SSE chat + non-stream chat.completion + b64 image generation,
+  all through the gateway (Playground UI typing blocked for automation — router path
+  identical, source tag differs only)
+- Criterion 5: grep of app-data dir = 0 key-pattern hits; api_keys holds key:* refs only
+- Criterion 8: curl with master key streams; wrong key 401; rotation kills old key
+  instantly (per-request keychain read); port-squat by another app (AI Hub on 8787)
+  surfaced as the loud invariant-16 error + remediation UI, worked around via port 8791
+- Criterion 10: Activity screen renders 9 ledger rows with source=gateway attribution,
+  per-key/provider columns, ↻ 1 fallback chips, ✕ NO_ROUTE failure row
+
+Bugs found & fixed during the live pass (all with regression coverage where applicable):
+- keyring v3 -> v2 (see above; root cause of the user's 'invalid (HTTP 0)')
+- alias priority sort was DESC — reversed the intended primary-provider-first routing
+  (§3.4); fixed to ASC + regression test
+- React StrictMode double-mounted the gateway bridge -> every request routed twice
+  (duplicated chunks + ledger rows); bridge is now idempotent
+- streaming 401/429 classified as NETWORK (error-event race in ipc-client): text() now
+  waits for the error event so the engine sees the real status -> AUTH_FAILED reaches
+  the health tracker (auth breaker works)
+- Test-button errors now surface the real message; addProvider made atomic (ghost
+  provider rollback); first key promotes draft -> pending (allowlist)
+- Gateway port choice persists across restarts (settings table)
+
+Left for a human (typing into the webview is blocked for automation):
+- Playground chat via the UI (one message closes criterion 4's UI half + a source=ui row)
+- The Stop button mid-stream (cancellation is covered by Rust + core tests)

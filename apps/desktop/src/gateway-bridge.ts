@@ -19,7 +19,13 @@ interface BridgeRequest {
 
 const active = new Map<number, AbortController>();
 
+let started = false;
+
 export async function startGatewayBridge(): Promise<void> {
+  // React StrictMode double-invokes effects in dev; without this guard every gateway
+  // request would be routed twice (duplicated chunks + duplicated ledger rows).
+  if (started) return;
+  started = true;
   await listen<BridgeRequest>("gateway-request", (event) => {
     void handle(event.payload);
   });
@@ -28,7 +34,7 @@ export async function startGatewayBridge(): Promise<void> {
     active.delete(event.payload.requestId);
   });
   // Liveness heartbeat: proves the router core answers (§3.5 availability).
-  setInterval(() => {
+  window.setInterval(() => {
     void invoke("gateway_heartbeat").catch(() => undefined);
   }, 2000);
   // Prime the heartbeat so the first request after enable isn't marked stale.

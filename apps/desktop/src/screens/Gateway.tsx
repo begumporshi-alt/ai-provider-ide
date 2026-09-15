@@ -16,7 +16,8 @@ interface GatewayStatus {
 
 export function GatewayScreen() {
   const [status, setStatus] = useState<GatewayStatus | null>(null);
-  const [portInput, setPortInput] = useState("8787");
+  // null = loading the persisted port; keeps the chosen port across restarts (§3.3 UX)
+  const [portInput, setPortInput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
 
@@ -25,6 +26,12 @@ export function GatewayScreen() {
   }, []);
   useEffect(() => {
     refresh();
+    invoke<string | null>("settings_get", { key: "gateway" })
+      .then((v) => {
+        const p = v ? (JSON.parse(v) as { port?: number }).port : undefined;
+        setPortInput(String(p ?? 8787));
+      })
+      .catch(() => setPortInput("8787"));
     const t = window.setInterval(refresh, 2500);
     return () => window.clearInterval(t);
   }, [refresh]);
@@ -35,7 +42,9 @@ export function GatewayScreen() {
       if (status?.running) {
         await invoke("gateway_disable");
       } else {
-        await invoke("gateway_enable", { port: Number(portInput) || undefined });
+        const port = Number(portInput) || undefined;
+        await invoke("gateway_enable", { port });
+        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port }) });
         if (!status?.hasKey) await invoke("gateway_key_generate");
       }
       refresh();
@@ -74,9 +83,9 @@ export function GatewayScreen() {
             <input
               className={`${inputCls} w-24`}
               style={inputStyle}
-              value={portInput}
+              value={portInput ?? ""}
               onChange={(e) => setPortInput(e.target.value.replace(/\D/g, ""))}
-              disabled={running}
+              disabled={running || portInput === null}
               inputMode="numeric"
             />
             <Button variant={running ? "danger" : "primary"} onClick={() => void toggle()}>
