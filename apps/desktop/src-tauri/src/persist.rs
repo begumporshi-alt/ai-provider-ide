@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tauri::State;
 
 use crate::commands::CommandError;
@@ -707,4 +708,386 @@ mod persist_tests {
         assert_eq!(open2, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn config_export_import_safety() {
+        let (store, dir) = tmp_store("cfg");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,rotation_strategy,created_at,updated_at) VALUES ('p','acme','Acme','https://acme.test/v1','enabled','round_robin',1,1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO api_keys (id,provider_id,label,secret_ref,secret_hint,status,priority,added_at) VALUES ('k','p','key-01','key:ref-1','7A2F','active',0,1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m','p',1,'builtin-template','{}',1,1)",
+                [],
+            ).unwrap();
+            conn.execute("INSERT INTO settings (key,value_json) VALUES ('router','{\"failoverEnabled\":true}')", []).unwrap();
+            conn.execute("INSERT INTO settings (key,value_json) VALUES ('gateway','{\"port\":8787}')", []).unwrap();
+        }
+
+        // export: carries the reference, never a secret; gateway setting is machine-local but exported
+        let snap = {
+            let conn = store.conn.lock().unwrap();
+            config_export_rows(&conn).unwrap()
+        };
+        assert_eq!(snap.format_version, 1);
+        assert_eq!(snap.providers.len(), 1);
+        assert_eq!(snap.keys.len(), 1);
+        assert_eq!(snap.keys[0].secret_ref, "key:ref-1");
+        let snap_json = serde_json::to_string(&snap).unwrap();
+        assert!(!snap_json.contains("sk-"), "no raw secret material in export");
+        assert!(!snap_json.contains("\"secret\""), "no secret-named field in export");
+
+        // import into a fresh store: providers -> draft, keys -> invalid (audit H7)
+        let (store2, dir2) = tmp_store("cfg2");
+        {
+            let mut conn = store2.conn.lock().unwrap();
+            let mut snap2: ImportSnapshot = serde_json::from_value(serde_json::to_value(&snap).unwrap()).unwrap();
+            // force a live status in the source; import must still land as draft
+            snap2.providers[0].status = "enabled".into();
+            let applied = config_import_checked(&mut conn, &snap2).unwrap();
+            assert_eq!(applied.providers, 1);
+            assert_eq!(applied.keys, 1);
+            let status: String = conn.query_row("SELECT status FROM providers WHERE id='p'", [], |r| r.get(0)).unwrap();
+            assert_eq!(status, "draft", "imported providers must land as draft");
+            let kstatus: String = conn.query_row("SELECT status FROM api_keys WHERE id='k'", [], |r| r.get(0)).unwrap();
+            assert_eq!(kstatus, "invalid", "imported keys must land as invalid");
+            let gw: Option<String> = conn.query_row("SELECT value_json FROM settings WHERE key='gateway'", [], |r| r.get(0)).ok();
+            assert_eq!(gw, None, "gateway (machine-local) setting must never be imported");
+
+            // re-import the same snapshot: idempotent, nothing duplicated
+            let again = config_import_checked(&mut conn, &snap2).unwrap();
+            assert_eq!((again.providers, again.keys), (0, 0));
+        }
+
+        // rejection: a raw payload carrying a `secret` field fails loud, applies nothing
+        let (store3, dir3) = tmp_store("cfg3");
+        {
+            let conn = store3.conn.lock().unwrap();
+            let mut raw = serde_json::to_value(&snap).unwrap();
+            raw["keys"][0]["secret"] = serde_json::json!("sk-live-123");
+            match parse_import(raw) {
+                Ok(_) => panic!("secret-bearing snapshot must be rejected"),
+                Err(e) => assert!(e.0.contains("raw secret fields"), "got: {}", e.0),
+            }
+            let n: i64 = conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get(0)).unwrap();
+            assert_eq!(n, 0, "rejected import must apply nothing");
+        }
+
+        // diagnostics: rows present but no body/secret columns
+        {
+            let conn = store.conn.lock().unwrap();
+            let bundle = diagnostics_json(&conn).unwrap();
+            assert!(bundle.contains("\"schemaVersion\""));
+            assert!(!bundle.contains("sk-"));
+        }
+
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
+        let _ = std::fs::remove_dir_all(&dir3);
+    }
+}
+
+// ---------- config export/import + diagnostics (spec req. 14, Phase 6) ----------
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportSnapshot {
+    pub format_version: u32,
+    pub exported_at: i64,
+    pub providers: Vec<ProviderRow>,
+    pub keys: Vec<ExportKey>,
+    pub manifests: Vec<ExportManifest>,
+    pub aliases: Vec<AliasRow>,
+    pub settings: Vec<SettingRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportKey {
+    pub id: String,
+    pub provider_id: String,
+    pub label: String,
+    pub secret_ref: String,
+    pub secret_hint: Option<String>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportManifestRow {
+    pub id: String,
+    pub provider_id: String,
+    pub version: i64,
+    pub origin: String,
+    pub body_json: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ImportSnapshot {
+    pub format_version: u32,
+    pub providers: Vec<ProviderRow>,
+    pub keys: Vec<ExportKey>,
+    pub manifests: Vec<ImportManifestRow>,
+    #[serde(default)]
+    pub aliases: Vec<AliasRow>,
+    #[serde(default)]
+    pub settings: Vec<SettingRow>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SettingRow {
+    pub key: String,
+    pub value_json: String,
+}
+
+#[tauri::command]
+pub fn config_export(store: State<'_, Arc<Store>>) -> Result<ExportSnapshot, CommandError> {
+    // Secrets NEVER leave the keychain: keys export as id/label/ref/hint only.
+    let conn = store.conn.lock().unwrap();
+    Ok(config_export_rows(&conn)?)
+}
+
+fn config_export_rows(conn: &rusqlite::Connection) -> Result<ExportSnapshot, rusqlite::Error> {
+    let providers = {
+        let mut stmt = conn.prepare("SELECT id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at FROM providers ORDER BY created_at")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ProviderRow {
+                id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, r#type: r.get(3)?,
+                base_url: r.get(4)?, status: r.get(5)?, rotation_strategy: r.get(6)?,
+                created_at: r.get(7)?, updated_at: r.get(8)?,
+            })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let keys = {
+        let mut stmt = conn.prepare("SELECT id, provider_id, label, secret_ref, secret_hint FROM api_keys")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExportKey { id: r.get(0)?, provider_id: r.get(1)?, label: r.get(2)?, secret_ref: r.get(3)?, secret_hint: r.get(4)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let manifests = {
+        let mut stmt = conn.prepare("SELECT id, provider_id, version, origin, body_json FROM manifests WHERE is_active = 1")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExportManifest { id: r.get(0)?, provider_id: r.get(1)?, version: r.get(2)?, origin: r.get(3)?, body_json: r.get(4)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let aliases = {
+        let mut stmt = conn.prepare("SELECT alias, provider_id, native_model_id, priority FROM model_aliases")?;
+        let rows = stmt.query_map([], |r| {
+            Ok(AliasRow { alias: r.get(0)?, provider_id: r.get(1)?, native_model_id: r.get(2)?, priority: r.get(3)? })
+        })?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    let settings = {
+        let mut stmt = conn.prepare("SELECT key, value_json FROM settings")?;
+        let rows = stmt.query_map([], |r| Ok(SettingRow { key: r.get(0)?, value_json: r.get(1)? }))?;
+        rows.collect::<Result<Vec<_>, _>>()?
+    };
+    Ok(ExportSnapshot {
+        format_version: 1,
+        exported_at: now_ms(),
+        providers,
+        keys,
+        manifests,
+        aliases,
+        settings,
+    })
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExportManifest {
+    pub id: String,
+    pub provider_id: String,
+    pub version: i64,
+    pub origin: String,
+    pub body_json: String,
+}
+
+/// Reject any `secret`-named key anywhere in the snapshot (defense in depth: the webview's
+/// TS validator scans the raw text first; this scans the deserialized Rust structs so a
+/// hand-crafted invoke can't bypass the UI check).
+fn find_secret_keys(v: &serde_json::Value, path: String, out: &mut Vec<String>) {
+    match v {
+        serde_json::Value::Object(map) => {
+            for (k, val) in map {
+                let p = format!("{path}.{k}");
+                if k == "secret" {
+                    out.push(p.clone());
+                }
+                find_secret_keys(val, p, out);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for (i, item) in items.iter().enumerate() {
+                find_secret_keys(item, format!("{path}[{i}]"), out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Apply an imported snapshot. Safety contract: providers land as `draft` and keys as
+/// `invalid` so the re-enter-key flow runs before anything can route (audit H7). Existing
+/// providers are skipped (never silently overwrite a live setup); a fresh install applies
+/// everything. All-or-nothing: one transaction. The command takes the RAW JSON value so
+/// the host-side secret scan sees exactly what arrived — typed structs can't carry a
+/// smuggled `secret` field, so scanning them would be theater.
+#[tauri::command]
+pub fn config_import(store: State<'_, Arc<Store>>, raw: serde_json::Value) -> Result<ImportApplied, CommandError> {
+    let snap = parse_import(raw)?;
+    let mut conn = store.conn.lock().unwrap();
+    config_import_checked(&mut conn, &snap)
+}
+
+fn parse_import(raw: serde_json::Value) -> Result<ImportSnapshot, CommandError> {
+    let mut secret_paths = Vec::new();
+    find_secret_keys(&raw, "$".to_string(), &mut secret_paths);
+    if !secret_paths.is_empty() {
+        return Err(CommandError(format!(
+            "raw secret fields present (rejected): {}",
+            secret_paths.iter().take(5).cloned().collect::<Vec<_>>().join(", ")
+        )));
+    }
+    serde_json::from_value(raw).map_err(|e| CommandError(e.to_string()))
+}
+
+fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot) -> Result<ImportApplied, CommandError> {
+    if snap.format_version != 1 {
+        return Err(CommandError(format!("unsupported formatVersion {}", snap.format_version)));
+    }
+    let tx = conn.transaction()?;
+    let mut providers = 0usize;
+    let mut keys = 0usize;
+    for p in &snap.providers {
+        let exists: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1 OR slug=?2", params![p.id, p.slug], |r| r.get(0))?;
+        if exists > 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO providers (id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at) VALUES (?1,?2,?3,?4,?5,'draft',?6,?7,?8)",
+            params![p.id, p.slug, p.name, p.r#type, p.base_url, p.rotation_strategy, p.created_at, p.updated_at],
+        )?;
+        providers += 1;
+    }
+    for k in &snap.keys {
+        let exists: i64 = tx.query_row("SELECT COUNT(*) FROM api_keys WHERE id=?1", params![k.id], |r| r.get(0))?;
+        if exists > 0 {
+            continue;
+        }
+        // Only import keys whose provider exists (skipped or new).
+        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![k.provider_id], |r| r.get(0))?;
+        if has_provider == 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO api_keys (id, provider_id, label, secret_ref, secret_hint, status, priority, cooldown_until, added_at) VALUES (?1,?2,?3,?4,?5,'invalid',0,NULL,?6)",
+            params![k.id, k.provider_id, k.label, k.secret_ref, k.secret_hint, now_ms()],
+        )?;
+        keys += 1;
+    }
+    for m in &snap.manifests {
+        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![m.provider_id], |r| r.get(0))?;
+        if has_provider == 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO manifests (id, provider_id, version, origin, body_json, created_at, is_active) VALUES (?1,?2,?3,?4,?5,?6,0) ON CONFLICT(provider_id, version) DO UPDATE SET body_json=excluded.body_json",
+            params![m.id, m.provider_id, m.version, m.origin, m.body_json, now_ms()],
+        )?;
+    }
+    for a in &snap.aliases {
+        // never overwrite a live alias on this machine; imported providers only
+        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![a.provider_id], |r| r.get(0))?;
+        if has_provider == 0 {
+            continue;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO model_aliases (alias, provider_id, native_model_id, priority) VALUES (?1,?2,?3,?4)",
+            params![a.alias, a.provider_id, a.native_model_id, a.priority],
+        )?;
+    }
+    for s in &snap.settings {
+        if s.key == "gateway" {
+            continue; // never import port/gateway settings (machine-local)
+        }
+        tx.execute(
+            "INSERT INTO settings (key, value_json) VALUES (?1,?2) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            params![s.key, s.value_json],
+        )?;
+    }
+    tx.commit()?;
+    Ok(ImportApplied { providers, keys })
+}
+
+#[derive(Serialize)]
+pub struct ImportApplied {
+    pub providers: usize,
+    pub keys: usize,
+}
+
+/// Diagnostics bundle: scrubbed recent state for bug reports — no request/response bodies,
+/// no header values, no secrets (invariants 1-2 hold because this reads rows, never vault).
+#[tauri::command]
+pub fn diagnostics_bundle(store: State<'_, Arc<Store>>) -> Result<String, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    Ok(diagnostics_json(&conn)?)
+}
+
+fn diagnostics_json(conn: &rusqlite::Connection) -> Result<String, rusqlite::Error> {
+    // Scrubbed bug-report bundle: ledger rows + drift events + schema version.
+    // No bodies, no header values, no secrets — only stored columns (req. 14).
+    let recent: Vec<Value>;
+    {
+        let mut stmt = conn.prepare(
+            "SELECT ts, modality, source, COALESCE(provider_id,''), model, status, COALESCE(error_class,''), COALESCE(latency_ms,0), COALESCE(fallback_chain_json,'[]') FROM ledger ORDER BY ts DESC LIMIT 200",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                let chain: String = r.get(8)?;
+                Ok(json!({
+                    "ts": r.get::<_, i64>(0)?, "modality": r.get::<_, String>(1)?,
+                    "source": r.get::<_, String>(2)?, "providerId": r.get::<_, String>(3)?,
+                    "model": r.get::<_, String>(4)?, "status": r.get::<_, String>(5)?,
+                    "errorClass": r.get::<_, String>(6)?, "latencyMs": r.get::<_, i64>(7)?,
+                    "chain": serde_json::from_str::<Value>(&chain).unwrap_or(Value::Null),
+                }))
+            })?;
+        recent = rows.collect::<Result<Vec<_>, _>>()?;
+    }
+    let drift: Vec<Value>;
+    {
+        let mut stmt = conn.prepare(
+            "SELECT provider_id, detected_at, COALESCE(trigger_json,'{}'), COALESCE(resolution,'') FROM drift_events ORDER BY detected_at DESC LIMIT 50",
+        )?;
+        drift = stmt
+            .query_map([], |r| {
+                let trig: String = r.get(2)?;
+                Ok(json!({
+                    "providerId": r.get::<_, String>(0)?, "detectedAt": r.get::<_, i64>(1)?,
+                    "trigger": serde_json::from_str::<Value>(&trig).unwrap_or(Value::Null),
+                    "resolution": r.get::<_, String>(3)?,
+                }))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+    }
+    let ver: i64 = conn
+        .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| r.get(0))
+        .unwrap_or(0);
+    Ok(json!({
+        "generatedAt": now_ms(),
+        "schemaVersion": ver,
+        "recentRequests": recent,
+        "driftEvents": drift,
+    })
+    .to_string())
 }

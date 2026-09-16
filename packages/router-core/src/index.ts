@@ -28,3 +28,8 @@ export {
 } from "./adapter-generator.js";
 export { DriftMonitor, type DriftAttempt, type DriftEvidence, type DriftMonitorDeps } from "./drift-monitor.js";
 export { RepairOrchestrator, type RepairPlan, type RepairDeps } from "./repair-orchestrator.js";
+export {
+  CONFIG_FORMAT_VERSION, validateImport,
+  type ConfigExport, type ExportProviderRow, type ExportKeyRow, type ExportManifestRow,
+  type ExportAliasRow, type ExportSettingRow, type ImportReport,
+} from "./config.js";

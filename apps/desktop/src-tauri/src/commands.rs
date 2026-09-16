@@ -15,7 +15,7 @@ use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::store::{self, Store};
 use crate::vault;
 
-#[derive(serde::Serialize)]
+#[derive(Debug, serde::Serialize)]
 pub struct CommandError(pub String);
 
 impl From<egress::EgressError> for CommandError {
@@ -169,6 +169,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::drift_event_resolve,
         crate::persist::manifests_history,
         crate::persist::manifest_stage,
-        crate::persist::manifest_activate
+        crate::persist::manifest_activate,
+        crate::persist::config_export,
+        crate::persist::config_import,
+        crate::persist::diagnostics_bundle
     ]
 }

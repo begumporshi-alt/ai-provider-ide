@@ -234,3 +234,26 @@ V1 limitations (recorded): the AI patch prompt gives candidates via the general 
 not a dedicated patch-only prompt (feedback carries the old manifest — good enough for v1);
 scheduled weekly re-probe is on-start + manual only (a real scheduler lands with the
 headless service mode in v2). 55 TS tests (6+49) + 29 Rust green.
+
+## 2026-09-16 — Phase 6a: config export/import + diagnostics bundle (req. 14)
+
+Host commands `config_export` / `config_import` / `diagnostics_bundle` (persist.rs), wired to
+store actions and a Settings > Config & diagnostics section (clipboard-based export/import —
+no new fs/dialog plugins; the file round-trip is the user's editor/OS).
+
+Safety model, layered (audit H7):
+- Export reads ONLY structured columns; keys serialize as id/label/secretRef/hint. A test
+  asserts no `"secret"`-named field and no key-like material appears in the export JSON.
+- Import rejects ANY `secret`-named field found in the RAW JSON value, before deserializing
+  into typed structs — scanning typed structs after parse would be theater, since serde
+  drops unknown fields. The webview's TS `validateImport` runs first for friendly errors;
+  the host check is the trust boundary (the webview is untrusted).
+- Imported providers land `draft`, keys `invalid`: nothing routes until keys are re-entered
+  and tested on the new machine. Existing providers/aliases are skipped (never silently
+  overwrite a live setup). The `gateway` setting is machine-local and never imported.
+  All-or-nothing transaction.
+
+TS side: `packages/router-core/src/config.ts` (formatVersion 1, findSecretFields recursive,
+row sanity) + 6 vitest cases. Rust side: `config_export_import_safety` test (draft/invalid
+forcing, gateway-setting exclusion, idempotent re-import, raw-secret rejection applies
+nothing). 30 Rust + 61 TS tests, typecheck + key-leak grep clean.

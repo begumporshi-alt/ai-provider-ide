@@ -457,3 +457,30 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
   return invoke<HostLedgerRow[]>("ledger_recent", { limit: 200 });
 }
+
+// ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------
+
+/** Full portable snapshot (providers, manifests, aliases, settings, key refs — never secrets). */
+export async function exportConfig(): Promise<string> {
+  const snap = await invoke<unknown>("config_export");
+  return JSON.stringify(snap, null, 2);
+}
+
+/**
+ * Validate + apply an imported snapshot. The TS validator runs first (friendly errors);
+ * the host re-scans and forces providers→draft, keys→invalid so nothing routes until
+ * keys are re-entered (audit H7).
+ */
+export async function importConfig(text: string): Promise<{ providers: number; keys: number }> {
+  const { validateImport } = await import("@aiprovider/router");
+  const report = validateImport(text);
+  if (!report.ok) throw new Error(report.errors.join(" · "));
+  const applied = await invoke<{ providers: number; keys: number }>("config_import", { raw: JSON.parse(text) });
+  await refreshFromHost(); // registry now holds drafts + invalid keys (re-enter-key flow)
+  return applied;
+}
+
+/** Scrubbed bug-report bundle: ledger + drift events + schema version. No bodies, no secrets. */
+export async function getDiagnosticsBundle(): Promise<string> {
+  return invoke<string>("diagnostics_bundle");
+}

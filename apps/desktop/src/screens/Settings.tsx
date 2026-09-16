@@ -1,13 +1,32 @@
 /**
  * Router Settings (UI_UX_PLAN.md §5): sectioned — Routing / Reliability / System AI — no
  * mega-form. System AI gets the explanatory treatment (what it powers, why it's locked
- * until the first provider, §2.9 bootstrap guard).
+ * until the first provider, §2.9 bootstrap guard). Phase 6 adds Config & diagnostics
+ * (export/import without secrets, scrubbed bug-report bundle).
  */
-import { useMemo, type ReactNode } from "react";
+import { useMemo, useState, type ReactNode } from "react";
 import type { ProviderRecord } from "@aiprovider/router";
-import { catalog, persistRouterSettings, registry, router, setProviderRotation } from "../store";
+import {
+  catalog, exportConfig, getDiagnosticsBundle, importConfig,
+  persistRouterSettings, registry, router, setProviderRotation,
+} from "../store";
 import { useUi } from "../ui-state";
 import { StatusDot } from "../components/atoms";
+
+async function copyText(text: string): Promise<boolean> {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand("copy");
+    ta.remove();
+    return ok;
+  }
+}
 
 export function SettingsScreen() {
   const tick = useUi((s) => s.tick);
@@ -96,7 +115,126 @@ export function SettingsScreen() {
           )}
         </div>
       </Section>
+
+      <ConfigDiagnosticsSection />
     </div>
+  );
+}
+
+function ConfigDiagnosticsSection() {
+  const { bump } = useUi();
+  const [busy, setBusy] = useState<string | null>(null);
+  const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
+  const [importText, setImportText] = useState("");
+  const [showImport, setShowImport] = useState(false);
+
+  const doExport = async () => {
+    setBusy("export");
+    try {
+      const json = await exportConfig();
+      const ok = await copyText(json);
+      setNote({
+        ok,
+        text: ok
+          ? `Configuration copied to clipboard (${(json.length / 1024).toFixed(1)} KB). API keys are never included — only their references.`
+          : "Copy failed — the export was generated but could not reach the clipboard.",
+      });
+    } catch (e) {
+      setNote({ ok: false, text: `Export failed: ${(e as Error).message}` });
+    } finally {
+      setBusy(null);
+      bump();
+    }
+  };
+
+  const doImport = async () => {
+    setBusy("import");
+    try {
+      const applied = await importConfig(importText);
+      setNote({
+        ok: true,
+        text: `Imported ${applied.providers} provider(s) and ${applied.keys} key(s). Providers land as drafts and keys as invalid — re-enter each key and test before enabling.`,
+      });
+      setImportText("");
+      setShowImport(false);
+    } catch (e) {
+      setNote({ ok: false, text: `Import rejected: ${(e as Error).message}` });
+    } finally {
+      setBusy(null);
+      bump();
+    }
+  };
+
+  const doDiagnostics = async () => {
+    setBusy("diag");
+    try {
+      const bundle = await getDiagnosticsBundle();
+      const ok = await copyText(bundle);
+      setNote({
+        ok,
+        text: ok
+          ? "Diagnostics bundle copied to clipboard — scrubbed (no request bodies, no headers, no secrets). Paste it into your bug report."
+          : "Diagnostics bundle generated but the copy failed.",
+      });
+    } catch (e) {
+      setNote({ ok: false, text: `Diagnostics failed: ${(e as Error).message}` });
+    } finally {
+      setBusy(null);
+      bump();
+    }
+  };
+
+  const btn = "rounded border px-3 py-1.5 text-[12px] disabled:opacity-50";
+  const btnStyle = { background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" };
+
+  return (
+    <Section
+      title="Config & diagnostics"
+      hint="Export moves your setup to another machine: providers, adapters, aliases and settings — never keychain secrets. Import re-adds them as drafts; keys must be re-entered and tested before anything routes."
+    >
+      <div className="flex flex-wrap gap-2">
+        <button className={btn} style={btnStyle} disabled={busy !== null} onClick={doExport}>
+          {busy === "export" ? "Exporting…" : "Export config"}
+        </button>
+        <button
+          className={btn}
+          style={btnStyle}
+          disabled={busy !== null}
+          onClick={() => { setShowImport((v) => !v); setNote(null); }}
+        >
+          {showImport ? "Cancel import" : "Import config"}
+        </button>
+        <button className={btn} style={btnStyle} disabled={busy !== null} onClick={doDiagnostics}>
+          {busy === "diag" ? "Collecting…" : "Copy diagnostics bundle"}
+        </button>
+      </div>
+
+      {showImport && (
+        <div className="mt-3">
+          <textarea
+            className="mono h-32 w-full rounded border p-2 text-[12px]"
+            style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+            placeholder='Paste an exported config JSON here…'
+            value={importText}
+            onChange={(e) => setImportText(e.target.value)}
+          />
+          <button
+            className={`${btn} mt-2`}
+            style={{ ...btnStyle, borderColor: "var(--accent, var(--border))" }}
+            disabled={busy !== null || importText.trim().length === 0}
+            onClick={doImport}
+          >
+            {busy === "import" ? "Importing…" : "Validate & import"}
+          </button>
+        </div>
+      )}
+
+      {note && (
+        <p className="mt-3 text-[12px]" style={{ color: note.ok ? "var(--success)" : "var(--danger, #e5484d)" }}>
+          {note.text}
+        </p>
+      )}
+    </Section>
   );
 }
 
