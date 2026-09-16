@@ -8,6 +8,7 @@
 import type { AdapterManifest, GenerateImageEndpoint, GenerateTextEndpoint, ListModelsEndpoint } from "@aiprovider/adapter-spec";
 import { selectAll, selectOne } from "./jsonpath.js";
 import { renderTemplate } from "./template.js";
+import type { AdapterInstance } from "./adapter-instance.js";
 
 export interface HttpPortLike {
   request(req: {
@@ -85,7 +86,7 @@ export class ManifestHttpError extends Error {
   }
 }
 
-export class ManifestInterpreter {
+export class ManifestInterpreter implements AdapterInstance {
   constructor(private readonly m: AdapterManifest, private readonly ctx: AdapterContext) {}
 
   get manifest(): AdapterManifest {

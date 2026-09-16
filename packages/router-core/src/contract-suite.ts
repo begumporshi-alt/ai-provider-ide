@@ -1,13 +1,15 @@
 /**
  * contract-suite (L1, §2.1 step 4): conformance tests a candidate manifest must pass before
  * registration. FREE checks run automatically; PAID checks (minimal text / image generation)
- * only behind explicit user consent (§2.2 — never automatic).
+ * only behind explicit user consent (§2.2 — never automatic). Runs against the
+ * key-blind AdapterInstance seam, so a declarative manifest and a sandboxed code adapter
+ * (§2.7) are gated by exactly the same checks.
  *
  * Test dimensions: auth (ping), models (listModels parses), text (max_tokens:1), image
  * (smallest, only if the manifest claims image support).
  */
 
-import type { ManifestInterpreter } from "./manifest-interpreter.js";
+import type { AdapterInstance } from "./adapter-instance.js";
 
 export interface ContractCheck {
   name: string;
@@ -33,7 +35,7 @@ export interface ContractOptions {
 }
 
 export async function runContractSuite(
-  interpreter: ManifestInterpreter,
+  adapter: AdapterInstance,
   opts: ContractOptions,
 ): Promise<ContractReport> {
   const checks: ContractCheck[] = [];
@@ -41,7 +43,7 @@ export async function runContractSuite(
   // 1. ping + model list (free)
   let models: string[] = [];
   try {
-    const ping = await interpreter.pingKey(opts.secretRef, opts.signal);
+    const ping = await adapter.pingKey(opts.secretRef, opts.signal);
     checks.push({
       name: "auth: model list with this key",
       pass: ping.ok,
@@ -49,7 +51,7 @@ export async function runContractSuite(
       detail: ping.ok ? undefined : (ping.message ?? `HTTP ${ping.status}`),
     });
     if (ping.ok) {
-      const entries = await interpreter.listModels(opts.secretRef, opts.signal);
+      const entries = await adapter.listModels(opts.secretRef, opts.signal);
       models = entries.map((e) => e.nativeId);
       const sane = models.length > 0 && models.every((m) => typeof m === "string" && m.length > 0 && m.length < 200);
       checks.push({
@@ -68,7 +70,7 @@ export async function runContractSuite(
     const model = opts.textModel ?? models[0]!;
     try {
       let text = "";
-      for await (const chunk of interpreter.generateText(
+      for await (const chunk of adapter.generateText(
         opts.secretRef,
         { model, messages: [{ role: "user", content: "ping" }], stream: false, maxTokens: 1 },
         opts.signal,
@@ -89,16 +91,16 @@ export async function runContractSuite(
   }
 
   // 3. minimal image generation (PAID — consent, only if the manifest claims images)
-  if (opts.consent.image && interpreter.capabilities().image) {
+  if (opts.consent.image && adapter.capabilities().image) {
     const imageModel =
       opts.imageModel ??
-      models.find((m) => interpreter.tagModality(m) === "image") ??
-      interpreter.tagModality(models[0] ?? "") === "image"
+      models.find((m) => adapter.tagModality(m) === "image") ??
+      adapter.tagModality(models[0] ?? "") === "image"
         ? models[0]
         : undefined;
     if (imageModel) {
       try {
-        const res = await interpreter.generateImage(
+        const res = await adapter.generateImage(
           opts.secretRef,
           { model: imageModel, prompt: "a single white pixel" },
           opts.signal,

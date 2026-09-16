@@ -46,3 +46,41 @@ describe("manifest grammar v1.1 (zod)", () => {
     expect(REQUEST_FIELD_WHITELIST.generateText!.has("evil_param")).toBe(false);
   });
 });
+
+describe("manifest grammar: adapter kind (§2.7)", () => {
+  const codeBody = { source: "export default { listModels() {} }", entry: "adapter" as const };
+
+  it("defaults kind to declarative", () => {
+    expect(ADAPTER_MANIFEST_V1_1.parse(validManifest).kind).toBe("declarative");
+  });
+
+  it("accepts a code adapter: kind:code + code.source, endpoints optional", () => {
+    const r = ADAPTER_MANIFEST_V1_1.safeParse({
+      ...validManifest,
+      kind: "code",
+      code: codeBody,
+      endpoints: {}, // a code adapter needs no declarative endpoints at all
+    });
+    expect(r.success).toBe(true);
+  });
+
+  it("rejects kind:code without a code body", () => {
+    const r = ADAPTER_MANIFEST_V1_1.safeParse({ ...validManifest, kind: "code" });
+    expect(r.success).toBe(false);
+  });
+
+  it("rejects a code body on a declarative manifest", () => {
+    const r = ADAPTER_MANIFEST_V1_1.safeParse({ ...validManifest, code: codeBody });
+    expect(r.success).toBe(false);
+  });
+
+  it("requires listModels + generateText on a declarative manifest", () => {
+    const r = ADAPTER_MANIFEST_V1_1.safeParse({ ...validManifest, endpoints: { listModels: validManifest.endpoints.listModels } });
+    expect(r.success).toBe(false);
+  });
+
+  it("caps code source at 64 KB", () => {
+    const r = ADAPTER_MANIFEST_V1_1.safeParse({ ...validManifest, kind: "code", code: { ...codeBody, source: "x".repeat(64_001) } });
+    expect(r.success).toBe(false);
+  });
+});

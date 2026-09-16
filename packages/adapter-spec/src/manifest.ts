@@ -65,35 +65,57 @@ export const GENERATE_IMAGE_ENDPOINT = z.object({
   }),
 });
 
-export const ADAPTER_MANIFEST_V1_1 = z.object({
-  manifestVersion: z.literal(1),
-  dialect: z.string().min(1),
-  provider: z.object({
-    baseUrl: z.string().url(),
-    auth: z.object({
-      headers: z.array(MANIFEST_ENDPOINT_AUTH_HEADER).min(1), // v1.1: multiple auth headers
-    }),
-  }),
-  endpoints: z.object({
-    listModels: LIST_MODELS_ENDPOINT.optional(),
-    generateText: GENERATE_TEXT_ENDPOINT.optional(),
-    generateImage: GENERATE_IMAGE_ENDPOINT.optional(),
-  }),
-  capabilities: z.object({ text: z.boolean(), image: z.boolean() }),
-  modalityRules: z
-    .record(z.enum(["text", "image"]), MODALITY_RULE)
-    .optional(),
-  limits: z
-    .object({ maxOutputTokens: z.number().int().positive().optional() })
-    .optional(),
-  provenance: z.object({
-    origin: z.enum(["builtin-template", "ai-generated", "ai-patched", "user-edited"]),
-    generatorModel: z.string().nullable(),
-    contractResult: z.unknown().optional(),
-    createdAt: z.string(),
-    validatedAt: z.string().optional(),
-  }),
+export const CODE_ADAPTER = z.object({
+  source: z.string().min(1).max(64_000), // the JS module text — executed ONLY in the QuickJS sandbox (§2.7)
+  entry: z.literal("adapter"), // reserved: v1 always exports `adapter`
 });
+
+export const ADAPTER_MANIFEST_V1_1 = z
+  .object({
+    manifestVersion: z.literal(1),
+    kind: z.enum(["declarative", "code"]).default("declarative"),
+    dialect: z.string().min(1),
+    provider: z.object({
+      baseUrl: z.string().url(),
+      auth: z.object({
+        headers: z.array(MANIFEST_ENDPOINT_AUTH_HEADER).min(1), // v1.1: multiple auth headers
+      }),
+    }),
+    endpoints: z.object({
+      listModels: LIST_MODELS_ENDPOINT.optional(),
+      generateText: GENERATE_TEXT_ENDPOINT.optional(),
+      generateImage: GENERATE_IMAGE_ENDPOINT.optional(),
+    }),
+    code: CODE_ADAPTER.optional(),
+    capabilities: z.object({ text: z.boolean(), image: z.boolean() }),
+    modalityRules: z
+      .record(z.enum(["text", "image"]), MODALITY_RULE)
+      .optional(),
+    limits: z
+      .object({ maxOutputTokens: z.number().int().positive().optional() })
+      .optional(),
+    provenance: z.object({
+      origin: z.enum(["builtin-template", "ai-generated", "ai-patched", "user-edited"]),
+      generatorModel: z.string().nullable(),
+      contractResult: z.unknown().optional(),
+      createdAt: z.string(),
+      validatedAt: z.string().optional(),
+    }),
+  })
+  .superRefine((m, ctx) => {
+    if (m.kind === "code") {
+      if (!m.code) {
+        ctx.addIssue({ code: "custom", message: 'kind "code" requires a code adapter body', path: ["code"] });
+      }
+    } else if (!m.code && (!m.endpoints.generateText || !m.endpoints.listModels)) {
+      // declarative manifests must carry at least the text path (pre-existing expectation
+      // from the contract suite; now stated in the grammar)
+      ctx.addIssue({ code: "custom", message: "declarative manifests require endpoints.listModels and endpoints.generateText", path: ["endpoints"] });
+    }
+    if (m.code && m.kind !== "code") {
+      ctx.addIssue({ code: "custom", message: "code bodies require kind: code", path: ["code"] });
+    }
+  });
 
 export type AdapterManifest = z.infer<typeof ADAPTER_MANIFEST_V1_1>;
 export type GenerateTextEndpoint = z.infer<typeof GENERATE_TEXT_ENDPOINT>;

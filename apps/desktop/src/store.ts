@@ -126,7 +126,7 @@ router.onAttempt = (a) => {
 export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPlan | undefined> {
   const provider = registry.getProvider(evidence.providerId);
   if (!provider) return undefined;
-  const { interpreter } = await adapters.forProvider(provider.id);
+  const { adapter } = await adapters.forProvider(provider.id);
   const secretRef = registry.keysOf(provider.id)[0]?.secretRef;
   if (!secretRef) return undefined;
   const otherHealthy = registry.listProviders().filter((p) => p.id !== provider.id && p.status === "enabled").length;
@@ -135,12 +135,12 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
   try {
     // free re-checks produce the failing-assertions context for the AI patch prompt
     const { runContractSuite } = await import("@aiprovider/router");
-    const contract = await runContractSuite(interpreter, { secretRef, consent: { text: false, image: false } });
+    const contract = await runContractSuite(adapter, { secretRef, consent: { text: false, image: false } });
     const plan = await new RepairOrchestrator({
       http,
       ai: router,
       systemLabel: routerSettingsLabel(),
-      currentManifest: interpreter.manifest,
+      currentManifest: adapter.manifest,
       currentVersion: 1,
       provider: { id: provider.id, slug: provider.slug, name: provider.name, baseUrl: provider.baseUrl },
       secretRef,
@@ -395,8 +395,8 @@ export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): 
 export async function testKey(keyId: string): Promise<{ ok: boolean; status: number; rateLimited: boolean; message?: string }> {
   const k = registry.getKey(keyId);
   if (!k) throw new Error(`unknown key ${keyId}`);
-  const { interpreter } = await adapters.forProvider(k.providerId);
-  const res = await interpreter.pingKey(k.secretRef);
+  const { adapter } = await adapters.forProvider(k.providerId);
+  const res = await adapter.pingKey(k.secretRef);
   registry.updateKey(keyId, {
     status: res.ok ? "active" : res.rateLimited ? "cooldown" : "invalid",
     lastTestedAt: Date.now(),

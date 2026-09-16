@@ -5,7 +5,8 @@
  * retry loop — the plan IS the retry policy. Enforces the §3.6 budgets (max attempts,
  * backoff honoring Retry-After) and propagates cancellation via AbortSignal.
  */
-import { ManifestHttpError, type ManifestInterpreter } from "./manifest-interpreter.js";
+import { ManifestHttpError } from "./manifest-interpreter.js";
+import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
 import { classify, type ErrorClass } from "./errors.js";
 import type { HealthTracker } from "./health-tracker.js";
@@ -39,8 +40,8 @@ export interface TextExecution {
 export const MAX_ATTEMPTS_DEFAULT = 6;
 
 interface AdapterFactory {
-  /** Resolve provider -> interpreter (adapter-runtime). */
-  forProvider(providerId: string): Promise<{ interpreter: ManifestInterpreter; baseUrl: string }>;
+  /** Resolve provider -> adapter (adapter-runtime); declarative or sandboxed code (§2.7). */
+  forProvider(providerId: string): Promise<{ adapter: AdapterInstance; baseUrl: string }>;
 }
 
 export class ExecutionEngine {
@@ -64,8 +65,8 @@ export class ExecutionEngine {
         if (args.signal?.aborted) return;
         let emitted = false;
         try {
-          const { interpreter } = await self.adapters.forProvider(c.provider.id);
-          for await (const chunk of interpreter.generateText(
+          const { adapter } = await self.adapters.forProvider(c.provider.id);
+          for await (const chunk of adapter.generateText(
             c.key.secretRef,
             { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature },
             args.signal,
@@ -126,8 +127,8 @@ export class ExecutionEngine {
     for (const c of args.plan.slice(0, max)) {
       if (args.signal?.aborted) break;
       try {
-        const { interpreter } = await this.adapters.forProvider(c.provider.id);
-        const res = await interpreter.generateImage(
+        const { adapter } = await this.adapters.forProvider(c.provider.id);
+        const res = await adapter.generateImage(
           c.key.secretRef,
           { model: c.model.nativeId, prompt: args.prompt, size: args.size },
           args.signal,

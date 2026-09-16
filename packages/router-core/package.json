@@ -12,7 +12,9 @@
   },
   "dependencies": {
     "@aiprovider/adapter-spec": "workspace:*",
+    "@jitl/quickjs-singlefile-mjs-release-sync": "^0.32.0",
     "eventsource-parser": "^3.0.0",
+    "quickjs-emscripten-core": "^0.32.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {

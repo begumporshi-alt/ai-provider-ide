@@ -103,10 +103,10 @@ export function OnboardingScreen() {
   );
 
   const runFreeChecks = useCallback(async (providerId: string, keyLabel: string) => {
-    const { interpreter } = await adapters.forProvider(providerId);
+    const { adapter } = await adapters.forProvider(providerId);
     const key = registry.keysOf(providerId).find((k) => k.label === keyLabel) ?? registry.keysOf(providerId)[0];
     if (!key) throw new Error("provider key row missing");
-    const report = await runContractSuite(interpreter, {
+    const report = await runContractSuite(adapter, {
       secretRef: key.secretRef,
       consent: { text: false, image: false },
     });
@@ -295,8 +295,8 @@ export function OnboardingScreen() {
         },
       });
       setStep(3);
-      const { interpreter } = await adapters.forProvider(providerId);
-      const freeReport = await runContractSuite(interpreter, {
+      const { adapter } = await adapters.forProvider(providerId);
+      const freeReport = await runContractSuite(adapter, {
         secretRef: key.secretRef,
         consent: { text: false, image: false },
       });
@@ -315,8 +315,8 @@ export function OnboardingScreen() {
     setBusy(true);
     setError(null);
     try {
-      const { interpreter } = await adapters.forProvider(r.providerId);
-      const report = await runContractSuite(interpreter, {
+      const { adapter } = await adapters.forProvider(r.providerId);
+      const report = await runContractSuite(adapter, {
         secretRef: registry.keysOf(r.providerId).find((k) => k.label === r!.keyLabel)?.secretRef ?? "",
         consent: { text: consentText, image: consentImage },
       });
@@ -339,8 +339,8 @@ export function OnboardingScreen() {
       // Sessions resumed from storage may predate their manifest detail (or the detail was
       // saved before registration); the provider's registered manifest is authoritative.
       if (!orch.session.manifest) {
-        const { interpreter } = await adapters.forProvider(r.providerId);
-        await orch.resume({ ...orch.session, manifest: interpreter.manifest });
+        const { adapter } = await adapters.forProvider(r.providerId);
+        await orch.resume({ ...orch.session, manifest: adapter.manifest });
       }
       await orch.setContract(contract);
       await orch.confirmRegistration();

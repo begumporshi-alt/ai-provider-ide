@@ -9,6 +9,7 @@ import type { AdapterManifest } from "@aiprovider/adapter-spec";
 function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, string>; imageEndpoint?: boolean }): AdapterManifest {
   return {
     manifestVersion: 1,
+    kind: "declarative",
     dialect: "openai-chat-v1",
     provider: { baseUrl, auth: { headers: [{ name: "Authorization", prefix: "Bearer" }] } },
     endpoints: {
@@ -57,6 +58,7 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
   // v1.1 grammar — no code path of its own.
   return {
     manifestVersion: 1,
+    kind: "declarative",
     dialect: "anthropic-messages-v1",
     provider: {
       baseUrl,

@@ -27,14 +27,14 @@ export class ModelCatalog {
 
   /** Refresh one provider's catalog; errors leave the stale rows in place (stale-fallback). */
   async refreshProvider(providerId: string, signal?: AbortSignal): Promise<number> {
-    const { interpreter } = await this.adapters.forProvider(providerId);
+    const { adapter } = await this.adapters.forProvider(providerId);
     const keys = this.registry.keysOf(providerId).filter((k) => k.status === "active");
     if (!keys.length) throw new Error(`provider ${providerId} has no active key`);
     let entries: { nativeId: string }[] = [];
     let lastErr: unknown;
     for (const k of keys) {
       try {
-        entries = await interpreter.listModels(k.secretRef, signal);
+        entries = await adapter.listModels(k.secretRef, signal);
         lastErr = undefined;
         break;
       } catch (e) {
@@ -48,7 +48,7 @@ export class ModelCatalog {
       this.models.push({
         providerId,
         nativeId: e.nativeId,
-        modality: interpreter.tagModality(e.nativeId) as Modality,
+        modality: adapter.tagModality(e.nativeId) as Modality,
         fetchedAt: now,
       });
     }
