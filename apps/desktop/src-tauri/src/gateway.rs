@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::extract::State;
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -215,8 +215,10 @@ fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opti
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        // Anthropic clients (Claude Code, anthropic-sdk) send the key in x-api-key.
+        // Anthropic clients (Claude Code, anthropic-sdk) send the key in x-api-key;
+        // Gemini clients use x-goog-api-key (or ?key=, handled in the Gemini handler).
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
     if constant_time_eq(presented, &stored) {
         core.failures.lock().unwrap().remove(&ip);
@@ -516,6 +518,312 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     }
 }
 
+/// OpenAI Responses API ingress (v1.1, 2026-09-16): Codex-style clients. Edge translation
+/// to the normalized chat call; the router core stays single-surface.
+fn to_chat_body_responses(req: &Value) -> Option<Value> {
+    let model = req.get("model").and_then(Value::as_str)?;
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(inst) = req.get("instructions").and_then(Value::as_str) {
+        messages.push(json!({ "role": "system", "content": inst }));
+    }
+    match req.get("input") {
+        Some(Value::String(t)) => messages.push(json!({ "role": "user", "content": t.clone() })),
+        Some(Value::Array(items)) => {
+            for it in items {
+                let role = it.get("role").and_then(Value::as_str).unwrap_or("user");
+                let content = match it.get("content") {
+                    Some(Value::String(t)) => t.clone(),
+                    Some(Value::Array(parts)) => parts
+                        .iter()
+                        .filter_map(|p| {
+                            p.get("text")
+                                .and_then(Value::as_str)
+                                .or_else(|| p.get("content").and_then(Value::as_str))
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                    _ => String::new(),
+                };
+                messages.push(json!({ "role": role, "content": content }));
+            }
+        }
+        _ => return None,
+    }
+    Some(json!({
+        "model": model,
+        "messages": messages,
+        "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        "max_tokens": req.get("max_output_tokens").and_then(Value::as_i64).unwrap_or(1024),
+    }))
+}
+
+fn responses_error(message: &str, code: &str) -> Value {
+    json!({ "error": { "message": message, "type": "invalid_request_error", "code": code } })
+}
+
+async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
+    // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
+    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+        return r;
+    }
+    let _ = uri;
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, responses_error("invalid JSON body", "invalid_json"));
+    };
+    let Some(chat) = to_chat_body_responses(&req) else {
+        return err(StatusCode::BAD_REQUEST, responses_error("model and input are required", "missing_required_parameter"));
+    };
+    for unsupported in ["tools", "tool_choice"] {
+        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                responses_error(&format!("{unsupported} is not supported yet"), "unsupported_parameter"),
+            );
+        }
+    }
+    let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => return map_generic_to_status(r),
+    };
+    let id = slot.id;
+    let resp_id = format!("resp_gw_{id}");
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+
+    if wants_stream {
+        let rid = resp_id.clone();
+        let stream_body = async_stream::stream! {
+            let ev = |name: &str, payload: Value| Ok::<Event, std::convert::Infallible>(
+                Event::default().event(name).data(payload.to_string()),
+            );
+            yield ev("response.created", json!({ "type": "response.created", "response": { "id": rid, "object": "response", "status": "in_progress" } }));
+            yield ev("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0,
+                "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "in_progress", "content": [] } }));
+            yield ev("response.content_part.added", json!({ "type": "response.content_part.added", "item_id": format!("{rid}_out"), "output_index": 0,
+                "content_index": 0, "part": { "type": "output_text", "text": "", "annotations": [] } }));
+            let mut text = String::new();
+            while let Some(msg) = slot.rx.recv().await {
+                match msg {
+                    BridgeMsg::Delta(t) => {
+                        text.push_str(&t);
+                        yield ev("response.output_text.delta", json!({ "type": "response.output_text.delta", "item_id": format!("{rid}_out"),
+                            "output_index": 0, "content_index": 0, "delta": t }));
+                    }
+                    BridgeMsg::Result(_) => {}
+                    BridgeMsg::Done => break,
+                    BridgeMsg::Error { message, .. } => {
+                        yield ev("response.failed", json!({ "type": "response.failed",
+                            "response": { "id": rid, "object": "response", "status": "failed", "error": { "message": message } } }));
+                        return;
+                    }
+                }
+            }
+            yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
+                "output_index": 0, "content_index": 0, "text": text.clone() }));
+            yield ev("response.content_part.done", json!({ "type": "response.content_part.done", "item_id": format!("{rid}_out"),
+                "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text.clone(), "annotations": [] } }));
+            yield ev("response.output_item.done", json!({ "type": "response.output_item.done", "output_index": 0,
+                "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "completed",
+                    "content": [{ "type": "output_text", "text": text.clone(), "annotations": [] }] } }));
+            yield ev("response.completed", json!({ "type": "response.completed",
+                "response": { "id": rid, "object": "response", "status": "completed",
+                    "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": text, "annotations": [] }] }],
+                    "usage": { "input_tokens": 0, "output_tokens": 0 } } }));
+            drop(slot);
+        };
+        return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+    }
+
+    let mut full = String::new();
+    let mut err_info: Option<(u16, String)> = None;
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Result(_) => {}
+            BridgeMsg::Done => break,
+            BridgeMsg::Error { status, message } => {
+                err_info = Some((status, message));
+                break;
+            }
+        }
+    }
+    drop(slot);
+    match err_info {
+        Some((_, message)) => err(StatusCode::BAD_GATEWAY, responses_error(&message, "upstream_error")),
+        None => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "id": resp_id, "object": "response", "status": "completed",
+                "output": [{ "type": "message", "role": "assistant",
+                    "content": [{ "type": "output_text", "text": full, "annotations": [] }] }],
+                "parallel_tool_calls": false, "tool_choice": "auto", "tools": [],
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            })
+            .to_string(),
+        )
+            .into_response(),
+    }
+}
+
+fn map_generic_to_status(r: Response) -> Response {
+    let status = r.status();
+    let body = openai_error(
+        if status == StatusCode::TOO_MANY_REQUESTS { "router at capacity" } else { "AI-Provider IDE core unavailable — is the app open?" },
+        if status == StatusCode::TOO_MANY_REQUESTS { "rate_limit" } else { "service_unavailable" },
+        None,
+    );
+    (status, axum::Json(body)).into_response()
+}
+
+fn gemini_error(message: &str, status: StatusCode) -> Response {
+    (
+        status,
+        axum::Json(json!({ "error": { "code": status.as_u16(), "message": message, "status": match status.as_u16() {
+            400 => "INVALID_ARGUMENT", 401 => "UNAUTHENTICATED", 429 => "RESOURCE_EXHAUSTED", 503 => "UNAVAILABLE", _ => "INTERNAL" } } })),
+    )
+        .into_response()
+}
+
+/// Gemini generateContent ingress (v1.1, 2026-09-16): `x-goog-api-key` or `?key=`, model
+/// in the path, contents/parts request and candidates response shapes. SSE via ?alt=sse.
+async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
+    let query: HashMap<String, String> = uri
+        .query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .map(|(k, v)| (k.into_owned(), v.into_owned()))
+                .collect()
+        })
+        .unwrap_or_default();
+    // ?key= is Gemini's legacy auth; fold it into the header check.
+    let mut headers2 = headers.clone();
+    if headers2.get("x-goog-api-key").is_none() {
+        if let Some(k) = query.get("key") {
+            if let Ok(v) = HeaderValue::from_str(k) {
+                headers2.insert("x-goog-api-key", v);
+            }
+        }
+    }
+    if let Some(r) = check_master_key(&core, &headers2, peer_ip(&headers)) {
+        return r;
+    }
+    // path: /v1beta/models/<model>:generateContent | :streamGenerateContent
+    let path = uri.path().to_string();
+    let tail = match path.rsplit("/models/").next() {
+        Some(t) => t,
+        None => return gemini_error("bad path — expected /v1beta/models/<model>:generateContent", StatusCode::NOT_FOUND),
+    };
+    let (model, streaming) = match tail.split_once(':') {
+        Some((m, "generateContent")) => (m.to_string(), false),
+        Some((m, "streamGenerateContent")) => (m.to_string(), true),
+        _ => return gemini_error("bad method suffix — expected :generateContent or :streamGenerateContent", StatusCode::BAD_REQUEST),
+    };
+    if streaming {
+        if query.get("alt").map(|v| v.as_str()) != Some("sse") {
+            // v1: Gemini streaming is served as SSE only (alt=sse); plain JSON-array
+            // streaming is not implemented — refuse rather than answer wrongly.
+            return gemini_error("streaming requires ?alt=sse", StatusCode::BAD_REQUEST);
+        }
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return gemini_error("invalid JSON body", StatusCode::BAD_REQUEST);
+    };
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(sys) = req.pointer("/systemInstruction/parts") {
+        let text = sys
+            .as_array()
+            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
+            .unwrap_or_default();
+        if !text.is_empty() {
+            messages.push(json!({ "role": "system", "content": text }));
+        }
+    }
+    let Some(contents) = req.get("contents").and_then(Value::as_array) else {
+        return gemini_error("contents is required", StatusCode::BAD_REQUEST);
+    };
+    for c in contents {
+        let role = if c.get("role").and_then(Value::as_str) == Some("model") { "assistant" } else { "user" };
+        let text = c
+            .get("parts")
+            .and_then(Value::as_array)
+            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
+            .unwrap_or_default();
+        messages.push(json!({ "role": role, "content": text }));
+    }
+    let chat = json!({
+        "model": model,
+        "messages": messages,
+        "stream": streaming,
+        "max_tokens": req.pointer("/generationConfig/maxOutputTokens").and_then(Value::as_i64).unwrap_or(1024),
+        "temperature": req.pointer("/generationConfig/temperature").and_then(Value::as_f64),
+    });
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => return map_generic_to_status(r),
+    };
+    let id = slot.id;
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+
+    if streaming {
+        let stream_body = async_stream::stream! {
+            while let Some(msg) = slot.rx.recv().await {
+                match msg {
+                    BridgeMsg::Delta(t) => {
+                        let chunk = json!({ "candidates": [{ "content": { "parts": [{ "text": t }], "role": "model" }, "index": 0 }] });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                    }
+                    BridgeMsg::Result(_) => {}
+                    BridgeMsg::Done => {
+                        let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0 } });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
+                        break;
+                    }
+                    BridgeMsg::Error { message, .. } => {
+                        let e = json!({ "error": { "code": 502, "message": message, "status": "INTERNAL" } });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(e.to_string()));
+                        break;
+                    }
+                }
+            }
+            drop(slot);
+        };
+        return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+    }
+
+    let mut full = String::new();
+    let mut err_info: Option<(u16, String)> = None;
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Result(_) => {}
+            BridgeMsg::Done => break,
+            BridgeMsg::Error { status, message } => {
+                err_info = Some((status, message));
+                break;
+            }
+        }
+    }
+    drop(slot);
+    match err_info {
+        Some((503, _)) | Some((429, _)) => {
+            let code = StatusCode::from_u16(503).unwrap();
+            gemini_error("gateway unavailable or at capacity", code)
+        }
+        Some((_, message)) => gemini_error(&message, StatusCode::BAD_GATEWAY),
+        None => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "candidates": [{ "content": { "parts": [{ "text": full }], "role": "model" }, "finishReason": "STOP", "index": 0 }],
+                "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 }
+            })
+            .to_string(),
+        )
+            .into_response(),
+    }
+}
+
 async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
         return r;
@@ -592,6 +900,8 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/chat/completions", post(chat_h))
         .route("/v1/images/generations", post(image_h))
         .route("/v1/messages", post(messages_h))
+        .route("/v1/responses", post(responses_h))
+        .route("/v1beta/models/{*tail}", post(gemini_h))
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -884,6 +1194,124 @@ mod tests {
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["type"], "error");
         assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_api_non_stream() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "input": "hi", "instructions": "be nice" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["object"], "response");
+        assert_eq!(body["status"], "completed");
+        assert_eq!(body["output"][0]["content"][0]["text"], "Hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_api_stream_events() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "input": [{ "role": "user", "content": "hi" }], "stream": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("response.completed") {
+                break;
+            }
+        }
+        for ev in ["response.created", "response.output_text.delta", "response.output_text.done", "response.completed"] {
+            assert!(acc.contains(ev), "missing {ev}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gemini_generate_content() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["candidates"][0]["content"]["parts"][0]["text"], "Hello");
+        assert_eq!(body["candidates"][0]["finishReason"], "STOP");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gemini_stream_requires_alt_sse() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:streamGenerateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:streamGenerateContent?alt=sse", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("finishReason") {
+                break;
+            }
+        }
+        assert!(acc.contains("Hel"), "no delta: {acc}");
+        assert!(acc.contains("STOP"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gemini_bad_key_401() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/m:generateContent", s.base))
+            .header("x-goog-api-key", "sk-wrong")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
     }
 
     #[tokio::test(flavor = "multi_thread")]

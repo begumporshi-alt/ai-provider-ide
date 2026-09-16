@@ -70,7 +70,7 @@ export function GatewayScreen() {
     <div className="mx-auto max-w-2xl">
       <h1 className="mb-1 text-[20px] font-semibold">Local Gateway</h1>
       <p className="mb-4 text-[13px]" style={{ color: "var(--text-dim)" }}>
-        Expose your whole Model Router as one OpenAI-compatible endpoint. Any app that takes a
+        Expose your whole Model Router behind one local master key — speaking OpenAI Chat, OpenAI Responses, Anthropic Messages, and Gemini. Any app that takes a
         base URL + API key — Cursor, Continue, openai-python, scripts — gets every provider you
         configured, with the same key rotation and failover, behind one local master key.
       </p>
@@ -161,6 +161,16 @@ export function GatewayScreen() {
           code={`curl ${endpoint}/messages \\\n  -H "x-api-key: <master key>" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \\\n  -d '{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'`}
           onCopy={() => void copy(`curl ${endpoint}/messages -H "x-api-key: <master key>" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'`, "acurl")}
         />
+        <PresetRow
+          label="OpenAI Responses (Codex-style)"
+          code={`curl ${endpoint.replace("/v1", "")}/v1/responses \\\n  -H "authorization: Bearer <master key>" -H "content-type: application/json" \\\n  -d '{"model":"gpt-4o","input":"hi","stream":true}'`}
+          onCopy={() => void copy(`curl ${endpoint.replace("/v1", "")}/v1/responses -H "authorization: Bearer <master key>" -H "content-type: application/json" -d '{"model":"gpt-4o","input":"hi","stream":true}'`, "rcurl")}
+        />
+        <PresetRow
+          label="Gemini generateContent"
+          code={`curl "${endpoint.replace("/v1", "/v1beta")}/models/mock/model-name:generateContent" \\\n  -H "x-goog-api-key: <master key>" -H "content-type: application/json" \\\n  -d '{"contents":[{"parts":[{"text":"hi"}]}]}'`}
+          onCopy={() => void copy(`curl "${endpoint.replace("/v1", "/v1beta")}/models/mock/model-name:generateContent" -H "x-goog-api-key: <master key>" -H "content-type: application/json" -d '{"contents":[{"parts":[{"text":"hi"}]}]}'`, "gcurl")}
+        />
       </section>
 
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
@@ -170,7 +180,7 @@ export function GatewayScreen() {
           <li>Serves while this window is open. Closing the app stops the gateway.</li>
           <li>Model names: qualified <code className="mono">provider/native</code> for an exact provider, or a bare id to let the router pick + fail over.</li>
           <li>Every request is logged in Activity under source <span className="mono">gateway</span>. Wrong key → 401; router busy → 429; app closed → 503.</li>
-          <li>Two compatible surfaces: <b>OpenAI</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) and <b>Anthropic</b> (<span className="mono">/v1/messages</span> — Claude Code / anthropic-sdk speak here, auth via <span className="mono">x-api-key</span>). Tools/tool_choice/response_format are refused with a clear error (never silently dropped).</li>
+          <li>Four compatible surfaces — one master key: <b>OpenAI Chat</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) · <b>OpenAI Responses</b> (<span className="mono">/v1/responses</span>) · <b>Anthropic Messages</b> (<span className="mono">/v1/messages</span>, auth via <span className="mono">x-api-key</span> — Claude Code / anthropic-sdk) · <b>Gemini</b> (<span className="mono">/v1beta/models/&lt;model&gt;:generateContent</span> + <span className="mono">?alt=sse</span> streaming, auth via <span className="mono">x-goog-api-key</span> or <span className="mono">?key=</span>). Tools/tool_choice are refused with a clear error (never silently dropped).</li>
         </ul>
       </section>
     </div>

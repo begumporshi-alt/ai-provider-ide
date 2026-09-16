@@ -462,6 +462,8 @@ assumed (audit H2):
 | `n`, `logprobs`, `user`, everything else unknown | **Ignored**, with a warning recorded in the ledger entry |
 | `/v1/messages` (Anthropic Messages dialect) | **Supported (v1.1, 2026-09-16)** — Claude Code / anthropic-sdk ingress: `x-api-key` auth accepted, messages translated, replies re-framed as Anthropic events; `tools`/`tool_choice` refused with the Anthropic error envelope |
 | `/v1/models` | **Supported** — merged catalog, qualified IDs |
+| `/v1/responses` | **Supported (v1.1, 2026-09-16)** — Codex-style ingress: `input`/`instructions` translated; streaming emits `response.created → …output_text.delta → …completed` |
+| Gemini `/v1beta/models/<m>:generateContent[:stream]` | **Supported (v1.1)** — `x-goog-api-key` or `?key=`; `contents/parts` translation; SSE via `?alt=sse` |
 | `/v1/embeddings` | **Out of scope for v1** (extension point: the modality enum) |
 | Error shape | OpenAI-style: `{"error": {"message", "type", "code"}}` |
 

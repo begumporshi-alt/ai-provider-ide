@@ -196,3 +196,14 @@ one-minute human pass away.
   curl through the running app (22 Rust total). §3.4 compatibility contract updated.
 - **Revisit when:** a user needs Responses/Gemini ingress — same edge-translation pattern,
   no core change.
+
+## 2026-09-16 — Gateway v1.1 extended: OpenAI Responses + Gemini ingress
+
+Per the multi-dialect decision above, /v1/responses and /v1beta/models/*:generateContent
+(+ :streamGenerateContent?alt=sse) are live: contents/parts and input/instructions
+translation at the edge; Gemini legacy ?key= accepted via the same master-key check.
+x-goog-api-key and x-api-key and Bearer all authenticate the single master key.
+V1 limits (recorded): Responses tool/events beyond the text-output lifecycle are refused;
+Gemini streaming requires alt=sse; function-declaration surfaces are refused explicitly.
+5 new Rust integration tests (27 total); all four surfaces live-verified via curl through
+the running app (Chat + Responses + Messages + Gemini, stream + non-stream).
