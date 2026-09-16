@@ -26,3 +26,5 @@ export {
   generateCandidates, lintManifest, fetchDocsExcerpt, redactionHash, extractJson,
   type RankedCandidate, type CandidateProgress, type CandidateStage, type GenerationDeps, type AuditRecord,
 } from "./adapter-generator.js";
+export { DriftMonitor, type DriftAttempt, type DriftEvidence, type DriftMonitorDeps } from "./drift-monitor.js";
+export { RepairOrchestrator, type RepairPlan, type RepairDeps } from "./repair-orchestrator.js";

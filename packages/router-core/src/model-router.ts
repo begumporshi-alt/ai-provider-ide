@@ -41,6 +41,12 @@ export class ModelRouter implements RouterFacade, AiTextPort {
   private readonly engine: ExecutionEngine;
   private readonly cursors = new Map<string, number>(); // providerId -> round-robin index
   settings: RouterSettings = { failoverEnabled: true, systemAi: null };
+  /**
+   * Drift hook (§2.10): every attempt outcome — failures in the fallback chain AND the
+   * serving success — is observed. Phase 5 wires this to DriftMonitor.observe; the router
+   * itself stays free of drift logic (separation keeps the attempt loop testable).
+   */
+  onAttempt?: (a: { providerId: string; providerSlug: string; model: string; requestedModel: string; cls: import("./errors.js").ErrorClass; ts: number }) => void;
 
   constructor(
     private readonly registry: ProviderRegistry,
@@ -249,6 +255,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           fallbackChain: exec.fallbackChain(),
         });
         if (served) router.advanceCursor(served.provider.id);
+        router.observeAttempts(exec, requestedModel);
       } catch (e) {
         const served = exec.served();
         await ledger.append({
@@ -267,9 +274,38 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           costEstimateMicros: 0,
           fallbackChain: exec.fallbackChain(),
         });
+        router.observeAttempts(exec, requestedModel);
         throw e;
       }
     }
     return { ...exec, chunks: wrapped() };
+  }
+
+  /** §2.10: surface every attempt of a routed request to the drift hook (once each). */
+  private observeAttempts(exec: TextExecution, requestedModel: string): void {
+    const hook = this.onAttempt;
+    if (!hook) return;
+    const now = Date.now();
+    for (const a of exec.fallbackChain()) {
+      hook({
+        providerId: a.candidate.provider.id,
+        providerSlug: a.candidate.provider.slug,
+        model: a.candidate.model.nativeId,
+        requestedModel,
+        cls: a.cls,
+        ts: now,
+      });
+    }
+    const served = exec.served();
+    if (served) {
+      hook({
+        providerId: served.provider.id,
+        providerSlug: served.provider.slug,
+        model: served.model.nativeId,
+        requestedModel,
+        cls: "OK",
+        ts: now,
+      });
+    }
   }
 }

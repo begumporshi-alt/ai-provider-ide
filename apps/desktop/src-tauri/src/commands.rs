@@ -164,6 +164,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_error,
         crate::persist::onboarding_save,
         crate::persist::onboarding_latest_active,
-        crate::persist::generator_audit_record
+        crate::persist::generator_audit_record,
+        crate::persist::drift_event_record,
+        crate::persist::drift_event_resolve,
+        crate::persist::manifests_history,
+        crate::persist::manifest_stage,
+        crate::persist::manifest_activate
     ]
 }

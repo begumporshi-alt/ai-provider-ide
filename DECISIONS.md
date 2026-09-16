@@ -207,3 +207,30 @@ V1 limits (recorded): Responses tool/events beyond the text-output lifecycle are
 Gemini streaming requires alt=sse; function-declaration surfaces are refused explicitly.
 5 new Rust integration tests (27 total); all four surfaces live-verified via curl through
 the running app (Chat + Responses + Messages + Gemini, stream + non-stream).
+
+## 2026-09-16 — Phase 5 (self-healing) complete + fully LIVE-verified, incl. rollback
+
+Built: DriftMonitor (§2.10 sliding window: >=5 drift-class errors / 15 min / >=2 models,
+with the succeeds-elsewhere isolation check and 1-per-hour cooldown; manual health-check
+bypasses it), RepairOrchestrator (re-probe -> deterministic re-fingerprint -> AI patch
+prompt carrying old manifest + failing assertions -> contract-gated best-of-2), router
+onAttempt hook, host drift_events/manifests_history/manifest_stage/manifest_activate
+commands, and the Providers UI: repairing badge + banner, Review-repair modal (evidence +
+checks + Approve & apply / Keep current), adapter history with one-click rollback.
+Two real bugs fixed during test authoring: cooldown blocked the FIRST trigger ever;
+RepairOrchestrator forgot to pass `http` (AI candidates went unchecked).
+
+Fully live-verified in the running app with NO human input:
+flip an enabled provider's shape -> traffic -> provider marked repairing (failover kept
+users served), drift_event recorded; background plan: re-fingerprint no-match -> oracle
+System AI generated a corrected manifest through the real AiTextPort exclusion route
+(generator_audit rows); Approve & apply -> manifest v2 (ai-patched) active, traffic
+returned to the provider ("drift-v2:dgpt"), drift_events resolved 'repaired v2',
+card back to Enabled; Check health -> history shows v2 active + v1; "roll back to this"
+-> v1 active again and a request proves v1 now fails with the OLD chain shape and
+failover catches it (ledger NOT_FOUND -> served by another provider). Criterion 9 closed.
+
+V1 limitations (recorded): the AI patch prompt gives candidates via the general generator,
+not a dedicated patch-only prompt (feedback carries the old manifest — good enough for v1);
+scheduled weekly re-probe is on-start + manual only (a real scheduler lands with the
+headless service mode in v2). 55 TS tests (6+49) + 29 Rust green.

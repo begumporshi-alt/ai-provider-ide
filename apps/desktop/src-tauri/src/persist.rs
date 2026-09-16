@@ -552,3 +552,159 @@ pub struct GeneratorAuditRow {
     pub completion_tokens: i64,
     pub redaction_hash: String,
 }
+
+// ---------- drift events + repair staging (§2.10, Phase 5) ----------
+
+#[tauri::command]
+pub fn drift_event_record(store: State<'_, Arc<Store>>, provider_id: String, trigger_json: String) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES (?1,?2,?3)",
+        params![provider_id, now_ms(), trigger_json],
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn drift_event_resolve(store: State<'_, Arc<Store>>, provider_id: String, resolution: String) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "UPDATE drift_events SET resolution=?2, resolved_at=?3 WHERE provider_id=?1 AND resolution IS NULL",
+        params![provider_id, resolution, now_ms()],
+    )?;
+    Ok(())
+}
+
+#[tauri::command]
+pub fn manifests_history(store: State<'_, Arc<Store>>, provider_id: String) -> Result<Vec<ManifestRow>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active FROM manifests WHERE provider_id = ?1 ORDER BY version DESC",
+    )?;
+    let rows = stmt.query_map(params![provider_id], |r| {
+        Ok(ManifestRow {
+            id: r.get(0)?,
+            provider_id: r.get(1)?,
+            version: r.get(2)?,
+            origin: r.get(3)?,
+            body_json: r.get(4)?,
+            contract_result_json: r.get(5)?,
+            created_at: r.get(6)?,
+            is_active: r.get::<_, i64>(7)? == 1,
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+/// Stage a repair candidate as a NEW version without activating it (human confirms first).
+#[tauri::command]
+pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i64, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let next: i64 = conn
+        .query_row("SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id = ?1", params![m.provider_id], |r| r.get(0))?;
+    conn.execute(
+        "INSERT INTO manifests (id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active) VALUES (?1,?2,?3,?4,?5,?6,?7,0)",
+        params![m.id, m.provider_id, next, m.origin, m.body_json, m.contract_result_json, m.created_at],
+    )?;
+    Ok(next)
+}
+
+/// Activate a staged manifest; returns the previously-active version for one-click rollback.
+#[tauri::command]
+pub fn manifest_activate(store: State<'_, Arc<Store>>, provider_id: String, version: i64) -> Result<Option<i64>, CommandError> {
+    let mut conn = store.conn.lock().unwrap();
+    let tx = conn.transaction()?;
+    let previous: Option<i64> = tx
+        .query_row("SELECT version FROM manifests WHERE provider_id=?1 AND is_active=1", params![provider_id], |r| r.get(0))
+        .ok();
+    tx.execute("UPDATE manifests SET is_active=0 WHERE provider_id=?1", params![provider_id])?;
+    let changed = tx.execute("UPDATE manifests SET is_active=1 WHERE provider_id=?1 AND version=?2", params![provider_id, version])?;
+    if changed == 0 {
+        return Err(CommandError(format!("manifest v{version} not found for provider {provider_id}")));
+    }
+    tx.commit()?;
+    Ok(previous)
+}
+
+#[cfg(test)]
+mod persist_tests {
+    use super::*;
+
+    fn tmp_store(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-p5-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::open(&dir).unwrap(), dir)
+    }
+
+    #[test]
+    fn manifest_versioning_stage_activate_rollback() {
+        let (store, dir) = tmp_store("ver");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) VALUES ('p','s','n','https://x.test','enabled',1,1)",
+                [],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m1','p',1,'builtin-template','{}',1,1)",
+                [],
+            ).unwrap();
+        }
+        let next = {
+            let conn = store.conn.lock().unwrap();
+            let n: i64 = conn.query_row("SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id='p'", [], |r| r.get(0)).unwrap();
+            conn.execute(
+                "INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m2','p',?1,'ai-patched','{}',1,0)",
+                rusqlite::params![n],
+            ).unwrap();
+            n
+        };
+        assert_eq!(next, 2);
+        // activate staged v2 -> returns previous v1
+        {
+            let mut conn = store.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            let prev: Option<i64> = tx.query_row("SELECT version FROM manifests WHERE provider_id='p' AND is_active=1", [], |r| r.get(0)).ok();
+            assert_eq!(prev, Some(1));
+            tx.execute("UPDATE manifests SET is_active=0 WHERE provider_id='p'", []).unwrap();
+            tx.execute("UPDATE manifests SET is_active=1 WHERE provider_id='p' AND version=2", []).unwrap();
+            tx.commit().unwrap();
+        }
+        // exactly one active, and rollback target exists
+        let conn = store.conn.lock().unwrap();
+        let active: Vec<i64> = conn.prepare("SELECT version FROM manifests WHERE is_active=1").unwrap()
+            .query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        assert_eq!(active, vec![2]);
+        let hist: i64 = conn.query_row("SELECT COUNT(*) FROM manifests WHERE provider_id='p'", [], |r| r.get(0)).unwrap();
+        assert_eq!(hist, 2);
+        // uq_manifests_one_active prevents two actives
+        let dup = conn.execute("INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m3','p',3,'ai-patched','{}',1,1)", []);
+        assert!(dup.is_err(), "unique partial index must reject a second active manifest");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drift_events_record_and_resolve() {
+        let (store, dir) = tmp_store("drift");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) VALUES ('p','s','n','https://x.test','enabled',1,1)",
+                [],
+            ).unwrap();
+            conn.execute("INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES ('p',1,'{\"errors\":5}')", []).unwrap();
+        }
+        let open: i64 = store.conn.lock().unwrap()
+            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(open, 1);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("UPDATE drift_events SET resolution='repaired', resolved_at=2 WHERE provider_id='p' AND resolution IS NULL", []).unwrap();
+        }
+        let open2: i64 = store.conn.lock().unwrap()
+            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| r.get(0)).unwrap();
+        assert_eq!(open2, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

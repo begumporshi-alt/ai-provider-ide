@@ -9,8 +9,10 @@
 import { useEffect, useMemo, useState } from "react";
 import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router";
 import {
-  addKey, addProvider, deleteKey, deleteProvider, registry, setKeyStatus, setProviderStatus, testKey, refreshCatalog,
+  addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, listManifestHistory,
+  pendingRepairs, registry, rollbackManifest, setKeyStatus, setProviderStatus, testKey, refreshCatalog,
 } from "../store";
+import type { HostManifestRow } from "../store";
 import { useUi } from "../ui-state";
 import {
   Button, Field, KeyFingerprint, Modal, StatusBadge, StatusDot, healthOf, inputCls, inputStyle,
@@ -27,6 +29,7 @@ export function ProvidersScreen() {
   const [addingKeyFor, setAddingKeyFor] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ kind: "provider" | "key"; id: string; name: string } | null>(null);
+  const [repairing, setRepairing] = useState<string | null>(null);
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -72,11 +75,29 @@ export function ProvidersScreen() {
                       />
                       Enabled
                     </label>
+                    {p.status === "repairing" && (
+                      <Button variant="primary" onClick={() => setRepairing(p.id)}>
+                        {pendingRepairs.has(p.id) ? "Review repair…" : "Repair…"}
+                      </Button>
+                    )}
+                    {p.status !== "repairing" && p.status !== "draft" && (
+                      <Button variant="ghost" onClick={() => void buildRepairPlan({
+                        providerId: p.id, providerSlug: p.slug,
+                        errors: 0, models: [], windowMs: 0, detectedAt: Date.now(),
+                      }).then(() => { setRepairing(p.id); bump(); })}>
+                        Check health
+                      </Button>
+                    )}
                     <Button variant="ghost" onClick={() => setConfirmDelete({ kind: "provider", id: p.id, name: p.name })}>
                       Remove
                     </Button>
                   </div>
                 </header>
+                {p.status === "repairing" && (
+                  <p className="mb-2 text-[12px]" style={{ color: "var(--warn)" }}>
+                    Drift suspected — requests still route here, but failover is covering. {pendingRepairs.has(p.id) ? "A repair plan is ready to review." : "Building a repair plan…"}
+                  </p>
+                )}
                 <table className="w-full">
                   <tbody>
                     {keys.map((k) => {
@@ -133,6 +154,7 @@ export function ProvidersScreen() {
       )}
 
       <NoticeBar />
+      {repairing && <RepairModal providerId={repairing} onClose={() => { setRepairing(null); bump(); }} />}
       {adding && <AddProviderModal onClose={() => setAdding(false)} onDone={() => { setAdding(false); bump(); }} />}
       {addingKeyFor && (
         <AddKeyModal
@@ -328,5 +350,93 @@ function NoticeBar() {
     <div className="fixed bottom-4 right-4 rounded border px-3 py-2 text-[12px] shadow-lg" style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}>
       {msg}
     </div>
+  );
+}
+
+
+function RepairModal({ providerId, onClose }: { providerId: string; onClose: () => void }) {
+  const tick = useUi((s) => s.tick);
+  void tick;
+  const entry = pendingRepairs.get(providerId);
+  const provider = registry.getProvider(providerId);
+  const [history, setHistory] = useState<HostManifestRow[] | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  useEffect(() => {
+    listManifestHistory(providerId).then(setHistory).catch(() => setHistory([]));
+  }, [providerId]);
+  if (!provider) return null;
+  const plan = entry?.plan;
+  const checks = plan?.candidate?.contract?.checks ?? [];
+  return (
+    <Modal title={`Repair — ${provider.name}`} onClose={onClose}>
+      {entry?.error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{entry.error}</p>}
+      {!entry && <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>No drift event recorded.</p>}
+      {entry && (
+        <>
+          <div className="mb-3">
+            <div className="mb-1 text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Evidence</div>
+            <ul className="list-disc pl-5 text-[12px]" style={{ color: "var(--text-dim)" }}>
+              {plan
+                ? plan.evidence.map((e, i) => <li key={i}>{e}</li>)
+                : [`${entry.evidence.errors} drift-class errors across ${entry.evidence.models.length} models in the last 15 min`]}
+            </ul>
+          </div>
+          {checks.length > 0 && (
+            <div className="mb-3">
+              <div className="mb-1 text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Contract checks (proposed adapter)</div>
+              {checks.map((c, i) => (
+                <div key={i} className="text-[12px]">
+                  <span style={{ color: c.pass ? "var(--success)" : "var(--danger)" }}>{c.pass ? "✓" : "✕"}</span> {c.name}
+                  {c.detail && <span style={{ color: "var(--text-faint)" }}> — {c.detail}</span>}
+                </div>
+              ))}
+            </div>
+          )}
+          {plan?.status === "planned" && (
+            <div className="flex items-center gap-2">
+              <Button variant="primary" disabled={busy} onClick={async () => {
+                setBusy(true);
+                const r = await approveRepair(providerId).catch((e) => { setMsg(String((e as Error).message)); return undefined; });
+                setBusy(false);
+                if (r) { setMsg(`Repaired — adapter v${r.version}${r.previous ? ` (previous v${r.previous} kept for rollback)` : ""}`); window.setTimeout(onClose, 1200); }
+              }}>
+                Approve & apply
+              </Button>
+              <Button variant="danger" onClick={async () => { setBusy(true); await setProviderStatus(providerId, "enabled"); setBusy(false); onClose(); }}>
+                Keep current adapter
+              </Button>
+            </div>
+          )}
+          {plan && plan.status !== "planned" && (
+            <p className="text-[12px]" style={{ color: "var(--warn)" }}>
+              {plan.status === "no_ai_available"
+                ? "Automated patch unavailable — add another healthy provider so the AI has a model to run on, or edit the adapter after the Phase-6 sandbox."
+                : "No repair candidate passed the contract checks. Re-run checks later; requests keep routing via failover."}
+            </p>
+          )}
+        </>
+      )}
+      {history && history.length > 1 && (
+        <div className="mt-3 border-t pt-2" style={{ borderColor: "var(--border)" }}>
+          <div className="mb-1 text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Adapter history</div>
+          {history.map((h) => (
+            <div key={h.version} className="flex items-center gap-2 text-[12px]">
+              <span className="mono">v{h.version}</span>
+              <span style={{ color: "var(--text-dim)" }}>{h.origin}</span>
+              {h.isActive ? <span className="rounded px-1 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--success)" }}>active</span> : (
+                <button className="text-[11px] underline decoration-dotted" style={{ color: "var(--text-dim)" }} onClick={async () => {
+                  await rollbackManifest(providerId, h.version);
+                  setMsg(`Rolled back to v${h.version}`);
+                }}>
+                  roll back to this
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {msg && <p className="mt-2 text-[12px]" style={{ color: "var(--success)" }}>{msg}</p>}
+    </Modal>
   );
 }

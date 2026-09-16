@@ -7,16 +7,20 @@
 import { invoke } from "@tauri-apps/api/core";
 import {
   AdapterRuntime,
+  DriftMonitor,
   ModelCatalog,
   ModelRouter,
   ProviderRegistry,
+  RepairOrchestrator,
   UsageLedger,
   PROVIDER_PROFILES,
   type AdapterManifest,
   type ApiKeyRecord,
   type CatalogModel,
+  type DriftEvidence,
   type LedgerEntry,
   type ProviderRecord,
+  type RepairPlan,
 } from "@aiprovider/router";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 
@@ -86,6 +90,117 @@ export const ledger = new UsageLedger({
 });
 export const catalog = new ModelCatalog(registry, adapters);
 export const router = new ModelRouter(registry, adapters, catalog, ledger);
+
+// ---------- Phase 5: drift detection + repair ----------
+
+/** Providers currently in repair flow: id -> evidence + plan (UI subscribes via useUi tick). */
+export const pendingRepairs = new Map<string, { evidence: DriftEvidence; plan?: RepairPlan; error?: string }>();
+
+const requestTimes: { requestedModel: string; providerId: string; ts: number }[] = [];
+
+export const driftMonitor = new DriftMonitor({
+  succeededElsewhere: (requestedModel, excludeProviderId) => {
+    // recent success for the same requested model via a different provider
+    const now = Date.now();
+    return ledger
+      .query({ since: now - 60 * 60_000 })
+      .some((e) => e.status === "ok" && e.requestedModel === requestedModel && e.providerId && e.providerId !== excludeProviderId);
+  },
+  onTrigger: (e) => {
+    void invoke("drift_event_record", { providerId: e.providerId, triggerJson: JSON.stringify(e) }).catch(() => undefined);
+    // mark repairing (failover keeps serving) and open the plan in the background
+    void setProviderStatus(e.providerId, "repairing").catch(() => undefined);
+    void buildRepairPlan(e).catch(() => undefined);
+  },
+});
+
+// observe every attempt; keep a model->provider success index for the "elsewhere" test
+router.onAttempt = (a) => {
+  driftMonitor.observe(a);
+  if (a.cls === "OK") {
+    requestTimes.push({ requestedModel: a.requestedModel, providerId: a.providerId, ts: a.ts });
+    if (requestTimes.length > 2000) requestTimes.splice(0, requestTimes.length - 2000);
+  }
+};
+
+export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPlan | undefined> {
+  const provider = registry.getProvider(evidence.providerId);
+  if (!provider) return undefined;
+  const { interpreter } = await adapters.forProvider(provider.id);
+  const secretRef = registry.keysOf(provider.id)[0]?.secretRef;
+  if (!secretRef) return undefined;
+  const otherHealthy = registry.listProviders().filter((p) => p.id !== provider.id && p.status === "enabled").length;
+  const entry = { evidence };
+  pendingRepairs.set(provider.id, entry);
+  try {
+    // free re-checks produce the failing-assertions context for the AI patch prompt
+    const { runContractSuite } = await import("@aiprovider/router");
+    const contract = await runContractSuite(interpreter, { secretRef, consent: { text: false, image: false } });
+    const plan = await new RepairOrchestrator({
+      http,
+      ai: router,
+      systemLabel: routerSettingsLabel(),
+      currentManifest: interpreter.manifest,
+      currentVersion: 1,
+      provider: { id: provider.id, slug: provider.slug, name: provider.name, baseUrl: provider.baseUrl },
+      secretRef,
+      otherHealthyProviders: otherHealthy,
+      failingChecks: contract.checks.filter((c) => !c.pass),
+      audit: async (a) => {
+        await invoke("generator_audit_record", {
+          e: { modelUsed: a.modelUsed, promptTokens: Math.round(a.promptChars / 4), completionTokens: Math.round(a.completionChars / 4), redactionHash: a.redactionHash },
+        }).catch(() => undefined);
+      },
+    }).plan();
+    pendingRepairs.set(provider.id, { ...entry, plan });
+    return plan;
+  } catch (err) {
+    pendingRepairs.set(provider.id, { ...entry, error: String((err as Error).message) });
+    return undefined;
+  }
+}
+
+function routerSettingsLabel(): string {
+  const sa = router.settings.systemAi;
+  if (sa) return `${registry.getProvider(sa.providerId)?.slug ?? "?"}/${sa.model} (system)`;
+  return "auto (system)";
+}
+
+/** Human confirms the staged repair: stage new manifest version + activate + hot-swap. */
+export async function approveRepair(providerId: string): Promise<{ version: number; previous: number | null } | undefined> {
+  const entry = pendingRepairs.get(providerId);
+  const manifest = entry?.plan?.candidate?.manifest ?? entry?.plan?.deterministic;
+  if (!manifest || !entry) return undefined;
+  const origin = entry.plan?.candidate ? "ai-patched" : "builtin-template";
+  const version = await invoke<number>("manifest_stage", {
+    m: {
+      id: crypto.randomUUID(), providerId, version: 0, origin,
+      bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
+      contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
+      createdAt: Date.now(), isActive: false,
+    },
+  });
+  const previous = await invoke<number | null>("manifest_activate", { providerId, version });
+  adapters.register(providerId, manifest); // hot-swap
+  await setProviderStatus(providerId, "enabled");
+  await refreshCatalog(providerId).catch(() => undefined);
+  await invoke("drift_event_resolve", { providerId, resolution: `repaired v${version}` }).catch(() => undefined);
+  pendingRepairs.delete(providerId);
+  return { version, previous };
+}
+
+export async function rollbackManifest(providerId: string, version: number): Promise<void> {
+  await invoke("manifest_activate", { providerId, version });
+  const rows = await invoke<HostManifestRow[]>("manifests_active");
+  const row = rows.find((r) => r.providerId === providerId);
+  if (row) {
+    adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
+  }
+}
+
+export async function listManifestHistory(providerId: string): Promise<HostManifestRow[]> {
+  return invoke<HostManifestRow[]>("manifests_history", { providerId });
+}
 
 let bootstrapped = false;
 
