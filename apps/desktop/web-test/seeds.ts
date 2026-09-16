@@ -16,9 +16,13 @@ export const MOCK_ORIGIN = `http://127.0.0.1:${MOCK_PORT}`;
 export const ORACLE_BASE = `${MOCK_ORIGIN}/v1`;
 /** A provider the declarative grammar genuinely cannot express (see mock.mjs). */
 export const EXOTIC_BASE = `${MOCK_ORIGIN}/v2`;
+/** OpenRouter-shaped catalog: namespaced ids, capability only in metadata (see mock.mjs). */
+export const OR_ROUTER_BASE = `${MOCK_ORIGIN}/v3`;
 export const ORACLE_KEY = "sk-oracle-works";
 /** The exotic's key. Must match RAW_EXOTIC_KEY in web-test/mock.mjs. */
 export const EXOTIC_KEY = "sk-nd-works";
+/** The OpenRouter-shaped provider's key. Must match RAW_OR_KEY in web-test/mock.mjs. */
+export const OR_ROUTER_KEY = "sk-or-router-works";
 
 export interface SeedInput {
   providers?: { id: string; slug: string; name: string; type: string; baseUrl: string; status: string; rotationStrategy: string; createdAt: number; updatedAt: number }[];
@@ -98,7 +102,63 @@ function systemAi(): SeedInput {
   };
 }
 
-const SEEDS: Record<string, () => SeedInput> = { systemai: systemAi };
+/**
+ * The production bug shape, reproduced (regression fixture for the 2026-09-16 modality
+ * amendment): an ENABLED OpenRouter provider whose cache holds a catalog with ZERO image
+ * models — exactly what the anchored id-pattern rule produced before the fix, and what is
+ * still sitting in a real user's SQLite after upgrading. The Image tab is empty here, and the
+ * spec asserts that Models > Refresh fills it by classifying the provider's own metadata.
+ *
+ * slug is deliberately "openrouter" so store.ts registers the REAL shipped profile (not a
+ * template): the seed's cached rows cannot hide a regression in that profile, because the rows
+ * are replaced by whatever a live refresh derives them from.
+ */
+function orRouter(): SeedInput {
+  const providerId = "seed-or";
+  return {
+    providers: [
+      {
+        id: providerId,
+        slug: "openrouter",
+        name: "OpenRouter (mock)",
+        type: "builtin",
+        baseUrl: OR_ROUTER_BASE,
+        status: "enabled",
+        rotationStrategy: "round_robin",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+    keys: [
+      {
+        id: "seed-or-key",
+        providerId,
+        label: "key-01",
+        secretRef: "key-01",
+        secret: OR_ROUTER_KEY,
+        secretHint: null,
+        status: "active",
+        priority: 1,
+        cooldownUntil: null,
+        addedAt: now,
+        lastUsedAt: null,
+        lastTestedAt: null,
+      },
+    ],
+    // The pre-fix cache: every namespaced id tagged text, so the Image tab has nothing.
+    models: [
+      { providerId, nativeId: "openai/gpt-5-image", modality: "text", contextWindow: null, fetchedAt: now },
+      { providerId, nativeId: "google/gemini-2.5-flash-image", modality: "text", contextWindow: null, fetchedAt: now },
+      { providerId, nativeId: "openrouter/auto", modality: "text", contextWindow: null, fetchedAt: now },
+      { providerId, nativeId: "openai/gpt-4o", modality: "text", contextWindow: null, fetchedAt: now },
+    ],
+    settings: {
+      router: JSON.stringify({ failoverEnabled: true, systemAi: null }),
+    },
+  };
+}
+
+const SEEDS: Record<string, () => SeedInput> = { systemai: systemAi, "or-router": orRouter };
 
 export function seedByName(name: string): SeedInput | null {
   const fn = SEEDS[name.toLowerCase()];

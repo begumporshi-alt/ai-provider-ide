@@ -4,9 +4,9 @@
  * (baseUrl + quirks) on top. These are DATA, not code paths — a new OpenAI-compatible provider
  * is a profile or a wizard entry, never a release.
  */
-import type { AdapterManifest } from "@aiprovider/adapter-spec";
+import type { AdapterManifest, ModalityRule } from "@aiprovider/adapter-spec";
 
-function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, string>; imageEndpoint?: boolean }): AdapterManifest {
+function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, string>; imageEndpoint?: boolean; imagePath?: string; imageRule?: ModalityRule }): AdapterManifest {
   return {
     manifestVersion: 1,
     kind: "declarative",
@@ -37,7 +37,7 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
         ? {
             generateImage: {
               method: "POST" as const,
-              path: "/images/generations",
+              path: extra.imagePath ?? "/images/generations",
               requestTemplate: { model: "{{model}}", prompt: "{{prompt}}", size: "{{size?}}" },
               responseMap: { imageB64: "$.data[0].b64_json", imageUrl: "$.data[0].url" },
             },
@@ -46,7 +46,7 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
     },
     capabilities: { text: true, image: Boolean(extra?.imageEndpoint) },
     modalityRules: extra?.imageEndpoint
-      ? { image: { modelIdPattern: "^(dall-e|flux|sd|imagen|seedream|nano-banana)" } }
+      ? { image: extra.imageRule ?? { modelIdPattern: "^(dall-e|flux|sd|imagen|seedream|nano-banana)" } }
       : undefined,
     provenance: { origin: "builtin-template", generatorModel: null, createdAt: "1970-01-01T00:00:00Z" },
   };
@@ -109,6 +109,15 @@ export const PROVIDER_PROFILES: Record<string, () => AdapterManifest> = {
     openaiCompat("https://openrouter.ai/api/v1", {
       textHeaders: { "HTTP-Referer": "{{appUrl}}", "X-Title": "AI-Provider IDE" },
       imageEndpoint: true,
+      // OpenRouter serves image generation from its own Image API, NOT /images/generations.
+      imagePath: "/images",
+      // OpenRouter namespaces every id (google/gemini-2.5-flash-image), so an id pattern can
+      // never classify it — declared id patterns match zero of its 444 models. Its catalog
+      // states the capability instead: architecture.output_modalities. Matching element [0]
+      // (PRIMARY output) rather than array membership keeps `openrouter/auto` and
+      // `auto-beta` — output ["text","image" in that order] — text models, where they belong;
+      // the 9 genuine image models lead with "image".
+      imageRule: { rawMatch: { path: "$.architecture.output_modalities[0]", contains: "image" } },
     }),
   opencode: () => openaiCompat("https://opencode.ai/zen/v1", { imageEndpoint: false }),
   "b.ai": () => anthropicCompat("https://api.b.ai/v1"),

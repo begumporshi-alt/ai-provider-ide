@@ -263,6 +263,12 @@ export async function bootstrap(): Promise<void> {
       /* keep defaults */
     }
   }
+
+  // Self-heal a stale catalog: a persisted cache can outlive its adapter's modality rules
+  // (the 2026-09-16 rawMatch amendment is the case), and `isStale` was never called, so a
+  // pre-fix cache would otherwise keep showing wrong classifications until a manual refresh.
+  // Rows already fresh are untouched; failures leave the stale rows in place (stale-fallback).
+  await refreshStaleCatalogs().catch(() => undefined);
 }
 
 async function refreshFromHost(): Promise<void> {
@@ -271,6 +277,27 @@ async function refreshFromHost(): Promise<void> {
     invoke<HostKeyRow[]>("api_keys_list", { providerId: null }),
   ]);
   registry.hydrate(providers.map(hostToProvider), keys.map(hostToKey));
+}
+
+/**
+ * Boot-time catalog self-heal: re-list exactly the enabled providers whose cached rows are
+ * missing or stale (TTL 24h), then persist the fresh rows. Never touches a provider without
+ * an active key or with live rows, and a failed refresh leaves the stale rows in place.
+ * Derived aliases are recomputed once at the end so ids that changed classification (or
+ * appeared) get the same alias treatment as any manual refresh.
+ */
+async function refreshStaleCatalogs(): Promise<void> {
+  const providers = registry.listProviders();
+  const stale = providers.filter(
+    (p) => p.status === "enabled" && registry.keysOf(p.id).some((k) => k.status === "active") && catalog.isStale(p.id),
+  );
+  for (const p of stale) {
+    await refreshCatalog(p.id).catch(() => undefined);
+  }
+  if (stale.length) {
+    catalog.deriveAutoAliases();
+    await persistAliases().catch(() => undefined);
+  }
 }
 
 async function persistAliases(): Promise<void> {

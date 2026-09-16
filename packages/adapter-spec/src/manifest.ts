@@ -8,17 +8,33 @@
  */
 import { z } from "zod";
 
-export const MODALITY_RULE = z.object({
-  modelIdPattern: z.string(), // regex string; model ids matching => this modality
-});
+/** A JSONPath selector within the supported subset (see router-core/jsonpath.ts). */
+const Selector = z.string().startsWith("$");
+
+/**
+ * How a model is classified into a modality (v1.1; `rawMatch` added by the 2026-09-16
+ * amendment, DECISIONS.md). A rule matches when EITHER matcher succeeds:
+ *  - `modelIdPattern` — regex over the native model id (bare ids: `dall-e-3`);
+ *  - `rawMatch` — the provider's own model metadata, selected from the raw object returned
+ *    by `listModels.map.raw`. `contains` matches when the selected value equals the string,
+ *    or is an array containing it. Namespaced catalogs (OpenRouter) are the motivating case:
+ *    `{path: "$.architecture.output_modalities[0]", contains: "image"}`.
+ */
+export const MODALITY_RULE = z
+  .object({
+    modelIdPattern: z.string().optional(),
+    rawMatch: z.object({ path: Selector, contains: z.string() }).optional(),
+  })
+  .refine((r) => r.modelIdPattern !== undefined || r.rawMatch !== undefined, {
+    message: "a modality rule needs modelIdPattern or rawMatch",
+  });
+
+export type ModalityRule = z.infer<typeof MODALITY_RULE>;
 
 export const MANIFEST_ENDPOINT_AUTH_HEADER = z.object({
   name: z.string().min(1),
   prefix: z.string().optional(), // e.g. "Bearer"
 });
-
-/** A JSONPath selector within the supported subset (see router-core/jsonpath.ts). */
-const Selector = z.string().startsWith("$");
 
 export const LIST_MODELS_ENDPOINT = z.object({
   method: z.literal("GET"),

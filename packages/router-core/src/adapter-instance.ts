@@ -11,7 +11,12 @@ import type { ImageAttemptResult, ModelEntry, TextArgs } from "./manifest-interp
 export interface AdapterInstance {
   readonly manifest: AdapterManifest;
   capabilities(): { text: boolean; image: boolean };
-  tagModality(nativeId: string): "text" | "image";
+  /**
+   * Takes the whole ModelEntry, not just the id: since the 2026-09-16 amendment a rule may
+   * match the provider's own metadata (`rawMatch` over `entry.raw`) instead of a regex on the
+   * id — the only way to classify namespaced catalogs like OpenRouter's.
+   */
+  tagModality(entry: ModelEntry): "text" | "image";
   listModels(secretRef: string, signal?: AbortSignal): Promise<ModelEntry[]>;
   generateText(secretRef: string, args: TextArgs, signal?: AbortSignal): AsyncGenerator<string>;
   generateImage(

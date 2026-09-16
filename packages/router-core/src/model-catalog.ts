@@ -6,6 +6,7 @@ import type { Modality } from "@aiprovider/adapter-spec";
 import type { AliasEntry, CatalogModel } from "./domain.js";
 import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ProviderRegistry } from "./provider-registry.js";
+import type { ModelEntry } from "./manifest-interpreter.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -30,7 +31,7 @@ export class ModelCatalog {
     const { adapter } = await this.adapters.forProvider(providerId);
     const keys = this.registry.keysOf(providerId).filter((k) => k.status === "active");
     if (!keys.length) throw new Error(`provider ${providerId} has no active key`);
-    let entries: { nativeId: string }[] = [];
+    let entries: ModelEntry[] = [];
     let lastErr: unknown;
     for (const k of keys) {
       try {
@@ -48,7 +49,7 @@ export class ModelCatalog {
       this.models.push({
         providerId,
         nativeId: e.nativeId,
-        modality: adapter.tagModality(e.nativeId) as Modality,
+        modality: adapter.tagModality(e) as Modality,
         fetchedAt: now,
       });
     }

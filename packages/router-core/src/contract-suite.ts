@@ -10,6 +10,7 @@
  */
 
 import type { AdapterInstance } from "./adapter-instance.js";
+import type { ModelEntry } from "./manifest-interpreter.js";
 
 export interface ContractCheck {
   name: string;
@@ -42,6 +43,7 @@ export async function runContractSuite(
 
   // 1. ping + model list (free)
   let models: string[] = [];
+  let entries: ModelEntry[] = [];
   try {
     const ping = await adapter.pingKey(opts.secretRef, opts.signal);
     checks.push({
@@ -51,7 +53,7 @@ export async function runContractSuite(
       detail: ping.ok ? undefined : (ping.message ?? `HTTP ${ping.status}`),
     });
     if (ping.ok) {
-      const entries = await adapter.listModels(opts.secretRef, opts.signal);
+      entries = await adapter.listModels(opts.secretRef, opts.signal);
       models = entries.map((e) => e.nativeId);
       const sane = models.length > 0 && models.every((m) => typeof m === "string" && m.length > 0 && m.length < 200);
       checks.push({
@@ -92,12 +94,14 @@ export async function runContractSuite(
 
   // 3. minimal image generation (PAID — consent, only if the manifest claims images)
   if (opts.consent.image && adapter.capabilities().image) {
-    const imageModel =
-      opts.imageModel ??
-      models.find((m) => adapter.tagModality(m) === "image") ??
-      adapter.tagModality(models[0] ?? "") === "image"
-        ? models[0]
-        : undefined;
+    // Prefer an explicitly requested model, else the first image-CLASSIFIED model. The tag check
+    // used to sit under `??` with a trailing ternary, so `a ?? b ?? c ? d : e` grouped as
+    // `(a ?? b ?? c) ? d : e` and every probe fell through to models[0] — a text model — making
+    // the paid image check fail (or bill the wrong model) on every provider. Passing the whole
+    // entry also lets metadata-based rules (rawMatch) vote, which is the only signal a namespaced
+    // catalog like OpenRouter's gives.
+    const imageEntry = entries.find((e) => adapter.tagModality(e) === "image");
+    const imageModel = opts.imageModel ?? imageEntry?.nativeId;
     if (imageModel) {
       try {
         const res = await adapter.generateImage(

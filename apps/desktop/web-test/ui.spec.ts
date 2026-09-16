@@ -177,3 +177,54 @@ test("image URL from a provider is fetched through egress and rendered", async (
   const seenImg = await (await page.request.get(`${MOCK_ORIGIN}/v1/e2e/img-seen`)).json();
   expect(seenImg.path).toBe("/v1/img/tiny.png");
 });
+
+// ---------------------------------------------------------------------------
+// Story 5 — the OpenRouter regression (2026-09-16 modality amendment, DECISIONS.md).
+//
+// The seed reproduces the exact state a real user is left in after upgrading: an enabled
+// OpenRouter provider whose persisted catalog has EVERY namespaced id tagged "text", because
+// the profile's anchored id-pattern rule ("^dall-e|flux|...") matches none of them. The Image
+// tab is therefore empty. Models > Refresh must re-list the provider and classify from the
+// provider's OWN metadata — architecture.output_modalities — through map.raw -> rawMatch.
+//
+// Asserted precisely, because a loose check would pass on the wrong behaviour:
+//   - the two image-primary models appear in the Image tab;
+//   - openrouter/auto does NOT, even though its output_modalities also names "image"
+//     (its PRIMARY output is text — the whole reason the rule reads index [0]);
+//   - generation still works: the provider's real route is /images, and it answers with
+//     base64 + media_type and no url, which the UI must render.
+// ---------------------------------------------------------------------------
+
+test("OpenRouter: image models are discovered from provider metadata, not their ids", async ({ page }) => {
+  await page.goto(`${APP}?seed=or-router`);
+  await expect(page.getByText("OpenRouter (mock)")).toBeVisible();
+
+  // Pre-fix state: the provider is enabled and cataloged, yet has no image models at all.
+  await page.getByRole("button", { name: "Model Browser" }).click();
+  await page.getByRole("button", { name: "Image Models" }).click();
+  await expect(page.getByText("0 image models")).toBeVisible();
+
+  // Refresh re-lists over the wire and re-tags from the provider's own metadata.
+  await page.getByRole("button", { name: /Refresh OpenRouter/ }).click();
+  await expect(page.getByText("2 image models")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByText("openai/gpt-5-image")).toBeVisible();
+  await expect(page.getByText("google/gemini-2.5-flash-image")).toBeVisible();
+
+  // The dual-modality auto-router stays in Text — index [0] is what makes that distinction.
+  await page.getByRole("button", { name: "Text Models" }).click();
+  await expect(page.getByText("openrouter/auto")).toBeVisible();
+  await expect(page.getByText("2 text models")).toBeVisible();
+
+  // And generation routes to the provider's real image API, rendering the returned base64.
+  await page.getByRole("button", { name: "Playground" }).click();
+  await page.getByRole("button", { name: "Image" }).click();
+  await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
+  const combo = page.getByRole("combobox");
+  const value = await combo.locator("option").filter({ hasText: /openai\/gpt-5-image/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
+  await combo.selectOption(value);
+  await page.getByRole("button", { name: "Generate" }).click();
+
+  const img = page.locator('img[alt="generated"]');
+  await expect(img).toBeVisible({ timeout: 30_000 });
+  expect(await img.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+});

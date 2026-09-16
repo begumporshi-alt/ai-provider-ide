@@ -19,6 +19,8 @@ import { createServer } from "node:http";
 const PORT = 18901;
 const MOCK_ORIGIN = `http://127.0.0.1:${PORT}`;
 const RAW_EXOTIC_KEY = "sk-nd-works";
+/** Must match OR_ROUTER_KEY in web-test/seeds.ts. */
+const RAW_OR_KEY = "sk-or-router-works";
 
 // ---------------------------------------------------------------------------
 // The Tier-2 envelope the oracle returns for the code-adapter round.
@@ -207,14 +209,54 @@ async function exotic(req, res, path) {
 }
 
 // ---------------------------------------------------------------------------
+// The OpenRouter-shaped provider (/v3): vendor-namespaced ids whose image capability is
+// stated ONLY in architecture.output_modalities. This is the regression fixture for the
+// 2026-09-16 modality amendment — an id-pattern rule matches ZERO of these ids, and
+// openrouter/auto must stay a TEXT model despite also listing "image". Image generation is
+// served from /images (OpenRouter's own Image API), not /images/generations.
+// ---------------------------------------------------------------------------
+
+const OR_MODELS = {
+  data: [
+    { id: "openai/gpt-5-image", architecture: { input_modalities: ["text"], output_modalities: ["image", "text"] } },
+    { id: "google/gemini-2.5-flash-image", architecture: { input_modalities: ["text", "image"], output_modalities: ["image", "text"] } },
+    // Dual-modality router: PRIMARY output is text, so it must NOT appear in the Image tab.
+    { id: "openrouter/auto", architecture: { input_modalities: ["text"], output_modalities: ["text", "image"] } },
+    { id: "openai/gpt-4o", architecture: { input_modalities: ["text"], output_modalities: ["text"] } },
+  ],
+};
+
+async function orRouter(req, res, path) {
+  if (path === "/models" && req.method === "GET") {
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${RAW_OR_KEY}`) return json(res, 401, { error: { message: "No auth credentials found" } });
+    return json(res, 200, OR_MODELS);
+  }
+  if (path === "/images" && req.method === "POST") {
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${RAW_OR_KEY}`) return json(res, 401, { error: { message: "No auth credentials found" } });
+    const body = JSON.parse((await readBody(req)) || "{}");
+    if (!String(body.prompt ?? "").trim()) return json(res, 400, { error: { message: "prompt required" } });
+    // OpenRouter's real shape: stateful base64, media_type, no url field.
+    return json(res, 200, {
+      created: Math.floor(Date.now() / 1000),
+      data: [{ b64_json: PNG_1PX.toString("base64"), media_type: "image/png" }],
+      usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 },
+    });
+  }
+  return notFound(res);
+}
+
+// ---------------------------------------------------------------------------
 
 const server = createServer(async (req, res) => {
   try {
     if (req.method === "OPTIONS") return cors(res);
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
-    const path = url.pathname.replace(/^\/(v1|v2)/, "");
+    const path = url.pathname.replace(/^\/(v1|v2|v3)/, "");
     if (req.url.startsWith("/v1/")) return await oracle(req, res, path);
     if (req.url.startsWith("/v2/")) return await exotic(req, res, path);
+    if (req.url.startsWith("/v3/")) return await orRouter(req, res, path);
     return notFound(res);
   } catch (e) {
     res.writeHead(500, { "Access-Control-Allow-Origin": "*", "Content-Type": "application/json" });

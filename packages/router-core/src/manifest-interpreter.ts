@@ -8,6 +8,7 @@
 import type { AdapterManifest, GenerateImageEndpoint, GenerateTextEndpoint, ListModelsEndpoint } from "@aiprovider/adapter-spec";
 import { selectAll, selectOne } from "./jsonpath.js";
 import { renderTemplate } from "./template.js";
+import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 
 export interface HttpPortLike {
@@ -97,10 +98,8 @@ export class ManifestInterpreter implements AdapterInstance {
     return this.m.capabilities;
   }
 
-  tagModality(nativeId: string): "text" | "image" {
-    const rules = this.m.modalityRules;
-    if (rules?.image && new RegExp(rules.image.modelIdPattern).test(nativeId)) return "image";
-    return "text";
+  tagModality(entry: ModelEntry): "text" | "image" {
+    return tagModalityFrom(this.m.modalityRules, entry);
   }
 
   async listModels(secretRef: string, signal?: AbortSignal): Promise<ModelEntry[]> {
@@ -119,9 +118,17 @@ export class ManifestInterpreter implements AdapterInstance {
     if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text());
     const json: unknown = JSON.parse(await res.text());
     const models: ModelEntry[] = [];
-    for (const raw of selectAll(json, ep.map.models)) {
-      const id = typeof raw === "string" ? raw : String((raw as Record<string, unknown>)?.id ?? "");
-      if (id) models.push({ nativeId: id, raw });
+    const raws = ep.map.raw ? selectAll(json, ep.map.raw) : [];
+    const items = selectAll(json, ep.map.models);
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      const id = typeof item === "string" ? item : String((item as Record<string, unknown>)?.id ?? "");
+      if (!id) continue;
+      // `map.raw` (v1.1) selects the raw model objects alongside the id list; index-aligned,
+      // since both selectors walk the same collection. Falls back to the id item itself when
+      // absent or misaligned, preserving pre-amendment behavior.
+      const raw = raws.length === items.length ? raws[i] : item;
+      models.push({ nativeId: id, raw });
     }
     return models;
   }

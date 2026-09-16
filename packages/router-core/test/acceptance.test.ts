@@ -15,7 +15,14 @@ import { AllAttemptsFailedError } from "../src/execution-engine.js";
 import { FakeHttp, FakeVault } from "./fakes.js";
 
 const OPENAI_TEXT_OK = (url: string): { status: number; body?: unknown; lines?: string[] } => {
-  if (url.endsWith("/models")) return { status: 200, body: { data: [{ id: "gpt-4o" }, { id: "dall-e-3" }] } };
+  if (url.endsWith("/models")) {
+    // Shape mirrors OpenRouter's real catalog: capability is stated in
+    // `architecture.output_modalities`, NOT inferable from the id (real ids are namespaced).
+    return { status: 200, body: { data: [
+      { id: "gpt-4o", architecture: { output_modalities: ["text"] } },
+      { id: "dall-e-3", architecture: { output_modalities: ["image"] } },
+    ] } };
+  }
   if (url.endsWith("/chat/completions")) {
     return { status: 200, lines: [
       `data: ${JSON.stringify({ choices: [{ delta: { content: "Hel" } }] })}`,
@@ -24,7 +31,9 @@ const OPENAI_TEXT_OK = (url: string): { status: number; body?: unknown; lines?: 
       "data: [DONE]",
     ] };
   }
-  if (url.endsWith("/images/generations")) return { status: 200, body: { data: [{ url: "https://img.example/x.png" }] } };
+  // OpenRouter's profile posts image generation to its own Image API at /images (not the
+  // OpenAI-compatible /images/generations), so that is the path this fake must serve.
+  if (url.endsWith("/images")) return { status: 200, body: { data: [{ b64_json: "QUJD", url: "https://img.example/x.png" }] } };
   return { status: 404 };
 };
 
@@ -177,10 +186,13 @@ describe("acceptance 4 — text + image end-to-end (core level)", () => {
   it("image generation resolves url + b64", async () => {
     const s = makeSetup({ responder: OPENAI_TEXT_OK });
     await addKeys(s, "pA", 1);
-    // tag dall-e-3 as image via the openrouter profile's modalityRules
+    // dall-e-3 is tagged image purely from the provider's architecture.output_modalities —
+    // the OpenRouter profile carries no id pattern for it (real OpenRouter ids are namespaced).
     await s.catalog.refreshProvider("pA");
     const imgs = s.catalog.forModality("image").map((m) => m.nativeId);
-    expect(imgs).toContain("dall-e-3");
+    expect(imgs).toEqual(["dall-e-3"]);
+    const texts = s.catalog.forModality("text").map((m) => m.nativeId);
+    expect(texts).toEqual(["gpt-4o"]);
     const res = await s.router.generateImage({ model: "openrouter/dall-e-3", prompt: "cat" });
     expect(res.url).toBe("https://img.example/x.png");
     const entry = s.ledger.query()[0]!;

@@ -48,6 +48,7 @@ import {
 } from "quickjs-emscripten-core";
 import type { HttpPort } from "./ports.js";
 import type { AdapterInstance } from "./adapter-instance.js";
+import { tagModality as tagModalityFrom } from "./modality.js";
 import type { ImageAttemptResult, ModelEntry, TextArgs } from "./manifest-interpreter.js";
 
 export class SandboxError extends Error {
@@ -128,10 +129,8 @@ export class CodeAdapterInstance implements AdapterInstance {
     return this.manifest.capabilities;
   }
 
-  tagModality(nativeId: string): "text" | "image" {
-    const rules = this.manifest.modalityRules;
-    if (rules?.image && new RegExp(rules.image.modelIdPattern).test(nativeId)) return "image";
-    return "text";
+  tagModality(entry: ModelEntry): "text" | "image" {
+    return tagModalityFrom(this.manifest.modalityRules, entry);
   }
 
   // ---------- sandbox lifecycle ----------

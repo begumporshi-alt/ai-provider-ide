@@ -89,8 +89,20 @@ describe("CodeAdapterInstance construction", () => {
   it("exposes manifest-derived capabilities and modality tagging", () => {
     const a = makeAdapter();
     expect(a.capabilities()).toEqual({ text: true, image: true });
-    expect(a.tagModality("img-2")).toBe("image");
-    expect(a.tagModality("text-1")).toBe("text");
+    // tagModality takes the whole entry (2026-09-16 amendment): a rule may match raw metadata,
+    // so the id alone is no longer enough to classify. The id-pattern rule still votes here.
+    expect(a.tagModality({ nativeId: "img-2", raw: { id: "img-2" } })).toBe("image");
+    expect(a.tagModality({ nativeId: "text-1", raw: { id: "text-1" } })).toBe("text");
+  });
+  it("classifies by raw provider metadata when the id says nothing (namespaced catalogs)", () => {
+    const m = codeManifest(GOOD_GUEST);
+    m.modalityRules = { image: { rawMatch: { path: "$.architecture.output_modalities[0]", contains: "image" } } };
+    const a = new CodeAdapterInstance(m, { http: new FakeHttp(RESPOND) });
+    expect(a.tagModality({ nativeId: "google/gemini-2.5-flash-image", raw: { architecture: { output_modalities: ["image", "text"] } } })).toBe("image");
+    // auto-router leads with text -> stays a text model even though it can also emit images
+    expect(a.tagModality({ nativeId: "openrouter/auto", raw: { architecture: { output_modalities: ["text", "image"] } } })).toBe("text");
+    // metadata absent entirely -> text (never guess)
+    expect(a.tagModality({ nativeId: "openai/gpt-4o", raw: { id: "openai/gpt-4o" } })).toBe("text");
   });
 });
 

@@ -84,3 +84,38 @@ describe("manifest grammar: adapter kind (§2.7)", () => {
     expect(r.success).toBe(false);
   });
 });
+
+describe("manifest grammar: modalityRules (2026-09-16 amendment — rawMatch)", () => {
+  const withRules = (rules: unknown) => ADAPTER_MANIFEST_V1_1.safeParse({ ...validManifest, modalityRules: rules });
+
+  it("accepts the pre-amendment id-pattern shape unchanged", () => {
+    expect(withRules({ image: { modelIdPattern: "^dall-e" } }).success).toBe(true);
+  });
+
+  it("accepts the new metadata matcher with no id pattern (the OpenRouter case)", () => {
+    const r = withRules({ image: { rawMatch: { path: "$.architecture.output_modalities[0]", contains: "image" } } });
+    expect(r.success).toBe(true);
+  });
+
+  it("accepts both matchers on one rule (id pattern OR metadata)", () => {
+    const r = withRules({ image: { modelIdPattern: "^dall-e", rawMatch: { path: "$.kind", contains: "image" } } });
+    expect(r.success).toBe(true);
+  });
+
+  it("rejects a rule with neither matcher — it could never classify anything", () => {
+    expect(withRules({ image: {} }).success).toBe(false);
+  });
+
+  it("requires the rawMatch path to be a $-rooted selector", () => {
+    expect(withRules({ image: { rawMatch: { path: "architecture.output_modalities", contains: "image" } } }).success).toBe(false);
+  });
+
+  it("keeps map.raw as an optional $-rooted selector (declared in v1.1, consumed since the amendment)", () => {
+    const ok = structuredClone(validManifest);
+    ok.endpoints.listModels!.map = { models: "$.data[*].id", raw: "$.data[*]" } as never;
+    expect(ADAPTER_MANIFEST_V1_1.safeParse(ok).success).toBe(true);
+    const bad = structuredClone(validManifest);
+    bad.endpoints.listModels!.map = { models: "$.data[*].id", raw: "data[*]" } as never;
+    expect(ADAPTER_MANIFEST_V1_1.safeParse(bad).success).toBe(false);
+  });
+});

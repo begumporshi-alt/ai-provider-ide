@@ -53,6 +53,51 @@
 - **Revisit if:** a dialect needs richer event logic than equality — likely Tier-2, not a
   grammar explosion.
 
+## 2026-09-16 — v1.1 grammar amendment: `modalityRules` may match raw model metadata; `map.raw` is consumed
+
+- **Decision:** `MODALITY_RULE` gains an optional second matcher,
+  `rawMatch: {path: <JSONPath>, contains: <string>}`, evaluated against the raw model object
+  the provider's listModels returned (the entry at `map.raw`, see below). A rule matches when
+  EITHER matcher succeeds; `modelIdPattern` stays required-or-present for existing manifests,
+  now optional as long as one matcher exists. `listModels` now consumes the `map.raw`
+  selector — declared in v1.1 but never read — and passes it through `ModelEntry.raw`;
+  `tagModality` takes the full `ModelEntry` so rules can see it.
+  `rawMatch.contains` matches when the selected value equals the string, OR (when the
+  selected value is an array) contains it.
+- **Rationale:** OpenRouter namespaces every model id (`google/gemini-2.5-flash-image`), so
+  the id-pattern matcher tagged none of its 11 image-output models and the Playground's Image
+  tab stayed empty — even though the provider's own catalog states
+  `architecture.output_modalities`. Vendor-prefixed ids are the norm for aggregators, so this
+  recurs; matching the provider's own metadata is the honest fix and keeps the profile pure
+  DATA. Matching on `$.architecture.output_modalities[0]` (primary output) rather than array
+  membership keeps `openrouter/auto` — output `[text, image]` — a text model, where it belongs.
+- **Revisit if:** a provider only signals image capability on a separate endpoint (e.g.
+  OpenRouter's dedicated `/images/models` list, whose 52 entries are mostly absent from the
+  main catalog) — that needs a discovery-side change (second listModels source), not a rule
+  shape; or if dual-modality models (`text+image`) should appear in BOTH router categories
+  (today `modality` is single-valued per model).
+- **Endpoint correction (same pass, live-probed 2026-09-16):** OpenRouter serves image
+  generation from its own Image API — `POST /api/v1/images` — not the OpenAI-compatible
+  `/images/generations`. Both paths 404 on GET and return the gateway's 401 on POST, so the
+  route cannot be distinguished unauthenticated; the docs are explicit. Retrieval shape is
+  `{created, data:[{b64_json, media_type}], usage}` — **no `url` field**, stateful b64 only.
+  The profile pins `imagePath: "/images"`; the responseMap's `imageUrl` simply never resolves
+  (harmless — `imageB64` carries the payload and the interpreter already treats both as
+  optional). `openaiCompat` gained `imagePath`/`imageRule` overlays so the OpenAI-compatible
+  default (`/images/generations` + id-pattern rule) is unchanged for every other profile and
+  for both mock providers.
+- **Evidence for the discriminator (live, same pass):** of OpenRouter's 444 catalog models,
+  exactly 9 lead their `output_modalities` with `image`; 11 contain `image` anywhere, the two
+  extras being `openrouter/auto` and `openrouter/auto-beta` at `["text","image"]` — text
+  routers. Zero model ids match the shared id pattern, confirming an id rule could never have
+  classified this catalog.
+- **Also fixed in this pass (latent, found while mapping call sites):**
+  `contract-suite.ts` selected its paid image probe with
+  `a ?? b ?? c ? d : e`, which groups as `(a ?? b ?? c) ? d : e` — every image probe collapsed
+  to `models[0]`, a text model. Now `entries.find(tagModality === "image")`, so the paid check
+  bills and exercises an actually-image model, and metadata rules get a vote.
+
+
 ## 2026-09-15 — RouterFacade.generateText returns `{ chunks }` of strings, not `AsyncIterable<TextChunk>`
 
 - **Options:** literal spec signature (`Promise<AsyncIterable<TextChunk>>`), or a small stream
