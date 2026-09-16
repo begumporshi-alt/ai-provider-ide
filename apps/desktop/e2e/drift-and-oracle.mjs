@@ -8,12 +8,17 @@
  */
 import http from "node:http";
 
+// Ports are env-overridable so several oracle pairs can coexist in one test run.
+const ORACLE_PORT = Number(process.env.ORACLE_PORT ?? 18788);
+const DRIFT_PORT = Number(process.env.DRIFT_PORT ?? 18790);
+const DRIFT_BASE = `http://127.0.0.1:${DRIFT_PORT}/v1`;
+
 let flipped = false;
 
 const FLIP_MANIFEST = JSON.stringify({
   manifestVersion: 1,
   dialect: "drifted-v2",
-  provider: { baseUrl: "http://127.0.0.1:18790/v1", auth: { headers: [{ name: "Authorization", prefix: "Bearer" }] } },
+  provider: { baseUrl: DRIFT_BASE, auth: { headers: [{ name: "Authorization", prefix: "Bearer" }] } },
   endpoints: {
     listModels: { method: "GET", path: "/items", map: { models: "$.items[*].name" } },
     generateText: {
@@ -107,7 +112,7 @@ http
       return json(404, { error: `no route ${url}` });
     });
   })
-  .listen(18790, "127.0.0.1", () => console.log("drift provider on :18790 (v1 mode; POST /__flip to drift)"));
+  .listen(DRIFT_PORT, "127.0.0.1", () => console.log(`drift provider on :${DRIFT_PORT} (v1 mode; POST /__flip to drift)`));
 
 http
   .createServer((req, res) => {
@@ -140,4 +145,4 @@ http
       res.end();
     });
   })
-  .listen(18788, "127.0.0.1", () => console.log("oracle AI on :18788/v1"));
+  .listen(ORACLE_PORT, "127.0.0.1", () => console.log(`oracle AI on :${ORACLE_PORT}/v1`));

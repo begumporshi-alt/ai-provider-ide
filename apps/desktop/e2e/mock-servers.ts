@@ -31,12 +31,22 @@ export function mockScript(file: string): string {
 /**
  * Start a mock script and resolve once its health endpoint answers.
  * @param file  script filename, e.g. "mock-provider.mjs"
- * @param port  port the script listens on
+ * @param port  port the script listens on (also passed to the child as PORT)
  * @param healthPath path that answers 200 without auth, e.g. "/v1/models"
+ * @param env   extra env for scripts hosting more than one server (oracle pairs, which need
+ *              ORACLE_PORT + their own port so several pairs can coexist in one run)
  */
-export async function startMock(file: string, port: number, healthPath: string): Promise<MockServer> {
+export async function startMock(
+  file: string,
+  port: number,
+  healthPath: string,
+  env: Record<string, string> = {},
+): Promise<MockServer> {
   const script = mockScript(file);
-  const child = spawn(process.execPath, [script], { stdio: ["ignore", "pipe", "pipe"] });
+  const child = spawn(process.execPath, [script], {
+    stdio: ["ignore", "pipe", "pipe"],
+    env: { ...process.env, PORT: String(port), ...env },
+  });
   let out = "";
   child.stdout?.on("data", (c) => (out += c.toString()));
   child.stderr?.on("data", (c) => (out += c.toString()));
@@ -78,12 +88,14 @@ export async function startMock(file: string, port: number, healthPath: string):
 }
 
 /** Start several mocks; tear them all down together. */
-export async function startMocks(specs: Array<{ file: string; port: number; healthPath: string }>): Promise<{
+export async function startMocks(
+  specs: Array<{ file: string; port: number; healthPath: string; env?: Record<string, string> }>,
+): Promise<{
   servers: MockServer[];
   stopAll: () => Promise<void>;
 }> {
   const servers: MockServer[] = [];
-  for (const s of specs) servers.push(await startMock(s.file, s.port, s.healthPath));
+  for (const s of specs) servers.push(await startMock(s.file, s.port, s.healthPath, s.env ?? {}));
   return {
     servers,
     stopAll: async () => {

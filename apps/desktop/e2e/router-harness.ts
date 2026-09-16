@@ -51,6 +51,19 @@ class HarnessVault implements KeyVaultPort {
   }
 }
 
+export type ManifestOrigin = "builtin-template" | "ai-generated" | "ai-patched";
+
+export interface ManifestRow {
+  id: string;
+  providerId: string;
+  version: number;
+  origin: ManifestOrigin;
+  bodyJson: string;
+  contractResultJson: string | null;
+  createdAt: number;
+  isActive: boolean;
+}
+
 export interface HarnessActions {
   addProvider(input: {
     slug: string;
@@ -62,6 +75,76 @@ export interface HarnessActions {
   setKeyStatus(keyId: string, status: ApiKeyRecord["status"]): void;
   refreshCatalog(providerId: string): Promise<number>;
   testKey(keyId: string): Promise<{ ok: boolean; status: number }>;
+
+  // --- onboarding / repair seams (mirror store.ts createPendingProvider + the wizard) ---
+
+  /** Create a provider in `pending` status: probes and contract checks reach it, but the
+   *  route planner excludes it (§3.1) until enableProvider(). Mirrors createPendingProvider. */
+  addPendingProvider(input: { slug: string; name: string; baseUrl: string }): ProviderRecord;
+  setProviderStatus(providerId: string, status: ProviderRecord["status"]): void;
+  /** The Settings-screen System AI pick — the router serves its own AI route (§2.9). */
+  setSystemAi(providerId: string, model: string): void;
+  /** Hot-swap a manifest on a provider without touching versions (adapters.register). */
+  registerManifest(providerId: string, manifest: AdapterManifest): void;
+  /** Mirror of the Rust `manifest_stage`: append an inactive version, return its number. */
+  stageManifest(
+    providerId: string,
+    manifest: AdapterManifest,
+    meta: { origin: ManifestOrigin; contract?: unknown },
+  ): number;
+  /** Mirror of `manifest_activate`: flip the active flag, hot-swap the adapter, return the
+   *  previously active version (or null). This is approveRepair AND rollbackManifest. */
+  activateManifest(providerId: string, version: number): number | null;
+  activeManifest(providerId: string): AdapterManifest | undefined;
+  manifestHistory(providerId: string): ManifestRow[];
+}
+
+/**
+ * In-memory mirror of the Rust manifest tables (manifest_stage / manifest_activate /
+ * manifests_active / manifests_history). Versioning and activation are the host's job in
+ * production; here the same per-provider version numbers and single-active-flag discipline
+ * are reproduced so the wizard's pickCandidate, approveRepair and rollbackManifest flows can
+ * be exercised end-to-end above real HTTP.
+ */
+class ManifestStore {
+  private readonly rows: ManifestRow[] = [];
+
+  stage(
+    providerId: string,
+    manifest: AdapterManifest,
+    meta: { origin: ManifestOrigin; contract?: unknown },
+  ): number {
+    const version = this.rows.filter((r) => r.providerId === providerId).length + 1;
+    this.rows.push({
+      id: crypto.randomUUID(),
+      providerId,
+      version,
+      origin: meta.origin,
+      bodyJson: JSON.stringify(manifest),
+      contractResultJson: meta.contract ? JSON.stringify(meta.contract) : null,
+      createdAt: Date.now(),
+      isActive: false,
+    });
+    return version;
+  }
+
+  activate(providerId: string, version: number): number | null {
+    let previous: number | null = null;
+    for (const r of this.rows) {
+      if (r.providerId !== providerId) continue;
+      if (r.isActive) previous = r.version;
+      r.isActive = r.version === version;
+    }
+    return previous;
+  }
+
+  active(providerId: string): ManifestRow | undefined {
+    return this.rows.find((r) => r.providerId === providerId && r.isActive);
+  }
+
+  history(providerId: string): ManifestRow[] {
+    return this.rows.filter((r) => r.providerId === providerId);
+  }
 }
 
 export interface RouterHarness {
@@ -78,6 +161,7 @@ export interface RouterHarness {
 export function buildHarness(): RouterHarness {
   const vault = new HarnessVault();
   const registry = new ProviderRegistry(vault);
+  const manifests = new ManifestStore();
 
   // The host-side egress: resolve a ref to (secret, own-provider host) exactly like the Rust
   // join of api_keys x providers, then substitute the sentinel at send time.
@@ -144,6 +228,51 @@ export function buildHarness(): RouterHarness {
         lastTestedAt: Date.now(),
       });
       return { ok: res.ok, status: res.status };
+    },
+
+    addPendingProvider({ slug, name, baseUrl }) {
+      if (registry.providerBySlug(slug)) {
+        throw new Error(`a provider with slug "${slug}" already exists — remove it first`);
+      }
+      // No manifest registered yet — the wizard assigns one (template or AI candidate).
+      return registry.addProvider({
+        id: crypto.randomUUID(),
+        slug,
+        name,
+        type: "manifest",
+        baseUrl,
+        status: "pending",
+        rotationStrategy: "round_robin",
+      });
+    },
+    setProviderStatus(providerId, status) {
+      registry.setProviderStatus(providerId, status);
+    },
+    setSystemAi(providerId, model) {
+      router.settings.systemAi = { providerId, model };
+    },
+    registerManifest(providerId, manifest) {
+      adapters.register(providerId, manifest);
+    },
+    stageManifest(providerId, manifest, meta) {
+      const provenance = {
+        ...manifest.provenance,
+        origin: meta.origin,
+      } as AdapterManifest["provenance"];
+      return manifests.stage(providerId, { ...manifest, provenance }, meta);
+    },
+    activateManifest(providerId, version) {
+      const previous = manifests.activate(providerId, version);
+      const row = manifests.active(providerId);
+      if (row) adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
+      return previous;
+    },
+    activeManifest(providerId) {
+      const row = manifests.active(providerId);
+      return row ? (JSON.parse(row.bodyJson) as AdapterManifest) : undefined;
+    },
+    manifestHistory(providerId) {
+      return manifests.history(providerId);
     },
   };
 

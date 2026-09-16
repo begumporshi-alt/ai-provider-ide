@@ -10,10 +10,16 @@
  */
 import http from "node:http";
 
+// Ports are env-overridable so several oracle pairs can coexist in one test run.
+const ORACLE_PORT = Number(process.env.ORACLE_PORT ?? 18788);
+const EXOTIC_PORT = Number(process.env.EXOTIC_PORT ?? 18789);
+// The manifest must point at the exotic provider's own port, whatever it is.
+const EXOTIC_BASE = `http://127.0.0.1:${EXOTIC_PORT}/v2`;
+
 const MANIFEST = JSON.stringify({
   manifestVersion: 1,
   dialect: "exotic-v2",
-  provider: { baseUrl: "http://127.0.0.1:18789/v2", auth: { headers: [{ name: "Authorization", prefix: "Bearer" }] } },
+  provider: { baseUrl: EXOTIC_BASE, auth: { headers: [{ name: "Authorization", prefix: "Bearer" }] } },
   endpoints: {
     listModels: { method: "GET", path: "/models", map: { models: "$.items[*].name", raw: "$.items[*]" } },
     generateText: {
@@ -63,7 +69,7 @@ http
       res.end(JSON.stringify({ error: "no route" }));
     });
   })
-  .listen(18788, "127.0.0.1", () => console.log("oracle AI on :18788/v1"));
+  .listen(ORACLE_PORT, "127.0.0.1", () => console.log(`oracle AI on :${ORACLE_PORT}/v1`));
 
 // exotic provider (18789)
 http
@@ -118,4 +124,4 @@ http
       res.end(JSON.stringify({ error: `no route ${url}` }));
     });
   })
-  .listen(18789, "127.0.0.1", () => console.log("exotic provider on :18789/v2"));
+  .listen(EXOTIC_PORT, "127.0.0.1", () => console.log(`exotic provider on :${EXOTIC_PORT}/v2`));

@@ -7,11 +7,13 @@
  *                                     Bearer sk-mock-key-B|C: 200 SSE stream / JSON
  *   POST /v1/images/generations   -> 200 with a tiny embedded PNG (b64_json)
  *
- * Plain node, zero deps: `node e2e/mock-provider.mjs` (port 18787).
+ * Plain node, zero deps: `node e2e/mock-provider.mjs` (port 18787, or PORT env).
  */
 import http from "node:http";
 
-const PORT = 18787;
+// PORT is env-overridable so several E2E files can each host their own mock on a distinct
+// port (vitest runs test files in parallel workers — a shared hardcoded port would clash).
+const PORT = Number(process.env.PORT ?? 18787);
 const PNG_1PX =
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
