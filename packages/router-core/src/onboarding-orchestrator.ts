@@ -18,6 +18,8 @@ export type OnboardingState =
   | "probing"
   | "fingerprinting"
   | "template_instantiated"
+  | "ai_generating"
+  | "linting"
   | "contract_testing"
   | "pending_registration"
   | "human_confirmation"
@@ -96,6 +98,13 @@ export class OnboardingOrchestrator {
     }
     await this.transition("template_instantiated", { fingerprint: result, manifest: result.template });
     return result;
+  }
+
+  /** The AI path adopted a generated manifest: record it and move to the contract step. */
+  async adoptGeneratedManifest(manifest: AdapterManifest): Promise<void> {
+    await this.transition("ai_generating", { manifest });
+    await this.transition("linting", { manifest });
+    await this.transition("template_instantiated", { manifest });
   }
 
   /** Free contract checks run automatically; paid ones need explicit consent (§2.2). */

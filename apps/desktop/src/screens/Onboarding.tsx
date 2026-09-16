@@ -6,14 +6,17 @@
  *
  * Cancellation removes everything the wizard created (provider row + keychain entry).
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import {
   OnboardingOrchestrator,
+  generateCandidates,
   runContractSuite,
+  type CandidateProgress,
   type ContractReport,
   type OnboardingSessionData,
   type ProbeAttempt,
+  type RankedCandidate,
 } from "@aiprovider/router";
 import {
   adapters, addKey, createPendingProvider, deleteProvider, getHttpPort,
@@ -41,9 +44,14 @@ export function OnboardingScreen() {
   const [consentText, setConsentText] = useState(false);
   const [consentImage, setConsentImage] = useState(false);
   const [dialect, setDialect] = useState<string>("");
+  const [aiProgress, setAiProgress] = useState<CandidateProgress[]>([]);
+  const [candidates, setCandidates] = useState<RankedCandidate[] | null>(null);
+  const [picked, setPicked] = useState<RankedCandidate | null>(null);
+  const [feedback, setFeedback] = useState("");
+  const [generating, setGenerating] = useState(false);
   const refs = useRef<WizardRefs | null>(null);
   const orchRef = useRef<OnboardingOrchestrator | null>(null);
-  const [resumable, setResumable] = useState<OnboardingSessionData | null>(null);
+  const [resumable, setResumable] = useState<(OnboardingSessionData & { rowId?: number }) | null>(null);
   const [prefill, setPrefill] = useState<OnboardingSessionData["input"] | null>(null);
 
   // resume support (§2.1): offer the latest non-terminal session
@@ -54,7 +62,7 @@ export function OnboardingScreen() {
         try {
           const input = JSON.parse(row.inputJson) as OnboardingSessionData["input"];
           const detail = row.detailJson ? JSON.parse(row.detailJson) : {};
-          setResumable({ input, state: row.state as OnboardingSessionData["state"], ...detail, updatedAt: 0 });
+          setResumable({ input, state: row.state as OnboardingSessionData["state"], ...detail, updatedAt: 0, rowId: row.id ?? undefined });
         } catch {
           /* corrupt row — ignore */
         }
@@ -109,9 +117,10 @@ export function OnboardingScreen() {
   /** Restart the wizard from a saved session: re-attach provider/key rows (the key lives in
    *  the keychain — the secret itself is never re-needed) and jump to the saved step. */
   const resumeSession = useCallback(
-    async (saved: OnboardingSessionData) => {
+    async (saved: OnboardingSessionData & { rowId?: number }) => {
       setResumable(null);
       setError(null);
+      sessionRowId.current = saved.rowId ?? null;
       const detail = saved as OnboardingSessionData & { providerId?: string | null };
       const byId = detail.providerId ? registry.getProvider(detail.providerId) : undefined;
       const byNameAndUrl = registry
@@ -125,7 +134,7 @@ export function OnboardingScreen() {
       const key = registry.keysOf(provider.id)[0];
       refs.current = { providerId: provider.id, keyLabel: key?.label ?? "key-01", secret: "" };
       const orch = new OnboardingOrchestrator(getHttpPort(), persistence);
-      await orch.resume(saved);
+      await orch.resume({ ...saved, providerId: undefined, ...({} as object) } as OnboardingSessionData);
       orchRef.current = orch;
       setPrefill(saved.input);
       switch (saved.state) {
@@ -142,6 +151,13 @@ export function OnboardingScreen() {
         case "fingerprinting":
           setDialect(saved.fingerprint?.dialect ?? "");
           setEvidence(saved.fingerprint?.evidence ?? []);
+          const unknownDialect = saved.fingerprint?.dialect === "unknown" || (!saved.fingerprint && saved.probeReport);
+          if (unknownDialect && saved.probeReport) {
+            // the deterministic path missed before the restart — continue into the AI path
+            setStep(2);
+            await runGenerator(orch, saved.input.baseUrl, provider.id, key!.secretRef);
+            break;
+          }
           setStep(3);
           setBusy(true);
           try {
@@ -171,6 +187,75 @@ export function OnboardingScreen() {
     [go, bump],
   );
 
+  /** Phase 4: the AI path. Best-of-N candidates, each gated schema -> lint -> free checks. */
+  async function runGenerator(orch: OnboardingOrchestrator, baseUrl: string, providerId: string, secretRef: string, note?: string) {
+    setGenerating(true);
+    setAiProgress([]);
+    setCandidates(null);
+    setPicked(null);
+    setError(null);
+    try {
+      const ranked = await generateCandidates({
+        ai: router,
+        systemLabel: (router.settings.systemAi ? `${registry.getProvider(router.settings.systemAi.providerId)?.slug}/${router.settings.systemAi.model}` : "auto") + " (system)",
+        report: orch.session.probeReport!,
+        baseUrl,
+        secretRef,
+        excludeProviderIds: [providerId],
+        docsUrl: orch.session.input.docsUrl,
+        http: getHttpPort(),
+        feedback: note,
+        onProgress: (p) => setAiProgress((prev) => [...prev.filter((x) => x.id !== p.id), p]),
+        audit: async (e) => {
+          await invoke("generator_audit_record", {
+            e: {
+              modelUsed: e.modelUsed,
+              promptTokens: Math.round(e.promptChars / 4),
+              completionTokens: Math.round(e.completionChars / 4),
+              redactionHash: e.redactionHash,
+            },
+          }).catch(() => undefined);
+        },
+      });
+      setCandidates(ranked);
+      if (!ranked.some((c) => c.manifest && c.freePasses > 0)) {
+        setError("No candidate passed the free contract checks — review the details below and regenerate with feedback, or abandon.");
+      }
+    } catch (e) {
+      setError(`Generation failed: ${(e as Error).message}`);
+    } finally {
+      setGenerating(false);
+    }
+  }
+
+  async function pickCandidate(c: RankedCandidate) {
+    const orch = orchRef.current;
+    const r = refs.current;
+    if (!orch || !r || !c.manifest) return;
+    setBusy(true);
+    setError(null);
+    try {
+      adapters.register(r.providerId, c.manifest);
+      await invoke("manifest_upsert_active", {
+        m: {
+          id: crypto.randomUUID(), providerId: r.providerId, version: 1, origin: "ai-generated",
+          bodyJson: JSON.stringify(c.manifest),
+          contractResultJson: JSON.stringify(c.contract),
+          createdAt: Date.now(), isActive: true,
+        },
+      });
+      await orch.adoptGeneratedManifest(c.manifest);
+      setPicked(c);
+      setDialect(`ai-generated (${c.manifest.dialect})`);
+      setStep(3);
+      await runFreeChecks(r.providerId, r.keyLabel);
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function start(input: { name: string; baseUrl: string; apiKey: string; docsUrl?: string }) {
     setBusy(true);
     setError(null);
@@ -190,9 +275,14 @@ export function OnboardingScreen() {
       setEvidence(fp.evidence);
       setDialect(fp.dialect);
       if (fp.dialect === "unknown" || !fp.template) {
-        setError(orch.session.failureReason ?? "could not identify this API");
         setStep(2);
         setBusy(false);
+        if (!router.systemAiAvailable().available) {
+          setError(orch.session.failureReason ?? "could not identify this API");
+        } else {
+          // deterministic path missed; hand off to the AI generator (Phase 4)
+          await runGenerator(orch, input.baseUrl, providerId, key.secretRef);
+        }
         return;
       }
       // register the template manifest on the pending provider, then free contract checks
@@ -266,8 +356,6 @@ export function OnboardingScreen() {
     }
   }
 
-  const aiReady = router.systemAiAvailable();
-
   return (
     <div className="mx-auto max-w-2xl">
       <div className="mb-4 flex items-center gap-3">
@@ -332,24 +420,36 @@ export function OnboardingScreen() {
       {step === 2 && (
         <Section title="Identification">
           {dialect && dialect !== "unknown" ? (
+            <p className="mb-2 text-[13px]">
+              <StatusDot health="healthy" /> This API speaks the <b className="mono">{dialect}</b> dialect — the
+              built-in template fits. No AI involved.
+            </p>
+          ) : (
             <>
-              <p className="mb-2 text-[13px]">
-                <StatusDot health="healthy" /> This API speaks the <b className="mono">{dialect}</b> dialect — the
-                built-in template fits. No AI involved.
-              </p>
-              <ul className="list-disc pl-5 text-[12px]" style={{ color: "var(--text-dim)" }}>
+              <ul className="mb-3 list-disc pl-5 text-[12px]" style={{ color: "var(--text-dim)" }}>
                 {evidence.map((e, i) => <li key={i}>{e}</li>)}
               </ul>
-            </>
-          ) : (
-            <div>
-              <p className="mb-2 text-[13px]" style={{ color: "var(--danger)" }}>{error}</p>
-              <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-                {aiReady.available
-                  ? "AI-assisted adapter generation can attempt this one (Phase 4)."
-                  : "AI-assisted adapter generation unlocks after your first provider is live (currently: " + (aiReady.reason ?? "locked") + ")."}
+              <p className="mb-2 text-[13px]" style={{ color: "var(--warn)" }}>
+                No known dialect matched — switching to AI-assisted generation.
               </p>
-            </div>
+              <AiPath
+                generating={generating}
+                aiProgress={aiProgress}
+                candidates={candidates}
+                picked={picked}
+                error={error}
+                feedback={feedback}
+                setFeedback={setFeedback}
+                onPick={(c) => void pickCandidate(c)}
+                onRegenerate={() => void runGenerator(
+                  orchRef.current!,
+                  orchRef.current!.session.input.baseUrl,
+                  refs.current!.providerId,
+                  registry.keysOf(refs.current!.providerId)[0]!.secretRef,
+                  feedback.trim() || undefined,
+                )}
+              />
+            </>
           )}
         </Section>
       )}
@@ -459,7 +559,106 @@ function ConnectForm({
   );
 }
 
-function Section({ title, children }: { title: string; children: React.ReactNode }) {
+function AiPath({
+  generating, aiProgress, candidates, picked, error, feedback, setFeedback, onPick, onRegenerate,
+}: {
+  generating: boolean;
+  aiProgress: CandidateProgress[];
+  candidates: RankedCandidate[] | null;
+  picked: RankedCandidate | null;
+  error: string | null;
+  feedback: string;
+  setFeedback: (v: string) => void;
+  onPick: (c: RankedCandidate) => void;
+  onRegenerate: () => void;
+}) {
+  const stageOf = (id: string) => aiProgress.find((p) => p.id === id)?.stage ?? (generating ? "parsing" : undefined);
+  const milestones = [
+    { label: "Understand the API", done: true },
+    { label: "Generate candidates", done: !generating && candidates !== null },
+    { label: "Contract tests", done: Boolean(candidates?.some((c) => c.manifest && c.freePasses > 0)) },
+    { label: "Your review", done: Boolean(picked) },
+  ];
+  const best = candidates && candidates.length ? candidates[0] : null;
+  const bestUsable = best?.manifest && best.freePasses > 0 ? best.id : null;
+  return (
+    <div>
+      <ul className="mb-3 space-y-1 text-[12px]">
+        {milestones.map((m) => (
+          <li key={m.label} className="flex items-center gap-2">
+            <span style={{ color: m.done ? "var(--success)" : "var(--text-faint)" }}>{m.done ? "✓" : "○"}</span>
+            <span style={{ color: m.done ? "var(--text)" : "var(--text-dim)" }}>{m.label}</span>
+          </li>
+        ))}
+      </ul>
+      {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
+      <div className="mb-3 grid grid-cols-3 gap-2">
+        {["A", "B", "C"].map((id) => {
+          const c = candidates?.find((x) => x.id === id);
+          const stage = c ? undefined : stageOf(id);
+          return (
+            <div key={id} className="rounded border p-2" style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}>
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-[12px] font-semibold">Candidate {id}</span>
+                {c?.manifest && c.freePasses > 0 && (
+                  <span className="rounded px-1 text-[10px]" style={{ background: "var(--success)", color: "#0b0d10", fontWeight: 600 }}>
+                    {bestUsable === id ? "★ recommended" : "usable"}
+                  </span>
+                )}
+              </div>
+              {!c && stage && <div className="text-[11px]" style={{ color: "var(--text-dim)" }}>{stage === "parsing" ? "asking System AI…" : `${stage}…`}</div>}
+              {!c && !stage && generating && <div className="text-[11px]" style={{ color: "var(--text-faint)" }}>queued</div>}
+              {c && !c.manifest && (
+                <div className="text-[11px]" style={{ color: "var(--danger)" }}>
+                  {c.rejectedReason ?? (c.schemaErrors[0] ?? c.lintErrors[0]) ?? "rejected"}
+                </div>
+              )}
+              {c?.manifest && (
+                <div className="space-y-0.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
+                  <div>auth ✓ {c.contract?.checks.find((x) => x.name.startsWith("auth"))?.pass ? "" : "✕"}</div>
+                  <div>models {c.contract?.checks.find((x) => x.name.startsWith("models"))?.pass ? "✓" : "—"}</div>
+                  <div>
+                    {Object.keys(c.manifest.endpoints).length} endpoint(s) · {c.score} pts
+                  </div>
+                  {c.contract?.checks.some((x) => !x.pass) && <div style={{ color: "var(--warn)" }}>some free checks failed</div>}
+                  <div className="pt-1">
+                    {c.manifest && c.freePasses > 0 ? (
+                      <Button disabled={Boolean(picked)} onClick={() => onPick(c)}>
+                        {picked?.id === id ? "Picked" : "Use this adapter"}
+                      </Button>
+                    ) : (
+                      <span style={{ color: "var(--danger)" }}>no usable route</span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      {!generating && candidates === null && !error && (
+        <p className="mb-2 text-[12px]" style={{ color: "var(--text-dim)" }}>Preparing generation…</p>
+      )}
+      {candidates && (
+        <div className="flex items-end gap-2">
+          <input
+            className={`${inputCls} flex-1`}
+            style={inputStyle}
+            placeholder="Optional: what should the next round do differently?"
+            value={feedback}
+            onChange={(e) => setFeedback(e.target.value)}
+          />
+          <Button onClick={onRegenerate}>Regenerate</Button>
+        </div>
+      )}
+      <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        The AI sees only structure (paths, status codes, key/type shapes) — never your key. It cannot choose the host; lint pins it to your URL. Nothing enables until you approve.
+      </p>
+    </div>
+  );
+}
+
+function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
     <section className="rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
       <h2 className="mb-3 text-[14px] font-semibold">{title}</h2>

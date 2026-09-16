@@ -531,3 +531,24 @@ pub fn onboarding_latest_active(store: State<'_, Arc<Store>>) -> Result<Option<O
         None => Ok(None),
     }
 }
+
+// ---------- generator audit (§2.5) ----------
+
+#[tauri::command]
+pub fn generator_audit_record(store: State<'_, Arc<Store>>, e: GeneratorAuditRow) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash) VALUES (?1,?2,?3,?4,?5)",
+        params![now_ms(), e.model_used, e.prompt_tokens, e.completion_tokens, e.redaction_hash],
+    )?;
+    Ok(())
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratorAuditRow {
+    pub model_used: String,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub redaction_hash: String,
+}

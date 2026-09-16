@@ -22,3 +22,7 @@ export {
   OnboardingOrchestrator, type OnboardingState, type OnboardingInput,
   type OnboardingSessionData, type OnboardingPersistence,
 } from "./onboarding-orchestrator.js";
+export {
+  generateCandidates, lintManifest, fetchDocsExcerpt, redactionHash, extractJson,
+  type RankedCandidate, type CandidateProgress, type CandidateStage, type GenerationDeps, type AuditRecord,
+} from "./adapter-generator.js";
