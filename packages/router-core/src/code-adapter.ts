@@ -194,6 +194,15 @@ export class CodeAdapterInstance implements AdapterInstance {
     }
   }
 
+  /**
+   * Compile the module without running any operation. The Tier-2 review gate calls this so a
+   * guest that cannot even parse is rejected before a human is asked to look at it — and so
+   * the contract checks that follow run against a module already proven to compile.
+   */
+  async compile(): Promise<void> {
+    await this.ensure();
+  }
+
   /** Tear down the current context; the next operation rebuilds from source. */
   private async reset(): Promise<void> {
     const ctx = this.ctx;

@@ -2,6 +2,10 @@ export type { AdapterManifest } from "@aiprovider/adapter-spec";
 export { ManifestInterpreter, ManifestHttpError, type HttpPortLike, type AdapterContext, type ModelEntry, type TextArgs } from "./manifest-interpreter.js";
 export { type AdapterInstance } from "./adapter-instance.js";
 export { CodeAdapterInstance, SandboxError, lintCodeSource, type CodeAdapterOptions } from "./code-adapter.js";
+export {
+  generateCodeCandidate, reviewCodeCandidate, lintCodeManifest,
+  type CodeGenerationDeps, type CodeReviewContext,
+} from "./code-candidate.js";
 export { selectAll, selectOne, parsePath } from "./jsonpath.js";
 export { renderTemplate } from "./template.js";
 export { BUILTIN_TEMPLATES, PROVIDER_PROFILES, type BuiltinTemplateId } from "./builtin-templates.js";

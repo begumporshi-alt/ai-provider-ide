@@ -11,6 +11,7 @@ import { invoke } from "@tauri-apps/api/core";
 import {
   OnboardingOrchestrator,
   generateCandidates,
+  generateCodeCandidate,
   runContractSuite,
   type CandidateProgress,
   type ContractReport,
@@ -24,6 +25,7 @@ import {
 } from "../store";
 import { useUi } from "../ui-state";
 import { Button, Field, StatusDot, inputCls, inputStyle } from "../components/atoms";
+import { CodeCandidateReview } from "../components/CodeCandidateReview";
 
 type Step = 0 | 1 | 2 | 3 | 4; // Connect → Probe → Identify → Test → Review
 
@@ -49,6 +51,14 @@ export function OnboardingScreen() {
   const [picked, setPicked] = useState<RankedCandidate | null>(null);
   const [feedback, setFeedback] = useState("");
   const [generating, setGenerating] = useState(false);
+  // Tier-2 (§2.7): the last-resort sandboxed code adapter, reviewed separately from the
+  // declarative A/B/C grid because it is executable, not inert data.
+  const [codeCandidate, setCodeCandidate] = useState<RankedCandidate | null>(null);
+  const [codeGenerating, setCodeGenerating] = useState(false);
+  const [codeError, setCodeError] = useState<string | null>(null);
+  const [codeLogs, setCodeLogs] = useState<string[]>([]);
+  const [codeApproved, setCodeApproved] = useState(false);
+  const [offerCode, setOfferCode] = useState(false);
   const refs = useRef<WizardRefs | null>(null);
   const orchRef = useRef<OnboardingOrchestrator | null>(null);
   const [resumable, setResumable] = useState<(OnboardingSessionData & { rowId?: number }) | null>(null);
@@ -188,16 +198,27 @@ export function OnboardingScreen() {
   );
 
   /** Phase 4: the AI path. Best-of-N candidates, each gated schema -> lint -> free checks. */
+  function systemLabel(): string {
+    return (router.settings.systemAi
+      ? `${registry.getProvider(router.settings.systemAi.providerId)?.slug}/${router.settings.systemAi.model}`
+      : "auto") + " (system)";
+  }
+
   async function runGenerator(orch: OnboardingOrchestrator, baseUrl: string, providerId: string, secretRef: string, note?: string) {
     setGenerating(true);
     setAiProgress([]);
     setCandidates(null);
     setPicked(null);
     setError(null);
+    setOfferCode(false);
+    setCodeCandidate(null);
+    setCodeError(null);
+    setCodeLogs([]);
+    setCodeApproved(false);
     try {
       const ranked = await generateCandidates({
         ai: router,
-        systemLabel: (router.settings.systemAi ? `${registry.getProvider(router.settings.systemAi.providerId)?.slug}/${router.settings.systemAi.model}` : "auto") + " (system)",
+        systemLabel: systemLabel(),
         report: orch.session.probeReport!,
         baseUrl,
         secretRef,
@@ -219,12 +240,57 @@ export function OnboardingScreen() {
       });
       setCandidates(ranked);
       if (!ranked.some((c) => c.manifest && c.freePasses > 0)) {
-        setError("No candidate passed the free contract checks — review the details below and regenerate with feedback, or abandon.");
+        setError("No candidate passed the free contract checks — review the details below and regenerate with feedback, or try the Tier-2 code adapter.");
+        // §2.7: Tier 2 is the last resort, offered only when the declarative grammar cannot
+        // express this provider. It is an explicit human action, never an automatic fallback.
+        setOfferCode(true);
+      } else {
+        setOfferCode(false);
       }
     } catch (e) {
       setError(`Generation failed: ${(e as Error).message}`);
     } finally {
       setGenerating(false);
+    }
+  }
+
+  /** Tier-2 (§2.7): the last resort, reached only when no declarative candidate was usable.
+   *  Deliberately a separate, explicit action — never automatic — because the output is
+   *  executable code. The gate (schema → lint → compile → free contract checks) runs before
+   *  the human sees anything; the panel below shows its evidence. */
+  async function runCodeGenerator(note?: string) {
+    const orch = orchRef.current;
+    const r = refs.current;
+    if (!orch || !r) return;
+    setCodeGenerating(true);
+    setCodeError(null);
+    setCodeCandidate(null);
+    setCodeLogs([]);
+    setCodeApproved(false);
+    try {
+      const candidate = await generateCodeCandidate({
+        ai: router,
+        systemLabel: systemLabel(),
+        report: orch.session.probeReport!,
+        baseUrl: orch.session.input.baseUrl,
+        secretRef: registry.keysOf(r.providerId)[0]?.secretRef ?? "",
+        excludeProviderIds: [r.providerId],
+        http: getHttpPort(),
+        feedback: note,
+        onLog: (line) => setCodeLogs((prev) => [...prev.slice(-199), line]),
+      });
+      setCodeCandidate(candidate);
+      if (!candidate.manifest || candidate.freePasses === 0) {
+        setCodeError(
+          candidate.rejectedReason
+            ? `The code adapter did not pass the gate: ${candidate.rejectedReason}`
+            : "The code adapter did not pass the free contract checks — review the evidence and regenerate with feedback.",
+        );
+      }
+    } catch (e) {
+      setCodeError(`Tier-2 generation failed: ${(e as Error).message}`);
+    } finally {
+      setCodeGenerating(false);
     }
   }
 
@@ -247,6 +313,7 @@ export function OnboardingScreen() {
       await orch.adoptGeneratedManifest(c.manifest);
       setPicked(c);
       setDialect(`ai-generated (${c.manifest.dialect})`);
+      if (c.manifest.kind === "code") setCodeApproved(true);
       setStep(3);
       await runFreeChecks(r.providerId, r.keyLabel);
     } catch (e) {
@@ -449,6 +516,42 @@ export function OnboardingScreen() {
                   feedback.trim() || undefined,
                 )}
               />
+              {offerCode && !codeCandidate && !codeGenerating && (
+                <div className="mt-3 rounded border p-3" style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}>
+                  <p className="mb-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                    No declarative manifest could express this API. The last resort is a
+                    <b> sandboxed code adapter</b>: the AI writes a small JS module that runs
+                    inside a QuickJS-WASM sandbox — no filesystem, no network of its own, no
+                    access to your key. You review its source and the gate evidence before it
+                    is registered.
+                  </p>
+                  <Button
+                    disabled={busy}
+                    onClick={() => void runCodeGenerator()}
+                  >
+                    Generate a sandboxed code adapter
+                  </Button>
+                </div>
+              )}
+              {(codeGenerating || codeCandidate) && (
+                <div className="mt-3">
+                  <CodeCandidateReview
+                    candidate={codeCandidate}
+                    generating={codeGenerating}
+                    logs={codeLogs}
+                    busy={busy}
+                    approved={codeApproved}
+                    error={codeError}
+                    onApprove={(c) => void pickCandidate(c)}
+                    onReject={() => {
+                      setCodeCandidate(null);
+                      setCodeError(null);
+                      setCodeLogs([]);
+                    }}
+                    onRegenerate={(note) => void runCodeGenerator(note)}
+                  />
+                </div>
+              )}
             </>
           )}
         </Section>

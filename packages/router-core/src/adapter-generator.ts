@@ -27,7 +27,7 @@ export interface CandidateProgress {
 }
 
 export interface RankedCandidate {
-  id: string; // "A" | "B" | "C"
+  id: string; // "A" | "B" | "C" for declarative; "JS" for a Tier-2 code candidate
   schemaErrors: string[];
   lintErrors: string[];
   manifest?: AdapterManifest;
@@ -36,6 +36,9 @@ export interface RankedCandidate {
   freePasses: number;
   score: number;
   rejectedReason?: string;
+  /** Tier-2 only (§2.7): the sandbox compile gate — the module actually compiled inside
+   *  QuickJS-WASM before the free contract checks ran on it. */
+  code?: { compiled: boolean; compileError?: string };
 }
 
 export interface AuditRecord {
