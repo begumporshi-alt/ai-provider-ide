@@ -259,8 +259,9 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
     };
-    // §3.4 compatibility contract: explicit refusal, never a silent drop.
-    for unsupported in ["tools", "tool_choice", "response_format", "functions"] {
+    // §3.4 compatibility contract: only reject truly incompatible parameters.
+    // Tools/tool_choice/response_format are now forwarded to upstream providers.
+    for unsupported in ["functions"] {
         if req.get(unsupported).is_some_and(|v| !v.is_null()) {
             return err(
                 StatusCode::BAD_REQUEST,
@@ -398,12 +399,23 @@ fn to_chat_body(req: &Value) -> Option<Value> {
         };
         messages.push(json!({ "role": role, "content": content }));
     }
-    Some(json!({
+    let mut out = json!({
         "model": model,
         "messages": messages,
         "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false),
         "max_tokens": req.get("max_tokens").and_then(Value::as_i64).unwrap_or(1024),
-    }))
+    });
+    // forward tools parameters to upstream providers
+    if req.get("tools").is_some() {
+        out["tools"] = req["tools"].clone();
+    }
+    if req.get("tool_choice").is_some() {
+        out["tool_choice"] = req["tool_choice"].clone();
+    }
+    if req.get("response_format").is_some() {
+        out["response_format"] = req["response_format"].clone();
+    }
+    Some(out)
 }
 
 fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
@@ -426,14 +438,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             anthropic_error("model and messages are required", "invalid_request_error"),
         );
     };
-    for unsupported in ["tools", "tool_choice"] {
-        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
-            return err(
-                StatusCode::BAD_REQUEST,
-                anthropic_error(&format!("{unsupported} is not supported yet"), "invalid_request_error"),
-            );
-        }
-    }
+    // tools/tool_choice are now forwarded to upstream providers
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -549,12 +554,20 @@ fn to_chat_body_responses(req: &Value) -> Option<Value> {
         }
         _ => return None,
     }
-    Some(json!({
+    let mut out = json!({
         "model": model,
         "messages": messages,
         "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false),
         "max_tokens": req.get("max_output_tokens").and_then(Value::as_i64).unwrap_or(1024),
-    }))
+    });
+    // forward tools parameters to upstream providers
+    if req.get("tools").is_some() {
+        out["tools"] = req["tools"].clone();
+    }
+    if req.get("tool_choice").is_some() {
+        out["tool_choice"] = req["tool_choice"].clone();
+    }
+    Some(out)
 }
 
 fn responses_error(message: &str, code: &str) -> Value {
@@ -573,14 +586,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     let Some(chat) = to_chat_body_responses(&req) else {
         return err(StatusCode::BAD_REQUEST, responses_error("model and input are required", "missing_required_parameter"));
     };
-    for unsupported in ["tools", "tool_choice"] {
-        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
-            return err(
-                StatusCode::BAD_REQUEST,
-                responses_error(&format!("{unsupported} is not supported yet"), "unsupported_parameter"),
-            );
-        }
-    }
+    // tools/tool_choice are now forwarded to upstream providers
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -1315,20 +1321,20 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn tools_param_rejected_explicitly() {
+    async fn tools_param_forwarded_to_upstream() {
+        // tools/tool_choice/response_format are now forwarded to upstream providers
+        // this test verifies the gateway accepts them and routes them to the bridge
         let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
         let s = start(key).await;
         let res = s
             .client
             .post(format!("{}/v1/chat/completions", s.base))
             .header("authorization", "Bearer sk-aip-test")
-            .json(&json!({ "model": "gpt-4o", "messages": [], "tools": [{}] }))
+            .json(&json!({ "model": "gpt-4o", "messages": [], "tools": [{"type": "function", "function": {"name": "test"}}], "tool_choice": "auto" }))
             .send()
             .await
             .unwrap();
-        assert_eq!(res.status(), 400);
-        let body: Value = res.json().await.unwrap();
-        assert!(body["error"]["message"].as_str().unwrap().contains("not supported"));
+        assert_eq!(res.status(), 200);
     }
 
     #[tokio::test(flavor = "multi_thread")]
