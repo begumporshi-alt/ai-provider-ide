@@ -177,3 +177,22 @@ Live bugs found & fixed during the wizard test:
 Suites: 48 TS tests (6 + 42) + 19 Rust green; typecheck + key-leak grep clean.
 Criterion 7 status: deterministic path live-proven; the fresh-install (typed) run is a
 one-minute human pass away.
+
+## 2026-09-16 — Gateway v1.1: multi-dialect ingress (OpenAI Chat + Anthropic Messages)
+
+- **User-directive raised:** "the IDE is not built for OpenAI compatibility only — support
+  all possible compatibilities." Agreed scope for now: **OpenAI Chat surface + Anthropic
+  Messages surface** (/v1/messages + x-api-key auth, full message_start/content_block_delta/
+  message_stop SSE framing); OpenAI Responses and Gemini generateContent land as follow-ups.
+- **Why now:** the egress side already speaks anthropic-compat to providers; with b.ai in the
+  sketch, ingressing Anthropic makes Claude Code / anthropic-sdk apps use the whole router —
+  symmetric to egress, and a one-phase build.
+- **Architecture:** translation lives at the gateway edge (ingress dialect -> normalized
+  router call), NOT inside the router core — the core stays one surface; each new ingress
+  dialect is one handler + one test pack. Extension point noted in ARCHITECTURE.md §7.
+- **Auth:** master key accepted via `Authorization: Bearer` OR `x-api-key` (constant-time,
+  same throttle). Errors on /v1/messages use Anthropic's error envelope.
+- **Verified:** 3 Rust tests (non-stream shape, stream framing, system/bad-request) + live
+  curl through the running app (22 Rust total). §3.4 compatibility contract updated.
+- **Revisit when:** a user needs Responses/Gemini ingress — same edge-translation pattern,
+  no core change.

@@ -460,6 +460,7 @@ assumed (audit H2):
 | `temperature` | **Supported** (passed through when the manifest allows it) |
 | `tools`, `tool_choice`, `response_format` | **Not in v1** → explicit `400` with a clear message ("tool calls are not supported yet") — never silently dropped |
 | `n`, `logprobs`, `user`, everything else unknown | **Ignored**, with a warning recorded in the ledger entry |
+| `/v1/messages` (Anthropic Messages dialect) | **Supported (v1.1, 2026-09-16)** — Claude Code / anthropic-sdk ingress: `x-api-key` auth accepted, messages translated, replies re-framed as Anthropic events; `tools`/`tool_choice` refused with the Anthropic error envelope |
 | `/v1/models` | **Supported** — merged catalog, qualified IDs |
 | `/v1/embeddings` | **Out of scope for v1** (extension point: the modality enum) |
 | Error shape | OpenAI-style: `{"error": {"message", "type", "code"}}` |
@@ -792,6 +793,9 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 - **Provider profiles** — thin overlays on templates for provider-specific quirks.
 - **Headless service mode** — the Local Gateway detached from the app window (menu-bar /
   launch-agent), a v2 extension once the §3.5 bridge contract is proven in practice.
+- **Gateway ingress dialects** — each external compatibility surface (OpenAI Chat, Anthropic
+  Messages; Responses and Gemini later) is one axum handler translating to the normalized
+  router call; the router core itself stays single-surface (§3.4 v1.1).
 
 **Lifecycle & hygiene (v1 decisions, from the audit):** port-conflict on 8787 is a loud error
 with remediation UX; deleting a key removes its keychain entry in the same transaction;

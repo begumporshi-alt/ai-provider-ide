@@ -151,6 +151,16 @@ export function GatewayScreen() {
           code={`OpenAI Base URL: ${endpoint}\nAPI Key: <paste the copied master key>`}
           onCopy={() => void copy(`OpenAI Base URL: ${endpoint}\nAPI Key: <paste the copied master key>`, "cursor")}
         />
+        <PresetRow
+          label="Claude Code / anthropic-sdk"
+          code={`export ANTHROPIC_BASE_URL="${endpoint}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`}
+          onCopy={() => void copy(`export ANTHROPIC_BASE_URL="${endpoint}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`, "claude")}
+        />
+        <PresetRow
+          label="cURL — Anthropic /v1/messages"
+          code={`curl ${endpoint}/messages \\\n  -H "x-api-key: <master key>" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" \\\n  -d '{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'`}
+          onCopy={() => void copy(`curl ${endpoint}/messages -H "x-api-key: <master key>" -H "anthropic-version: 2023-06-01" -H "content-type: application/json" -d '{"model":"claude-3-5-sonnet","max_tokens":64,"messages":[{"role":"user","content":"hi"}]}'`, "acurl")}
+        />
       </section>
 
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
@@ -160,7 +170,7 @@ export function GatewayScreen() {
           <li>Serves while this window is open. Closing the app stops the gateway.</li>
           <li>Model names: qualified <code className="mono">provider/native</code> for an exact provider, or a bare id to let the router pick + fail over.</li>
           <li>Every request is logged in Activity under source <span className="mono">gateway</span>. Wrong key → 401; router busy → 429; app closed → 503.</li>
-          <li>Supported: model, messages, stream, max_tokens, temperature. Tools/tool_choice/response_format are refused with a clear error (never silently dropped).</li>
+          <li>Two compatible surfaces: <b>OpenAI</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) and <b>Anthropic</b> (<span className="mono">/v1/messages</span> — Claude Code / anthropic-sdk speak here, auth via <span className="mono">x-api-key</span>). Tools/tool_choice/response_format are refused with a clear error (never silently dropped).</li>
         </ul>
       </section>
     </div>

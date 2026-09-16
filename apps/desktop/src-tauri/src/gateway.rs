@@ -215,6 +215,8 @@ fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opti
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
+        // Anthropic clients (Claude Code, anthropic-sdk) send the key in x-api-key.
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
     if constant_time_eq(presented, &stored) {
         core.failures.lock().unwrap().remove(&ip);
@@ -227,6 +229,11 @@ fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opti
 
 fn openai_error(message: &str, kind: &str, code: Option<&str>) -> Value {
     json!({ "error": { "message": message, "type": kind, "code": code } })
+}
+
+/// Anthropic-style error envelope for /v1/messages failures (§3.4 extended 2026-09-16).
+fn anthropic_error(message: &str, kind: &str) -> Value {
+    json!({ "type": "error", "error": { "type": kind, "message": message } })
 }
 
 fn err(status: StatusCode, body: Value) -> Response {
@@ -364,6 +371,151 @@ async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> R
     err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
 }
 
+/// Anthropic Messages ingress (2026-09-16 amendment, DECISIONS.md): Claude Code and
+/// anthropic-sdk clients can point at this IDE. The request is translated to the router's
+/// normalized chat call; the reply is re-framed as Anthropic events. The router core stays
+/// provider-agnostic — this is ingress-dialect translation at the edge, symmetric to the
+/// egress dialects providers speak.
+fn to_chat_body(req: &Value) -> Option<Value> {
+    let model = req.get("model").and_then(Value::as_str)?;
+    let mut messages: Vec<Value> = Vec::new();
+    if let Some(system) = req.get("system").and_then(Value::as_str) {
+        messages.push(json!({ "role": "system", "content": system }));
+    }
+    for m in req.get("messages").and_then(Value::as_array)? {
+        let role = m.get("role").and_then(Value::as_str).unwrap_or("user");
+        // content: string OR content blocks [{type:"text",text:…}] -> flattened to text
+        let content = match m.get("content") {
+            Some(Value::String(t)) => t.clone(),
+            Some(Value::Array(blocks)) => blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(""),
+            _ => String::new(),
+        };
+        messages.push(json!({ "role": role, "content": content }));
+    }
+    Some(json!({
+        "model": model,
+        "messages": messages,
+        "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false),
+        "max_tokens": req.get("max_tokens").and_then(Value::as_i64).unwrap_or(1024),
+    }))
+}
+
+fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
+    match cls {
+        Some("length") => "max_tokens",
+        _ => "end_turn",
+    }
+}
+
+async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+        return r;
+    }
+    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+        return err(StatusCode::BAD_REQUEST, anthropic_error("invalid JSON body", "invalid_request_error"));
+    };
+    let Some(chat) = to_chat_body(&req) else {
+        return err(
+            StatusCode::BAD_REQUEST,
+            anthropic_error("model and messages are required", "invalid_request_error"),
+        );
+    };
+    for unsupported in ["tools", "tool_choice"] {
+        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                anthropic_error(&format!("{unsupported} is not supported yet"), "invalid_request_error"),
+            );
+        }
+    }
+    let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let mut slot = match try_slot(&core) {
+        Ok(s) => s,
+        Err(r) => {
+            // map the generic responses to anthropic shape
+            let status = r.status().as_u16();
+            return err(
+                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
+                anthropic_error("gateway unavailable or at capacity", "overloaded_error"),
+            );
+        }
+    };
+    let id = slot.id;
+    let msg_id = format!("msg_gw_{id}");
+    let model = chat.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+
+    if wants_stream {
+        let mid = msg_id.clone();
+        let stream_body = async_stream::stream! {
+            // Anthropic SSE: `event: <name>` + `data: <json>` — emit the full lifecycle.
+            let start = json!({ "type": "message_start", "message": { "id": mid, "type": "message", "role": "assistant",
+                "content": [], "model": model, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } } });
+            yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_start").data(start.to_string()));
+            yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_start")
+                .data(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()));
+            while let Some(msg) = slot.rx.recv().await {
+                match msg {
+                    BridgeMsg::Delta(t) => {
+                        let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
+                    }
+                    BridgeMsg::Result(_) => {}
+                    BridgeMsg::Done => break,
+                    BridgeMsg::Error { message, .. } => {
+                        let e = json!({ "type": "error", "error": { "type": "overloaded_error", "message": message } });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data(e.to_string()));
+                        return;
+                    }
+                }
+            }
+            yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
+                .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
+            yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
+                .data(json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 0 } }).to_string()));
+            yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
+            drop(slot);
+        };
+        return Sse::new(stream_body)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response();
+    }
+
+    let mut full = String::new();
+    let mut err_info: Option<(u16, String)> = None;
+    while let Some(msg) = slot.rx.recv().await {
+        match msg {
+            BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Result(_) => {}
+            BridgeMsg::Done => break,
+            BridgeMsg::Error { status, message } => {
+                err_info = Some((status, message));
+                break;
+            }
+        }
+    }
+    drop(slot);
+    match err_info {
+        Some((_, message)) => err(StatusCode::BAD_GATEWAY, anthropic_error(&message, "api_error")),
+        None => (
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            json!({
+                "id": msg_id, "type": "message", "role": "assistant",
+                "content": [{ "type": "text", "text": full }],
+                "model": model, "stop_reason": anthropic_stop_reason(None), "stop_sequence": null,
+                "usage": { "input_tokens": 0, "output_tokens": 0 }
+            })
+            .to_string(),
+        )
+            .into_response(),
+    }
+}
+
 async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
         return r;
@@ -439,6 +591,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/models", get(models_h))
         .route("/v1/chat/completions", post(chat_h))
         .route("/v1/images/generations", post(image_h))
+        .route("/v1/messages", post(messages_h))
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -643,6 +796,94 @@ mod tests {
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["object"], "chat.completion");
         assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_messages_non_stream() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test") // Anthropic-style auth header
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "message");
+        assert_eq!(body["role"], "assistant");
+        assert_eq!(body["content"][0]["type"], "text");
+        assert_eq!(body["content"][0]["text"], "Hello");
+        assert_eq!(body["stop_reason"], "end_turn");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_messages_stream_framing() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64, "stream": true,
+                "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("message_stop") {
+                break;
+            }
+        }
+        for stage in ["message_start", "content_block_start", "content_block_delta", "content_block_stop", "message_delta", "message_stop"] {
+            assert!(acc.contains(stage), "missing {stage} in:
+{acc}");
+        }
+        // synth bridge streams "Hel" + "lo" as separate deltas
+        assert!(acc.contains("Hel"), "delta text missing");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_system_and_bad_request() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        // system as a top-level string must become a system turn (accepted, 200)
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 8, "system": "be terse",
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        // missing messages -> anthropic-shaped 400
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "max_tokens": 8 }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "error");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
     #[tokio::test(flavor = "multi_thread")]
