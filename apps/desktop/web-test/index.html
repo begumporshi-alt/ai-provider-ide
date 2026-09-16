@@ -1,0 +1,20 @@
+<!doctype html>
+<!--
+  web-test/index.html — DEV-ONLY browser harness (see web-test/shim.ts).
+
+  Loads the Tauri shim BEFORE the app so the genuine, unmodified UI runs in a plain browser,
+  drivable by Playwright (typing included, which the WRY webview can't accept from CUA).
+  Not referenced by the Tauri build; vite serves it only during `pnpm --filter desktop web-test`.
+-->
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI-Provider IDE — web test harness</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="./shim.ts"></script>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

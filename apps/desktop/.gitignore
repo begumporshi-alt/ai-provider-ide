@@ -22,3 +22,8 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Playwright live-UI harness (dev-only)
+test-results/
+playwright-report/
+web-test/.report/
