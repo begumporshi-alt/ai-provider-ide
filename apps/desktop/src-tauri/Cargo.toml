@@ -33,6 +33,7 @@ async-stream = "0.3"
 rand = "0.8"
 arboard = "3"
 url = "2.5.8"
+base64 = "0.22"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

@@ -61,7 +61,7 @@ test("zero-config wizard: connect an OpenAI-compatible provider and route throug
   // Probe → identify → free contract checks run unattended; the template fits, so no AI panel.
   await expect(page.getByText("Contract tests")).toBeVisible({ timeout: 60_000 });
   await expect(page.getByText("auth: model list with this key")).toBeVisible();
-  await expect(page.getByText(/models: catalog parses \(2 models\)/)).toBeVisible();
+  await expect(page.getByText(/models: catalog parses \(3 models\)/)).toBeVisible();
 
   await page.getByRole("button", { name: "Continue to review" }).click();
   await expect(page.getByText("Review & enable")).toBeVisible();
@@ -145,4 +145,35 @@ test("state persists across reload mid-wizard", async ({ page }) => {
   await page.reload();
   await expect(page.getByText("Exotic ND")).toBeVisible();
   await expect(page.getByText("System AI (mock)")).toBeVisible();
+});
+
+// ---------------------------------------------------------------------------
+// Story 4 — a provider that returns an image URL (not base64) still renders. The webview CSP
+// blocks remote images, so the bytes come back through the host's scoped egress carve-out
+// (invariant 3: the URL was returned in that provider's own response) and render as data:.
+// ---------------------------------------------------------------------------
+
+test("image URL from a provider is fetched through egress and rendered", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await expect(page.getByText("System AI (mock)")).toBeVisible();
+
+  await page.getByRole("button", { name: "Playground" }).click();
+  await page.getByRole("button", { name: "Image" }).click();
+  await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
+
+  const combo = page.getByRole("combobox");
+  const value = await combo.locator("option").filter({ hasText: /sd-oracle-1/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
+  await combo.selectOption(value);
+  await page.getByRole("button", { name: "Generate" }).click();
+
+  // The provider answered with a URL on the mock's origin; the UI must have pulled its bytes
+  // through egress and rendered them — a CSP-blocked URL would leave no img at all.
+  const img = page.locator('img[alt="generated"]');
+  await expect(img).toBeVisible({ timeout: 30_000 });
+  const src = await img.getAttribute("src");
+  expect(src).toMatch(/^data:image\/png;base64,/);
+
+  // Wire-level truth: the image request hit the mock's actual bytes endpoint.
+  const seenImg = await (await page.request.get(`${MOCK_ORIGIN}/v1/e2e/img-seen`)).json();
+  expect(seenImg.path).toBe("/v1/img/tiny.png");
 });

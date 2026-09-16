@@ -17,6 +17,7 @@
 import { createServer } from "node:http";
 
 const PORT = 18901;
+const MOCK_ORIGIN = `http://127.0.0.1:${PORT}`;
 const RAW_EXOTIC_KEY = "sk-nd-works";
 
 // ---------------------------------------------------------------------------
@@ -53,6 +54,15 @@ const CODE_ENVELOPE = {
 // ---------------------------------------------------------------------------
 
 let seen = { url: null, headers: {} };
+
+/** 1×1 transparent PNG — what the image endpoint serves and what /img/tiny.png returns. */
+const PNG_1PX = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==",
+  "base64",
+);
+
+/** Last request that hit the image bytes endpoint — wire-level truth for the spec. */
+let imgSeen = { path: null };
 
 function cors(res, extra = {}) {
   // Authorization must be named explicitly: the "*" wildcard never matches it
@@ -102,9 +112,27 @@ async function oracle(req, res, path) {
       data: [
         { id: "oracle-mini", object: "model", owned_by: "sysai" },
         { id: "oracle-flash", object: "model", owned_by: "sysai" },
+        { id: "sd-oracle-1", object: "model", owned_by: "sysai" },
       ],
     });
   }
+  // The image model's endpoint returns a URL (not b64) on THIS mock's origin, which the
+  // renderer must fetch back through the host's egress carve-out (CSP forbids it directly).
+  if (path === "/images/generations" && req.method === "POST") {
+    const body = JSON.parse((await readBody(req)) || "{}");
+    if (!String(body.prompt ?? "").trim()) return json(res, 400, { error: "prompt required" });
+    return json(res, 200, { created: Math.floor(Date.now() / 1000), data: [{ url: `${MOCK_ORIGIN}/v1/img/tiny.png` }] });
+  }
+  if (path === "/img/tiny.png" && req.method === "GET") {
+    imgSeen = { path: "/v1/img/tiny.png" };
+    res.writeHead(200, {
+      "Content-Type": "image/png",
+      "Content-Length": PNG_1PX.length,
+      "Access-Control-Allow-Origin": "*",
+    });
+    return res.end(PNG_1PX);
+  }
+  if (path === "/e2e/img-seen" && req.method === "GET") return json(res, 200, imgSeen);
   if (path === "/chat/completions" && req.method === "POST") {
     const body = JSON.parse((await readBody(req)) || "{}");
     const messages = body.messages ?? [];

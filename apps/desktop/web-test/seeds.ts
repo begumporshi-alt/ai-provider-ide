@@ -36,7 +36,9 @@ function systemAi(): SeedInput {
   const providerId = "seed-oracle";
   // BUILTIN_TEMPLATES["openai-compat"] is the raw openaiCompat(baseUrl) builder; PROVIDER_PROFILES
   // only carries the three sketch providers (openrouter/opencode/b.ai), which pin other baseUrls.
-  const manifest = BUILTIN_TEMPLATES["openai-compat"](ORACLE_BASE);
+  // imageEndpoint:true gives the oracle the image endpoint + modality rules the Playground's
+  // Image tab needs (the mock serves a URL, exercising the host egress carve-out).
+  const manifest = BUILTIN_TEMPLATES["openai-compat"](ORACLE_BASE, { imageEndpoint: true });
   return {
     providers: [
       {
@@ -82,8 +84,14 @@ function systemAi(): SeedInput {
     models: [
       { providerId, nativeId: "oracle-mini", modality: "text", contextWindow: 8192, fetchedAt: now },
       { providerId, nativeId: "oracle-flash", modality: "text", contextWindow: 8192, fetchedAt: now },
+      // Image model: "sd-" matches the openai-compat modality rule, so the Playground's
+      // Image tab lists it and the interpreter routes /images/generations.
+      { providerId, nativeId: "sd-oracle-1", modality: "image", contextWindow: null, fetchedAt: now },
     ],
-    aliases: [{ alias: "sysai/oracle-mini", providerId, nativeModelId: "oracle-mini", priority: 1 }],
+    aliases: [
+      { alias: "sysai/oracle-mini", providerId, nativeModelId: "oracle-mini", priority: 1 },
+      { alias: "sysai/sd-oracle-1", providerId, nativeModelId: "sd-oracle-1", priority: 1 },
+    ],
     settings: {
       router: JSON.stringify({ failoverEnabled: true, systemAi: { providerId, model: "oracle-mini" } }),
     },

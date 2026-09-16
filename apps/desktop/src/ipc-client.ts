@@ -171,6 +171,27 @@ async function* emptyLines(): AsyncIterable<string> {
   return;
 }
 
+interface WireImageFetch {
+  status: number;
+  content_type: string;
+  base64: string;
+  bytes: number;
+}
+
+/**
+ * Invariant-3 carve-out: render a provider-returned image URL. The webview's CSP forbids
+ * remote content, and the URL's host may be a CDN the allowlist never saw — the host fetches
+ * it scoped to that response (no secret attached) and hands back bytes as base64, which the
+ * UI shows as a `data:` URI. A non-2xx answer throws so the caller can show the raw link.
+ */
+export async function fetchImageUrl(url: string, timeoutMs = 30_000): Promise<string> {
+  const res = await invoke<WireImageFetch>("egress_fetch_image", { req: { url, timeout_ms: timeoutMs } });
+  if (res.status < 200 || res.status >= 300) {
+    throw new Error(`image fetch failed: http ${res.status}`);
+  }
+  return `data:${res.content_type};base64,${res.base64}`;
+}
+
 /** KeyVaultPort over `vault:*`. The secret goes IN once and never comes back OUT (invariant 14). */
 export function createKeyVaultPort(): KeyVaultPort {
   return {

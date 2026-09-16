@@ -94,6 +94,16 @@ pub async fn egress_stream(
         .map_err(Into::into)
 }
 
+/// Invariant-3 carve-out: fetch a provider-returned URL (an imageUrl) as base64, scoped to
+/// that response, never an allowlist entry. No secret involved.
+#[tauri::command]
+pub async fn egress_fetch_image(
+    state: State<'_, Arc<EgressState>>,
+    req: egress::ImageFetchRequest,
+) -> Result<egress::ImageFetchResponse, CommandError> {
+    egress::fetch_image(&state, req).await.map_err(Into::into)
+}
+
 // NOTE: no egress_allow_host / egress_deny_host commands. The allowlist is mutated only by
 // provider CRUD host-side (persist.rs) — a compromised webview cannot open new destinations.
 
@@ -133,6 +143,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         vault_has,
         egress_request,
         egress_stream,
+        egress_fetch_image,
         store_info,
         settings_set,
         settings_get,

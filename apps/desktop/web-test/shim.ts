@@ -415,6 +415,10 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "egress_stream":
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       return egressStream(args.req as WireReq, args.onEvent as string);
+    case "egress_fetch_image": {
+      const req = args.req as { url: string; timeout_ms?: number | null };
+      return fetchImage(req.url, req.timeout_ms ?? 30_000);
+    }
 
     // ---- gateway bridge: the webview calls these; the real Rust gateway consumes them ----
     case "gateway_heartbeat":
@@ -524,7 +528,87 @@ async function egressUnary(req: WireReq): Promise<{ status: number; headers: Rec
   const res = await fetch(req.url, { method: req.method, headers, body: req.body ?? undefined, redirect: "manual" });
   const resHeaders: Record<string, string> = {};
   res.headers.forEach((v, k) => (resHeaders[k.toLowerCase()] = v));
-  return { status: res.status, headers: resHeaders, body: await res.text() };
+  const body = await res.text();
+  recordReturnedHosts(body);
+  return { status: res.status, headers: resHeaders, body };
+}
+
+// ---------------------------------------------------------------------------
+// Image fetch — the invariant-3 carve-out, mirrored from egress.rs §fetch_image:
+// a host returned in a provider response body is fetchable for a short window
+// (scoped, expiring), never added to the allowlist; no secret is ever attached.
+// ---------------------------------------------------------------------------
+
+/** host -> recorded-at (ms). Transient: never persisted, never in the allowlist. */
+const returnedHosts = new Map<string, number>();
+const RETURNED_HOST_TTL_MS = 10 * 60 * 1000;
+const IMAGE_FETCH_MAX_BYTES = 32 * 1024 * 1024;
+
+function recordReturnedHosts(body: string): void {
+  if (body.length > 2 * 1024 * 1024) return;
+  const now = Date.now();
+  let rest = body;
+  for (;;) {
+    const m = /https?:\/\/([A-Za-z0-9._\-[\]]+)/.exec(rest);
+    if (!m) break;
+    returnedHosts.set(m[1]!.toLowerCase(), now);
+    rest = rest.slice(m.index + m[0].length);
+  }
+  for (const [h, t] of [...returnedHosts]) if (now - t > RETURNED_HOST_TTL_MS) returnedHosts.delete(h);
+}
+
+function bytesToBase64(bytes: Uint8Array): string {
+  let bin = "";
+  const CHUNK = 0x8000;
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    bin += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(bin);
+}
+
+async function fetchImage(
+  url: string,
+  timeoutMs: number,
+): Promise<{ status: number; content_type: string; base64: string; bytes: number }> {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`invalid url: ${url}`);
+  }
+  const host = parsed.hostname.toLowerCase();
+  const providerHosts = new Set(
+    [...providers.values()].map((p) => {
+      try {
+        return new URL(p.baseUrl as string).hostname.toLowerCase();
+      } catch {
+        return "";
+      }
+    }),
+  );
+  const lease = returnedHosts.get(host);
+  const leased = lease !== undefined && Date.now() - lease <= RETURNED_HOST_TTL_MS;
+  if (!isLocal(host) && !providerHosts.has(host) && !leased) {
+    throw new Error(`image host not allowlisted: ${host} (invariant 3)`);
+  }
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    // The browser follows redirects itself here; the Rust path re-validates each hop. The
+    // mock never redirects, so this stays faithful for the harness's purposes.
+    const res = await fetch(url, { redirect: "follow", signal: ctrl.signal });
+    const buf = await res.arrayBuffer();
+    if (buf.byteLength > IMAGE_FETCH_MAX_BYTES) throw new Error("response exceeds 32 MiB cap");
+    const bytes = new Uint8Array(buf);
+    return {
+      status: res.status,
+      content_type: res.headers.get("content-type") ?? "application/octet-stream",
+      base64: bytesToBase64(bytes),
+      bytes: bytes.length,
+    };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function egressStream(req: WireReq, onEvent: string): Promise<null> {

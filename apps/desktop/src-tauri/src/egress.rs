@@ -15,9 +15,11 @@
 //!   header-stripping does not cover `x-api-key`, so following off-allowlist would exfil).
 //! - The webview cannot mutate the allowlist; only `provider_upsert`/`provider_delete` do.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
@@ -49,6 +51,8 @@ pub enum EgressError {
     Vault(#[from] vault::VaultError),
     #[error("store error: {0}")]
     Store(#[from] crate::store::StoreError),
+    #[error("image fetch refused: {0}")]
+    ImageFetch(String),
 }
 
 /// In-memory allowlist of provider hosts. Mutated ONLY by provider CRUD commands host-side
@@ -91,6 +95,25 @@ pub struct EgressResponse {
     pub status: u16,
     pub headers: std::collections::BTreeMap<String, String>,
     pub body: String,
+}
+
+/// Invariant-3 carve-out request: fetch a URL that a provider returned in the body of a
+/// response the gateway itself just served (e.g. an `imageUrl` from an image generation).
+/// The host must be localhost, allowlisted, or a recently-returned scoped host; the fetch
+/// carries NO secret and follows redirects only to hosts passing the same rule.
+#[derive(Debug, Deserialize)]
+pub struct ImageFetchRequest {
+    pub url: String,
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImageFetchResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub base64: String,
+    pub bytes: usize,
 }
 
 /// Events streamed to the TS side for SSE requests (invariant: only raw text lines — the
@@ -219,7 +242,62 @@ pub async fn request(state: &EgressState, req: EgressRequest) -> Result<EgressRe
         .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
         .collect();
     let body = res.text().await?;
+    // Invariant-3 carve-out: whatever hosts this provider just handed back (an imageUrl on a
+    // CDN host, a docs URL, ...) become fetchable for a short window — scoped, expiring,
+    // and never written into the allowlist.
+    state.record_returned_hosts(&body);
     Ok(EgressResponse { status, headers, body })
+}
+
+/// Cap for the image-fetch carve-out — protects the webview from a hostile endpoint
+/// streaming gigabytes of base64.
+const IMAGE_FETCH_MAX_BYTES: usize = 32 * 1024 * 1024;
+
+/// Invariant-3 check for the image-fetch carve-out: localhost, allowlisted, or a host the
+/// gateway just saw in a provider response body (the scoped, expiring lease).
+pub fn image_host_allowed(state: &EgressState, host: &str) -> Result<(), EgressError> {
+    let host = host.to_lowercase();
+    if is_local(&host) || state.allow.contains(&host) || state.returned_host_fresh(&host) {
+        Ok(())
+    } else {
+        Err(EgressError::HostDenied(host))
+    }
+}
+
+/// Invariant-3 carve-out fetch: get the bytes of a URL a provider returned (an imageUrl),
+/// scoped to that response, NOT a new allowlist entry. No secret is ever attached — this
+/// path exists for pre-signed CDN URLs, which need none. Every redirect hop re-passes the
+/// same allow/scoped check (see the image_client policy above).
+pub async fn fetch_image(state: &EgressState, req: ImageFetchRequest) -> Result<ImageFetchResponse, EgressError> {
+    let url = reqwest::Url::parse(&req.url).map_err(|e| EgressError::BadUrl(e.to_string()))?;
+    image_host_allowed(state, url.host_str().unwrap_or(""))?;
+    let mut b = state.image_client.get(url);
+    if let Some(ms) = req.timeout_ms {
+        b = b.timeout(std::time::Duration::from_millis(ms));
+    }
+    let res = b.send().await?;
+    let status = res.status().as_u16();
+    let content_type = res
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/octet-stream")
+        .to_string();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(EgressError::Http)?;
+        bytes.extend_from_slice(&chunk);
+        if bytes.len() > IMAGE_FETCH_MAX_BYTES {
+            return Err(EgressError::ImageFetch("response exceeds 32 MiB cap".into()));
+        }
+    }
+    Ok(ImageFetchResponse {
+        status,
+        content_type,
+        base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+        bytes: bytes.len(),
+    })
 }
 
 /// SSE streaming request: lines flow through the channel. When the webview stops consuming
@@ -284,15 +362,27 @@ pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<St
 /// Managed state: the audited trio (client + allowlist + pairing DB).
 pub struct EgressState {
     pub client: reqwest::Client,
+    /// Image-fetch client whose redirect policy re-validates every hop against the SAME
+    /// allow/scoped rule — no cross-host leap can sneak a request off the approved set
+    /// (reqwest's default policy strips standard auth headers cross-host but not custom
+    /// ones, and this path carries no secret at all).
+    image_client: reqwest::Client,
     pub allow: Arc<AllowList>,
     pub store: Arc<Store>,
+    /// Invariant-3 lease: hosts returned in response bodies, valid briefly. A provider
+    /// that returns an `imageUrl` on a CDN host the allowlist has never seen may have
+    /// THAT host fetched back — scoped, expiring, never persisted to the allowlist.
+    returned_hosts: RwLock<HashMap<String, Instant>>,
 }
+
+/// How long a provider-returned host stays fetchable (invariant 3 carve-out).
+const RETURNED_HOST_TTL: Duration = Duration::from_secs(10 * 60);
 
 impl EgressState {
     /// Connect budget per §3.6; redirect policy vetoes any off-allowlist hop (Blocker 1 of
     /// the Phase 1 diff review).
     pub fn new(allow: Arc<AllowList>, store: Arc<Store>) -> Self {
-        let _ = &allow;
+        let allow_clone = allow.clone();
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
@@ -304,9 +394,73 @@ impl EgressState {
                 .tcp_nodelay(true)
                 .build()
                 .expect("reqwest client"),
+            image_client: reqwest::Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(10))
+                .redirect(reqwest::redirect::Policy::custom(
+                    move |attempt: reqwest::redirect::Attempt| {
+                        let host = attempt.url().host_str().unwrap_or("").to_lowercase();
+                        if is_local(&host) || allow_clone.contains(&host) {
+                            attempt.follow()
+                        } else {
+                            attempt.stop()
+                        }
+                    },
+                ))
+                .tcp_nodelay(true)
+                .build()
+                .expect("reqwest image client"),
             allow,
             store,
+            returned_hosts: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Record hosts that appeared in a response body, for the invariant-3 carve-out. The
+    /// body is bounded before scanning so a giant payload can't burn time.
+    pub fn record_returned_hosts(&self, body: &str) {
+        if body.len() > 2 * 1024 * 1024 {
+            return; // provider-returned image URLs live in small JSON envelopes
+        }
+        let mut hosts = HashSet::new();
+        let mut rest = body;
+        while let Some(pos) = rest.find("http") {
+            let tail = &rest[pos..];
+            let (scheme_len, body_start) = if tail.starts_with("https://") {
+                (8, 8)
+            } else if tail.starts_with("http://") {
+                (7, 7)
+            } else {
+                (0, 1) // advance one byte; not a URL marker
+            };
+            if scheme_len > 0 {
+                let after = &tail[body_start..];
+                let host_len = after
+                    .bytes()
+                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'_' || *b == b'[' || *b == b']')
+                    .count();
+                let host = &after[..host_len];
+                if !host.is_empty() {
+                    hosts.insert(host.to_lowercase());
+                }
+            }
+            // Always advance at least one byte so malformed text can't loop forever.
+            rest = &tail[scheme_len.max(1)..];
+        }
+        if hosts.is_empty() {
+            return;
+        }
+        let mut map = self.returned_hosts.write().unwrap();
+        let now = Instant::now();
+        map.retain(|_, t| *t + RETURNED_HOST_TTL >= now);
+        for h in hosts {
+            map.insert(h, now);
+        }
+    }
+
+    /// Invariant-3 check for the image-fetch carve-out.
+    fn returned_host_fresh(&self, host: &str) -> bool {
+        let map = self.returned_hosts.read().unwrap();
+        map.get(host).is_some_and(|t| t.elapsed() < RETURNED_HOST_TTL)
     }
 }
 
@@ -359,6 +513,93 @@ mod tests {
         let mut h = std::collections::BTreeMap::new();
         h.insert("x-api-key".to_string(), "{{secret}}".to_string());
         assert!(matches!(inject_secret(h, None), Err(EgressError::SentinelMissing)));
+    }
+}
+
+#[cfg(test)]
+mod image_fetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn allow_with(host: &str) -> AllowList {
+        let a = AllowList::default();
+        a.allow(host);
+        a
+    }
+
+    fn store_with(provider_url: &str, secret_ref: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("aip-img-{}-{}", std::process::id(), {
+            static N: AtomicUsize = AtomicUsize::new(0);
+            N.fetch_add(1, Ordering::Relaxed)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).unwrap();
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, created_at, updated_at) VALUES ('p','s','n',?1,'enabled',1,1)",
+            rusqlite::params![provider_url],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (id, provider_id, label, secret_ref, added_at) VALUES ('k','p','l',?1,1)",
+            rusqlite::params![secret_ref],
+        ).unwrap();
+        drop(conn);
+        s
+    }
+
+    fn state_with(host: &str) -> EgressState {
+        EgressState::new(Arc::new(allow_with(host)), Arc::new(store_with("https://x.test/v1", "key:k1")))
+    }
+
+    #[test]
+    fn localhost_and_allowlisted_hosts_pass() {
+        let state = state_with("cdn.example.com");
+        assert!(image_host_allowed(&state, "127.0.0.1").is_ok());
+        assert!(image_host_allowed(&state, "cdn.example.com").is_ok());
+    }
+
+    #[test]
+    fn unknown_host_is_refused_before_any_request() {
+        let state = state_with("cdn.example.com");
+        assert!(matches!(
+            image_host_allowed(&state, "evil.example.com"),
+            Err(EgressError::HostDenied(_))
+        ));
+    }
+
+    #[test]
+    fn a_provider_returned_host_passes_the_carve_out() {
+        let state = state_with("cdn.example.com");
+        assert!(image_host_allowed(&state, "files.provider-cdn.test").is_err());
+        // The provider's response body names that host -> scoped lease opens, nothing persisted.
+        state.record_returned_hosts(r#"{"data":[{"url":"https://files.provider-cdn.test/a.png"}]}"#);
+        assert!(image_host_allowed(&state, "files.provider-cdn.test").is_ok());
+        assert!(!state.allow.contains("files.provider-cdn.test"), "carve-out must never widen the allowlist");
+        // A different host still has no lease.
+        assert!(image_host_allowed(&state, "other-cdn.test").is_err());
+    }
+
+    #[test]
+    fn an_expired_lease_is_refused_again() {
+        let state = state_with("cdn.example.com");
+        state.record_returned_hosts(r#"{"url":"https://files.provider-cdn.test/a.png"}"#);
+        assert!(image_host_allowed(&state, "files.provider-cdn.test").is_ok());
+        // Push the lease timestamp past its TTL.
+        state
+            .returned_hosts
+            .write()
+            .unwrap()
+            .insert("files.provider-cdn.test".to_string(), Instant::now() - RETURNED_HOST_TTL - Duration::from_secs(1));
+        assert!(image_host_allowed(&state, "files.provider-cdn.test").is_err());
+    }
+
+    #[test]
+    fn body_scanning_is_bounded_and_terminates() {
+        let state = state_with("cdn.example.com");
+        // Malformed text and a huge body must not hang or open anything.
+        state.record_returned_hosts("http:// http:// http://");
+        state.record_returned_hosts(&"x".repeat(3 * 1024 * 1024));
+        assert!(image_host_allowed(&state, "evil.example.com").is_err());
     }
 }
 

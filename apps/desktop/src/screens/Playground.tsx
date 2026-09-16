@@ -6,6 +6,7 @@
  */
 import { useMemo, useRef, useState } from "react";
 import { catalog, registry, router } from "../store";
+import { fetchImageUrl } from "../ipc-client";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, inputCls, inputStyle } from "../components/atoms";
 
@@ -199,6 +200,8 @@ function ImageBox() {
   const [prompt, setPrompt] = useState("");
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ url?: string; base64?: string; ms: number; provider?: string; key?: string } | null>(null);
+  const [shown, setShown] = useState<string | null>(null); // data: URI once the bytes are in hand
+  const [fetchNote, setFetchNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.image ?? "";
@@ -209,6 +212,8 @@ function ImageBox() {
     setBusy(true);
     setError(null);
     setResult(null);
+    setShown(null);
+    setFetchNote(null);
     const t0 = Date.now();
     setProgress("Queued at the router…");
     const timer = window.setTimeout(() => setProgress("Waiting for the provider…"), 1500);
@@ -216,6 +221,20 @@ function ImageBox() {
       const res = await router.generateImage({ model: chosen, prompt: prompt.trim() });
       setProgress("");
       setResult({ ...res, ms: Date.now() - t0, provider: chosen.split("/")[0] });
+
+      if (res.base64) {
+        setShown(`data:image/png;base64,${res.base64}`);
+      } else if (res.url) {
+        // Provider-returned URL (e.g. a CDN link). The webview CSP blocks it directly; pull
+        // the bytes through the host's scoped fetch (invariant 3 carve-out, no secret sent).
+        setFetchNote("fetching the image through the host…");
+        try {
+          setShown(await fetchImageUrl(res.url));
+          setFetchNote(null);
+        } catch (e) {
+          setFetchNote(`could not load the image (${(e as Error).message}) — the link below still works`);
+        }
+      }
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -245,6 +264,7 @@ function ImageBox() {
       <div className="flex items-center gap-3">
         {busy ? <Button variant="danger" disabled>Generating…</Button> : <Button variant="primary" disabled={!chosen || !prompt.trim()} onClick={() => void go()}>Generate</Button>}
         {progress && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{progress}</span>}
+        {fetchNote && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{fetchNote}</span>}
       </div>
       {error && <p className="mt-3 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
       {result && (
@@ -252,16 +272,9 @@ function ImageBox() {
           <p className="mono mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
             ✓ {result.ms}ms · {result.provider}{result.key ? ` · ${result.key}` : ""}
           </p>
-          {result.base64 && !result.url && <img alt="generated" src={`data:image/png;base64,${result.base64}`} className="max-h-80 rounded border" style={{ borderColor: "var(--border)" }} />}
+          {shown && <img alt="generated" src={shown} className="max-h-80 rounded border" style={{ borderColor: "var(--border)" }} />}
           {result.url && (
-            <>
-              {/* Remote image URLs flow through egress, not the webview CSP (§5 invariant 12):
-                  fetch here via the host, render as data:; for v1 show the link. */}
-              <p className="mono text-[12px]" style={{ color: "var(--text-dim)" }}>{result.url}</p>
-              <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
-                Remote images open via egress fetch in a later phase (CSP keeps the webview from loading them directly).
-              </p>
-            </>
+            <p className="mono mt-1 text-[11px] break-all" style={{ color: "var(--text-faint)" }}>{result.url}</p>
           )}
         </div>
       )}
