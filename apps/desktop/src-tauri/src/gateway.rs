@@ -333,7 +333,23 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
+                        let (pt, ct) = usage.unwrap_or((0, 0));
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(
+                            json!({
+                                "id": format!("gw-{id}"),
+                                "object": "chat.completion.chunk",
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {},
+                                    "finish_reason": "stop",
+                                    "usage": {
+                                        "prompt_tokens": pt,
+                                        "completion_tokens": ct,
+                                        "total_tokens": pt + ct
+                                    }
+                                }]
+                            }).to_string(),
+                        ));
                         break;
                     }
                     BridgeMsg::Error { message, .. } => {
@@ -681,6 +697,7 @@ fn responses_error(message: &str, code: &str) -> Value {
 /// Strip tools/tool_choice/response_format from a forwarded chat body when the
 /// gateway's tools toggle is disabled. Called after translating ingress dialects
 /// so the router core never receives those fields when tools are off.
+#[allow(dead_code)]
 fn strip_tool_fields(body: &mut Value, enabled: bool) {
     if !enabled {
         if let Some(obj) = body.as_object_mut() {
@@ -1252,13 +1269,13 @@ mod tests {
         let mut acc = String::new();
         while let Some(chunk) = stream.next().await {
             acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
-            if acc.contains("[DONE]") {
+            if acc.contains("finish_reason") && acc.contains("\"stop\"") {
                 break;
             }
         }
         assert!(acc.contains("Hel"));
         assert!(acc.contains("lo"));
-        assert!(acc.contains("[DONE]"), "stream must terminate: {acc}");
+        assert!(acc.contains("finish_reason") && acc.contains("stop"), "stream must terminate: {acc}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
