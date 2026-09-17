@@ -256,8 +256,8 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           model: served?.model.nativeId ?? requestedModel,
           status: "ok",
           latencyMs: Date.now() - t0,
-          tokensIn: 0,
-          tokensOut: 0,
+          tokensIn: exec.usage()?.prompt_tokens ?? 0,
+          tokensOut: exec.usage()?.completion_tokens ?? 0,
           costEstimateMicros: 0,
           fallbackChain: exec.fallbackChain(),
         });
@@ -276,8 +276,8 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           status: "error",
           errorClass: served ? "NETWORK" : "NO_ROUTE",
           latencyMs: Date.now() - t0,
-          tokensIn: 0,
-          tokensOut: 0,
+          tokensIn: exec.usage()?.prompt_tokens ?? 0,
+          tokensOut: exec.usage()?.completion_tokens ?? 0,
           costEstimateMicros: 0,
           fallbackChain: exec.fallbackChain(),
         });

@@ -511,3 +511,35 @@ export async function importConfig(text: string): Promise<{ providers: number; k
 export async function getDiagnosticsBundle(): Promise<string> {
   return invoke<string>("diagnostics_bundle");
 }
+
+// ── Crash reporting (L0 — local only, no external telemetry) ─────────────────
+
+export interface CrashReport {
+  id: string;
+  ts: number;
+  message: string;
+  backtrace: string;
+  os: string;
+  arch: string;
+  app_version: string;
+}
+
+export async function getCrashCount(): Promise<number> {
+  return invoke<number>("crash_count");
+}
+
+export async function listCrashes(): Promise<string[]> {
+  return invoke<string[]>("crash_list");
+}
+
+export async function readCrash(id: string): Promise<CrashReport | null> {
+  return invoke<CrashReport | null>("crash_read", { id });
+}
+
+export async function clearCrash(id: string): Promise<boolean> {
+  return invoke<boolean>("crash_clear", { id });
+}
+
+export async function clearAllCrashes(): Promise<number> {
+  return invoke<number>("crash_clear_all");
+}

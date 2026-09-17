@@ -74,7 +74,7 @@ export class ExecutionEngine {
           const { adapter } = await self.adapters.forProvider(c.provider.id);
           for await (const chunk of adapter.generateText(
             c.key.secretRef,
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall: args.onToolCall },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall: args.onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; } },
             args.signal,
           )) {
             if (!emitted) {

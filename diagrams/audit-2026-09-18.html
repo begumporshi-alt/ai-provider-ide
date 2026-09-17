@@ -1,0 +1,501 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AI-Provider IDE — Architecture Diagram</title>
+<style>
+  :root {
+    --bg: #0d1117;
+    --surface: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #8b949e;
+    --accent-rust: #dea584;
+    --accent-ts: #519aba;
+    --accent-rust-light: #f85149;
+    --accent-purple: #a371f7;
+    --accent-green: #3fb950;
+    --accent-blue: #58a6ff;
+    --accent-orange: #d29922;
+    --accent-pink: #f778ba;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+    padding: 32px;
+    min-height: 100vh;
+  }
+  h1 {
+    font-size: 28px;
+    font-weight: 700;
+    margin-bottom: 4px;
+    background: linear-gradient(135deg, var(--accent-rust), var(--accent-purple));
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  .subtitle { color: var(--muted); font-size: 14px; margin-bottom: 32px; }
+  .legend {
+    display: flex;
+    gap: 20px;
+    margin-bottom: 28px;
+    flex-wrap: wrap;
+  }
+  .legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .legend-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+  }
+  .diagram {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 36px;
+    max-width: 1200px;
+    margin: 0 auto;
+  }
+  .layer {
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 20px 24px;
+    margin-bottom: 16px;
+    position: relative;
+  }
+  .layer-label {
+    position: absolute;
+    top: -10px;
+    left: 20px;
+    background: var(--surface);
+    padding: 0 8px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--muted);
+  }
+  .layer-title {
+    font-size: 15px;
+    font-weight: 600;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .layer-title .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+  .flow-row {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+  }
+  .flow-row:last-child { margin-bottom: 0; }
+  .box {
+    border-radius: 8px;
+    padding: 10px 16px;
+    font-size: 13px;
+    font-weight: 500;
+    border: 1px solid;
+    position: relative;
+  }
+  .box-sub {
+    font-size: 11px;
+    color: var(--muted);
+    font-weight: 400;
+    margin-top: 3px;
+  }
+  .arrow {
+    color: var(--muted);
+    font-size: 18px;
+    flex-shrink: 0;
+  }
+  /* Color themes */
+  .rust-layer { border-color: rgba(222,165,132,0.3); background: rgba(222,165,132,0.05); }
+  .rust-layer .layer-title .dot { background: var(--accent-rust); }
+  .rust-box {
+    background: rgba(222,165,132,0.1);
+    border-color: rgba(222,165,132,0.3);
+    color: var(--accent-rust);
+  }
+  .ts-layer { border-color: rgba(81,154,186,0.3); background: rgba(81,154,186,0.05); }
+  .ts-layer .layer-title .dot { background: var(--accent-ts); }
+  .ts-box {
+    background: rgba(81,154,186,0.1);
+    border-color: rgba(81,154,186,0.3);
+    color: var(--accent-ts);
+  }
+  .ext-layer { border-color: rgba(163,113,247,0.3); background: rgba(163,113,247,0.05); }
+  .ext-layer .layer-title .dot { background: var(--accent-purple); }
+  .ext-box {
+    background: rgba(163,113,247,0.1);
+    border-color: rgba(163,113,247,0.3);
+    color: var(--accent-purple);
+  }
+  .client-layer { border-color: rgba(63,185,80,0.3); background: rgba(63,185,80,0.05); }
+  .client-layer .layer-title .dot { background: var(--accent-green); }
+  .client-box {
+    background: rgba(63,185,80,0.1);
+    border-color: rgba(63,185,80,0.3);
+    color: var(--accent-green);
+  }
+  .gateway-layer { border-color: rgba(88,166,255,0.3); background: rgba(88,166,255,0.05); }
+  .gateway-layer .layer-title .dot { background: var(--accent-blue); }
+  .gateway-box {
+    background: rgba(88,166,255,0.1);
+    border-color: rgba(88,166,255,0.3);
+    color: var(--accent-blue);
+  }
+  .down-arrow {
+    text-align: center;
+    color: var(--muted);
+    font-size: 22px;
+    padding: 6px 0;
+  }
+  .connection-label {
+    font-size: 11px;
+    color: var(--muted);
+    background: var(--bg);
+    padding: 2px 8px;
+    border-radius: 4px;
+    border: 1px solid var(--border);
+  }
+  .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  .grid-3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 12px; }
+  @media (max-width: 800px) {
+    .grid-2, .grid-3 { grid-template-columns: 1fr; }
+  }
+  .status-bar {
+    margin-top: 24px;
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+  }
+  .status-chip {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+    border-radius: 20px;
+    font-size: 12px;
+    font-weight: 500;
+    border: 1px solid;
+  }
+  .chip-green { background: rgba(63,185,80,0.1); border-color: rgba(63,185,80,0.3); color: var(--accent-green); }
+  .chip-yellow { background: rgba(210,153,34,0.1); border-color: rgba(210,153,34,0.3); color: var(--accent-orange); }
+  .chip-red { background: rgba(248,81,73,0.1); border-color: rgba(248,81,73,0.3); color: var(--accent-rust-light); }
+  .chip-blue { background: rgba(88,166,255,0.1); border-color: rgba(88,166,255,0.3); color: var(--accent-blue); }
+  .status-grid {
+    margin-top: 24px;
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+    gap: 12px;
+  }
+  .status-card {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 14px 16px;
+  }
+  .status-card h4 {
+    font-size: 12px;
+    color: var(--muted);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    margin-bottom: 6px;
+  }
+  .status-card .val {
+    font-size: 22px;
+    font-weight: 700;
+  }
+  .status-card .desc {
+    font-size: 12px;
+    color: var(--muted);
+    margin-top: 2px;
+  }
+  .gaps-section {
+    margin-top: 28px;
+    border-top: 1px solid var(--border);
+    padding-top: 20px;
+  }
+  .gaps-section h3 {
+    font-size: 14px;
+    color: var(--accent-orange);
+    margin-bottom: 12px;
+  }
+  .gap-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 8px;
+  }
+  .gap-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 8px 12px;
+    background: var(--bg);
+    border-radius: 6px;
+    font-size: 12px;
+    border: 1px solid var(--border);
+  }
+  .gap-sev {
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    font-weight: 700;
+    flex-shrink: 0;
+    margin-top: 1px;
+  }
+  .sev-major { background: rgba(248,81,73,0.2); color: var(--accent-rust-light); }
+  .sev-minor { background: rgba(210,153,34,0.2); color: var(--accent-orange); }
+  .sev-low { background: rgba(63,185,80,0.2); color: var(--accent-green); }
+  .top-flow {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 0;
+    padding: 10px 0;
+  }
+  .top-flow .flow-row { margin-bottom: 4px; }
+  .top-flow .down-arrow { font-size: 16px; }
+  .bridge-zone {
+    border: 2px dashed var(--border);
+    border-radius: 10px;
+    padding: 16px;
+    margin: 8px 0;
+    position: relative;
+  }
+  .bridge-label {
+    position: absolute;
+    top: -9px;
+    left: 16px;
+    background: var(--surface);
+    padding: 0 8px;
+    font-size: 11px;
+    color: var(--accent-pink);
+    font-weight: 600;
+  }
+  .storage-row {
+    display: flex;
+    gap: 12px;
+    margin-top: 8px;
+    flex-wrap: wrap;
+  }
+  .storage-chip {
+    padding: 6px 12px;
+    border-radius: 6px;
+    font-size: 11px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    background: var(--bg);
+  }
+</style>
+</head>
+<body>
+
+<h1>AI-Provider IDE</h1>
+<p class="subtitle">Local-first Tauri 2 desktop gateway &amp; model router · 127.0.0.1:8787 · 284 tests passing</p>
+
+<div class="legend">
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-rust)"></div>Rust Host (Tauri)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-ts)"></div>TypeScript Core (Webview)</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-blue)"></div>Gateway Layer</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-purple)"></div>Upstream Providers</div>
+  <div class="legend-item"><div class="legend-dot" style="background:var(--accent-green)"></div>External Clients</div>
+</div>
+
+<div class="diagram">
+
+  <!-- EXTERNAL CLIENTS -->
+  <div class="layer client-layer">
+    <div class="layer-label">Layer 0 — External</div>
+    <div class="layer-title"><div class="dot"></div>External AI Coding Clients</div>
+    <div class="flow-row">
+      <div class="box client-box">Cursor<div class="box-sub">IDE plugin</div></div>
+      <div class="box client-box">Claude Code<div class="box-sub">CLI agent</div></div>
+      <div class="box client-box">Gemini SDK<div class="box-sub">Google AI</div></div>
+      <div class="box client-box">Codex<div class="box-sub">OpenAI CLI</div></div>
+      <div class="box client-box">Custom Scripts<div class="box-sub">any HTTP client</div></div>
+    </div>
+  </div>
+
+  <div class="down-arrow">↓ <span class="connection-label">HTTP/SSE · 127.0.0.1:8787 · Bearer &lt;master-key&gt;</span></div>
+
+  <!-- GATEWAY LAYER -->
+  <div class="layer gateway-layer">
+    <div class="layer-label">Layer 0 — Rust Host</div>
+    <div class="layer-title"><div class="dot"></div>Local Gateway (Axum Server)</div>
+    <div class="flow-row">
+      <div class="box gateway-box" style="flex:1">
+        <strong>gateway.rs</strong> — Axum HTTP server
+        <div class="box-sub">Auth: constant-time key compare · Capacity: Semaphore(42) · Heartbeat check per request</div>
+      </div>
+    </div>
+    <div class="flow-row" style="margin-top:10px">
+      <div class="box gateway-box" style="font-size:11px">POST /v1/chat/completions</div>
+      <div class="box gateway-box" style="font-size:11px">POST /v1/messages</div>
+      <div class="box gateway-box" style="font-size:11px">POST /v1/responses</div>
+      <div class="box gateway-box" style="font-size:11px">POST /v1beta/models/:m:generateContent</div>
+      <div class="box gateway-box" style="font-size:11px">GET /v1/models</div>
+      <div class="box gateway-box" style="font-size:11px">POST /v1/images/generations</div>
+    </div>
+  </div>
+
+  <div class="down-arrow">↓ <span class="connection-label">Tauri Event: gateway-request → gateway-cancel</span></div>
+
+  <!-- BRIDGE ZONE -->
+  <div class="bridge-zone">
+    <div class="bridge-label">⚡ Trust Boundary — IPC Channel</div>
+    <div class="flow-row">
+      <div class="box rust-box" style="flex:1">
+        <strong>gateway_cmds.rs</strong> — Tauri command dispatch
+        <div class="box-sub">gateway_enable/disable/status · master key rotate/revoke · heartbeat · chunk/result/done/error events</div>
+      </div>
+      <div class="arrow">↔</div>
+      <div class="box ts-box" style="flex:1">
+        <strong>gateway-bridge.ts</strong> — Webview event listener
+        <div class="box-sub">normalizeGatewayRequest() · detectClient() · stream deltas via gateway_chunk commands</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="down-arrow">↓ <span class="connection-label">Tauri Commands: invoke("egress_request"|"egress_stream"|"vault_put"|…)</span></div>
+
+  <!-- ROUTER CORE (TypeScript) -->
+  <div class="layer ts-layer">
+    <div class="layer-label">Layer 1–3 — TypeScript Router Core</div>
+    <div class="layer-title"><div class="dot"></div>Model Router (pure TS, zero host knowledge)</div>
+    <div class="grid-3">
+      <div class="box ts-box">
+        <strong>L3 · Public Facade</strong>
+        <div class="box-sub">model-router.ts<br>generateText / generateImage / listModels</div>
+      </div>
+      <div class="box ts-box">
+        <strong>L2 · Routing Engine</strong>
+        <div class="box-sub">route-planner → execution-engine<br>failover · key rotation · circuit breaker</div>
+      </div>
+      <div class="box ts-box">
+        <strong>L2 · Health &amp; Ledger</strong>
+        <div class="box-sub">health-tracker · usage-ledger<br>drift-monitor · repair-orchestrator</div>
+      </div>
+      <div class="box ts-box">
+        <strong>L1 · Adapters</strong>
+        <div class="box-sub">manifest-interpreter · builtin-templates<br>openai-chat-v1 · anthropic-messages-v1</div>
+      </div>
+      <div class="box ts-box">
+        <strong>L1 · Self-Construction</strong>
+        <div class="box-sub">probe-runner · fingerprinter · adapter-generator<br>contract-suite · code-adapter (QuickJS-WASM)</div>
+      </div>
+      <div class="box ts-box">
+        <strong>L1 · Ingress Normalizers</strong>
+        <div class="box-sub">gateway-normalizer · gateway-sse-parser<br>gateway-client-detector · modality classifier</div>
+      </div>
+    </div>
+  </div>
+
+  <div class="down-arrow">↓ <span class="connection-label">Tauri Commands: egress_request / egress_stream / vault_get</span></div>
+
+  <!-- RUST EGRESS + STORE -->
+  <div class="layer rust-layer">
+    <div class="layer-label">Layer 0 — Rust Host</div>
+    <div class="layer-title"><div class="dot"></div>Egress Gateway &amp; Persistence</div>
+    <div class="grid-2">
+      <div class="box rust-box">
+        <strong>egress.rs</strong> — Outbound HTTP Gateway
+        <div class="box-sub">Host allowlist · secret_ref→host pairing · {{secret}} sentinel injection · SSE→Channel stream · Image-fetch carve-out · No-redirect policy</div>
+      </div>
+      <div class="box rust-box">
+        <strong>store.rs + persist.rs + vault.rs</strong>
+        <div class="box-sub">SQLite (WAL, FK enforcement) · OS keychain via keyring crate · Provider/Key/Manifest/Alias/Ledger CRUD</div>
+      </div>
+    </div>
+    <div class="storage-row">
+      <div class="storage-chip">🗄️ SQLite: app_data_dir/ai-provider-ide.db</div>
+      <div class="storage-chip">🔑 Keychain: ai-provider-ide:key:* / ai-provider-ide:masterkey</div>
+      <div class="storage-chip">📋 Clipboard (one-shot master key reveal only)</div>
+    </div>
+  </div>
+
+  <div class="down-arrow">↓ <span class="connection-label">HTTPS · Host allowlist enforced · No auth header leakage on redirects</span></div>
+
+  <!-- UPSTREAM PROVIDERS -->
+  <div class="layer ext-layer">
+    <div class="layer-label">Upstream</div>
+    <div class="layer-title"><div class="dot"></div>Registered AI Providers</div>
+    <div class="flow-row">
+      <div class="box ext-box">OpenRouter<div class="box-sub">openai-chat-v1 · +images</div></div>
+      <div class="box ext-box">OpenCode Zen<div class="box-sub">openai-chat-v1 · text only</div></div>
+      <div class="box ext-box">b.ai<div class="box-sub">anthropic-messages-v1</div></div>
+      <div class="box ext-box">Any Custom Provider<div class="box-sub">declarative v1.1 manifest</div></div>
+    </div>
+  </div>
+
+  <!-- STATUS SECTION -->
+  <div class="gaps-section">
+    <h3>🟢 Build Status — All Green</h3>
+    <div class="status-grid">
+      <div class="status-card">
+        <h4>Rust Compilation</h4>
+        <div class="val" style="color:var(--accent-green)">✓ PASS</div>
+        <div class="desc">0 warnings, clean build</div>
+      </div>
+      <div class="status-card">
+        <h4>Rust Tests</h4>
+        <div class="val" style="color:var(--accent-green)">48 ✓</div>
+        <div class="desc">gateway · egress · tools · persist</div>
+      </div>
+      <div class="status-card">
+        <h4>TS Typecheck</h4>
+        <div class="val" style="color:var(--accent-green)">✓ PASS</div>
+        <div class="desc">3 workspace packages clean</div>
+      </div>
+      <div class="status-card">
+        <h4>JS Unit Tests</h4>
+        <div class="val" style="color:var(--accent-green)">236 ✓</div>
+        <div class="desc">adapter-spec · router-core · desktop</div>
+      </div>
+      <div class="status-card">
+        <h4>Vite Build</h4>
+        <div class="val" style="color:var(--accent-green)">✓ PASS</div>
+        <div class="desc">8 chunks · QuickJS Wasm 687 KB</div>
+      </div>
+      <div class="status-card">
+        <h4>Gateway Port</h4>
+        <div class="val" style="color:var(--accent-blue)">8787</div>
+        <div class="desc">127.0.0.1 bound · master-key auth</div>
+      </div>
+    </div>
+
+    <h3 style="margin-top:24px">⚠️ Known Gaps &amp; Pending Items</h3>
+    <div class="gap-list">
+      <div class="gap-item"><span class="gap-sev sev-major">MAJOR</span><span>Token counting not surfaced to ledger — tokens_in/out always 0</span></div>
+      <div class="gap-item"><span class="gap-sev sev-major">MAJOR</span><span>Cost estimation always zero — pricing_json unused in ledger path</span></div>
+      <div class="gap-item"><span class="gap-sev sev-major">MAJOR</span><span>No database backup mechanism (manifests are irreplaceable)</span></div>
+      <div class="gap-item"><span class="gap-sev sev-major">MAJOR</span><span>Self-construction AI-assisted path not wired into onboarding flow</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>keyring version mismatch: vault.rs says v3, Cargo.toml pins v2</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>tools_enabled AtomicBool flag has no effect in chat_h handler</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>No /v1/health endpoint for external readiness probes</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>Ledger rollup only on startup — no periodic timer</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>No graceful gateway shutdown drain for in-flight SSE streams</span></div>
+      <div class="gap-item"><span class="gap-sev sev-minor">MINOR</span><span>No egress request URL logging (tracing configured but unused)</span></div>
+      <div class="gap-item"><span class="gap-sev sev-low">LOW</span><span>No auto-updater wired (generate-updater-keys.sh exists but unused)</span></div>
+      <div class="gap-item"><span class="gap-sev sev-low">LOW</span><span>3 local commits pending push to origin/main</span></div>
+    </div>
+  </div>
+
+</div>
+
+</body>
+</html>

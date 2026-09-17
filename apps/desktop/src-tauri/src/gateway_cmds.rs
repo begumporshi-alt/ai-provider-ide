@@ -131,6 +131,18 @@ pub fn gateway_tool_calls(
     Ok(())
 }
 
+/// Token usage from the webview router for one bridged request.
+#[tauri::command]
+pub fn gateway_usage(
+    state: State<'_, Arc<GatewayState>>,
+    request_id: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+) -> Result<(), String> {
+    state.core.reply(request_id, BridgeMsg::Usage { prompt_tokens, completion_tokens });
+    Ok(())
+}
+
 /// Replies from the webview router for one bridged request.
 #[tauri::command]
 pub fn gateway_chunk(state: State<'_, Arc<GatewayState>>, request_id: u64, text: String) -> Result<(), String> {

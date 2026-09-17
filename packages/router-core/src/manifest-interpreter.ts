@@ -62,6 +62,12 @@ export interface TextArgs {
    * null on tool-call chunks. So they get their own channel.
    */
   onToolCall?: (call: ToolCall) => void;
+  /**
+   * Token usage callback: fires once at stream end (or on non-stream response) with whatever
+   * usage the upstream provider included in the final chunk. Both values may be undefined if the
+   * provider never emitted a usage block.
+   */
+  onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
 }
 
 /** Streaming reassembly buffer: `arguments` arrives as fragments, one fragment per chunk. */
@@ -231,6 +237,17 @@ export class ManifestInterpreter implements AdapterInstance {
       const text = selectOne(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
       if (ep.responseMap.toolCalls) emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls));
+      // Non-stream: pick up usage from the response body directly.
+      if (args.onUsage && ep.responseMap.usage) {
+        const u = selectOne(json, ep.responseMap.usage) as Record<string, unknown> | undefined;
+        if (u && typeof u === "object") {
+          const pt = u["prompt_tokens"];
+          const ct = u["completion_tokens"];
+          if (typeof pt === "number" || typeof ct === "number") {
+            args.onUsage({ prompt_tokens: typeof pt === "number" ? pt : 0, completion_tokens: typeof ct === "number" ? ct : 0 });
+          }
+        }
+      }
       return;
     }
 
@@ -238,6 +255,9 @@ export class ManifestInterpreter implements AdapterInstance {
     const pending = new Map<number, PendingCall>();
     const tcs = args.onToolCall ? ep.stream.toolCallStream : undefined;
     const wantToolCalls = Boolean(args.onToolCall && (ep.stream.chunkMap.toolCalls || tcs));
+    // Last-seen usage block from the stream. Set by the Rust-side parser or by the provider's
+    // own usage chunk (e.g. OpenAI puts it on the final choice; Anthropic puts it on message_delta).
+    let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
 
     // SSE path: `data: {...}` lines through chunkMap / errorMap / finish (§2.6 v1.1).
     // try/finally so the reassembled tool calls are reported on EVERY exit path, including
@@ -286,6 +306,17 @@ export class ManifestInterpreter implements AdapterInstance {
         }
         const delta = selectOne(json, ep.stream.chunkMap.delta);
         if (typeof delta === "string" && delta) yield delta;
+        // Collect usage whenever present on any chunk (OpenAI: on final choice; Anthropic: on message_delta).
+        if (ep.responseMap.usage) {
+          const chunkUsage = selectOne(json, ep.responseMap.usage) as Record<string, unknown> | undefined;
+          if (chunkUsage && typeof chunkUsage === "object") {
+            const pt = chunkUsage["prompt_tokens"];
+            const ct = chunkUsage["completion_tokens"];
+            if (typeof pt === "number" || typeof ct === "number") {
+              lastUsage = { ...(lastUsage ?? {}), prompt_tokens: typeof pt === "number" ? pt : lastUsage?.prompt_tokens, completion_tokens: typeof ct === "number" ? ct : lastUsage?.completion_tokens };
+            }
+          }
+        }
         if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
         const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
         if (typeof finish === "string" && finish !== "null") return;
@@ -297,6 +328,10 @@ export class ManifestInterpreter implements AdapterInstance {
         for (const c of pending.values()) {
           args.onToolCall({ id: c.id, name: c.name, arguments: c.args });
         }
+      }
+      // Forward final usage block to the caller (may be undefined if provider omitted it).
+      if (args.onUsage && lastUsage && !signal?.aborted) {
+        args.onUsage({ prompt_tokens: lastUsage.prompt_tokens ?? 0, completion_tokens: lastUsage.completion_tokens ?? 0 });
       }
     }
   }

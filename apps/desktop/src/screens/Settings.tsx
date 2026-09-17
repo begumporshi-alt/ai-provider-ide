@@ -4,12 +4,14 @@
  * until the first provider, §2.9 bootstrap guard). Phase 6 adds Config & diagnostics
  * (export/import without secrets, scrubbed bug-report bundle).
  */
-import { useMemo, useState, type ReactNode } from "react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ProviderRecord } from "@aiprovider/router";
 import {
-  catalog, exportConfig, getDiagnosticsBundle, importConfig,
+  catalog, clearAllCrashes, clearCrash, exportConfig, getCrashCount,
+  getDiagnosticsBundle, importConfig, listCrashes, readCrash,
   persistRouterSettings, registry, router, setProviderRotation,
 } from "../store";
+import type { CrashReport } from "../store";
 import { useUi } from "../ui-state";
 import { StatusDot } from "../components/atoms";
 
@@ -35,9 +37,111 @@ export function SettingsScreen() {
   const ai = router.systemAiAvailable();
   const settings = router.settings;
 
+  // ── Crash report banner state ──────────────────────────────────────────────
+  const [crashCount, setCrashCount] = useState<number>(0);
+  const [expanded, setExpanded] = useState<boolean>(false);
+  const [crashes, setCrashes] = useState<CrashReport[]>([]);
+  const [crashing, setCrashing] = useState<boolean>(false);
+
+  const loadCrashInfo = async () => {
+    const n = await getCrashCount();
+    setCrashCount(n);
+    if (n > 0 && expanded) {
+      const ids = await listCrashes();
+      const reports = (await Promise.all(ids.map((id) => readCrash(id))))
+        .filter((r): r is CrashReport => r !== null);
+      setCrashes(reports);
+    }
+  };
+
+  useEffect(() => { void loadCrashInfo(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const handleClearAll = async () => {
+    setCrashing(true);
+    try {
+      await clearAllCrashes();
+      setCrashCount(0);
+      setCrashes([]);
+      setExpanded(false);
+    } finally {
+      setCrashing(false);
+    }
+  };
+
+  const handleClearOne = async (id: string) => {
+    await clearCrash(id);
+    setCrashCount((n) => n - 1);
+    setCrashes((prev) => prev.filter((r) => r.id !== id));
+  };
+
   return (
     <div className="mx-auto max-w-2xl">
       <h1 className="mb-4 text-[20px] font-semibold">Router Settings</h1>
+
+      {crashCount > 0 && (
+        <div
+          className="mb-4 rounded border px-3 py-2.5"
+          style={{ borderColor: "var(--danger, #e5484d)", background: "var(--surface-danger, rgba(229,72,77,0.06))" }}
+        >
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex items-center gap-2 text-[13px] font-medium" style={{ color: "var(--danger, #e5484d)" }}>
+              <span style={{ fontSize: 14 }}>⚠</span>
+              {crashCount === 1 ? "1 crash report found" : `${crashCount} crash reports found`}
+            </div>
+            <div className="flex items-center gap-2 shrink-0">
+              <button
+                className="rounded border px-2 py-0.5 text-[11px] disabled:opacity-50"
+                style={{ borderColor: "var(--border)", color: "var(--text-faint)", background: "transparent" }}
+                onClick={() => setExpanded((v) => !v)}
+              >
+                {expanded ? "Hide" : "Details"}
+              </button>
+              <button
+                className="rounded border px-2 py-0.5 text-[11px] disabled:opacity-50"
+                style={{ borderColor: "var(--danger, #e5484d)", color: "var(--danger, #e5484d)", background: "transparent" }}
+                disabled={crashing}
+                onClick={handleClearAll}
+              >
+                {crashing ? "Clearing…" : "Clear all"}
+              </button>
+            </div>
+          </div>
+          {expanded && crashes.length > 0 && (
+            <div className="mt-2.5 flex flex-col gap-2">
+              {crashes.map((r) => (
+                <div
+                  key={r.id}
+                  className="rounded border p-2"
+                  style={{ borderColor: "var(--border)", background: "var(--bg-elevated, var(--surface))" }}
+                >
+                  <div className="flex items-start justify-between gap-2">
+                    <div className="min-w-0">
+                      <div className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{r.id}</div>
+                      <div className="mt-0.5 text-[12px] truncate" style={{ color: "var(--text)" }}>{r.message}</div>
+                    </div>
+                    <button
+                      className="shrink-0 rounded border px-1.5 py-0.5 text-[10px] disabled:opacity-50"
+                      style={{ borderColor: "var(--border)", color: "var(--text-faint)", background: "transparent" }}
+                      onClick={() => handleClearOne(r.id)}
+                    >
+                      ✕
+                    </button>
+                  </div>
+                  <pre className="mt-1.5 max-h-24 overflow-auto text-[10px] mono" style={{ color: "var(--text-dim)" }}>
+                    {r.backtrace}
+                  </pre>
+                </div>
+              ))}
+              <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                Reports are stored locally in the app data directory — no data is sent anywhere.
+              </p>
+            </div>
+          )}
+          {expanded && crashes.length === 0 && (
+            <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>Loading…</p>
+          )}
+        </div>
+      )}
 
       <Section title="Routing">
         <Row label="Provider failover" hint="When every key of a provider fails, continue with the next provider that carries the model.">

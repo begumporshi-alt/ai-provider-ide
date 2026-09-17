@@ -3,6 +3,11 @@
  * router core, streams chunks back through the gateway_* commands, and aborts on cancel
  * events (§3.5). Ledger source is "gateway" (criterion 10 attribution).
  *
+ * Phase 2 enhancement: raw upstream SSE is parsed by gateway-sse-parser.ts which
+ * reassembles tool calls from delta fragments and emits structured tool_calls
+ * via gateway_tool_calls, unblocking WorkBuddy/Claude Code/Codex from receiving
+ * real tool calls instead of mercury-2.5 pseudo-markup.
+ *
  * The master key never appears here — auth happened in Rust before this file ever runs
  * (invariants 10, 14).
  */
@@ -75,11 +80,28 @@ async function handle(req: BridgeRequest): Promise<void> {
               toolCallsJson: JSON.stringify([call]),
             }).catch(() => undefined);
           },
+          onUsage: (usage) => {
+            // Collect usage from the adapter; we emit it after the stream so Rust can
+            // forward it to the client alongside the final SSE events.
+            void invoke("gateway_usage", {
+              requestId: req.requestId,
+              promptTokens: usage.prompt_tokens,
+              completionTokens: usage.completion_tokens,
+            }).catch(() => undefined);
+          },
         },
         { signal: ac.signal, source: "gateway" as LedgerSource },
       );
-      for await (const chunk of exec.chunks) {
-        await invoke("gateway_chunk", { requestId: req.requestId, text: chunk }).catch(() => {
+
+      // Phase 2: Filter out mercury-2.5 pseudo-tool-call markup from text chunks.
+      // The adapter's onToolCall channel forwards real tool calls via gateway_tool_calls.
+      // This suppresses in-text fallback (<|tool_call_start|>...<|tool_call_end|>)
+      // so WorkBuddy receives clean text, not rendered markup.
+      for await (const rawChunk of exec.chunks) {
+        if (rawChunk.includes("<|tool_call_start|>") || rawChunk.includes("<function=")) {
+          continue;
+        }
+        await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => {
           ac.abort();
         });
       }

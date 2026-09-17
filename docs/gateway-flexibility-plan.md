@@ -386,18 +386,18 @@ Add a `gateway-logger` that logs normalized request shape and response metadata 
 ## 4. File-Level Implementation Checklist
 
 ### New files
-- [ ] `packages/router-core/src/gateway-normalizer.ts` — request normalization pipeline
-- [ ] `packages/router-core/src/gateway-normalizer.test.ts` — unit tests for normalizer
-- [ ] `packages/router-core/src/gateway-sse-parser.ts` — SSE delta parsers + accumulator state
-- [ ] `packages/router-core/src/gateway-sse-parser.test.ts` — unit tests for parsers
+- [x] `packages/router-core/src/gateway-normalizer.ts` — request normalization pipeline
+- [x] `packages/router-core/src/gateway-normalizer.test.ts` — unit tests for normalizer
+- [x] `packages/router-core/src/gateway-sse-parser.ts` — SSE delta parsers + accumulator state
+- [x] `packages/router-core/src/gateway-sse-parser.test.ts` — unit tests for parsers
 - [ ] `packages/router-core/src/gateway-client-detector.ts` — client detection from headers
 - [ ] `packages/router-core/src/gateway-client-detector.test.ts` — tests for detection
 - [ ] `packages/router-core/src/gateway-responses-translator.ts` — Responses <-> Chat Completions
 
 ### Modified files
-- [ ] `apps/desktop/src/gateway-bridge.ts` — wire normalizer, parser, tool-call emission
-- [ ] `apps/desktop/src-tauri/src/gateway_cmds.rs` — add `gateway_tool_calls`, forward headers
-- [ ] `apps/desktop/src-tauri/src/gateway/mod.rs` — add `BridgeMsg::ToolCalls` variant
+- [x] `apps/desktop/src/gateway-bridge.ts` — wire normalizer, parser, tool-call emission
+- [x] `apps/desktop/src-tauri/src/gateway_cmds.rs` — add `gateway_tool_calls`, forward headers
+- [x] `apps/desktop/src-tauri/src/gateway/mod.rs` — add `BridgeMsg::ToolCalls` variant
 - [ ] `packages/router-core/src/model-router.ts` — expose `generateText` with `stream: false` option
 - [ ] `packages/router-core/src/execution-engine.ts` — support `stream: false` in `executeText`
 

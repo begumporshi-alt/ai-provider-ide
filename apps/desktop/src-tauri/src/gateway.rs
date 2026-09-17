@@ -63,6 +63,10 @@ pub enum BridgeMsg {
     Delta(String),
     ToolCalls(Value),
     Result(Value),
+    Usage {
+        prompt_tokens: u64,
+        completion_tokens: u64,
+    },
     Done,
     Error { status: u16, message: String },
 }
@@ -280,7 +284,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
     if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
-    let Ok(req) = serde_json::from_str::<Value>(&body) else {
+    let Ok(mut req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
     };
     // §3.4 compatibility contract: only reject truly incompatible parameters.
@@ -297,6 +301,14 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
         return err(StatusCode::BAD_REQUEST, openai_error("model is required", "invalid_request", None));
     }
     let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // §3.4: strip tool fields when the gateway toggle is off
+    if !core.is_tools_enabled() {
+        if let Some(obj) = req.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("response_format");
+        }
+    }
 
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -311,6 +323,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
         // Slot (and its Drop -> bridge.cancel) lives inside the SSE stream: axum drops the
         // stream exactly when the client disconnects or the body finishes.
         let stream_body = async_stream::stream! {
+            let mut usage: Option<(u64, u64)> = None;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -329,7 +342,23 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                         ));
                         break;
                     }
-                    BridgeMsg::ToolCalls(_) => {}
+                    BridgeMsg::ToolCalls(calls) => {
+                        // Emit tool calls as OpenAI-shaped SSE chunk so clients receive
+                        // structured tool_calls instead of mercury-2.5 pseudo-markup.
+                        let payload = json!({
+                            "id": format!("gw-{}", id),
+                            "object": "chat.completion.chunk",
+                            "choices": [{
+                                "index": 0,
+                                "delta": { "tool_calls": calls },
+                                "finish_reason": "tool_calls"
+                            }]
+                        });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
+                    }
+                    BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                        usage = Some((prompt_tokens, completion_tokens));
+                    }
                 }
             }
             drop(slot);
@@ -340,19 +369,25 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
     }
 
     let mut full = String::new();
+    let mut tool_calls_json: Option<String> = None;
+    let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
-            BridgeMsg::Result(v) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
-            }
+            BridgeMsg::Result(_) => {}
             BridgeMsg::Done => break,
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
-            BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::ToolCalls(calls) => {
+                // Buffer tool calls for non-streaming response.
+                tool_calls_json = Some(calls.to_string());
+            }
+            BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
         }
     }
     drop(slot);
@@ -366,14 +401,28 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
             };
             err(code, openai_error(&message, "upstream_error", None))
         }
-        None => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json!({ "id": format!("gw-{id}"), "object": "chat.completion",
-                "choices": [{ "index": 0, "message": { "role": "assistant", "content": full }, "finish_reason": "stop" }] })
-                .to_string(),
-        )
-            .into_response(),
+        None => {
+            let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": full }, "finish_reason": "stop" });
+            if let Some(tc) = tool_calls_json {
+                let parsed: Value = serde_json::from_str(&tc).unwrap_or_default();
+                if !parsed.is_null() {
+                    choice["message"]["tool_calls"] = parsed;
+                    choice["finish_reason"] = "tool_calls".into();
+                }
+            }
+            if let Some((pt, ct)) = usage {
+                choice["usage"] = json!({ "prompt_tokens": pt, "completion_tokens": ct });
+            }
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({ "id": format!("gw-{id}"), "object": "chat.completion",
+                    "choices": [choice],
+                    "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct })) })
+                    .to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -399,6 +448,7 @@ async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> R
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::Usage { .. } => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
@@ -462,13 +512,21 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, anthropic_error("invalid JSON body", "invalid_request_error"));
     };
-    let Some(chat) = to_chat_body(&req) else {
+    let Some(mut chat) = to_chat_body(&req) else {
         return err(
             StatusCode::BAD_REQUEST,
             anthropic_error("model and messages are required", "invalid_request_error"),
         );
     };
     // tools/tool_choice are now forwarded to upstream providers
+    // §3.4: strip when toggle is off
+    if !core.is_tools_enabled() {
+        if let Some(obj) = chat.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("response_format");
+        }
+    }
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -496,6 +554,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_start").data(start.to_string()));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_start")
                 .data(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()));
+            let mut usage: Option<(u64, u64)> = None;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -510,12 +569,16 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                         return;
                     }
                     BridgeMsg::ToolCalls(_) => {}
+                    BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                        usage = Some((prompt_tokens, completion_tokens));
+                    }
                 }
             }
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
                 .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
-                .data(json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null }, "usage": { "output_tokens": 0 } }).to_string()));
+                .data(json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                    "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
             drop(slot);
         };
@@ -525,6 +588,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     }
 
     let mut full = String::new();
+    let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
@@ -536,23 +600,30 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                 break;
             }
             BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
         }
     }
     drop(slot);
     match err_info {
         Some((_, message)) => err(StatusCode::BAD_GATEWAY, anthropic_error(&message, "api_error")),
-        None => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json!({
-                "id": msg_id, "type": "message", "role": "assistant",
-                "content": [{ "type": "text", "text": full }],
-                "model": model, "stop_reason": anthropic_stop_reason(None), "stop_sequence": null,
-                "usage": { "input_tokens": 0, "output_tokens": 0 }
-            })
-            .to_string(),
-        )
-            .into_response(),
+        None => {
+            let prompt_tokens = usage.as_ref().map(|(pt, _)| pt).unwrap_or(&0);
+            let completion_tokens = usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0);
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({
+                    "id": msg_id, "type": "message", "role": "assistant",
+                    "content": [{ "type": "text", "text": full }],
+                    "model": model, "stop_reason": anthropic_stop_reason(None), "stop_sequence": null,
+                    "usage": { "input_tokens": prompt_tokens, "output_tokens": completion_tokens }
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -607,6 +678,19 @@ fn responses_error(message: &str, code: &str) -> Value {
     json!({ "error": { "message": message, "type": "invalid_request_error", "code": code } })
 }
 
+/// Strip tools/tool_choice/response_format from a forwarded chat body when the
+/// gateway's tools toggle is disabled. Called after translating ingress dialects
+/// so the router core never receives those fields when tools are off.
+fn strip_tool_fields(body: &mut Value, enabled: bool) {
+    if !enabled {
+        if let Some(obj) = body.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("response_format");
+        }
+    }
+}
+
 async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
     if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
@@ -616,12 +700,20 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, responses_error("invalid JSON body", "invalid_json"));
     };
-    let Some(chat) = to_chat_body_responses(&req) else {
+    let Some(mut chat) = to_chat_body_responses(&req) else {
         return err(StatusCode::BAD_REQUEST, responses_error("model and input are required", "missing_required_parameter"));
     };
     // Forward tools/tool_choice from the original Responses API request to upstream providers.
     let tools: Option<Value> = req.get("tools").cloned();
     let tool_choice: Option<Value> = req.get("tool_choice").cloned();
+    // §3.4: strip when toggle is off
+    if !core.is_tools_enabled() {
+        if let Some(obj) = chat.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+            obj.remove("response_format");
+        }
+    }
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -646,6 +738,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                 "content_index": 0, "part": { "type": "output_text", "text": "", "annotations": [] } }));
             let mut text = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new(); // call_id, name, arguments
+            let mut usage: Option<(u64, u64)> = None;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -675,6 +768,9 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                             }
                         }
                     }
+                    BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                        usage = Some((prompt_tokens, completion_tokens));
+                    }
                 }
             }
             yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
@@ -701,7 +797,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
             yield ev("response.completed", json!({ "type": "response.completed",
                 "response": { "id": rid, "object": "response", "status": "completed",
                     "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
-                    "usage": { "input_tokens": 0, "output_tokens": 0 },
+                    "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
                     "tools": stream_tools.unwrap_or(json!([])),
                     "tool_choice": resolved_tool_choice
                 } }));
@@ -714,6 +810,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     let mut full = String::new();
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
+    let mut usage: Option<(u64, u64)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
@@ -738,6 +835,9 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                     }
                 }
             }
+            BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
         }
     }
     drop(slot);
@@ -748,10 +848,11 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
             for (call_id, name, args) in &tool_calls {
                 content.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
             }
+            let (pt, ct) = usage.unwrap_or((0, 0));
             let resp_body = json!({
                 "id": resp_id, "object": "response", "status": "completed",
                 "output": [{ "type": "message", "role": "assistant", "content": content }],
-                "usage": { "input_tokens": 0, "output_tokens": 0 },
+                "usage": { "input_tokens": pt, "output_tokens": ct },
                 "tools": tools.unwrap_or(json!([])),
                 "tool_choice": tool_choice.unwrap_or(json!("auto"))
             });
@@ -869,6 +970,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
 
     if streaming {
         let stream_body = async_stream::stream! {
+            let mut usage: Option<(u64, u64)> = None;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -877,7 +979,8 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
-                        let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0 } });
+                        let (pt, ct) = usage.unwrap_or((0, 0));
+                        let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
                         break;
                     }
@@ -887,6 +990,9 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                         break;
                     }
                     BridgeMsg::ToolCalls(_) => {}
+                    BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                        usage = Some((prompt_tokens, completion_tokens));
+                    }
                 }
             }
             drop(slot);
@@ -895,6 +1001,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
     }
 
     let mut full = String::new();
+    let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
@@ -906,6 +1013,9 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                 break;
             }
             BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
+                usage = Some((prompt_tokens, completion_tokens));
+            }
         }
     }
     drop(slot);
@@ -915,16 +1025,19 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
             gemini_error("gateway unavailable or at capacity", code)
         }
         Some((_, message)) => gemini_error(&message, StatusCode::BAD_GATEWAY),
-        None => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json!({
-                "candidates": [{ "content": { "parts": [{ "text": full }], "role": "model" }, "finishReason": "STOP", "index": 0 }],
-                "usageMetadata": { "promptTokenCount": 0, "candidatesTokenCount": 0, "totalTokenCount": 0 }
-            })
-            .to_string(),
-        )
-            .into_response(),
+        None => {
+            let (pt, ct) = usage.unwrap_or((0, 0));
+            (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({
+                    "candidates": [{ "content": { "parts": [{ "text": full }], "role": "model" }, "finishReason": "STOP", "index": 0 }],
+                    "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct, "totalTokenCount": pt + ct }
+                })
+                .to_string(),
+            )
+                .into_response()
+        }
     }
 }
 
@@ -959,6 +1072,7 @@ async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body:
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::Usage { .. } => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))

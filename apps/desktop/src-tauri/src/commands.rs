@@ -14,6 +14,7 @@ use tauri::State;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::store::{self, Store};
 use crate::vault;
+use crate::crash_report;
 
 #[derive(Debug, serde::Serialize)]
 pub struct CommandError(pub String);
@@ -136,6 +137,47 @@ pub fn settings_get(store: State<'_, Arc<Store>>, key: String) -> Result<Option<
     }
 }
 
+/// Return the app data directory from the store's DB path (parent of the .db file).
+fn app_data_dir(store: &store::Store) -> std::path::PathBuf {
+    std::path::PathBuf::from(&store.path)
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_default()
+}
+
+// ── crash reporting (L0 — local only, no external telemetry) ─────────────────
+
+#[tauri::command]
+pub fn crash_count(store: State<'_, Arc<store::Store>>) -> Result<usize, CommandError> {
+    Ok(crash_report::crash_count(&app_data_dir(&store)))
+}
+
+#[tauri::command]
+pub fn crash_list(store: State<'_, Arc<store::Store>>) -> Result<Vec<String>, CommandError> {
+    Ok(crash_report::list_crash_reports(&app_data_dir(&store)))
+}
+
+#[tauri::command]
+pub fn crash_read(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<Option<crash_report::CrashReport>, CommandError> {
+    Ok(crash_report::read_crash_report(&app_data_dir(&store), &id))
+}
+
+#[tauri::command]
+pub fn crash_clear(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<bool, CommandError> {
+    Ok(crash_report::clear_crash_report(&app_data_dir(&store), &id))
+}
+
+#[tauri::command]
+pub fn crash_clear_all(store: State<'_, Arc<store::Store>>) -> Result<usize, CommandError> {
+    Ok(crash_report::clear_all_crash_reports(&app_data_dir(&store)))
+}
+
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         vault_put,
@@ -176,6 +218,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_done,
         crate::gateway_cmds::gateway_error,
         crate::gateway_cmds::gateway_tool_calls,
+        crate::gateway_cmds::gateway_usage,
         crate::persist::onboarding_save,
         crate::persist::onboarding_latest_active,
         crate::persist::generator_audit_record,
@@ -188,6 +231,12 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::config_import,
         crate::persist::diagnostics_bundle,
         crate::tools::tools_policy,
-        crate::tools::tool_run
+        crate::tools::tool_run,
+        // Crash reporting (local-only, no external telemetry)
+        crate::commands::crash_count,
+        crate::commands::crash_list,
+        crate::commands::crash_read,
+        crate::commands::crash_clear,
+        crate::commands::crash_clear_all,
     ]
 }

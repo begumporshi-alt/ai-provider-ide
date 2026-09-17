@@ -87,6 +87,12 @@ export interface TextRequest {
    * response streams as an EMPTY transcript, because `delta.content` is null on those chunks.
    */
   onToolCall?: (call: ToolCall) => void;
+  /**
+   * Token usage callback: fires once at stream end (or on non-stream response) with whatever
+   * usage the upstream provider included in the final chunk. Both values may be absent if the
+   * provider never emitted a usage block.
+   */
+  onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
 }
 
 export type TextChunk = string;

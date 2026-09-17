@@ -1,4 +1,5 @@
 mod commands;
+mod crash_report;
 mod egress;
 mod gateway;
 mod gateway_cmds;
@@ -75,6 +76,11 @@ pub fn run() {
         .setup(|app| {
             // L0 services: OS keychain (via keyring), egress gateway, sql-store.
             let data_dir = app.path().app_data_dir()?;
+            // Install the panic hook now that we know the real app data dir.
+            // This captures panics that happen after setup completes (the common case).
+            // Panics during setup itself will print to stderr but won't produce a report —
+            // that's an acceptable tradeoff since such panics are rare and obvious.
+            crash_report::install_panic_hook(data_dir.clone());
             let store = Arc::new(
                 store::Store::open(&data_dir).map_err(|e| format!("store init failed: {e}"))?,
             );
