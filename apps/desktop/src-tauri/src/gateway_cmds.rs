@@ -119,6 +119,18 @@ pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), Stri
     Ok(())
 }
 
+/// Structured tool calls from the webview router for one bridged request.
+#[tauri::command]
+pub fn gateway_tool_calls(
+    state: State<'_, Arc<GatewayState>>,
+    request_id: u64,
+    tool_calls_json: String,
+) -> Result<(), String> {
+    let v: serde_json::Value = serde_json::from_str(&tool_calls_json).map_err(|e| e.to_string())?;
+    state.core.reply(request_id, BridgeMsg::ToolCalls(v));
+    Ok(())
+}
+
 /// Replies from the webview router for one bridged request.
 #[tauri::command]
 pub fn gateway_chunk(state: State<'_, Arc<GatewayState>>, request_id: u64, text: String) -> Result<(), String> {

@@ -62,6 +62,14 @@ fn probe_key_refs(store: &store::Store) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Initialize tracing (stderr JSON on debug, plain text on release)
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_env_filter(
+            std::env::var("GW_LOG").unwrap_or_else(|_| "info".to_string()),
+        )
+        .try_init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {

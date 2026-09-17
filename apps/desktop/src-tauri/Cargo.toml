@@ -34,6 +34,8 @@ rand = "0.8"
 arboard = "3"
 url = "2.5.8"
 base64 = "0.22"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

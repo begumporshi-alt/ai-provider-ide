@@ -9,12 +9,14 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { router } from "./store";
-import type { LedgerSource } from "@aiprovider/router";
+import { normalizeGatewayRequest, detectClient } from "@aiprovider/router";
+import type { LedgerSource, ToolCall } from "@aiprovider/router";
 
 interface BridgeRequest {
   requestId: number;
-  kind: "chat" | "models" | "image";
+  kind: "chat" | "responses" | "models" | "image";
   body: Record<string, unknown>;
+  headers: Record<string, string>;
 }
 
 const active = new Map<number, AbortController>();
@@ -49,24 +51,36 @@ async function handle(req: BridgeRequest): Promise<void> {
     void invoke("gateway_done", { requestId: req.requestId }).catch(() => undefined);
   };
   try {
-    if (req.kind === "chat") {
-      const model = String(req.body.model ?? "");
-      const messages = (req.body.messages ?? []) as Array<{ role: "user" | "assistant" | "system"; content: string }>;
+    if (req.kind === "chat" || req.kind === "responses") {
+      const clientHint = detectClient(req.headers || {});
+      // For Responses API requests, the body has already been normalized by Rust's
+      // to_chat_body_responses() — but we still apply the normalizer for tool schema
+      // hygiene and role fixes on top of what Rust provides.
+      const normalizedBody = normalizeGatewayRequest(req.body, { clientHint });
+
+      const model = String(normalizedBody.model ?? "");
+      const messages = (normalizedBody.messages ?? []) as Array<{ role: "user" | "assistant" | "system"; content: string }>;
       const exec = await router.generateText(
         {
           model,
           messages,
-          maxTokens: typeof req.body.max_tokens === "number" ? req.body.max_tokens : undefined,
-          temperature: typeof req.body.temperature === "number" ? req.body.temperature : undefined,
-          tools: req.body.tools,
-          toolChoice: req.body.tool_choice,
-          responseFormat: req.body.response_format,
+          maxTokens: typeof normalizedBody.max_tokens === "number" ? normalizedBody.max_tokens : undefined,
+          temperature: typeof normalizedBody.temperature === "number" ? normalizedBody.temperature : undefined,
+          tools: normalizedBody.tools,
+          toolChoice: normalizedBody.tool_choice,
+          responseFormat: normalizedBody.response_format,
+          onToolCall: (call: ToolCall) => {
+            void invoke("gateway_tool_calls", {
+              requestId: req.requestId,
+              toolCallsJson: JSON.stringify([call]),
+            }).catch(() => undefined);
+          },
         },
         { signal: ac.signal, source: "gateway" as LedgerSource },
       );
       for await (const chunk of exec.chunks) {
         await invoke("gateway_chunk", { requestId: req.requestId, text: chunk }).catch(() => {
-          ac.abort(); // the gateway stopped listening; cancel upstream
+          ac.abort();
         });
       }
       done();

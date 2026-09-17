@@ -53,12 +53,15 @@ pub struct BridgeRequest {
     pub request_id: u64,
     pub kind: &'static str, // "chat" | "models" | "image"
     pub body: Value,
+    /// Select headers forwarded for client detection (User-Agent, X-Client-Name, etc.).
+    pub headers: HashMap<String, String>,
 }
 
 /// Messages the webview bridge sends back for one request.
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
     Delta(String),
+    ToolCalls(Value),
     Result(Value),
     Done,
     Error { status: u16, message: String },
@@ -260,6 +263,17 @@ fn peer_ip(_headers: &HeaderMap) -> IpAddr {
     IpAddr::V4(Ipv4Addr::LOCALHOST) // loopback bind: single peer namespace (v1)
 }
 
+/// Extract headers relevant for client detection (User-Agent, X-Client-Name, etc.).
+fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for key in ["user-agent", "x-client-name", "x-codex-client", "accept", "x-api-key", "anthropic-version"] {
+        if let Some(v) = headers.get(key).and_then(|v| v.to_str().ok()) {
+            out.insert(key.to_string(), v.to_string());
+        }
+    }
+    out
+}
+
 // ---------- handlers ----------
 
 async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
@@ -289,7 +303,9 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req });
+    let fwd = forwarded_headers(&headers);
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req.clone(), headers: fwd });
+    tracing::info!(request_id = id, kind = "chat", model = %req.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching chat request");
 
     if wants_stream {
         // Slot (and its Drop -> bridge.cancel) lives inside the SSE stream: axum drops the
@@ -313,6 +329,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                         ));
                         break;
                     }
+                    BridgeMsg::ToolCalls(_) => {}
                 }
             }
             drop(slot);
@@ -335,6 +352,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                 err_info = Some((status, message));
                 break;
             }
+            BridgeMsg::ToolCalls(_) => {}
         }
     }
     drop(slot);
@@ -368,7 +386,8 @@ async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> R
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "models", body: json!({}) });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "models", body: json!({}), headers: forwarded_headers(&headers) });
+    tracing::info!(request_id = id, kind = "models", "dispatching models request");
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
@@ -379,6 +398,7 @@ async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> R
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
+            BridgeMsg::ToolCalls(_) => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
@@ -464,7 +484,8 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let id = slot.id;
     let msg_id = format!("msg_gw_{id}");
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("").to_string();
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: forwarded_headers(&headers) });
+    tracing::info!(request_id = id, kind = "anthropic", model = %model, "dispatching anthropic messages request");
 
     if wants_stream {
         let mid = msg_id.clone();
@@ -488,6 +509,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data(e.to_string()));
                         return;
                     }
+                    BridgeMsg::ToolCalls(_) => {}
                 }
             }
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
@@ -513,6 +535,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                 err_info = Some((status, message));
                 break;
             }
+            BridgeMsg::ToolCalls(_) => {}
         }
     }
     drop(slot);
@@ -596,7 +619,9 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     let Some(chat) = to_chat_body_responses(&req) else {
         return err(StatusCode::BAD_REQUEST, responses_error("model and input are required", "missing_required_parameter"));
     };
-    // tools/tool_choice are now forwarded to upstream providers
+    // Forward tools/tool_choice from the original Responses API request to upstream providers.
+    let tools: Option<Value> = req.get("tools").cloned();
+    let tool_choice: Option<Value> = req.get("tool_choice").cloned();
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
@@ -604,10 +629,12 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     };
     let id = slot.id;
     let resp_id = format!("resp_gw_{id}");
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: forwarded_headers(&headers) });
+    tracing::info!(request_id = id, kind = "responses", model = %chat.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching responses request");
 
     if wants_stream {
         let rid = resp_id.clone();
+        let stream_tools = tools.clone();
         let stream_body = async_stream::stream! {
             let ev = |name: &str, payload: Value| Ok::<Event, std::convert::Infallible>(
                 Event::default().event(name).data(payload.to_string()),
@@ -618,6 +645,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
             yield ev("response.content_part.added", json!({ "type": "response.content_part.added", "item_id": format!("{rid}_out"), "output_index": 0,
                 "content_index": 0, "part": { "type": "output_text", "text": "", "annotations": [] } }));
             let mut text = String::new();
+            let mut tool_calls: Vec<(String, String, Value)> = Vec::new(); // call_id, name, arguments
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -632,26 +660,60 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                             "response": { "id": rid, "object": "response", "status": "failed", "error": { "message": message } } }));
                         return;
                     }
+                    BridgeMsg::ToolCalls(calls) => {
+                        if let Some(arr) = calls.as_array() {
+                            for tc in arr {
+                                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                                let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                                let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                                let args: Value = if let Some(s) = args_raw.as_str() {
+                                    serde_json::from_str(s).unwrap_or(json!(s))
+                                } else {
+                                    args_raw.clone()
+                                };
+                                tool_calls.push((call_id.to_string(), name.to_string(), args));
+                            }
+                        }
+                    }
                 }
             }
             yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
                 "output_index": 0, "content_index": 0, "text": text.clone() }));
+            // Emit any tool-call output items interleaved with the text content.
+            let mut content_parts: Vec<Value> = vec![json!({ "type": "output_text", "text": text.clone(), "annotations": [] })];
+            for (call_id, name, args) in &tool_calls {
+                yield ev("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0,
+                    "item": { "id": format!("{rid}_fc_{call_id}"), "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() } }));
+                yield ev("response.function_call_arguments.done", json!({ "type": "response.function_call_arguments.done", "item_id": format!("{rid}_fc_{call_id}"),
+                    "output_index": 0, "arguments": args.to_string() }));
+                content_parts.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
+            }
             yield ev("response.content_part.done", json!({ "type": "response.content_part.done", "item_id": format!("{rid}_out"),
                 "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text.clone(), "annotations": [] } }));
             yield ev("response.output_item.done", json!({ "type": "response.output_item.done", "output_index": 0,
                 "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "completed",
-                    "content": [{ "type": "output_text", "text": text.clone(), "annotations": [] }] } }));
+                    "content": content_parts } }));
+            let resolved_tool_choice = stream_tools
+                .as_ref()
+                .map(|_| json!("auto"))
+                .or(tool_choice.as_ref().map(|tc| tc.clone()))
+                .unwrap_or(json!("auto"));
             yield ev("response.completed", json!({ "type": "response.completed",
                 "response": { "id": rid, "object": "response", "status": "completed",
-                    "output": [{ "type": "message", "role": "assistant", "content": [{ "type": "output_text", "text": text, "annotations": [] }] }],
-                    "usage": { "input_tokens": 0, "output_tokens": 0 } } }));
+                    "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
+                    "usage": { "input_tokens": 0, "output_tokens": 0 },
+                    "tools": stream_tools.unwrap_or(json!([])),
+                    "tool_choice": resolved_tool_choice
+                } }));
             drop(slot);
         };
         return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
     }
 
+    // Non-streaming path.
     let mut full = String::new();
     let mut err_info: Option<(u16, String)> = None;
+    let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
@@ -661,25 +723,48 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                 err_info = Some((status, message));
                 break;
             }
+            BridgeMsg::ToolCalls(calls) => {
+                if let Some(arr) = calls.as_array() {
+                    for tc in arr {
+                        let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let args: Value = if let Some(s) = args_raw.as_str() {
+                            serde_json::from_str(s).unwrap_or(json!(s))
+                        } else {
+                            args_raw.clone()
+                        };
+                        tool_calls.push((call_id.to_string(), name.to_string(), args));
+                    }
+                }
+            }
         }
     }
     drop(slot);
     match err_info {
         Some((_, message)) => err(StatusCode::BAD_GATEWAY, responses_error(&message, "upstream_error")),
-        None => (
-            StatusCode::OK,
-            [(header::CONTENT_TYPE, "application/json")],
-            json!({
+        None => {
+            let mut content: Vec<Value> = vec![json!({ "type": "output_text", "text": full, "annotations": [] })];
+            for (call_id, name, args) in &tool_calls {
+                content.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
+            }
+            let resp_body = json!({
                 "id": resp_id, "object": "response", "status": "completed",
-                "output": [{ "type": "message", "role": "assistant",
-                    "content": [{ "type": "output_text", "text": full, "annotations": [] }] }],
-                "parallel_tool_calls": false, "tool_choice": "auto", "tools": [],
-                "usage": { "input_tokens": 0, "output_tokens": 0 }
-            })
-            .to_string(),
-        )
-            .into_response(),
+                "output": [{ "type": "message", "role": "assistant", "content": content }],
+                "usage": { "input_tokens": 0, "output_tokens": 0 },
+                "tools": tools.unwrap_or(json!([])),
+                "tool_choice": tool_choice.unwrap_or(json!("auto"))
+            });
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body.to_string()).into_response()
+        }
     }
+}
+
+/// Catch-all for unknown `/v1/*` and `/v1beta/*` routes — returns a JSON 404 OpenAI-style error
+/// instead of falling through to the Tauri webview HTML 404 page.
+async fn unknown_route() -> Response {
+    tracing::warn!("unknown gateway route hit");
+    err(StatusCode::NOT_FOUND, openai_error("route not found", "not_found", Some("unknown_route")))
 }
 
 fn map_generic_to_status(r: Response) -> Response {
@@ -779,7 +864,8 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
         Err(r) => return map_generic_to_status(r),
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: forwarded_headers(&headers) });
+    tracing::info!(request_id = id, kind = "gemini", "dispatching gemini request");
 
     if streaming {
         let stream_body = async_stream::stream! {
@@ -800,6 +886,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(e.to_string()));
                         break;
                     }
+                    BridgeMsg::ToolCalls(_) => {}
                 }
             }
             drop(slot);
@@ -818,6 +905,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                 err_info = Some((status, message));
                 break;
             }
+            BridgeMsg::ToolCalls(_) => {}
         }
     }
     drop(slot);
@@ -857,7 +945,8 @@ async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body:
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "image", body: req });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "image", body: req, headers: forwarded_headers(&headers) });
+    tracing::info!(request_id = id, kind = "image", "dispatching image request");
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
@@ -869,6 +958,7 @@ async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body:
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
+            BridgeMsg::ToolCalls(_) => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
@@ -918,6 +1008,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/messages", post(messages_h))
         .route("/v1/responses", post(responses_h))
         .route("/v1beta/models/{*tail}", post(gemini_h))
+        .fallback(unknown_route)
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
@@ -963,6 +1054,12 @@ mod tests {
                 }
                 match req.kind {
                     "chat" => {
+                        core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
+                        core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                        core.reply(req.request_id, BridgeMsg::Done);
+                    }
+                    "responses" => {
+                        // Same synthetic text output as chat; responses_h wraps it into Responses API frames.
                         core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                         core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
                         core.reply(req.request_id, BridgeMsg::Done);
@@ -1430,4 +1527,101 @@ mod tests {
         assert!(!constant_time_eq("abc", "abd"));
         assert!(!constant_time_eq("abc", "abcd"));
     }
+    // ========== Phase 3: End-to-End Tool Call Verification ==========
+
+    /// Phase 3 Test 1: Verify non-streaming request with tools returns valid response
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase3_non_stream_tool_calls_in_response() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "run command"}],
+                "tools": [{"type": "function", "function": {"name": "bash", "parameters": {"type": "object", "properties": {"command": {"type": "string"}}}}}],
+                "stream": false
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        // The synth bridge returns "Hello" without tool calls, so finish_reason should be "stop"
+        assert_eq!(body["choices"][0]["finish_reason"], "stop");
+    }
+
+    /// Phase 3 Test 3: Verify tool schema is forwarded to bridge
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase3_tools_schema_forwarded() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "list files"}],
+                "tools": [{
+                    "type": "function",
+                    "function": {
+                        "name": "list_files",
+                        "description": "List files in directory",
+                        "parameters": {
+                            "type": "object",
+                            "properties": {
+                                "path": {"type": "string", "description": "Directory path"}
+                            },
+                            "required": ["path"]
+                        }
+                    }
+                }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    /// Phase 3 Test 4: Verify headers are forwarded for client detection
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase3_headers_forwarded() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("user-agent", "Claude-Code/1.0")
+            .header("x-client-name", "claude-code")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+    }
+
+    /// Phase 5: JSON 404 for unknown /v1/* routes
+    #[tokio::test(flavor = "multi_thread")]
+    async fn catch_all_unknown_route_returns_json_404() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/unknown/path", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 404);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "not_found");
+        assert_eq!(body["error"]["code"], "unknown_route");
+    }
+
 }
