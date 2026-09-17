@@ -10,6 +10,7 @@ import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
 import { classify, type ErrorClass } from "./errors.js";
 import type { HealthTracker } from "./health-tracker.js";
+import type { ToolCall } from "./ports.js";
 
 export interface AttemptOutcome {
   candidate: Candidate;
@@ -25,6 +26,11 @@ export interface ExecuteTextArgs {
   stream: boolean;
   maxTokens?: number;
   temperature?: number;
+  tools?: unknown;
+  toolChoice?: unknown;
+  responseFormat?: unknown;
+  /** Real tool calls are reported here, never through `chunks` (see ports.ToolCall). */
+  onToolCall?: (call: ToolCall) => void;
   signal?: AbortSignal;
   maxAttempts?: number;
 }
@@ -68,7 +74,7 @@ export class ExecutionEngine {
           const { adapter } = await self.adapters.forProvider(c.provider.id);
           for await (const chunk of adapter.generateText(
             c.key.secretRef,
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall: args.onToolCall },
             args.signal,
           )) {
             if (!emitted) {

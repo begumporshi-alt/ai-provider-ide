@@ -24,11 +24,25 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
           stream: "{{stream}}",
           max_tokens: "{{maxTokens?}}",
           temperature: "{{temperature?}}",
+          // §3.4 tool calling. All three are `{{x?}}`: when the caller supplies no tools the
+          // fields are omitted entirely rather than sent as null, which some servers reject.
+          tools: "{{tools?}}",
+          tool_choice: "{{toolChoice?}}",
+          response_format: "{{responseFormat?}}",
         },
-        responseMap: { text: "$.choices[0].message.content", usage: "$.usage" },
+        responseMap: {
+          text: "$.choices[0].message.content",
+          usage: "$.usage",
+          toolCalls: "$.choices[0].message.tool_calls",
+        },
         stream: {
           protocol: "sse",
-          chunkMap: { delta: "$.choices[0].delta.content" },
+          chunkMap: {
+            delta: "$.choices[0].delta.content",
+            // Streaming tool calls arrive as fragments indexed by `index`; see
+            // manifest-interpreter, which reassembles them before reporting.
+            toolCalls: "$.choices[0].delta.tool_calls",
+          },
           errorMap: { "$.error": "PASS_THROUGH" },
           finish: "$.choices[0].finish_reason",
         },
@@ -75,14 +89,40 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           messages: "{{messages}}",
           stream: "{{stream}}",
           max_tokens: "{{maxTokens}}", // anthropic REQUIRES max_tokens — not optional here
+          // Anthropic's tool_choice is an object, not a string; pass-through, so the caller
+          // supplies the dialect's own shape.
+          tools: "{{tools?}}",
+          tool_choice: "{{toolChoice?}}",
         },
-        responseMap: { text: "$.content[0].text", usage: "$.usage" },
+        responseMap: {
+          text: "$.content[0].text",
+          usage: "$.usage",
+          // Non-stream: `content` is a MIXED array (text blocks + tool_use blocks). The
+          // jsonpath subset has no filter expressions, so the interpreter filters by
+          // block type — see emitToolCalls.
+          toolCalls: "$.content",
+        },
         stream: {
           protocol: "sse",
           // content_block_delta events carry {delta:{text}}
           chunkMap: { delta: "$.delta.text" },
           errorMap: { "$.error": "PASS_THROUGH" },
           stopWhen: { path: "$.type", equals: "message_stop" },
+          // Tool use is split across events: content_block_start carries id+name, then one
+          // content_block_delta per input_json_delta fragment of the arguments JSON.
+          toolCallStream: {
+            start: {
+              when: { path: "$.content_block.type", equals: "tool_use" },
+              id: "$.content_block.id",
+              name: "$.content_block.name",
+              index: "$.index",
+            },
+            delta: {
+              when: { path: "$.delta.type", equals: "input_json_delta" },
+              partial: "$.delta.partial_json",
+              index: "$.index",
+            },
+          },
         },
       },
     },

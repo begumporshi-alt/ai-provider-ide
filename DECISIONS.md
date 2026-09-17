@@ -302,3 +302,94 @@ TS side: `packages/router-core/src/config.ts` (formatVersion 1, findSecretFields
 row sanity) + 6 vitest cases. Rust side: `config_export_import_safety` test (draft/invalid
 forcing, gateway-setting exclusion, idempotent re-import, raw-secret rejection applies
 nothing). 30 Rust + 61 TS tests, typecheck + key-leak grep clean.
+
+## 2026-09-17 — Tool-calling plumbing completed; in-band pseudo-tokens quarantined in the UI
+
+Trigger: mercury-2.5 (chosen in Playground) answered "create a skill" with raw markup —
+`<|tool_call_start|> <function=Bash> <parameter=command> mkdir -p ~/.zcode/skills/…` — painted
+verbatim into the transcript. Mercury 2.5 DOES support native tool calling, so this was never a
+model limitation. The `.zcode/skills/...` path was a model hallucination, not app configuration
+(nothing in this repo references `.zcode`).
+
+Three separate app-side breaks, all fixed:
+1. `ModelRouter.generateText` accepted `TextRequest.tools/toolChoice/responseFormat` and then
+   dropped them — `engine.executeText` was called without them. Silent downgrade of every
+   tool-capable provider to a toolless request.
+2. `builtin-templates` did not declare `tools` / `tool_choice` / `response_format` in
+   `requestTemplate`, so `renderTemplate` never emitted them even once forwarded. Added as
+   `{{x?}}` (omitted, never null) and whitelisted in `REQUEST_FIELD_WHITELIST` — the values are
+   caller-supplied placeholders, so invariant 4 is unchanged: a hostile manifest still cannot
+   smuggle body params of its own.
+3. The SSE loop read only `delta.content`, which is null on tool-call chunks, so a tool-calling
+   response streamed as an EMPTY transcript. Added optional `toolCalls` selectors to
+   `chunkMap` and `responseMap`, and an `onToolCall` side channel on `TextRequest`.
+
+**Decision: `onToolCall`, not a tagged chunk union.** `TextChunk` stays a string (see the
+2026-09-15 decision below). A tool call is structured, and `arguments` arrives as fragments
+indexed by `index` that must be reassembled before use, so it cannot be interleaved into a
+string stream without corrupting both. The callback keeps the existing protocol intact and is
+a no-op for callers that do not register a handler.
+**Deferred (now resolved, same day):** anthropic-compat streamed tool calls report via a
+`toolCallStream` descriptor (start/delta by `index`) added to builtin-templates; `emitToolCalls`
+reassembles `input_json_delta` fragments, so BOTH dialects stream tool calls end-to-end.
+Non-stream always worked. See the 2026-09-17 agent-mode entry for the execution layer.
+
+UI: `apps/desktop/src/lib/assistant-stream.ts` quarantines in-band pseudo-tokens into inert
+labelled cards instead of leaking them as text (still required — a toolless Playground session,
+or a model ignoring the guard, can still emit them). Plain chat sends a no-tools system turn by
+default; a separate **agent mode** sends the tool registry and runs a real execution loop with
+per-call confirmation (entry below). Playground also no longer replays empty assistant turns left
+behind by Stop/failure, which providers reject with 400.
+
+Tests: `packages/router-core/test/tool-calling.test.ts` (4) + `apps/desktop/src/lib/
+assistant-stream.test.ts` (7). 118 router-core + 18 adapter-spec + 7 desktop unit tests pass;
+typecheck and vite build clean.
+
+## 2026-09-17 — Tool execution layer built (Rust sandbox + TS registry/agent loop + Playground agent mode)
+
+Authorized build ("build i want everything what is necessary") closing the tool-calling story
+end-to-end. The host — not the model, not the UI — is the enforcement boundary, in three layers:
+
+1. **Sandboxed Rust tool host** (`apps/desktop/src-tauri/src/tools.rs`; compiled, 9 unit tests
+   pass). Four tools: `read_file`, `write_file`, `list_dir`, `run_command`. Four rules:
+   - NO SHELL — `Command::new(prog).args(argv)`, never `sh -c`; `; | &&` and `$( )` are inert text.
+   - ALLOWLIST — fixed executable set; `git` restricted to non-network subcommands
+     (push/pull/fetch/clone refused).
+   - ROOT CONFINEMENT — `resolve_within` canonicalizes and requires the resolved path to stay
+     under the workspace root, defeating `..` and outward symlinks; re-checked after any create.
+   - BOUNDED — 60s wall-clock timeout (kill via a shared `Arc<Mutex<Child>>`, since `wait_with_output`
+     consumes self), 64KB output cap, scrubbed environment (no ambient secrets leak into the transcript).
+   Exposed as Tauri commands `tool_run` / `tools_policy`; registered in `commands.rs::handlers()`.
+2. **TS tool registry + agent loop** (`apps/desktop/src/lib/tools/`). `AGENT_TOOLS` is the single
+   source of truth, mirroring the 4 Rust handlers 1:1; `registryToOpenAI` renders the OpenAI
+   `tools` array (`additionalProperties:false`). `runAgentLoop` is fully injectable (fake
+   `generate` + fake `host` in tests) and returns `{ text, messages }` so multi-turn agent chats
+   replay tool turns (assistant `tool_calls` + `tool` results) correctly. `onToolCall` feeds calls
+   in; `confirm` pauses per call.
+3. **Playground agent mode** (`src/screens/Playground.tsx`). Toggle + workspace-root input + live
+   sandbox-allowlist line; per-call **Allow/Deny** modal before any execution; tool results render
+   as collapsible bubbles; in-flight turns show live tool-call cards. Plain chat still defaults to
+   the no-tools guard.
+
+Verification: 44 Rust lib tests (9 tool-host + 35 existing) + 11 desktop unit tests (7
+assistant-stream + 4 agent-loop) green; all router-core/adapter-spec suites green; `tsc --noEmit`
+and `vite build` clean.
+
+**Convention learned (this session):** the `Edit` tool intermittently reported success without
+persisting the change on this project; mitigated by re-reading the edited region before trusting
+it / before compiling.
+
+## 2026-09-17 (later) — Tool-host test-isolation bug fixed
+
+Verification pass after the build surfaced a latent defect: `list_dir_stays_inside_the_root`
+passed in isolation but **failed under `cargo test`** (parallel run). Root cause: the test
+`root()` helper keyed its temp dir on `std::process::id()` only, so all 9 tool-host tests shared
+one directory; each test's `remove_dir_all` at the top clobbered a concurrent sibling's fixtures
+(a test created `a/b`, then a parallel `root()` wiped `a` before `do_list_dir` ran → "not a
+directory"). Fix: an `AtomicU64` per-`root()` suffix gives every test a distinct, non-wiped dir.
+Sandbox logic was correct throughout; this was purely test harness state.
+
+Re-verified green end-to-end: 44 Rust lib tests (10 incl. 9 tool-host) + 38 desktop TS tests
+(11 unit incl. 4 agent-loop + 7 assistant-stream, 27 e2e) + 119 router-core + 18 adapter-spec.
+`cargo` is not on the default PATH here — invoke via `~/.cargo/bin/cargo` (rustup stable
+aarch64, 1.88.0).

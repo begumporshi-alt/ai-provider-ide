@@ -81,6 +81,7 @@ pub struct GatewayCore {
     key_provider: KeyProvider,
     running: AtomicBool,
     port: Mutex<u16>,
+    tools_enabled: AtomicBool,
 }
 
 impl GatewayCore {
@@ -95,6 +96,7 @@ impl GatewayCore {
             key_provider,
             running: AtomicBool::new(false),
             port: Mutex::new(DEFAULT_PORT),
+            tools_enabled: AtomicBool::new(false),
         }
     }
 
@@ -133,6 +135,14 @@ impl GatewayCore {
 
     fn close(&self, id: u64) {
         self.pending.lock().unwrap().remove(&id);
+    }
+
+    pub fn is_tools_enabled(&self) -> bool {
+        self.tools_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tools_enabled(&self, enabled: bool) {
+        self.tools_enabled.store(enabled, Ordering::Relaxed);
     }
 }
 

@@ -20,9 +20,11 @@ export function GatewayScreen() {
   const [portInput, setPortInput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
+  const [toolsEnabled, setToolsEnabled] = useState<boolean>(false);
 
   const refresh = useCallback(() => {
     invoke<GatewayStatus>("gateway_status").then(setStatus).catch((e) => setError(String(e)));
+    invoke<boolean>("get_tools_enabled").then(setToolsEnabled).catch(() => {});
   }, []);
   useEffect(() => {
     refresh();
@@ -50,6 +52,16 @@ export function GatewayScreen() {
       refresh();
     } catch (e) {
       setError(String(e)); // invariant 16: port-squat surfaces here, loudly
+    }
+  }
+
+  async function toggleTools() {
+    setError(null);
+    try {
+      await invoke("set_tools_enabled", { enabled: !toolsEnabled });
+      setToolsEnabled((prev) => !prev);
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -180,8 +192,27 @@ export function GatewayScreen() {
           <li>Serves while this window is open. Closing the app stops the gateway.</li>
           <li>Model names: qualified <code className="mono">provider/native</code> for an exact provider, or a bare id to let the router pick + fail over.</li>
           <li>Every request is logged in Activity under source <span className="mono">gateway</span>. Wrong key → 401; router busy → 429; app closed → 503.</li>
-          <li>Four compatible surfaces — one master key: <b>OpenAI Chat</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) · <b>OpenAI Responses</b> (<span className="mono">/v1/responses</span>) · <b>Anthropic Messages</b> (<span className="mono">/v1/messages</span>, auth via <span className="mono">x-api-key</span> — Claude Code / anthropic-sdk) · <b>Gemini</b> (<span className="mono">/v1beta/models/&lt;model&gt;:generateContent</span> + <span className="mono">?alt=sse</span> streaming, auth via <span className="mono">x-goog-api-key</span> or <span className="mono">?key=</span>). Tools/tool_choice are refused with a clear error (never silently dropped).</li>
+          <li>Four compatible surfaces — one master key: <b>OpenAI Chat</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) · <b>OpenAI Responses</b> (<span className="mono">/v1/responses</span>) · <b>Anthropic Messages</b> (<span className="mono">/v1/messages</span>, auth via <span className="mono">x-api-key</span> — Claude Code / anthropic-sdk) · <b>Gemini</b> (<span className="mono">/v1beta/models/&lt;model&gt;:generateContent</span> + <span className="mono">?alt=sse</span> streaming, auth via <span className="mono">x-goog-api-key</span> or <span className="mono">?key=</span>).</li>
+          <li>Tools/tool_choice/response_format are forwarded to upstream providers when enabled. Legacy <code className="mono">functions</code> parameters (deprecated OpenAI style) are always rejected.</li>
         </ul>
+      </section>
+
+      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        <h2 className="mb-2 text-[14px] font-semibold">Feature toggles</h2>
+        <div className="flex items-center justify-between">
+          <div>
+            <span className="text-[13px] font-medium">Forward tools parameters</span>
+            <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+              Forward <code className="mono">tools</code>, <code className="mono">tool_choice</code>, and <code className="mono">response_format</code> to upstream providers.
+            </p>
+          </div>
+          <Button
+            variant={toolsEnabled ? "primary" : "ghost"}
+            onClick={() => void toggleTools()}
+          >
+            {toolsEnabled ? "Enabled" : "Disabled"}
+          </Button>
+        </div>
       </section>
     </div>
   );

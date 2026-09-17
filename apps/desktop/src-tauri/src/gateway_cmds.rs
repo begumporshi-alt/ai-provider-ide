@@ -101,6 +101,17 @@ pub fn gateway_key_revoke() -> Result<(), String> {
     gateway::revoke_master_key()
 }
 
+#[tauri::command]
+pub fn get_tools_enabled(state: State<'_, Arc<GatewayState>>) -> Result<bool, String> {
+    Ok(state.core.is_tools_enabled())
+}
+
+#[tauri::command]
+pub fn set_tools_enabled(enabled: bool, state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+    state.core.set_tools_enabled(enabled);
+    Ok(())
+}
+
 /// Webview liveness heartbeat (2s cadence from bridge.ts): proves the router core answers.
 #[tauri::command]
 pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {

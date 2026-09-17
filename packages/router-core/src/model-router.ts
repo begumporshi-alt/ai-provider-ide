@@ -68,6 +68,13 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       stream: true,
       maxTokens: req.maxTokens,
       temperature: req.temperature,
+      // §3.4 pass-through. These were accepted on TextRequest and then dropped here, so every
+      // tool-capable provider silently received a toolless request — which is why models that
+      // were trained on agent transcripts (mercury-2.5) invent tool-call markup in prose.
+      tools: req.tools,
+      toolChoice: req.toolChoice,
+      responseFormat: req.responseFormat,
+      onToolCall: req.onToolCall,
       signal: opts?.signal,
     });
     return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0);

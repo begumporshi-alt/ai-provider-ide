@@ -163,6 +163,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::ledger_recent,
         crate::persist::ledger_rollup_run,
         crate::gateway_cmds::gateway_status,
+        crate::gateway_cmds::get_tools_enabled,
+        crate::gateway_cmds::set_tools_enabled,
         crate::gateway_cmds::gateway_enable,
         crate::gateway_cmds::gateway_disable,
         crate::gateway_cmds::gateway_key_generate,
@@ -183,6 +185,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::manifest_activate,
         crate::persist::config_export,
         crate::persist::config_import,
-        crate::persist::diagnostics_bundle
+        crate::persist::diagnostics_bundle,
+        crate::tools::tools_policy,
+        crate::tools::tool_run
     ]
 }

@@ -39,12 +39,54 @@ export interface StorePort {
   execute(sql: string, params?: unknown[]): Promise<void>;
 }
 
+/**
+ * A REAL tool call returned by a provider (OpenAI `tool_calls`), normalized across dialects.
+ *
+ * Distinct from the in-band pseudo-tokens some models emit as plain text (`<|tool_call_start|>`
+ * etc.) — those arrive as ordinary text chunks and are the UI's problem, not the router's.
+ * `arguments` is the raw JSON string exactly as the provider built it; parsing it is the
+ * caller's job because only the caller knows the schema of its own tools.
+ */
+export interface ToolCall {
+  id?: string;
+  name?: string;
+  /** JSON text; may be empty when the model calls a tool that takes no arguments. */
+  arguments?: string;
+  /** The provider's own object, for dialects that carry fields this shape does not model. */
+  raw?: unknown;
+}
+
+/**
+ * One turn in a chat request. Permissive on purpose: the router never interprets these, it
+ * forwards them verbatim, and the tool dialects disagree on the extra fields
+ * (`tool_call_id` for a result, `tool_calls` on the assistant turn that requested them).
+ */
+export type ChatMessage = {
+  role: "user" | "assistant" | "system" | "tool";
+  content: string;
+  /** Set on role "tool": which call this result answers. */
+  tool_call_id?: string;
+  /** Set on role "assistant" when the turn requested calls; must be replayed or most
+   *  providers reject the following tool result with a 400. */
+  tool_calls?: unknown;
+};
+
 export interface TextRequest {
   model: string;
-  messages: Array<{ role: "user" | "assistant" | "system"; content: string }>;
+  messages: ChatMessage[];
   /** §3.4 compatibility contract: both supported, passed through when the manifest allows. */
   maxTokens?: number;
   temperature?: number;
+  /** Tool calling support (§3.4) */
+  tools?: unknown;
+  toolChoice?: unknown;
+  responseFormat?: unknown;
+  /**
+   * Side channel for real tool calls. Kept out of `chunks` on purpose: TextChunk is a string
+   * (DECISIONS.md), and a tool call is structured, not prose. Without this a tool-calling
+   * response streams as an EMPTY transcript, because `delta.content` is null on those chunks.
+   */
+  onToolCall?: (call: ToolCall) => void;
 }
 
 export type TextChunk = string;

@@ -58,6 +58,9 @@ async function handle(req: BridgeRequest): Promise<void> {
           messages,
           maxTokens: typeof req.body.max_tokens === "number" ? req.body.max_tokens : undefined,
           temperature: typeof req.body.temperature === "number" ? req.body.temperature : undefined,
+          tools: req.body.tools,
+          toolChoice: req.body.tool_choice,
+          responseFormat: req.body.response_format,
         },
         { signal: ac.signal, source: "gateway" as LedgerSource },
       );

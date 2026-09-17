@@ -48,16 +48,46 @@ export const LIST_MODELS_ENDPOINT = z.object({
 /** Equality condition against a selector: matches when selectOne(json, path) === value. */
 const StreamCondition = z.object({ path: Selector, equals: z.union([z.string(), z.number(), z.boolean(), z.null()]) });
 
+/**
+ * How a dialect frames a tool call ACROSS stream events (v1.1 amendment 2026-09-17).
+ *
+ * Needed because not every dialect delivers a tool call as one object the way OpenAI does
+ * (`delta.tool_calls`, handled by `chunkMap.toolCalls`). Anthropic splits it over events:
+ *
+ *   content_block_start -> { content_block: { type: "tool_use", id, name } }
+ *   content_block_delta -> { delta: { type: "input_json_delta", partial_json: "{ \"pa" } }
+ *
+ * So the grammar needs a start-event (id/name) and a delta-event (argument fragment), each
+ * recognized by a condition, plus the block index that ties them together. `index` is
+ * optional: dialects with one tool call per event may omit it.
+ */
+const TOOL_CALL_STREAM = z.object({
+  start: z.object({
+    when: StreamCondition,
+    id: Selector.optional(),
+    name: Selector.optional(),
+    index: Selector.optional(),
+  }),
+  delta: z.object({
+    when: StreamCondition,
+    partial: Selector,
+    index: Selector.optional(),
+  }),
+});
+
 export const GENERATE_TEXT_ENDPOINT = z.object({
   method: z.literal("POST"),
   path: z.string(),
   headers: z.record(z.string()).optional(), // per-endpoint static request headers (v1.1)
   requestTemplate: z.record(z.string()), // values are "{{x}}", "{{x?}}", or literals
-  responseMap: z.object({ text: Selector, usage: Selector.optional() }),
+  // `toolCalls` (v1.1 amendment 2026-09-17): where a real tool call sits in the response.
+  // Optional and dialect-specific — a manifest that omits it simply never reports tool
+  // calls, which is the pre-amendment behaviour.
+  responseMap: z.object({ text: Selector, usage: Selector.optional(), toolCalls: Selector.optional() }),
   stream: z
     .object({
       protocol: z.literal("sse"),
-      chunkMap: z.object({ delta: Selector }),
+      chunkMap: z.object({ delta: Selector, toolCalls: Selector.optional() }),
       errorMap: z.record(z.string()).optional(), // v1.1 mid-stream errors
       finish: Selector.optional(),
       // v1.1 amendment 2026-09-15 (DECISIONS.md): dialect-portable stream control.
@@ -66,6 +96,9 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
       //   ignoreWhen — events whose mismatched chunkMap must not classify as PARSE_ERROR
       stopWhen: StreamCondition.optional(),
       ignoreWhen: StreamCondition.optional(),
+      // Multi-event tool-call framing (anthropic-compat). Mutually exclusive in practice
+      // with chunkMap.toolCalls; if both are declared, toolCallStream wins.
+      toolCallStream: TOOL_CALL_STREAM.optional(),
     })
     .optional(),
 });
@@ -141,8 +174,13 @@ export type GenerateImageEndpoint = z.infer<typeof GENERATE_IMAGE_ENDPOINT>;
 /** Whitelisted request-body fields per endpoint — a hostile manifest cannot smuggle extras
  *  (invariant 4: generator picks mappings, lint bounds the surface). */
 export const REQUEST_FIELD_WHITELIST: Record<string, ReadonlySet<string>> = {
+  // `tools` / `tool_choice` / `response_format` (2026-09-17) carry CALLER-supplied values via
+  // {{tools?}} placeholders — the manifest can only say "put the caller's tools here", it
+  // cannot invent them. Same trust level as `messages`, so whitelisting them does not weaken
+  // invariant 4 (a hostile manifest still cannot smuggle arbitrary body params of its own).
   generateText: new Set([
     "model", "messages", "stream", "max_tokens", "temperature",
+    "tools", "tool_choice", "response_format",
   ]),
   generateImage: new Set(["model", "prompt", "size"]),
   listModels: new Set<string>(),

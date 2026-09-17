@@ -4,6 +4,7 @@ mod gateway;
 mod gateway_cmds;
 mod persist;
 mod store;
+mod tools;
 mod vault;
 
 use std::sync::{Arc, RwLock};

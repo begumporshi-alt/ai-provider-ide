@@ -9,7 +9,8 @@
  *     async generateText(http, emit, argsJson) -> undefined          // emit(chunk) streams
  *     async generateImage(http, argsJson) -> {ok,status,base64?,url?,errorBody?}
  *   }
- *   `argsJson` is a JSON string: {model, messages, stream, maxTokens?, temperature?}.
+ *   `argsJson` is a JSON string: {model, messages, stream, maxTokens?, temperature?,
+ *    tools?, toolChoice?, responseFormat?}.
  *   `http(req)` -> Promise<{status, text}>: req = {path, method?, headers?, body?}.
  *     `path` must be a RELATIVE provider path ("/models"); the host prefixes the manifest
  *     baseUrl and injects the sentinel auth headers + secretRef — guest code can NEVER
@@ -528,6 +529,9 @@ export class CodeAdapterInstance implements AdapterInstance {
         stream: args.stream,
         maxTokens: args.maxTokens,
         temperature: args.temperature,
+        tools: args.tools ?? null,
+        toolChoice: args.toolChoice ?? null,
+        responseFormat: args.responseFormat ?? null,
         limits: this.manifest.limits ?? null,
       }),
     );

@@ -10,6 +10,7 @@ import { selectAll, selectOne } from "./jsonpath.js";
 import { renderTemplate } from "./template.js";
 import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
+import type { ToolCall } from "./ports.js";
 
 export interface HttpPortLike {
   request(req: {
@@ -52,6 +53,71 @@ export interface TextArgs {
   stream: boolean;
   maxTokens?: number;
   temperature?: number;
+  tools?: unknown;
+  toolChoice?: unknown;
+  responseFormat?: unknown;
+  /**
+   * Reports REAL tool calls (OpenAI `tool_calls`). They cannot ride along in `chunks` — the
+   * chunk protocol is strings only — and they cannot be derived from `delta.content`, which is
+   * null on tool-call chunks. So they get their own channel.
+   */
+  onToolCall?: (call: ToolCall) => void;
+}
+
+/** Streaming reassembly buffer: `arguments` arrives as fragments, one fragment per chunk. */
+interface PendingCall {
+  id?: string;
+  name?: string;
+  args: string;
+}
+
+/** Accumulate one chunk's `tool_calls` array into the buffer, keyed by the delta index. */
+function collectToolCallDeltas(acc: Map<number, PendingCall>, raw: unknown): void {
+  const list = Array.isArray(raw) ? raw : [raw];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    const idx = typeof o.index === "number" ? o.index : 0;
+    const cur = acc.get(idx) ?? { args: "" };
+    if (typeof o.id === "string" && o.id) cur.id = o.id;
+    const fn = o.function;
+    if (fn && typeof fn === "object") {
+      const f = fn as Record<string, unknown>;
+      if (typeof f.name === "string" && f.name) cur.name = f.name;
+      if (typeof f.arguments === "string") cur.args += f.arguments;
+    }
+    acc.set(idx, cur);
+  }
+}
+
+/** Block types that are tool calls. Anthropic `content` mixes these with `text` blocks. */
+const TOOL_BLOCK_TYPES = new Set(["tool_use", "function"]);
+
+/** Normalize a non-stream tool-call array (already complete — no reassembly needed). */
+function emitToolCalls(sink: ((call: ToolCall) => void) | undefined, raw: unknown): void {
+  if (!sink) return;
+  const list = Array.isArray(raw) ? raw : [raw];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    // A dialect may hand back a mixed array (anthropic `content` = text + tool_use blocks);
+    // only the tool blocks are calls. OpenAI entries carry no `type` and pass through.
+    if (typeof o.type === "string" && !TOOL_BLOCK_TYPES.has(o.type)) continue;
+    const fn = (typeof o.function === "object" && o.function ? o.function : o) as Record<string, unknown>;
+    // OpenAI nests under `function` (arguments as a JSON string); anthropic is flat with
+    // `input` (already an object).
+    const argsRaw = fn.arguments ?? fn.input;
+    sink({
+      id: typeof o.id === "string" ? o.id : undefined,
+      name: typeof fn.name === "string" ? fn.name : undefined,
+      arguments: typeof argsRaw === "string"
+        ? argsRaw
+        : argsRaw === undefined
+          ? undefined
+          : JSON.stringify(argsRaw),
+      raw: item,
+    });
+  }
 }
 
 function joinUrl(baseUrl: string, path: string): string {
@@ -145,6 +211,9 @@ export class ManifestInterpreter implements AdapterInstance {
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
       temperature: args.temperature,
+      tools: args.tools,
+      toolChoice: args.toolChoice,
+      responseFormat: args.responseFormat,
       ...this.ctx.vars,
     });
     const res = await this.ctx.http.request({
@@ -161,33 +230,74 @@ export class ManifestInterpreter implements AdapterInstance {
       const json: unknown = JSON.parse(await res.text());
       const text = selectOne(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
+      if (ep.responseMap.toolCalls) emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls));
       return;
     }
 
+    // Reassembled here, flushed once the stream ends: `arguments` is delivered in fragments.
+    const pending = new Map<number, PendingCall>();
+    const tcs = args.onToolCall ? ep.stream.toolCallStream : undefined;
+    const wantToolCalls = Boolean(args.onToolCall && (ep.stream.chunkMap.toolCalls || tcs));
+
     // SSE path: `data: {...}` lines through chunkMap / errorMap / finish (§2.6 v1.1).
-    for await (const line of res.lines) {
-      if (signal?.aborted) return;
-      const trimmed = line.trim();
-      if (!trimmed.startsWith("data:")) continue;
-      const payload = trimmed.slice(5).trim();
-      if (payload === "[DONE]") return;
-      let json: unknown;
-      try {
-        json = JSON.parse(payload);
-      } catch {
-        continue;
+    // try/finally so the reassembled tool calls are reported on EVERY exit path, including
+    // the early `return`s below (stopWhen, finish_reason, [DONE]).
+    try {
+      for await (const line of res.lines) {
+        if (signal?.aborted) return;
+        const trimmed = line.trim();
+        if (!trimmed.startsWith("data:")) continue;
+        const payload = trimmed.slice(5).trim();
+        if (payload === "[DONE]") return;
+        let json: unknown;
+        try {
+          json = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+        if (ep.stream.errorMap) {
+          for (const errPath of Object.keys(ep.stream.errorMap)) {
+            const err = selectOne(json, errPath);
+            if (err) throw new ManifestHttpError(200, JSON.stringify(err), "mid-stream");
+          }
+        }
+        if (wantToolCalls) {
+          if (tcs) {
+            // Multi-event framing (anthropic): a start event declares the call, subsequent
+            // delta events append argument fragments.
+            if (selectOne(json, tcs.start.when.path) === tcs.start.when.equals) {
+              const idx = tcs.start.index ? Number(selectOne(json, tcs.start.index) ?? 0) : 0;
+              const existing = pending.get(idx) ?? { args: "" };
+              const id = tcs.start.id ? selectOne(json, tcs.start.id) : undefined;
+              const name = tcs.start.name ? selectOne(json, tcs.start.name) : undefined;
+              if (typeof id === "string" && id) existing.id = id;
+              if (typeof name === "string" && name) existing.name = name;
+              pending.set(idx, existing);
+            } else if (selectOne(json, tcs.delta.when.path) === tcs.delta.when.equals) {
+              const idx = tcs.delta.index ? Number(selectOne(json, tcs.delta.index) ?? 0) : 0;
+              const partial = selectOne(json, tcs.delta.partial);
+              const cur = pending.get(idx) ?? { args: "" };
+              if (typeof partial === "string") cur.args += partial;
+              pending.set(idx, cur);
+            }
+          } else if (ep.stream.chunkMap.toolCalls) {
+            collectToolCallDeltas(pending, selectOne(json, ep.stream.chunkMap.toolCalls));
+          }
+        }
+        const delta = selectOne(json, ep.stream.chunkMap.delta);
+        if (typeof delta === "string" && delta) yield delta;
+        if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
+        const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
+        if (typeof finish === "string" && finish !== "null") return;
       }
-      if (ep.stream.errorMap) {
-        for (const errPath of Object.keys(ep.stream.errorMap)) {
-          const err = selectOne(json, errPath);
-          if (err) throw new ManifestHttpError(200, JSON.stringify(err), "mid-stream");
+    } finally {
+      // Stream over (end of lines, [DONE], stopWhen or finish_reason). A cancelled stream has
+      // no complete call to report, so partials are dropped when aborted.
+      if (args.onToolCall && !signal?.aborted) {
+        for (const c of pending.values()) {
+          args.onToolCall({ id: c.id, name: c.name, arguments: c.args });
         }
       }
-      const delta = selectOne(json, ep.stream.chunkMap.delta);
-      if (typeof delta === "string" && delta) yield delta;
-      if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
-      const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
-      if (typeof finish === "string" && finish !== "null") return;
     }
   }
 
