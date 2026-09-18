@@ -840,3 +840,26 @@ Two consequences had to be solved, or this would have shipped a worse bug than i
 the plan snippet that prescribed the buggy `JSON.parse(rawChunk)` pattern — now marked
 REJECTED in `docs/gateway-flexibility-plan.md` with what was wrong and why. Recoverable from
 git if the Claude/Responses dialect work needs it.
+
+---
+
+## R5 accepted: the rename orphans local data, and we are not migrating it (2026-09-18)
+
+Renaming `identifier` from `dev.aiprovider.ide` to `dev.aiprovider.router` moved the app-data
+directory and the keychain namespace, so a renamed build cannot see data written by the old
+one. Measured before deciding, because the finding had only ever been theoretical:
+
+```
+dev.aiprovider.ide/ai-provider-ide.db        360 KB + 4.3 MB WAL   real data, last written 14:13
+dev.aiprovider.router/ai-provider-router.db    4 KB                created empty on first launch
+```
+
+**Decision: accept it.** The app is pre-release and the only person affected is the developer,
+so there is no user data at risk. Re-entering provider keys is cheaper than migration code that
+reads one database, writes another and re-registers keychain entries — code that becomes dead
+weight the moment it has run once, and which can lose recent rows quietly through a bad WAL
+copy. An empty database, by contrast, announces itself immediately.
+
+**Nothing was deleted.** `dev.aiprovider.ide/` stays exactly where it is and remains
+recoverable until removed by hand. If the app ever ships to anyone who has run an older build,
+this decision has to be revisited — that is the moment migration becomes worth writing.

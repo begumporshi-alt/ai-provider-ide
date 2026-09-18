@@ -407,7 +407,7 @@ semaphore and R3's per-provider caps still apply, but one app key can still mono
 Tracked as a v1.1 follow-up — it needs a per-key token bucket, which is a different mechanism
 from anything here.
 
-### R5 — [MEDIUM] The rename orphans existing local data (introduced by this change)
+### R5 — [MEDIUM] The rename orphans existing local data — **RESOLVED 2026-09-18 (accepted)**
 
 Renaming `identifier` and the keychain service changes both the app-data directory and the
 keychain namespace. Verified on this machine:
@@ -425,6 +425,26 @@ Keys are not lost from the keychain — they are merely invisible under the new 
 they must re-enter keys; or (b) ship a one-time migration that copies the DB to the new path and
 re-registers keychain entries under the new service. Recommended: (a) now, since the app is
 pre-release, and record it in DECISIONS.md.
+
+**Resolution (applied): (a) accept.** Measured on this machine first, because the finding was
+only ever theoretical:
+
+```
+dev.aiprovider.ide/ai-provider-ide.db        360 KB  + 4.3 MB WAL   ← real data, last written 14:13
+dev.aiprovider.router/ai-provider-router.db    4 KB                 ← created empty on first launch
+```
+
+So the orphaning is live, not hypothetical: the renamed build starts with no providers,
+manifests or ledger, and keys held under the old keychain service are invisible to it.
+
+Accepted anyway. The app is pre-release and the only person affected is the developer — there
+are no users whose data would be destroyed. Re-entering provider keys is cheaper than shipping
+migration code that reads one database, writes another and re-registers keychain entries; that
+code would be dead weight the instant it had run once, and a bad WAL copy can lose recent rows
+far more quietly than an empty database announces itself.
+
+Nothing was deleted. The old directory stays in place so the data remains recoverable until it
+is removed by hand. Recorded in DECISIONS.md.
 
 ### R6 — [LOW] TypeScript version split (6.0.3 vs 5.8) — **RESOLVED 2026-09-18**
 
@@ -450,12 +470,15 @@ any two workspace packages declare different TypeScript, if the pin is a range r
 exact, or if `pnpm-lock.yaml` resolves to more than one TypeScript. It was negative-tested:
 reverting one package to `~5.8.0` makes it exit 1 with the offending file named.
 
-### R7 — [LOW] `dev.db` was untracked and not ignored
+### R7 — [LOW] `dev.db` was untracked and not ignored — **RESOLVED 2026-09-18**
 
 `apps/desktop/src-tauri/dev.db` existed untracked in the working tree — a local database one
 `git add -A` away from being committed with real provider references and ledger history.
 
 **Fix (applied):** `*.db`, `*.db-shm`, `*.db-wal` added to `.gitignore`.
+
+**Verified 2026-09-18:** the three rules are present under `apps/desktop/src-tauri/`, and
+`git ls-files` reports no tracked `.db` anywhere in the tree.
 
 ### R8 — [LOW] `store.ts` / `commands.rs` concentration — **RESOLVED 2026-09-18**
 
