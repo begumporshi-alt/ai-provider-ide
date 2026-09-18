@@ -302,6 +302,11 @@ pub struct ModelRow {
     /// cost — and therefore the monthly spend cap — goes dark until the next manual refresh.
     #[serde(default)]
     pub pricing_json: Option<String>,
+    /// What the model can do, as JSON (`{"reasoning":true}`), or NULL when the provider did not
+    /// say. Persisted for the same reason as pricing: the gateway worker never re-lists, so an
+    /// unpersisted capability is one the gateway cannot report to a client.
+    #[serde(default)]
+    pub capabilities_json: Option<String>,
 }
 
 #[tauri::command]
@@ -326,16 +331,16 @@ fn replace_models(conn: &mut rusqlite::Connection, provider_id: &str, rows: &[Mo
     for r in rows {
         let id = format!("{}:{}", r.provider_id, r.native_id);
         tx.execute(
-            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at, pricing_json) VALUES (?1,?2,?3,?4,?5,?6,?7)
-             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6, pricing_json=?7",
-            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at, r.pricing_json],
+            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
+             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6, pricing_json=?7, capabilities_json=?8",
+            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at, r.pricing_json, r.capabilities_json],
         )?;
     }
     tx.commit()
 }
 
 fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
-    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json FROM models_cache")?;
+    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json FROM models_cache")?;
     let rows = stmt.query_map([], |r| {
         Ok(ModelRow {
             provider_id: r.get(0)?,
@@ -344,6 +349,7 @@ fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
             context_window: r.get(3)?,
             fetched_at: r.get(4)?,
             pricing_json: r.get(5)?,
+            capabilities_json: r.get(6)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -845,6 +851,7 @@ mod persist_tests {
                     context_window: None,
                     fetched_at: 1,
                     pricing_json: Some(r#"{"prompt":150000,"completion":600000}"#.into()),
+                    capabilities_json: Some(r#"{"reasoning":false}"#.into()),
                 },
                 ModelRow {
                     provider_id: "p".into(),
@@ -853,6 +860,7 @@ mod persist_tests {
                     context_window: None,
                     fetched_at: 1,
                     pricing_json: None,
+                    capabilities_json: None,
                 },
             ];
             replace_models(&mut conn, "p", &rows).unwrap();
@@ -876,11 +884,13 @@ mod persist_tests {
                 context_window: None,
                 fetched_at: 2,
                 pricing_json: None,
+                capabilities_json: None,
             }];
             replace_models(&mut conn, "p", &refreshed).unwrap();
             let back = list_models(&conn).unwrap();
             assert_eq!(back.len(), 1);
             assert_eq!(back[0].pricing_json, None);
+            assert_eq!(back[0].capabilities_json, None, "a refresh with no capability data must clear it, not leave a stale claim");
             assert_eq!(back[0].fetched_at, 2);
         }
         let _ = std::fs::remove_dir_all(&dir);

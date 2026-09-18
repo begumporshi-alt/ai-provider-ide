@@ -15,6 +15,7 @@ export { buildPlan, orderKeys, type Candidate, type PlanContext, type PlanInput 
 export { ExecutionEngine, AllAttemptsFailedError, MAX_ATTEMPTS_DEFAULT, type AttemptOutcome, type TextExecution } from "./execution-engine.js";
 export { ProviderLimiter, PER_PROVIDER_DEFAULT } from "./concurrency.js";
 export { parsePricing, estimateCostMicros, priceRank, type PricingMicros } from "./pricing.js";
+export { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
 export { UsageLedger, type LedgerEntry, type LedgerSource } from "./usage-ledger.js";
 export { AdapterRuntime } from "./adapter-runtime.js";
 export { ModelCatalog } from "./model-catalog.js";

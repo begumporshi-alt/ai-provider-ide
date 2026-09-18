@@ -42,6 +42,12 @@ export interface CatalogModel {
    * refresh time. `undefined` = unknown (NOT free) — the UI renders it as "—", not "$0.00".
    */
   pricing?: PricingMicros;
+  /**
+   * Whether the provider says this model can produce reasoning. `undefined` = unknown, which is
+   * deliberately different from `false` — clients are told "no reasoning" only when the catalog
+   * actually says so, never by default.
+   */
+  supportsReasoning?: boolean;
 }
 
 export interface AliasEntry {

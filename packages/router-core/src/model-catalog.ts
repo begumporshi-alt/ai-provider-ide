@@ -8,6 +8,7 @@ import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ProviderRegistry } from "./provider-registry.js";
 import type { ModelEntry } from "./manifest-interpreter.js";
 import { parsePricing, type PricingMicros } from "./pricing.js";
+import { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -55,6 +56,10 @@ export class ModelCatalog {
         // Audit R2: keep the provider's published price, normalized. Unparseable/absent
         // pricing stays `undefined` (unknown), so "no price" can never read as "free".
         pricing: parsePricing(e.raw),
+        // Same reasoning as pricing, for the other facts a client cannot guess: the prompt
+        // budget and whether the model reasons. Persisted with the row (see model-meta.ts).
+        contextWindow: parseContextWindow(e.raw),
+        supportsReasoning: parseReasoningSupport(e.raw),
       });
     }
     this.fetchedAt.set(providerId, now);

@@ -38,7 +38,20 @@ export interface HostKeyRow {
 }
 export interface HostModelRow {
   providerId: string; nativeId: string; modality: string; contextWindow: number | null; fetchedAt: number;
-  pricingJson: string | null;
+  pricingJson: string | null; capabilitiesJson: string | null;
+}
+
+/**
+ * Capabilities come back as a JSON string. Unknown stays unknown — never assumed either way,
+ * because a client acts on this flag.
+ */
+function parseCapabilitiesJson(v: string | null | undefined): { reasoning?: boolean } | undefined {
+  if (!v) return undefined;
+  try {
+    return JSON.parse(v) as { reasoning?: boolean };
+  } catch {
+    return undefined;
+  }
 }
 
 /** Pricing comes back as a string; a row that fails to parse is unknown, never free. */
@@ -240,6 +253,7 @@ export async function bootstrap(): Promise<void> {
       modality: m.modality as CatalogModel["modality"],
       contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
       pricing: parsePricingJson(m.pricingJson),
+      supportsReasoning: parseCapabilitiesJson(m.capabilitiesJson)?.reasoning,
     })),
     fetchedByProvider,
   );
@@ -455,8 +469,11 @@ export async function refreshCatalog(providerId: string, signal?: AbortSignal): 
       providerId: m.providerId, nativeId: m.nativeId, modality: m.modality,
       contextWindow: m.contextWindow ?? null, fetchedAt: m.fetchedAt,
       // Persisted alongside the row: the catalog is fetched once per 24h, so a launch that
-      // only hydrates would otherwise price every request as unknown.
+      // only hydrates would otherwise price every request as unknown — and would have no idea
+      // what the model can do.
       pricingJson: m.pricing ? JSON.stringify(m.pricing) : null,
+      capabilitiesJson:
+        m.supportsReasoning === undefined ? null : JSON.stringify({ reasoning: m.supportsReasoning }),
     })),
   });
   catalog.deriveAutoAliases();
