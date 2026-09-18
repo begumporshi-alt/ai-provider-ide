@@ -773,3 +773,43 @@ recognise, not as a safety default.
 **Also:** the UI initial state mirrors the Rust default so the toggle does not flash "Disabled"
 for a beat before the invoke resolves, and the label changed from "Forward tools parameters" to
 **"Gateway tools"** — it now covers both modes, and the old name described only one of them.
+
+---
+
+## The gateway returned empty completions: chunks are text, not JSON (2026-09-18)
+
+Found while writing the first tests for the gateway bridge. Every answer the gateway produced
+was empty.
+
+**The bug.** The bridge did `JSON.parse(rawChunk)` on each streamed chunk and `continue`d when
+that threw. Chunks are not JSON. The adapter resolves the provider's SSE/JSON itself and yields
+decoded `delta` strings (`manifest-interpreter`: `yield delta`); the e2e suite asserts
+`collect(exec.chunks) === "Hello, world!"`. So the parse threw on every single chunk, and
+`continue` skipped everything below it — `turnText`, `emitProse`, and the mercury marker scan.
+`gateway_chunk` was never called, so Rust had no deltas to stream back.
+
+**Why it survived.** Tool calls are unaffected, because they do not travel in chunks: the
+interpreter reports them on `onToolCall` in a `finally` once the stream ends, and the bridge
+already collected them there. A tool-calling conversation looked like it worked. A plain chat
+request silently returned nothing. Two consumers disagreed about the chunk contract and nobody
+noticed — `Playground.tsx` did `streamed += chunk` (text), the bridge did `JSON.parse` (JSON).
+
+**Fix.** Treat a chunk as text. Deleted the `parseOpenAIChatDelta` / `parseClaudeDelta` /
+accumulator path — it could never have matched — and the now-unreachable `finish_reason`
+fallback. Usage still reaches the client through `onUsage`, which the interpreter does invoke.
+
+**The bridge is now tested.** `src/gateway-bridge.test.ts` drives the real loop with the Tauri
+IPC layer and the model mocked, so the part that only ever ran in a webview is covered
+headlessly: gateway mode, pass-through, tools off, the 8-iteration cap, abort-on-backpressure.
+
+**Corollary: the client sees the preamble.** The header claimed gateway mode shows the client
+"only the final answer" — true only because nothing was emitted at all. With prose flowing, a
+model that says "on it: " before a tool call streams that too. Making the old claim true would
+mean buffering turn text until the model stops asking, which loses it on an abort or at the
+iteration cap, where there is nothing else to show. The stream stays faithful; tool calls and
+their results stay server-side.
+
+**Lesson:** when two consumers disagree about a data contract, one of them is dead code that has
+never run. `JSON.parse` inside a `catch { continue }` is invisible — it converts "wrong shape"
+into "silently dropped", and it took a test that asserts on output, not on absence of a crash,
+to surface it.
