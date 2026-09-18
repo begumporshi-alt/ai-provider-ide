@@ -22,6 +22,12 @@ through it works end to end.
   Bare `openai/gpt-4o-mini` and `openrouter/openai/gpt-4o-mini` both route. Add
   `maxInputTokens`/`maxOutputTokens` (128000/16384) to avoid default-cap truncation.
 - Config hot-reloads in ~1s; no restart needed.
+- **Tushu wants the display name to mark provenance.** "ai-provider router" is deliberate, not
+  leftover: it tells him at a glance which models are served by our gateway rather than by one of
+  his other providers. Do not rename it away. The sync gives published entries a unique name
+  (`Router: <id>`) only when a preserved name would collide, because six rows all reading
+  "ai-provider router" made the picker unusable — but the *marker* is the point, so prefer
+  "ai-provider router" as a prefix over a bare or differently-worded name.
 
 ## Gateway behaviour worth remembering
 
@@ -48,8 +54,8 @@ through it works end to end.
 
 ## Testing
 
-- router-core: `packages/router-core && ./node_modules/.bin/vitest run` (199 tests)
+- router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
 - desktop: `apps/desktop && ./node_modules/.bin/vitest run` (43 tests)
-- Rust: `apps/desktop/src-tauri && cargo test --lib` (88 tests)
+- Rust: `apps/desktop/src-tauri && cargo test --lib` (111 tests)
 - Use `./node_modules/.bin/tsc`, never `npx tsc` (the latter tries to install `tsc@2.0.4`).
 - The sandbox `grep` shim silently returns nothing for alternation (`a|b`) — use the Grep tool.
