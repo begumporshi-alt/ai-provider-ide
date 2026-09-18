@@ -1,0 +1,10 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "gateway-worker",
+  "description": "Capability for the gateway worker window (audit R1). It exists because `default` is scoped to the main window, and a window with no capability gets none — which made `listen('gateway-request')` fail with 'not allowed by ACL', so the bridge never started, no heartbeat was ever sent, and the gateway reported itself stopped seconds after Start.",
+  "windows": ["gateway"],
+  "permissions": [
+    "core:event:allow-listen",
+    "core:event:allow-unlisten"
+  ]
+}

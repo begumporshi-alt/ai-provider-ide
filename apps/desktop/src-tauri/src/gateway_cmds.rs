@@ -454,7 +454,14 @@ pub fn gateway_tool_run(
 
 /// Webview liveness heartbeat (2s cadence from bridge.ts): proves the router core answers.
 #[tauri::command]
-pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+pub fn gateway_heartbeat(app: AppHandle, state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+    // Logged only after a gap, so steady-state beats (every ~2s) stay quiet while the two
+    // interesting cases are recorded: the worker coming up for the first time, and it
+    // recovering after the OS or an error had stopped it.
+    let quiet_for = state.core.heartbeat_age_ms();
+    if quiet_for > 5_000 {
+        log_to_file(&app, &format!("worker reported in after {quiet_for}ms quiet"));
+    }
     state.core.heartbeat();
     state.core.set_worker_error(None);
     Ok(())
