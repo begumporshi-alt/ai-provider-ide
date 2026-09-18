@@ -9,13 +9,14 @@
 > 69 Rust), typecheck clean in all three TS projects on a single compiler, `vite build` clean,
 > `key-leak-grep` OK, `check-ts-version` OK
 >
-> **UPDATE (same day, after this audit):** findings **R2** (cost attribution), **R3**
-> (per-provider concurrency), **R4** (spend cap + per-app gateway keys), **R6** (one
-> TypeScript across the workspace), **R7** (dev.db ignores), and **R8** (module concentration)
-> have since been implemented — see their sections below, marked RESOLVED. **R1** is partially
-> resolved: the gateway's *lifetime* is decoupled from the window (background mode) but its
-> *execution* still runs in the renderer.
-> Remaining open: **R1 (execution half)** — and nothing else from this audit.
+> **UPDATE (same day, after this audit):** **all eight findings are now addressed** — R2, R3,
+> R4, R5, R6, R7, R8 resolved, and R1 resolved in two passes: the gateway's *lifetime* is
+> decoupled from the window (background mode) and its *execution* is decoupled from the UI
+> renderer (dedicated worker window). See each section below.
+>
+> Two caveats on R1: the gateway is still webview-hosted rather than truly headless (v2), and
+> one assumption — that macOS keeps a hidden webview running JS — rests on a **manual check
+> that has not yet been performed**. Everything else here is machine-verified.
 
 ---
 
@@ -238,15 +239,38 @@ process outlives the window.
   stamps the heartbeat so the grace window starts fresh. Leaving background restores 6s, so a
   renderer that dies while hidden is still detected. 3 new tests cover all three transitions.
 
-**Still open (v2).** The *execution* coupling remains: requests still run in the renderer, so
-the gateway still inherits renderer responsiveness and is briefly unavailable across an HMR
-reload. Removing that requires running `router-core` outside a renderer — a Node sidecar or a
-Rust port — which is a packaging-and-IPC epic, not a patch.
+**Execution coupling — RESOLVED 2026-09-18 (by decoupling, not by going headless).**
 
-**Not verified by automated test:** that macOS keeps a hidden WKWebView's `setInterval` running.
-The 15× heartbeat margin is designed to absorb throttling, but this needs one manual check:
-start the gateway, close the window, curl the endpoint. If it 503s, the fallback is to widen
-`HEARTBEAT_STALE_HIDDEN_MS` or keep the window off-screen rather than hidden.
+The bridge moved into its own never-visible `WebviewWindow` (`gateway.html` →
+`src/gateway-worker.ts`), created on `gateway_enable`. Consequences removed:
+
+- UI render work can no longer delay a gateway request — separate renderer, separate JS context.
+- An HMR reload of the UI no longer tears down the bridge: the worker page's module graph
+  contains no React, so editing screens does not reload it. (Editing `router-core` still does,
+  and there is no HMR at all in a production build.)
+
+This is **not** headless in the strict sense — still a webview, still TypeScript. True headless
+(router-core outside any renderer) needs a bundled Node runtime plus the entire host command
+surface re-plumbed over a new IPC transport, since a sidecar cannot use Tauri `invoke`. That is
+a v2 epic; this captures both symptoms at a fraction of the cost and risk.
+
+Three details that matter:
+
+1. **`emit_to` is load-bearing.** `emit` broadcasts to every webview and both windows hydrate a
+   router core, so a broadcast would answer each request twice — two upstream calls, two ledger
+   rows, two streams to the client.
+2. **`startGatewayBridge` refuses to start outside the `gateway` window.** Makes that bug
+   impossible rather than unlikely, and stops a stray heartbeat from keeping the core looking
+   alive after the worker dies.
+3. **The staleness bound now tracks the bridge host, not the UI window.** The worker is hidden
+   by design, so 30s is the production bound; showing the UI no longer clears it.
+
+**Not verified by automated test:** that macOS keeps a hidden WKWebView running JS at all. This
+is the same assumption background mode rests on, and now also the dedicated worker. One manual
+check covers both: start the gateway, close the window, `curl http://127.0.0.1:8787/v1/models`.
+If it 503s, hidden webviews are suspended — the fallback is to widen
+`HEARTBEAT_STALE_HIDDEN_MS`, and failing that, to create the worker window off-screen rather
+than hidden (which invalidates this approach and points back at the sidecar).
 
 ### R2 — [HIGH] Cost attribution is designed but never computed — **RESOLVED 2026-09-18**
 

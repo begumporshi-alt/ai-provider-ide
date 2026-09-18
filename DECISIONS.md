@@ -599,3 +599,36 @@ executing the fix.**
 **Verification:** 69 Rust tests pass unchanged (including all four dialect integration tests),
 no new compiler warnings. Committed as its own commit so the mechanical move is reviewable
 separately from any behaviour change.
+
+## 2026-09-18 — Audit R1 (execution half): dedicated gateway window
+
+**Chosen over true headless.** A real sidecar needs a bundled Node runtime (and macOS
+notarisation for it) *plus* the entire host command surface — egress, vault, store, ledger,
+settings, tools — re-plumbed over a new IPC transport, because a sidecar cannot use Tauri
+`invoke`. That is weeks and high-risk. A dedicated hidden webview captures both stated symptoms
+at a fraction of the cost.
+
+**Decisions**
+
+- **One window owns the bridge.** Rust creates it on `gateway_enable` via
+  `WebviewWindowBuilder` (`visible(false)`); the UI window no longer starts the bridge at all.
+- **`emit_to`, never `emit`.** `emit` broadcasts to every webview and both windows hydrate a
+  router core — each request would be answered twice: two upstream calls, two ledger rows, two
+  streams. This is the one change in this work that would have caused silent, expensive
+  misbehaviour if gotten wrong.
+- **Self-guarding over CI-guarding.** `startGatewayBridge` refuses to start outside the
+  `gateway` window rather than relying on a lint rule. Also stops a stray heartbeat from
+  keeping the core looking alive after the worker dies.
+- **The staleness bound follows the bridge host, not the UI window.** The worker is hidden by
+  design, so 30s is the production bound and restoring the UI no longer clears it.
+- **Vite needs a second input.** Without `build.rollupOptions.input` including `gateway.html`,
+  the production build omits the page and the worker window loads a 404. Verified:
+  `dist/gateway.html` is emitted and the bundle contains no React.
+
+**Accepted limitation:** not actually headless — still a webview, still TypeScript. Editing
+`router-core` still reloads the worker in dev (no HMR in production builds). True headless is
+v2.
+
+**Open assumption (unchanged, now load-bearing for two features):** that macOS keeps a hidden
+webview running JS. One check covers both this and background mode: start the gateway, close
+the window, `curl http://127.0.0.1:8787/v1/models`.
