@@ -14,9 +14,13 @@
 > decoupled from the window (background mode) and its *execution* is decoupled from the UI
 > renderer (dedicated worker window). See each section below.
 >
-> Two caveats on R1: the gateway is still webview-hosted rather than truly headless (v2), and
-> one assumption — that macOS keeps a hidden webview running JS — rests on a **manual check
-> that has not yet been performed**. Everything else here is machine-verified.
+> **LATER THE SAME DAY:** that open assumption was tested and **failed as written**. The
+> dedicated worker window, created with `.visible(false)`, was being suspended by macOS as soon
+> as nothing else was on screen — a real regression against background mode, not a
+> hypothetical. Measured, diagnosed and fixed; see R1.
+>
+> The one caveat left: the gateway is still webview-hosted rather than truly headless (v2).
+> Everything else here is machine-verified or measured.
 
 ---
 
@@ -214,7 +218,7 @@ a browser.
 
 Ordered by materiality. Each has a concrete fix.
 
-### R1 — [HIGH] The gateway cannot run without the webview — **PARTIALLY RESOLVED 2026-09-18**
+### R1 — [HIGH] The gateway cannot run without the webview — **RESOLVED 2026-09-18**
 
 Every gateway request executes in the webview's JavaScript event loop. Consequences: the
 gateway dies with the window (Tauri exits on last-window close by default), is unavailable
@@ -265,12 +269,46 @@ Three details that matter:
 3. **The staleness bound now tracks the bridge host, not the UI window.** The worker is hidden
    by design, so 30s is the production bound; showing the UI no longer clears it.
 
-**Not verified by automated test:** that macOS keeps a hidden WKWebView running JS at all. This
-is the same assumption background mode rests on, and now also the dedicated worker. One manual
-check covers both: start the gateway, close the window, `curl http://127.0.0.1:8787/v1/models`.
-If it 503s, hidden webviews are suspended — the fallback is to widen
-`HEARTBEAT_STALE_HIDDEN_MS`, and failing that, to create the worker window off-screen rather
-than hidden (which invalidates this approach and points back at the sidecar).
+**The assumption was then tested — and it failed as written.** Verified 2026-09-18 on macOS 15
+with a standalone AppKit/WKWebView harness (`/tmp/wvprobe`), 2s timer, UI window hidden. This
+was a real bug in the shipped code, not a hypothetical:
+
+| how the worker window is shown                | ticks over 24s | JS |
+|-----------------------------------------------|----------------|----|
+| never ordered in — `.visible(false)`          | 0              | **suspended** |
+| `orderFront` + `orderOut` immediately         | 0              | **suspended** |
+| `orderFront` + `orderOut` after 16ms          | 0              | **suspended** |
+| `orderFront` + `orderOut` after 300ms         | 8 (max gap 3.0s) | alive |
+| `orderFront` + `orderOut` after 1000ms        | 8 (max gap 3.0s) | alive |
+| ordered in once, then `orderOut` (UI window)  | 10             | alive |
+
+macOS suspends the JS of a webview whose window was never actually composited — and it stays
+suspended exactly when nothing else is on screen, which is precisely when the gateway is meant
+to be serving. tao's `visible(false)` skips `makeKeyAndOrderFront` altogether
+(`tao/platform_impl/macos/window.rs:630`), so `.visible(false)` produced row 1: the worker ran
+while the UI was up and died the moment the app went to the background — a regression against
+background mode, which had worked when the bridge lived in the (always-displayed) UI window.
+
+Two things ruled out while diagnosing:
+
+- **App Nap is not the cause.** Suppressing it (`ProcessInfo.beginActivity`) changed nothing.
+- **Parking the window off-screen does not work.** macOS clamps windows back into the visible
+  area — a window requested at `x = -4000` lands at `x = 480`. So there is no invisible
+  warm-up; the window must genuinely appear.
+
+**Fix (shipped):** create the worker window visible, undecorated and small, then hide it after
+`WORKER_WARMUP_MS = 1000` (3x the proven 300ms minimum). Once composited it keeps running with
+no window on screen. `focused(false)` makes tao use `orderFront` rather than
+`makeKeyAndOrderFront`, so the warm-up does not steal key-window status. Cost: a ~220x140
+undecorated window is briefly visible when the gateway starts, once per session.
+
+Measured margin on the liveness bound: a hidden webview's 2s timer fires at ~0.33/s with a worst
+observed gap of 3.0s, so `HEARTBEAT_STALE_HIDDEN_MS = 30_000` carries 10x headroom — throttling
+cannot trip it, while a genuinely suspended renderer is still caught.
+
+Not covered by CI: this is a platform behaviour, so no automated test can assert it. The
+evidence is the harness above; the constants carry the numbers in comments so the next reader
+does not have to rediscover them.
 
 ### R2 — [HIGH] Cost attribution is designed but never computed — **RESOLVED 2026-09-18**
 

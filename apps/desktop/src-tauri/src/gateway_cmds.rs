@@ -4,16 +4,47 @@
 //! key never appears in webview-observable state.
 
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
 use crate::store::Store;
 
-/// R1: label of the dedicated, never-visible window that hosts the router core for gateway
-/// requests. Keeping the bridge out of the UI window is what stops UI render work — and UI
-/// HMR reloads — from touching in-flight gateway requests.
+/// R1: label of the dedicated window that hosts the router core for gateway requests. Keeping
+/// the bridge out of the UI window is what stops UI render work — and UI HMR reloads — from
+/// touching in-flight gateway requests.
 pub const GATEWAY_WINDOW: &str = "gateway";
+
+/// How long the worker window must stay on screen before it can be hidden.
+///
+/// This is not a guess. Measured on macOS 15 with a 2s timer and the UI window hidden, the
+/// JS in a worker window behaves like this:
+///
+/// | how the window was shown                  | ticks over 24s |
+/// |-------------------------------------------|----------------|
+/// | never ordered in (`visible(false)`)       | 0  — suspended |
+/// | `orderFront` + `orderOut` immediately     | 0  — suspended |
+/// | `orderFront` + `orderOut` after 16ms      | 0  — suspended |
+/// | `orderFront` + `orderOut` after 300ms     | 8  — alive     |
+/// | `orderFront` + `orderOut` after 1000ms    | 8  — alive     |
+///
+/// macOS suspends the JS of a webview whose window was never really composited, and it only
+/// unfreezes once nothing else is on screen — which is precisely when the gateway is meant to
+/// be serving. tao's `visible(false)` skips `makeKeyAndOrderFront` entirely
+/// (`tao/platform_impl/macos/window.rs:630`), so the old `.visible(false)` produced row 1:
+/// the worker ran while the UI was up and died the moment the app went to the background.
+///
+/// Parking the window off-screen does **not** avoid this: macOS clamps windows back into the
+/// visible area (a window requested at x=-4000 lands at x=480). So the warm-up is a real,
+/// brief appearance, and `WORKER_WARMUP_MS` is its cost. 1000ms is 3x the proven minimum.
+const WORKER_WARMUP_MS: u64 = 1_000;
+
+/// Warm-up window size — small and undecorated, so the unavoidable appearance is as
+/// unobtrusive as it can be.
+const WORKER_WARMUP_W: f64 = 220.0;
+const WORKER_WARMUP_H: f64 = 140.0;
 
 pub struct GatewayState {
     pub core: Arc<GatewayCore>,
@@ -56,15 +87,38 @@ pub fn ensure_bridge_window(app: &AppHandle) -> Result<(), String> {
     }
     WebviewWindowBuilder::new(app, GATEWAY_WINDOW, WebviewUrl::App("gateway.html".into()))
         .title("AI-Provider Router — gateway worker")
-        .visible(false)
+        // `visible(true)` is load-bearing, not an oversight — see `WORKER_WARMUP_MS`. The
+        // window has to be composited once or macOS never lets its JS run while the app is
+        // in the background. `focused(false)` keeps it from stealing key-window status:
+        // tao then uses `orderFront` rather than `makeKeyAndOrderFront`, which is the same
+        // path the measurements in `WORKER_WARMUP_MS` were taken on.
+        .visible(true)
+        .focused(false)
+        .decorations(false)
+        .inner_size(WORKER_WARMUP_W, WORKER_WARMUP_H)
         .build()
         .map_err(|e| format!("gateway worker window failed to start: {e}"))?;
-    // The worker window is hidden by design, so the renderer's heartbeat is subject to the
-    // OS throttling that HEARTBEAT_STALE_HIDDEN_MS exists to absorb.
+    hide_worker_after_warmup(app);
+    // The worker window ends up hidden, so the renderer's heartbeat is subject to the OS
+    // throttling that HEARTBEAT_STALE_HIDDEN_MS exists to absorb.
     if let Some(state) = app.try_state::<Arc<GatewayState>>() {
         state.core.set_hidden(true);
     }
     Ok(())
+}
+
+/// Retire the warm-up window once it has been on screen long enough to count as displayed.
+///
+/// After this the window is hidden for the rest of the session, but its webview keeps
+/// running — which is the whole point: the gateway serves with no window on screen.
+fn hide_worker_after_warmup(app: &AppHandle) {
+    let app = app.clone();
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(WORKER_WARMUP_MS));
+        if let Some(win) = app.get_webview_window(GATEWAY_WINDOW) {
+            let _ = win.hide();
+        }
+    });
 }
 
 pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {

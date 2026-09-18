@@ -611,7 +611,8 @@ at a fraction of the cost.
 **Decisions**
 
 - **One window owns the bridge.** Rust creates it on `gateway_enable` via
-  `WebviewWindowBuilder` (`visible(false)`); the UI window no longer starts the bridge at all.
+  `WebviewWindowBuilder`; the UI window no longer starts the bridge at all.
+  *(It was created `visible(false)`; that turned out to be fatal — see the next entry.)*
 - **`emit_to`, never `emit`.** `emit` broadcasts to every webview and both windows hydrate a
   router core — each request would be answered twice: two upstream calls, two ledger rows, two
   streams. This is the one change in this work that would have caused silent, expensive
@@ -632,3 +633,59 @@ v2.
 **Open assumption (unchanged, now load-bearing for two features):** that macOS keeps a hidden
 webview running JS. One check covers both this and background mode: start the gateway, close
 the window, `curl http://127.0.0.1:8787/v1/models`.
+
+---
+
+## 2026-09-18 (later) — the hidden-webview assumption was measured, and it failed
+
+The open assumption above was load-bearing for two shipped features. Instead of leaving it for
+a manual check, it was measured with a standalone AppKit/WKWebView harness — a hidden window
+whose JS posts a timestamp every 2s, with the "UI" window hidden after a warm-up phase.
+
+**Result: the assumption is false as written.** A webview whose window was never composited has
+its JS suspended, and it stays suspended precisely when nothing else is on screen:
+
+| how the window is shown                    | ticks / 24s |      |
+|--------------------------------------------|-------------|------|
+| never ordered in (`visible(false)`)        | 0           | dead |
+| `orderFront` + `orderOut` immediately      | 0           | dead |
+| `orderFront` + `orderOut` after 16ms       | 0           | dead |
+| `orderFront` + `orderOut` after 300ms      | 8           | alive |
+| `orderFront` + `orderOut` after 1000ms     | 8           | alive |
+
+tao's `visible(false)` never calls `makeKeyAndOrderFront` (`tao/.../macos/window.rs:630`), so
+the worker window was row 1: it ran while the UI was on screen and died the moment the app went
+to the background. **This was a regression** — background mode had worked when the bridge lived
+in the always-displayed UI window. The dedicated worker window silently broke it.
+
+**Explicitly ruled out:**
+
+- *App Nap.* Suppressing it changed nothing, so this is WebKit, not power management.
+- *Parking the window off-screen.* macOS clamps windows back into the visible area (requested
+  `x = -4000` → actual `x = 480`). There is no invisible warm-up.
+
+**Fix:** create the worker window visible, undecorated and small, then hide it after
+`WORKER_WARMUP_MS = 1000` — 3x the proven 300ms minimum. After that it keeps running with no
+window on screen. `focused(false)` makes tao use `orderFront` instead of
+`makeKeyAndOrderFront`, so the warm-up does not steal key status.
+
+**Cost accepted:** a ~220x140 undecorated window is briefly visible when the gateway starts,
+once per session. The alternatives were worse — a window that is never displayed does not work
+at all, off-screen parking is impossible, and reverting to the UI-window bridge would undo this
+entry's whole point.
+
+**Decisions**
+
+- **Measure, do not assume.** The assumption had been written down twice as "verified by a
+  manual check not yet performed". It was wrong. A 60-line harness settled in minutes what a
+  paragraph of hedging could not.
+- **Put the numbers in the code.** The measurement table lives in a comment next to
+  `WORKER_WARMUP_MS`, so the next person who sees a magic 1000 knows why it cannot be 0.
+- **Keep the liveness bound finite.** A suspended renderer must still be detectable. Measured
+  cadence is ~0.33/s with a 3.0s worst gap; the 30s bound therefore has 10x headroom, which is
+  also recorded in the code.
+- **No test.** This is platform behaviour, untestable in CI. The harness output is the evidence.
+
+**Lesson:** "hidden" is not one state. A window that was never shown and a window that was
+shown and then hidden behave completely differently, and only the second keeps running JS.
+Any future change that creates a Tauri window hidden-from-birth needs the same warm-up.

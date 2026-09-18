@@ -38,6 +38,11 @@ const HEARTBEAT_STALE_MS: u64 = 6_000;
 /// so the renderer's 2s heartbeat cannot be expected to land on schedule — but it does still
 /// run. A looser bound keeps the gateway serving in the background; the cost is that a truly
 /// dead renderer is detected after 30s instead of 6s (and only while hidden).
+///
+/// The headroom is measured, not assumed: with nothing on screen a hidden webview's 2s timer
+/// fires at ~0.33/s with a worst observed gap of 3.0s. 30s is 10x that, so ordinary
+/// throttling can never trip it. An unbounded `HEARTBEAT_STALE_HIDDEN_MS` would be the real
+/// hazard — a suspended webview would then look alive forever.
 const HEARTBEAT_STALE_HIDDEN_MS: u64 = 30_000;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
