@@ -14,6 +14,10 @@ interface GatewayStatus {
   endpointUrl: string;
   /** R1: window hidden, gateway serving in the background. */
   background: boolean;
+  /** Age of the worker's last heartbeat. Distinguishes "you stopped it" from "it lapsed". */
+  heartbeatAgeMs: number;
+  /** Why the worker page failed to boot, if it did. It runs in an invisible window. */
+  workerError: string | null;
 }
 
 /** Audit R4: metadata only — the secret lives in the keychain and is never returned here. */
@@ -229,6 +233,23 @@ export function GatewayScreen() {
             </Button>
           </div>
         </div>
+
+        {status?.workerError && (
+          <div className="mb-3 rounded border p-2.5" style={{ borderColor: "var(--danger)", background: "var(--danger-soft, transparent)" }}>
+            <p className="text-[12px] font-medium" style={{ color: "var(--danger)" }}>
+              The gateway worker failed to start, so nothing can answer requests.
+            </p>
+            <pre className="mono mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-faint)" }}>
+              {status.workerError}
+            </pre>
+          </div>
+        )}
+
+        {!running && status && !status.workerError && status.heartbeatAgeMs > 0 && (
+          <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+            Stopped — last heard from the worker {Math.round(status.heartbeatAgeMs / 1000)}s ago.
+          </p>
+        )}
 
         <div className="mb-2">
           <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Endpoint URL</span>

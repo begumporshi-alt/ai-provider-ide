@@ -9,6 +9,7 @@
  *
  * The master key never appears here — authentication happened in Rust before this file runs.
  */
+import { invoke } from "@tauri-apps/api/core";
 import { bootstrap } from "./store";
 import { startGatewayBridge } from "./gateway-bridge";
 
@@ -30,5 +31,9 @@ async function main(): Promise<void> {
 }
 
 main().catch((e: unknown) => {
+  const message = e instanceof Error ? `${e.message}\n${e.stack ?? ""}` : String(e);
   write(`gateway worker failed: ${String(e)}`, "err");
+  // This window is never visible, so the console above is unreadable. Without reporting it
+  // host-side the only symptom is a gateway that stops answering seconds after Start.
+  void invoke("gateway_worker_error", { message }).catch(() => undefined);
 });

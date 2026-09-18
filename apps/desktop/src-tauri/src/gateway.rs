@@ -148,6 +148,9 @@ pub struct GatewayCore {
     /// Workspace root for local tool execution (write_file, mkdir, run_command).
     /// Set via `gateway_set_workspace_root` Tauri command before first tool use.
     workspace_root: Mutex<Option<std::path::PathBuf>>,
+    /// Why the worker page failed to start, if it did. It runs in a window nobody can see, so
+    /// without a channel back to the host its failures were unobservable.
+    worker_error: Mutex<Option<String>>,
 }
 
 /// Where the sandboxed tools may write before the user picks a workspace.
@@ -186,6 +189,7 @@ impl GatewayCore {
             // before the request ever leaves, which breaks coding agents, so off is opt-in.
             tools_enabled: AtomicBool::new(true),
             workspace_root: Mutex::new(default_workspace_root()),
+            worker_error: Mutex::new(None),
         }
     }
 
@@ -209,6 +213,24 @@ impl GatewayCore {
 
     pub fn heartbeat(&self) {
         *self.last_heartbeat.lock().unwrap() = Instant::now();
+    }
+
+    /// Age of the last beat, for diagnostics: "stopped" is ambiguous on its own, because a
+    /// lapsed heartbeat looks identical to an operator pressing Stop.
+    pub fn heartbeat_age_ms(&self) -> u64 {
+        self.last_heartbeat.lock().unwrap().elapsed().as_millis() as u64
+    }
+
+    /// Recorded by the worker page when it fails. Cleared when it reports in healthy.
+    pub fn set_worker_error(&self, message: Option<String>) {
+        if let Some(m) = &message {
+            tracing::error!("gateway worker: {m}");
+        }
+        *self.worker_error.lock().unwrap() = message;
+    }
+
+    pub fn worker_error(&self) -> Option<String> {
+        self.worker_error.lock().unwrap().clone()
     }
 
     pub fn is_available(&self) -> bool {

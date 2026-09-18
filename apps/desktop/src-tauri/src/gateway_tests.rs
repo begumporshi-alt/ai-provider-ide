@@ -958,3 +958,35 @@
         core.set_tools_enabled(true);
         assert!(core.is_tools_enabled());
     }
+
+    /// A bound socket and a working gateway are different states, and conflating them is what
+    /// made Start a dead button: the heartbeat lapses, the UI reads "Stopped", the operator
+    /// presses Start, and a "is the listener set?" check answers yes and does nothing.
+    #[test]
+    fn a_listener_bound_under_a_lapsed_heartbeat_is_stale() {
+        use crate::gateway_cmds::GatewayState;
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        let state = GatewayState { core: core.clone(), server: Mutex::new(None) };
+
+        // Nothing bound: not stale, just stopped.
+        assert!(!state.has_stale_server());
+
+        let (tx, _rx) = tokio::sync::oneshot::channel::<()>();
+        *state.server.lock().unwrap() = Some(ServerHandle {
+            shutdown: tx,
+            addr: "127.0.0.1:0".parse().unwrap(),
+        });
+        core.set_running(true);
+        core.heartbeat();
+        assert!(!state.has_stale_server(), "a healthy listener is not stale");
+
+        // Beat lapses while the socket stays bound — the dead-button case.
+        core.set_hidden(false);
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(7_000);
+        assert!(state.has_stale_server(), "lapsed beat under a bound listener is stale");
+
+        // And once stopped deliberately, it is simply not running.
+        core.set_running(false);
+        assert!(state.has_stale_server(), "bound but not running is stale too");
+    }

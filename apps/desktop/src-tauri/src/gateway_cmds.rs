@@ -51,6 +51,18 @@ pub struct GatewayState {
     pub server: Mutex<Option<gateway::ServerHandle>>,
 }
 
+impl GatewayState {
+    /// True when a listener is bound but the gateway cannot actually serve.
+    ///
+    /// These are different states and conflating them is what made the Start button dead: the
+    /// heartbeat can lapse — suspended worker renderer, a page that never booted — while the
+    /// socket is still up, so the UI reads "Stopped", the operator presses Start, and a
+    /// "is `server` set?" check answers yes and does nothing.
+    pub fn has_stale_server(&self) -> bool {
+        self.server.lock().unwrap().is_some() && !self.core.is_available()
+    }
+}
+
 /// Production bridge: dispatch/cancel flow as events to the gateway worker window.
 ///
 /// `emit_to` is load-bearing here, not stylistic: `emit` broadcasts to *every* webview, and
@@ -107,6 +119,22 @@ pub fn ensure_bridge_window(app: &AppHandle) -> Result<(), String> {
     Ok(())
 }
 
+/// Re-composite an existing worker window.
+///
+/// `ensure_bridge_window` is idempotent and returns early when the window is already up, which
+/// is right for creation but wrong for recovery: a window that has been hidden long enough can
+/// have its JS suspended by the OS, and showing it again is what resumes it. Called on every
+/// start so a second Start revives a stalled worker rather than trusting one that has gone
+/// quiet.
+pub fn warm_bridge_window(app: &AppHandle) {
+    if let Some(win) = app.get_webview_window(GATEWAY_WINDOW) {
+        // `show()` only — deliberately no `set_focus()`. Stealing key-window status from
+        // whatever the operator is using would be a worse bug than the one we are fixing.
+        let _ = win.show();
+    }
+    hide_worker_after_warmup(app);
+}
+
 /// Retire the warm-up window once it has been on screen long enough to count as displayed.
 ///
 /// After this the window is hidden for the rest of the session, but its webview keeps
@@ -155,6 +183,13 @@ pub struct GatewayStatus {
     /// R1: the window is hidden and the gateway is serving in the background. Lets the UI
     /// show real state instead of inferring it ("if you can read this, it isn't hidden").
     pub background: bool,
+    /// Milliseconds since the worker last reported in. Exposed because "stopped" is ambiguous
+    /// without it: `running: false` can mean the operator stopped it, or that the worker's
+    /// heartbeat lapsed underneath a socket that is still bound. The age tells you which.
+    pub heartbeat_age_ms: u64,
+    /// Why the worker page failed, if it did. It runs in an invisible window, so anything it
+    /// threw used to land in a console nobody can open.
+    pub worker_error: Option<String>,
 }
 
 #[tauri::command]
@@ -166,6 +201,8 @@ pub fn gateway_status(state: State<'_, Arc<GatewayState>>) -> Result<GatewayStat
         has_key: gateway::vault_key_provider()().is_some(),
         endpoint_url: format!("http://127.0.0.1:{port}/v1"),
         background: state.core.is_hidden(),
+        heartbeat_age_ms: state.core.heartbeat_age_ms(),
+        worker_error: state.core.worker_error(),
     })
 }
 
@@ -174,13 +211,28 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     // AppHandle + inner().clone(): State<'_, _> in async commands hits the 'static
     // lifetime bound (classic Tauri E0700); cloning the Arc sidesteps it.
     let state = app.state::<Arc<GatewayState>>().inner().clone();
+
+    // A bound socket is not a working gateway. The heartbeat can lapse while the listener is
+    // still up — a suspended worker renderer, a page that failed to boot — and then the UI
+    // shows "Stopped" while `server` is still `Some`. Reporting the port and returning left
+    // Start doing nothing at exactly the moment the operator needs it, so tear the stale
+    // listener down and bring it back up instead.
+    if state.has_stale_server() {
+        if let Some(handle) = state.server.lock().unwrap().take() {
+            let _ = handle.shutdown.send(());
+        }
+        state.core.set_running(false);
+    }
     if state.server.lock().unwrap().is_some() {
-        // Already up: report the bound port (idempotent).
+        // Already up and healthy: report the bound port (idempotent).
         return Ok(state.core.port());
     }
     // R1: the bridge lives in its own window; bring it up before the socket accepts traffic,
     // so no request can arrive with nothing listening.
     ensure_bridge_window(&app)?;
+    // Re-warm even when the window already existed: macOS can suspend the JS of a window that
+    // has been hidden for a while, and re-compositing it is what resumes the heartbeat.
+    warm_bridge_window(&app);
     let handle = gateway::spawn(state.core.clone(), port.unwrap_or(gateway::DEFAULT_PORT)).await?;
     state.core.set_running(true);
     let bound = handle.addr.port();
@@ -361,6 +413,19 @@ pub fn gateway_tool_run(
 #[tauri::command]
 pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
     state.core.heartbeat();
+    state.core.set_worker_error(None);
+    Ok(())
+}
+
+/// The worker page reporting that it failed to boot.
+///
+/// It runs in a window nobody can ever see, so an exception during `bootstrap()` or
+/// `startGatewayBridge()` used to land in a console that cannot be opened — the only symptom
+/// was a gateway that silently stopped answering a few seconds after Start. This gives that
+/// failure somewhere to go: it is logged host-side and surfaced in `gateway_status`.
+#[tauri::command]
+pub fn gateway_worker_error(state: State<'_, Arc<GatewayState>>, message: String) -> Result<(), String> {
+    state.core.set_worker_error(Some(message));
     Ok(())
 }
 

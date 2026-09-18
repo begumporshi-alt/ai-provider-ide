@@ -236,6 +236,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_spend_status,
         crate::gateway_cmds::gateway_spend_cap_set,
         crate::gateway_cmds::gateway_heartbeat,
+        crate::gateway_cmds::gateway_worker_error,
         crate::gateway_cmds::gateway_chunk,
         crate::gateway_cmds::gateway_result,
         crate::gateway_cmds::gateway_done,
