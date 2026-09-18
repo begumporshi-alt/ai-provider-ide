@@ -27,11 +27,13 @@ jobs:
         run: pnpm test
       - name: Key-leak grep (criterion 5)
         run: pnpm key-leak-grep
+      - name: Single TypeScript version (audit R6)
+        run: pnpm check-ts-version
       - name: Rust check
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Rust tests (gateway criterion 8, egress invariants, store, persist)
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Install Playwright browsers
-        run: pnpm --filter desktop exec playwright install chromium
+        run: pnpm --filter ai-provider-router-desktop exec playwright install chromium
       - name: Live-UI tests (Playwright harness — wizard, Tier-2 review, egress image)
-        run: pnpm --filter desktop web-test
+        run: pnpm --filter ai-provider-router-desktop web-test

@@ -13,7 +13,7 @@ importers:
       '@aiprovider/adapter-spec':
         specifier: workspace:*
         version: link:../../packages/adapter-spec
-      '@aiprovider/router':
+      '@aiprovider/router-core':
         specifier: workspace:*
         version: link:../../packages/router-core
       '@tauri-apps/api':
@@ -57,7 +57,7 @@ importers:
         specifier: ^4.3.3
         version: 4.3.3
       typescript:
-        specifier: ~6.0.3
+        specifier: 6.0.3
         version: 6.0.3
       vite:
         specifier: ^8.0.16
@@ -73,8 +73,8 @@ importers:
         version: 3.25.76
     devDependencies:
       typescript:
-        specifier: ~5.8.0
-        version: 5.8.3
+        specifier: 6.0.3
+        version: 6.0.3
       vitest:
         specifier: ^3.1.0
         version: 3.2.7(@types/node@26.6.0)(jiti@2.7.0)(lightningcss@1.33.0)
@@ -98,8 +98,8 @@ importers:
         version: 3.25.76
     devDependencies:
       typescript:
-        specifier: ~5.8.0
-        version: 5.8.3
+        specifier: 6.0.3
+        version: 6.0.3
       vitest:
         specifier: ^3.1.0
         version: 3.2.7(@types/node@26.6.0)(jiti@2.7.0)(lightningcss@1.33.0)
@@ -1083,11 +1083,6 @@ packages:
     resolution: {integrity: sha512-u8KszXvGfU68hVcZpRHKG28T0krMuv2G5nDhiHaMLen/gIuFEgIJhaJuO69qjnXg5paSrbPMFfx3brNuN8eVSg==}
     engines: {node: '>=14.0.0'}
 
-  typescript@5.8.3:
-    resolution: {integrity: sha512-p1diW6TqL9L07nNxvRMM7hMMw4c5XOo/1ibL4aAIGmSAt9slTE1Xgw5KWuof2uTOvCg9BY7ZRi+GaF+7sfgPeQ==}
-    engines: {node: '>=14.17'}
-    hasBin: true
-
   typescript@6.0.3:
     resolution: {integrity: sha512-y2TvuxSZPDyQakkFRPZHKFm+KKVqIisdg9/CZwm9ftvKXLP8NRWj38/ODjNbr43SsoXqNuAisEf1GdCxqWcdBw==}
     engines: {node: '>=14.17'}
@@ -1968,8 +1963,6 @@ snapshots:
   tinyrainbow@2.0.0: {}
 
   tinyspy@4.0.6: {}
-
-  typescript@5.8.3: {}
 
   typescript@6.0.3: {}
 
