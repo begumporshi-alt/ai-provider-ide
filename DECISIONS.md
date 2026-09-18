@@ -813,3 +813,30 @@ their results stay server-side.
 never run. `JSON.parse` inside a `catch { continue }` is invisible — it converts "wrong shape"
 into "silently dropped", and it took a test that asserts on output, not on absence of a crash,
 to surface it.
+
+---
+
+## Gateway mode shows only the settled answer (2026-09-18)
+
+A gateway-mode run spans several model turns, and only the last one is an answer. Text from a
+turn that goes on to call a tool is a preamble the client never asked for, so it is held back
+and dropped when the next turn starts. Pass-through and tools-off still stream immediately —
+neither has a follow-up turn to wait for.
+
+Two consequences had to be solved, or this would have shipped a worse bug than it fixed:
+
+- **Backpressure.** `gateway_chunk` failing was the only signal that the client is still
+  connected. Holding text back removed it, so a client that disconnected mid-run would have
+  paid for all 8 remaining turns. The bridge now probes with an *empty* chunk before every
+  turn after the first, and Rust drops empty deltas instead of putting them on the wire. Net
+  effect: disconnect detection costs one turn instead of being immediate — bounded, not
+  unbounded.
+- **The iteration ceiling.** There is no settled answer at the cap, but the last turn is
+  released anyway. A client that receives nothing cannot distinguish "gave up" from "broke".
+
+## Dead code removed (2026-09-18)
+
+`gateway-sse-parser.ts` (~300 lines + ~400 lines of tests) is gone, along with its export and
+the plan snippet that prescribed the buggy `JSON.parse(rawChunk)` pattern — now marked
+REJECTED in `docs/gateway-flexibility-plan.md` with what was wrong and why. Recoverable from
+git if the Claude/Responses dialect work needs it.
