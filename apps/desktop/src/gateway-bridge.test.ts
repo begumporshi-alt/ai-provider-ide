@@ -111,7 +111,7 @@ describe("gateway-bridge tool loop", () => {
   it("gateway mode: supplies its own registry, executes, feeds results back, then answers", async () => {
     h.steps = [
       {
-        text: "",
+        text: "on it: ",
         calls: [{ id: "c1", name: "write_file", arguments: '{"path":"a.txt","content":"hi"}' }],
       },
       { text: "wrote it" },
@@ -142,9 +142,13 @@ describe("gateway-bridge tool loop", () => {
     const toolMsg = msgs.find((m) => m.role === "tool");
     expect(toolMsg?.tool_call_id).toBe("c1");
 
-    // The client sees only the final prose — never an intermediate tool call.
+    // The client sees prose as it arrives, including the preamble before the call, but
+    // never the call itself. Buffering the preamble until the end would mean losing it
+    // whenever the run aborts or hits the iteration cap.
     expect(calls("gateway_tool_calls").length).toBe(0);
-    expect(calls("gateway_chunk").map((c) => c.args.text).join("")).toContain("wrote it");
+    const streamed = calls("gateway_chunk").map((c) => c.args.text).join("");
+    expect(streamed).toContain("on it: ");
+    expect(streamed).toContain("wrote it");
     expect(calls("gateway_done").length).toBe(1);
   });
 

@@ -13,7 +13,10 @@
  *   GATEWAY       The client sent no tools and the gateway tool toggle is on. We supply our
  *                 own sandboxed registry, execute each call in the Rust host, feed the
  *                 results back to the model, and keep going until it stops asking. The
- *                 client only ever sees the final answer.
+ *                 client sees the model's prose as it arrives — including any preamble
+ *                 before a tool call — but never the tool calls or their results, which stay
+ *                 server-side. Suppressing the preamble would mean buffering text we might
+ *                 never emit: an abort or the iteration cap would swallow it whole.
  *
  * Mercury-2.5 handling: models trained on agent transcripts may emit tool calls as
  * inline text markers rather than structured OpenAI tool_calls. Those markers are not part
