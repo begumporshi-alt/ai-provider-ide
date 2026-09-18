@@ -863,3 +863,30 @@ copy. An empty database, by contrast, announces itself immediately.
 **Nothing was deleted.** `dev.aiprovider.ide/` stays exactly where it is and remains
 recoverable until removed by hand. If the app ever ships to anyone who has run an older build,
 this decision has to be revisited — that is the moment migration becomes worth writing.
+
+## The gateway as a third-party endpoint: speak the wire, accept client namespaces, survive restart (2026-09-18)
+
+Pointing WorkBuddy at the gateway as a custom provider exposed three gaps that nothing in the app
+exercised, because every client until now was our own.
+
+**SSE handshake.** Streams ended at EOF with no `data: [DONE]`, and the first frame carried no
+`role`. `curl` never complained — it stops at close — but a client reading for the sentinel hangs
+and one reading `delta.role` loses the speaker. Both frames are now emitted. Worth noting: the
+existing test looped *until* it saw `[DONE]`, so it passed by falling through to EOF. A test that
+waits for a sentinel is not a test that the sentinel exists.
+
+**Client namespaces.** WorkBuddy stamps `custom-local:` on every id it loads from `models.json`.
+The bundle claims `ModelProvider` strips it before sending; it has also been observed arriving
+intact at a local proxy. Rather than adjudicate, the router now strips a leading namespace it does
+not recognise — restricted to prefixes with no `/` that name no real provider, so
+`openai/gpt-4o:extended` keeps its variant suffix. The tag is the client's bookkeeping, not part
+of any native id, so refusing to see past it is refusing a whole class of caller.
+
+**Restart.** The gateway only ever started on a click, so every relaunch silently broke anything
+configured against it. `enabled` is now persisted alongside the port and restored at startup,
+best-effort — a failure to restore must never stop the UI from opening.
+
+**Consequence for the catalog.** The 457 model ids the app lists are not all real: several
+(`openai/gpt-6-astra`, `inference-net/schematron-v2-turbo`) have no upstream and fail with
+`NETWORK`. Real ids such as `openrouter/openai/gpt-4o-mini` route correctly, which is why the
+WorkBuddy entries pin verified ids rather than trusting the catalog.
