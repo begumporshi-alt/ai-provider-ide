@@ -13,6 +13,8 @@
         slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
         /// Make the synthetic model answer with tool calls instead of a plain finish.
         tool_calls: AtomicBool,
+        /// Prepend an empty delta — the bridge's between-turns liveness probe.
+        empty_delta: AtomicBool,
     }
 
     impl SynthBridge {
@@ -22,6 +24,7 @@
                 cancels: AtomicUsize::new(0),
                 slow: AtomicUsize::new(0),
                 tool_calls: AtomicBool::new(false),
+                empty_delta: AtomicBool::new(false),
             }
         }
         fn attach(&self, core: &Arc<GatewayCore>) {
@@ -30,6 +33,9 @@
         fn answer_with_tool_calls(&self, on: bool) {
             self.tool_calls.store(on, Ordering::Relaxed);
         }
+        fn answer_with_empty_delta(&self, on: bool) {
+            self.empty_delta.store(on, Ordering::Relaxed);
+        }
     }
 
     impl Bridge for SynthBridge {
@@ -37,12 +43,16 @@
             let core = self.core.lock().unwrap().clone().unwrap();
             let slow = self.slow.load(Ordering::Relaxed);
             let with_tools = self.tool_calls.load(Ordering::Relaxed);
+            let with_empty = self.empty_delta.load(Ordering::Relaxed);
             std::thread::spawn(move || {
                 if slow > 0 {
                     std::thread::sleep(Duration::from_millis(slow as u64 * 20));
                 }
                 match req.kind {
                     "chat" => {
+                        if with_empty {
+                            core.reply(req.request_id, BridgeMsg::Delta(String::new()));
+                        }
                         core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                         core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
                         if with_tools {
@@ -276,6 +286,40 @@
         }
         // synth bridge streams "Hel" + "lo" as separate deltas
         assert!(acc.contains("Hel"), "delta text missing");
+    }
+
+    /// Gateway mode holds text back until the model settles, so it probes liveness between
+    /// turns with an empty chunk. That probe must reach the client as nothing — an empty
+    /// content delta is not information, and streaming a blank frame per turn is noise that
+    /// some clients render as a spurious empty message.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn empty_delta_is_not_a_wire_event() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.answer_with_empty_delta(true);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("[DONE]") {
+                break;
+            }
+        }
+        assert!(!acc.contains(r#""content":"""#), "empty delta reached the wire:
+{acc}");
+        // The probe is dropped, not the message: real text still arrives.
+        assert!(acc.contains("Hel") && acc.contains("lo"), "real deltas missing:
+{acc}");
     }
 
     #[tokio::test(flavor = "multi_thread")]

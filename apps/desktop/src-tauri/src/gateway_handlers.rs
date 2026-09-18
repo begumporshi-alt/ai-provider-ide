@@ -62,6 +62,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             let mut usage: Option<(u64, u64)> = None;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
+                    // An empty delta carries no content, so it is not a wire event at all.
+                    // The bridge relies on this: in gateway mode it holds text back until the
+                    // model settles, and probes liveness between turns with an empty chunk —
+                    // which must reach the client as nothing.
+                    BridgeMsg::Delta(t) if t.is_empty() => {}
                     BridgeMsg::Delta(t) => {
                         let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk",
                             "choices": [{ "index": 0, "delta": { "content": t } }] });

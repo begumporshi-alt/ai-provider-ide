@@ -13,10 +13,15 @@
  *   GATEWAY       The client sent no tools and the gateway tool toggle is on. We supply our
  *                 own sandboxed registry, execute each call in the Rust host, feed the
  *                 results back to the model, and keep going until it stops asking. The
- *                 client sees the model's prose as it arrives — including any preamble
- *                 before a tool call — but never the tool calls or their results, which stay
- *                 server-side. Suppressing the preamble would mean buffering text we might
- *                 never emit: an abort or the iteration cap would swallow it whole.
+ *                 client sees only the answer the model settles on: text from a turn that
+ *                 goes on to call a tool is a preamble the client never asked for, so it is
+ *                 held back and dropped when the next turn starts. Tool calls and their
+ *                 results stay server-side entirely.
+ *
+ *                 Two exceptions, both deliberate. Pass-through and tools-off stream as they
+ *                 arrive, because neither has a follow-up turn to wait for. And if the run
+ *                 hits the iteration ceiling, the last turn is released rather than dropped:
+ *                 a client that receives nothing cannot tell "gave up" from "broke".
  *
  * Mercury-2.5 handling: models trained on agent transcripts may emit tool calls as
  * inline text markers rather than structured OpenAI tool_calls. Those markers are not part
@@ -128,6 +133,13 @@ async function handle(req: BridgeRequest): Promise<void> {
       // registry is ours to steer with "auto".
       const toolChoice = gatewayTools ? "auto" : normalizedBody.tool_choice;
 
+      // Gateway mode runs several model turns, and only the last one is an answer. Text from
+      // a turn that goes on to call tools is a preamble ("on it:"), and the client did not
+      // ask for it — so it is held here and released only once a turn ends without asking
+      // for anything. Pass-through and tools-off have no follow-up turn, so they stream
+      // straight through; there is nothing to wait for.
+      let heldProse = "";
+
       // Emitting a chunk is also the liveness check: gateway_chunk fails once the HTTP
       // request is gone, and aborting here is what stops us paying for tokens nobody wants.
       const emitProse = (t: string) => {
@@ -137,9 +149,20 @@ async function handle(req: BridgeRequest): Promise<void> {
           .filter((s): s is { kind: "text"; text: string } => s.kind === "text")
           .map((s) => s.text)
           .join("");
-        if (visible) {
-          void invoke("gateway_chunk", { requestId: req.requestId, text: visible }).catch(() => ac.abort());
+        if (!visible) return;
+        if (gatewayTools) {
+          heldProse += visible;
+          return;
         }
+        void invoke("gateway_chunk", { requestId: req.requestId, text: visible }).catch(() => ac.abort());
+      };
+
+      /** Release what a finished turn produced. Awaited: it races gateway_done. */
+      const flushProse = async () => {
+        if (!heldProse) return;
+        const text = heldProse;
+        heldProse = "";
+        await invoke("gateway_chunk", { requestId: req.requestId, text }).catch(() => undefined);
       };
 
       // Must be awaited by the caller: this and gateway_done race on the same channel, and if
@@ -189,6 +212,21 @@ async function handle(req: BridgeRequest): Promise<void> {
       for (let iter = 1; iter <= MAX_TOOL_ITERATIONS; iter++) {
         if (ac.signal.aborted) return;
 
+        // A turn that ends up calling tools has nothing to show the client, so whatever it
+        // said goes no further. Starting a new turn discards the previous turn's preamble.
+        heldProse = "";
+
+        // Holding text back removes our only backpressure: `gateway_chunk` failing is how we
+        // learn the client is gone, and in gateway mode nothing is emitted until the end. So
+        // probe before every turn after the first. An empty chunk is answered with nothing on
+        // the wire (Rust drops empty deltas) — it is purely a liveness check, and a failure
+        // here stops us paying for tokens nobody will read.
+        if (gatewayTools && iter > 1) {
+          const alive = await invoke("gateway_chunk", { requestId: req.requestId, text: "" })
+            .then(() => true)
+            .catch(() => false);
+          if (!alive) return;
+        }
         const collected: ToolCall[] = [];
         const mercuryCalls: ToolCall[] = [];
         let turnText = "";
@@ -252,8 +290,10 @@ async function handle(req: BridgeRequest): Promise<void> {
           continue;
         }
 
-        // No tool calls at all: the model answered and the turn is over.
+        // No tool calls at all: the model answered and the turn is over. This is the only
+        // text the client sees in gateway mode, so release it before finishing.
         if (collected.length === 0) {
+          await flushProse();
           done();
           return;
         }
@@ -270,7 +310,10 @@ async function handle(req: BridgeRequest): Promise<void> {
         await sandboxTurn(turnText, collected);
       }
 
-      // Iteration ceiling reached: return what we have rather than looping forever.
+      // Iteration ceiling reached: return what we have rather than looping forever. The last
+      // turn is released even though it is not a clean answer — a client that gets nothing
+      // at all cannot tell "gave up" from "broke".
+      await flushProse();
       done();
       return;
     }

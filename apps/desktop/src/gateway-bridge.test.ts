@@ -142,19 +142,18 @@ describe("gateway-bridge tool loop", () => {
     const toolMsg = msgs.find((m) => m.role === "tool");
     expect(toolMsg?.tool_call_id).toBe("c1");
 
-    // The client sees prose as it arrives, including the preamble before the call, but
-    // never the call itself. Buffering the preamble until the end would mean losing it
-    // whenever the run aborts or hits the iteration cap.
+    // The client sees only the answer the model settled on. The "on it: " preamble belongs
+    // to a turn that went on to call a tool, so it is dropped, not streamed.
     expect(calls("gateway_tool_calls").length).toBe(0);
     const streamed = calls("gateway_chunk").map((c) => c.args.text).join("");
-    expect(streamed).toContain("on it: ");
-    expect(streamed).toContain("wrote it");
+    expect(streamed).toBe("wrote it");
+    expect(streamed).not.toContain("on it: ");
     expect(calls("gateway_done").length).toBe(1);
   });
 
   it("pass-through: emits the client's calls and ends, without executing them", async () => {
     const clientTools = [{ type: "function", function: { name: "their_tool" } }];
-    h.steps = [{ text: "", calls: [{ id: "c1", name: "their_tool", arguments: "{}" }] }];
+    h.steps = [{ text: "thinking", calls: [{ id: "c1", name: "their_tool", arguments: "{}" }] }];
 
     await send({
       model: "m1",
@@ -180,6 +179,8 @@ describe("gateway-bridge tool loop", () => {
 
     // Executing here would run the file write twice.
     expect(calls("gateway_tool_run").length).toBe(0);
+    // No follow-up turn, so nothing is held back — pass-through streams as it arrives.
+    expect(calls("gateway_chunk").map((c) => c.args.text).join("")).toContain("thinking");
     expect(calls("gateway_done").length).toBe(1);
   });
 
@@ -195,12 +196,15 @@ describe("gateway-bridge tool loop", () => {
   });
 
   it("caps a model that never stops calling tools", async () => {
-    h.steps = [{ text: "", calls: [{ id: "c1", name: "write_file", arguments: "{}" }] }];
+    h.steps = [{ text: "still working", calls: [{ id: "c1", name: "write_file", arguments: "{}" }] }];
 
     await send({ model: "m1", messages: [{ role: "user", content: "loop forever" }] });
 
     // 8 is MAX_TOOL_ITERATIONS; the point is that it is bounded, not that it is 8.
     expect(h.genCalls.length).toBe(8);
+    // There is no clean answer to show, but the last turn is released anyway: a client that
+    // receives nothing cannot tell "gave up" from "broke".
+    expect(calls("gateway_chunk").map((c) => c.args.text).join("")).toContain("still working");
     expect(calls("gateway_done").length).toBe(1);
   });
 
@@ -222,9 +226,12 @@ describe("gateway-bridge tool loop", () => {
     expect(await waitFor(() => calls("gateway_chunk").length > 0)).toBe(true);
     await new Promise((r) => setTimeout(r, 150));
 
-    // Neither finished nor errored: it just stopped, and did not run the tool.
+    // Neither finished nor errored: it just stopped.
     expect(calls("gateway_done").length).toBe(0);
-    expect(calls("gateway_tool_run").length).toBe(0);
+    // Turn 1's call already ran before the disconnect was noticed — holding text back means
+    // we find out at the next turn boundary rather than mid-turn. What matters is that it
+    // is bounded at one extra turn, not eight: no second turn was ever requested.
+    expect(calls("gateway_tool_run").length).toBe(1);
     expect(h.genCalls.length).toBe(1);
   });
 });
