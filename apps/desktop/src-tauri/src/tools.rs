@@ -130,6 +130,12 @@ fn resolve_within(root: &Path, rel: &str, create_parents: bool) -> Result<PathBu
     }
     let root_canon = fs::canonicalize(root).map_err(|e| format!("workspace root is not accessible: {e}"))?;
     let target = root_canon.join(rel_path);
+    // Reads and listings cannot create anything, so a missing path is simply missing. Say so
+    // plainly: the reader of this message is a model, and "parent directory is not accessible"
+    // sends it chasing a permissions problem that does not exist.
+    if !create_parents && !target.exists() {
+        return Err(format!("no such file or directory: {rel}"));
+    }
     let resolved = match fs::canonicalize(&target) {
         Ok(c) => c,
         Err(_) => {
@@ -494,3 +500,9 @@ mod tests {
         assert!(res.output.contains("dir  b"));
     }
 }
+
+/// Agent-session coverage: can a model actually scaffold, run, and edit a project through
+/// this sandbox? See `tools_agent_tests.rs`.
+#[cfg(test)]
+#[path = "tools_agent_tests.rs"]
+mod agent_tests;
