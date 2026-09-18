@@ -5,28 +5,66 @@
 
 use std::sync::{Arc, Mutex};
 
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
 use crate::store::Store;
+
+/// R1: label of the dedicated, never-visible window that hosts the router core for gateway
+/// requests. Keeping the bridge out of the UI window is what stops UI render work — and UI
+/// HMR reloads — from touching in-flight gateway requests.
+pub const GATEWAY_WINDOW: &str = "gateway";
 
 pub struct GatewayState {
     pub core: Arc<GatewayCore>,
     pub server: Mutex<Option<gateway::ServerHandle>>,
 }
 
-/// Production bridge: dispatch/cancel flow as events to the webview.
+/// Production bridge: dispatch/cancel flow as events to the gateway worker window.
+///
+/// `emit_to` is load-bearing here, not stylistic: `emit` broadcasts to *every* webview, and
+/// both windows hydrate a router core. With a broadcast each request would be answered twice —
+/// two upstream calls, two ledger rows, two streams to the client.
 struct EventBridge {
     app: AppHandle,
 }
 
 impl Bridge for EventBridge {
     fn dispatch(&self, req: BridgeRequest) {
-        let _ = self.app.emit("gateway-request", &req);
+        let _ = self.app.emit_to(
+            EventTarget::webview_window(GATEWAY_WINDOW),
+            "gateway-request",
+            &req,
+        );
     }
     fn cancel(&self, request_id: u64) {
-        let _ = self.app.emit("gateway-cancel", serde_json::json!({ "requestId": request_id }));
+        let _ = self.app.emit_to(
+            EventTarget::webview_window(GATEWAY_WINDOW),
+            "gateway-cancel",
+            serde_json::json!({ "requestId": request_id }),
+        );
     }
+}
+
+/// R1: create the gateway worker window if it is not already up. Idempotent.
+///
+/// Failure is returned rather than swallowed: without this window nothing answers gateway
+/// requests, so a silent fallback would look like a running gateway that 503s on everything.
+pub fn ensure_bridge_window(app: &AppHandle) -> Result<(), String> {
+    if app.get_webview_window(GATEWAY_WINDOW).is_some() {
+        return Ok(());
+    }
+    WebviewWindowBuilder::new(app, GATEWAY_WINDOW, WebviewUrl::App("gateway.html".into()))
+        .title("AI-Provider Router — gateway worker")
+        .visible(false)
+        .build()
+        .map_err(|e| format!("gateway worker window failed to start: {e}"))?;
+    // The worker window is hidden by design, so the renderer's heartbeat is subject to the
+    // OS throttling that HEARTBEAT_STALE_HIDDEN_MS exists to absorb.
+    if let Some(state) = app.try_state::<Arc<GatewayState>>() {
+        state.core.set_hidden(true);
+    }
+    Ok(())
 }
 
 pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {
@@ -86,6 +124,9 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
         // Already up: report the bound port (idempotent).
         return Ok(state.core.port());
     }
+    // R1: the bridge lives in its own window; bring it up before the socket accepts traffic,
+    // so no request can arrive with nothing listening.
+    ensure_bridge_window(&app)?;
     let handle = gateway::spawn(state.core.clone(), port.unwrap_or(gateway::DEFAULT_PORT)).await?;
     state.core.set_running(true);
     let bound = handle.addr.port();

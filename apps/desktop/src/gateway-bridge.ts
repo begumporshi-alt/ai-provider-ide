@@ -17,6 +17,7 @@
  */
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { router } from "./store";
 import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router-core";
 import type { LedgerSource, AccumulatorState } from "@aiprovider/router-core";
@@ -32,8 +33,25 @@ interface BridgeRequest {
 const active = new Map<number, AbortController>();
 let started = false;
 
+/**
+ * Must match `GATEWAY_WINDOW` in src-tauri/src/gateway_cmds.rs. Rust emits requests to that
+ * one window; if the UI window also registered a listener it would answer them too — two
+ * upstream calls, two ledger rows, two streams to the client. Refusing to start anywhere else
+ * makes that failure impossible rather than merely unlikely.
+ */
+const BRIDGE_WINDOW = "gateway";
+
 export async function startGatewayBridge(): Promise<void> {
   if (started) return;
+  if (getCurrentWindow().label !== BRIDGE_WINDOW) {
+    // Not an error: this runs in the UI window during development if someone re-adds the
+    // call. Silence is safer than a second listener.
+    console.warn(
+      `[gateway-bridge] refusing to start in window "${getCurrentWindow().label}" — the bridge ` +
+        `only runs in "${BRIDGE_WINDOW}" (audit R1).`,
+    );
+    return;
+  }
   started = true;
   await listen<BridgeRequest>("gateway-request", (event) => {
     void handle(event.payload);

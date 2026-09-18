@@ -12,8 +12,6 @@ use std::sync::{Arc, RwLock};
 
 use tauri::Manager;
 
-use crate::gateway_cmds::GatewayState;
-
 /// Seed the egress allowlist from registered provider base URLs. Only statuses that can
 /// actually serve (pending/enabled/repairing) are allowed (invariant 9: no stale grants).
 fn initial_allow_hosts(store: &store::Store) -> std::collections::HashSet<String> {
@@ -97,10 +95,10 @@ fn show_window(app: &tauri::AppHandle) {
         let _ = w.show();
         let _ = w.unminimize();
         let _ = w.set_focus();
-        if let Some(state) = app.try_state::<std::sync::Arc<GatewayState>>() {
-            state.core.set_hidden(false);
-        }
     }
+    // Deliberately does NOT clear the core's hidden flag: that flag describes the *bridge
+    // host* window, which is the permanently-hidden gateway worker. Restoring the UI has no
+    // bearing on whether the worker renderer is throttled.
 }
 
 /// R1: read the persisted preference. Default ON — background mode is the whole point of
@@ -124,12 +122,6 @@ fn hide_on_close(app: &tauri::AppHandle) -> bool {
     }
 }
 
-fn set_hidden_flag(app: &tauri::AppHandle, hidden: bool) {
-    use tauri::Manager as _;
-    if let Some(state) = app.try_state::<std::sync::Arc<GatewayState>>() {
-        state.core.set_hidden(hidden);
-    }
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -172,7 +164,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            // R1: the window is the gateway's host, so closing it must not end the process.
+            // R1: closing the UI window must not end the process. The gateway's renderer is a
+            // separate hidden window, so it keeps serving regardless.
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },
@@ -183,7 +176,6 @@ pub fn run() {
                     api.prevent_close();
                     if let Some(w) = app.get_webview_window("main") {
                         let _ = w.hide();
-                        set_hidden_flag(app, true);
                         tracing::info!("window hidden — gateway still serving in background");
                     }
                 }
