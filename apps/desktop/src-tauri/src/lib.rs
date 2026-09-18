@@ -7,6 +7,7 @@ mod persist;
 mod store;
 mod tools;
 mod vault;
+mod workbuddy;
 
 use std::sync::{Arc, RwLock};
 

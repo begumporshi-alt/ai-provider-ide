@@ -245,6 +245,18 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     let bound = handle.addr.port();
     *state.server.lock().unwrap() = Some(handle);
     log_to_file(&app, &format!("enabled on port {bound}"));
+    // Keep the entry we publish into third-party clients current: url/port, key, and the
+    // capability fields that nobody should have to hand-maintain. Best-effort — a client
+    // config we cannot write must never stop the gateway from serving.
+    if let Some(store) = app.try_state::<Arc<Store>>() {
+        match crate::workbuddy::sync(store.inner()) {
+            Ok(r) => log_to_file(
+                &app,
+                &format!("workbuddy sync: {} published, {} stale removed", r.updated, r.removed),
+            ),
+            Err(e) => log_to_file(&app, &format!("workbuddy sync skipped: {e}")),
+        }
+    }
     spawn_watchdog(app, state);
     Ok(bound)
 }
