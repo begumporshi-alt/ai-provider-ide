@@ -14,8 +14,8 @@
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { router } from "./store";
-import { normalizeGatewayRequest, detectClient } from "@aiprovider/router";
-import type { LedgerSource, ToolCall } from "@aiprovider/router";
+import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, initAccumulatorState } from "@aiprovider/router";
+import type { LedgerSource, ToolCall, AccumulatorState } from "@aiprovider/router";
 
 interface BridgeRequest {
   requestId: number;
@@ -93,17 +93,57 @@ async function handle(req: BridgeRequest): Promise<void> {
         { signal: ac.signal, source: "gateway" as LedgerSource },
       );
 
-      // Phase 2: Filter out mercury-2.5 pseudo-tool-call markup from text chunks.
-      // The adapter's onToolCall channel forwards real tool calls via gateway_tool_calls.
-      // This suppresses in-text fallback (<|tool_call_start|>...<|tool_call_end|>)
-      // so WorkBuddy receives clean text, not rendered markup.
+      // Phase 2: Feed raw SSE chunks through parseOpenAIChatDelta to reassemble tool calls
+      // from delta fragments. The OpenAI adapter normalises upstream responses, so this is
+      // the common path. onToolCall fires for each complete tool call; the parser also
+      // filters mercury-2.5 pseudo-markup (<|tool_call_start|>, <function=) from text.
+      const state: AccumulatorState = initAccumulatorState();
+      let toolCallEmitted = false;
       for await (const rawChunk of exec.chunks) {
         if (rawChunk.includes("<|tool_call_start|>") || rawChunk.includes("<function=")) {
+          // Ignore mercury-2.5 pseudo-tool-call markup — it's in-band text, not structured calls.
           continue;
         }
-        await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => {
-          ac.abort();
-        });
+        let parsed: ReturnType<typeof parseOpenAIChatDelta> | null = null;
+        try {
+          parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
+        } catch {
+          // Non-JSON fragment (or incomplete line) — treat as raw text.
+          await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => undefined);
+          continue;
+        }
+        if (parsed?.text) {
+          await invoke("gateway_chunk", { requestId: req.requestId, text: parsed.text }).catch(() => {
+            ac.abort();
+          });
+        }
+        if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
+          await invoke("gateway_tool_calls", {
+            requestId: req.requestId,
+            toolCallsJson: JSON.stringify(parsed.toolCalls),
+          }).catch(() => undefined);
+          toolCallEmitted = true;
+        }
+        if (parsed?.usage) {
+          void invoke("gateway_usage", {
+            requestId: req.requestId,
+            promptTokens: parsed.usage.prompt_tokens ?? 0,
+            completionTokens: parsed.usage.completion_tokens ?? 0,
+          }).catch(() => undefined);
+        }
+      }
+      // If no structured tool calls arrived via gateway_tool_calls but the final chunk had
+      // finishReason=tool_calls, re-emit the accumulated calls to ensure the client receives them.
+      if (!toolCallEmitted && state.toolCalls.size > 0 && state.finishReason === "tool_calls") {
+        const calls = Array.from(state.toolCalls.values()).map((c) => ({
+          id: c.id ?? "",
+          type: c.type,
+          function: c.function,
+        }));
+        void invoke("gateway_tool_calls", {
+          requestId: req.requestId,
+          toolCallsJson: JSON.stringify(calls),
+        }).catch(() => undefined);
       }
       done();
       return;

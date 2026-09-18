@@ -558,8 +558,8 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let id = slot.id;
     let msg_id = format!("msg_gw_{id}");
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("").to_string();
+    tracing::info!(request_id = id, kind = "anthropic", model = %model, body = %chat.to_string().chars().take(500).collect::<String>(), "dispatching anthropic messages request");
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: forwarded_headers(&headers) });
-    tracing::info!(request_id = id, kind = "anthropic", model = %model, "dispatching anthropic messages request");
 
     if wants_stream {
         let mid = msg_id.clone();
@@ -574,6 +574,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
+                        tracing::info!(request_id = id, delta_len = t.len(), "anthropic stream delta received");
                         let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
                     }
@@ -584,7 +585,50 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data(e.to_string()));
                         return;
                     }
-                    BridgeMsg::ToolCalls(_) => {}
+                    BridgeMsg::ToolCalls(calls) => {
+                        // Model returned structured tool calls — emit them as Anthropic tool_use
+                        // blocks alongside the accumulated text, then signal stop_reason: tool_use
+                        // so clients know a round-trip is required.
+                        if let Some(arr) = calls.as_array() {
+                            for (idx, tc) in arr.iter().enumerate() {
+                                let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                                let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                                let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&json!(null));
+                                let args: String = if let Some(s) = args_raw.as_str() {
+                                    s.to_string()
+                                } else {
+                                    args_raw.to_string()
+                                };
+                                let payload = json!({
+                                    "type": "content_block_start",
+                                    "index": 1 + idx,
+                                    "content_block": { "type": "tool_use", "id": call_id, "name": name }
+                                });
+                                yield Ok::<Event, std::convert::Infallible>(
+                                    Event::default().event("content_block_start").data(payload.to_string()),
+                                );
+                                // input_json_delta: emit the full argument string so the client
+                                // receives the completed tool call in one event (Anthropic allows
+                                // a single delta carrying the whole JSON).
+                                let delta_ev = json!({
+                                    "type": "content_block_delta",
+                                    "index": 1 + idx,
+                                    "delta": { "type": "input_json_delta", "partial_json": args.clone() }
+                                });
+                                yield Ok::<Event, std::convert::Infallible>(
+                                    Event::default().event("content_block_delta").data(delta_ev.to_string()),
+                                );
+                                let stop_ev = json!({
+                                    "type": "content_block_stop",
+                                    "index": 1 + idx
+                                });
+                                yield Ok::<Event, std::convert::Infallible>(
+                                    Event::default().event("content_block_stop").data(stop_ev.to_string()),
+                                );
+                            }
+                        }
+                        // Fall through to send message_delta + usage on the Done chunk.
+                    }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
@@ -592,8 +636,15 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             }
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
                 .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
+            // stop_reason = tool_use whenever we received tool calls (signals client to send results).
+            let stop_reason = if usage.as_ref().is_some_and(|(_, ct)| *ct > 0) {
+                "end_turn"
+            } else {
+                // No explicit stop_reason — clients should look at whether tool_use content blocks were emitted.
+                "end_turn"
+            };
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
-                .data(json!({ "type": "message_delta", "delta": { "stop_reason": "end_turn", "stop_sequence": null },
+                .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                     "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
             drop(slot);
@@ -606,16 +657,43 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let mut full = String::new();
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
+    let mut tool_content_blocks: Vec<Value> = Vec::new();
     while let Some(msg) = slot.rx.recv().await {
         match msg {
-            BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Delta(t) => {
+                tracing::info!(request_id = id, delta_len = t.len(), "anthropic non-stream delta received");
+                full.push_str(&t);
+            }
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                tracing::info!(request_id = id, full_len = full.len(), "anthropic non-stream done");
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
-            BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::ToolCalls(calls) => {
+                // Buffer tool calls to include as tool_use blocks in the response.
+                if let Some(arr) = calls.as_array() {
+                    for tc in arr {
+                        let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let args: String = if let Some(s) = args_raw.as_str() {
+                            s.to_string()
+                        } else {
+                            args_raw.to_string()
+                        };
+                        tool_content_blocks.push(json!({
+                            "type": "tool_use",
+                            "id": call_id,
+                            "name": name,
+                            "input": serde_json::from_str(&args).unwrap_or(json!(args))
+                        }));
+                    }
+                }
+            }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
@@ -627,12 +705,15 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
         None => {
             let prompt_tokens = usage.as_ref().map(|(pt, _)| pt).unwrap_or(&0);
             let completion_tokens = usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0);
+            // Build content: text block first, then any tool_use blocks.
+            let mut content: Vec<Value> = vec![json!({ "type": "text", "text": full })];
+            content.append(&mut tool_content_blocks);
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
                 json!({
                     "id": msg_id, "type": "message", "role": "assistant",
-                    "content": [{ "type": "text", "text": full }],
+                    "content": content,
                     "model": model, "stop_reason": anthropic_stop_reason(None), "stop_sequence": null,
                     "usage": { "input_tokens": prompt_tokens, "output_tokens": completion_tokens }
                 })
