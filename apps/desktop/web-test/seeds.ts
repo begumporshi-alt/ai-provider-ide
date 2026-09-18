@@ -8,7 +8,7 @@
  * Ports must match web-test/mock.mjs. Secrets appear here ONLY because this is a dev harness
  * against a local mock — they are never shipped and never touch a real provider.
  */
-import { BUILTIN_TEMPLATES } from "@aiprovider/router";
+import { BUILTIN_TEMPLATES } from "@aiprovider/router-core";
 
 export const MOCK_PORT = 18901;
 export const MOCK_ORIGIN = `http://127.0.0.1:${MOCK_PORT}`;

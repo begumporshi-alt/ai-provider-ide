@@ -21,7 +21,7 @@ import {
   type LedgerEntry,
   type ProviderRecord,
   type RepairPlan,
-} from "@aiprovider/router";
+} from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 
 // ---------- host row shapes (camelCase, mirror persist.rs) ----------
@@ -58,7 +58,7 @@ const vault = createKeyVaultPort();
 const http = createHttpPort();
 
 export const registry = new ProviderRegistry(vault);
-export const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.ide" });
+export const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.router" });
 export const ledger = new UsageLedger({
   async append(e: LedgerEntry) {
     await invoke("ledger_append", {
@@ -134,7 +134,7 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
   pendingRepairs.set(provider.id, entry);
   try {
     // free re-checks produce the failing-assertions context for the AI patch prompt
-    const { runContractSuite } = await import("@aiprovider/router");
+    const { runContractSuite } = await import("@aiprovider/router-core");
     const contract = await runContractSuite(adapter, { secretRef, consent: { text: false, image: false } });
     const plan = await new RepairOrchestrator({
       http,
@@ -499,7 +499,7 @@ export async function exportConfig(): Promise<string> {
  * keys are re-entered (audit H7).
  */
 export async function importConfig(text: string): Promise<{ providers: number; keys: number }> {
-  const { validateImport } = await import("@aiprovider/router");
+  const { validateImport } = await import("@aiprovider/router-core");
   const report = validateImport(text);
   if (!report.ok) throw new Error(report.errors.join(" · "));
   const applied = await invoke<{ providers: number; keys: number }>("config_import", { raw: JSON.parse(text) });

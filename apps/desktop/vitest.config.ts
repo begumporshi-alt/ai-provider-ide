@@ -3,7 +3,7 @@
  * mock providers, so it needs node (not jsdom), generous timeouts for server boot + streaming,
  * and must not be confused with the app's src/ (no unit tests there).
  *
- * Vitest (via esbuild) is also the reason the suite can import @aiprovider/router at all: node's
+ * Vitest (via esbuild) is also the reason the suite can import @aiprovider/router-core at all: node's
  * type-stripping does not rewrite `./x.js` specifiers to `.ts`, but esbuild does.
  */
 import { defineConfig } from "vitest/config";

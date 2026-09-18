@@ -1,4 +1,4 @@
-# MASTER PROMPT — AI-Provider IDE
+# MASTER PROMPT — AI-Provider Router
 
 > **Source of truth:** hand-drawn notebook sketch, 2026-09-15
 > (`~/Desktop/WhatsApp Image 2026-09-15 at 17.06.43.jpeg`), analyzed via ChatGPT vision.
@@ -14,7 +14,7 @@
 
 ## 1. Mission
 
-Build **AI-Provider IDE** — a local-first application that gives one unified interface to the
+Build **AI-Provider Router** — a local-first application that gives one unified interface to the
 user's own third-party AI providers. The user brings their own API keys for multiple providers;
 a central **Model Router** abstracts all provider differences away so the rest of the app talks
 to a single, normalized AI layer ("Custom AI to 3rd party" — your own keys, third-party models).
@@ -26,7 +26,7 @@ Model Router, and the Router talks to providers.**
 
 ```
                           ┌─────────────────────────┐
-                          │     AI-Provider IDE     │
+                          │     AI-Provider Router     │
                           └────────────┬────────────┘
                                        │
                                        ▼
@@ -164,7 +164,7 @@ Model Router, and the Router talks to providers.**
   and SQLite — the webview is key-blind and CORS-blocked from providers by design).
 - **UI:** React + TypeScript + Tailwind (matches a provider-card / dashboard style UI).
 - **Core:** a UI-agnostic TypeScript package — `packages/router-core` (published as
-  `@aiprovider/router`) containing providers, key management, routing, and failover — fully
+  `@aiprovider/router-core`) containing providers, key management, routing, and failover — fully
   unit-testable without the UI; `packages/adapter-spec` holds the manifest schema.
 - **Provider adapters:** one adapter interface (`listModels`, `generateText`, `generateImage`,
   `pingKey`), implemented per provider (OpenRouter, OpenCode, b.ai, + a generic

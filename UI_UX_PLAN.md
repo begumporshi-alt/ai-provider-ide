@@ -1,4 +1,4 @@
-# UI/UX PLAN — AI-Provider IDE (v1)
+# UI/UX PLAN — AI-Provider Router (v1)
 
 > **Source:** two-round design discussion with ChatGPT (GPT), 2026-09-15 — round 1: full
 > direction; round 2: pushback (theme scope, Overview screen, build order, AI-wait UX,

@@ -19,7 +19,7 @@
  *   - SSE is re-framed to raw text lines split on \n with \r trimmed; a consumer that stops
  *     iterating (abort) cancels the upstream connection.
  */
-import type { HttpPort } from "@aiprovider/router";
+import type { HttpPort } from "@aiprovider/router-core";
 
 export const SENTINEL = "{{secret}}";
 

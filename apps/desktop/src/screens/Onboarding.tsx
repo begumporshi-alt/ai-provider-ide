@@ -18,7 +18,7 @@ import {
   type OnboardingSessionData,
   type ProbeAttempt,
   type RankedCandidate,
-} from "@aiprovider/router";
+} from "@aiprovider/router-core";
 import {
   adapters, addKey, createPendingProvider, deleteProvider, getHttpPort,
   refreshCatalog, registry, setProviderStatus, router,

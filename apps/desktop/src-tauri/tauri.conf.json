@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "AI-Provider IDE",
+  "productName": "AI-Provider Router",
   "version": "0.1.0",
-  "identifier": "dev.aiprovider.ide",
+  "identifier": "dev.aiprovider.router",
   "build": {
     "beforeDevCommand": "pnpm dev",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "AI-Provider IDE",
+        "title": "AI-Provider Router",
         "width": 800,
         "height": 600
       }

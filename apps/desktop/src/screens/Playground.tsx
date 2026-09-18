@@ -11,7 +11,7 @@ import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type ToolsPolicy, type AgentEvent } from "../lib/tools";
-import type { ChatMessage, ToolCall } from "@aiprovider/router";
+import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -28,7 +28,7 @@ interface Msg {
  * root the user sets. It is deliberately terse; the sandbox, not the prompt, is the enforcement.
  */
 const AGENT_SYSTEM =
-  "You are an agent inside AI-Provider IDE. You have file and shell tools confined to the " +
+  "You are an agent inside AI-Provider Router. You have file and shell tools confined to the " +
   "workspace root the user specified. Complete the task by calling tools: read_file and " +
   "list_dir to inspect, write_file to create or edit, run_command for allowlisted commands. " +
   "Prefer inspecting before editing. Never ask the user to run a command — call the tool. " +
@@ -58,7 +58,7 @@ function tryParseArgs(raw?: string): Record<string, unknown> {
  * which is what you want when probing a provider's own prompting.
  */
 const NO_TOOLS_SYSTEM =
-  "You are answering inside AI-Provider IDE's Playground — a plain chat console. " +
+  "You are answering inside AI-Provider Router's Playground — a plain chat console. " +
   "You have no tools, functions, plugins, or file/shell access of any kind. " +
   "Never emit tool-call markup (for example <tool_call>, <|tool_call_start|>, or <function=...>). " +
   "When a request would need a tool, say so in plain prose and describe the steps instead.";

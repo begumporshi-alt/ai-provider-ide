@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI-Provider IDE — System Architecture</title>
+  <title>AI-Provider Router — System Architecture</title>
   <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -57,12 +57,12 @@
 </head>
 <body>
   <div class="frame">
-    <p class="eyebrow">AI-Provider IDE · System Architecture</p>
+    <p class="eyebrow">AI-Provider Router · System Architecture</p>
     <h1>One router in front of every provider</h1>
     <p class="sub">The IDE — and any external app via the Local Gateway — never talks to providers directly. Keys live only in the Rust host; the webview is key-blind by construction.</p>
 
     <svg viewBox="0 0 1120 672" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="aip-system-title aip-system-desc">
-      <title id="aip-system-title">AI-Provider IDE system architecture</title>
+      <title id="aip-system-title">AI-Provider Router system architecture</title>
       <desc id="aip-system-desc">Layered architecture: the React UI calls the Model Router, which plans attempts across the Adapter Runtime; all outbound HTTPS flows through the Rust egress gateway, which alone reads API keys from the OS keychain vault and forwards requests to third-party providers. External apps reach the same Model Router through a Local Gateway at 127.0.0.1:8787 authenticated by a generated master key, and an Adapter Generator self-constructs new provider integrations using AI routed back through the Model Router.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>

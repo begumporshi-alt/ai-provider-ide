@@ -1,5 +1,5 @@
 /**
- * AI-Provider IDE — app root. Bootstraps the core from the host, then routes screens.
+ * AI-Provider Router — app root. Bootstraps the core from the host, then routes screens.
  */
 import { useEffect, useState } from "react";
 import { bootstrap } from "./store";

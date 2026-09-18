@@ -3,23 +3,24 @@
  * router core, streams chunks back through the gateway_* commands, and aborts on cancel
  * events (§3.5). Ledger source is "gateway" (criterion 10 attribution).
  *
- * Phase 2 enhancement: raw upstream SSE is parsed by gateway-sse-parser.ts which
- * reassembles tool calls from delta fragments and emits structured tool_calls
- * via gateway_tool_calls, unblocking WorkBuddy/Claude Code/Codex from receiving
- * real tool calls instead of mercury-2.5 pseudo-markup.
+ * Tool execution loop: when the provider returns tool_calls, the bridge executes them
+ * locally via gateway_tool_run, appends results to messages, and calls gateway_re_dispatch
+ * to re-emit the request with updated context. Runs until the model stops returning
+ * tool_calls, then emits gateway_done to the client.
  *
- * Dual-path parsing: parseOpenAIChatDelta handles OpenAI Chat Completions format;
- * parseClaudeDelta is used as fallback for Anthropic Messages format (b.ai etc.)
- * so tool calls and text both survive the bridge for both dialects.
+ * Mercury-2.5 handling: models trained on agent transcripts may emit tool calls as
+ * inline text markers rather than structured OpenAI tool_calls. This bridge intercepts
+ * those markers, parses them into structured calls, executes them locally, and filters
+ * them from the client-visible stream so the user never sees raw marker syntax.
  *
- * The master key never appears here — auth happened in Rust before this file ever runs
- * (invariants 10, 14).
+ * The master key never appears here — auth happened in Rust before this file ever runs.
  */
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { router } from "./store";
-import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router";
-import type { LedgerSource, AccumulatorState } from "@aiprovider/router";
+import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router-core";
+import type { LedgerSource, AccumulatorState } from "@aiprovider/router-core";
+import { parseAssistantStream, type ToolSegment } from "./lib/assistant-stream";
 
 interface BridgeRequest {
   requestId: number;
@@ -29,12 +30,9 @@ interface BridgeRequest {
 }
 
 const active = new Map<number, AbortController>();
-
 let started = false;
 
 export async function startGatewayBridge(): Promise<void> {
-  // React StrictMode double-invokes effects in dev; without this guard every gateway
-  // request would be routed twice (duplicated chunks + duplicated ledger rows).
   if (started) return;
   started = true;
   await listen<BridgeRequest>("gateway-request", (event) => {
@@ -44,11 +42,9 @@ export async function startGatewayBridge(): Promise<void> {
     active.get(event.payload.requestId)?.abort();
     active.delete(event.payload.requestId);
   });
-  // Liveness heartbeat: proves the router core answers (§3.5 availability).
   window.setInterval(() => {
     void invoke("gateway_heartbeat").catch(() => undefined);
   }, 2000);
-  // Prime the heartbeat so the first request after enable isn't marked stale.
   void invoke("gateway_heartbeat").catch(() => undefined);
 }
 
@@ -62,115 +58,198 @@ async function handle(req: BridgeRequest): Promise<void> {
   try {
     if (req.kind === "chat" || req.kind === "responses") {
       const clientHint = detectClient(req.headers || {});
-      // For Responses API requests, the body has already been normalized by Rust's
-      // to_chat_body_responses() — but we still apply the normalizer for tool schema
-      // hygiene and role fixes on top of what Rust provides.
       const normalizedBody = normalizeGatewayRequest(req.body, { clientHint });
-
       const model = String(normalizedBody.model ?? "");
-      const messages = (normalizedBody.messages ?? []) as Array<{ role: "user" | "assistant" | "system"; content: string }>;
-      const exec = await router.generateText(
-        {
-          model,
-          messages,
-          maxTokens: typeof normalizedBody.max_tokens === "number" ? normalizedBody.max_tokens : undefined,
-          temperature: typeof normalizedBody.temperature === "number" ? normalizedBody.temperature : undefined,
-          tools: normalizedBody.tools,
-          toolChoice: normalizedBody.tool_choice,
-          responseFormat: normalizedBody.response_format,
-          onToolCall: (call) => {
-            // Emit via gateway_tool_calls so the agent loop sees the call even when
-            // parseOpenAIChatDelta cannot recover it from the raw SSE stream
-            // (e.g. Anthropic tool_use blocks that arrive as content_block_start +
-            // input_json_delta instead of delta.tool_calls).
-            void invoke("gateway_tool_calls", {
-              requestId: req.requestId,
-              toolCallsJson: JSON.stringify([call]),
-            }).catch(() => undefined);
-          },
-          onUsage: (usage) => {
-            // Collect usage from the adapter; we emit it after the stream so Rust can
-            // forward it to the client alongside the final SSE events.
-            void invoke("gateway_usage", {
-              requestId: req.requestId,
-              promptTokens: usage.prompt_tokens,
-              completionTokens: usage.completion_tokens,
-            }).catch(() => undefined);
-          },
-        },
-        { signal: ac.signal, source: "gateway" as LedgerSource },
-      );
+      let messages = (normalizedBody.messages ?? []) as Array<{
+        role: "user" | "assistant" | "system" | "tool";
+        content: string;
+        tool_call_id?: string;
+        tool_calls?: Array<{ id?: string; name?: string; arguments?: string }>;
+      }>;
+      const tools = normalizedBody.tools;
+      const toolChoice = normalizedBody.tool_choice;
+      const responseFormat = normalizedBody.response_format;
+      const maxTokens = typeof normalizedBody.max_tokens === "number" ? normalizedBody.max_tokens : undefined;
+      const temperature = typeof normalizedBody.temperature === "number" ? normalizedBody.temperature : undefined;
 
-      // Phase 2: Feed raw upstream SSE chunks through parseOpenAIChatDelta to
-      // reassemble tool calls from delta fragments. The OpenAI adapter
-      // normalises upstream responses, so this is the common path.
-      //
-      // parseClaudeDelta is used as fallback for Anthropic Messages format
-      // (b.ai etc.) where the manifest interpreter consumes all raw SSE via
-      // toolCallStream and yields zero text chunks to exec.chunks. The Claude
-      // parser independently reassembles tool_use blocks from content_block_start
-      // / input_json_delta / content_block_stop events.
-      const state: AccumulatorState = initAccumulatorState();
-      let toolCallEmitted = false;
-      for await (const rawChunk of exec.chunks) {
-        if (rawChunk.includes("<|tool_call_start|>") || rawChunk.includes("<function=")) {
-          // Ignore mercury-2.5 pseudo-tool-call markup — it's in-band text, not structured calls.
-          continue;
+      const emitProse = (t: string) => {
+        if (!t) return;
+        const segs = parseAssistantStream(t);
+        const visible = segs
+          .filter((s): s is { kind: "text"; text: string } => s.kind === "text")
+          .map((s) => s.text)
+          .join("");
+        if (visible) {
+          void invoke("gateway_chunk", { requestId: req.requestId, text: visible }).catch(() => ac.abort());
         }
-        let parsed: ReturnType<typeof parseOpenAIChatDelta> | null = null;
+      };
+
+      // The gateway Rust side initializes workspace_root to current_dir / home_dir on startup.
+      // gateway_set_workspace_root can be called anytime to change it; nothing needed here.
+      let _workspaceRoot: string | null = null;
+      const ensureWorkspaceRoot = async (): Promise<string> => {
+        if (_workspaceRoot !== null) return _workspaceRoot;
         try {
-          parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
-        } catch {
-          // Non-JSON fragment (or incomplete line) — treat as raw text.
-          await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => undefined);
-          continue;
-        }
-        // Fallback: if parseOpenAIChatDelta returned null (e.g. Anthropic SSE event
-        // like content_block_start), try parseClaudeDelta with the same state.
-        if (!parsed) {
-          try {
-            parsed = parseClaudeDelta(JSON.parse(rawChunk), state);
-          } catch {
-            await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => undefined);
-            continue;
+          const existing = await invoke<string | null>("gateway_get_workspace_root");
+          if (existing) {
+            _workspaceRoot = existing;
+            return _workspaceRoot;
           }
-        }
-        if (parsed?.text) {
-          await invoke("gateway_chunk", { requestId: req.requestId, text: parsed.text }).catch(() => {
-            ac.abort();
-          });
-        }
-        if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
+        } catch {}
+        // Fallback: should not normally reach here since Rust defaults to cwd/home.
+        _workspaceRoot = "/tmp";
+        await invoke("gateway_set_workspace_root", { path: _workspaceRoot }).catch(() => undefined);
+        return _workspaceRoot;
+      };
+
+      const dispatchMercuryCalls = async (calls: ToolSegment[], list: Array<{ id?: string; name?: string; arguments?: string; raw?: unknown }>, emitted: { ref: boolean }) => {
+        for (const seg of calls) {
+          const callId = crypto.randomUUID().slice(0, 8);
+          const argsObj: Record<string, string> = {};
+          for (const [k, v] of Object.entries(seg.params)) {
+            argsObj[k] = v;
+          }
+          list.push({ id: callId, name: seg.name ?? "", arguments: JSON.stringify(argsObj) });
           await invoke("gateway_tool_calls", {
             requestId: req.requestId,
-            toolCallsJson: JSON.stringify(parsed.toolCalls),
+            toolCallsJson: JSON.stringify([{ id: callId, type: "function", function: { name: seg.name ?? "", arguments: JSON.stringify(argsObj) } }]),
           }).catch(() => undefined);
-          toolCallEmitted = true;
+          emitted.ref = true;
         }
-        if (parsed?.usage) {
-          void invoke("gateway_usage", {
+      };
+
+      while (true) {
+        const accumulatedToolCalls: Array<{ id?: string; name?: string; arguments?: string; raw?: unknown }> = [];
+        let toolCallEmitted = false;
+
+        const exec = await router.generateText(
+          {
+            model,
+            messages,
+            maxTokens,
+            temperature,
+            tools,
+            toolChoice,
+            responseFormat,
+            onToolCall: (call) => { accumulatedToolCalls.push(call); },
+            onUsage: (usage) => {
+              void invoke("gateway_usage", {
+                requestId: req.requestId,
+                promptTokens: usage.prompt_tokens,
+                completionTokens: usage.completion_tokens,
+              }).catch(() => undefined);
+            },
+          },
+          { signal: ac.signal, source: "gateway" as LedgerSource },
+        );
+
+        const state: AccumulatorState = initAccumulatorState();
+        let pendingMercury: ToolSegment | null = null;
+
+        for await (const rawChunk of exec.chunks) {
+          let parsed: ReturnType<typeof parseOpenAIChatDelta> | null = null;
+          try {
+            parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
+          } catch {
+            continue;
+          }
+          if (!parsed) {
+            try {
+              parsed = parseClaudeDelta(JSON.parse(rawChunk), state);
+            } catch {
+              continue;
+            }
+          }
+
+          if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
+            for (const c of parsed.toolCalls) {
+              if (!accumulatedToolCalls.some((a) => a.id === c.id)) {
+                accumulatedToolCalls.push(c);
+              }
+            }
+            await invoke("gateway_tool_calls", {
+              requestId: req.requestId,
+              toolCallsJson: JSON.stringify(parsed.toolCalls),
+            }).catch(() => undefined);
+            toolCallEmitted = true;
+          }
+
+          if (parsed?.usage) {
+            void invoke("gateway_usage", {
+              requestId: req.requestId,
+              promptTokens: parsed.usage.prompt_tokens ?? 0,
+              completionTokens: parsed.usage.completion_tokens ?? 0,
+            }).catch(() => undefined);
+          }
+
+          // Mercury-2.5 inline text markers.
+          const segs = parseAssistantStream(rawChunk);
+          for (const seg of segs) {
+            if (seg.kind === "tool" && seg.complete) {
+              if (pendingMercury !== null) {
+                pendingMercury = null;
+              }
+            } else if (seg.kind === "tool" && !seg.complete) {
+              pendingMercury = seg;
+            }
+          }
+          emitProse(segs.filter((s): s is { kind: "text"; text: string } => s.kind === "text").map((s) => s.text).join(""));
+          const completedMercury = segs.filter((s): s is ToolSegment => s.kind === "tool" && s.complete);
+          if (completedMercury.length > 0) {
+            await dispatchMercuryCalls(completedMercury, accumulatedToolCalls, { ref: false } as { ref: boolean });
+          }
+        }
+
+        if (pendingMercury !== null && pendingMercury.complete) {
+          await dispatchMercuryCalls([pendingMercury], accumulatedToolCalls, { ref: false } as { ref: boolean });
+        }
+
+        if (!toolCallEmitted && state.toolCalls.size > 0 && state.finishReason === "tool_calls") {
+          const calls = Array.from(state.toolCalls.values()).map((c) => ({
+            id: c.id ?? "",
+            type: c.type,
+            function: c.function,
+          }));
+          void invoke("gateway_tool_calls", {
             requestId: req.requestId,
-            promptTokens: parsed.usage.prompt_tokens ?? 0,
-            completionTokens: parsed.usage.completion_tokens ?? 0,
+            toolCallsJson: JSON.stringify(calls),
           }).catch(() => undefined);
         }
-      }
-      // If no structured tool calls arrived via gateway_tool_calls but the final
-      // chunk had finishReason=tool_calls, re-emit the accumulated calls to ensure
-      // the client receives them.
-      if (!toolCallEmitted && state.toolCalls.size > 0 && state.finishReason === "tool_calls") {
-        const calls = Array.from(state.toolCalls.values()).map((c) => ({
-          id: c.id ?? "",
-          type: c.type,
-          function: c.function,
-        }));
-        void invoke("gateway_tool_calls", {
+
+        if (accumulatedToolCalls.length === 0) {
+          done();
+          return;
+        }
+
+        // Ensure workspace root is set before executing any tools.
+        await ensureWorkspaceRoot().catch(() => undefined);
+
+        for (const call of accumulatedToolCalls) {
+          const name = call.name ?? "";
+          let args = {};
+          try {
+            args = call.arguments ? JSON.parse(call.arguments) : {};
+          } catch {
+            args = call.arguments ?? {};
+          }
+          try {
+            const result = await invoke<{ ok: boolean; output: string; error?: string }>(
+              "gateway_tool_run",
+              { requestId: req.requestId, toolName: name, arguments: JSON.stringify(args) },
+            );
+            const resultText = result.ok ? result.output : (result.error ?? "tool execution failed");
+            messages.push({ role: "tool", content: resultText, tool_call_id: call.id ?? name });
+          } catch (e) {
+            const errMsg = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;
+            messages.push({ role: "tool", content: errMsg, tool_call_id: call.id ?? name });
+          }
+        }
+
+        await invoke("gateway_re_dispatch", {
           requestId: req.requestId,
-          toolCallsJson: JSON.stringify(calls),
+          messagesJson: JSON.stringify(messages),
         }).catch(() => undefined);
       }
-      done();
-      return;
     }
     if (req.kind === "models") {
       const rows = await router.listModels();
@@ -198,7 +277,7 @@ async function handle(req: BridgeRequest): Promise<void> {
     }
     await invoke("gateway_error", { requestId: req.requestId, status: 400, message: `unknown bridge kind ${req.kind}` });
   } catch (e) {
-    if (ac.signal.aborted) return; // client is gone; nothing to report
+    if (ac.signal.aborted) return;
     const msg = String((e as Error)?.message ?? e);
     const status = /no route|not found/i.test(msg) ? 404 : 502;
     await invoke("gateway_error", { requestId: req.requestId, status, message: msg }).catch(() => undefined);

@@ -18,7 +18,7 @@
  * The returned `messages` is the conversation only (the system turn is NOT included, so the
  * caller can persist it and feed it back next turn without duplicating the system prompt).
  */
-import type { ChatMessage, ToolCall } from "@aiprovider/router";
+import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { registryToOpenAI } from "./registry";
 import type { AgentLoopOptions } from "./types";
 

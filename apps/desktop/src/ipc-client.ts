@@ -4,7 +4,7 @@
  * one). UI screens import ONLY this module — nothing else crosses to core or host.
  */
 import { invoke, Channel } from "@tauri-apps/api/core";
-import type { HttpPort, KeyVaultPort, StorePort } from "@aiprovider/router";
+import type { HttpPort, KeyVaultPort, StorePort } from "@aiprovider/router-core";
 
 interface WireEgressResponse {
   status: number;

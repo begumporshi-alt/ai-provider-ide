@@ -147,7 +147,7 @@ export type BuiltinTemplateId = keyof typeof BUILTIN_TEMPLATES;
 export const PROVIDER_PROFILES: Record<string, () => AdapterManifest> = {
   openrouter: () =>
     openaiCompat("https://openrouter.ai/api/v1", {
-      textHeaders: { "HTTP-Referer": "{{appUrl}}", "X-Title": "AI-Provider IDE" },
+      textHeaders: { "HTTP-Referer": "{{appUrl}}", "X-Title": "AI-Provider Router" },
       imageEndpoint: true,
       // OpenRouter serves image generation from its own Image API, NOT /images/generations.
       imagePath: "/images",

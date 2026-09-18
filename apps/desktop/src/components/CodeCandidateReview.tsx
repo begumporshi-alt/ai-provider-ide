@@ -10,7 +10,7 @@
  * "never executed before passing the contract suite, always human-confirmed").
  */
 import { useState } from "react";
-import type { RankedCandidate } from "@aiprovider/router";
+import type { RankedCandidate } from "@aiprovider/router-core";
 import { Button, inputCls, inputStyle } from "./atoms";
 
 const SOURCE_LIMIT = 64_000; // grammar bound, mirrored from the sandbox (defense in depth)

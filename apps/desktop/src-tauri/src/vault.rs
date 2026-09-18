@@ -1,10 +1,10 @@
 //! keychain-vault (L0): the ONLY home of raw secrets (invariants 1, 10, 14).
-//! OS keychain via `keyring` v3, service `ai-provider-ide`, accounts `key:<keyId>` for
+//! OS keychain via `keyring` v2, service `ai-provider-router`, accounts `key:<keyId>` for
 //! provider keys and `masterkey` for the Local Gateway master key (Phase 2b).
 
 use keyring::Entry;
 
-pub const SERVICE: &str = "ai-provider-ide";
+pub const SERVICE: &str = "ai-provider-router";
 
 #[derive(thiserror::Error, Debug)]
 pub enum VaultError {

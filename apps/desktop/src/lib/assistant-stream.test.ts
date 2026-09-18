@@ -2,7 +2,7 @@ import { describe, expect, it } from "vitest";
 import { parseAssistantStream, toolSegments, visibleText } from "./assistant-stream";
 
 /** The verbatim failure from the 2026-09-17 mercury-2.5 report. */
-const MERCURY = `<|tool_call_start|> <function=Bash> <parameter=command> mkdir -p /Users/tushershikder/.zcode/skills/ai-provider-ide-guide <parameter=description> Create skill directory <|tool_call_end|>`;
+const MERCURY = `<|tool_call_start|> <function=Bash> <parameter=command> mkdir -p /Users/tushershikder/.zcode/skills/ai-provider-router-guide <parameter=description> Create skill directory <|tool_call_end|>`;
 
 describe("parseAssistantStream", () => {
   it("leaves ordinary prose untouched", () => {
@@ -17,7 +17,7 @@ describe("parseAssistantStream", () => {
     expect(tool.kind === "tool" && tool.name).toBe("Bash");
     expect(tool.kind === "tool" && tool.complete).toBe(true);
     expect(tool.kind === "tool" && tool.params.command).toBe(
-      "mkdir -p /Users/tushershikder/.zcode/skills/ai-provider-ide-guide",
+      "mkdir -p /Users/tushershikder/.zcode/skills/ai-provider-router-guide",
     );
   });
 

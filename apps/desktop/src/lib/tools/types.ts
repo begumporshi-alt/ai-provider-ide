@@ -9,7 +9,7 @@
  * `createTauriToolHost` (host.ts); unit tests inject a fake. That is what makes the loop
  * deterministic and testable without a desktop shell.
  */
-import type { ChatMessage, TextRequest, TextStream } from "@aiprovider/router";
+import type { ChatMessage, TextRequest, TextStream } from "@aiprovider/router-core";
 
 /** A tool the agent may call. Mirrors, 1:1, the four handlers the Rust sandbox allows. */
 export interface ToolSpec {
@@ -32,8 +32,8 @@ export type GenerateFn = (
 
 export type AgentEvent =
   | { type: "assistant"; text: string }
-  | { type: "tool_call"; call: import("@aiprovider/router").ToolCall }
-  | { type: "tool_result"; call: import("@aiprovider/router").ToolCall; result: string; ok: boolean }
+  | { type: "tool_call"; call: import("@aiprovider/router-core").ToolCall }
+  | { type: "tool_result"; call: import("@aiprovider/router-core").ToolCall; result: string; ok: boolean }
   | { type: "done"; text: string; iterations: number };
 
 export interface AgentLoopOptions {
@@ -54,7 +54,7 @@ export interface AgentLoopOptions {
    * Per-call confirmation gate. Return true to execute, false to deny (the UI shows the
    * user an allow/deny prompt). When omitted, every call executes (non-interactive use).
    */
-  confirm?: (call: import("@aiprovider/router").ToolCall, args: Record<string, unknown>) => Promise<boolean>;
+  confirm?: (call: import("@aiprovider/router-core").ToolCall, args: Record<string, unknown>) => Promise<boolean>;
   /** Streaming + lifecycle events for the UI. */
   onEvent?: (ev: AgentEvent) => void;
   signal?: AbortSignal;

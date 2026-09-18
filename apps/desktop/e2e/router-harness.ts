@@ -22,7 +22,7 @@ import {
   type HttpPort,
   type KeyVaultPort,
   type ProviderRecord,
-} from "@aiprovider/router";
+} from "@aiprovider/router-core";
 import { HostHttp, type EgressAuditEntry } from "./host-http.js";
 
 /** In-memory keychain + the ref->provider join the Rust host does in SQLite. */
@@ -182,7 +182,7 @@ export function buildHarness(): RouterHarness {
     return { secret: undefined, expectedHost: undefined };
   });
 
-  const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.ide" });
+  const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.router" });
   const ledger = new UsageLedger();
   const catalog = new ModelCatalog(registry, adapters);
   const router = new ModelRouter(registry, adapters, catalog, ledger);

@@ -492,10 +492,10 @@ mod tests {
     fn secret_injected_only_at_sentinel() {
         let mut h = std::collections::BTreeMap::new();
         h.insert("Authorization".to_string(), "Bearer {{secret}}".to_string());
-        h.insert("X-Title".to_string(), "AI-Provider IDE".to_string());
+        h.insert("X-Title".to_string(), "AI-Provider Router".to_string());
         let out = inject_secret(h, Some("sk-real-secret")).unwrap();
         assert_eq!(out["Authorization"], "Bearer sk-real-secret");
-        assert_eq!(out["X-Title"], "AI-Provider IDE");
+        assert_eq!(out["X-Title"], "AI-Provider Router");
     }
 
     #[test]

@@ -119,7 +119,7 @@ export class RepairOrchestrator {
 
   private async runChecks(manifest: AdapterManifest): Promise<ContractReport> {
     const { ManifestInterpreter } = await import("./manifest-interpreter.js");
-    const interp = new ManifestInterpreter(manifest, { http: this.deps.http, vars: { appUrl: "https://aiprovider.ide" } });
+    const interp = new ManifestInterpreter(manifest, { http: this.deps.http, vars: { appUrl: "https://aiprovider.router" } });
     return runContractSuite(interp, { secretRef: this.deps.secretRef, consent: { text: false, image: false } });
   }
 }

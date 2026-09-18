@@ -1,6 +1,6 @@
 # Gateway Flexibility Improvement Plan
 
-**Goal:** Make the AI-Provider IDE gateway flexible enough to serve WorkBuddy, Claude Code, Codex, zcode/z.ai, Cursor, and any other OpenAI-compatible AI coding IDE — by adopting proven patterns from OmniRoute's gateway architecture.
+**Goal:** Make the AI-Provider Router gateway flexible enough to serve WorkBuddy, Claude Code, Codex, zcode/z.ai, Cursor, and any other OpenAI-compatible AI coding IDE — by adopting proven patterns from OmniRoute's gateway architecture.
 
 **Date:** 2026-09-17
 **Reference:** OmniRoute v3.8.50 (shallow clone at `/tmp/OmniRoute`)
@@ -121,7 +121,7 @@ export function normalizeGatewayRequest(
 In `apps/desktop/src/gateway-bridge.ts`, before calling `router.generateText()`:
 
 ```typescript
-import { normalizeGatewayRequest, detectClient } from "@aiprovider/router/gateway-normalizer";
+import { normalizeGatewayRequest, detectClient } from "@aiprovider/router-core/gateway-normalizer";
 
 // Detect client from headers (passed through by Rust gateway)
 const clientHint = detectClient(req.headers);

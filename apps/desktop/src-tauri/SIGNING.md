@@ -10,11 +10,11 @@ This guide covers macOS codesigning, notarization, and the auto-updater setup.
 # Create a key pair
 openssl genrsa -out dev.key 2048
 openssl req -new -x509 -key dev.key -out dev.crt -days 3650 \
-  -subj "/C=US/ST=California/L=San Francisco/O=AI Provider IDE/CN=dev.aiprovider.ide"
+  -subj "/C=US/ST=California/L=San Francisco/O=AI Provider Router/CN=dev.aiprovider.router"
 
 # Convert to PKCS12 for macOS Keychain
 openssl pkcs12 -export -out dev.p12 -inkey dev.key -in dev.crt \
-  -passout pass:codesign -name "AI Provider IDE"
+  -passout pass:codesign -name "AI Provider Router"
 
 # Import to Keychain (you'll be prompted)
 security import dev.p12 -k /Library/Keychains/System.keychain -P codesign -T /usr/bin/codesign
@@ -92,7 +92,7 @@ https://releases.aiprovider.dev/{target}/{arch}/{version}/latest
 Example structure:
 ```
 /darwin/aarch64/0.1.0/latest
-  ├── AI-Provider IDE.app.tar.gz
+  ├── AI-Provider Router.app.tar.gz
   └── latest.json
 ```
 
@@ -105,7 +105,7 @@ Example structure:
   "platforms": {
     "darwin-aarch64": {
       "signature": "...",
-      "url": "https://releases.aiprovider.dev/darwin/aarch64/0.1.1/AI-Provider IDE.app.tar.gz"
+      "url": "https://releases.aiprovider.dev/darwin/aarch64/0.1.1/AI-Provider Router.app.tar.gz"
     }
   }
 }

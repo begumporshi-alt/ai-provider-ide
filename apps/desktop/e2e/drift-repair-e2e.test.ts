@@ -31,7 +31,7 @@ import {
   runContractSuite,
   type DriftEvidence,
   type RepairPlan,
-} from "@aiprovider/router";
+} from "@aiprovider/router-core";
 import { startMocks } from "./mock-servers.js";
 import { buildHarness, type RouterHarness } from "./router-harness.js";
 

@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { runAgentLoop } from "./agentLoop";
 import { AGENT_TOOLS } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
-import type { ChatMessage, TextStream, ToolCall } from "@aiprovider/router";
+import type { ChatMessage, TextStream, ToolCall } from "@aiprovider/router-core";
 
 function streamOf(...chunks: string[]): TextStream {
   return {

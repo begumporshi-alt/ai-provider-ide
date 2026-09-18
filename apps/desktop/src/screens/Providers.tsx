@@ -7,7 +7,7 @@
  * "the auto-wizard arrives in Phase 3" note — never fake the wizard.
  */
 import { useEffect, useMemo, useState } from "react";
-import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router";
+import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router-core";
 import {
   addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, listManifestHistory,
   pendingRepairs, registry, rollbackManifest, setKeyStatus, setProviderStatus, testKey, refreshCatalog,

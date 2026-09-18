@@ -277,7 +277,7 @@ export async function generateCandidates(deps: GenerationDeps): Promise<RankedCa
     let contract: ContractReport | undefined;
     if (deps.http) {
       deps.onProgress?.({ id, stage: "contract", detail: "running free checks…" });
-      const interpreter = new ManifestInterpreter(manifest, { http: deps.http, vars: { appUrl: "https://aiprovider.ide" } });
+      const interpreter = new ManifestInterpreter(manifest, { http: deps.http, vars: { appUrl: "https://aiprovider.router" } });
       try {
         contract = await runContractSuite(interpreter, { secretRef: deps.secretRef, consent: { text: false, image: false }, signal: deps.signal });
       } catch (e) {

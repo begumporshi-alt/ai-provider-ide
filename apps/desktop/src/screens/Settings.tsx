@@ -5,7 +5,7 @@
  * (export/import without secrets, scrubbed bug-report bundle).
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
-import type { ProviderRecord } from "@aiprovider/router";
+import type { ProviderRecord } from "@aiprovider/router-core";
 import {
   catalog, clearAllCrashes, clearCrash, exportConfig, getCrashCount,
   getDiagnosticsBundle, importConfig, listCrashes, readCrash,

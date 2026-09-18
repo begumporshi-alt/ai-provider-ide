@@ -1,4 +1,4 @@
-# ARCHITECTURE — AI-Provider IDE
+# ARCHITECTURE — AI-Provider Router
 
 > Complete architecture, including the **self-construction engine** (auto-provider onboarding).
 > Built from the notebook sketch spec ([MASTER_PROMPT.md](MASTER_PROMPT.md)) plus the user
@@ -17,7 +17,7 @@
 
 ## Executive Summary
 
-AI-Provider IDE is a local-first desktop application that turns the user's own third-party AI
+AI-Provider Router is a local-first desktop application that turns the user's own third-party AI
 provider accounts (OpenRouter, OpenCode, b.ai, plus any future provider) into a single
 normalized AI layer. Every request flows through a central Model Router that picks provider,
 API key, and model, with transparent key rotation and provider failover, and exposes exactly
@@ -71,7 +71,7 @@ those L1 modules are the pipeline's tools. This is by design — don't "fix" it.
 
 Two runtimes inside one desktop process:
 
-- **Webview (TypeScript):** React UI + the entire `@aiprovider/router` core. UI-agnostic;
+- **Webview (TypeScript):** React UI + the entire `@aiprovider/router-core` package. UI-agnostic;
   talks to the host only through narrow ports implemented over Tauri IPC commands and channels.
 - **Rust host:** the only code allowed to touch the network with credentials, the OS keychain,
   and SQLite. Exposes typed commands (`vault:*`, `egress:*`, `store:*`) and streams responses
@@ -257,7 +257,7 @@ support as a side effect).
                      "pagination": { "style": "openai-cursor" },  // v1.1: follow paged model lists
                      "map": { "models": "$.data[*].id", "raw": "$.data[*]" } },
     "generateText":{ "method": "POST", "path": "/chat/completions",
-                     "headers": { "HTTP-Referer": "{{appUrl}}", "X-Title": "AI-Provider IDE" },
+                     "headers": { "HTTP-Referer": "{{appUrl}}", "X-Title": "AI-Provider Router" },
                                                                        // v1.1: static extra request headers
                      "requestTemplate": { "model": "{{model}}", "messages": "{{messages}}",
                                           "stream": "{{stream}}",
@@ -695,7 +695,7 @@ from the newest good backup. A user-initiated **config export** (JSON: providers
 aliases, settings, `secret_ref`s — never keychain values) provides a portable,
 human-inspectable disaster-recovery path.
 
-**OS keychain** (Rust `keyring` v3, service `ai-provider-ide`, accounts `key:<keyId>` for
+**OS keychain** (Rust `keyring` v3, service `ai-provider-router`, accounts `key:<keyId>` for
 provider keys and `masterkey` for the Local Gateway master key): the only home of raw secrets.
 Linux requires Secret Service (gnome-keyring/KWallet) — surfaced as a
 first-run check; macOS Keychain and Windows Credential Manager work out of the box.

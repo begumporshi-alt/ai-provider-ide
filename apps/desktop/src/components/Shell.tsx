@@ -38,7 +38,7 @@ export function Shell({ children }: { children: ReactNode }) {
         style={{ background: "var(--sidebar)", borderColor: "var(--border)" }}
       >
         <div className="flex items-center gap-2 px-4 py-3.5">
-          <span className="text-[13px] font-semibold tracking-tight">AI-Provider IDE</span>
+          <span className="text-[13px] font-semibold tracking-tight">AI-Provider Router</span>
         </div>
         <nav className="flex-1 overflow-y-auto px-2">
           {NAV.map((g) => (

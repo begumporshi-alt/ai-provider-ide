@@ -1,4 +1,4 @@
-# AUDIT REPORT — AI-Provider IDE
+# AUDIT REPORT — AI-Provider Router
 
 > **Audited:** [MASTER_PROMPT.md](MASTER_PROMPT.md) (spec/prompt) · [ARCHITECTURE.md](ARCHITECTURE.md)
 > (architecture + implementation plan) · [diagrams/](diagrams/) (3 diagram sources)
@@ -160,7 +160,7 @@ no-secrets config export (manifests, aliases, settings, refs) for portable disas
   invariant — reword + implement reveal Rust-side (see H5).
 - **L3** MASTER_PROMPT staleness cluster: §7 still offers "Tauri or Electron" (architecture
   commits to Tauri 2); screen 3 omits the system-AI pick; AC-6 says "one adapter file" vs the
-  architecture's better "data-only via wizard"; package naming `@aiprovider/router` vs
+  architecture's better "data-only via wizard"; package naming `@aiprovider/router-core` vs
   `packages/router-core` — pick one.
 - **L4** Sandbox hardening details: WASM memory cap, rate limit on the sandbox `http` host
   function, lint bounds on OpenAPI-derived path counts.

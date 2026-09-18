@@ -54,7 +54,7 @@ export class AdapterRuntime {
       ? new CodeAdapterInstance(manifest, { http: this.http })
       : new ManifestInterpreter(manifest, {
           http: this.http,
-          vars: { appUrl: this.vars.appUrl ?? "https://aiprovider.ide" },
+          vars: { appUrl: this.vars.appUrl ?? "https://aiprovider.router" },
         });
   }
 }
