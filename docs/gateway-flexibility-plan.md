@@ -222,22 +222,19 @@ for await (const chunk of exec.chunks) {
 }
 ```
 
-New bridge (conceptual):
-```typescript
-const state = initAccumulatorState();
-for await (const rawChunk of exec.chunks) {
-  const parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
-  if (parsed?.text) {
-    await invoke("gateway_chunk", { requestId, text: parsed.text });
-  }
-  if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
-    await invoke("gateway_tool_calls", { requestId, toolCalls: parsed.toolCalls });
-  }
-  if (parsed?.usage) {
-    await invoke("gateway_usage", { requestId, usage: parsed.usage });
-  }
-}
-```
+New bridge (conceptual) — ⚠️ REJECTED. Do not implement this.
+
+This snippet was built once and it broke the gateway: **every completion came back empty**.
+It assumes `exec.chunks` yields raw upstream SSE frames. It does not. Adapters resolve the
+provider's SSE themselves and yield decoded `delta` strings (`manifest-interpreter`:
+`yield delta`), and tool calls never travel in chunks at all — they arrive on `onToolCall`
+once the stream ends. So `JSON.parse(rawChunk)` threw on every single chunk, and the
+`catch { continue }` around it silently dropped the entire answer.
+
+The `gateway-sse-parser` module this depends on was deleted on 2026-09-18; the plan to feed
+raw SSE into the bridge was never adopted by the architecture. The bridge that shipped is
+the "Current bridge" shape above, plus Mercury-2.5 marker filtering and the tool loop —
+tool calls come from `onToolCall`, and usage from the `onUsage` callback. See DECISIONS.md.
 
 **Important:** The upstream adapter already returns OpenAI-shaped SSE (since our adapters normalize to OpenAI). So we only need the `parseOpenAIChatDelta` parser for the common case. The Claude/Responses parsers are needed when we add native Claude or Responses adapters later.
 

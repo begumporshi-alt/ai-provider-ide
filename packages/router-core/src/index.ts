@@ -43,4 +43,3 @@ export {
 } from "./config.js";
 export { normalizeGatewayRequest, ensureToolCallIds, fixMissingToolResponses, stripOrphanedToolResults, sanitizeOpenAITools, type NormalizeOptions } from "./gateway-normalizer.js";
 export { detectClient, type ClientHint } from "./gateway-client-detector.js";
-export { parseOpenAIChatDelta, parseClaudeDelta, parseResponsesDelta, initAccumulatorState, type ParsedChunk, type AccumulatorState } from "./gateway-sse-parser.js";
