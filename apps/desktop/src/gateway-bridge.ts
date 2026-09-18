@@ -8,14 +8,18 @@
  * via gateway_tool_calls, unblocking WorkBuddy/Claude Code/Codex from receiving
  * real tool calls instead of mercury-2.5 pseudo-markup.
  *
+ * Dual-path parsing: parseOpenAIChatDelta handles OpenAI Chat Completions format;
+ * parseClaudeDelta is used as fallback for Anthropic Messages format (b.ai etc.)
+ * so tool calls and text both survive the bridge for both dialects.
+ *
  * The master key never appears here — auth happened in Rust before this file ever runs
  * (invariants 10, 14).
  */
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { router } from "./store";
-import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, initAccumulatorState } from "@aiprovider/router";
-import type { LedgerSource, ToolCall, AccumulatorState } from "@aiprovider/router";
+import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router";
+import type { LedgerSource, AccumulatorState } from "@aiprovider/router";
 
 interface BridgeRequest {
   requestId: number;
@@ -74,7 +78,11 @@ async function handle(req: BridgeRequest): Promise<void> {
           tools: normalizedBody.tools,
           toolChoice: normalizedBody.tool_choice,
           responseFormat: normalizedBody.response_format,
-          onToolCall: (call: ToolCall) => {
+          onToolCall: (call) => {
+            // Emit via gateway_tool_calls so the agent loop sees the call even when
+            // parseOpenAIChatDelta cannot recover it from the raw SSE stream
+            // (e.g. Anthropic tool_use blocks that arrive as content_block_start +
+            // input_json_delta instead of delta.tool_calls).
             void invoke("gateway_tool_calls", {
               requestId: req.requestId,
               toolCallsJson: JSON.stringify([call]),
@@ -93,10 +101,15 @@ async function handle(req: BridgeRequest): Promise<void> {
         { signal: ac.signal, source: "gateway" as LedgerSource },
       );
 
-      // Phase 2: Feed raw SSE chunks through parseOpenAIChatDelta to reassemble tool calls
-      // from delta fragments. The OpenAI adapter normalises upstream responses, so this is
-      // the common path. onToolCall fires for each complete tool call; the parser also
-      // filters mercury-2.5 pseudo-markup (<|tool_call_start|>, <function=) from text.
+      // Phase 2: Feed raw upstream SSE chunks through parseOpenAIChatDelta to
+      // reassemble tool calls from delta fragments. The OpenAI adapter
+      // normalises upstream responses, so this is the common path.
+      //
+      // parseClaudeDelta is used as fallback for Anthropic Messages format
+      // (b.ai etc.) where the manifest interpreter consumes all raw SSE via
+      // toolCallStream and yields zero text chunks to exec.chunks. The Claude
+      // parser independently reassembles tool_use blocks from content_block_start
+      // / input_json_delta / content_block_stop events.
       const state: AccumulatorState = initAccumulatorState();
       let toolCallEmitted = false;
       for await (const rawChunk of exec.chunks) {
@@ -111,6 +124,16 @@ async function handle(req: BridgeRequest): Promise<void> {
           // Non-JSON fragment (or incomplete line) — treat as raw text.
           await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => undefined);
           continue;
+        }
+        // Fallback: if parseOpenAIChatDelta returned null (e.g. Anthropic SSE event
+        // like content_block_start), try parseClaudeDelta with the same state.
+        if (!parsed) {
+          try {
+            parsed = parseClaudeDelta(JSON.parse(rawChunk), state);
+          } catch {
+            await invoke("gateway_chunk", { requestId: req.requestId, text: rawChunk }).catch(() => undefined);
+            continue;
+          }
         }
         if (parsed?.text) {
           await invoke("gateway_chunk", { requestId: req.requestId, text: parsed.text }).catch(() => {
@@ -132,8 +155,9 @@ async function handle(req: BridgeRequest): Promise<void> {
           }).catch(() => undefined);
         }
       }
-      // If no structured tool calls arrived via gateway_tool_calls but the final chunk had
-      // finishReason=tool_calls, re-emit the accumulated calls to ensure the client receives them.
+      // If no structured tool calls arrived via gateway_tool_calls but the final
+      // chunk had finishReason=tool_calls, re-emit the accumulated calls to ensure
+      // the client receives them.
       if (!toolCallEmitted && state.toolCalls.size > 0 && state.finishReason === "tool_calls") {
         const calls = Array.from(state.toolCalls.values()).map((c) => ({
           id: c.id ?? "",

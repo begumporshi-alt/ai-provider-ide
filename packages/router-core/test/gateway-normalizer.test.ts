@@ -350,6 +350,19 @@ describe("normalizeGatewayRequest — zcode / z.ai adaptations", () => {
     const msgs = out.messages as Array<{ role: string }>;
     expect(msgs.filter((m) => m.role === "user")).toHaveLength(1);
   });
+
+  it("preserves system prompts for zcode", () => {
+    const out = normalizeGatewayRequest({
+      messages: [
+        { role: "system", content: "Always respond in JSON format" },
+        { role: "user", content: "hi" },
+      ],
+    }, { clientHint: "zcode" });
+    const msgs = out.messages as Array<{ role: string; content: unknown }>;
+    const sys = msgs.find((m) => m.role === "system")!;
+    const text = (sys.content as unknown as Array<{type:string; text:string}>)[0]!.text;
+    expect(text).toBe("Always respond in JSON format");
+  });
 });
 
 describe("normalizeGatewayRequest — Codex adaptations", () => {

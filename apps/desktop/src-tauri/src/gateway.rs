@@ -517,6 +517,7 @@ fn to_chat_body(req: &Value) -> Option<Value> {
 fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
     match cls {
         Some("length") => "max_tokens",
+        Some("tool_use") => "tool_use",
         _ => "end_turn",
     }
 }
@@ -571,6 +572,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_start")
                 .data(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()));
             let mut usage: Option<(u64, u64)> = None;
+            let mut has_tool_calls = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -589,6 +591,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                         // Model returned structured tool calls — emit them as Anthropic tool_use
                         // blocks alongside the accumulated text, then signal stop_reason: tool_use
                         // so clients know a round-trip is required.
+                        has_tool_calls = true;
                         if let Some(arr) = calls.as_array() {
                             for (idx, tc) in arr.iter().enumerate() {
                                 let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -637,12 +640,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
                 .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
             // stop_reason = tool_use whenever we received tool calls (signals client to send results).
-            let stop_reason = if usage.as_ref().is_some_and(|(_, ct)| *ct > 0) {
-                "end_turn"
-            } else {
-                // No explicit stop_reason — clients should look at whether tool_use content blocks were emitted.
-                "end_turn"
-            };
+            let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
                 .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                     "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
@@ -658,6 +656,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_content_blocks: Vec<Value> = Vec::new();
+    let mut has_tool_calls = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
@@ -675,6 +674,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             }
             BridgeMsg::ToolCalls(calls) => {
                 // Buffer tool calls to include as tool_use blocks in the response.
+                has_tool_calls = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -714,7 +714,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                 json!({
                     "id": msg_id, "type": "message", "role": "assistant",
                     "content": content,
-                    "model": model, "stop_reason": anthropic_stop_reason(None), "stop_sequence": null,
+                    "model": model, "stop_reason": anthropic_stop_reason(if has_tool_calls { Some("tool_use") } else { None }), "stop_sequence": null,
                     "usage": { "input_tokens": prompt_tokens, "output_tokens": completion_tokens }
                 })
                 .to_string(),
@@ -1051,13 +1051,23 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
             .unwrap_or_default();
         messages.push(json!({ "role": role, "content": text }));
     }
-    let chat = json!({
+    let mut chat = json!({
         "model": model,
         "messages": messages,
         "stream": streaming,
         "max_tokens": req.pointer("/generationConfig/maxOutputTokens").and_then(Value::as_i64).unwrap_or(1024),
         "temperature": req.pointer("/generationConfig/temperature").and_then(Value::as_f64),
     });
+    // Forward tools/tool_choice/response_format if present so upstream providers receive them.
+    if let Some(tools) = req.get("tools").cloned() {
+        chat["tools"] = tools;
+    }
+    if let Some(tc) = req.get("tool_choice").cloned() {
+        chat["tool_choice"] = tc;
+    }
+    if let Some(rf) = req.get("response_format").cloned() {
+        chat["response_format"] = rf;
+    }
     let mut slot = match try_slot(&core) {
         Ok(s) => s,
         Err(r) => return map_generic_to_status(r),
@@ -1087,7 +1097,29 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(e.to_string()));
                         break;
                     }
-                    BridgeMsg::ToolCalls(_) => {}
+                    BridgeMsg::ToolCalls(calls) => {
+                        // Emit a Gemini functionCall part and signal completion so the client
+                        // can send tool results back in the next generateContent call.
+                        if let Some(arr) = calls.as_array() {
+                            for tc in arr {
+                                let _call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                                let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                                let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&json!(null));
+                                let args: String = if let Some(s) = args_raw.as_str() {
+                                    s.to_string()
+                                } else {
+                                    args_raw.to_string()
+                                };
+                                let part = json!({ "functionCall": { "name": name, "args": serde_json::from_str(&args).unwrap_or(json!({})) } });
+                                let chunk = json!({ "candidates": [{ "content": { "parts": [part], "role": "model" }, "index": 0, "finishReason": "STOP" }] });
+                                yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
+                            }
+                        }
+                        let (pt, ct) = usage.unwrap_or((0, 0));
+                        let fin = json!({ "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
+                        break;
+                    }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
@@ -1101,6 +1133,8 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
     let mut full = String::new();
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
+    let mut has_tool_calls = false;
+    let mut tool_parts: Vec<Value> = Vec::new();
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
@@ -1110,7 +1144,22 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                 err_info = Some((status, message));
                 break;
             }
-            BridgeMsg::ToolCalls(_) => {}
+            BridgeMsg::ToolCalls(calls) => {
+                has_tool_calls = true;
+                if let Some(arr) = calls.as_array() {
+                    for tc in arr {
+                        let _call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let args: String = if let Some(s) = args_raw.as_str() {
+                            s.to_string()
+                        } else {
+                            args_raw.to_string()
+                        };
+                        tool_parts.push(json!({ "functionCall": { "name": name, "args": serde_json::from_str(&args).unwrap_or(json!({})) } }));
+                    }
+                }
+            }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
@@ -1125,11 +1174,17 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
         Some((_, message)) => gemini_error(&message, StatusCode::BAD_GATEWAY),
         None => {
             let (pt, ct) = usage.unwrap_or((0, 0));
+            let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };
+            let parts = if has_tool_calls && !tool_parts.is_empty() {
+                tool_parts
+            } else {
+                vec![json!({ "text": full })]
+            };
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
                 json!({
-                    "candidates": [{ "content": { "parts": [{ "text": full }], "role": "model" }, "finishReason": "STOP", "index": 0 }],
+                    "candidates": [{ "content": { "parts": parts, "role": "model" }, "finishReason": finish_reason, "index": 0 }],
                     "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct, "totalTokenCount": pt + ct }
                 })
                 .to_string(),
