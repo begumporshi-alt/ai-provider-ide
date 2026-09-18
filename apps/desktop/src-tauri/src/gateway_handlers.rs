@@ -37,6 +37,10 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         return err(StatusCode::BAD_REQUEST, openai_error("model is required", "invalid_request", None));
     }
     let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    // Echoed on every response. Clients read `model` back to confirm what actually served them,
+    // and some refuse a body without it. Failover here stays inside the requested id (same native
+    // model, different carrier), so the requested id is what served.
+    let model = req.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     // §3.4: strip tool fields when the gateway toggle is off
     if !core.is_tools_enabled() {
         if let Some(obj) = req.as_object_mut() {
@@ -77,7 +81,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                             started = true;
                             json!({ "role": "assistant", "content": t })
                         };
-                        let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk",
+                        let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk", "model": model,
                             "choices": [{ "index": 0, "delta": delta }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
                     }
@@ -88,6 +92,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                             json!({
                                 "id": format!("gw-{id}"),
                                 "object": "chat.completion.chunk",
+                                "model": model,
                                 "choices": [{
                                     "index": 0,
                                     "delta": {},
@@ -119,6 +124,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                         let payload = json!({
                             "id": format!("gw-{}", id),
                             "object": "chat.completion.chunk",
+                            "model": model,
                             "choices": [{
                                 "index": 0,
                                 "delta": { "tool_calls": calls },
@@ -190,7 +196,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
-                json!({ "id": format!("gw-{id}"), "object": "chat.completion",
+                json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
                     "choices": [choice],
                     "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct })) })
                     .to_string(),

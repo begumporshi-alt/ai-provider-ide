@@ -363,6 +363,47 @@
         );
     }
 
+    /// Every OpenAI response — streamed or not — carries the model that served it. Clients read
+    /// it back to check they got what they asked for, and some reject a body without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_echo_the_served_model() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["model"], "gpt-4o", "non-stream body has no model:
+{body}");
+
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("[DONE]") {
+                break;
+            }
+        }
+        assert!(acc.contains(r#""model":"gpt-4o""#), "stream frames carry no model:
+{acc}");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn anthropic_system_and_bad_request() {
         let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
