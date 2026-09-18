@@ -8,6 +8,12 @@ coverage/
 target/
 apps/desktop/src-tauri/gen/
 
+# Local dev database (contains provider refs + ledger history — never commit)
+apps/desktop/src-tauri/*.db
+apps/desktop/src-tauri/*.db-shm
+apps/desktop/src-tauri/*.db-wal
+*.bak
+
 # App data / local
 .playwright-mcp/
 .video_agent/
