@@ -18,6 +18,93 @@ use crate::gateway::{
     BridgeRequest, GatewayCore,
 };
 
+/// One Gemini function declaration -> one OpenAI function declaration.
+fn declaration_to_openai(d: &Value) -> Option<Value> {
+    let name = d.get("name").and_then(Value::as_str)?;
+    let mut function = json!({
+        "name": name,
+        "parameters": d.get("parameters").cloned()
+            .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+    });
+    if let Some(desc) = d.get("description").and_then(Value::as_str) {
+        function["description"] = json!(desc);
+    }
+    Some(json!({ "type": "function", "function": function }))
+}
+
+/// Gemini nests declarations one level down (`tools: [{ functionDeclarations: [...] }]`), so
+/// flatten while converting. Returns None rather than an empty array: "no tools" and "tools:
+/// []" are not the same instruction to a model.
+fn tools_to_openai(tools: &Value) -> Option<Value> {
+    let arr = tools.as_array()?;
+    let mut out = Vec::new();
+    for t in arr {
+        if let Some(decls) = t.get("functionDeclarations").and_then(Value::as_array) {
+            out.extend(decls.iter().filter_map(declaration_to_openai));
+        } else if let Some(c) = declaration_to_openai(t) {
+            out.push(c);
+        }
+    }
+    if out.is_empty() { None } else { Some(Value::Array(out)) }
+}
+
+/// Gemini `functionCallingConfig` -> OpenAI. `AUTO|ANY|NONE` plus an optional forced name.
+fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
+    let cfg = tc.get("functionCallingConfig").cloned().unwrap_or_else(|| tc.clone());
+    match cfg.get("mode").and_then(Value::as_str).unwrap_or("AUTO").to_uppercase().as_str() {
+        "ANY" => match cfg
+            .get("allowedFunctionNames")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(Value::as_str)
+        {
+            Some(n) => Some(json!({ "type": "function", "function": { "name": n } })),
+            None => Some(json!("required")),
+        },
+        "NONE" => Some(json!("none")),
+        _ => Some(json!("auto")),
+    }
+}
+
+#[cfg(test)]
+mod tool_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn nested_function_declarations_are_flattened() {
+        let out = tools_to_openai(&json!([{ "functionDeclarations": [
+            { "name": "Bash", "description": "Run it", "parameters": { "type": "object" } },
+            { "name": "Read" }
+        ]}])).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["function"]["name"], "Bash");
+        assert_eq!(out[1]["function"]["name"], "Read");
+        assert_eq!(out[1]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn bare_declarations_are_accepted_too() {
+        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
+        assert_eq!(out[0]["type"], "function");
+    }
+
+    #[test]
+    fn an_empty_tools_array_means_no_tools_at_all() {
+        assert_eq!(tools_to_openai(&json!([])), None);
+    }
+
+    #[test]
+    fn function_calling_config_maps_onto_the_openai_vocabulary() {
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY"}})).unwrap(), json!("required"));
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"NONE"}})).unwrap(), json!("none"));
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"AUTO"}})).unwrap(), json!("auto"));
+        assert_eq!(
+            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["Bash"]}})).unwrap(),
+            json!({ "type": "function", "function": { "name": "Bash" } })
+        );
+    }
+}
+
 fn gemini_error(message: &str, status: StatusCode) -> Response {
     (
         status,
@@ -100,11 +187,12 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         "max_tokens": req.pointer("/generationConfig/maxOutputTokens").and_then(Value::as_i64).unwrap_or(1024),
         "temperature": req.pointer("/generationConfig/temperature").and_then(Value::as_f64),
     });
-    // Forward tools/tool_choice/response_format if present so upstream providers receive them.
-    if let Some(tools) = req.get("tools").cloned() {
+    // Converted, not cloned — see the note in gateway_anthropic. Gemini wraps declarations in
+    // `tools: [{ functionDeclarations: [...] }]`, which no OpenAI-shaped provider understands.
+    if let Some(tools) = req.get("tools").and_then(tools_to_openai) {
         chat["tools"] = tools;
     }
-    if let Some(tc) = req.get("tool_choice").cloned() {
+    if let Some(tc) = req.get("tool_choice").and_then(tool_choice_to_openai) {
         chat["tool_choice"] = tc;
     }
     if let Some(rf) = req.get("response_format").cloned() {

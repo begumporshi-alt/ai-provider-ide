@@ -47,17 +47,89 @@ fn to_chat_body(req: &Value) -> Option<Value> {
         "stream": req.get("stream").and_then(Value::as_bool).unwrap_or(false),
         "max_tokens": req.get("max_tokens").and_then(Value::as_i64).unwrap_or(1024),
     });
-    // forward tools parameters to upstream providers
-    if req.get("tools").is_some() {
-        out["tools"] = req["tools"].clone();
+    // Tools must be CONVERTED, not cloned. The bridge speaks OpenAI; Anthropic's
+    // `{name, description, input_schema}` is not the same object, and forwarding it verbatim
+    // sends an OpenAI-shaped provider a body it rejects outright (502 SERVER_ERROR). That was
+    // invisible while no manifest forwarded tools at all — it only surfaced once they did.
+    if let Some(tools) = req.get("tools").and_then(tools_to_openai) {
+        out["tools"] = tools;
     }
-    if req.get("tool_choice").is_some() {
-        out["tool_choice"] = req["tool_choice"].clone();
+    if let Some(tc) = req.get("tool_choice").and_then(tool_choice_to_openai) {
+        out["tool_choice"] = tc;
     }
     if req.get("response_format").is_some() {
         out["response_format"] = req["response_format"].clone();
     }
     Some(out)
+}
+
+/// Anthropic tool declarations -> OpenAI function declarations.
+fn tools_to_openai(tools: &Value) -> Option<Value> {
+    let arr = tools.as_array()?;
+    let out: Vec<Value> = arr
+        .iter()
+        .filter_map(|t| {
+            let name = t.get("name").and_then(Value::as_str)?;
+            let mut function = json!({
+                "name": name,
+                // A tool with no schema still needs one, or the model has nowhere to put args.
+                "parameters": t.get("input_schema").cloned()
+                    .unwrap_or_else(|| json!({ "type": "object", "properties": {} })),
+            });
+            // Omitted rather than null: providers reject a null description.
+            if let Some(d) = t.get("description").and_then(Value::as_str) {
+                function["description"] = json!(d);
+            }
+            Some(json!({ "type": "function", "function": function }))
+        })
+        .collect();
+    if out.is_empty() { None } else { Some(Value::Array(out)) }
+}
+
+/// Anthropic `tool_choice` -> OpenAI. `auto|any|none|tool` maps onto `auto|required|none|forced`.
+fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
+    match tc.get("type").and_then(Value::as_str).unwrap_or("auto") {
+        "tool" => tc
+            .get("name")
+            .and_then(Value::as_str)
+            .map(|n| json!({ "type": "function", "function": { "name": n } })),
+        "any" => Some(json!("required")),
+        "none" => Some(json!("none")),
+        _ => Some(json!("auto")),
+    }
+}
+
+#[cfg(test)]
+mod tool_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_tools_become_openai_functions() {
+        let out = tools_to_openai(&json!([{ "name": "Bash", "description": "Run it",
+                                            "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }]))
+            .unwrap();
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "Bash");
+        assert_eq!(out[0]["function"]["parameters"]["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn a_tool_without_a_schema_still_gets_one() {
+        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
+        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
+        assert!(out[0]["function"].get("description").is_none(), "absent, not null");
+    }
+
+    #[test]
+    fn tool_choice_maps_onto_the_openai_vocabulary() {
+        assert_eq!(tool_choice_to_openai(&json!({"type":"auto"})).unwrap(), json!("auto"));
+        assert_eq!(tool_choice_to_openai(&json!({"type":"any"})).unwrap(), json!("required"));
+        assert_eq!(tool_choice_to_openai(&json!({"type":"none"})).unwrap(), json!("none"));
+        assert_eq!(
+            tool_choice_to_openai(&json!({"type":"tool","name":"Bash"})).unwrap(),
+            json!({ "type": "function", "function": { "name": "Bash" } })
+        );
+    }
 }
 
 fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {

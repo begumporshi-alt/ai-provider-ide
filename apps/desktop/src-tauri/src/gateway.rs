@@ -119,6 +119,89 @@ pub enum BridgeMsg {
     Error { status: u16, message: String },
 }
 
+/**
+ * Put tool calls into the shape the OpenAI wire — and every other dialect's reader — expects.
+ *
+ * The webview side hands us `{id, name, arguments}`. That flat form is NOT what any consumer
+ * reads: chat/responses/anthropic/gemini all look for `function.name` / `function.arguments`,
+ * because that is the dialect they are translating into. So a flat call meant the Anthropic,
+ * Gemini and Responses paths silently emitted tool calls with an empty name and null arguments,
+ * and the OpenAI path put a non-conformant object on the wire (no `index`, no `type`, no
+ * `function` wrapper) that a strict client cannot parse.
+ *
+ * Normalising once, where the bridge message lands, means the canonical shape is OpenAI's and
+ * the other dialects' existing readers are simply correct. Already-shaped input is passed
+ * through, only gaining `index`/`type` if it lacks them.
+ */
+pub fn normalize_tool_calls(calls: Value) -> Value {
+    let Some(arr) = calls.as_array() else { return calls };
+    Value::Array(
+        arr.iter()
+            .enumerate()
+            .map(|(i, tc)| {
+                if tc.get("function").is_some() {
+                    let mut out = tc.clone();
+                    if let Some(obj) = out.as_object_mut() {
+                        // `index` is how a streaming client ties argument fragments to a call.
+                        if !obj.contains_key("index") {
+                            obj.insert("index".into(), json!(i));
+                        }
+                        if !obj.contains_key("type") {
+                            obj.insert("type".into(), json!("function"));
+                        }
+                    }
+                    return out;
+                }
+                json!({
+                    "index": i,
+                    "id": tc.get("id").cloned().unwrap_or_else(|| json!(format!("call_{i}"))),
+                    "type": "function",
+                    "function": {
+                        "name": tc.get("name").cloned().unwrap_or(Value::Null),
+                        // A call with no arguments is `{}`, not absent: every reader parses
+                        // this string, and null makes them fall back to the raw text.
+                        "arguments": tc.get("arguments").cloned().unwrap_or_else(|| json!("{}")),
+                    },
+                })
+            })
+            .collect(),
+    )
+}
+
+#[cfg(test)]
+mod tool_call_shape_tests {
+    use super::*;
+
+    #[test]
+    fn flat_bridge_calls_become_openai_shaped() {
+        let out = normalize_tool_calls(json!([{ "id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" }]));
+        assert_eq!(out[0]["index"], 0);
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["id"], "call_1");
+        assert_eq!(out[0]["function"]["name"], "Bash");
+        assert_eq!(out[0]["function"]["arguments"], "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn already_shaped_calls_keep_their_fields() {
+        let input = json!([{ "index": 3, "id": "call_9", "type": "function",
+                             "function": { "name": "Read", "arguments": "{}" } }]);
+        assert_eq!(normalize_tool_calls(input.clone()), input);
+    }
+
+    #[test]
+    fn a_call_with_no_arguments_is_not_null() {
+        let out = normalize_tool_calls(json!([{ "name": "Bash" }]));
+        assert_eq!(out[0]["function"]["arguments"], "{}");
+        assert_eq!(out[0]["id"], "call_0", "a call still needs an id clients can answer");
+    }
+
+    #[test]
+    fn non_array_input_is_left_alone() {
+        assert_eq!(normalize_tool_calls(json!(null)), json!(null));
+    }
+}
+
 /// Hand-off surface to the router core. Production emits Tauri events; the Phase-2b
 /// integration test injects a synthetic bridge (the §3.5 entry-gate spike).
 pub trait Bridge: Send + Sync + 'static {

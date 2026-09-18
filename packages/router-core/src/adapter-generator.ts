@@ -73,12 +73,21 @@ const SCHEMA_SUMMARY = `A manifest JSON object with:
 - dialect: a short name like "custom-v1"
 - provider: { baseUrl: string, auth: { headers: [{ name, prefix? }] } }  // "prefix {{secret}}" placeholders are substituted host-side; header VALUES must stay as the literal "{{secret}}" or "Bearer {{secret}}"
 - endpoints.listModels?: { method: "GET", path, map: { models: "$.path[*]" } }
-- endpoints.generateText?: { method: "POST", path, requestTemplate: { <whitelist fields>: "{{...}}" }, responseMap: { text: "$.path" }, stream?: { protocol: "sse", chunkMap: { delta: "$.path" }, stopWhen?: { path, equals } } }
+- endpoints.generateText?: { method: "POST", path, requestTemplate: { <whitelist fields>: "{{...}}" }, responseMap: { text: "$.path", usage?: "$.path", toolCalls?: "$.path" }, stream?: { protocol: "sse", chunkMap: { delta: "$.path", toolCalls?: "$.path" }, stopWhen?: { path, equals }, requestUsage?: true } }
 - endpoints.generateImage?: { method: "POST", path, requestTemplate: {...}, responseMap: { imageB64?: "$.path", imageUrl?: "$.path" } }
 - capabilities: { text: boolean, image: boolean }
 - provenance: { origin: "ai-generated", generatorModel: null, createdAt: "x" }
 
-requestTemplate placeholders are ONLY: {{model}} {{messages}} {{stream}} {{maxTokens?}} {{temperature?}} — and request-body fields ONLY: model, messages, stream, max_tokens, temperature (text); model, prompt, size (image). Selectors are $ .field [0] [*] only — no filters, no expressions.`;
+requestTemplate placeholders are ONLY: {{model}} {{messages}} {{stream}} {{maxTokens?}} {{temperature?}} {{tools?}} {{toolChoice?}} {{responseFormat?}} — and request-body fields ONLY: model, messages, stream, max_tokens, temperature, tools, tool_choice, response_format (text); model, prompt, size (image). Selectors are $ .field [0] [*] only — no filters, no expressions.
+
+TOOL CALLING (get this right — omitting it silently breaks every tool-using client): for an
+OpenAI-compatible provider ALWAYS emit these fields — in requestTemplate: "tools": "{{tools?}}",
+"tool_choice": "{{toolChoice?}}", "response_format": "{{responseFormat?}}"; in responseMap:
+"usage": "$.usage", "toolCalls": "$.choices[0].message.tool_calls"; in stream:
+chunkMap."toolCalls": "$.choices[0].delta.tool_calls" and "requestUsage": true. All of the
+requestTemplate ones are optional placeholders, so a caller sending no tools is unaffected — but
+a manifest that omits them never forwards the caller's tools at all, and the model then imitates
+tool calls as raw text instead of calling them.`;
 
 function systemPrompt(pinnedBaseUrl: string): string {
   const example = JSON.stringify(

@@ -127,6 +127,47 @@ fn catalog_facts(store: &Store, native_id: &str) -> (Option<i64>, Option<bool>, 
     (ctx, reasoning, Some(modality))
 }
 
+/**
+ * Whether a manifest forwards the caller's tool definitions upstream.
+ *
+ * Ground truth for "does this model support tools *through us*", and the only source that can
+ * answer it: a provider's catalog rarely publishes the fact, and even when it does, what
+ * decides the outcome is whether OUR adapter puts `tools` on the wire. A manifest whose
+ * `requestTemplate` has no `tools` field drops every tool definition silently — the model then
+ * imitates tool calls as raw text and, given a tool-shaped system prompt, can loop until the
+ * user cancels. Claiming `supportsToolCall: true` on such a model is exactly what causes that.
+ */
+fn manifest_forwards_tools(body_json: &str) -> bool {
+    serde_json::from_str::<Value>(body_json)
+        .ok()
+        .and_then(|m| m.get("endpoints").cloned())
+        .and_then(|e| e.get("generateText").cloned())
+        .and_then(|g| g.get("requestTemplate").cloned())
+        .and_then(|t| t.get("tools").cloned())
+        .is_some()
+}
+
+/**
+ * Tool support for one model, read from the ACTIVE manifest of a provider that carries it.
+ *
+ * `None` means unknown, and the caller must treat unknown as false: a client acts on this flag,
+ * and promising tool calls that will be dropped on the floor is far worse than not offering
+ * them. (Same rule as `supportsReasoning`.)
+ */
+fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
+    let conn = store.conn.lock().ok()?;
+    conn.query_row(
+        "SELECT m.body_json FROM models_cache c
+         JOIN manifests m ON m.provider_id = c.provider_id AND m.is_active = 1
+         WHERE c.native_id = ?1
+         ORDER BY (c.context_window IS NULL), (c.capabilities_json IS NULL) LIMIT 1",
+        rusqlite::params![native_id],
+        |r| r.get::<_, String>(0),
+    )
+    .ok()
+    .map(|body| manifest_forwards_tools(&body))
+}
+
 fn gateway_port(store: &Store) -> u16 {
     let conn = match store.conn.lock() {
         Ok(c) => c,
@@ -255,6 +296,12 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
         })
         .unwrap_or_default();
 
+    // A name is only worth keeping if it tells the operator which model it is. Every published
+    // entry defaulting to "ai-provider router" made five rows in the picker indistinguishable,
+    // which is how a model with no tool support got picked by accident. So a preserved name is
+    // honoured only while it stays unique among what we publish; otherwise fall back to the id.
+    let mut used_names: Vec<String> = Vec::new();
+
     let mut ours = Vec::new();
     for id in &models {
         let Some(key) = key.as_deref() else { break };
@@ -267,9 +314,17 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
                 .unwrap_or(fallback)
                 .to_string()
         };
+        let default_name = format!("Router: {id}");
+        let kept_name = pick("name", &default_name);
+        let name = if used_names.iter().any(|n| n == &kept_name) {
+            default_name.clone()
+        } else {
+            used_names.push(kept_name.clone());
+            kept_name
+        };
         ours.push(json!({
             "id": id,
-            "name": pick("name", "ai-provider router"),
+            "name": name,
             "vendor": pick("vendor", "AI-Provider Router"),
             "url": our_endpoint,
             "apiKey": key,
@@ -278,7 +333,10 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
             // Unknown capability is reported as false only here, at the client boundary: a
             // client acts on this flag, and "cannot reason" is the safe claim to make.
             "supportsReasoning": reasoning.unwrap_or(false),
-            "supportsToolCall": true,
+            // NOT hardcoded true. A model whose adapter drops `tools` cannot answer a tool
+            // call, and saying otherwise makes the client send tools the model never sees —
+            // it then role-plays them as inline text and can run away. Unknown is false.
+            "supportsToolCall": tool_support(store, id).unwrap_or(false),
             "supportsImages": modality.as_deref() == Some("image"),
             "useCustomProtocol": false,
         }));
@@ -489,6 +547,58 @@ mod tests {
         assert_eq!(got, vec!["openai/gpt-4o-mini".to_string()]);
         assert!(!persist, "already persisted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn manifest_with_template(tpl: &str) -> String {
+        format!(
+            r#"{{"manifestVersion":1,"endpoints":{{"generateText":{{"requestTemplate":{tpl}}}}}}}"#
+        )
+    }
+
+    #[test]
+    fn tool_support_comes_from_the_manifest_not_a_guess() {
+        // The bug this closes: a manifest with no `tools` field drops the caller's tool
+        // definitions, yet the client was told `supportsToolCall: true` regardless.
+        assert!(manifest_forwards_tools(&manifest_with_template(
+            r#"{"model":"{{model}}","tools":"{{tools?}}"}"#
+        )));
+        assert!(!manifest_forwards_tools(&manifest_with_template(
+            r#"{"model":"{{model}}","messages":"{{messages}}"}"#
+        )));
+        // A manifest that is not declarative text, or is unparseable, is unknown — never true.
+        assert!(!manifest_forwards_tools("not json"));
+        assert!(!manifest_forwards_tools("{}"));
+    }
+
+    #[test]
+    fn duplicate_display_names_do_not_survive_a_sync() {
+        // Every entry named "ai-provider router" is indistinguishable in the client's picker.
+        let existing = r#"[
+            {"id":"agnes-2.5-flash","name":"ai-provider router","url":"http://127.0.0.1:8787/v1/chat/completions"},
+            {"id":"openai/gpt-4o-mini","name":"ai-provider router","url":"http://127.0.0.1:8787/v1/chat/completions"}
+        ]"#;
+        let prior: Vec<Value> = serde_json::from_str(existing).unwrap();
+        let models = ["agnes-2.5-flash".to_string(), "openai/gpt-4o-mini".to_string()];
+        let mut used: Vec<String> = Vec::new();
+        let mut names = Vec::new();
+        for id in &models {
+            let old = prior.iter().find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()));
+            let default_name = format!("Router: {id}");
+            let kept = old
+                .and_then(|e| e.get("name"))
+                .and_then(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .unwrap_or(&default_name)
+                .to_string();
+            names.push(if used.iter().any(|n| n == &kept) {
+                default_name.clone()
+            } else {
+                used.push(kept.clone());
+                kept
+            });
+        }
+        assert_eq!(names, vec!["ai-provider router", "Router: openai/gpt-4o-mini"]);
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 2);
     }
 
     #[test]

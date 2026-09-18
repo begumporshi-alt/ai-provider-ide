@@ -530,7 +530,9 @@ pub fn gateway_tool_calls(
     tool_calls_json: String,
 ) -> Result<(), String> {
     let v: serde_json::Value = serde_json::from_str(&tool_calls_json).map_err(|e| e.to_string())?;
-    state.core.reply(request_id, BridgeMsg::ToolCalls(v));
+    // Normalised here, at the single point where tool calls enter the gateway, so every
+    // dialect's reader (OpenAI, Anthropic, Responses, Gemini) gets the shape it looks for.
+    state.core.reply(request_id, BridgeMsg::ToolCalls(crate::gateway::normalize_tool_calls(v)));
     Ok(())
 }
 
