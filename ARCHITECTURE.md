@@ -584,11 +584,11 @@ CREATE TABLE models_cache (
   provider_id       TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   native_id         TEXT NOT NULL,
   modality          TEXT NOT NULL CHECK (modality IN ('text','image')),
-  context_window    INTEGER,
-  capabilities_json TEXT,
-  pricing_json      TEXT,                -- normalized to USD
+  context_window    INTEGER,             -- provider's published prompt budget
+  capabilities_json TEXT,                -- {"reasoning":bool}; what we publish to clients
+  pricing_json      TEXT,                -- {prompt,completion} micro-USD per 1M tokens
   fetched_at        INTEGER NOT NULL,
-  raw_json          TEXT,
+  raw_json          TEXT,                -- unused: never written, never read
   UNIQUE (provider_id, native_id)
 );
 CREATE INDEX idx_models_provider_modality ON models_cache(provider_id, modality);

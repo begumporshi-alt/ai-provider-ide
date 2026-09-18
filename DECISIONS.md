@@ -914,3 +914,46 @@ best-effort — a failure to restore must never stop the UI from opening.
 (`openai/gpt-6-astra`, `inference-net/schematron-v2-turbo`) have no upstream and fail with
 `NETWORK`. Real ids such as `openrouter/openai/gpt-4o-mini` route correctly, which is why the
 WorkBuddy entries pin verified ids rather than trusting the catalog.
+
+## 2026-09-19 — The gateway maintains its own entry in a third-party client's model list
+
+**Context.** Pointing WorkBuddy at the gateway meant hand-writing an entry into
+`~/.workbuddy-ai/models.json` and getting `supportsReasoning`, `maxInputTokens` and
+`maxOutputTokens` right by hand — then re-doing it whenever the port moved or the key rotated.
+Getting them wrong fails silently: the client asks a model for reasoning it cannot produce, or
+truncates a long prompt against a default cap.
+
+**Decision.** `src-tauri/src/workbuddy.rs`: on gateway enable, rewrite our entries in the client's
+config from the catalog and the keychain. Because the gateway auto-restores on launch, this runs
+every time the app starts with no UI involvement. The Model Browser exposes a per-row
+Expose/Unexpose toggle; `workbuddy_set_models` persists the choice and rewrites immediately.
+
+**Rules, because this writes to another application's config file:**
+- Only entries that are ours are touched — ours by id, or by pointing at our endpoint. That second
+  rule is what retires a stale entry instead of leaving it in the picker forever. A different
+  local proxy on another port is left alone.
+- A file that is not valid JSON, or is neither a list nor `{"models":[...]}`, is an error and is
+  never overwritten. Writes are atomic (temp + rename in the same directory).
+- A file shape is written back as it arrived; a name or vendor the user chose is preserved.
+- **"Never configured" and "explicitly empty" are distinct.** Without that, unpublishing
+  everything is re-seeded from the client file on the next launch and the entry silently returns.
+  Publishing nothing is a real state that runs the merge and removes our entries — it does not
+  skip.
+
+**Unknown vs false.** The catalog distinguishes "the provider did not say" from "cannot reason"
+(`undefined` vs `false`). `false` is emitted only at the client boundary, where a boolean is
+required and "cannot reason" is the safe claim.
+
+**Prerequisite fixed:** `models_cache.context_window` and `capabilities_json` were 0/457
+populated — captured nowhere and persisted nowhere, the same defect that hid pricing. Both are now
+parsed at refresh (`model-meta.ts`) and persisted like pricing. `raw_json` remains in the schema
+unused: never written, never read.
+
+**Verified.** `maxInputTokens` came back 128000 for gpt-4o-mini and 163840 for deepseek — two
+different real values, which is what proves they are catalog-derived rather than a fallback.
+Publish 2 → publish 0 (other 6 entries untouched) → publish 1, across three restarts; 4/4 chat
+afterwards; 35/35 liveness samples and 6/6 chats over 3 idle minutes with zero watchdog revives.
+
+**Revisit if:** another client needs the same treatment (the module is one file and the merge is
+pure — the port-specific part is only `models_path` and the entry shape), or if a client starts
+validating the configured id against `/v1/models`, which advertises qualified ids only.
