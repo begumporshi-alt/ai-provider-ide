@@ -26,8 +26,8 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { router } from "./store";
-import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router-core";
-import type { LedgerSource, AccumulatorState } from "@aiprovider/router-core";
+import { normalizeGatewayRequest, detectClient } from "@aiprovider/router-core";
+import type { LedgerSource } from "@aiprovider/router-core";
 import { parseAssistantStream, type ToolSegment } from "./lib/assistant-stream";
 import { AGENT_TOOLS, registryToOpenAI } from "./lib/tools/registry";
 
@@ -213,38 +213,16 @@ async function handle(req: BridgeRequest): Promise<void> {
           { signal: ac.signal, source: "gateway" as LedgerSource },
         );
 
-        const state: AccumulatorState = initAccumulatorState();
-
         for await (const rawChunk of exec.chunks) {
           if (ac.signal.aborted) break;
-          let parsed: ReturnType<typeof parseOpenAIChatDelta> | null = null;
-          try {
-            parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
-          } catch {
-            continue;
-          }
-          if (!parsed) {
-            try {
-              parsed = parseClaudeDelta(JSON.parse(rawChunk), state);
-            } catch {
-              continue;
-            }
-          }
 
-          if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
-            for (const c of parsed.toolCalls) {
-              if (!collected.some((a) => a.id === c.id)) collected.push(c as ToolCall);
-            }
-          }
-
-          if (parsed?.usage) {
-            void invoke("gateway_usage", {
-              requestId: req.requestId,
-              promptTokens: parsed.usage.prompt_tokens ?? 0,
-              completionTokens: parsed.usage.completion_tokens ?? 0,
-            }).catch(() => undefined);
-          }
-
+          // Chunks are decoded text deltas, not wire frames. The adapter resolves the
+          // provider's SSE/JSON itself and yields `delta` strings
+          // (manifest-interpreter: `yield delta`), and real tool calls never travel in
+          // chunks at all — they arrive on `onToolCall` once the stream ends. Parsing a
+          // chunk as JSON here used to throw on every chunk and `continue`, which silently
+          // dropped the entire answer: the client saw an empty completion.
+          //
           // Mercury-2.5 inline text markers: not part of any client tool contract, so these
           // are always ours to run.
           const segs = parseAssistantStream(rawChunk);
@@ -264,15 +242,6 @@ async function handle(req: BridgeRequest): Promise<void> {
         }
 
         if (ac.signal.aborted) return;
-
-        // Some providers stream the tool calls without ever setting finish_reason on the same
-        // chunk, so fall back to whatever the accumulator gathered.
-        if (state.finishReason === "tool_calls" && state.toolCalls.size > 0) {
-          for (const c of state.toolCalls.values()) {
-            const call = { id: c.id ?? "", name: c.function?.name ?? "", arguments: c.function?.arguments ?? "{}" };
-            if (!collected.some((a) => a.id === call.id)) collected.push(call);
-          }
-        }
 
         // Mercury markers first: they are ours regardless of who declared the real tools.
         if (mercuryCalls.length > 0) {

@@ -743,3 +743,33 @@ are always executed locally and filtered from the client-visible stream.
 pass-through non-stream returns `tool_calls`, `reply` reports no listener, safe workspace
 default, fresh core uses it) + 261 TS. `cargo check` is now warning-free. `dist/gateway.html`
 still emitted with no React in the bundle.
+
+---
+
+## Tools default to ON, not OFF (2026-09-18)
+
+The gateway tool toggle shipped defaulting to **off**, which stripped `tools`, `tool_choice` and
+`response_format` from every request before it left the process.
+
+For a router that coding agents are pointed at, that default is actively hostile and silently so.
+An agent that declares tools gets none forwarded. An agent that declares none gets no gateway
+fallback either. Either way the failure mode is a model that quietly cannot use tools, with
+nothing in the response explaining why.
+
+**Both modes are safe with the flag on**, which is the whole argument:
+
+- pass-through — client declares tools, they go upstream, the *client* executes them. The gateway
+  runs nothing.
+- gateway — client declares none, the gateway supplies its registry and executes inside the Rust
+  sandbox, rooted at `~/AI-Provider-Router-Workspace`.
+
+Neither mode executes anything the client did not ask for, and the sandbox root is a dedicated
+folder rather than `$HOME` or the process CWD. There is no containment argument for defaulting
+to off.
+
+**So off is now opt-in.** It survives because some clients break on tool parameters they do not
+recognise, not as a safety default.
+
+**Also:** the UI initial state mirrors the Rust default so the toggle does not flash "Disabled"
+for a beat before the invoke resolves, and the label changed from "Forward tools parameters" to
+**"Gateway tools"** — it now covers both modes, and the old name described only one of them.
