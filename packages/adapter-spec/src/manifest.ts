@@ -99,6 +99,11 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
       // Multi-event tool-call framing (anthropic-compat). Mutually exclusive in practice
       // with chunkMap.toolCalls; if both are declared, toolCallStream wins.
       toolCallStream: TOOL_CALL_STREAM.optional(),
+      // Ask the provider for a usage block on the stream. OpenAI-shaped servers omit usage
+      // entirely unless asked, so without this every streamed request reports zero tokens —
+      // which silently zeroes cost and defeats any spend cap. Always paired with
+      // `responseMap.usage`, which is what actually reads the block off the final chunk.
+      requestUsage: z.boolean().optional(),
     })
     .optional(),
 });

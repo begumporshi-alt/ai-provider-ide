@@ -45,6 +45,9 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
           },
           errorMap: { "$.error": "PASS_THROUGH" },
           finish: "$.choices[0].finish_reason",
+          // This dialect omits usage on a stream unless it is explicitly requested. Asking is
+          // what makes cost — and therefore the spend cap — non-zero for streamed requests.
+          requestUsage: true,
         },
       },
       ...(extra?.imageEndpoint

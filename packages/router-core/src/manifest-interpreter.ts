@@ -222,6 +222,21 @@ export class ManifestInterpreter implements AdapterInstance {
       responseFormat: args.responseFormat,
       ...this.ctx.vars,
     });
+    // OpenAI-shaped servers send no usage on a stream unless asked, and `stream_options` is
+    // rejected outright on a non-stream request — so it can only be added here, at send time,
+    // where we know which way this particular call is going. Without it the ledger records
+    // zero tokens for every streamed completion, and cost (and therefore the spend cap) is
+    // permanently 0.
+    //
+    // The manifest flag decides, but defaults to on for this dialect: providers already stored
+    // in the database were generated before the flag existed, and a migration that rewrites
+    // user-visible manifests is a heavier instrument than a default. A server that rejects the
+    // field can be opted out by setting `requestUsage: false` on its manifest.
+    const wantsUsage =
+      ep.stream?.requestUsage ?? (this.m.dialect === "openai-chat-v1" && Boolean(ep.responseMap.usage));
+    if (args.stream && wantsUsage) {
+      body["stream_options"] = { include_usage: true };
+    }
     const res = await this.ctx.http.request({
       url: joinUrl(this.m.provider.baseUrl, ep.path),
       method: "POST",
