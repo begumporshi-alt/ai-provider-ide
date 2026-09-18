@@ -1,4 +1,4 @@
-# DECISIONS — AI-Provider IDE
+# DECISIONS — AI-Provider Router
 
 > Decision, date, options, rationale, revisit trigger. Append-only.
 
@@ -22,8 +22,8 @@
 
 ## 2026-09-15 — Monorepo layout frozen as specified
 
-- **Decision:** `apps/desktop` (Tauri 2, react-ts template, identifier `dev.aiprovider.ide`),
-  `packages/router-core` (`@aiprovider/router`), `packages/adapter-spec`. Ports defined in
+- **Decision:** `apps/desktop` (Tauri 2, react-ts template, identifier `dev.aiprovider.router`),
+  `packages/router-core` (`@aiprovider/router-core`), `packages/adapter-spec`. Ports defined in
   router-core (`HttpPort`, `KeyVaultPort`, `StorePort`) mirror ARCHITECTURE.md §1.3 hard rules.
 - **Rationale:** keeps the router UI-agnostic and unit-testable with fake ports (spec req. 9).
 - **Revisit if:** build tooling forces a different split (e.g., Vite/Tauri workspace conflicts).
@@ -393,3 +393,180 @@ Re-verified green end-to-end: 44 Rust lib tests (10 incl. 9 tool-host) + 38 desk
 (11 unit incl. 4 agent-loop + 7 assistant-stream, 27 e2e) + 119 router-core + 18 adapter-spec.
 `cargo` is not on the default PATH here — invoke via `~/.cargo/bin/cargo` (rustup stable
 aarch64, 1.88.0).
+
+## 2026-09-18 — Project renamed AI-Provider IDE → AI-Provider Router
+
+- **Decision:** the user-specified name "ai-provider router" is normalized to
+  **`ai-provider-router`** everywhere (hyphenated; display form "AI-Provider Router"). Applied
+  to the repo package name, the desktop app package, the Tauri `productName`/window title, the
+  bundle identifier, the keychain service, the SQLite filename, the Rust crate + lib name, and
+  all four design documents plus the four diagram sources.
+- **Package naming:** `@aiprovider/router` → **`@aiprovider/router-core`** (the old name
+  collided conceptually with the directory `packages/router-core` and with the runtime
+  `ModelRouter`; the suffix matches the directory). `@aiprovider/adapter-spec` is unchanged.
+  Rust crate `desktop` → `ai-provider-router`; lib `desktop_lib` → `ai_provider_router_lib`.
+- **Identifiers renamed (accepted consequence):** `dev.aiprovider.ide` → `dev.aiprovider.router`,
+  keychain service `ai-provider-ide` → `ai-provider-router`, DB `ai-provider-ide.db` →
+  `ai-provider-router.db`. **This orphans any existing install's data**: on macOS the app-data
+  directory is keyed by identifier, so a previously installed build loses its providers, keys,
+  manifests, and ledger. Keys are NOT deleted — they remain in the login keychain under the old
+  service name and must be re-entered. Accepted because the app is pre-release and no migration
+  runner exists yet.
+- **Revisit if:** a signed release is being cut with real users — then ship a one-time migration
+  (copy DB to the new path; re-register keychain entries under the new service).
+- **Also fixed in this pass:** `apps/desktop/src-tauri/dev.db` was untracked and not ignored —
+  `*.db`/`*.db-shm`/`*.db-wal` added to `.gitignore`.
+- **Filter selectors had to follow the rename (easy to miss):** the desktop package name is what
+  `pnpm --filter <name>` matches, so renaming it silently broke three call sites — root
+  `package.json` `"dev": "pnpm --filter desktop tauri dev"` and two CI steps
+  (`playwright install`, `web-test`). All three now use `ai-provider-router-desktop`. **Any
+  future app-package rename must update these too**; `pnpm --filter ./apps/desktop` (path form)
+  would be rename-proof if this recurs.
+- **Verified green after the rename:** typecheck clean in all three TS projects; 181 router-core
+  + 18 adapter-spec + 38 desktop + 53 Rust tests pass; `vite build` clean with zero occurrences
+  of the old name in the bundle; `key-leak-grep` OK; `pnpm --filter ai-provider-router-desktop`
+  resolves. Full write-up in [ARCHITECTURE_AUDIT.md](ARCHITECTURE_AUDIT.md).
+- **Tooling note:** `pnpm` was not installed on this machine; installed `pnpm@10.12.4` to match
+  `packageManager`. Root `node_modules/.bin` is empty in this workspace — invoke per-package
+  binaries (`packages/router-core/node_modules/.bin/tsc`, etc.).
+
+## 2026-09-18 — R3: per-provider concurrency caps, enforced in the CORE not the gateway edge
+
+- **Options:** (a) a per-provider semaphore at the axum gateway ingress, (b) a per-provider cap
+  in the router core consulted per candidate.
+- **Decision:** **(b)**. The gateway cannot know which provider will serve a request until the
+  router has planned it — so a cap at ingress could only reject (503/429) or queue, neither of
+  which helps the caller. Enforcing it in the core means a saturated provider is **skipped in the
+  plan**, so the request fails over to a provider that can actually serve it.
+- **Design:** `ProviderLimiter` (`packages/router-core/src/concurrency.ts`) with
+  `settings.perProviderConcurrency` (default 4; `0` = unlimited). Skipped candidates are recorded
+  as `RATE_LIMITED` outcomes so the fallback chain stays honest. Permits release in a `finally`
+  on every path (success, classified failure, mid-stream throw) and release is idempotent — a
+  double release must never leak capacity.
+- **Why not just lower the global bound:** a global bound cannot see providers; one degraded
+  provider could still occupy all 40 slots and defeat failover. That was the finding.
+- **Revisit if:** real traffic shows the default 4 is too tight for bursty single-provider
+  setups, or if a headless mode (R1) moves execution off the webview — then re-evaluate whether
+  the cap belongs beside the gateway's `MAX_TOTAL`.
+
+## 2026-09-18 — R2: cost attribution — canonical unit is micro-USD per 1M tokens
+
+- **Problem:** `ledger.cost_estimate_micros` was always 0. `pricing_json` was stored but never
+  read; `cost_spread` rotation fell back to priority because no price was ever available.
+- **Decision:** canonical unit = **micro-USD per 1M tokens** (integer). Micros because the ledger
+  column is `cost_estimate_micros INTEGER`; per-1M because per-token prices are ~1e-7 and round
+  to zero in any integer representation (0.00000015 USD/token -> 150_000 micros per 1M tokens).
+- **Unknown ≠ free.** `parsePricing` returns `undefined` and `estimateCostMicros` returns
+  `undefined` (never 0) when a provider publishes no price. Most Anthropic-compatible catalogs
+  and b.ai publish none. The UI renders "—", not "$0.00". This distinction is the whole point —
+  conflating them overstates what the app knows.
+- **Surfaces:** `ModelCatalog` captures `pricing` per model from the provider's raw catalog entry
+  (OpenRouter `pricing.{prompt,completion}`; also `input/output` and `*_cost_per_token`);
+  `ModelRouter` computes real cost into the ledger; `cost_spread` now orders carriers
+  cheapest-first, opt-in via `PlanContext.pricingFor` so existing ordering is untouched;
+  Activity gained a Cost column (6 decimals for sub-cent requests).
+- **Known limitation (accepted):** unknown-vs-free is resolved at render time from the in-memory
+  catalog, not persisted per row. A durable fix is a `cost_known` column via migration `0002`.
+- **Revisit if:** non-USD pricing appears (would need an FX step at cache-write time), or image
+  generation needs per-image pricing (images carry no token counts today, so cost stays 0).
+
+## 2026-09-18 — Audit R4: per-app gateway keys + monthly spend cap
+
+**Context.** The gateway exposes the user's paid credentials to arbitrary local apps behind one
+master key. Before this change: no budget, no per-app keys, no way to cut off one consumer
+without rotating the master key (which breaks every other connected app).
+
+**Decisions**
+
+- **Split storage.** Key *metadata* (label, created, revoked) goes in SQLite (migration
+  `0002_gateway_keys`); the *secret* goes in the OS keychain under `gwkey:<id>`. SQLite is
+  auditable and survives restart; the keychain is where secrets belong. Nothing in the DB ever
+  holds credential material — same invariant as `api_keys.secret_ref`.
+- **Secret never crosses the DOM.** `gateway_app_key_create` generates → keychain → clipboard
+  (Rust `arboard`) and returns only `{id, label}`. If the clipboard write fails the keychain
+  entry and the row are both rolled back, so no credential exists that nobody holds.
+- **Revocation over deletion.** `revoke` sets `revoked_at` and keeps the row; `delete` is a
+  separate explicit action. `active_gateway_key_ids` filters on `revoked_at IS NULL` and is
+  re-read per request, so revocation lands on the next request without a restart.
+- **402, not 429/403, when the cap is hit.** 402 is the one status clients already read as "out
+  of credit", so a runaway agent loop stops retrying instead of hammering the endpoint.
+- **Cap is checked after auth.** A 402 discloses the configured budget and current spend; that
+  must not be reachable by an unauthenticated caller on the loopback port.
+- **Cap scope = every ledger row**, not just `source='gateway'`. A cap that ignored Playground
+  and generator usage would be silently understated. Stated in the UI copy: it is a ceiling on
+  what you pay, not on one client.
+- **Month boundary computed in SQL** (`strftime('%s','now','start of month','utc')`), not by
+  hand-rolled calendar math — month lengths vary, and that is exactly the off-by-one that
+  mis-bills.
+- **Micro-USD is the only money unit** across the stack, matching `router-core/pricing.ts`.
+  Cap 0 means *disabled*, not "zero budget" — otherwise an empty Settings field bricks the
+  gateway.
+
+**Behaviour change found by a test (not by reading).** The brute-force backoff used to run
+*before* the key was checked, so one bad credential throttled every caller on the loopback for
+500ms+ — with per-app keys, one misconfigured app locks out all the others. Moved to the
+failure path: a valid key always gets through (and clears the counter), repeat failures are
+still throttled at the same bound.
+
+**Known limitation (accepted):** no per-consumer *request-rate* limit. One app key can still
+monopolise the global semaphore. Needs a per-key token bucket — a different mechanism, deferred
+to v1.1.
+
+## 2026-09-18 — Audit R1 (partial): background mode — the gateway outlives the window
+
+**Context.** Every gateway request ran in the webview's JS event loop, so the gateway died with
+the window. Three consequences were listed: dies with the window, unavailable during HMR reload,
+inherits renderer responsiveness. This change fixes the first; the other two need a real
+headless core (v2).
+
+**Decisions**
+
+- **Scope: lifetime decoupling, not execution decoupling.** Running `router-core` outside a
+  renderer means a Node sidecar or a Rust port — a packaging + IPC epic. Shipping the lifetime
+  fix now captures most of the user-visible value ("my gateway stops when I close the window")
+  at a fraction of the risk. Recorded as PARTIAL, not RESOLVED, and the audit says what's left.
+- **Tray is mandatory, not decorative.** A hidden app with no UI is unreachable — worse than the
+  original problem. So tray construction failure is handled by *logging a warning and leaving
+  close-to-quit intact*, never by hiding anyway.
+- **Default ON.** Background mode is the point of the feature; a user who wants close-to-quit can
+  turn it off. Preference lives in `settings.background.hideOnClose`.
+- **Hidden-window heartbeat bound relaxes 6s → 30s.** macOS throttles timers in a hidden window;
+  a fixed 6s bound would 503 every background request. Entering background stamps the heartbeat
+  so the grace window starts fresh rather than mid-interval. Leaving background restores 6s — a
+  renderer that died while hidden is still detected, just more slowly.
+- **`RunEvent::Reopen` is `#[cfg(target_os = "macos")]`** in Tauri 2, so the match arm is gated.
+  CI is macOS-only, but this keeps a Linux/Windows build from breaking.
+
+**Cost.** Two Cargo features on `tauri`: `tray-icon` and `image-png` (the latter so the tray
+reuses the bundled icon instead of shipping a second one).
+
+**Explicitly not verified.** That macOS keeps a hidden WKWebView's `setInterval` firing. The 15x
+margin is designed to absorb throttling, but this needs one manual check — start the gateway,
+close the window, curl the endpoint. If it 503s, widen `HEARTBEAT_STALE_HIDDEN_MS` or keep the
+window off-screen instead of hidden. Flagged in ARCHITECTURE_AUDIT.md rather than left implicit.
+
+## 2026-09-18 — Audit R6: one TypeScript across the workspace (6.0.3, exact pin)
+
+**Decision: unify upward on 6.0.3, pinned exactly, plus a CI guard.**
+
+- **Direction settled by experiment, not taste.** Before touching a manifest I ran desktop's
+  6.0.3 binary against both packages' tsconfigs — both clean. So the packages moved up; nothing
+  moved down. Had router-core failed, the answer would have been different.
+- **Exact pin (`6.0.3`), not `~6.0.3`.** A range lets *resolved* versions diverge even when the
+  declared strings match — the same drift, one level lower down. For a compiler, deliberate
+  upgrades are the right default anyway.
+- **The guard is the fix; matching versions is only the cleanup.** `scripts/check-ts-version.sh`
+  (`pnpm check-ts-version`, wired into CI) fails on: two packages declaring different versions,
+  a range instead of an exact pin, or a lockfile resolving more than one TypeScript.
+  Negative-tested — reverting one package to `~5.8.0` exits 1 and names the file.
+
+**Lockfile:** regenerated with `pnpm install --lockfile-only` (no node_modules churn).
+`typescript@5.8.3` pruned; `pnpm install --frozen-lockfile` verified.
+
+**Environment gotcha worth remembering (cost me a repair step).** `pnpm install` fails here with
+`ERR_PNPM_CODEBUDDY_BROKER_DENY` (symlink EEXIST) — but it does not fail atomically: it removed
+`node_modules/typescript` from both packages before erroring, leaving a dangling `.bin/tsc`.
+- For lockfile-only changes always use `pnpm install --lockfile-only`.
+- If a full install fails, check for dangling bins and repoint the symlink into the pnpm store
+  rather than reinstalling:
+  `ln -sfn ../../../node_modules/.pnpm/typescript@<v>/node_modules/typescript <pkg>/node_modules/typescript`
