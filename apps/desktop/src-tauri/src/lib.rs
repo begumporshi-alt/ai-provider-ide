@@ -61,6 +61,23 @@ fn probe_key_refs(store: &store::Store) {
     }
 }
 
+/// The port the gateway should come back up on, or `None` when it was left off.
+///
+/// The gateway is a local endpoint other processes point at — WorkBuddy's custom-provider entry
+/// among them — so "was serving" is a setting, not a session detail. A gateway that needs a click
+/// after every relaunch silently breaks every client configured against it.
+fn persisted_gateway_port(store: &store::Store) -> Option<u16> {
+    let conn = store.conn.lock().unwrap();
+    let value: String = conn
+        .query_row("SELECT value_json FROM settings WHERE key = 'gateway'", [], |r| r.get(0))
+        .ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&value).ok()?;
+    if parsed.get("enabled")?.as_bool()? != true {
+        return None;
+    }
+    Some(parsed.get("port")?.as_u64()? as u16)
+}
+
 /// R1 background mode: closing the window hides the app instead of quitting, so the gateway
 /// keeps serving. The tray is the way back — and the only way out that doesn't require
 /// Activity Monitor — so if it cannot be built we deliberately leave close-to-quit in place.
@@ -150,6 +167,8 @@ pub fn run() {
             let allow = Arc::new(egress::AllowList(RwLock::new(initial_allow_hosts(&store))));
             let egress_state = Arc::new(egress::EgressState::new(allow, store.clone()));
             gateway_cmds::run_rollup(&store);
+            // Read before `store` is handed to `app.manage` — after that it is gone.
+            let restore_port = persisted_gateway_port(&store);
             app.manage(store);
             app.manage(egress_state);
             gateway_cmds::manage(app)?;
@@ -157,6 +176,17 @@ pub fn run() {
             // intact, so the app can never end up running with no way to reach it.
             if let Err(e) = build_tray(app.handle()) {
                 tracing::warn!("tray icon unavailable — close will quit: {e}");
+            }
+            // Bring the gateway back if it was serving when the app last quit. Best-effort: a
+            // failure here must never stop the UI from opening, so it is logged and dropped.
+            if let Some(port) = restore_port {
+                let handle = app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    match crate::gateway_cmds::gateway_enable(handle, Some(port)).await {
+                        Ok(bound) => tracing::info!("gateway restored on port {bound}"),
+                        Err(e) => tracing::warn!("gateway auto-restore failed: {e}"),
+                    }
+                });
             }
             Ok(())
         })

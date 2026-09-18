@@ -103,10 +103,14 @@ export function GatewayScreen() {
     try {
       if (status?.running) {
         await invoke("gateway_disable");
+        // Persist the off state too: "enabled" is what startup restores, so leaving a stale
+        // `true` behind would start the gateway again on the next launch.
+        const port = Number(portInput) || undefined;
+        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port, enabled: false }) });
       } else {
         const port = Number(portInput) || undefined;
         await invoke("gateway_enable", { port });
-        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port }) });
+        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port, enabled: true }) });
         if (!status?.hasKey) await invoke("gateway_key_generate");
       }
       refresh();

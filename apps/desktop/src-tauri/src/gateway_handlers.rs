@@ -60,6 +60,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         // stream exactly when the client disconnects or the body finishes.
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
+            let mut started = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     // An empty delta carries no content, so it is not a wire event at all.
@@ -68,8 +69,16 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                     // which must reach the client as nothing.
                     BridgeMsg::Delta(t) if t.is_empty() => {}
                     BridgeMsg::Delta(t) => {
+                        // The first content frame opens the message the way OpenAI does it, so
+                        // clients that read delta.role instead of inferring it see an assistant.
+                        let delta = if started {
+                            json!({ "content": t })
+                        } else {
+                            started = true;
+                            json!({ "role": "assistant", "content": t })
+                        };
                         let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk",
-                            "choices": [{ "index": 0, "delta": { "content": t } }] });
+                            "choices": [{ "index": 0, "delta": delta }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
@@ -91,6 +100,10 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                                 }]
                             }).to_string(),
                         ));
+                        // OpenAI terminates every stream with `data: [DONE]`. Clients that wait
+                        // for that sentinel rather than for EOF otherwise hang until the socket
+                        // closes, so both normal exits have to emit it.
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
                         break;
                     }
                     BridgeMsg::Error { message, .. } => {
@@ -113,6 +126,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                             }]
                         });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
                         break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {

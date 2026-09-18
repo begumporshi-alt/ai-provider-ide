@@ -83,8 +83,27 @@ function orderCarriers(wanted: WantedRef[], ctx: PlanContext): WantedRef[] {
     .map((x) => x.w);
 }
 
-function resolveWanted(model: string, ctx: PlanContext): WantedRef[] {
+/**
+ * Clients stamp a namespace onto model ids they did not define themselves: WorkBuddy prefixes
+ * every entry it loads from `models.json` with `custom-local:`. That tag belongs to the client's
+ * own catalog, not to any provider, so it is not part of the native id — resolve without it.
+ *
+ * Only a prefix with no `/` is eligible, which keeps the ordinary shapes intact:
+ * `openrouter/gpt-4o` has no colon at all, and `openai/gpt-4o:extended` is a variant suffix whose
+ * prefix contains a slash. A prefix that names a real provider is also left alone.
+ */
+export function stripClientNamespace(model: string, ctx: Pick<PlanContext, "providers">): string {
+  const i = model.indexOf(":");
+  if (i < 0) return model;
+  const prefix = model.slice(0, i);
+  if (prefix.includes("/")) return model;
+  if (ctx.providers.some((p) => p.slug === prefix)) return model;
+  return model.slice(i + 1);
+}
+
+function resolveWanted(requested: string, ctx: PlanContext): WantedRef[] {
   const out: WantedRef[] = [];
+  const model = stripClientNamespace(requested, ctx);
 
   if (model.includes("/")) {
     const slug = model.split("/")[0]!;
