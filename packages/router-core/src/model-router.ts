@@ -9,14 +9,23 @@ import type { ImageRequest, ModelInfo, RouterFacade, TextRequest } from "./ports
 import type { ProviderRegistry } from "./provider-registry.js";
 import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ModelCatalog } from "./model-catalog.js";
+import type { CatalogModel } from "./domain.js";
 import { buildPlan, type Candidate, type PlanContext } from "./route-planner.js";
 import { HealthTracker } from "./health-tracker.js";
 import { ExecutionEngine, type TextExecution } from "./execution-engine.js";
+import { ProviderLimiter, PER_PROVIDER_DEFAULT } from "./concurrency.js";
+import { estimateCostMicros } from "./pricing.js";
 import { UsageLedger, type LedgerSource } from "./usage-ledger.js";
 
 export interface RouterSettings {
   failoverEnabled: boolean;
   systemAi: { providerId: string; model: string } | null;
+  /**
+   * Max in-flight requests per provider (audit R3). `0` = unlimited. Saturated providers are
+   * skipped in favour of one that can serve, so a single degraded provider cannot occupy the
+   * gateway's whole global budget.
+   */
+  perProviderConcurrency: number;
 }
 
 /** §2.8 dependency inversion: the Generator depends on THIS, never on Router internals. */
@@ -40,7 +49,13 @@ export class ModelRouter implements RouterFacade, AiTextPort {
   readonly health = new HealthTracker();
   private readonly engine: ExecutionEngine;
   private readonly cursors = new Map<string, number>(); // providerId -> round-robin index
-  settings: RouterSettings = { failoverEnabled: true, systemAi: null };
+  settings: RouterSettings = {
+    failoverEnabled: true,
+    systemAi: null,
+    perProviderConcurrency: PER_PROVIDER_DEFAULT,
+  };
+  /** Per-provider in-flight cap (audit R3). Exposed for tests and Router Settings. */
+  readonly limiter = new ProviderLimiter(PER_PROVIDER_DEFAULT);
   /**
    * Drift hook (§2.10): every attempt outcome — failures in the fallback chain AND the
    * serving success — is observed. Phase 5 wires this to DriftMonitor.observe; the router
@@ -54,11 +69,17 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     private readonly catalog: ModelCatalog,
     private readonly ledger: UsageLedger,
   ) {
-    this.engine = new ExecutionEngine({ forProvider: (pid) => this.adapters.forProvider(pid) }, this.health);
+    this.engine = new ExecutionEngine({ forProvider: (pid) => this.adapters.forProvider(pid) }, this.health, this.limiter);
+  }
+
+  /** Apply `settings.perProviderConcurrency` to the live limiter (Router Settings changes). */
+  syncConcurrency(): void {
+    this.limiter.maxPerProvider = this.settings.perProviderConcurrency;
   }
 
   async generateText(req: TextRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<TextExecution> {
     const t0 = Date.now();
+    this.syncConcurrency();
     const plan = this.plan(req.model, "text");
     if (!plan.length) throw new Error(`no route for model "${req.model}" (no enabled provider carries it)`);
     const exec = await this.engine.executeText({
@@ -82,6 +103,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
 
   async generateImage(req: ImageRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<{ url?: string; base64?: string }> {
     const t0 = Date.now();
+    this.syncConcurrency();
     const plan = this.plan(req.model, "image");
     if (!plan.length) throw new Error(`no route for image model "${req.model}"`);
     const res = await this.engine.executeImage({ plan, prompt: req.prompt, model: req.model, signal: opts?.signal });
@@ -211,6 +233,11 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     this.cursors.set(providerId, this.nextKeyCursor(providerId) + 1);
   }
 
+  /** R2: normalized pricing for a catalog model (`undefined` = unknown, NOT free). */
+  pricingFor(model: CatalogModel) {
+    return this.catalog.pricingFor(model.providerId, model.nativeId);
+  }
+
   private slugOf(providerId: string): string {
     return this.registry.getProvider(providerId)?.slug ?? providerId;
   }
@@ -223,6 +250,8 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       aliases: this.catalog.aliases,
       health: this.health,
       nextKeyCursor: (pid) => this.nextKeyCursor(pid),
+      // R2: lets `cost_spread` order carriers by real price instead of falling back to priority.
+      pricingFor: (pid, nativeId) => this.catalog.pricingFor(pid, nativeId),
     };
     let plan = buildPlan({ model, modality, excludeProviderIds }, ctx);
     if (!this.settings.failoverEnabled) {
@@ -246,6 +275,8 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       try {
         for await (const c of exec.chunks) yield c;
         const served = exec.served();
+        const tokensIn = exec.usage()?.prompt_tokens ?? 0;
+        const tokensOut = exec.usage()?.completion_tokens ?? 0;
         await ledger.append({
           ts: Date.now(),
           modality,
@@ -256,9 +287,15 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           model: served?.model.nativeId ?? requestedModel,
           status: "ok",
           latencyMs: Date.now() - t0,
-          tokensIn: exec.usage()?.prompt_tokens ?? 0,
-          tokensOut: exec.usage()?.completion_tokens ?? 0,
-          costEstimateMicros: 0,
+          tokensIn,
+          tokensOut,
+          // R2: real cost instead of a constant 0. Unknown pricing -> 0 in the ledger column,
+          // and the UI renders "—" for it by consulting the catalog (unknown != free).
+          costEstimateMicros: estimateCostMicros(
+            served ? router.pricingFor(served.model) : undefined,
+            tokensIn,
+            tokensOut,
+          ) ?? 0,
           fallbackChain: exec.fallbackChain(),
         });
         if (served) router.advanceCursor(served.provider.id);

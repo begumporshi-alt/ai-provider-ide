@@ -10,6 +10,7 @@ import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
 import { classify, type ErrorClass } from "./errors.js";
 import type { HealthTracker } from "./health-tracker.js";
+import type { ProviderLimiter } from "./concurrency.js";
 import type { ToolCall } from "./ports.js";
 
 export interface AttemptOutcome {
@@ -51,9 +52,15 @@ interface AdapterFactory {
 }
 
 export class ExecutionEngine {
+  /**
+   * `limiter` is optional and opt-in (audit R3): when present, a candidate whose provider is
+   * already at its in-flight cap is skipped with a RATE_LIMITED outcome, so the loop advances
+   * to another provider instead of queueing behind a degraded one. Absent = legacy behaviour.
+   */
   constructor(
     private readonly adapters: AdapterFactory,
     private readonly health: HealthTracker,
+    private readonly limiter?: ProviderLimiter,
   ) {}
 
   async executeText(args: ExecuteTextArgs): Promise<TextExecution> {
@@ -69,6 +76,13 @@ export class ExecutionEngine {
       for (let i = 0; i < attempts; i++) {
         const c = args.plan[i]!;
         if (args.signal?.aborted) return;
+        // R3: skip a saturated provider rather than waiting on it — failover is the better
+        // answer than queueing. Consecutive candidates of the same provider are skipped too.
+        const release = self.limiter ? self.limiter.acquire(c.provider.id) : null;
+        if (self.limiter && !release) {
+          fallbackChain.push({ candidate: c, cls: "RATE_LIMITED", status: 429 });
+          continue;
+        }
         let emitted = false;
         try {
           const { adapter } = await self.adapters.forProvider(c.provider.id);
@@ -105,6 +119,9 @@ export class ExecutionEngine {
           if (args.signal?.aborted) return;
           // TIMEOUT: don't burn the remaining plan on a hung provider chain? §3.6 says the
           // next plan entry IS the retry, so we continue.
+        } finally {
+          // Released on every path — success, classified failure, and mid-stream throw alike.
+          release?.();
         }
       }
       if (!served) {
@@ -132,6 +149,12 @@ export class ExecutionEngine {
     const max = args.maxAttempts ?? MAX_ATTEMPTS_DEFAULT;
     for (const c of args.plan.slice(0, max)) {
       if (args.signal?.aborted) break;
+      // R3: same skip-don't-wait rule as the text path.
+      const release = this.limiter ? this.limiter.acquire(c.provider.id) : null;
+      if (this.limiter && !release) {
+        attempts.push({ candidate: c, cls: "RATE_LIMITED", status: 429 });
+        continue;
+      }
       try {
         const { adapter } = await this.adapters.forProvider(c.provider.id);
         const res = await adapter.generateImage(
@@ -149,6 +172,8 @@ export class ExecutionEngine {
       } catch {
         attempts.push({ candidate: c, cls: "NETWORK", status: 0 });
         this.health.recordResult(c.key, "NETWORK");
+      } finally {
+        release?.();
       }
     }
     throw new AllAttemptsFailedError(args.model, attempts);

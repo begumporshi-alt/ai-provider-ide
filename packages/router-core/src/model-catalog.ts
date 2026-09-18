@@ -7,6 +7,7 @@ import type { AliasEntry, CatalogModel } from "./domain.js";
 import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ProviderRegistry } from "./provider-registry.js";
 import type { ModelEntry } from "./manifest-interpreter.js";
+import { parsePricing, type PricingMicros } from "./pricing.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -51,6 +52,9 @@ export class ModelCatalog {
         nativeId: e.nativeId,
         modality: adapter.tagModality(e) as Modality,
         fetchedAt: now,
+        // Audit R2: keep the provider's published price, normalized. Unparseable/absent
+        // pricing stays `undefined` (unknown), so "no price" can never read as "free".
+        pricing: parsePricing(e.raw),
       });
     }
     this.fetchedAt.set(providerId, now);
@@ -94,5 +98,10 @@ export class ModelCatalog {
 
   forModality(modality: Modality): CatalogModel[] {
     return this.models.filter((m) => m.modality === modality);
+  }
+
+  /** Normalized pricing for one model, or `undefined` when the provider published none. */
+  pricingFor(providerId: string, nativeId: string): PricingMicros | undefined {
+    return this.models.find((m) => m.providerId === providerId && m.nativeId === nativeId)?.pricing;
   }
 }

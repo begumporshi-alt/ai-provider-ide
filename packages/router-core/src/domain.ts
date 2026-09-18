@@ -3,6 +3,7 @@
  * `secretRef` only — never a secret (invariant 1).
  */
 import type { KeyStatus, Modality, ProviderLifecycleState } from "@aiprovider/adapter-spec";
+import type { PricingMicros } from "./pricing.js";
 
 export interface ProviderRecord {
   id: string;
@@ -36,6 +37,11 @@ export interface CatalogModel {
   modality: Modality;
   contextWindow?: number;
   fetchedAt: number;
+  /**
+   * Normalized provider pricing (audit R2), captured from the provider's raw catalog entry at
+   * refresh time. `undefined` = unknown (NOT free) — the UI renders it as "—", not "$0.00".
+   */
+  pricing?: PricingMicros;
 }
 
 export interface AliasEntry {

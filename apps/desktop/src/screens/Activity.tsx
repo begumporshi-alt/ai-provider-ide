@@ -5,7 +5,26 @@
  * mount from the host.
  */
 import { useEffect, useMemo, useState } from "react";
-import { listLedger, loadRecentLedger, registry, type HostLedgerRow } from "../store";
+import { listLedger, loadRecentLedger, registry, catalog, type HostLedgerRow } from "../store";
+
+/**
+ * Cost formatting (audit R2). The ledger stores micro-USD; `null` means the provider published
+ * no price, which must render as "unknown" — never as "$0.00", because unknown and free are
+ * different facts and conflating them overstates what the app knows.
+ */
+function formatCost(micros: number | null): string {
+  if (micros === null) return "—";
+  if (micros === 0) return "$0.00";
+  const usd = micros / 1_000_000;
+  // Sub-cent requests are the norm for small prompts; 2 decimals would show them all as $0.00.
+  return usd < 0.01 ? `$${usd.toFixed(6)}` : `$${usd.toFixed(4)}`;
+}
+
+/** Cost for a row, or null when the provider published no pricing for that model. */
+function costFor(providerId: string | null, model: string, micros: number): number | null {
+  if (!providerId) return null;
+  return catalog.pricingFor(providerId, model) ? micros : null;
+}
 import { useUi } from "../ui-state";
 import { EmptyState } from "../components/atoms";
 
@@ -37,6 +56,7 @@ export function ActivityScreen() {
       latencyMs: e.latencyMs ?? null,
       tokensIn: e.tokensIn,
       tokensOut: e.tokensOut,
+      cost: costFor(e.providerId ?? null, e.model, e.costEstimateMicros),
       fallbacks: (e.fallbackChain ?? []).map((a) => `${registry.getProvider(a.candidate.provider.id)?.name ?? a.candidate.provider.slug} · ${a.candidate.key.label} → ${a.cls}`),
     }));
     const fromDisk = persisted
@@ -54,6 +74,7 @@ export function ActivityScreen() {
         latencyMs: p.latencyMs,
         tokensIn: p.tokensIn,
         tokensOut: p.tokensOut,
+        cost: costFor(p.providerId, p.model, p.costEstimateMicros),
         fallbacks: (() => {
           try {
             const arr = JSON.parse(p.fallbackChainJson ?? "[]") as { provider: string; key: string; cls: string }[];
@@ -89,6 +110,7 @@ export function ActivityScreen() {
               <th className="w-20 font-medium">Key</th>
               <th className="w-16 font-medium">Source</th>
               <th className="w-20 font-medium">Latency</th>
+              <th className="w-24 font-medium">Cost</th>
               <th className="w-24 font-medium">Status</th>
             </tr>
           </thead>
@@ -102,6 +124,9 @@ export function ActivityScreen() {
                   <td className="text-[12px]" style={{ color: "var(--text-dim)" }}>{r.key}</td>
                   <td><SourceChip source={r.source} /></td>
                   <td className="mono text-[12px]">{r.latencyMs != null ? `${r.latencyMs}ms` : "—"}</td>
+                  <td className="mono text-[12px]" style={{ color: r.cost === null ? "var(--text-faint)" : undefined }} title={r.cost === null ? "provider published no pricing for this model" : undefined}>
+                    {formatCost(r.cost)}
+                  </td>
                   <td>
                     <span className="text-[12px]" style={{ color: r.status === "ok" ? (r.fallbacks.length ? "var(--warn)" : "var(--success)") : "var(--danger)" }}>
                       {r.status === "ok" ? (r.fallbacks.length ? `↻ ${r.fallbacks.length} fallback` : "✓ ok") : `✕ ${r.errorClass ?? "failed"}`}
@@ -110,10 +135,11 @@ export function ActivityScreen() {
                 </tr>
                 {open === i && (
                   <tr key={`${i}-detail`} className="border-t" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-                    <td colSpan={7} className="px-3 py-2">
+                    <td colSpan={8} className="px-3 py-2">
                       <div className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
                         <div>requested: {r.requested} → served: {r.model} ({r.modality})</div>
                         <div>tokens in/out: {r.tokensIn}/{r.tokensOut}{r.source === "generator" ? " · System AI request (§2.8 exclusion path)" : ""}</div>
+                        {r.cost === null && <div>cost: unknown — this provider publishes no pricing for {r.model}</div>}
                         {r.fallbacks.length > 0 && (
                           <div className="mt-1">
                             <div className="mb-0.5" style={{ color: "var(--warn)" }}>routing chain:</div>
