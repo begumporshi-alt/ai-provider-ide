@@ -56,3 +56,37 @@ describe("buildPlan with a namespaced id", () => {
     expect(buildPlan({ model: "custom-local:openrouter/no-such-model", modality: "text" }, ctx)).toEqual([]);
   });
 });
+
+/**
+ * OpenRouter publishes native ids that already contain a slash (`openai/gpt-4o-mini`), so a
+ * client sending the provider's own id is indistinguishable from a `<slug>/<native>` qualified
+ * id. Read the slash as a qualifier only when it names a real provider; otherwise the id must
+ * still resolve as a bare native id, or every such client 404s.
+ */
+describe("buildPlan with a provider-native id that contains a slash", () => {
+  it("routes the bare native id to the provider that carries it", () => {
+    const plan = buildPlan({ model: "openai/gpt-4o-mini", modality: "text" }, ctx);
+    expect(plan).toHaveLength(1);
+    expect(plan[0]!.provider.slug).toBe("openrouter");
+    expect(plan[0]!.model.nativeId).toBe("openai/gpt-4o-mini");
+  });
+
+  it("routes it through a client tag too", () => {
+    const plan = buildPlan({ model: "custom-local:openai/gpt-4o-mini", modality: "text" }, ctx);
+    expect(plan).toHaveLength(1);
+    expect(plan[0]!.model.nativeId).toBe("openai/gpt-4o-mini");
+  });
+
+  it("does not silently reroute a genuinely qualified id", () => {
+    // `openrouter` IS a provider here, so the id is qualified and the bare-id fallback must not
+    // also fire — otherwise a request could be served by whichever provider happens to carry a
+    // model literally named `openrouter/openai/gpt-4o-mini`.
+    const ambiguous = [
+      ...models,
+      { providerId: "pOR", nativeId: "openrouter/openai/gpt-4o-mini", modality: "text" as const, fetchedAt: 1, pricing: undefined },
+    ];
+    const plan = buildPlan({ model: "openrouter/openai/gpt-4o-mini", modality: "text" }, { ...ctx, catalog: () => ambiguous });
+    expect(plan).toHaveLength(1);
+    expect(plan[0]!.model.nativeId).toBe("openai/gpt-4o-mini");
+  });
+});

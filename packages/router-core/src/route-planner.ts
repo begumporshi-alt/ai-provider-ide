@@ -105,10 +105,19 @@ function resolveWanted(requested: string, ctx: PlanContext): WantedRef[] {
   const out: WantedRef[] = [];
   const model = stripClientNamespace(requested, ctx);
 
+  // `<slug>/<native>` is the qualified form — but only when the leading segment really is one
+  // of our providers. OpenRouter's own native ids contain a slash (`openai/gpt-4o-mini`), so a
+  // bare native id and a qualified id are indistinguishable on the wire. Read the slash as a
+  // provider qualifier ONLY when it resolves; otherwise fall through to the bare-id lookup
+  // below, or every client that sends a provider-native id 404s with "no route for model".
+  let qualified = false;
   if (model.includes("/")) {
     const slug = model.split("/")[0]!;
     const p = ctx.providers.find((x) => x.slug === slug);
-    if (p) out.push({ providerId: p.id, nativeId: model.slice(slug.length + 1) });
+    if (p) {
+      out.push({ providerId: p.id, nativeId: model.slice(slug.length + 1) });
+      qualified = true;
+    }
   }
 
   // Alias map: every provider carrying the alias, priority order (§3.4 bare-ID rule):
@@ -117,8 +126,10 @@ function resolveWanted(requested: string, ctx: PlanContext): WantedRef[] {
   for (const a of aliasRows) out.push({ providerId: a.providerId, nativeId: a.nativeModelId });
 
   // Bare native id present on one or more providers: include all carriers — primary first,
-  // the rest become automatic failover candidates (§3.1).
-  if (!model.includes("/") && aliasRows.length === 0) {
+  // the rest become automatic failover candidates (§3.1). Runs for slash-bearing ids too when
+  // the leading segment named no provider; a genuinely qualified id never reaches here, so it
+  // can never be silently rerouted to a different provider.
+  if (!qualified && aliasRows.length === 0) {
     for (const c of ctx.catalog().filter((m) => m.nativeId === model)) {
       out.push({ providerId: c.providerId, nativeId: c.nativeId });
     }
