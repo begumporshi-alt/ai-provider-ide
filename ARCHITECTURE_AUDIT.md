@@ -10,11 +10,12 @@
 > `key-leak-grep` OK, `check-ts-version` OK
 >
 > **UPDATE (same day, after this audit):** findings **R2** (cost attribution), **R3**
-> (per-provider concurrency), **R4** (spend cap + per-app gateway keys), and **R6** (one
-> TypeScript across the workspace) have since been implemented — see their sections below,
-> marked RESOLVED. **R1** is partially resolved: the gateway's *lifetime* is decoupled from the
-> window (background mode) but its *execution* still runs in the renderer.
-> Remaining open: R1 (execution half), R7, R8.
+> (per-provider concurrency), **R4** (spend cap + per-app gateway keys), **R6** (one
+> TypeScript across the workspace), **R7** (dev.db ignores), and **R8** (module concentration)
+> have since been implemented — see their sections below, marked RESOLVED. **R1** is partially
+> resolved: the gateway's *lifetime* is decoupled from the window (background mode) but its
+> *execution* still runs in the renderer.
+> Remaining open: **R1 (execution half)** — and nothing else from this audit.
 
 ---
 
@@ -394,12 +395,43 @@ reverting one package to `~5.8.0` makes it exit 1 with the offending file named.
 
 **Fix (applied):** `*.db`, `*.db-shm`, `*.db-wal` added to `.gitignore`.
 
-### R8 — [LOW] `store.ts` / `commands.rs` concentration
+### R8 — [LOW] `store.ts` / `commands.rs` concentration — **RESOLVED 2026-09-18**
 
 Both IPC seams accumulate every action. Acceptable now; they will not scale indefinitely.
 
 **Fix:** when either passes ~1.5k LOC, split by domain (providers / keys / manifests / ledger /
 settings) behind the existing command surface. No behavior change.
+
+**Resolution (applied) — but the finding named the wrong files.** Measured against its own
+1.5k trigger, neither file qualifies: `store.ts` is 545 lines, `commands.rs` is 270. The
+concentration that mattered was **`gateway.rs` at 2,389 lines**, which also had the widest blast
+radius in the codebase — auth, four wire dialects, the tool loop, capacity, and the spend gate
+all in one file.
+
+Split by **dialect**, not by size, so a framing change to one protocol cannot touch another:
+
+| file | lines | contents |
+|---|---|---|
+| `gateway.rs` | 552 | core state, bridge protocol, auth, capacity, shared helpers |
+| `gateway_handlers.rs` | 312 | OpenAI Chat / models / images + catch-all |
+| `gateway_anthropic.rs` | 290 | Anthropic Messages |
+| `gateway_responses.rs` | 281 | OpenAI Responses |
+| `gateway_gemini.rs` | 259 | Gemini `generateContent` |
+| `gateway_tests.rs` | 790 | integration tests (`gateway::tests` via `#[path]`) |
+
+Verified as behaviour-preserving: 69 Rust tests pass unchanged, including all four dialect
+integration tests, with no new compiler warnings.
+
+**Two things worth recording:**
+
+- *Nothing had to be made `pub`.* Child modules can reach the parent's private items, so the
+  shared helpers stay private in `gateway.rs` and each dialect imports them. Only the seven
+  handler entry points became `pub(crate)`.
+- *Tests were not split.* They exercise the HTTP surface end to end, so per-dialect test files
+  would duplicate the harness for no gain.
+
+**Still watch:** `persist.rs` (1,297) and `egress.rs` (648) are the next-largest. Neither is
+urgent, but `persist.rs` is growing and is the natural next candidate under the same rule.
 
 ---
 

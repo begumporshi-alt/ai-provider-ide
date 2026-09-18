@@ -570,3 +570,32 @@ window off-screen instead of hidden. Flagged in ARCHITECTURE_AUDIT.md rather tha
 - If a full install fails, check for dangling bins and repoint the symlink into the pnpm store
   rather than reinstalling:
   `ln -sfn ../../../node_modules/.pnpm/typescript@<v>/node_modules/typescript <pkg>/node_modules/typescript`
+
+## 2026-09-18 — Audit R8: gateway.rs split by wire dialect
+
+**The finding named the wrong files.** R8 flagged `store.ts` and `commands.rs` with a "~1.5k LOC"
+trigger. Measured: store.ts 545, commands.rs 270. Neither qualifies. The real concentration was
+`gateway.rs` at 2,389 lines — auth, four wire dialects, the tool loop, capacity and the spend gate
+in one file, i.e. the widest blast radius in the repo. Re-measuring before acting changed what
+the task actually was. **Lesson: audit findings age; verify the trigger condition before
+executing the fix.**
+
+**Decisions**
+
+- **Cut by dialect, not by size.** The split follows the wire protocol boundary (OpenAI Chat /
+  models / images, Anthropic Messages, OpenAI Responses, Gemini) so a framing change to one
+  cannot touch another. An arbitrary "first 800 lines / rest" cut would split nothing coherent.
+- **Nothing became `pub`.** Rust lets a child module reach the parent's private items, so
+  `check_gateway_key`, `try_slot`, `err`, `openai_error`, `peer_ip`, `forwarded_headers` and
+  `map_generic_to_status` stay private in `gateway.rs` and each dialect imports them. Only the
+  seven handler entry points went `pub(crate)` — the surface `spawn()` routes to.
+- **`#[path]` for clean module names.** Files are `gateway_<dialect>.rs` (sorts together in a
+  directory listing) but modules are `anthropic`, `gemini`, `handlers`, `responses` — no
+  `gateway::gateway_anthropic` stutter.
+- **Tests not split.** They exercise the HTTP surface end to end, so per-dialect test files
+  would duplicate the harness. Kept as one `gateway_tests.rs` declared via
+  `#[path = "gateway_tests.rs"] mod tests;` so `use super::*` still resolves to `gateway`.
+
+**Verification:** 69 Rust tests pass unchanged (including all four dialect integration tests),
+no new compiler warnings. Committed as its own commit so the mechanical move is reviewable
+separately from any behaviour change.
