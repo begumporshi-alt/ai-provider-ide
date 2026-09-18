@@ -47,7 +47,9 @@ export function GatewayScreen() {
   const [portInput, setPortInput] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
-  const [toolsEnabled, setToolsEnabled] = useState<boolean>(false);
+  // Mirrors the Rust default (GatewayCore::new) so the toggle does not flash "Disabled"
+  // for a beat before the invoke resolves.
+  const [toolsEnabled, setToolsEnabled] = useState<boolean>(true);
   // R4
   const [appKeys, setAppKeys] = useState<AppKey[]>([]);
   const [newKeyLabel, setNewKeyLabel] = useState("");
@@ -455,9 +457,13 @@ export function GatewayScreen() {
         <h2 className="mb-2 text-[14px] font-semibold">Feature toggles</h2>
         <div className="flex items-center justify-between">
           <div>
-            <span className="text-[13px] font-medium">Forward tools parameters</span>
+            <span className="text-[13px] font-medium">Gateway tools</span>
             <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              Forward <code className="mono">tools</code>, <code className="mono">tool_choice</code>, and <code className="mono">response_format</code> to upstream providers.
+              On (default): a client that brings its own <code className="mono">tools</code> has them forwarded
+              upstream and runs them itself; a client that brings none gets the gateway&apos;s own sandboxed
+              tools, confined to <span className="mono">~/AI-Provider-Router-Workspace</span>. Off strips
+              <code className="mono">tools</code>, <code className="mono">tool_choice</code> and
+              <code className="mono">response_format</code> from every request.
             </p>
           </div>
           <Button

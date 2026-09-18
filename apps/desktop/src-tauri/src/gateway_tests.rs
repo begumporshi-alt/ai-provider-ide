@@ -900,3 +900,17 @@
         let root = core.workspace_root().expect("default workspace root");
         assert_eq!(root, default_workspace_root().unwrap());
     }
+
+    /// Tools are on by default. Off is opt-in because stripping `tools` / `tool_choice` /
+    /// `response_format` breaks every coding agent that connects.
+    #[test]
+    fn tools_are_enabled_by_default() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        assert!(core.is_tools_enabled(), "gateway tools must default to on");
+        // And the toggle still works both ways.
+        core.set_tools_enabled(false);
+        assert!(!core.is_tools_enabled());
+        core.set_tools_enabled(true);
+        assert!(core.is_tools_enabled());
+    }

@@ -179,7 +179,12 @@ impl GatewayCore {
             hidden: AtomicBool::new(false),
             running: AtomicBool::new(false),
             port: Mutex::new(DEFAULT_PORT),
-            tools_enabled: AtomicBool::new(false),
+            // On by default. Two things hang off this flag, and both are safe with it on:
+            // a client that brings its own tools is passed through (the client runs them),
+            // and a client that brings none gets the gateway's sandboxed registry instead —
+            // confined to `default_workspace_root()`. Off means tool parameters are stripped
+            // before the request ever leaves, which breaks coding agents, so off is opt-in.
+            tools_enabled: AtomicBool::new(true),
             workspace_root: Mutex::new(default_workspace_root()),
         }
     }
