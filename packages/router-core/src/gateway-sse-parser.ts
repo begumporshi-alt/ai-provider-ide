@@ -2,8 +2,24 @@
  * Gateway SSE parser (Phase 2 of gateway-flexibility plan).
  *
  * Parses raw upstream SSE into structured OpenAI-compatible chunks, reassembling
- * tool calls from delta fragments. The gateway bridge feeds raw SSE lines into this
- * parser and emits structured deltas + tool calls back to the client.
+ * tool calls from delta fragments.
+ *
+ * ⚠️ NOT WIRED UP — no production code calls this. Read the rest before using it.
+ *
+ * The header used to claim "the gateway bridge feeds raw SSE lines into this parser".
+ * It never did, and it cannot: adapters resolve the provider's SSE themselves and yield
+ * decoded `delta` strings (`manifest-interpreter`: `yield delta`), and tool calls do not
+ * travel in chunks at all — the interpreter reports them on `onToolCall` once the stream
+ * ends. So the bridge receives text, not wire frames.
+ *
+ * That false premise shipped as a real bug: the bridge called
+ * `JSON.parse(rawChunk)` on every chunk, which threw on every chunk, and the
+ * `catch { continue }` around it silently dropped the entire answer — the gateway
+ * returned empty completions. See DECISIONS.md (2026-09-18).
+ *
+ * Wire this up only if the bridge is changed to receive genuinely raw upstream SSE.
+ * Until then it is dead code kept for the dialect work described below, and nothing
+ * should be written against the assumption that chunks are JSON.
  *
  * Three parser variants correspond to the three upstream formats our adapters may return:
  * - parseOpenAIChatDelta — OpenAI Chat Completions stream
