@@ -60,7 +60,6 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         // stream exactly when the client disconnects or the body finishes.
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
-            let mut tool_pending = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -70,11 +69,6 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
-                        if tool_pending {
-                            // Bridge executed tools and re-dispatched; break to let the
-                            // FollowUp handler take over with the next turn.
-                            break;
-                        }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                             json!({
@@ -101,8 +95,9 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                         break;
                     }
                     BridgeMsg::ToolCalls(calls) => {
-                        // Emit tool calls as OpenAI-shaped SSE chunk so clients receive
-                        // structured tool_calls instead of mercury-2.5 pseudo-markup.
+                        // Pass-through: the client declared these tools and will run them
+                        // itself, so hand them back shaped for the OpenAI wire and stop.
+                        // The request ends here — the gateway does not also execute them.
                         let payload = json!({
                             "id": format!("gw-{}", id),
                             "object": "chat.completion.chunk",
@@ -113,19 +108,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                             }]
                         });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
-                        tool_pending = true;
                         break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
-                    BridgeMsg::FollowUp { messages } => {
-                        // Bridge executed tools and re-dispatched with updated messages.
-                        let mut new_chat = req.clone();
-                        new_chat["messages"] = json!(messages);
-                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-                    }
-                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             drop(slot);
@@ -137,36 +124,25 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
 
     let mut full = String::new();
     let mut tool_calls_json: Option<String> = None;
-    let mut tool_pending = false;
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => {
-                if tool_pending { break; }
-                break;
-            }
+            BridgeMsg::Done => break,
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
-                // Buffer tool calls for non-streaming response.
+                // Pass-through: hand the client's tool calls back and finish the request.
                 tool_calls_json = Some(calls.to_string());
-                tool_pending = true;
                 break;
             }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
-            BridgeMsg::FollowUp { messages } => {
-                let mut new_chat = req.clone();
-                new_chat["messages"] = json!(messages);
-                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-            }
-            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);
@@ -205,35 +181,6 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     }
 }
 
-/// Build updated messages from the original chat body + tool call results, then re-dispatch
-/// through the bridge so the handler loop can continue collecting more turns.
-///
-/// Tool result messages are appended as role="tool" entries; the assistant turn that
-/// requested the calls is kept as-is so upstream providers see a complete conversation.
-fn re_dispatch_with_tool_results(
-    core: &Arc<GatewayCore>,
-    request_id: u64,
-    original_chat: &serde_json::Value,
-    tool_calls: &serde_json::Value,
-) {
-    let mut msgs: Vec<Value> = original_chat.get("messages").cloned().unwrap_or(json!([])).as_array().cloned().unwrap_or_default();
-    if let Some(arr) = tool_calls.as_array() {
-        for tc in arr {
-            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
-            let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&json!(null));
-            let _args: String = if let Some(s) = args_raw.as_str() { s.to_string() } else { args_raw.to_string() };
-            // Append a tool result message: the bridge will set content via gateway_re_dispatch.
-            msgs.push(json!({
-                "role": "tool",
-                "tool_call_id": call_id,
-                "content": format!("[gateway: tool '{}' called, awaiting result]", name),
-            }));
-        }
-    }
-    core.re_dispatch(request_id, msgs);
-}
-
 pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
@@ -257,8 +204,6 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
-            BridgeMsg::ToolResult { .. } => {}
-            BridgeMsg::FollowUp { .. } => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
@@ -304,9 +249,8 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
-            BridgeMsg::ToolResult { .. } => {}
-            BridgeMsg::FollowUp { .. } => {}
         }
-    }    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
+    }
+    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
 }
 

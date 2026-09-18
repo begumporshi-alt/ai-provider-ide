@@ -182,12 +182,6 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
-                    BridgeMsg::FollowUp { messages } => {
-                        let mut new_chat = req.clone();
-                        new_chat["messages"] = json!(messages);
-                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-                    }
-                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             // Only emit stop events if we didn't break for tool execution.
@@ -212,7 +206,6 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_content_blocks: Vec<Value> = Vec::new();
     let mut has_tool_calls = false;
-    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
@@ -221,7 +214,6 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             }
             BridgeMsg::Result(_) => {}
             BridgeMsg::Done => {
-                if tool_pending { break; }
                 tracing::info!(request_id = id, full_len = full.len(), "anthropic non-stream done");
                 break;
             }
@@ -232,7 +224,6 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             BridgeMsg::ToolCalls(calls) => {
                 // Buffer tool calls to include as tool_use blocks in the response.
                 has_tool_calls = true;
-                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -256,12 +247,6 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
-            BridgeMsg::FollowUp { messages } => {
-                let mut new_chat = req.clone();
-                new_chat["messages"] = json!(messages);
-                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-            }
-            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);

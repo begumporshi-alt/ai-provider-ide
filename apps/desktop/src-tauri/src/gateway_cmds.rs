@@ -357,36 +357,6 @@ pub fn gateway_tool_run(
     Ok(crate::tools::tool_run(req))
 }
 
-/// Re-dispatch a request with accumulated tool results.
-/// Called by the bridge after executing tools locally.
-#[tauri::command]
-pub fn gateway_followup(
-    state: State<'_, Arc<GatewayState>>,
-    request_id: u64,
-    messages_json: String,
-) -> Result<(), String> {
-    let messages: Vec<serde_json::Value> =
-        serde_json::from_str(&messages_json).map_err(|e| e.to_string())?;
-    // Re-dispatch to the webview with updated messages
-    state.core.reply(request_id, BridgeMsg::FollowUp { messages });
-    Ok(())
-}
-
-/// Called by the bridge to re-dispatch with fresh messages after local tool execution.
-/// This is the primary tool-loop mechanism: bridge runs tools → builds new messages →
-/// calls this command → handler re-dispatches to upstream provider.
-#[tauri::command]
-pub fn gateway_re_dispatch(
-    state: State<'_, Arc<GatewayState>>,
-    request_id: u64,
-    messages_json: String,
-) -> Result<(), String> {
-    let messages: Vec<serde_json::Value> =
-        serde_json::from_str(&messages_json).map_err(|e| e.to_string())?;
-    state.core.re_dispatch(request_id, messages);
-    Ok(())
-}
-
 /// Webview liveness heartbeat (2s cadence from bridge.ts): proves the router core answers.
 #[tauri::command]
 pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
@@ -420,9 +390,17 @@ pub fn gateway_usage(
 
 /// Replies from the webview router for one bridged request.
 #[tauri::command]
+/// One streamed chunk.
+///
+/// Errors when nobody is listening any more. That is the bridge's only backpressure signal,
+/// and it is what stops a runaway tool loop: the bridge aborts on a failed chunk, so a request
+/// whose client has gone cannot keep buying upstream tokens.
 pub fn gateway_chunk(state: State<'_, Arc<GatewayState>>, request_id: u64, text: String) -> Result<(), String> {
-    state.core.reply(request_id, BridgeMsg::Delta(text));
-    Ok(())
+    if state.core.reply(request_id, BridgeMsg::Delta(text)) {
+        Ok(())
+    } else {
+        Err(format!("request {request_id} is no longer active"))
+    }
 }
 
 #[tauri::command]

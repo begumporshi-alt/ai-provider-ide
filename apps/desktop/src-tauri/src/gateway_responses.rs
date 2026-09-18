@@ -139,10 +139,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                             "output_index": 0, "content_index": 0, "delta": t }));
                     }
                     BridgeMsg::Result(_) => {}
-                    BridgeMsg::Done => {
-                        if tool_pending { break; }
-                        break;
-                    }
+                    BridgeMsg::Done => break,
                     BridgeMsg::Error { message, .. } => {
                         yield ev("response.failed", json!({ "type": "response.failed",
                             "response": { "id": rid, "object": "response", "status": "failed", "error": { "message": message } } }));
@@ -168,12 +165,6 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
-                    BridgeMsg::FollowUp { messages } => {
-                        let mut new_chat = req.clone();
-                        new_chat["messages"] = json!(messages);
-                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: new_chat, headers: fwd.clone() });
-                    }
-                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             if !tool_pending {
@@ -218,21 +209,16 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
     let mut usage: Option<(u64, u64)> = None;
-    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => {
-                if tool_pending { break; }
-                break;
-            }
+            BridgeMsg::Done => break,
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
-                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -251,12 +237,6 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
-            BridgeMsg::FollowUp { messages } => {
-                let mut new_chat = req.clone();
-                new_chat["messages"] = json!(messages);
-                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: new_chat, headers: fwd.clone() });
-            }
-            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);

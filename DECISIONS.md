@@ -689,3 +689,57 @@ entry's whole point.
 **Lesson:** "hidden" is not one state. A window that was never shown and a window that was
 shown and then hidden behave completely differently, and only the second keeps running JS.
 Any future change that creates a Tauri window hidden-from-birth needs the same warm-up.
+
+---
+
+## 2026-09-18 (later) — the gateway tool loop: two modes, owned by whoever declared the tools
+
+Auditing tool use found the gateway loop was half-built. Four defects, all real:
+
+1. **Tools executed twice.** On `ToolCalls` the handler emitted the calls to the client *and*
+   the bridge independently ran them in the sandbox. With Claude Code or Cursor as the client,
+   a `write_file` landed twice.
+2. **Local execution could never answer.** Both stream and non-stream handlers `break` on
+   `ToolCalls` and `drop(slot)`, so the `FollowUp` arm was unreachable and
+   `re_dispatch_with_tool_results` was dead code — exactly the "never used" warning. The
+   gateway ran the tool and threw the result away.
+3. **Unbounded.** The bridge loop was `while (true)` with no cap (the in-app `agentLoop.ts`
+   has `maxIterations = 8`; the gateway bridge does not use it), and `gateway_chunk` always
+   returned `Ok`, so there was no backpressure. A model that kept calling tools looped forever
+   with nobody listening.
+4. **Re-dispatch omitted the assistant `tool_calls` turn**, so upstream would have rejected
+   the follow-up anyway.
+
+**Fix — one rule decides everything: whoever declares the tools owns them.**
+
+- **Pass-through** (client sent its own `tools`): emit the calls on the wire and end the
+  request. Never execute them — the client already will. This is what professional routers do
+  for coding agents.
+- **Gateway** (client sent no tools, gateway tool toggle on): supply the sandboxed registry,
+  execute in the Rust host, feed results back, keep going until the model stops. The client
+  only sees the final answer.
+
+Mercury-2.5 inline markers are neither: they are not part of any client tool contract, so they
+are always executed locally and filtered from the client-visible stream.
+
+**Decisions**
+
+- **Delete rather than repair the dead mechanism.** `BridgeMsg::FollowUp`, `ToolResult`,
+  `gateway_re_dispatch`, `gateway_followup` and `re_dispatch_with_tool_results` are gone. The
+  bridge owns the loop; a second dispatch mechanism was the source of the confusion.
+- **`reply()` returns whether anyone was listening.** That is now the bridge's only
+  backpressure signal, and it is what stops a runaway loop — `gateway_chunk` fails and the
+  bridge aborts.
+- **Cap at 8 iterations**, matching `agentLoop.ts`. Bounded cost when a model will not stop.
+- **Push the assistant `tool_calls` turn before the results.** Providers reject a `tool`
+  message that answers nothing.
+- **Emit tool calls *awaited* before `gateway_done`.** Both go down the same channel; if Done
+  landed first the client would see a finished request with no calls in it.
+- **The sandbox default root is now `~/AI-Provider-Router-Workspace`,** not the process
+  working directory (which is `/` for a Finder-launched app) and not `$HOME`. A write-capable
+  sandbox must not silently default to either.
+
+**Verified:** 82 Rust tests (5 new: pass-through stream terminates without a stop finish,
+pass-through non-stream returns `tool_calls`, `reply` reports no listener, safe workspace
+default, fresh core uses it) + 261 TS. `cargo check` is now warning-free. `dist/gateway.html`
+still emitted with no React in the bundle.

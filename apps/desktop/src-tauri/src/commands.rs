@@ -245,8 +245,6 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_set_workspace_root,
         crate::gateway_cmds::gateway_get_workspace_root,
         crate::gateway_cmds::gateway_tool_run,
-        crate::gateway_cmds::gateway_followup,
-        crate::gateway_cmds::gateway_re_dispatch,
         crate::persist::onboarding_save,
         crate::persist::onboarding_latest_active,
         crate::persist::generator_audit_record,

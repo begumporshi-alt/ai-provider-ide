@@ -122,7 +122,6 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     if streaming {
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
-            let mut tool_pending = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -131,7 +130,6 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
-                        if tool_pending { break; }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
@@ -160,21 +158,16 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                                 yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                             }
                         }
+                        // Pass-through: the tool calls have already been yielded above, so the
+                        // request ends here rather than also emitting a normal STOP finish.
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         let fin = json!({ "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
-                        tool_pending = true;
                         break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
-                    BridgeMsg::FollowUp { messages } => {
-                        let mut new_chat = req.clone();
-                        new_chat["messages"] = serde_json::to_value(&messages).unwrap_or_default();
-                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-                    }
-                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             drop(slot);
@@ -187,22 +180,17 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     let mut err_info: Option<(u16, String)> = None;
     let mut has_tool_calls = false;
     let mut tool_parts: Vec<Value> = Vec::new();
-    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => {
-                if tool_pending { break; }
-                break;
-            }
+            BridgeMsg::Done => break,
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
                 has_tool_calls = true;
-                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let _call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -220,12 +208,6 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
-            BridgeMsg::FollowUp { messages } => {
-                let mut new_chat = req.clone();
-                new_chat["messages"] = serde_json::to_value(&messages).unwrap_or_default();
-                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
-            }
-            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);

@@ -3,15 +3,22 @@
  * router core, streams chunks back through the gateway_* commands, and aborts on cancel
  * events (§3.5). Ledger source is "gateway" (criterion 10 attribution).
  *
- * Tool execution loop: when the provider returns tool_calls, the bridge executes them
- * locally via gateway_tool_run, appends results to messages, and calls gateway_re_dispatch
- * to re-emit the request with updated context. Runs until the model stops returning
- * tool_calls, then emits gateway_done to the client.
+ * Tool calls have exactly two modes, and which one applies is decided by who declared the
+ * tools — never guessed:
+ *
+ *   PASS-THROUGH  The client sent its own `tools` array. Those are the client's tools and
+ *                 the client will run them. We emit them on the wire and end the request.
+ *                 We do NOT also execute them: that would write the same file twice.
+ *
+ *   GATEWAY       The client sent no tools and the gateway tool toggle is on. We supply our
+ *                 own sandboxed registry, execute each call in the Rust host, feed the
+ *                 results back to the model, and keep going until it stops asking. The
+ *                 client only ever sees the final answer.
  *
  * Mercury-2.5 handling: models trained on agent transcripts may emit tool calls as
- * inline text markers rather than structured OpenAI tool_calls. This bridge intercepts
- * those markers, parses them into structured calls, executes them locally, and filters
- * them from the client-visible stream so the user never sees raw marker syntax.
+ * inline text markers rather than structured OpenAI tool_calls. Those markers are not part
+ * of any client tool contract, so they are always executed locally and filtered out of the
+ * client-visible stream — the user never sees raw marker syntax.
  *
  * The master key never appears here — auth happened in Rust before this file ever runs.
  */
@@ -22,12 +29,24 @@ import { router } from "./store";
 import { normalizeGatewayRequest, detectClient, parseOpenAIChatDelta, parseClaudeDelta, initAccumulatorState } from "@aiprovider/router-core";
 import type { LedgerSource, AccumulatorState } from "@aiprovider/router-core";
 import { parseAssistantStream, type ToolSegment } from "./lib/assistant-stream";
+import { AGENT_TOOLS, registryToOpenAI } from "./lib/tools/registry";
 
 interface BridgeRequest {
   requestId: number;
   kind: "chat" | "responses" | "models" | "image";
   body: Record<string, unknown>;
   headers: Record<string, string>;
+}
+
+/** Matches `maxIterations` in lib/tools/agentLoop.ts. A model that will not stop calling
+ *  tools must not be able to spend without limit; 8 turns is enough for real work and
+ *  bounded when something goes wrong. */
+const MAX_TOOL_ITERATIONS = 8;
+
+interface ToolCall {
+  id?: string;
+  name?: string;
+  arguments?: string;
 }
 
 const active = new Map<number, AbortController>();
@@ -78,18 +97,36 @@ async function handle(req: BridgeRequest): Promise<void> {
       const clientHint = detectClient(req.headers || {});
       const normalizedBody = normalizeGatewayRequest(req.body, { clientHint });
       const model = String(normalizedBody.model ?? "");
-      let messages = (normalizedBody.messages ?? []) as Array<{
+      const messages = (normalizedBody.messages ?? []) as Array<{
         role: "user" | "assistant" | "system" | "tool";
         content: string;
         tool_call_id?: string;
         tool_calls?: Array<{ id?: string; name?: string; arguments?: string }>;
       }>;
-      const tools = normalizedBody.tools;
-      const toolChoice = normalizedBody.tool_choice;
+      const clientTools = Array.isArray(normalizedBody.tools) && normalizedBody.tools.length > 0
+        ? normalizedBody.tools
+        : undefined;
       const responseFormat = normalizedBody.response_format;
       const maxTokens = typeof normalizedBody.max_tokens === "number" ? normalizedBody.max_tokens : undefined;
       const temperature = typeof normalizedBody.temperature === "number" ? normalizedBody.temperature : undefined;
 
+      // Who owns the tools? The client, if it brought its own. Otherwise the gateway, but
+      // only when the operator has turned gateway tools on.
+      let gatewayTools = false;
+      if (!clientTools) {
+        try {
+          gatewayTools = await invoke<boolean>("get_tools_enabled");
+        } catch {
+          gatewayTools = false;
+        }
+      }
+      const tools = gatewayTools ? registryToOpenAI(AGENT_TOOLS) : clientTools;
+      // Pass-through must honour the client's own tool_choice; only the gateway-supplied
+      // registry is ours to steer with "auto".
+      const toolChoice = gatewayTools ? "auto" : normalizedBody.tool_choice;
+
+      // Emitting a chunk is also the liveness check: gateway_chunk fails once the HTTP
+      // request is gone, and aborting here is what stops us paying for tokens nobody wants.
       const emitProse = (t: string) => {
         if (!t) return;
         const segs = parseAssistantStream(t);
@@ -102,43 +139,56 @@ async function handle(req: BridgeRequest): Promise<void> {
         }
       };
 
-      // The gateway Rust side initializes workspace_root to current_dir / home_dir on startup.
-      // gateway_set_workspace_root can be called anytime to change it; nothing needed here.
-      let _workspaceRoot: string | null = null;
-      const ensureWorkspaceRoot = async (): Promise<string> => {
-        if (_workspaceRoot !== null) return _workspaceRoot;
-        try {
-          const existing = await invoke<string | null>("gateway_get_workspace_root");
-          if (existing) {
-            _workspaceRoot = existing;
-            return _workspaceRoot;
-          }
-        } catch {}
-        // Fallback: should not normally reach here since Rust defaults to cwd/home.
-        _workspaceRoot = "/tmp";
-        await invoke("gateway_set_workspace_root", { path: _workspaceRoot }).catch(() => undefined);
-        return _workspaceRoot;
+      // Must be awaited by the caller: this and gateway_done race on the same channel, and if
+      // Done landed first the client would see a finished request with no tool calls in it.
+      const emitToolCalls = async (calls: ToolCall[]) => {
+        await invoke("gateway_tool_calls", {
+          requestId: req.requestId,
+          toolCallsJson: JSON.stringify(calls),
+        }).catch(() => undefined);
       };
 
-      const dispatchMercuryCalls = async (calls: ToolSegment[], list: Array<{ id?: string; name?: string; arguments?: string; raw?: unknown }>, emitted: { ref: boolean }) => {
-        for (const seg of calls) {
-          const callId = crypto.randomUUID().slice(0, 8);
-          const argsObj: Record<string, string> = {};
-          for (const [k, v] of Object.entries(seg.params)) {
-            argsObj[k] = v;
+      const executeLocally = async (calls: ToolCall[]) => {
+        for (const call of calls) {
+          const name = call.name ?? "";
+          let args: unknown = {};
+          try {
+            args = call.arguments ? JSON.parse(call.arguments) : {};
+          } catch {
+            args = call.arguments ?? {};
           }
-          list.push({ id: callId, name: seg.name ?? "", arguments: JSON.stringify(argsObj) });
-          await invoke("gateway_tool_calls", {
-            requestId: req.requestId,
-            toolCallsJson: JSON.stringify([{ id: callId, type: "function", function: { name: seg.name ?? "", arguments: JSON.stringify(argsObj) } }]),
-          }).catch(() => undefined);
-          emitted.ref = true;
+          let resultText: string;
+          try {
+            const result = await invoke<{ ok: boolean; output: string; error?: string }>(
+              "gateway_tool_run",
+              { requestId: req.requestId, toolName: name, arguments: JSON.stringify(args) },
+            );
+            resultText = result.ok ? result.output : (result.error ?? "tool execution failed");
+          } catch (e) {
+            resultText = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;
+          }
+          messages.push({ role: "tool", content: resultText, tool_call_id: call.id ?? name });
         }
       };
 
-      while (true) {
-        const accumulatedToolCalls: Array<{ id?: string; name?: string; arguments?: string; raw?: unknown }> = [];
-        let toolCallEmitted = false;
+      /** Run the calls in the sandbox and leave the model a well-formed turn it can accept:
+       *  the assistant message that requested the calls, then one result per call. Providers
+       *  reject a `tool` message that is not answering a preceding `tool_calls` turn. */
+      const sandboxTurn = async (turnText: string, calls: ToolCall[]) => {
+        messages.push({
+          role: "assistant",
+          content: turnText,
+          tool_calls: calls.map((c) => ({ id: c.id ?? "", name: c.name ?? "", arguments: c.arguments ?? "{}" })),
+        });
+        await executeLocally(calls);
+      };
+
+      for (let iter = 1; iter <= MAX_TOOL_ITERATIONS; iter++) {
+        if (ac.signal.aborted) return;
+
+        const collected: ToolCall[] = [];
+        const mercuryCalls: ToolCall[] = [];
+        let turnText = "";
 
         const exec = await router.generateText(
           {
@@ -149,7 +199,9 @@ async function handle(req: BridgeRequest): Promise<void> {
             tools,
             toolChoice,
             responseFormat,
-            onToolCall: (call) => { accumulatedToolCalls.push(call); },
+            onToolCall: (call) => {
+              if (!collected.some((c) => c.id && c.id === call.id)) collected.push(call as ToolCall);
+            },
             onUsage: (usage) => {
               void invoke("gateway_usage", {
                 requestId: req.requestId,
@@ -162,9 +214,9 @@ async function handle(req: BridgeRequest): Promise<void> {
         );
 
         const state: AccumulatorState = initAccumulatorState();
-        let pendingMercury: ToolSegment | null = null;
 
         for await (const rawChunk of exec.chunks) {
+          if (ac.signal.aborted) break;
           let parsed: ReturnType<typeof parseOpenAIChatDelta> | null = null;
           try {
             parsed = parseOpenAIChatDelta(JSON.parse(rawChunk), state);
@@ -181,15 +233,8 @@ async function handle(req: BridgeRequest): Promise<void> {
 
           if (parsed?.toolCalls && parsed.finishReason === "tool_calls") {
             for (const c of parsed.toolCalls) {
-              if (!accumulatedToolCalls.some((a) => a.id === c.id)) {
-                accumulatedToolCalls.push(c);
-              }
+              if (!collected.some((a) => a.id === c.id)) collected.push(c as ToolCall);
             }
-            await invoke("gateway_tool_calls", {
-              requestId: req.requestId,
-              toolCallsJson: JSON.stringify(parsed.toolCalls),
-            }).catch(() => undefined);
-            toolCallEmitted = true;
           }
 
           if (parsed?.usage) {
@@ -200,74 +245,62 @@ async function handle(req: BridgeRequest): Promise<void> {
             }).catch(() => undefined);
           }
 
-          // Mercury-2.5 inline text markers.
+          // Mercury-2.5 inline text markers: not part of any client tool contract, so these
+          // are always ours to run.
           const segs = parseAssistantStream(rawChunk);
-          for (const seg of segs) {
-            if (seg.kind === "tool" && seg.complete) {
-              if (pendingMercury !== null) {
-                pendingMercury = null;
-              }
-            } else if (seg.kind === "tool" && !seg.complete) {
-              pendingMercury = seg;
-            }
+          const visible = segs
+            .filter((s): s is { kind: "text"; text: string } => s.kind === "text")
+            .map((s) => s.text)
+            .join("");
+          turnText += visible;
+          emitProse(visible);
+
+          for (const seg of segs.filter((s): s is ToolSegment => s.kind === "tool" && s.complete)) {
+            const id = crypto.randomUUID().slice(0, 8);
+            const params: Record<string, string> = {};
+            for (const [k, v] of Object.entries(seg.params)) params[k] = v;
+            mercuryCalls.push({ id, name: seg.name ?? "", arguments: JSON.stringify(params) });
           }
-          emitProse(segs.filter((s): s is { kind: "text"; text: string } => s.kind === "text").map((s) => s.text).join(""));
-          const completedMercury = segs.filter((s): s is ToolSegment => s.kind === "tool" && s.complete);
-          if (completedMercury.length > 0) {
-            await dispatchMercuryCalls(completedMercury, accumulatedToolCalls, { ref: false } as { ref: boolean });
+        }
+
+        if (ac.signal.aborted) return;
+
+        // Some providers stream the tool calls without ever setting finish_reason on the same
+        // chunk, so fall back to whatever the accumulator gathered.
+        if (state.finishReason === "tool_calls" && state.toolCalls.size > 0) {
+          for (const c of state.toolCalls.values()) {
+            const call = { id: c.id ?? "", name: c.function?.name ?? "", arguments: c.function?.arguments ?? "{}" };
+            if (!collected.some((a) => a.id === call.id)) collected.push(call);
           }
         }
 
-        if (pendingMercury !== null && pendingMercury.complete) {
-          await dispatchMercuryCalls([pendingMercury], accumulatedToolCalls, { ref: false } as { ref: boolean });
+        // Mercury markers first: they are ours regardless of who declared the real tools.
+        if (mercuryCalls.length > 0) {
+          await sandboxTurn(turnText, mercuryCalls);
+          continue;
         }
 
-        if (!toolCallEmitted && state.toolCalls.size > 0 && state.finishReason === "tool_calls") {
-          const calls = Array.from(state.toolCalls.values()).map((c) => ({
-            id: c.id ?? "",
-            type: c.type,
-            function: c.function,
-          }));
-          void invoke("gateway_tool_calls", {
-            requestId: req.requestId,
-            toolCallsJson: JSON.stringify(calls),
-          }).catch(() => undefined);
-        }
-
-        if (accumulatedToolCalls.length === 0) {
+        // No tool calls at all: the model answered and the turn is over.
+        if (collected.length === 0) {
           done();
           return;
         }
 
-        // Ensure workspace root is set before executing any tools.
-        await ensureWorkspaceRoot().catch(() => undefined);
-
-        for (const call of accumulatedToolCalls) {
-          const name = call.name ?? "";
-          let args = {};
-          try {
-            args = call.arguments ? JSON.parse(call.arguments) : {};
-          } catch {
-            args = call.arguments ?? {};
-          }
-          try {
-            const result = await invoke<{ ok: boolean; output: string; error?: string }>(
-              "gateway_tool_run",
-              { requestId: req.requestId, toolName: name, arguments: JSON.stringify(args) },
-            );
-            const resultText = result.ok ? result.output : (result.error ?? "tool execution failed");
-            messages.push({ role: "tool", content: resultText, tool_call_id: call.id ?? name });
-          } catch (e) {
-            const errMsg = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;
-            messages.push({ role: "tool", content: errMsg, tool_call_id: call.id ?? name });
-          }
+        // Pass-through: hand the client's calls back untouched and end the request. We do not
+        // execute them — the client already will.
+        if (!gatewayTools) {
+          await emitToolCalls(collected);
+          done();
+          return;
         }
 
-        await invoke("gateway_re_dispatch", {
-          requestId: req.requestId,
-          messagesJson: JSON.stringify(messages),
-        }).catch(() => undefined);
+        // Gateway tools: run them in the sandbox and keep the conversation going.
+        await sandboxTurn(turnText, collected);
       }
+
+      // Iteration ceiling reached: return what we have rather than looping forever.
+      done();
+      return;
     }
     if (req.kind === "models") {
       const rows = await router.listModels();

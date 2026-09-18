@@ -100,20 +100,21 @@ pub struct BridgeRequest {
 }
 
 /// Messages the webview bridge sends back for one request.
+///
+/// The bridge owns the tool loop, so there is deliberately no "here are tool results, dispatch
+/// again" variant: it executes locally, re-calls the model itself, and only ever emits prose,
+/// a final `Result`, `Usage`, `Done` or `Error` on this channel. Tool calls only appear here in
+/// *pass-through* mode, where the client declared the tools and will execute them itself.
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
     Delta(String),
+    /// Client-declared tool calls to hand back untouched (pass-through mode only).
     ToolCalls(Value),
-    /// Tool execution result from the local sandbox, fed back to the model as a tool role message.
-    ToolResult { call_id: String, content: String },
     Result(Value),
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
-    /// Re-dispatch the request with updated messages (accumulated tool results).
-    /// The bridge should append tool results to the conversation and send a new request.
-    FollowUp { messages: Vec<serde_json::Value> },
     Done,
     Error { status: u16, message: String },
 }
@@ -149,13 +150,22 @@ pub struct GatewayCore {
     workspace_root: Mutex<Option<std::path::PathBuf>>,
 }
 
+/// Where the sandboxed tools may write before the user picks a workspace.
+///
+/// Deliberately NOT the process working directory and NOT `$HOME`. A desktop app launched
+/// from Finder inherits cwd `/`, and `$HOME` would hand a model the whole user directory;
+/// either would make "write a file" a surprisingly dangerous instruction. A single
+/// predictable folder under the home directory is both safe and usable, and
+/// `gateway_set_workspace_root` can point it somewhere else at any time.
+pub fn default_workspace_root() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from)?;
+    let dir = home.join("AI-Provider-Router-Workspace");
+    std::fs::create_dir_all(&dir).ok()?;
+    Some(dir)
+}
+
 impl GatewayCore {
     pub fn new(bridge: Arc<dyn Bridge>, key_provider: KeyProvider) -> Self {
-        // Default workspace root: current process directory, falling back to home.
-        let default_root = std::env::current_dir()
-            .ok()
-            .or_else(|| std::env::var("HOME").map(std::path::PathBuf::from).ok())
-            .unwrap_or_default();
         Self {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -170,7 +180,7 @@ impl GatewayCore {
             running: AtomicBool::new(false),
             port: Mutex::new(DEFAULT_PORT),
             tools_enabled: AtomicBool::new(false),
-            workspace_root: Mutex::new(Some(default_root)),
+            workspace_root: Mutex::new(default_workspace_root()),
         }
     }
 
@@ -234,14 +244,24 @@ impl GatewayCore {
 
     /// Webview bridge replies land here (gateway_chunk / gateway_result / gateway_done /
     /// gateway_error commands). Unknown/stale id = client already gone -> idempotent no-op.
-    pub fn reply(&self, id: u64, msg: BridgeMsg) {
+    /// Hand a bridge message to the HTTP handler waiting on this request.
+    ///
+    /// Returns whether anyone was still listening. That is load-bearing, not incidental: the
+    /// bridge streams into this channel, and if the client has already gone (disconnect, or a
+    /// completed pass-through response) there is no point paying for more upstream tokens.
+    /// `false` lets the caller tear the loop down instead of streaming into a void.
+    pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
         let tx = self.pending.lock().unwrap().get(&id).cloned();
-        if let Some(tx) = tx {
-            let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
-            let _ = tx.send(msg);
-            if terminal {
-                self.pending.lock().unwrap().remove(&id);
+        match tx {
+            Some(tx) => {
+                let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
+                let sent = tx.send(msg).is_ok();
+                if terminal {
+                    self.pending.lock().unwrap().remove(&id);
+                }
+                sent
             }
+            None => false,
         }
     }
 
@@ -265,15 +285,6 @@ impl GatewayCore {
     /// Get the current workspace root. Returns None if not set.
     pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
         self.workspace_root.lock().unwrap().clone()
-    }
-
-    /// Re-dispatch a request with updated messages (after local tool execution).
-    /// The bridge calls this via `gateway_re_dispatch` to continue the agent loop.
-    pub fn re_dispatch(&self, id: u64, messages: Vec<serde_json::Value>) {
-        let tx = self.pending.lock().unwrap().get(&id).cloned();
-        if let Some(tx) = tx {
-            let _ = tx.send(BridgeMsg::FollowUp { messages });
-        }
     }
 }
 

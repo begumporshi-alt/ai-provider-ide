@@ -11,14 +11,24 @@
         core: Mutex<Option<Arc<GatewayCore>>>,
         cancels: AtomicUsize,
         slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
+        /// Make the synthetic model answer with tool calls instead of a plain finish.
+        tool_calls: AtomicBool,
     }
 
     impl SynthBridge {
         fn new() -> Self {
-            Self { core: Mutex::new(None), cancels: AtomicUsize::new(0), slow: AtomicUsize::new(0) }
+            Self {
+                core: Mutex::new(None),
+                cancels: AtomicUsize::new(0),
+                slow: AtomicUsize::new(0),
+                tool_calls: AtomicBool::new(false),
+            }
         }
         fn attach(&self, core: &Arc<GatewayCore>) {
             *self.core.lock().unwrap() = Some(core.clone());
+        }
+        fn answer_with_tool_calls(&self, on: bool) {
+            self.tool_calls.store(on, Ordering::Relaxed);
         }
     }
 
@@ -26,6 +36,7 @@
         fn dispatch(&self, req: BridgeRequest) {
             let core = self.core.lock().unwrap().clone().unwrap();
             let slow = self.slow.load(Ordering::Relaxed);
+            let with_tools = self.tool_calls.load(Ordering::Relaxed);
             std::thread::spawn(move || {
                 if slow > 0 {
                     std::thread::sleep(Duration::from_millis(slow as u64 * 20));
@@ -34,6 +45,18 @@
                     "chat" => {
                         core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                         core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                        if with_tools {
+                            // Pass-through: the client declared these, so the gateway hands
+                            // them straight back and never executes them itself.
+                            core.reply(
+                                req.request_id,
+                                BridgeMsg::ToolCalls(json!([{
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": { "name": "write_file", "arguments": "{\"path\":\"a.txt\"}" }
+                                }])),
+                            );
+                        }
                         core.reply(req.request_id, BridgeMsg::Done);
                     }
                     "responses" => {
@@ -787,4 +810,93 @@
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["error"]["type"], "not_found");
         assert_eq!(body["error"]["code"], "unknown_route");
+    }
+
+    // ---------- tool calls: pass-through (2026-09-18) ----------
+    //
+    // These lock in the rule that ended double execution: when the client declares the tools,
+    // the gateway hands the calls back and ends the request. It does NOT also run them, and
+    // it does not wait for anything — the request must terminate.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pass_through_stream_emits_tool_calls_then_ends() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.answer_with_tool_calls(true);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut stream = res.bytes_stream();
+        let mut acc = String::new();
+        // Drain to EOF: if the handler waited on a bridge that went off to execute tools,
+        // this would never return.
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        assert!(acc.contains("\"tool_calls\""), "client must receive the calls: {acc}");
+        assert!(acc.contains("finish_reason"), "{acc}");
+        assert!(acc.contains("write_file"), "call payload must survive: {acc}");
+        // A pass-through turn ends on the tool calls, never on a normal stop finish.
+        assert!(
+            !acc.contains("\"finish_reason\":\"stop\""),
+            "must not also emit a stop finish: {acc}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pass_through_non_stream_returns_tool_calls() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.answer_with_tool_calls(true);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "write_file");
+        assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+    }
+
+    /// The bridge's only backpressure signal. Without it, a request whose client has gone
+    /// keeps streaming — and in a tool loop, keeps buying tokens — forever.
+    #[test]
+    fn reply_reports_when_nobody_is_listening() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        assert!(
+            !core.reply(999_999, BridgeMsg::Delta("x".into())),
+            "delivering to an unknown request must report failure"
+        );
+        assert!(!core.reply(999_999, BridgeMsg::Done));
+    }
+
+    /// A write-capable sandbox must not silently default to the whole home directory or to
+    /// the process working directory (which is `/` for a Finder-launched app).
+    #[test]
+    fn default_workspace_root_is_a_dedicated_folder() {
+        let root = default_workspace_root().expect("HOME should be set");
+        let home = std::path::PathBuf::from(std::env::var("HOME").unwrap());
+        assert!(root.starts_with(&home), "{root:?} must live under home");
+        assert_ne!(root, home, "must not hand the model the whole home directory");
+        assert!(root.is_dir(), "workspace folder must exist");
+    }
+
+    #[test]
+    fn a_fresh_core_uses_the_safe_workspace_default() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        let root = core.workspace_root().expect("default workspace root");
+        assert_eq!(root, default_workspace_root().unwrap());
     }
