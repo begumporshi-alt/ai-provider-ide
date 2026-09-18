@@ -19,6 +19,7 @@ import {
   type CatalogModel,
   type DriftEvidence,
   type LedgerEntry,
+  type PricingMicros,
   type ProviderRecord,
   type RepairPlan,
 } from "@aiprovider/router-core";
@@ -37,6 +38,18 @@ export interface HostKeyRow {
 }
 export interface HostModelRow {
   providerId: string; nativeId: string; modality: string; contextWindow: number | null; fetchedAt: number;
+  pricingJson: string | null;
+}
+
+/** Pricing comes back as a string; a row that fails to parse is unknown, never free. */
+function parsePricingJson(v: string | null | undefined): PricingMicros | undefined {
+  if (!v) return undefined;
+  try {
+    const p = JSON.parse(v) as PricingMicros;
+    return typeof p?.prompt === "number" && typeof p?.completion === "number" ? p : undefined;
+  } catch {
+    return undefined;
+  }
 }
 export interface HostManifestRow {
   id: string; providerId: string; version: number; origin: string; bodyJson: string;
@@ -226,6 +239,7 @@ export async function bootstrap(): Promise<void> {
       providerId: m.providerId, nativeId: m.nativeId,
       modality: m.modality as CatalogModel["modality"],
       contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
+      pricing: parsePricingJson(m.pricingJson),
     })),
     fetchedByProvider,
   );
@@ -440,6 +454,9 @@ export async function refreshCatalog(providerId: string, signal?: AbortSignal): 
     rows: catalog.all().filter((m) => m.providerId === providerId).map((m) => ({
       providerId: m.providerId, nativeId: m.nativeId, modality: m.modality,
       contextWindow: m.contextWindow ?? null, fetchedAt: m.fetchedAt,
+      // Persisted alongside the row: the catalog is fetched once per 24h, so a launch that
+      // only hydrates would otherwise price every request as unknown.
+      pricingJson: m.pricing ? JSON.stringify(m.pricing) : null,
     })),
   });
   catalog.deriveAutoAliases();

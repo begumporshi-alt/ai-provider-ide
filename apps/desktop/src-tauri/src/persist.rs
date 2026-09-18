@@ -296,29 +296,46 @@ pub struct ModelRow {
     #[serde(default)]
     pub context_window: Option<i64>,
     pub fetched_at: i64,
+    /// Normalized pricing as JSON (`{prompt, completion}` in micro-USD per 1M tokens), or NULL
+    /// when the provider published none. Persisted because the catalog is only re-fetched every
+    /// 24h: without it, every launch after a refresh reads back a catalog with no prices, and
+    /// cost — and therefore the monthly spend cap — goes dark until the next manual refresh.
+    #[serde(default)]
+    pub pricing_json: Option<String>,
 }
 
 #[tauri::command]
 pub fn models_cache_replace(store: State<'_, Arc<Store>>, provider_id: String, rows: Vec<ModelRow>) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
-    let tx = conn.transaction()?;
-    tx.execute("DELETE FROM models_cache WHERE provider_id = ?1", params![provider_id])?;
-    for r in rows {
-        let id = format!("{}:{}", r.provider_id, r.native_id);
-        tx.execute(
-            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at) VALUES (?1,?2,?3,?4,?5,?6)
-             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6",
-            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at],
-        )?;
-    }
-    tx.commit()?;
-    Ok(())
+    replace_models(&mut conn, &provider_id, &rows).map_err(Into::into)
 }
 
 #[tauri::command]
 pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
-    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at FROM models_cache")?;
+    list_models(&conn).map_err(Into::into)
+}
+
+/// The cache write, split out of the command so it can be tested without a Tauri `State`.
+/// `pricing_json` rides along because the catalog is re-fetched only once per 24h: a launch
+/// that hydrates from this table and finds no price will price every request as unknown,
+/// which zeroes cost and leaves the monthly spend cap unable to fire.
+fn replace_models(conn: &mut rusqlite::Connection, provider_id: &str, rows: &[ModelRow]) -> rusqlite::Result<()> {
+    let tx = conn.transaction()?;
+    tx.execute("DELETE FROM models_cache WHERE provider_id = ?1", params![provider_id])?;
+    for r in rows {
+        let id = format!("{}:{}", r.provider_id, r.native_id);
+        tx.execute(
+            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at, pricing_json) VALUES (?1,?2,?3,?4,?5,?6,?7)
+             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6, pricing_json=?7",
+            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at, r.pricing_json],
+        )?;
+    }
+    tx.commit()
+}
+
+fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
+    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json FROM models_cache")?;
     let rows = stmt.query_map([], |r| {
         Ok(ModelRow {
             provider_id: r.get(0)?,
@@ -326,9 +343,10 @@ pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, 
             modality: r.get(2)?,
             context_window: r.get(3)?,
             fetched_at: r.get(4)?,
+            pricing_json: r.get(5)?,
         })
     })?;
-    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    rows.collect::<Result<Vec<_>, _>>()
 }
 
 #[derive(Serialize, Deserialize)]
@@ -807,6 +825,64 @@ mod persist_tests {
         let dup = conn.execute("INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m3','p',3,'ai-patched','{}',1,1)", []);
         assert!(dup.is_err(), "unique partial index must reject a second active manifest");
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_pricing_survives_the_cache_round_trip() {
+        let (store, dir) = tmp_store("pricing");
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) VALUES ('p','s','n','https://x.test','enabled',1,1)",
+                [],
+            ).unwrap();
+            let rows = vec![
+                ModelRow {
+                    provider_id: "p".into(),
+                    native_id: "openai/gpt-4o-mini".into(),
+                    modality: "text".into(),
+                    context_window: None,
+                    fetched_at: 1,
+                    pricing_json: Some(r#"{"prompt":150000,"completion":600000}"#.into()),
+                },
+                ModelRow {
+                    provider_id: "p".into(),
+                    native_id: "some/free-model".into(),
+                    modality: "text".into(),
+                    context_window: None,
+                    fetched_at: 1,
+                    pricing_json: None,
+                },
+            ];
+            replace_models(&mut conn, "p", &rows).unwrap();
+            let back = list_models(&conn).unwrap();
+            assert_eq!(back.len(), 2);
+
+            // The priced row comes back priced — this is what the ledger reads after a restart.
+            let priced = back.iter().find(|r| r.native_id == "openai/gpt-4o-mini").unwrap();
+            assert_eq!(priced.pricing_json.as_deref(), Some(r#"{"prompt":150000,"completion":600000}"#));
+
+            // An unpriced row stays NULL. Writing 0 here would make "unknown" read as "free".
+            let unpriced = back.iter().find(|r| r.native_id == "some/free-model").unwrap();
+            assert_eq!(unpriced.pricing_json, None);
+
+            // A refresh that no longer carries pricing overwrites the old price rather than
+            // leaving a stale one behind.
+            let refreshed = vec![ModelRow {
+                provider_id: "p".into(),
+                native_id: "openai/gpt-4o-mini".into(),
+                modality: "text".into(),
+                context_window: None,
+                fetched_at: 2,
+                pricing_json: None,
+            }];
+            replace_models(&mut conn, "p", &refreshed).unwrap();
+            let back = list_models(&conn).unwrap();
+            assert_eq!(back.len(), 1);
+            assert_eq!(back[0].pricing_json, None);
+            assert_eq!(back[0].fetched_at, 2);
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

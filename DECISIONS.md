@@ -451,8 +451,9 @@ aarch64, 1.88.0).
 
 ## 2026-09-18 — R2: cost attribution — canonical unit is micro-USD per 1M tokens
 
-- **Problem:** `ledger.cost_estimate_micros` was always 0. `pricing_json` was stored but never
-  read; `cost_spread` rotation fell back to priority because no price was ever available.
+- **Problem:** `ledger.cost_estimate_micros` was always 0; `cost_spread` rotation fell back to
+  priority because no price was ever available. (Corrected 2026-09-19: `pricing_json` was not
+  merely unread, it was **never written** — see the follow-up below.)
 - **Decision:** canonical unit = **micro-USD per 1M tokens** (integer). Micros because the ledger
   column is `cost_estimate_micros INTEGER`; per-1M because per-token prices are ~1e-7 and round
   to zero in any integer representation (0.00000015 USD/token -> 150_000 micros per 1M tokens).
@@ -469,6 +470,29 @@ aarch64, 1.88.0).
   catalog, not persisted per row. A durable fix is a `cost_known` column via migration `0002`.
 - **Revisit if:** non-USD pricing appears (would need an FX step at cache-write time), or image
   generation needs per-image pricing (images carry no token counts today, so cost stays 0).
+
+### Follow-up 2026-09-19 — the price never survived a restart
+
+- **What was actually wrong:** the column existed in the schema and `ModelCatalog` computed the
+  price correctly, but the cache round-trip dropped it. `persist::ModelRow` had no pricing
+  field, and both `models_cache_replace` (INSERT + ON CONFLICT) and `models_cache_list`
+  (SELECT) omitted `pricing_json`. Every launch therefore hydrated a priceless catalog.
+- **Why it hit the gateway harder than the UI:** `gateway-worker.ts` calls `bootstrap()` and
+  never calls `refreshCatalog`, so the gateway priced every request from the persisted column
+  alone — always unknown, always 0. The UI, at least, prices correctly for the rest of a
+  session in which a refresh happened.
+- **Decision:** persist `pricing_json` (JSON `{prompt, completion}`, micro-USD per 1M) with the
+  row and parse it back on hydrate; NULL stays NULL, so unknown never reads as free. The write
+  and read were extracted from the commands into `replace_models` / `list_models` taking
+  `&Connection`, so they are testable without a Tauri `State` — regression test
+  `model_pricing_survives_the_cache_round_trip`, which also pins that a refresh carrying no
+  price overwrites a stale one instead of leaving it behind.
+- **Verified on the installed app:** 440/457 OpenRouter models now carry a price (the other 17
+  publish none); a gateway request records `tokens_in 316 / tokens_out 2 / cost 49` µUSD —
+  `316*150_000 + 2*600_000`, /1e6 = 48.6 -> 49. The R4 monthly spend cap can now fire.
+- **Operational note:** a cache written before this fix is *fresh*, so `refreshStaleCatalogs`
+  will not re-list it until the 24h TTL expires — marking rows stale is what triggers the
+  re-list. Refreshing from the Models screen does the same thing immediately.
 
 ## 2026-09-18 — Audit R4: per-app gateway keys + monthly spend cap
 
