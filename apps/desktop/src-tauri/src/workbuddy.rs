@@ -142,43 +142,55 @@ fn gateway_port(store: &Store) -> u16 {
     .unwrap_or(8787)
 }
 
-/// The models to publish. Persisted, and seeded on first run from whatever already points at
-/// our endpoint — so adopting an existing hand-written entry needs no configuration at all.
-fn published_models(store: &Store, existing: Option<&str>, our_endpoint: &str) -> Vec<String> {
-    let conn = store.conn.lock().ok();
-    let stored: Vec<String> = conn
-        .as_ref()
-        .and_then(|c| {
-            c.query_row("SELECT value_json FROM settings WHERE key=?1", rusqlite::params![SETTINGS_KEY], |r| {
-                r.get::<_, String>(0)
-            })
-            .ok()
-        })
-        .and_then(|v| serde_json::from_str::<Value>(&v).ok())
-        .and_then(|v| v.get("models").and_then(Value::as_array).cloned())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|m| m.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
-    drop(conn);
-    if !stored.is_empty() {
-        return stored;
-    }
+/**
+ * What the operator asked to publish, or `None` if they have never set it.
+ *
+ * `None` and `Some(vec![])` are deliberately different. An explicit empty list means "publish
+ * nothing"; if that were re-seeded from the client file, unpublishing would silently undo
+ * itself — the entry would come straight back on the next launch.
+ */
+fn configured_models(store: &Store) -> Option<Vec<String>> {
+    let conn = store.conn.lock().ok()?;
+    let raw: String = conn
+        .query_row(
+            "SELECT value_json FROM settings WHERE key=?1",
+            rusqlite::params![SETTINGS_KEY],
+            |r| r.get(0),
+        )
+        .ok()?;
+    serde_json::from_str::<Value>(&raw)
+        .ok()?
+        .get("models")
+        .and_then(Value::as_array)
+        .map(|arr| arr.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())
+}
 
-    // First run: adopt entries that already point at us, rather than publishing nothing.
+/// First run only: adopt entries that already point at us, so taking over a hand-written entry
+/// needs no configuration at all.
+fn seed_from(existing: Option<&str>, our_endpoint: &str) -> Vec<String> {
     existing
         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
         .map(|v| {
-            let arr = v.as_array().cloned().or_else(|| v.get("models").and_then(Value::as_array).cloned());
-            arr.unwrap_or_default()
-                .iter()
+            let arr = v
+                .as_array()
+                .cloned()
+                .or_else(|| v.get("models").and_then(Value::as_array).cloned())
+                .unwrap_or_default();
+            arr.iter()
                 .filter(|e| matches!(e.get("url").and_then(Value::as_str), Some(u) if u == our_endpoint))
                 .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_string))
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// `(models, needs_persisting)` — persisted only when we seeded, so an explicit choice is never
+/// overwritten by a guess.
+fn resolve_models(store: &Store, existing: Option<&str>, our_endpoint: &str) -> (Vec<String>, bool) {
+    match configured_models(store) {
+        Some(list) => (list, false),
+        None => (seed_from(existing, our_endpoint), true),
+    }
 }
 
 fn write_atomic(path: &Path, content: &str) -> Result<(), String> {
@@ -216,22 +228,20 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
         Err(e) => return Err(format!("cannot read {}: {e}", path.display())),
     };
 
-    let models = published_models(store, existing.as_deref(), &our_endpoint);
-    if models.is_empty() {
-        return Ok(WorkbuddySyncResult {
-            path: path.display().to_string(),
-            endpoint: our_endpoint,
-            models,
-            updated: 0,
-            removed: 0,
-            note: Some("no models published yet — add one through the app first".into()),
-        });
-    }
+    let (models, needs_persisting) = resolve_models(store, existing.as_deref(), &our_endpoint);
 
-    let key = crate::vault::get(crate::gateway::MASTER_ACCOUNT)
-        .ok()
-        .flatten()
-        .ok_or_else(|| "no gateway key yet".to_string())?;
+    // Empty is a real state, not a skip: publishing nothing must still remove the entries we
+    // previously put there, or "unpublish" would leave a stale model in the client's picker.
+    let key = if models.is_empty() {
+        None
+    } else {
+        Some(
+            crate::vault::get(crate::gateway::MASTER_ACCOUNT)
+                .ok()
+                .flatten()
+                .ok_or_else(|| "no gateway key yet".to_string())?,
+        )
+    };
 
     // Existing entries, so a name or vendor the user chose is kept rather than overwritten.
     let prior: Vec<Value> = existing
@@ -247,6 +257,7 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
 
     let mut ours = Vec::new();
     for id in &models {
+        let Some(key) = key.as_deref() else { break };
         let (ctx, reasoning, modality) = catalog_facts(store, id);
         let old = prior.iter().find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()));
         let pick = |k: &str, fallback: &str| -> String {
@@ -276,23 +287,80 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
     let (serialized, updated, removed) = merge(existing.as_deref(), &ours, &our_endpoint)?;
     write_atomic(&path, &serialized)?;
 
-    // Remember what we published so a later run does not depend on the client file.
-    let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
-         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-        rusqlite::params![SETTINGS_KEY, json!({ "models": models }).to_string()],
-    )
-    .map_err(|e| e.to_string())?;
+    // Remember what we published, but only when we seeded it — an explicit choice stands.
+    if needs_persisting {
+        let conn = store.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            rusqlite::params![SETTINGS_KEY, json!({ "models": models }).to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
 
+    let note = if models.is_empty() {
+        Some("nothing published — our entries were removed from the client".into())
+    } else {
+        None
+    };
     Ok(WorkbuddySyncResult {
         path: path.display().to_string(),
         endpoint: our_endpoint,
         models,
         updated,
         removed,
-        note: None,
+        note,
     })
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkbuddyStatus {
+    /// Models currently published into the client, in the order they were chosen.
+    pub published: Vec<String>,
+    pub path: String,
+    pub endpoint: String,
+    /// False when the client's config file is not there (yet) — not an error, just nothing to
+    /// keep in sync yet.
+    pub client_present: bool,
+}
+
+#[tauri::command]
+pub fn workbuddy_status(store: tauri::State<'_, Arc<Store>>) -> Result<WorkbuddyStatus, String> {
+    let path = models_path().ok_or_else(|| "cannot resolve $HOME".to_string())?;
+    Ok(WorkbuddyStatus {
+        published: configured_models(store.inner()).unwrap_or_default(),
+        endpoint: endpoint(gateway_port(store.inner())),
+        client_present: path.exists(),
+        path: path.display().to_string(),
+    })
+}
+
+/// Publish exactly this list, and rewrite the client's file now rather than waiting for the
+/// next launch.
+#[tauri::command]
+pub fn workbuddy_set_models(
+    store: tauri::State<'_, Arc<Store>>,
+    models: Vec<String>,
+) -> Result<WorkbuddySyncResult, String> {
+    let store = store.inner();
+    {
+        // Keep the order the operator chose; drop empties and duplicates.
+        let mut seen = std::collections::HashSet::new();
+        let clean: Vec<String> = models
+            .into_iter()
+            .map(|m| m.trim().to_string())
+            .filter(|m| !m.is_empty() && seen.insert(m.clone()))
+            .collect();
+        let conn = store.conn.lock().map_err(|e| e.to_string())?;
+        conn.execute(
+            "INSERT INTO settings (key, value_json) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            rusqlite::params![SETTINGS_KEY, json!({ "models": clean }).to_string()],
+        )
+        .map_err(|e| e.to_string())?;
+    }
+    sync(store)
 }
 
 #[tauri::command]
@@ -366,22 +434,48 @@ mod tests {
         assert!(merge(Some(r#"{"something":"else"}"#), &ours(), "http://127.0.0.1:8787/v1/chat/completions").is_err());
     }
 
+    fn tmp_store(tag: &str) -> (crate::store::Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wb-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        (crate::store::Store::open(&dir).unwrap(), dir)
+    }
+
+    const EP: &str = "http://127.0.0.1:8787/v1/chat/completions";
+
     #[test]
     fn seeds_from_an_entry_already_pointing_at_us() {
-        let dir = std::env::temp_dir().join(format!("wb-seed-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = crate::store::Store::open(&dir).unwrap();
+        let (store, dir) = tmp_store("seed");
+        assert_eq!(configured_models(&store), None, "nothing configured yet");
         let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
-        let got = published_models(&store, Some(existing), "http://127.0.0.1:8787/v1/chat/completions");
+        let (got, persist) = resolve_models(&store, Some(existing), EP);
         assert_eq!(got, vec!["openai/gpt-4o-mini".to_string()]);
+        assert!(persist, "a seeded list must be remembered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_explicit_empty_list_is_not_re_seeded() {
+        // The whole point: unpublishing everything must stick. Re-seeding from the client file
+        // would resurrect the entry on the next launch.
+        let (store, dir) = tmp_store("empty");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value_json) VALUES ('workbuddy', ?1)",
+                rusqlite::params![r#"{"models":[]}"#],
+            )
+            .unwrap();
+        }
+        let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
+        let (got, persist) = resolve_models(&store, Some(existing), EP);
+        assert!(got.is_empty());
+        assert!(!persist, "an explicit choice must not be overwritten by a guess");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn remembers_the_published_list_so_a_later_run_needs_no_seed() {
-        let dir = std::env::temp_dir().join(format!("wb-mem-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let store = crate::store::Store::open(&dir).unwrap();
+        let (store, dir) = tmp_store("mem");
         {
             let conn = store.conn.lock().unwrap();
             conn.execute(
@@ -391,8 +485,21 @@ mod tests {
             .unwrap();
         }
         // No existing client file at all — the persisted list is what makes this work.
-        let got = published_models(&store, None, "http://127.0.0.1:8787/v1/chat/completions");
+        let (got, persist) = resolve_models(&store, None, EP);
         assert_eq!(got, vec!["openai/gpt-4o-mini".to_string()]);
+        assert!(!persist, "already persisted");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn publishing_nothing_removes_our_entry() {
+        let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"},
+                           {"id":"other","url":"https://api.b.ai/v1/chat/completions"}]"#;
+        let (out, updated, removed) = merge(Some(existing), &[], EP).unwrap();
+        let arr = serde_json::from_str::<Value>(&out).unwrap().as_array().unwrap().clone();
+        assert_eq!(updated, 0);
+        assert_eq!(removed, 1);
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], "other", "only our entry goes");
     }
 }

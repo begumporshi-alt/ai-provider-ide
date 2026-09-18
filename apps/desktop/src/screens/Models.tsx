@@ -2,9 +2,12 @@
  * Model Browser — IDE explorer, not marketplace (UI_UX_PLAN.md §2): Text/Image tabs, search,
  * provider filter, dense table. Defaults per modality live in router settings.
  */
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
-import { catalog, registry, router, persistRouterSettings, refreshCatalog } from "../store";
+import {
+  catalog, registry, router, persistRouterSettings, refreshCatalog,
+  workbuddyStatus, workbuddySetModels,
+} from "../store";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, StatusDot } from "../components/atoms";
 
@@ -14,6 +17,30 @@ export function ModelsScreen() {
   const [tab, setTab] = useState<Modality>("text");
   const [q, setQ] = useState("");
   const [providerFilter, setProviderFilter] = useState<string>("all");
+  // Which models the gateway publishes into the connected client (WorkBuddy). Owned by the
+  // host, because that is where the client's config file is written.
+  const [published, setPublished] = useState<string[]>([]);
+  const [clientPresent, setClientPresent] = useState(false);
+
+  useEffect(() => {
+    workbuddyStatus()
+      .then((s) => {
+        setPublished(s.published);
+        setClientPresent(s.clientPresent);
+      })
+      .catch(() => undefined);
+  }, [tick]);
+
+  const togglePublish = async (nativeId: string) => {
+    const next = published.includes(nativeId)
+      ? published.filter((m) => m !== nativeId)
+      : [...published, nativeId];
+    const res = await workbuddySetModels(next).catch(() => null);
+    // Trust the host's answer rather than the local guess — it dedupes and is the thing that
+    // actually wrote the file.
+    setPublished(res ? res.models : next);
+    bump();
+  };
 
   const rows = useMemo(() => {
     void tick;
@@ -83,6 +110,8 @@ export function ModelsScreen() {
               <th className="font-medium">Model</th>
               <th className="w-40 font-medium">Provider</th>
               <th className="w-24 font-medium">Default</th>
+              <th className="w-20 font-medium">Client</th>
+              <th className="w-24" />
               <th className="w-28" />
             </tr>
           </thead>
@@ -95,6 +124,22 @@ export function ModelsScreen() {
                   {defaultFor === `${m.slug}/${m.nativeId}` && (
                     <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>default</span>
                   )}
+                </td>
+                <td>
+                  {published.includes(m.nativeId) && (
+                    <span
+                      className="rounded px-1.5 py-0.5 text-[10px]"
+                      style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
+                      title={clientPresent ? "Published to the connected client" : "Client config not found yet"}
+                    >
+                      exposed
+                    </span>
+                  )}
+                </td>
+                <td className="text-right">
+                  <Button onClick={() => void togglePublish(m.nativeId)}>
+                    {published.includes(m.nativeId) ? "Unexpose" : "Expose"}
+                  </Button>
                 </td>
                 <td className="text-right">
                   <Button
@@ -130,6 +175,11 @@ export function ModelsScreen() {
           <StatusDot health="healthy" /> Aliases: identical native IDs across providers resolve by bare name with provider failover (§3.4).
         </p>
       )}
+      <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        {clientPresent
+          ? `Exposed models are published to the connected client (${published.length} published). Capabilities and token limits come from the catalog, so they stay correct without hand-editing.`
+          : "Expose a model to publish it to a connected client. Its config will be created the first time the gateway starts with something published."}
+      </p>
     </div>
   );
 }

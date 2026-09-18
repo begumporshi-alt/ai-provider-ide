@@ -481,6 +481,30 @@ export async function refreshCatalog(providerId: string, signal?: AbortSignal): 
   return n;
 }
 
+/** The third-party client we keep in sync (WorkBuddy), as the host sees it. */
+export interface WorkbuddyStatus {
+  published: string[];
+  path: string;
+  endpoint: string;
+  clientPresent: boolean;
+}
+export interface WorkbuddySyncResult {
+  path: string; endpoint: string; models: string[]; updated: number; removed: number;
+  note: string | null;
+}
+
+export async function workbuddyStatus(): Promise<WorkbuddyStatus> {
+  return invoke<WorkbuddyStatus>("workbuddy_status");
+}
+
+/**
+ * Publish exactly these models to the client and rewrite its config now. Ids are native ids,
+ * which is what the client sends and what the router resolves.
+ */
+export async function workbuddySetModels(models: string[]): Promise<WorkbuddySyncResult> {
+  return invoke<WorkbuddySyncResult>("workbuddy_set_models", { models });
+}
+
 export function persistRouterSettings(): void {
   void invoke("settings_set", { key: "router", valueJson: JSON.stringify(router.settings) });
 }
