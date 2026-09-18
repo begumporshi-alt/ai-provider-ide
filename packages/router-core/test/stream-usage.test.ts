@@ -66,6 +66,27 @@ describe("stream usage", () => {
     expect(JSON.parse(http.calls[0]!.body!).stream_options).toEqual({ include_usage: true });
   });
 
+  it("reads usage that arrives AFTER the finish_reason chunk", async () => {
+    // The measured OpenRouter ordering: content, finish_reason, then a trailing chunk carrying
+    // usage and an empty `choices`, then [DONE]. Stopping at finish_reason loses the usage —
+    // this is the ordering that zeroed every ledger row.
+    const http = new FakeHttp(() => ({
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ choices: [{ delta: { content: "Ok!" } }] })}`,
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }] })}`,
+        `data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: 69, completion_tokens: 3 } })}`,
+        "data: [DONE]",
+      ],
+    }));
+    const interp = new ManifestInterpreter(OPENAI, { http, vault: new FakeVault(), vars: {} } as never);
+    let seen: { prompt_tokens: number; completion_tokens: number } | undefined;
+    for await (const _c of interp.generateText("key:x", { model: "gpt-4o", messages: [], stream: true, onUsage: (u: { prompt_tokens: number; completion_tokens: number }) => { seen = u; } } as never)) {
+      void _c;
+    }
+    expect(seen).toEqual({ prompt_tokens: 69, completion_tokens: 3 });
+  });
+
   it("reaches the ledger: a real OpenRouter-shaped stream records its tokens", async () => {
     // End-to-end through the router, because every link above is verified individually and the
     // ledger was still writing 0. OpenRouter puts usage on the SAME chunk as finish_reason, so
@@ -100,6 +121,41 @@ describe("stream usage", () => {
     const row = ledger.query()[0]!;
     expect(row.tokensIn).toBe(8);
     expect(row.tokensOut).toBe(9);
+  });
+
+  it("reaches the caller too — the bridge forwards usage host-side", async () => {
+    // `TextRequest.onUsage` was declared but never passed down, so the engine swallowed it and
+    // every gateway response reported `usage: null` even when the ledger had the numbers.
+    const base = "https://a.test/api/v1";
+    const http = new FakeHttp((url: string) =>
+      url.endsWith("/models")
+        ? { status: 200, body: { data: [{ id: "gpt-4o" }] } }
+        : {
+            status: 200,
+            lines: [
+              `data: ${JSON.stringify({ choices: [{ delta: { content: "Ok!" } }] })}`,
+              `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "stop" }], usage: { prompt_tokens: 4, completion_tokens: 6 } })}`,
+              "data: [DONE]",
+            ],
+          },
+    );
+    const registry = new ProviderRegistry(new FakeVault());
+    const adapters = new AdapterRuntime(http);
+    const p = registry.addProvider({ id: "pA", slug: "openrouter", name: "A", type: "builtin", baseUrl: base, status: "enabled", rotationStrategy: "round_robin" });
+    adapters.register(p.id, PROVIDER_PROFILES["openrouter"]!());
+    await registry.addKey({ providerId: p.id, label: "k1", secret: "sk-test-1" });
+    const catalog = new ModelCatalog(registry, adapters);
+    const router = new ModelRouter(registry, adapters, catalog, new UsageLedger());
+    await catalog.refreshProvider(p.id);
+
+    let seen: { prompt_tokens: number; completion_tokens: number } | undefined;
+    const exec = await router.generateText({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hi" }],
+      onUsage: (u) => { seen = u; },
+    });
+    for await (const _c of exec.chunks) void _c;
+    expect(seen).toEqual({ prompt_tokens: 4, completion_tokens: 6 });
   });
 
   it("does NOT send stream_options on a non-stream request — servers reject it", async () => {

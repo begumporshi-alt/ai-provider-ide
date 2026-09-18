@@ -96,6 +96,9 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       toolChoice: req.toolChoice,
       responseFormat: req.responseFormat,
       onToolCall: req.onToolCall,
+      // Forwarded so the caller can report usage onward (the gateway sends it host-side); the
+      // engine keeps its own copy for the ledger regardless.
+      onUsage: req.onUsage,
       signal: opts?.signal,
     });
     return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0);

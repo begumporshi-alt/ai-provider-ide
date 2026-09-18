@@ -334,7 +334,16 @@ export class ManifestInterpreter implements AdapterInstance {
         }
         if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
         const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
-        if (typeof finish === "string" && finish !== "null") return;
+        if (typeof finish === "string" && finish !== "null") {
+          // When usage is requested, OpenAI-shaped servers put it on a chunk AFTER the one
+          // carrying finish_reason — measured against OpenRouter: content, finish_reason,
+          // then a final chunk with `usage` and an empty `choices`, then [DONE]. Returning here
+          // dropped that trailing chunk, so every streamed request reported zero tokens and
+          // cost (and the spend cap) stayed 0 forever. Keep reading when we asked for usage;
+          // the trailing chunks carry no delta, so nothing extra is emitted.
+          if (!wantsUsage) return;
+          continue;
+        }
       }
     } finally {
       // Stream over (end of lines, [DONE], stopWhen or finish_reason). A cancelled stream has
