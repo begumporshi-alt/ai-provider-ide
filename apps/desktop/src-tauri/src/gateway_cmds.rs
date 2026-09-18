@@ -218,6 +218,13 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     // Start doing nothing at exactly the moment the operator needs it, so tear the stale
     // listener down and bring it back up instead.
     if state.has_stale_server() {
+        log_to_file(
+            &app,
+            &format!(
+                "re-enabling over a stale listener (no heartbeat for {}ms)",
+                state.core.heartbeat_age_ms()
+            ),
+        );
         if let Some(handle) = state.server.lock().unwrap().take() {
             let _ = handle.shutdown.send(());
         }
@@ -237,7 +244,43 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     state.core.set_running(true);
     let bound = handle.addr.port();
     *state.server.lock().unwrap() = Some(handle);
+    log_to_file(&app, &format!("enabled on port {bound}"));
+    spawn_watchdog(app, state);
     Ok(bound)
+}
+
+/// Re-composite the worker window if the heartbeat lapses while we are supposed to be serving.
+///
+/// A hidden webview is not a guaranteed-running webview: macOS can suspend its JS, and when
+/// that happens the gateway silently stops answering with no operator action to explain it.
+/// Reviving the window is the same trick that makes it work at creation, so try it before
+/// giving up. Rate-limited to once a minute — this is a recovery path, not a pacemaker, and
+/// every attempt briefly puts a window on screen.
+fn spawn_watchdog(app: AppHandle, state: Arc<GatewayState>) {
+    tokio::spawn(async move {
+        let mut last_warm = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if state.server.lock().unwrap().is_none() {
+                return; // stopped by the operator
+            }
+            if state.core.is_available() {
+                continue;
+            }
+            if last_warm.elapsed() < Duration::from_secs(60) {
+                continue;
+            }
+            last_warm = std::time::Instant::now();
+            log_to_file(
+                &app,
+                &format!(
+                    "watchdog: no heartbeat for {}ms — re-warming worker window",
+                    state.core.heartbeat_age_ms()
+                ),
+            );
+            warm_bridge_window(&app);
+        }
+    });
 }
 
 #[tauri::command]
@@ -417,6 +460,32 @@ pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), Stri
     Ok(())
 }
 
+/// Append a line to `{app_data_dir}/gateway.log`.
+///
+/// The worker runs in a window nobody can see and the release build has no console, so
+/// without this a misbehaving gateway leaves no trace anywhere. Best-effort: diagnostics
+/// must never be the reason the gateway fails to start.
+fn log_to_file(app: &AppHandle, line: &str) {
+    use std::io::Write as _;
+    use tauri::Manager as _;
+    let Ok(dir) = app.path().app_data_dir() else { return };
+    if std::fs::create_dir_all(&dir).is_err() {
+        return;
+    }
+    let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("gateway.log"))
+    else {
+        return;
+    };
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let _ = writeln!(f, "{secs} {line}");
+}
+
 /// The worker page reporting that it failed to boot.
 ///
 /// It runs in a window nobody can ever see, so an exception during `bootstrap()` or
@@ -424,7 +493,12 @@ pub fn gateway_heartbeat(state: State<'_, Arc<GatewayState>>) -> Result<(), Stri
 /// was a gateway that silently stopped answering a few seconds after Start. This gives that
 /// failure somewhere to go: it is logged host-side and surfaced in `gateway_status`.
 #[tauri::command]
-pub fn gateway_worker_error(state: State<'_, Arc<GatewayState>>, message: String) -> Result<(), String> {
+pub fn gateway_worker_error(
+    app: AppHandle,
+    state: State<'_, Arc<GatewayState>>,
+    message: String,
+) -> Result<(), String> {
+    log_to_file(&app, &format!("worker error: {message}"));
     state.core.set_worker_error(Some(message));
     Ok(())
 }
