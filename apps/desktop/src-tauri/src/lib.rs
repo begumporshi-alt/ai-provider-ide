@@ -12,6 +12,8 @@ use std::sync::{Arc, RwLock};
 
 use tauri::Manager;
 
+use crate::gateway_cmds::GatewayState;
+
 /// Seed the egress allowlist from registered provider base URLs. Only statuses that can
 /// actually serve (pending/enabled/repairing) are allowed (invariant 9: no stale grants).
 fn initial_allow_hosts(store: &store::Store) -> std::collections::HashSet<String> {
@@ -61,6 +63,74 @@ fn probe_key_refs(store: &store::Store) {
     }
 }
 
+/// R1 background mode: closing the window hides the app instead of quitting, so the gateway
+/// keeps serving. The tray is the way back — and the only way out that doesn't require
+/// Activity Monitor — so if it cannot be built we deliberately leave close-to-quit in place.
+/// Stranding a running process with no UI is worse than the problem this solves.
+fn build_tray(app: &tauri::AppHandle) -> Result<(), Box<dyn std::error::Error>> {
+    use tauri::menu::{MenuBuilder, MenuItemBuilder};
+    use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItemBuilder::with_id("show", "Open AI-Provider Router").build(app)?;
+    let quit = MenuItemBuilder::with_id("quit", "Quit").build(app)?;
+    let menu = MenuBuilder::new(app).item(&show).separator().item(&quit).build()?;
+
+    let mut builder = TrayIconBuilder::with_id("main")
+        .tooltip("AI-Provider Router")
+        .menu(&menu)
+        .on_menu_event(|app, event| match event.id().as_ref() {
+            "show" => show_window(app),
+            "quit" => app.exit(0),
+            _ => {}
+        });
+    // Reuse the bundled app icon; a tray with no icon is invisible on most platforms.
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+fn show_window(app: &tauri::AppHandle) {
+    use tauri::Manager as _;
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+        if let Some(state) = app.try_state::<std::sync::Arc<GatewayState>>() {
+            state.core.set_hidden(false);
+        }
+    }
+}
+
+/// R1: read the persisted preference. Default ON — background mode is the whole point of
+/// shipping this, and a user who wants close-to-quit can turn it off in the Gateway screen.
+fn hide_on_close(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager as _;
+    let Some(store) = app.try_state::<std::sync::Arc<store::Store>>() else {
+        return true;
+    };
+    let raw: Option<String> = store
+        .conn
+        .lock()
+        .ok()
+        .and_then(|conn| {
+            conn.query_row("SELECT value_json FROM settings WHERE key='background'", [], |r| r.get(0))
+                .ok()
+        });
+    match raw.as_deref().and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) {
+        Some(v) => v.get("hideOnClose").and_then(|b| b.as_bool()).unwrap_or(true),
+        None => true,
+    }
+}
+
+fn set_hidden_flag(app: &tauri::AppHandle, hidden: bool) {
+    use tauri::Manager as _;
+    if let Some(state) = app.try_state::<std::sync::Arc<GatewayState>>() {
+        state.core.set_hidden(hidden);
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing (stderr JSON on debug, plain text on release)
@@ -91,9 +161,37 @@ pub fn run() {
             app.manage(store);
             app.manage(egress_state);
             gateway_cmds::manage(app)?;
+            // R1: tray is best-effort. On failure we log and fall through with close-to-quit
+            // intact, so the app can never end up running with no way to reach it.
+            if let Err(e) = build_tray(app.handle()) {
+                tracing::warn!("tray icon unavailable — close will quit: {e}");
+            }
             Ok(())
         })
         .invoke_handler(commands::handlers())
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        .run(|app, event| match event {
+            // R1: the window is the gateway's host, so closing it must not end the process.
+            tauri::RunEvent::WindowEvent {
+                label,
+                event: tauri::WindowEvent::CloseRequested { api, .. },
+                ..
+            } => {
+                if label == "main" && hide_on_close(app) {
+                    use tauri::Manager as _;
+                    api.prevent_close();
+                    if let Some(w) = app.get_webview_window("main") {
+                        let _ = w.hide();
+                        set_hidden_flag(app, true);
+                        tracing::info!("window hidden — gateway still serving in background");
+                    }
+                }
+            }
+            // R1: macOS Dock icon click / Finder reopen — the discoverable way back.
+            // `RunEvent::Reopen` is macOS-only in Tauri, so it is gated for cross-platform builds.
+            #[cfg(target_os = "macos")]
+            tauri::RunEvent::Reopen { .. } => show_window(app),
+            _ => {}
+        });
 }

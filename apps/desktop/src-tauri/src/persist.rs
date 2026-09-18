@@ -627,6 +627,131 @@ pub fn manifest_activate(store: State<'_, Arc<Store>>, provider_id: String, vers
     Ok(previous)
 }
 
+// ---------- audit R4: per-app gateway keys + monthly spend cap ----------
+//
+// Threat model: the gateway exposes the user's PAID credentials to local apps behind one key.
+// (a) Per-app keys let one consumer be cut off without rotating the master key (which would
+//     break every other connected app).
+// (b) The spend cap bounds a runaway consumer (an agent loop in a connected IDE) — the ledger
+//     already tracks cost, so month-to-date is a single SUM.
+//
+// Split: metadata + revocation live in SQLite (auditable, survives restart); the secret lives
+// in the OS keychain and is shown once. So nothing here ever holds a credential.
+
+/// Ids of every non-revoked per-app key. Read per request so revocation is immediate.
+pub fn active_gateway_key_ids(store: &Store) -> Result<Vec<String>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare("SELECT id FROM gateway_keys WHERE revoked_at IS NULL")?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayKeyRow {
+    pub id: String,
+    pub label: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+}
+
+pub fn gateway_keys_list(store: &Store) -> Result<Vec<GatewayKeyRow>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, label, created_at, last_used_at, revoked_at FROM gateway_keys ORDER BY created_at DESC",
+    )?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(GatewayKeyRow {
+                id: r.get(0)?,
+                label: r.get(1)?,
+                created_at: r.get(2)?,
+                last_used_at: r.get(3)?,
+                revoked_at: r.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Register a key row. The caller generates the secret, copies it to the clipboard, and stores
+/// it in the keychain — this only records that it exists.
+pub fn gateway_key_insert(store: &Store, id: &str, label: &str) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO gateway_keys (id, label, created_at) VALUES (?1, ?2, ?3)",
+        params![id, label, now_ms()],
+    )?;
+    Ok(())
+}
+
+pub fn gateway_key_revoke(store: &Store, id: &str) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let changed = conn.execute(
+        "UPDATE gateway_keys SET revoked_at=?2 WHERE id=?1 AND revoked_at IS NULL",
+        params![id, now_ms()],
+    )?;
+    if changed == 0 {
+        return Err(CommandError("gateway key not found or already revoked".into()));
+    }
+    Ok(())
+}
+
+/// Hard delete (row + keychain entry). Prefer `revoke` — deleting loses the audit trail.
+pub fn gateway_key_delete(store: &Store, id: &str) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute("DELETE FROM gateway_keys WHERE id=?1", params![id])?;
+    crate::vault::delete(&format!("{}{}", crate::gateway::APP_KEY_PREFIX, id)).ok();
+    Ok(())
+}
+
+/// Month-to-date spend in micro-USD, at the UTC month boundary.
+///
+/// Scope: all ledger rows, whatever the `source` (ui / gateway / generator). A cap that only
+/// counted gateway traffic would be silently understated by Playground usage — the user sets a
+/// budget on what they pay, not on one client.
+///
+/// The boundary is computed in SQL rather than by hand: month lengths vary, and a hand-rolled
+/// calendar conversion is exactly the kind of off-by-one that silently mis-bills. `start of
+/// month` + `utc` gives the first instant of the current UTC month.
+pub fn month_spend_micros(store: &Store) -> i64 {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    conn.query_row(
+        "SELECT COALESCE(SUM(cost_estimate_micros), 0) FROM ledger
+         WHERE ts >= CAST(strftime('%s', 'now', 'start of month', 'utc') AS INTEGER) * 1000",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Spend cap in micro-USD, or 0/None when disabled.
+pub fn spend_cap_micros(store: &Store) -> Option<i64> {
+    let conn = store.conn.lock().unwrap();
+    let raw: Option<String> = conn
+        .query_row("SELECT value_json FROM settings WHERE key='spend'", [], |r| r.get(0))
+        .ok();
+    let v: serde_json::Value = serde_json::from_str(&raw?).ok()?;
+    let cap = v.get("capMicrosPerMonth")?.as_i64()?;
+    if cap <= 0 { None } else { Some(cap) }
+}
+
+pub fn spend_cap_set(store: &Store, cap_micros: i64) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO settings (key, value_json) VALUES ('spend', ?1)
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+        params![serde_json::json!({ "capMicrosPerMonth": cap_micros }).to_string()],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod persist_tests {
     use super::*;
@@ -790,6 +915,85 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
         let _ = std::fs::remove_dir_all(&dir3);
+    }
+
+    // ---------- audit R4: gateway key metadata + spend cap ----------
+
+    /// A revoked key disappears from the *active* set but stays in the list — the audit trail
+    /// is the point of revocation over deletion. Double-revoke is an error, not a no-op.
+    #[test]
+    fn gateway_keys_revoke_is_immediate_and_idempotency_checked() {
+        let (store, dir) = tmp_store("gk");
+        gateway_key_insert(&store, "ak-1", "Cursor").unwrap();
+        gateway_key_insert(&store, "ak-2", "Claude Code").unwrap();
+        assert_eq!(active_gateway_key_ids(&store).unwrap().len(), 2);
+
+        gateway_key_revoke(&store, "ak-1").unwrap();
+        let active = active_gateway_key_ids(&store).unwrap();
+        assert_eq!(active, vec!["ak-2".to_string()], "revocation is immediate");
+
+        let rows = gateway_keys_list(&store).unwrap();
+        assert_eq!(rows.len(), 2, "revoked rows are retained");
+        let one = rows.iter().find(|r| r.id == "ak-1").unwrap();
+        assert!(one.revoked_at.is_some());
+        assert_eq!(one.label, "Cursor");
+
+        assert!(
+            gateway_key_revoke(&store, "ak-1").is_err(),
+            "revoking twice must report, not silently succeed"
+        );
+        assert!(gateway_key_revoke(&store, "ak-nope").is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn gateway_key_delete_removes_row() {
+        let (store, dir) = tmp_store("gkd");
+        gateway_key_insert(&store, "ak-1", "tmp").unwrap();
+        gateway_key_delete(&store, "ak-1").unwrap();
+        assert!(gateway_keys_list(&store).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The cap round-trips, and 0 means "disabled" rather than "zero budget" — that
+    /// distinction is what keeps an empty Settings field from bricking the gateway.
+    #[test]
+    fn spend_cap_round_trip_and_zero_means_disabled() {
+        let (store, dir) = tmp_store("cap");
+        assert_eq!(spend_cap_micros(&store), None, "unset cap = disabled");
+        spend_cap_set(&store, 5_000_000).unwrap();
+        assert_eq!(spend_cap_micros(&store), Some(5_000_000));
+        spend_cap_set(&store, 9_000_000).unwrap();
+        assert_eq!(spend_cap_micros(&store), Some(9_000_000), "set must upsert");
+        spend_cap_set(&store, 0).unwrap();
+        assert_eq!(spend_cap_micros(&store), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Month-to-date must be a calendar month in UTC, not "last N days". A row from two
+    /// months ago is excluded even though it is well inside any 90-day retention window.
+    #[test]
+    fn month_spend_counts_only_the_current_utc_month() {
+        let (store, dir) = tmp_store("spend");
+        let now = now_ms();
+        let two_months_ago = now - 62 * 24 * 3600 * 1000;
+        {
+            let conn = store.conn.lock().unwrap();
+            for (ts, cost) in [(now, 100_i64), (now, 250_i64), (two_months_ago, 999_i64)] {
+                conn.execute(
+                    "INSERT INTO ledger (ts, modality, source, provider_id, model, status, tokens_in, tokens_out, cost_estimate_micros)
+                     VALUES (?1,'text','gateway','p','m','ok',1,1,?2)",
+                    params![ts, cost],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(
+            month_spend_micros(&store),
+            350,
+            "only the current UTC month counts"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

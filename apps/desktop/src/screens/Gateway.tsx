@@ -12,6 +12,33 @@ interface GatewayStatus {
   port: number;
   hasKey: boolean;
   endpointUrl: string;
+  /** R1: window hidden, gateway serving in the background. */
+  background: boolean;
+}
+
+/** Audit R4: metadata only — the secret lives in the keychain and is never returned here. */
+interface AppKey {
+  id: string;
+  label: string;
+  createdAt: number;
+  lastUsedAt: number | null;
+  revokedAt: number | null;
+}
+
+/** Audit R4: month-to-date spend vs. the cap, both in micro-USD (cap 0 = disabled). */
+interface SpendStatus {
+  monthMicros: number;
+  capMicros: number;
+  capped: boolean;
+}
+
+/** Canonical cost unit is micro-USD (see packages/router-core/src/pricing.ts). */
+function usd(micros: number): string {
+  return (micros / 1_000_000).toLocaleString(undefined, {
+    style: "currency",
+    currency: "USD",
+    maximumFractionDigits: micros < 10_000 ? 4 : 2,
+  });
 }
 
 export function GatewayScreen() {
@@ -21,22 +48,49 @@ export function GatewayScreen() {
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
   const [toolsEnabled, setToolsEnabled] = useState<boolean>(false);
+  // R4
+  const [appKeys, setAppKeys] = useState<AppKey[]>([]);
+  const [newKeyLabel, setNewKeyLabel] = useState("");
+  const [spend, setSpend] = useState<SpendStatus | null>(null);
+  const [capInput, setCapInput] = useState("");
+  // R1: closing the window hides the app instead of quitting, so the gateway keeps serving.
+  // Persisted under settings key "background"; defaults ON (that is the point of the feature).
+  const [hideOnClose, setHideOnClose] = useState<boolean | null>(null);
 
   const refresh = useCallback(() => {
     invoke<GatewayStatus>("gateway_status").then(setStatus).catch((e) => setError(String(e)));
     invoke<boolean>("get_tools_enabled").then(setToolsEnabled).catch(() => {});
   }, []);
+
+  const refreshKeys = useCallback(() => {
+    invoke<AppKey[]>("gateway_app_keys").then(setAppKeys).catch((e) => setError(String(e)));
+  }, []);
+  const refreshSpend = useCallback(() => {
+    invoke<SpendStatus>("gateway_spend_status")
+      .then((s) => {
+        setSpend(s);
+        // Mirror the persisted cap into the field. Only runs on mount and after a save, so it
+        // cannot clobber an in-progress edit.
+        setCapInput(s.capMicros > 0 ? String(s.capMicros / 1_000_000) : "");
+      })
+      .catch((e) => setError(String(e)));
+  }, []);
   useEffect(() => {
     refresh();
+    refreshKeys();
+    refreshSpend();
     invoke<string | null>("settings_get", { key: "gateway" })
       .then((v) => {
         const p = v ? (JSON.parse(v) as { port?: number }).port : undefined;
         setPortInput(String(p ?? 8787));
       })
       .catch(() => setPortInput("8787"));
+    invoke<string | null>("settings_get", { key: "background" })
+      .then((v) => setHideOnClose(v ? (JSON.parse(v) as { hideOnClose?: boolean }).hideOnClose ?? true : true))
+      .catch(() => setHideOnClose(true));
     const t = window.setInterval(refresh, 2500);
     return () => window.clearInterval(t);
-  }, [refresh]);
+  }, [refresh, refreshKeys, refreshSpend]);
 
   async function toggle() {
     setError(null);
@@ -52,6 +106,74 @@ export function GatewayScreen() {
       refresh();
     } catch (e) {
       setError(String(e)); // invariant 16: port-squat surfaces here, loudly
+    }
+  }
+
+  /**
+   * R4: the secret is generated and copied host-side (Rust arboard) and never enters the
+   * webview — that is why this returns only {id, label} and the UI says "copied to clipboard".
+   */
+  async function createAppKey() {
+    setError(null);
+    const label = newKeyLabel.trim() || "untitled";
+    try {
+      await invoke<{ id: string; label: string }>("gateway_app_key_create", { label });
+      setNewKeyLabel("");
+      refreshKeys();
+      flash("appkey");
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function revokeAppKey(id: string) {
+    setError(null);
+    try {
+      await invoke("gateway_app_key_revoke", { id });
+      refreshKeys();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function deleteAppKey(id: string) {
+    setError(null);
+    try {
+      await invoke("gateway_app_key_delete", { id });
+      refreshKeys();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  /** R1: persist close-to-background. Read host-side at close time (`hide_on_close` in lib.rs);
+   *  nothing to restart — the preference takes effect on the next close. */
+  async function setBackground(on: boolean) {
+    setError(null);
+    try {
+      await invoke("settings_set", { key: "background", valueJson: JSON.stringify({ hideOnClose: on }) });
+      setHideOnClose(on);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  /** `override` bypasses the text field (Disable button) — setState is async, so the field
+   *  value cannot be read back in the same tick. */
+  async function saveCap(override?: number) {
+    setError(null);
+    const micros =
+      override ??
+      (() => {
+        const usdValue = Number(capInput);
+        if (capInput.trim() === "" || !Number.isFinite(usdValue)) return 0;
+        return Math.max(0, Math.round(usdValue * 1_000_000));
+      })();
+    try {
+      await invoke("gateway_spend_cap_set", { capMicros: micros });
+      refreshSpend();
+    } catch (e) {
+      setError(String(e));
     }
   }
 
@@ -147,6 +269,135 @@ export function GatewayScreen() {
       </section>
 
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        <h2 className="mb-1 text-[14px] font-semibold">Background</h2>
+        <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+          Closing the window keeps the app — and the gateway — running instead of quitting. It moves to your menu bar
+          (or the Dock on macOS); click it to come back, or use Quit there to stop completely.
+        </p>
+        <div className="flex items-center justify-between">
+          <div>
+            <span className="text-[13px] font-medium">Keep running when the window is closed</span>
+            <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+              {hideOnClose === null
+                ? "Loading preference…"
+                : hideOnClose
+                  ? "On — closing the window hides the app and the gateway keeps serving."
+                  : "Off — closing the window quits the app and stops the gateway."}
+            </p>
+          </div>
+          <Button variant={hideOnClose ? "primary" : "ghost"} onClick={() => void setBackground(!hideOnClose)} disabled={hideOnClose === null}>
+            {hideOnClose ? "On" : "Off"}
+          </Button>
+        </div>
+        {status?.background && (
+          <p className="mt-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
+            Serving in the background right now.
+          </p>
+        )}
+      </section>
+
+      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        <h2 className="mb-1 text-[14px] font-semibold">Per-app keys</h2>
+        <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+          Give each connected app its own key so you can cut one off without rotating the master key — and without
+          breaking every other app. The secret is shown once, by copying it to your clipboard; only the label is kept.
+          Revoking takes effect on the very next request.
+        </p>
+
+        <div className="mb-3 flex items-center gap-2">
+          <input
+            className={`${inputCls} flex-1`}
+            style={inputStyle}
+            placeholder="Label — e.g. Cursor, Claude Code, my-script"
+            value={newKeyLabel}
+            onChange={(e) => setNewKeyLabel(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") void createAppKey();
+            }}
+          />
+          <Button variant="primary" onClick={() => void createAppKey()}>
+            {copied === "appkey" ? "Copied to clipboard" : "Create key"}
+          </Button>
+        </div>
+
+        {appKeys.length === 0 ? (
+          <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+            No per-app keys yet. Everything currently uses the master key.
+          </p>
+        ) : (
+          <ul className="divide-y" style={{ borderColor: "var(--border)" }}>
+            {appKeys.map((k) => (
+              <li key={k.id} className="flex items-center gap-3 py-2">
+                <div className="min-w-0 flex-1">
+                  <div className="flex items-center gap-2">
+                    <span className="truncate text-[13px] font-medium">{k.label}</span>
+                    {k.revokedAt !== null && (
+                      <span className="rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wide" style={{ background: "var(--bg)", color: "var(--danger)" }}>
+                        revoked
+                      </span>
+                    )}
+                  </div>
+                  <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
+                    {k.id} · created {new Date(k.createdAt).toLocaleDateString()}
+                  </span>
+                </div>
+                {k.revokedAt === null ? (
+                  <Button variant="danger" onClick={() => void revokeAppKey(k.id)}>Revoke</Button>
+                ) : (
+                  <Button variant="ghost" onClick={() => void deleteAppKey(k.id)}>Delete</Button>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
+      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        <h2 className="mb-1 text-[14px] font-semibold">Monthly spend cap</h2>
+        <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+          Stops a runaway consumer — an agent loop in a connected IDE — from spending past a budget. Month-to-date is
+          measured from the ledger at the UTC month boundary and counts <b>all</b> router usage (Playground and generator
+          included), not just gateway traffic, so it is a real ceiling on what you pay. When it is reached the gateway
+          answers 402 instead of forwarding. Leave blank to disable.
+        </p>
+
+        <div className="mb-3 flex items-center gap-4">
+          <div>
+            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>This month</span>
+            <span className="mono text-[15px] font-semibold" style={{ color: spend?.capped ? "var(--danger)" : "var(--text)" }}>
+              {spend ? usd(spend.monthMicros) : "—"}
+            </span>
+          </div>
+          <div>
+            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Cap (USD)</span>
+            <div className="flex items-center gap-2">
+              <input
+                className={`${inputCls} w-28`}
+                style={inputStyle}
+                value={capInput}
+                placeholder="none"
+                inputMode="decimal"
+                onChange={(e) => setCapInput(e.target.value.replace(/[^\d.]/g, ""))}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") void saveCap();
+                }}
+              />
+              <Button onClick={() => void saveCap()}>{spend?.capMicros ? "Update" : "Set cap"}</Button>
+              {spend?.capMicros ? (
+                <Button variant="ghost" onClick={() => { setCapInput(""); void saveCap(0); }}>Disable</Button>
+              ) : null}
+            </div>
+          </div>
+        </div>
+
+        {spend?.capped && (
+          <div className="rounded border px-3 py-2 text-[12px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
+            Cap reached — the gateway is refusing requests with 402 until the month rolls over or you raise the cap.
+          </div>
+        )}
+      </section>
+
+      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
         <h2 className="mb-2 text-[14px] font-semibold">Copy-paste presets</h2>
         <PresetRow
           label="openai-python"
@@ -189,9 +440,12 @@ export function GatewayScreen() {
         <h2 className="mb-2 text-[14px] font-semibold">How it behaves</h2>
         <ul className="list-disc space-y-1 pl-5 text-[12px]" style={{ color: "var(--text-dim)" }}>
           <li>Binds <code className="mono">127.0.0.1</code> only — nothing on your LAN is reachable (LAN sharing would be a separate, warned opt-in).</li>
-          <li>Serves while this window is open. Closing the app stops the gateway.</li>
+          <li>Serves while the app is running — including with the window closed, once background mode is on. Quitting
+            the app stops the gateway.</li>
           <li>Model names: qualified <code className="mono">provider/native</code> for an exact provider, or a bare id to let the router pick + fail over.</li>
-          <li>Every request is logged in Activity under source <span className="mono">gateway</span>. Wrong key → 401; router busy → 429; app closed → 503.</li>
+          <li>Every request is logged in Activity under source <span className="mono">gateway</span>. Wrong key → 401; router busy → 429; app closed → 503; monthly cap reached → 402.</li>
+          <li>Per-app keys are checked alongside the master key, and revocation lands on the next request. A failed
+            attempt never slows down a caller with a valid key.</li>
           <li>Four compatible surfaces — one master key: <b>OpenAI Chat</b> (<span className="mono">/v1/chat/completions</span>, <span className="mono">/v1/models</span>, <span className="mono">/v1/images/generations</span>) · <b>OpenAI Responses</b> (<span className="mono">/v1/responses</span>) · <b>Anthropic Messages</b> (<span className="mono">/v1/messages</span>, auth via <span className="mono">x-api-key</span> — Claude Code / anthropic-sdk) · <b>Gemini</b> (<span className="mono">/v1beta/models/&lt;model&gt;:generateContent</span> + <span className="mono">?alt=sse</span> streaming, auth via <span className="mono">x-goog-api-key</span> or <span className="mono">?key=</span>).</li>
           <li>Tools/tool_choice/response_format are forwarded to upstream providers when enabled. Legacy <code className="mono">functions</code> parameters (deprecated OpenAI style) are always rejected.</li>
         </ul>

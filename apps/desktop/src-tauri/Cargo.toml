@@ -1,8 +1,8 @@
 [package]
-name = "desktop"
+name = "ai-provider-router"
 version = "0.1.0"
-description = "A Tauri App"
-authors = ["you"]
+description = "AI Provider Router — a local-first desktop app that turns the user's own AI provider accounts into one normalized, key-blind AI layer."
+authors = ["Tusher Shikder"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -11,14 +11,16 @@ edition = "2021"
 # The `_lib` suffix may seem redundant but it is necessary
 # to make the lib name unique and wouldn't conflict with the bin name.
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
-name = "desktop_lib"
+name = "ai_provider_router_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# `tray-icon` (R1): background mode needs a way back into a windowless app. `image-png`
+# lets the tray reuse the bundled icon instead of shipping a second one.
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-opener = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

@@ -40,6 +40,22 @@ impl From<rusqlite::Error> for CommandError {
     }
 }
 
+/// `CommandError` is serialized to the webview (Tauri requires `Serialize`). It also implements
+/// `Display` so non-command callers — e.g. `gateway_cmds`, which needs a `String` error — can
+/// reuse `persist::*` helpers through the ordinary `?`/`map_err` idiom instead of reaching into
+/// the tuple field. One error type, two surfaces.
+impl std::fmt::Display for CommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<CommandError> for String {
+    fn from(e: CommandError) -> Self {
+        e.0
+    }
+}
+
 /// All webview-facing vault accounts must be provider keys (`key:<keyId>`); the gateway
 /// `masterkey` account is host-only (invariant 10).
 fn check_account(account: &str) -> Result<(), CommandError> {
@@ -212,6 +228,13 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_key_generate,
         crate::gateway_cmds::gateway_key_copy,
         crate::gateway_cmds::gateway_key_revoke,
+        // Audit R4: per-app gateway keys + monthly spend cap.
+        crate::gateway_cmds::gateway_app_key_create,
+        crate::gateway_cmds::gateway_app_keys,
+        crate::gateway_cmds::gateway_app_key_revoke,
+        crate::gateway_cmds::gateway_app_key_delete,
+        crate::gateway_cmds::gateway_spend_status,
+        crate::gateway_cmds::gateway_spend_cap_set,
         crate::gateway_cmds::gateway_heartbeat,
         crate::gateway_cmds::gateway_chunk,
         crate::gateway_cmds::gateway_result,
@@ -219,6 +242,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_error,
         crate::gateway_cmds::gateway_tool_calls,
         crate::gateway_cmds::gateway_usage,
+        crate::gateway_cmds::gateway_set_workspace_root,
+        crate::gateway_cmds::gateway_get_workspace_root,
+        crate::gateway_cmds::gateway_tool_run,
+        crate::gateway_cmds::gateway_followup,
+        crate::gateway_cmds::gateway_re_dispatch,
         crate::persist::onboarding_save,
         crate::persist::onboarding_latest_active,
         crate::persist::generator_audit_record,

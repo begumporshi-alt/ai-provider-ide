@@ -36,13 +36,52 @@ pub const DEFAULT_PORT: u16 = 8787;
 pub const MASTER_ACCOUNT: &str = "masterkey";
 const MAX_TOTAL: usize = 8 + 32; // §3.5: 8 concurrent, queue of 32
 const HEARTBEAT_STALE_MS: u64 = 6_000;
+/// R1: liveness bound while the window is hidden. macOS throttles timers in a hidden window,
+/// so the renderer's 2s heartbeat cannot be expected to land on schedule — but it does still
+/// run. A looser bound keeps the gateway serving in the background; the cost is that a truly
+/// dead renderer is detected after 30s instead of 6s (and only while hidden).
+const HEARTBEAT_STALE_HIDDEN_MS: u64 = 30_000;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
 /// OS keychain. Production passes the vault-backed closure.
 pub type KeyProvider = Arc<dyn Fn() -> Option<String> + Send + Sync + 'static>;
 
+/// R4: active per-app key secrets (keychain-backed). Returns only NON-revoked keys, so
+/// revocation takes effect on the very next request without rotating anything else.
+pub type AppKeyProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync + 'static>;
+
 pub fn vault_key_provider() -> KeyProvider {
     Arc::new(|| vault::get(MASTER_ACCOUNT).ok().flatten())
+}
+
+/// Keychain account prefix for a per-app gateway key (audit R4).
+pub const APP_KEY_PREFIX: &str = "gwkey:";
+
+/// R4: secrets of every non-revoked per-app key, read from the keychain. Metadata (label,
+/// revocation, last-used) lives in SQLite — see `persist.rs`.
+pub fn vault_app_key_provider(store: Arc<crate::store::Store>) -> AppKeyProvider {
+    Arc::new(move || {
+        let ids = crate::persist::active_gateway_key_ids(&store).unwrap_or_default();
+        ids.iter()
+            .filter_map(|id| vault::get(&format!("{APP_KEY_PREFIX}{id}")).ok().flatten())
+            .collect()
+    })
+}
+
+/// R4: month-to-date spend vs. the configured cap, in micro-USD — `(spent, cap)`, where
+/// `cap <= 0` means "no cap". Injected the same way as the key providers so the HTTP surface
+/// is testable without SQLite.
+pub type SpendProvider = Arc<dyn Fn() -> (i64, i64) + Send + Sync + 'static>;
+
+/// Production spend gate. Reads on every request (not cached): the ledger is capped at 90 days
+/// and the SUM is an indexed range scan, so the cost is negligible next to an upstream LLM
+/// round-trip — and a stale cap is exactly the failure this feature exists to prevent.
+pub fn vault_spend_provider(store: Arc<crate::store::Store>) -> SpendProvider {
+    Arc::new(move || {
+        let spent = crate::persist::month_spend_micros(&store);
+        let cap = crate::persist::spend_cap_micros(&store).unwrap_or(0);
+        (spent, cap)
+    })
 }
 
 // ---------- bridge protocol (Rust <-> webview) ----------
@@ -62,11 +101,16 @@ pub struct BridgeRequest {
 pub enum BridgeMsg {
     Delta(String),
     ToolCalls(Value),
+    /// Tool execution result from the local sandbox, fed back to the model as a tool role message.
+    ToolResult { call_id: String, content: String },
     Result(Value),
     Usage {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// Re-dispatch the request with updated messages (accumulated tool results).
+    /// The bridge should append tool results to the conversation and send a new request.
+    FollowUp { messages: Vec<serde_json::Value> },
     Done,
     Error { status: u16, message: String },
 }
@@ -86,13 +130,29 @@ pub struct GatewayCore {
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     bridge: Arc<dyn Bridge>,
     key_provider: KeyProvider,
+    /// R4: optional per-app key secrets. `None` = master key only (all existing tests).
+    /// Behind a Mutex so it can be swapped after create/revoke without rebuilding the core.
+    app_key_provider: Mutex<Option<AppKeyProvider>>,
+    /// R4: optional monthly spend gate. `None` = uncapped (all existing tests).
+    spend_provider: Mutex<Option<SpendProvider>>,
+    /// R1: window hidden (background mode). Loosens the heartbeat bound — see
+    /// `HEARTBEAT_STALE_HIDDEN_MS`.
+    hidden: AtomicBool,
     running: AtomicBool,
     port: Mutex<u16>,
     tools_enabled: AtomicBool,
+    /// Workspace root for local tool execution (write_file, mkdir, run_command).
+    /// Set via `gateway_set_workspace_root` Tauri command before first tool use.
+    workspace_root: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl GatewayCore {
     pub fn new(bridge: Arc<dyn Bridge>, key_provider: KeyProvider) -> Self {
+        // Default workspace root: current process directory, falling back to home.
+        let default_root = std::env::current_dir()
+            .ok()
+            .or_else(|| std::env::var("HOME").map(std::path::PathBuf::from).ok())
+            .unwrap_or_default();
         Self {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -101,10 +161,32 @@ impl GatewayCore {
             failures: Mutex::new(HashMap::new()),
             bridge,
             key_provider,
+            app_key_provider: Mutex::new(None),
+            spend_provider: Mutex::new(None),
+            hidden: AtomicBool::new(false),
             running: AtomicBool::new(false),
             port: Mutex::new(DEFAULT_PORT),
             tools_enabled: AtomicBool::new(false),
+            workspace_root: Mutex::new(Some(default_root)),
         }
+    }
+
+    /// R4: attach per-app key verification. Kept as a builder so `new()` — and therefore every
+    /// existing test — keeps the master-key-only behaviour.
+    pub fn with_app_keys(mut self, provider: AppKeyProvider) -> Self {
+        self.app_key_provider = Mutex::new(Some(provider));
+        self
+    }
+
+    /// R4: attach the monthly spend gate. Builder, like `with_app_keys`, so `new()` keeps the
+    /// uncapped behaviour every existing test relies on.
+    ///
+    /// There is deliberately no `set_*` counterpart for either provider: both read the store
+    /// on *every* request, so create / revoke / cap-change take effect on the next request with
+    /// no swap and no cache to invalidate.
+    pub fn with_spend(mut self, provider: SpendProvider) -> Self {
+        self.spend_provider = Mutex::new(Some(provider));
+        self
     }
 
     pub fn heartbeat(&self) {
@@ -112,8 +194,28 @@ impl GatewayCore {
     }
 
     pub fn is_available(&self) -> bool {
+        let bound = if self.hidden.load(Ordering::Relaxed) {
+            HEARTBEAT_STALE_HIDDEN_MS
+        } else {
+            HEARTBEAT_STALE_MS
+        };
         self.running.load(Ordering::Relaxed)
-            && self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(HEARTBEAT_STALE_MS)
+            && self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(bound)
+    }
+
+    /// R1: flip background mode. Entering it stamps the heartbeat so the (longer) grace window
+    /// starts now rather than part-way through — otherwise a window hidden immediately after
+    /// the last beat would trip the short bound before the renderer's next throttled tick.
+    pub fn set_hidden(&self, hidden: bool) {
+        if self.hidden.swap(hidden, Ordering::Relaxed) != hidden {
+            if hidden {
+                self.heartbeat();
+            }
+        }
+    }
+
+    pub fn is_hidden(&self) -> bool {
+        self.hidden.load(Ordering::Relaxed)
     }
 
     pub fn set_running(&self, on: bool) {
@@ -151,6 +253,25 @@ impl GatewayCore {
     pub fn set_tools_enabled(&self, enabled: bool) {
         self.tools_enabled.store(enabled, Ordering::Relaxed);
     }
+
+    /// Set the workspace root for local tool execution. Must be set before any tool calls.
+    pub fn set_workspace_root(&self, root: std::path::PathBuf) {
+        *self.workspace_root.lock().unwrap() = Some(root);
+    }
+
+    /// Get the current workspace root. Returns None if not set.
+    pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.workspace_root.lock().unwrap().clone()
+    }
+
+    /// Re-dispatch a request with updated messages (after local tool execution).
+    /// The bridge calls this via `gateway_re_dispatch` to continue the agent loop.
+    pub fn re_dispatch(&self, id: u64, messages: Vec<serde_json::Value>) {
+        let tx = self.pending.lock().unwrap().get(&id).cloned();
+        if let Some(tx) = tx {
+            let _ = tx.send(BridgeMsg::FollowUp { messages });
+        }
+    }
 }
 
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
@@ -175,7 +296,7 @@ fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
         return Err(err_ra(
             StatusCode::SERVICE_UNAVAILABLE,
             "1",
-            openai_error("AI-Provider IDE core unavailable — is the app open?", "service_unavailable", None),
+            openai_error("AI-Provider Router core unavailable — is the app open?", "service_unavailable", None),
         ));
     }
     let Ok(permit) = core.permits.clone().try_acquire_owned() else {
@@ -216,14 +337,21 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
     e.1 = Instant::now() + delay;
 }
 
-/// Returns Some(response) to deny, None to allow. Reads the key provider per request so a
+/// Returns Some(response) to deny, None to allow. Reads the key providers per request so a
 /// rotation/revocation kills the old key instantly (§3.3, criterion 8).
-fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<Response> {
+///
+/// Accepts the master key OR any active per-app key (audit R4). Master is tried first because
+/// it is the common case; per-app secrets are only read when the master does not match, so
+/// adding app keys costs nothing on the hot path.
+///
+/// The brute-force backoff is applied on the FAILURE path only, after the key has been
+/// checked. It used to run up front, which meant one bad credential throttled every caller on
+/// the loopback — with per-app keys (R4) that is one misconfigured app locking out all the
+/// others. Throttling only attempts that would have been rejected anyway keeps the same
+/// anti-brute-force bound (one attempt per backoff window) without collateral damage.
+fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<Response> {
     if !core.running.load(Ordering::Relaxed) {
         return Some(err_ra(StatusCode::SERVICE_UNAVAILABLE, "1", openai_error("gateway disabled", "service_unavailable", None)));
-    }
-    if !auth_allowed(core, ip) {
-        return Some(err_ra(StatusCode::TOO_MANY_REQUESTS, "30", openai_error("too many failed auth attempts — backing off", "rate_limit", None)));
     }
     let Some(stored) = (core.key_provider)() else {
         return Some(err(StatusCode::UNAUTHORIZED, openai_error("no master key configured", "invalid_request", Some("invalid_api_key"))));
@@ -237,13 +365,53 @@ fn check_master_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opti
         .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
         .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
         .unwrap_or("");
-    if constant_time_eq(presented, &stored) {
-        core.failures.lock().unwrap().remove(&ip);
-        None
-    } else {
-        note_auth_failure(core, ip);
-        Some(err(StatusCode::UNAUTHORIZED, openai_error("invalid master key", "invalid_request", Some("invalid_api_key"))))
+    let mut matched = constant_time_eq(presented, &stored);
+    if !matched {
+        // R4: per-app key. Every comparison is constant-time, and we deliberately do NOT break
+        // early on a match that is followed by more keys (no length/first-byte oracle).
+        // Clone the Arc out of the lock before calling it — never hold a mutex across a
+        // keychain read (which can block on a macOS security prompt).
+        let app_provider = core.app_key_provider.lock().ok().and_then(|g| g.clone());
+        if let Some(provider) = app_provider {
+            for secret in provider() {
+                if constant_time_eq(presented, &secret) {
+                    matched = true;
+                }
+            }
+        }
     }
+    if matched {
+        core.failures.lock().unwrap().remove(&ip);
+        return spend_gate(core);
+    }
+    if !auth_allowed(core, ip) {
+        return Some(err_ra(StatusCode::TOO_MANY_REQUESTS, "30", openai_error("too many failed auth attempts — backing off", "rate_limit", None)));
+    }
+    note_auth_failure(core, ip);
+    Some(err(StatusCode::UNAUTHORIZED, openai_error("invalid gateway key", "invalid_request", Some("invalid_api_key"))))
+}
+
+/// R4: deny once month-to-date spend has reached the cap. Checked *after* auth so the cap
+/// (and the current spend) is never disclosed to an unauthenticated caller.
+///
+/// 402 is deliberate: it is the one status clients already read as "you are out of credit",
+/// so a runaway agent loop stops retrying instead of hammering a 429/403.
+fn spend_gate(core: &GatewayCore) -> Option<Response> {
+    // Clone the Arc out of the lock before calling it — never hold a mutex across a DB read.
+    let provider = core.spend_provider.lock().ok().and_then(|g| g.clone())?;
+    let (spent, cap) = provider();
+    if cap > 0 && spent >= cap {
+        return Some(err_ra(
+            StatusCode::PAYMENT_REQUIRED,
+            "0",
+            openai_error(
+                &format!("monthly spend cap reached — {spent}/{cap} micro-USD this month"),
+                "insufficient_quota",
+                Some("spend_cap_exceeded"),
+            ),
+        ));
+    }
+    None
 }
 
 fn openai_error(message: &str, kind: &str, code: Option<&str>) -> Value {
@@ -281,7 +449,7 @@ fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
 // ---------- handlers ----------
 
 async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
-    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
     let Ok(mut req) = serde_json::from_str::<Value>(&body) else {
@@ -316,7 +484,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
     };
     let id = slot.id;
     let fwd = forwarded_headers(&headers);
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req.clone(), headers: fwd });
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req.clone(), headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "chat", model = %req.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching chat request");
 
     if wants_stream {
@@ -324,6 +492,7 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
         // stream exactly when the client disconnects or the body finishes.
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
+            let mut tool_pending = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -333,6 +502,11 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
+                        if tool_pending {
+                            // Bridge executed tools and re-dispatched; break to let the
+                            // FollowUp handler take over with the next turn.
+                            break;
+                        }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                             json!({
@@ -371,10 +545,19 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
                             }]
                         });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
+                        tool_pending = true;
+                        break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    BridgeMsg::FollowUp { messages } => {
+                        // Bridge executed tools and re-dispatched with updated messages.
+                        let mut new_chat = req.clone();
+                        new_chat["messages"] = json!(messages);
+                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+                    }
+                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             drop(slot);
@@ -386,13 +569,17 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
 
     let mut full = String::new();
     let mut tool_calls_json: Option<String> = None;
+    let mut tool_pending = false;
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if tool_pending { break; }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
@@ -400,10 +587,18 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
             BridgeMsg::ToolCalls(calls) => {
                 // Buffer tool calls for non-streaming response.
                 tool_calls_json = Some(calls.to_string());
+                tool_pending = true;
+                break;
             }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            BridgeMsg::FollowUp { messages } => {
+                let mut new_chat = req.clone();
+                new_chat["messages"] = json!(messages);
+                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+            }
+            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);
@@ -442,8 +637,37 @@ async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: 
     }
 }
 
+/// Build updated messages from the original chat body + tool call results, then re-dispatch
+/// through the bridge so the handler loop can continue collecting more turns.
+///
+/// Tool result messages are appended as role="tool" entries; the assistant turn that
+/// requested the calls is kept as-is so upstream providers see a complete conversation.
+fn re_dispatch_with_tool_results(
+    core: &Arc<GatewayCore>,
+    request_id: u64,
+    original_chat: &serde_json::Value,
+    tool_calls: &serde_json::Value,
+) {
+    let mut msgs: Vec<Value> = original_chat.get("messages").cloned().unwrap_or(json!([])).as_array().cloned().unwrap_or_default();
+    if let Some(arr) = tool_calls.as_array() {
+        for tc in arr {
+            let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
+            let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
+            let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&json!(null));
+            let _args: String = if let Some(s) = args_raw.as_str() { s.to_string() } else { args_raw.to_string() };
+            // Append a tool result message: the bridge will set content via gateway_re_dispatch.
+            msgs.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": format!("[gateway: tool '{}' called, awaiting result]", name),
+            }));
+        }
+    }
+    core.re_dispatch(request_id, msgs);
+}
+
 async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
     let mut slot = match try_slot(&core) {
@@ -465,6 +689,8 @@ async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> R
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
+            BridgeMsg::ToolResult { .. } => {}
+            BridgeMsg::FollowUp { .. } => {}
         }
     }
     err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
@@ -523,7 +749,7 @@ fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
 }
 
 async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
-    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
@@ -560,7 +786,8 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let msg_id = format!("msg_gw_{id}");
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     tracing::info!(request_id = id, kind = "anthropic", model = %model, body = %chat.to_string().chars().take(500).collect::<String>(), "dispatching anthropic messages request");
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: forwarded_headers(&headers) });
+    let fwd = forwarded_headers(&headers);
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
 
     if wants_stream {
         let mid = msg_id.clone();
@@ -635,16 +862,24 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    BridgeMsg::FollowUp { messages } => {
+                        let mut new_chat = req.clone();
+                        new_chat["messages"] = json!(messages);
+                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+                    }
+                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
-            yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
-                .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
-            // stop_reason = tool_use whenever we received tool calls (signals client to send results).
-            let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
-            yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
-                .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                    "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
-            yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
+            // Only emit stop events if we didn't break for tool execution.
+            if !has_tool_calls {
+                yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_stop")
+                    .data(json!({ "type": "content_block_stop", "index": 0 }).to_string()));
+                let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+                yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
+                    .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
+                        "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
+                yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
+            }
             drop(slot);
         };
         return Sse::new(stream_body)
@@ -657,6 +892,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_content_blocks: Vec<Value> = Vec::new();
     let mut has_tool_calls = false;
+    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
@@ -665,6 +901,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             }
             BridgeMsg::Result(_) => {}
             BridgeMsg::Done => {
+                if tool_pending { break; }
                 tracing::info!(request_id = id, full_len = full.len(), "anthropic non-stream done");
                 break;
             }
@@ -675,6 +912,7 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
             BridgeMsg::ToolCalls(calls) => {
                 // Buffer tool calls to include as tool_use blocks in the response.
                 has_tool_calls = true;
+                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -693,10 +931,17 @@ async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, bo
                         }));
                     }
                 }
+                break;
             }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            BridgeMsg::FollowUp { messages } => {
+                let mut new_chat = req.clone();
+                new_chat["messages"] = json!(messages);
+                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+            }
+            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);
@@ -791,7 +1036,7 @@ fn strip_tool_fields(body: &mut Value, enabled: bool) {
 
 async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
-    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
     let _ = uri;
@@ -819,7 +1064,8 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     };
     let id = slot.id;
     let resp_id = format!("resp_gw_{id}");
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: forwarded_headers(&headers) });
+    let fwd = forwarded_headers(&headers);
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "responses", model = %chat.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching responses request");
 
     if wants_stream {
@@ -837,6 +1083,7 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
             let mut text = String::new();
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new(); // call_id, name, arguments
             let mut usage: Option<(u64, u64)> = None;
+            let mut tool_pending = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -845,7 +1092,10 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                             "output_index": 0, "content_index": 0, "delta": t }));
                     }
                     BridgeMsg::Result(_) => {}
-                    BridgeMsg::Done => break,
+                    BridgeMsg::Done => {
+                        if tool_pending { break; }
+                        break;
+                    }
                     BridgeMsg::Error { message, .. } => {
                         yield ev("response.failed", json!({ "type": "response.failed",
                             "response": { "id": rid, "object": "response", "status": "failed", "error": { "message": message } } }));
@@ -865,40 +1115,52 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                                 tool_calls.push((call_id.to_string(), name.to_string(), args));
                             }
                         }
+                        tool_pending = true;
+                        break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    BridgeMsg::FollowUp { messages } => {
+                        let mut new_chat = req.clone();
+                        new_chat["messages"] = json!(messages);
+                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: new_chat, headers: fwd.clone() });
+                    }
+                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
-            yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
+            if !tool_pending {
+                yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
                 "output_index": 0, "content_index": 0, "text": text.clone() }));
-            // Emit any tool-call output items interleaved with the text content.
-            let mut content_parts: Vec<Value> = vec![json!({ "type": "output_text", "text": text.clone(), "annotations": [] })];
-            for (call_id, name, args) in &tool_calls {
-                yield ev("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0,
-                    "item": { "id": format!("{rid}_fc_{call_id}"), "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() } }));
-                yield ev("response.function_call_arguments.done", json!({ "type": "response.function_call_arguments.done", "item_id": format!("{rid}_fc_{call_id}"),
-                    "output_index": 0, "arguments": args.to_string() }));
-                content_parts.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
+                // Emit any tool-call output items interleaved with the text content.
+                let mut content_parts: Vec<Value> = vec![json!({ "type": "output_text", "text": text.clone(), "annotations": [] })];
+                for (call_id, name, args) in &tool_calls {
+                    yield ev("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0,
+                        "item": { "id": format!("{rid}_fc_{call_id}"), "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() } }));
+                    yield ev("response.function_call_arguments.done", json!({ "type": "response.function_call_arguments.done", "item_id": format!("{rid}_fc_{call_id}"),
+                        "output_index": 0, "arguments": args.to_string() }));
+                    content_parts.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
+                }
+                yield ev("response.content_part.done", json!({ "type": "response.content_part.done", "item_id": format!("{rid}_out"),
+                    "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text.clone(), "annotations": [] } }));
+                yield ev("response.output_item.done", json!({ "type": "response.output_item.done", "output_index": 0,
+                    "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "completed",
+                        "content": content_parts } }));
+                let resolved_tool_choice = stream_tools
+                    .as_ref()
+                    .map(|_| json!("auto"))
+                    .or(tool_choice.as_ref().map(|tc| tc.clone()))
+                    .unwrap_or(json!("auto"));
+                yield ev("response.completed", json!({ "type": "response.completed",
+                    "response": { "id": rid, "object": "response", "status": "completed",
+                        "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
+                        "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
+                        "tools": stream_tools.unwrap_or(json!([])),
+                        "tool_choice": resolved_tool_choice
+                    } }));
+            } else {
+                return;
             }
-            yield ev("response.content_part.done", json!({ "type": "response.content_part.done", "item_id": format!("{rid}_out"),
-                "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text.clone(), "annotations": [] } }));
-            yield ev("response.output_item.done", json!({ "type": "response.output_item.done", "output_index": 0,
-                "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "completed",
-                    "content": content_parts } }));
-            let resolved_tool_choice = stream_tools
-                .as_ref()
-                .map(|_| json!("auto"))
-                .or(tool_choice.as_ref().map(|tc| tc.clone()))
-                .unwrap_or(json!("auto"));
-            yield ev("response.completed", json!({ "type": "response.completed",
-                "response": { "id": rid, "object": "response", "status": "completed",
-                    "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
-                    "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
-                    "tools": stream_tools.unwrap_or(json!([])),
-                    "tool_choice": resolved_tool_choice
-                } }));
             drop(slot);
         };
         return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
@@ -909,16 +1171,21 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
     let mut usage: Option<(u64, u64)> = None;
+    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if tool_pending { break; }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
+                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -932,10 +1199,17 @@ async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, u
                         tool_calls.push((call_id.to_string(), name.to_string(), args));
                     }
                 }
+                break;
             }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            BridgeMsg::FollowUp { messages } => {
+                let mut new_chat = req.clone();
+                new_chat["messages"] = json!(messages);
+                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: new_chat, headers: fwd.clone() });
+            }
+            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);
@@ -969,7 +1243,7 @@ async fn unknown_route() -> Response {
 fn map_generic_to_status(r: Response) -> Response {
     let status = r.status();
     let body = openai_error(
-        if status == StatusCode::TOO_MANY_REQUESTS { "router at capacity" } else { "AI-Provider IDE core unavailable — is the app open?" },
+        if status == StatusCode::TOO_MANY_REQUESTS { "router at capacity" } else { "AI-Provider Router core unavailable — is the app open?" },
         if status == StatusCode::TOO_MANY_REQUESTS { "rate_limit" } else { "service_unavailable" },
         None,
     );
@@ -1005,7 +1279,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
             }
         }
     }
-    if let Some(r) = check_master_key(&core, &headers2, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers2, peer_ip(&headers)) {
         return r;
     }
     // path: /v1beta/models/<model>:generateContent | :streamGenerateContent
@@ -1073,12 +1347,14 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
         Err(r) => return map_generic_to_status(r),
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: forwarded_headers(&headers) });
+    let fwd = forwarded_headers(&headers);
+    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "gemini", "dispatching gemini request");
 
     if streaming {
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
+            let mut tool_pending = false;
             while let Some(msg) = slot.rx.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -1087,6 +1363,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
+                        if tool_pending { break; }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
@@ -1118,11 +1395,18 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         let fin = json!({ "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
+                        tool_pending = true;
                         break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    BridgeMsg::FollowUp { messages } => {
+                        let mut new_chat = req.clone();
+                        new_chat["messages"] = serde_json::to_value(&messages).unwrap_or_default();
+                        core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+                    }
+                    BridgeMsg::ToolResult { .. } => {}
                 }
             }
             drop(slot);
@@ -1135,17 +1419,22 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
     let mut err_info: Option<(u16, String)> = None;
     let mut has_tool_calls = false;
     let mut tool_parts: Vec<Value> = Vec::new();
+    let mut tool_pending = false;
     while let Some(msg) = slot.rx.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if tool_pending { break; }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
                 has_tool_calls = true;
+                tool_pending = true;
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let _call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
@@ -1163,6 +1452,12 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            BridgeMsg::FollowUp { messages } => {
+                let mut new_chat = req.clone();
+                new_chat["messages"] = serde_json::to_value(&messages).unwrap_or_default();
+                core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: new_chat, headers: fwd.clone() });
+            }
+            BridgeMsg::ToolResult { .. } => {}
         }
     }
     drop(slot);
@@ -1195,7 +1490,7 @@ async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri:
 }
 
 async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
-    if let Some(r) = check_master_key(&core, &headers, peer_ip(&headers)) {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
@@ -1226,9 +1521,10 @@ async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body:
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
+            BridgeMsg::ToolResult { .. } => {}
+            BridgeMsg::FollowUp { .. } => {}
         }
-    }
-    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
+    }    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
 }
 
 // ---------- master key + server lifecycle ----------
@@ -1236,6 +1532,19 @@ async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body:
 /// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the keychain, return it
 /// exactly once for display (§3.3). Rotation = call again: the old key dies instantly
 /// because every request re-reads the keychain.
+/// A crypto-random gateway credential. 32 hex chars from OsRng (same shape as the master key,
+/// so external apps cannot tell a per-app key from the master one).
+pub fn generate_random_key() -> String {
+    let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
+    format!("sk-aip-{raw}")
+}
+
+/// Copy arbitrary text to the clipboard host-side (invariant 14: never crosses the DOM).
+pub fn copy_text(text: &str) -> Result<(), String> {
+    let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
+    cb.set_text(text.to_string()).map_err(|e| e.to_string())
+}
+
 pub fn generate_master_key() -> Result<String, String> {
     let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
     let key = format!("sk-aip-{raw}");
@@ -1869,6 +2178,193 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
+    }
+
+    // ---------- audit R4: per-app keys + monthly spend cap ----------
+
+    /// `start()` plus the two R4 providers. Both are `Option` so each test opts into exactly
+    /// the behaviour it exercises; `None` reproduces the pre-R4 (master-only, uncapped) path.
+    fn core_with(
+        key: Arc<Mutex<Option<String>>>,
+        app_keys: Option<Arc<Mutex<Vec<String>>>>,
+        spend: Option<Arc<Mutex<(i64, i64)>>>,
+    ) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
+        let bridge = Arc::new(SynthBridge::new());
+        let mut core =
+            GatewayCore::new(bridge.clone(), Arc::new(move || key.lock().unwrap().clone()));
+        if let Some(ak) = app_keys {
+            core = core.with_app_keys(Arc::new(move || ak.lock().unwrap().clone()));
+        }
+        if let Some(sp) = spend {
+            core = core.with_spend(Arc::new(move || *sp.lock().unwrap()));
+        }
+        let core = Arc::new(core);
+        bridge.attach(&core);
+        (core, bridge)
+    }
+
+    async fn start_with(
+        app_keys: Option<Arc<Mutex<Vec<String>>>>,
+        spend: Option<Arc<Mutex<(i64, i64)>>>,
+    ) -> TestServer {
+        let master = Arc::new(Mutex::new(Some("sk-aip-master".to_string())));
+        let (core, bridge) = core_with(master, app_keys, spend);
+        core.set_running(true);
+        let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+        TestServer {
+            client: reqwest::Client::new(),
+            base: format!("http://{}", handle.addr),
+            core,
+            bridge,
+            _handle: handle,
+        }
+    }
+
+    async fn post_chat(s: &TestServer, bearer: &str) -> reqwest::Response {
+        s.client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", format!("Bearer {bearer}"))
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    /// R4(a): a per-app key authenticates even though it is not the master key — this is what
+    /// lets an app be onboarded without handing out the master credential.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_app_key_authenticates() {
+        let s = start_with(Some(Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]))), None).await;
+        let res = post_chat(&s, "sk-aip-app1").await;
+        assert_eq!(res.status(), 200, "per-app key must be accepted");
+    }
+
+    /// R4(a): revocation is immediate. The provider is re-read per request, so dropping a key
+    /// from the active list kills it on the NEXT request — no restart, no master rotation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_revoked_app_key_rejected_immediately() {
+        let keys = Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]));
+        let s = start_with(Some(keys.clone()), None).await;
+        assert_eq!(post_chat(&s, "sk-aip-app1").await.status(), 200);
+        keys.lock().unwrap().clear(); // == revoke
+        assert_eq!(post_chat(&s, "sk-aip-app1").await.status(), 401);
+        // The master key is untouched — revoking one consumer must not break the owner.
+        assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+    }
+
+    /// R4(a): an unrecognised key is still rejected when app keys are configured, and the
+    /// failure is recorded (so the brute-force backoff still applies).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_unknown_key_still_rejected() {
+        let s = start_with(Some(Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]))), None).await;
+        let res = post_chat(&s, "sk-aip-nope").await;
+        assert_eq!(res.status(), 401);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    /// R4(a): the backoff window opened by a bad credential must not throttle a caller that
+    /// authenticates correctly — otherwise one misconfigured app DoSes the rest for 500ms+
+    /// per failure. It must still throttle a *second* bad attempt inside the window.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_valid_key_not_throttled_by_another_callers_failures() {
+        let s = start_with(None, None).await;
+        assert_eq!(post_chat(&s, "wrong").await.status(), 401);
+        assert_eq!(post_chat(&s, "wrong").await.status(), 429, "repeat failures are throttled");
+        // The load-bearing assertion: inside an open backoff window a *correct* key still
+        // gets through (and, by clearing the counter, closes the window).
+        assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+        assert_eq!(post_chat(&s, "wrong").await.status(), 401, "success resets the counter");
+    }
+
+    /// R4(b): at or over the cap the gateway refuses with 402 instead of spending more.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_spend_cap_blocks_at_threshold() {
+        let s = start_with(None, Some(Arc::new(Mutex::new((50, 50))))).await;
+        let res = post_chat(&s, "sk-aip-master").await;
+        assert_eq!(res.status(), 402);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "insufficient_quota");
+        assert_eq!(body["error"]["code"], "spend_cap_exceeded");
+    }
+
+    /// R4(b): strictly under the cap the request proceeds — the gate must not be off-by-one.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_spend_cap_allows_under_threshold() {
+        let s = start_with(None, Some(Arc::new(Mutex::new((49, 50))))).await;
+        assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+    }
+
+    /// R4(b): cap 0 means disabled, not "zero budget" — otherwise enabling the feature with a
+    /// cleared field would brick the gateway.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_spend_cap_zero_disables() {
+        let s = start_with(None, Some(Arc::new(Mutex::new((999_999, 0))))).await;
+        assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+    }
+
+    /// R4(b): the cap is checked after auth, so an unauthenticated caller gets 401 — never a
+    /// 402 that would disclose the configured budget and current spend.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn r4_spend_cap_not_disclosed_to_unauthenticated() {
+        let s = start_with(None, Some(Arc::new(Mutex::new((500, 50))))).await;
+        let res = post_chat(&s, "wrong-key").await;
+        assert_eq!(res.status(), 401, "spend state must not leak pre-auth");
+    }
+
+    // ---------- audit R1: background mode liveness ----------
+
+    /// R1: a hidden window's heartbeat is throttled by the OS, so the liveness bound must
+    /// relax — 6s would drop every request while the app sits in the background.
+    #[test]
+    fn r1_hidden_loosens_the_heartbeat_bound() {
+        let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
+        core.set_running(true);
+        assert!(core.is_available());
+
+        // Age the heartbeat past the visible bound (6s) but inside the hidden one (30s).
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(7_000);
+        assert!(!core.is_available(), "stale beat must fail while visible");
+
+        core.set_hidden(true);
+        assert!(core.is_available(), "hidden mode must tolerate a throttled beat");
+        assert!(core.is_hidden());
+    }
+
+    /// R1: entering background stamps the heartbeat. Without this, hiding right before the
+    /// beat was due would trip the short bound during the first throttled interval.
+    #[test]
+    fn r1_entering_background_stamps_the_heartbeat() {
+        let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
+        core.set_running(true);
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(10_000);
+        assert!(!core.is_available());
+        core.set_hidden(true);
+        assert!(core.is_available(), "set_hidden must refresh the beat");
+    }
+
+    /// R1: leaving background restores the tight bound, so a renderer that died while hidden
+    /// is detected again instead of being trusted forever.
+    #[test]
+    fn r1_leaving_background_restores_the_tight_bound() {
+        let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
+        core.set_running(true);
+        core.set_hidden(true);
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(10_000);
+        assert!(core.is_available());
+        core.set_hidden(false);
+        assert!(!core.is_available(), "visible mode must re-apply the 6s bound");
+    }
+
+    /// R4(b): no provider attached == uncapped. Guards the builder contract that every
+    /// pre-R4 test relies on.
+    #[test]
+    fn r4_uncapped_without_provider() {
+        let core = GatewayCore::new(
+            Arc::new(SynthBridge::new()),
+            Arc::new(|| Some("k".to_string())),
+        );
+        assert!(spend_gate(&core).is_none());
     }
 
     /// Phase 5: JSON 404 for unknown /v1/* routes

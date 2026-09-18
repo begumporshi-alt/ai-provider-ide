@@ -41,6 +41,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "ai-provider-router"
+version = "0.1.0"
+dependencies = [
+ "arboard",
+ "async-stream",
+ "axum",
+ "base64 0.22.1",
+ "futures-util",
+ "keyring",
+ "rand 0.8.8",
+ "reqwest 0.12.28",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tauri",
+ "tauri-build",
+ "tauri-plugin-opener",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+]
+
+[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1007,31 +1032,6 @@ dependencies = [
  "quote",
  "rustc_version",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "desktop"
-version = "0.1.0"
-dependencies = [
- "arboard",
- "async-stream",
- "axum",
- "base64 0.22.1",
- "futures-util",
- "keyring",
- "rand 0.8.8",
- "reqwest 0.12.28",
- "rusqlite",
- "serde",
- "serde_json",
- "tauri",
- "tauri-build",
- "tauri-plugin-opener",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
- "url",
 ]
 
 [[package]]
@@ -4503,6 +4503,7 @@ dependencies = [
  "gtk",
  "heck 0.5.0",
  "http",
+ "image",
  "jni",
  "libc",
  "log",

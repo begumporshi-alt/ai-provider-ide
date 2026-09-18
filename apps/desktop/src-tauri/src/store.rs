@@ -173,6 +173,23 @@ CREATE TABLE settings (
   value_json TEXT NOT NULL
 );
 "#,
+),
+(
+    // 0002 — audit R4. Per-app gateway keys: one revocable credential per consuming app, so a
+    // leaked or retired client can be cut off WITHOUT rotating the master key (which would
+    // break every other app). Metadata + revocation live here; the secret lives in the OS
+    // keychain under `gwkey:<id>` and is shown once, never persisted.
+    "0002_gateway_keys",
+    r#"
+CREATE TABLE gateway_keys (
+  id           TEXT PRIMARY KEY,
+  label        TEXT NOT NULL,
+  created_at   INTEGER NOT NULL,
+  last_used_at INTEGER,
+  revoked_at   INTEGER
+);
+CREATE INDEX idx_gateway_keys_active ON gateway_keys(revoked_at);
+"#,
 )];
 
 #[derive(Serialize)]
@@ -190,7 +207,7 @@ impl Store {
     /// Open (or create) the DB in the app data dir with the §4 hygiene pragmas.
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(dir)?;
-        let path = dir.join("ai-provider-ide.db");
+        let path = dir.join("ai-provider-router.db");
         let conn = Connection::open(&path)?;
         // foreign_keys OFF by default in SQLite — without this every FK is decorative (§4).
         conn.pragma_update(None, "journal_mode", "WAL")?;
@@ -277,13 +294,13 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        assert_eq!(info.schema_version, 1);
-        // All v1.1 tables exist (§4).
+        assert_eq!(info.schema_version, 2); // 0001 schema_v1_1 + 0002 gateway_keys
+        // All v1.1 tables exist (§4), plus the R4 gateway-keys table.
         let conn = s.conn.lock().unwrap();
         for table in [
             "providers", "api_keys", "manifests", "models_cache", "model_aliases",
             "ledger", "ledger_rollups", "drift_events", "onboarding_sessions",
-            "generator_audit", "settings",
+            "generator_audit", "settings", "gateway_keys",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))
