@@ -50,7 +50,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         }
     }
 
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -210,7 +210,7 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r;
     }
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return r,
     };
@@ -254,7 +254,7 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
     {
         return err(StatusCode::BAD_REQUEST, openai_error("model and prompt are required", "invalid_request", None));
     }
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return r,
     };

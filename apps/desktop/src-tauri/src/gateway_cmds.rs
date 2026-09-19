@@ -150,10 +150,14 @@ fn hide_worker_after_warmup(app: &AppHandle) {
 }
 
 pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {
+    // The request path can re-warm the worker window itself, so a lapsed heartbeat becomes a
+    // short wait rather than a 503. (The watchdog does the same, but once a minute at most.)
+    let warm_app = app.clone();
     let core = GatewayCore::new(
         Arc::new(EventBridge { app: app.clone() }),
         gateway::vault_key_provider(),
-    );
+    )
+    .with_warm(Arc::new(move || warm_bridge_window(&warm_app)));
     // R4: per-app keys + monthly spend cap, both store-backed. `try_state` because setup order
     // is not guaranteed for every caller (a harness may build a core with no Store managed);
     // in that case the gateway degrades to master-key-only and uncapped rather than panicking.

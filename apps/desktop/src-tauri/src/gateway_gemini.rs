@@ -198,7 +198,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     if let Some(rf) = req.get("response_format").cloned() {
         chat["response_format"] = rf;
     }
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return map_generic_to_status(r),
     };

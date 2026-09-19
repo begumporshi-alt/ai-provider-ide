@@ -163,7 +163,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
         }
     }
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => {
             // map the generic responses to anthropic shape

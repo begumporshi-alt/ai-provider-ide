@@ -169,6 +169,67 @@ pub fn normalize_tool_calls(calls: Value) -> Value {
 }
 
 #[cfg(test)]
+mod core_recovery_tests {
+    use super::*;
+
+    /// A core whose worker window has gone quiet, which is what a suspended hidden webview
+    /// looks like from here.
+    fn stale_core() -> Arc<GatewayCore> {
+        let core = Arc::new(GatewayCore::new(
+            Arc::new(NoopBridge),
+            Arc::new(|| Some("sk-aip-test".to_string())),
+        ));
+        core.set_running(true);
+        core.set_hidden(true);
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        assert!(!core.is_available());
+        core
+    }
+
+    struct NoopBridge;
+    impl Bridge for NoopBridge {
+        fn dispatch(&self, _req: BridgeRequest) {}
+        fn cancel(&self, _id: u64) {}
+    }
+
+    #[tokio::test]
+    async fn a_request_waits_out_a_lapsed_heartbeat_and_asks_for_a_re_warm() {
+        let core = stale_core();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        // The real hook re-composites the window that hosts this very core, so it has to be
+        // able to refer back to it — hence `set_warm` rather than the consuming builder.
+        let weak = Arc::downgrade(&core);
+        core.set_warm(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+            if let Some(core) = weak.upgrade() {
+                core.heartbeat(); // stand in for the resumed webview beating again
+            }
+        }));
+
+        assert!(await_core(&core).await, "a lapsed beat must be waited out, not refused");
+        assert!(core.is_available());
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "asked for recovery exactly once");
+    }
+
+    #[test]
+    fn a_core_with_no_host_hook_is_simply_not_warmed() {
+        // `new()` attaches no hook, so tests and harnesses cannot be made to depend on one.
+        let core = stale_core();
+        core.request_warm();
+        assert!(!core.is_available());
+    }
+
+    #[test]
+    fn stopped_is_terminal_and_does_not_look_like_a_lapsed_beat() {
+        let core = stale_core();
+        core.set_running(false);
+        assert!(!core.is_running());
+        assert!(!core.is_available());
+    }
+}
+
+#[cfg(test)]
 mod tool_call_shape_tests {
     use super::*;
 
@@ -234,7 +295,22 @@ pub struct GatewayCore {
     /// Why the worker page failed to start, if it did. It runs in a window nobody can see, so
     /// without a channel back to the host its failures were unobservable.
     worker_error: Mutex<Option<String>>,
+    /// Host hook that re-composites the worker window. `None` in tests, which never suspend
+    /// anything; see `request_warm`.
+    warm: Mutex<Option<WarmFn>>,
+    /// When the hook last actually fired, for rate limiting.
+    last_warm: Mutex<Option<Instant>>,
 }
+
+/// Minimum gap between re-warms from the request path.
+///
+/// Every warm briefly puts the worker window on screen, which is precisely why the watchdog is
+/// limited to once a minute. The request path needs to be able to recover faster than that, but
+/// not so fast that a run of requests during one lapse turns into a flickering window.
+const WARM_MIN_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Re-composites the worker window. Provided by the host, since only it can touch windows.
+pub type WarmFn = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Where the sandboxed tools may write before the user picks a workspace.
 ///
@@ -273,6 +349,8 @@ impl GatewayCore {
             tools_enabled: AtomicBool::new(true),
             workspace_root: Mutex::new(default_workspace_root()),
             worker_error: Mutex::new(None),
+            warm: Mutex::new(None),
+            last_warm: Mutex::new(None),
         }
     }
 
@@ -317,13 +395,65 @@ impl GatewayCore {
     }
 
     pub fn is_available(&self) -> bool {
+        self.is_running() && self.beat_is_fresh()
+    }
+
+    /// Whether the operator asked the gateway to serve at all. Separate from `is_available`
+    /// because "stopped" and "heartbeat lapsed" need different answers: the first is terminal,
+    /// the second is worth waiting out.
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::Relaxed)
+    }
+
+    fn beat_is_fresh(&self) -> bool {
         let bound = if self.hidden.load(Ordering::Relaxed) {
             HEARTBEAT_STALE_HIDDEN_MS
         } else {
             HEARTBEAT_STALE_MS
         };
-        self.running.load(Ordering::Relaxed)
-            && self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(bound)
+        self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(bound)
+    }
+
+    /// Ask the host to re-composite the worker window.
+    ///
+    /// A hidden webview's JS can be suspended by the OS, and showing the window again is what
+    /// resumes it. The watchdog does this too, but it is rate-limited to once a minute so it
+    /// cannot become a pacemaker — which leaves a request that arrives inside its cooldown with
+    /// nothing to do but fail. Letting the request path ask for the same recovery is what turns
+    /// that hard 503 into a short wait.
+    /// Rate-limited, so a burst of requests during one lapse produces one re-composite rather
+    /// than one each. Safe to call on every poll of `await_core`.
+    pub fn request_warm(&self) {
+        {
+            let Ok(mut last) = self.last_warm.lock() else { return };
+            if last.is_some_and(|t| t.elapsed() < WARM_MIN_INTERVAL) {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+        // Clone the Arc out of the lock first — never hold a mutex across a callback that
+        // touches windows, which can re-enter the host.
+        let f = self.warm.lock().ok().and_then(|g| g.clone());
+        if let Some(f) = f {
+            f();
+        }
+    }
+
+    /// Attach the host's re-warm hook. A builder, like `with_app_keys`, so `new()` — and every
+    /// existing test — keeps working with no hook at all.
+    pub fn with_warm(mut self, warm: WarmFn) -> Self {
+        self.warm = Mutex::new(Some(warm));
+        self
+    }
+
+    /// Same hook, attached later. Unlike the key/spend providers there is no reason this cannot
+    /// change: it holds no state that could go stale, and a hook that wants to reference its own
+    /// core (the real one re-composites the window that hosts it) can only be installed after
+    /// the core exists.
+    pub fn set_warm(&self, warm: WarmFn) {
+        if let Ok(mut g) = self.warm.lock() {
+            *g = Some(warm);
+        }
     }
 
     /// R1: flip background mode. Entering it stamps the heartbeat so the (longer) grace window
@@ -414,9 +544,53 @@ impl Drop for Slot {
     }
 }
 
+/// How long a request will wait for the worker window to come back before giving up.
+///
+/// Long enough to cover a re-composite — the watchdog logs show one landing in well under a
+/// second — and short enough that a genuinely dead worker costs a client one bad request, not a
+/// hanging one.
+const CORE_RECOVERY_GRACE: Duration = Duration::from_millis(5_000);
+const CORE_RECOVERY_POLL: Duration = Duration::from_millis(150);
+
+/**
+ * Wait out a lapsed heartbeat instead of rejecting on it.
+ *
+ * The worker lives in a hidden webview, and macOS suspends hidden webviews. When that happens
+ * the bridge stops beating and every request fails until the watchdog happens to re-warm the
+ * window — and the watchdog is deliberately rate-limited to once a minute, so most requests
+ * arriving during a lapse were simply refused. Recovery is a `show()` away, so a request can
+ * ask for it directly and wait a bounded moment.
+ *
+ * Returns false only when the wait was exhausted. Called at most once per request, and only
+ * when the beat is already stale, so a healthy gateway pays nothing.
+ */
+async fn await_core(core: &Arc<GatewayCore>) -> bool {
+    let deadline = Instant::now() + CORE_RECOVERY_GRACE;
+    loop {
+        if core.beat_is_fresh() {
+            return true;
+        }
+        // Called every poll rather than once: `request_warm` is rate-limited, and a warm that
+        // lands while the window is still coming up may not resume the beat first time.
+        core.request_warm();
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(CORE_RECOVERY_POLL).await;
+    }
+}
+
 /// 503 if the core is unreachable, 429 if over capacity, otherwise the Slot.
-fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
-    if !core.is_available() {
+async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
+    // Stopped is terminal — waiting would only delay the same answer. A lapsed beat is not.
+    if !core.is_running() {
+        return Err(err_ra(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "1",
+            openai_error("AI-Provider Router gateway is stopped", "service_unavailable", None),
+        ));
+    }
+    if !core.is_available() && !await_core(core).await {
         return Err(err_ra(
             StatusCode::SERVICE_UNAVAILABLE,
             "1",

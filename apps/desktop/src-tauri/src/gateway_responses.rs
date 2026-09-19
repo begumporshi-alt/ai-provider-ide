@@ -105,7 +105,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         }
     }
     let wants_stream = chat.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    let mut slot = match try_slot(&core) {
+    let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return map_generic_to_status(r),
     };
