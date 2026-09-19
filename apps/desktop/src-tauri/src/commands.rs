@@ -347,6 +347,25 @@ pub fn memory_set_pinned(
 }
 
 #[tauri::command]
+pub fn memory_update(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    text: String,
+) -> Result<bool, CommandError> {
+    memory::update(&store, &id, &text).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_session_atoms(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+    layer: String,
+    limit: Option<usize>,
+) -> Result<Vec<memory::Memory>, CommandError> {
+    memory::session_atoms(&store, &session_id, &layer, limit.unwrap_or(200)).map_err(CommandError)
+}
+
+#[tauri::command]
 pub fn memory_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
     memory::clear(&store).map_err(CommandError)
 }
@@ -478,6 +497,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         memory_list,
         memory_forget,
         memory_set_pinned,
+        memory_update,
+        memory_session_atoms,
         memory_clear,
         memory_stats,
         // Crash reporting (local-only, no external telemetry)

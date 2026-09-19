@@ -887,6 +887,25 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       row.updated_at = Date.now();
       return true;
     }
+    case "memory_update": {
+      const row = memories.find((m) => m.id === args.id);
+      if (!row) return false;
+      const text = String(args.text ?? "").trim();
+      if (!text) throw new Error("memory text is empty");
+      row.text = text;
+      row.updated_at = Date.now();
+      return true;
+    }
+    case "memory_session_atoms": {
+      const sessionId = String(args.session_id ?? "");
+      const layer = String(args.layer ?? "");
+      if (!MEMORY_LAYERS.includes(layer)) throw new Error(`unknown memory layer '${layer}'`);
+      const limit = (args.limit as number) ?? 200;
+      return memories
+        .filter((m) => m.session_id === sessionId && m.layer === layer)
+        .sort((a, b) => (a.created_at as number) - (b.created_at as number))
+        .slice(0, limit);
+    }
     case "memory_clear":
       memories.length = 0;
       return null;

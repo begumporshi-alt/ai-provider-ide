@@ -79,9 +79,11 @@ test("memory: a layer filter narrows the list", async ({ page }) => {
   await page.getByRole("button", { name: "Memory", exact: true }).click();
   await page.getByRole("button", { name: "L1 atoms" }).click();
 
-  await expect(page.getByText("Tushu lives in Dhaka, which is GMT+6")).toBeVisible();
-  await expect(page.getByText("Works on the AI-Provider Router desktop app")).toHaveCount(0);
-  await expect(page.getByText("what timezone are you in?")).toHaveCount(0);
+  const list = page.getByTestId("memory-list");
+  await expect(list.getByText("Tushu lives in Dhaka, which is GMT+6")).toBeVisible();
+  // L3 lives in Core profile, not in the derived list — its absence here is the contract.
+  await expect(list.getByText("Works on the AI-Provider Router desktop app")).toHaveCount(0);
+  await expect(list.getByText("what timezone are you in?")).toHaveCount(0);
 });
 
 test("memory: search returns the on-topic memory with a score", async ({ page }) => {
@@ -120,4 +122,52 @@ test("memory: an empty store explains itself instead of showing a blank panel", 
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Memory", exact: true }).click();
   await expect(page.getByText(/No memories yet/)).toBeVisible();
+});
+
+test("memory: the core profile section lets the user add, edit, and forget L3 facts", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  // Add: the textarea accepts a fact, "save as core" wires through captureMemory + the host.
+  const textarea = page.locator("textarea").first();
+  await textarea.fill("I write Rust by day and TypeScript by night");
+  await page.getByRole("button", { name: "save as core" }).click();
+  await expect(page.getByText("I write Rust by day and TypeScript by night", { exact: true })).toBeVisible();
+
+  await expect
+    .poll(async () => (await store<MemoryRow[]>(page, "memories")).filter((m) => m.layer === "L3").length)
+    .toBe(1);
+
+  // Edit: rewriting a fact goes through memory_update, not delete+add. The row's edit textarea
+  // appears above the add textarea, so it is nth(0) in document order.
+  await page.getByRole("button", { name: "edit", exact: true }).click();
+  const editBox = page.locator("textarea").nth(0);
+  await editBox.fill("I write Rust by day and TypeScript by night, in that order");
+  await page.getByRole("button", { name: "save", exact: true }).click();
+  await expect(page.getByText("I write Rust by day and TypeScript by night, in that order", { exact: true })).toBeVisible();
+  await expect(page.getByText(/write Rust by day and TypeScript by night$/)).toHaveCount(0);
+  // The id is preserved — it's an edit, not a delete+add.
+  await expect.poll(async () => (await store<MemoryRow[]>(page, "memories")).length).toBe(1);
+
+  // Forget: the dedicated forget on the row removes it without touching the rest of the store.
+  await page.getByRole("button", { name: "forget", exact: true }).click();
+  await expect(page.getByText(/write Rust by day/)).toHaveCount(0);
+});
+
+test("memory: pinned L3 rows survive a recall that did not rank them", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.evaluate(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const host = (window as any).__webTest;
+    // L1 atoms that will dominate the BM25 ranking
+    await host.invoke("memory_capture", { layer: "L1", text: "Router gateway listens on 8787", session_id: "s1", subject: null, pinned: false });
+    await host.invoke("memory_capture", { layer: "L1", text: "Workspace root must be set before agent mode", session_id: "s1", subject: null, pinned: false });
+    // A pinned L3 that shares no words with the query — pinned must still surface it.
+    await host.invoke("memory_capture", { layer: "L3", text: "Building a Tauri app", session_id: null, subject: null, pinned: true });
+  });
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  // The L3 fact shows in the Core profile section even when the L1 filter is selected.
+  await page.getByRole("button", { name: "L1 atoms" }).click();
+  await expect(page.getByText("Building a Tauri app")).toBeVisible();
 });

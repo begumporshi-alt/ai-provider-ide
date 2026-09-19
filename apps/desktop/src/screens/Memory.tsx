@@ -12,6 +12,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { Button, EmptyState, inputCls, inputStyle } from "../components/atoms";
 import { useUi } from "../ui-state";
+import { captureCore, editCore } from "../lib/memory/engine";
 import {
   clearMemories,
   forgetMemory,
@@ -24,12 +25,13 @@ import {
   type MemoryStats,
 } from "../store";
 
+/** L3 has a dedicated editor above the main list, so it is excluded here to avoid duplication.
+ *  Selecting L3 from the filter would show nothing — the chip is removed for the same reason. */
 const LAYERS: { id: MemoryLayer | null; label: string; blurb: string }[] = [
-  { id: null, label: "all", blurb: "every layer" },
+  { id: null, label: "derived", blurb: "L0 raw, L1 atoms, L2 scenarios" },
   { id: "L0", label: "L0 raw", blurb: "what was actually said" },
   { id: "L1", label: "L1 atoms", blurb: "facts, preferences, constraints" },
   { id: "L2", label: "L2 scenarios", blurb: "knowledge blocks per subject" },
-  { id: "L3", label: "L3 core", blurb: "stable long-term profile" },
 ];
 
 const SEARCH_NOTE =
@@ -73,7 +75,8 @@ export function MemoryScreen() {
   }, [query, layer, tick]);
 
   const shown = useMemo(() => {
-    const base = hits ?? all;
+    // L3 is owned by CoreSection — excluded from the derived list to keep one source of truth.
+    const base = (hits ?? all).filter((m) => m.layer !== "L3");
     return layer ? base.filter((m) => m.layer === layer) : base;
   }, [hits, all, layer]);
 
@@ -130,6 +133,8 @@ export function MemoryScreen() {
 
       {error && <p className="mb-3 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
 
+      <CoreSection all={all} bump={bump} setError={setError} />
+
       <div className="mb-3 flex items-center gap-2">
         <input
           value={query}
@@ -166,7 +171,7 @@ export function MemoryScreen() {
           }
         />
       ) : (
-        <div>
+        <div data-testid="memory-list">
           {shown.map((m) => (
             <div key={m.id} className="mb-1.5 flex items-start gap-2 rounded border px-3 py-2" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
               <span className="mono mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
@@ -198,5 +203,172 @@ export function MemoryScreen() {
         </div>
       )}
     </div>
+  );
+}
+
+/**
+ * Core profile editor. L3 is the only layer the user authors directly — everything else is
+ * derived from chat — because the stable things about a person are the things the person
+ * knows. Pinning is implicit on save so a new fact always rides along in recall.
+ */
+function CoreSection({
+  all,
+  bump,
+  setError,
+}: {
+  all: Memory[];
+  bump: () => void;
+  setError: (e: string | null) => void;
+}) {
+  const core = useMemo(
+    () => all.filter((m) => m.layer === "L3").sort((a, b) => a.created_at - b.created_at),
+    [all],
+  );
+  const [draft, setDraft] = useState("");
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
+
+  async function doAdd() {
+    const text = draft.trim();
+    if (!text) return;
+    setError(null);
+    try {
+      await captureCore(text);
+      setDraft("");
+      bump();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function doSaveEdit() {
+    if (!editingId) return;
+    const text = editDraft.trim();
+    if (!text) return;
+    setError(null);
+    try {
+      await editCore(editingId, text);
+      setEditingId(null);
+      setEditDraft("");
+      bump();
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  return (
+    <section
+      className="mb-5 rounded border p-3"
+      style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+      data-testid="core-profile"
+    >
+      <div className="mb-2 flex items-baseline justify-between">
+        <h2 className="text-[13px] font-semibold">Core profile</h2>
+        <span className="text-[11px]" style={{ color: "var(--text-dim)" }}>
+          {core.length} {core.length === 1 ? "fact" : "facts"} · always injected into recall
+        </span>
+      </div>
+      <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        L3 is yours to author. The other layers are derived from chat; this one is the stable
+        stuff about you that the model should never ask twice. Pinned on save.
+      </p>
+      {core.length > 0 && (
+        <div className="mb-3">
+          {core.map((m) => (
+            <div
+              key={m.id}
+              className="mb-1.5 flex items-start gap-2 rounded border px-3 py-2"
+              style={{ borderColor: "var(--border)", background: "var(--background)" }}
+            >
+              <span
+                className="mono mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+                style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
+              >
+                L3
+              </span>
+              <div className="min-w-0 flex-1">
+                {editingId === m.id ? (
+                  <textarea
+                    value={editDraft}
+                    onChange={(e) => setEditDraft(e.target.value)}
+                    rows={3}
+                    className={`${inputCls} mono w-full`}
+                    style={{ ...inputStyle, resize: "vertical" }}
+                  />
+                ) : (
+                  <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed">
+                    {m.text}
+                  </div>
+                )}
+                <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
+                  {new Date(m.updated_at).toLocaleString()}
+                </div>
+              </div>
+              {editingId === m.id ? (
+                <>
+                  <button
+                    className="shrink-0 text-[11px]"
+                    style={{ color: "var(--text-dim)" }}
+                    onClick={() => {
+                      setEditingId(null);
+                      setEditDraft("");
+                    }}
+                  >
+                    cancel
+                  </button>
+                  <button
+                    className="shrink-0 text-[11px]"
+                    style={{ color: "var(--accent)" }}
+                    onClick={doSaveEdit}
+                    disabled={!editDraft.trim()}
+                  >
+                    save
+                  </button>
+                </>
+              ) : (
+                <>
+                  <button
+                    className="shrink-0 text-[11px]"
+                    style={{ color: "var(--text-dim)" }}
+                    onClick={() => {
+                      setEditingId(m.id);
+                      setEditDraft(m.text);
+                    }}
+                  >
+                    edit
+                  </button>
+                  <button
+                    className="shrink-0 text-[11px]"
+                    style={{ color: "var(--danger)" }}
+                    onClick={async () => {
+                      setError(null);
+                      try {
+                        await forgetMemory(m.id);
+                        bump();
+                      } catch (e) {
+                        setError(String(e));
+                      }
+                    }}
+                  >
+                    forget
+                  </button>
+                </>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      <textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={2}
+        placeholder="add a stable fact about you…"
+        className={`${inputCls} mono w-full`}
+        style={{ ...inputStyle, resize: "vertical" }}
+      />
+      <div className="mt-2 flex justify-end">
+        <Button onClick={doAdd} disabled={!draft.trim()}>save as core</Button>
+      </div>
+    </section>
   );
 }

@@ -11,9 +11,14 @@ import type { Memory } from "../../store";
 import {
   DEFAULT_CONTEXT_BUDGET,
   MAX_ATOM_CHARS,
+  SCENARIO_EVERY,
+  captureCore,
+  distilScenarios,
   distilTurn,
+  editCore,
   memoryBlock,
   parseAtoms,
+  parseScenarios,
   recallContext,
   recordRecall,
   rememberTurn,
@@ -25,6 +30,8 @@ const captureMemories = vi.spyOn(store, "captureMemories");
 const captureMemory = vi.spyOn(store, "captureMemory");
 const recallMemories = vi.spyOn(store, "recallMemories");
 const listMemories = vi.spyOn(store, "listMemories");
+const sessionMemories = vi.spyOn(store, "sessionMemories");
+const updateMemory = vi.spyOn(store, "updateMemory");
 const recordContext = vi.spyOn(store, "recordContext");
 
 function mem(id: string, layer: Memory["layer"], text: string, pinned = false): Memory {
@@ -40,11 +47,15 @@ describe("memory engine", () => {
     captureMemory.mockReset();
     recallMemories.mockReset();
     listMemories.mockReset();
+    sessionMemories.mockReset();
+    updateMemory.mockReset();
     recordContext.mockReset();
     captureMemories.mockResolvedValue(0);
     captureMemory.mockResolvedValue(mem("m", "L1", "x"));
     recallMemories.mockResolvedValue([]);
     listMemories.mockResolvedValue([]);
+    sessionMemories.mockResolvedValue([]);
+    updateMemory.mockResolvedValue(true);
     recordContext.mockResolvedValue();
     startSession("mem-test");
   });
@@ -153,6 +164,158 @@ describe("memory engine", () => {
     it("swallows a write failure", async () => {
       captureMemories.mockRejectedValueOnce(new Error("db locked"));
       await expect(rememberTurn("s", "a", "b")).resolves.toBeUndefined();
+    });
+  });
+
+  describe("distilScenarios", () => {
+    beforeEach(() => resetDistillation());
+
+    /** Make `sessionMemories` return n atoms in the layer, oldest first. */
+    function atomsInSession(count: number) {
+      sessionMemories.mockResolvedValue(
+        Array.from({ length: count }, (_, i) => mem(`a${i}`, "L1", `atom ${i}`)),
+      );
+    }
+
+    it("does not call the model until SCENARIO_EVERY new atoms have piled up", async () => {
+      const generate = vi.fn();
+      atomsInSession(SCENARIO_EVERY - 1);
+      expect(await distilScenarios("s", "m/1", generate)).toBe(0);
+      expect(generate).not.toHaveBeenCalled();
+    });
+
+    it("distils a window of new atoms when the threshold is crossed", async () => {
+      const generate = vi.fn().mockResolvedValue(
+        JSON.stringify([{ subject: "router work", text: "we are fixing the gateway" }]),
+      );
+      atomsInSession(SCENARIO_EVERY + 2);
+      const written = await distilScenarios("s", "m/1", generate);
+      expect(written).toBe(1);
+      expect(captureMemories).toHaveBeenCalledTimes(1);
+      const stored = captureMemories.mock.calls[0]![0];
+      expect(stored[0]).toMatchObject({
+        layer: "L2",
+        text: "we are fixing the gateway",
+        subject: "router work",
+        sessionId: "s",
+      });
+      // First pass: every atom is unseen, so the prompt contains all of them.
+      const firstPrompt = generate.mock.calls[0]![1] as string;
+      expect(firstPrompt).toContain("atom 0");
+      expect(firstPrompt).toContain(`atom ${SCENARIO_EVERY + 1}`);
+      // Second pass, only after six *new* atoms have piled up: the previous batch is excluded.
+      // After the first pass consumed 8 atoms, the next pass fires only when there are at least
+      // SCENARIO_EVERY atoms past the recorded cursor of 8 — i.e. 14 or more.
+      sessionMemories.mockResolvedValue(
+        Array.from({ length: SCENARIO_EVERY + 8 }, (_, i) => mem(`b${i}`, "L1", `new ${i}`)),
+      );
+      await distilScenarios("s", "m/1", generate);
+      const secondPrompt = generate.mock.calls[1]![1] as string;
+      // First pass consumed atoms 0..7 (cursor now at 8); the second pass starts at index 8.
+      expect(secondPrompt).toContain("new 8");
+      expect(secondPrompt).toContain("new 13");
+      expect(secondPrompt).not.toContain("new 0");
+      expect(secondPrompt).not.toContain("new 7");
+    });
+
+    it("does not refire on the very next call until another SCENARIO_EVERY arrive", async () => {
+      const generate = vi.fn().mockResolvedValue(
+        JSON.stringify([{ subject: "x", text: "y" }]),
+      );
+      atomsInSession(SCENARIO_EVERY);
+      await distilScenarios("s", "m/1", generate);
+      expect(generate).toHaveBeenCalledTimes(1);
+      // No new atoms between calls.
+      await distilScenarios("s", "m/1", generate);
+      expect(generate).toHaveBeenCalledTimes(1);
+      // Six more arrive -> next pass fires.
+      sessionMemories.mockResolvedValue([
+        ...Array.from({ length: SCENARIO_EVERY * 2 }, (_, i) => mem(`a${i}`, "L1", `atom ${i}`)),
+      ]);
+      await distilScenarios("s", "m/1", generate);
+      expect(generate).toHaveBeenCalledTimes(2);
+    });
+
+    it("rolls back the cursor when the call fails so the next pass retries the same atoms", async () => {
+      const generate = vi.fn().mockRejectedValue(new Error("500"));
+      atomsInSession(SCENARIO_EVERY);
+      expect(await distilScenarios("s", "m/1", generate)).toBe(0);
+      generate.mockResolvedValue(JSON.stringify([{ subject: "x", text: "y" }]));
+      // Same atoms, no new ones.
+      await distilScenarios("s", "m/1", generate);
+      expect(generate).toHaveBeenCalledTimes(2);
+      expect(captureMemories).toHaveBeenCalledTimes(1);
+    });
+
+    it("writes nothing when the model finds nothing groupable", async () => {
+      const generate = vi.fn().mockResolvedValue("[]");
+      atomsInSession(SCENARIO_EVERY);
+      expect(await distilScenarios("s", "m/1", generate)).toBe(0);
+      expect(captureMemories).not.toHaveBeenCalled();
+    });
+
+    it("does not call out at all when there is no model configured", async () => {
+      const generate = vi.fn();
+      atomsInSession(SCENARIO_EVERY);
+      expect(await distilScenarios("s", "", generate)).toBe(0);
+      expect(generate).not.toHaveBeenCalled();
+    });
+  });
+
+  describe("parseScenarios", () => {
+    it("reads a bare JSON array", () => {
+      const got = parseScenarios(JSON.stringify([
+        { subject: "router work", text: "we are fixing the gateway" },
+        { subject: "writing style", text: "lead with the conclusion" },
+      ]));
+      expect(got).toEqual([
+        { subject: "router work", text: "we are fixing the gateway" },
+        { subject: "writing style", text: "lead with the conclusion" },
+      ]);
+    });
+
+    it("survives prose the model wrapped around the JSON", () => {
+      const reply = "Sure!\n```json\n[{\"subject\":\"x\",\"text\":\"y\"}]\n```";
+      expect(parseScenarios(reply)).toEqual([{ subject: "x", text: "y" }]);
+    });
+
+    it("clamps long texts and drops entries with empty subject or text", () => {
+      const long = "y".repeat(500);
+      expect(
+        parseScenarios(JSON.stringify([
+          { subject: "ok", text: "good" },
+          { subject: "", text: "no subject" },
+          { subject: "no text", text: "" },
+          { subject: "long", text: long },
+        ])),
+      ).toEqual([
+        { subject: "ok", text: "good" },
+        { subject: "long", text: `${"y".repeat(399)}…` },
+      ]);
+    });
+
+    it("returns nothing rather than throwing on garbage", () => {
+      for (const bad of ["", "no json", "[unterminated", "{not an array}", "null"]) {
+        expect(parseScenarios(bad)).toEqual([]);
+      }
+    });
+  });
+
+  describe("L3 core profile", () => {
+    it("captureCore pins the fact so it always rides along in recall", async () => {
+      captureMemory.mockResolvedValue({ ...mem("core1", "L3", "Lives in Dhaka"), pinned: true });
+      const m = await captureCore("Lives in Dhaka");
+      expect(captureMemory).toHaveBeenCalledWith(
+        expect.objectContaining({ layer: "L3", text: "Lives in Dhaka", pinned: true }),
+      );
+      expect(m).not.toBeNull();
+    });
+
+    it("editCore routes through updateMemory and survives a missing id", async () => {
+      updateMemory.mockResolvedValueOnce(true);
+      expect(await editCore("m1", "new text")).toBe(true);
+      updateMemory.mockRejectedValueOnce(new Error("missing"));
+      expect(await editCore("missing", "x")).toBe(false);
     });
   });
 

@@ -15,6 +15,8 @@ import {
   captureMemory,
   listMemories,
   recallMemories,
+  sessionMemories,
+  updateMemory,
   type Memory,
   type MemoryLayer,
 } from "../../store";
@@ -53,16 +55,32 @@ Exchange:
  * better atoms than one does.
  */
 export const DISTIL_EVERY = 3;
+/**
+ * Scenarios are derived less often than atoms. A session that has produced six new atoms since
+ * the last scenario pass gets condensed into L2 blocks — fewer passes means a single batch is
+ * meaningful, and L2 stays small enough that "abstract first" recall is cheap.
+ */
+export const SCENARIO_EVERY = 6;
+/** One scenario pass yields at most this many L2 rows. Bound the prompt. */
+const MAX_SCENARIOS_PER_PASS = 3;
 
 /** The exchanges awaiting distillation, oldest first, capped at one batch. */
 const pending: { user: string; assistant: string }[] = [];
 let sinceDistil = 0;
 
-/** Test seam: forget the accumulated window. */
+/** Test seam: forget the accumulated window and the scenario-pass marker. */
 export function resetDistillation(): void {
   pending.length = 0;
   sinceDistil = 0;
+  lastScenarioAt.clear();
 }
+
+/**
+ * Last scenario pass per session: the number of L1 atoms that pass had already consumed, so
+ * `current - recorded` is the size of the new window. Map (not plain object) so sessions are
+ * GC'd naturally when no one is listening.
+ */
+const lastScenarioAt: Map<string, number> = new Map();
 
 /**
  * Record the raw exchange. L0 is the layer everything else is derived from, so it is written
@@ -148,6 +166,9 @@ export async function distilTurn(
     await captureMemories(
       atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, sessionId })),
     );
+    // Scenarios ride along with the atoms that produced them — fire-and-forget, so a slow or
+    // failing second call never delays what the user is reading.
+    void distilScenarios(sessionId, model, generate);
     return atoms;
   } catch {
     // Counter and window both survive: a transient failure retries on the next turn instead of
@@ -164,6 +185,99 @@ async function defaultGenerator(model: string, prompt: string): Promise<string> 
   let out = "";
   for await (const chunk of exec.chunks) out += chunk;
   return out;
+}
+
+const SCENARIO_PROMPT = `You condense a batch of memory atoms into scenario blocks.
+
+A scenario is a short, durable block of related facts that hang together — one project, one
+ongoing thread of work, one area of preference. Not one fact per scenario.
+
+Rules:
+- Return ONLY a JSON array of objects: [{"subject": "<2-4 words>", "text": "<block>"}].
+- No prose, no code fence, no commentary.
+- Up to ${MAX_SCENARIOS_PER_PASS} scenarios per pass.
+- Each "subject" is the shortest useful label.
+- Each "text" is a self-contained paragraph under 400 characters.
+- Drop atoms that are trivial or one-off — only group durable ones into scenarios.
+- If nothing groups, return [].
+
+Atoms:
+`;
+
+/**
+ * Condense the L1 atoms accumulated since the last scenario pass into L2 blocks.
+ *
+ * Returns the number of L2 rows written. A pass fires only after `SCENARIO_EVERY` new atoms
+ * have piled up for one session, so a chat that yields one atom every few turns costs nothing
+ * here for a while. On failure the marker rolls back, so the next pass retries the same atoms
+ * instead of silently losing them.
+ */
+export async function distilScenarios(
+  sessionId: string,
+  model: string,
+  generate?: Generator,
+): Promise<number> {
+  if (!model) return 0;
+  let atoms: Memory[] = [];
+  try {
+    atoms = await sessionMemories(sessionId, "L1", 200);
+  } catch {
+    return 0;
+  }
+  const seen = lastScenarioAt.get(sessionId) ?? 0;
+  if (atoms.length - seen < SCENARIO_EVERY) return 0;
+  // Record the new cursor first so a stuck call doesn't re-queue the same atoms next time.
+  lastScenarioAt.set(sessionId, atoms.length);
+  const fresh = atoms.slice(seen);
+  const script = fresh.map((a) => `- ${a.text}`).join("\n");
+  try {
+    const reply = await (generate ?? defaultGenerator)(model, `${SCENARIO_PROMPT}${script}`);
+    const scenarios = parseScenarios(reply);
+    if (scenarios.length === 0) return 0;
+    await captureMemories(
+      scenarios.map((s) => ({
+        layer: "L2" as MemoryLayer,
+        text: s.text,
+        sessionId,
+        subject: s.subject,
+      })),
+    );
+    return scenarios.length;
+  } catch {
+    // Roll the cursor back so the next pass retries the same atoms.
+    lastScenarioAt.set(sessionId, seen);
+    return 0;
+  }
+}
+
+/**
+ * Same defensive parsing as parseAtoms, but for objects. Prose the model wraps around the JSON
+ * is tolerated; an unbalanced response is rejected.
+ */
+export function parseScenarios(
+  reply: string,
+): { subject: string; text: string }[] {
+  const start = reply.indexOf("[");
+  const end = reply.lastIndexOf("]");
+  if (start < 0 || end <= start) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(reply.slice(start, end + 1));
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed)) return [];
+  return parsed
+    .filter((v): v is Record<string, unknown> => v && typeof v === "object")
+    .map((v) => ({
+      subject: String(v.subject ?? "").trim().slice(0, 80),
+      text:
+        String(v.text ?? "").trim().length > 400
+          ? `${String(v.text).trim().slice(0, 399)}…`
+          : String(v.text ?? "").trim(),
+    }))
+    .filter((s) => s.subject.length > 0 && s.text.length > 0)
+    .slice(0, MAX_SCENARIOS_PER_PASS);
 }
 
 /**
@@ -249,15 +363,38 @@ export function recordRecall(messageNodeId: string, memories: Memory[]): void {
 export async function captureAndRecord(
   layer: MemoryLayer,
   text: string,
-  sessionId?: string | null,
+  sessionId: string | null = null,
+  options: { pinned?: boolean } = {},
 ): Promise<Memory | null> {
   try {
-    const m = await captureMemory({ layer, text, sessionId: sessionId ?? null });
+    const m = await captureMemory({
+      layer,
+      text,
+      sessionId,
+      pinned: options.pinned ?? false,
+    });
     const rec = activeSession();
     rec.node("memory", m.text.slice(0, 80), { layer, memoryId: m.id });
     void rec.flush();
     return m;
   } catch {
     return null;
+  }
+}
+
+/**
+ * Add a fact to the L3 core profile. Pinned by default — the point of L3 is that it always
+ * rides along in recall. Session-null so the fact outlives the conversation.
+ */
+export async function captureCore(text: string): Promise<Memory | null> {
+  return captureAndRecord("L3", text, null, { pinned: true });
+}
+
+/** Edit the text of an existing core fact. Returns false when the id was not found. */
+export async function editCore(id: string, text: string): Promise<boolean> {
+  try {
+    return await updateMemory(id, text);
+  } catch {
+    return false;
   }
 }

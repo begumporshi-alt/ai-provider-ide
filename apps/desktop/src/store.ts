@@ -703,6 +703,21 @@ export async function setMemoryPinned(id: string, pinned: boolean): Promise<bool
   return invoke<boolean>("memory_set_pinned", { id, pinned });
 }
 
+/** Rewrite one memory's text. The layer is left alone — promotion is the caller's call. */
+export async function updateMemory(id: string, text: string): Promise<boolean> {
+  return invoke<boolean>("memory_update", { id, text });
+}
+
+/**
+ * One session's memories in one layer, oldest first. Used by scenario distillation, which needs
+ * a chronological window rather than the recency-ordered one `listMemories` returns.
+ */
+export async function sessionMemories(
+  sessionId: string, layer: MemoryLayer, limit = 200,
+): Promise<Memory[]> {
+  return invoke<Memory[]>("memory_session_atoms", { sessionId, layer, limit });
+}
+
 export async function clearMemories(): Promise<void> {
   await invoke("memory_clear");
 }

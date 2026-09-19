@@ -350,6 +350,63 @@ pub fn set_pinned(store: &Store, id: &str, pinned: bool) -> Result<bool, String>
     Ok(n > 0)
 }
 
+/// Rewrite the text of one memory. Layer is left alone — promotion is the caller's call, not
+/// the store's. Used by the L3 core-profile editor in the Memory screen.
+pub fn update(store: &Store, id: &str, text: &str) -> Result<bool, String> {
+    let text = clamp_text(text.trim());
+    if text.is_empty() {
+        return Err("memory text is empty".into());
+    }
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let n = conn
+        .execute(
+            "UPDATE memories SET text = ?1, updated_at = ?2 WHERE id = ?3",
+            params![text, now_ms(), id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Count and fetch atoms for one session — used by `distilScenarios` to decide when the next
+/// scenario pass should fire and what to feed it. Sorted oldest-first so the model's window is
+/// chronological.
+pub fn session_atoms(
+    store: &Store,
+    session_id: &str,
+    layer: &str,
+    limit: usize,
+) -> Result<Vec<Memory>, String> {
+    if !valid_layer(layer) {
+        return Err(format!("unknown memory layer '{layer}'"));
+    }
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned
+             FROM memories WHERE session_id = ?1 AND layer = ?2
+             ORDER BY created_at ASC LIMIT ?3",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id, layer, limit as i64], |r| {
+            Ok(Memory {
+                id: r.get(0)?,
+                layer: r.get(1)?,
+                text: r.get(2)?,
+                session_id: r.get(3)?,
+                subject: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                pinned: r.get::<_, i64>(7)? != 0,
+                score: None,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 pub fn clear(store: &Store) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     conn.execute_batch("DELETE FROM memories;").map_err(|e| e.to_string())
@@ -549,6 +606,40 @@ mod memory_tests {
         assert_eq!(capture_batch(&s, &items).unwrap(), 3);
         assert_eq!(stats(&s).unwrap().l1, 2);
         assert_eq!(stats(&s).unwrap().l2, 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn update_rewrites_text_and_refreshes_timestamp() {
+        let (s, d) = temp_store("update");
+        let m = capture(&s, &input("L3", "old core fact")).unwrap();
+        assert!(update(&s, &m.id, "new core fact").unwrap());
+        let all = list(&s, None, 10).unwrap();
+        assert_eq!(all[0].text, "new core fact");
+        assert!(all[0].updated_at >= m.updated_at);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn update_with_empty_text_is_an_error_not_a_silent_delete() {
+        let (s, d) = temp_store("update-empty");
+        let m = capture(&s, &input("L3", "keep me")).unwrap();
+        assert!(update(&s, &m.id, "   ").is_err());
+        assert_eq!(list(&s, None, 10).unwrap()[0].text, "keep me");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn session_atoms_returns_only_that_session_in_that_layer_oldest_first() {
+        let (s, d) = temp_store("session");
+        capture(&s, &MemoryInput { session_id: Some("A".into()), ..input("L1", "a1") }).unwrap();
+        capture(&s, &MemoryInput { session_id: Some("A".into()), ..input("L1", "a2") }).unwrap();
+        capture(&s, &MemoryInput { session_id: Some("B".into()), ..input("L1", "b1") }).unwrap();
+        capture(&s, &MemoryInput { session_id: Some("A".into()), ..input("L2", "scn") }).unwrap();
+        let a = session_atoms(&s, "A", "L1", 100).unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].text, "a1");
+        assert_eq!(a[1].text, "a2");
         let _ = std::fs::remove_dir_all(&d);
     }
 }
