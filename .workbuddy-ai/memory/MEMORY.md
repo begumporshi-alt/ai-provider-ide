@@ -116,6 +116,14 @@ through it works end to end.
 - **Distillation is batched (`DISTIL_EVERY = 3`), never per turn.** A per-turn model call doubles
   token spend and puts two rows in the activity ledger for every message — `ui.spec.ts:277` caught
   exactly that. If you ever change this, watch the ledger.
+- **All four layers have producers, or the layered recall is theatre.**
+  - L0 raw: written by `rememberTurn` on every exchange.
+  - L1 atoms: distilled by `distilTurn` (batched, every 3 turns).
+  - L2 scenarios: distilled by `distilScenarios` (batched, every 6 L1 atoms per session).
+    Cursor per session, rolls back on failure so the next pass retries the same atoms.
+    Needs oldest-first (use `sessionMemories` / `memory_session_atoms`, not `listMemories`).
+  - L3 core: **user-authored**, not auto-distilled — the stable facts about a person are the
+    facts the person knows. Pinned by default; the whole point is that L3 always rides along.
 - `memory` nodes in the context graph finally have a producer: `recordRecall()` emits them with
   `message -recalled-> memory` edges.
 
