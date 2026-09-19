@@ -308,3 +308,29 @@ test("human approval gate exists for code adapters", async ({ page }) => {
   // The review component should be in the build.
   await expect(page.getByText("Tier-2 code adapter — human review required").first()).toBeVisible({ timeout: 10_000 }).catch(() => {});
 });
+
+// ---------------------------------------------------------------------------
+// Story 11 — Agent mode refuses to run without a workspace root.
+// The guard is real (file and shell tools are confined to the root); the Send button disables
+// itself until a path is set, so the user cannot send a tool call into the void.
+// ---------------------------------------------------------------------------
+
+test("playground: agent mode refuses to send without a workspace root", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Playground", exact: true }).click();
+
+  // Pick the only model the seeded provider advertises — matches the option whose label carries
+  // the provider slug (same approach sendInPlayground uses).
+  const combo = page.getByRole("combobox");
+  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
+  await combo.selectOption(value);
+
+  // Flip agent mode on without filling the root.
+  await page.getByLabel("agent mode").check();
+  // Send must be disabled — the guard is the disabled attribute, not a post-hoc error.
+  await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
+
+  // Filling the root unsticks it.
+  await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+});
