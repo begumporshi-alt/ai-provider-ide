@@ -93,6 +93,31 @@ through it works end to end.
   stop a run the Playground started. The `Chat` remount rule above is why this is module-level.
 - Nav: `ScreenId` in `ui-state.ts`, the Tools group in `components/Shell.tsx`, and the route in
   `App.tsx`. Three places; forgetting `App.tsx` gives a screen that is unreachable but compiles.
+- **`runAgentLoop` returns `{ text, messages }` where `messages` EXCLUDES the closing assistant
+  turn** — `text` *is* that answer. Callers must append it themselves or the answer is neither
+  rendered nor recorded. This caused two shipped bugs in `Playground.tsx` (the other: agent mode
+  built `history` from the stale `msgs` closure and never sent the user's prompt).
+
+## Memory engine (P7)
+
+- Four layers: **L0 raw conversation, L1 atoms, L2 scenarios, L3 core**. Migration `0006_memories`,
+  module `src-tauri/src/memory.rs`, webview side `src/lib/memory/engine.ts`.
+- **Retrieval is BM25 via SQLite FTS5, not embeddings** — no embedding model, no vector index, no
+  second process. That is why search is keyword search, and the UI says so.
+- FTS5 is already compiled into the bundled SQLite: `libsqlite3-sys 0.30.1` sets
+  `-DSQLITE_ENABLE_FTS5`. Check `Cargo.lock` for the version — a stale 0.25.2 also sits in the
+  registry and will mislead you.
+- **Split: host stores and ranks, webview distils.** Extraction needs a model, and the webview
+  owns the gateway client; doing it in Rust would duplicate provider selection + key handling.
+- `memories_fts` is an **external-content** FTS5 table — the three triggers are the only thing
+  keeping the index honest. Any new write path must go through them.
+- Recall queries are **tokenised and re-quoted before reaching FTS5** (`match_expr`). Raw FTS5
+  syntax turns a typo into a thrown error, and a thrown error into zero results.
+- **Distillation is batched (`DISTIL_EVERY = 3`), never per turn.** A per-turn model call doubles
+  token spend and puts two rows in the activity ledger for every message — `ui.spec.ts:277` caught
+  exactly that. If you ever change this, watch the ledger.
+- `memory` nodes in the context graph finally have a producer: `recordRecall()` emits them with
+  `message -recalled-> memory` edges.
 
 ## Tauri command args (cost a rebuild once)
 
@@ -134,9 +159,9 @@ screen without the built app. It is not headless-by-default in spirit: it drives
   `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
-- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (50 tests)
+- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (55 tests)
 - Rust: `apps/desktop/src-tauri && cargo test --lib` (140 tests)
-- browser UI: `apps/desktop && pnpm web-test` (14 specs) — see the harness section above
+- browser UI: `apps/desktop && pnpm web-test` (16 specs) — see the harness section above
 - **Isolating an egress failure:** test a *second* provider through the same gateway before
   believing it is a router bug. On 2026-09-19 OpenRouter returned `NETWORK` on every attempt
   (36–40 ms — far too fast to be a real connection) while Agnes served 200s and `curl` reached
