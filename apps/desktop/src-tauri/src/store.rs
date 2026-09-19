@@ -2,6 +2,7 @@
 //! than tauri-plugin-sql so the ordered NNNN_name.sql runner, integrity checks, and the
 //! WAL/pragma init live in one audited place (DECISIONS.md 2026-09-15).
 
+use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Mutex;
 
@@ -309,6 +310,173 @@ END;
 "#,
 )];
 
+/// Backfills that need real logic — grouping, weight merging, FK-safe re-keying — and so cannot be
+/// expressed as one SQL batch.
+///
+/// Ordered *after* every entry in `MIGRATIONS`, so a step here takes the version
+/// `MIGRATIONS.len() + idx + 1`. Keeping the two lists separate rather than interleaved means the
+/// SQL list stays a literal list of schemas; the numbering is the only coupling, and it is
+/// asserted by `migrations_apply_once_and_are_idempotent`.
+const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>)] =
+    &[("0007_stable_memory_node_ids", backfill_stable_memory_node_ids)];
+
+/// One legacy graph node, paired with the stable id it should have carried.
+struct LegacyNode {
+    old_id: String,
+    new_id: String,
+    label: String,
+    source: String,
+    session_id: Option<String>,
+    ts: i64,
+    meta_json: Option<String>,
+}
+
+/// Re-key memory graph nodes written before the stable-id fix.
+///
+/// Every recording path used to mint a fresh sequence id (`memory:<session>:<n>`), so a single
+/// memory could appear as several nodes and the host's edge-weight accumulator
+/// (`weight = MIN(weight + excluded.weight, 50)`) never fired — every `recalled` edge stayed at
+/// weight 1. Deriving the node id from the memory id fixed new writes, but it cannot heal the old
+/// ones: they keep the old shape forever and the same fact reappears under the new shape.
+///
+/// Each node's own `meta_json` carried `memoryId`, so the intended key is *recoverable exactly*
+/// rather than guessed. Matching on the label instead would be wrong twice over: it is truncated
+/// to 80 characters, and two distinct memories may share a label.
+fn backfill_stable_memory_node_ids(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let legacy = load_legacy_memory_nodes(tx)?;
+    if legacy.is_empty() {
+        return Ok(());
+    }
+
+    // One surviving node per stable id, dated from the first time we saw the memory. The earliest
+    // sighting is the honest one: the later rows are duplicates, not later facts.
+    let mut reps: BTreeMap<&str, &LegacyNode> = BTreeMap::new();
+    for n in &legacy {
+        match reps.get(n.new_id.as_str()) {
+            Some(prev) if prev.ts <= n.ts => {}
+            _ => {
+                reps.insert(n.new_id.as_str(), n);
+            }
+        }
+    }
+
+    {
+        let mut ins = tx.prepare(
+            "INSERT OR IGNORE INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+             VALUES (?1,'memory',?2,?3,?4,?5,?6)",
+        )?;
+        for n in reps.values() {
+            ins.execute(rusqlite::params![
+                n.new_id,
+                n.label,
+                n.source,
+                n.session_id,
+                n.ts,
+                n.meta_json
+            ])?;
+        }
+    }
+
+    // Collapse the legacy edges onto the stable targets, summing weight the same way the host
+    // does: a relation recorded five times should read as a strong one, not as five of them.
+    let mut merged: BTreeMap<(String, String, String), (f64, i64)> = BTreeMap::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT e.from_id,
+                    'memory:' || json_extract(n.meta_json,'$.memoryId') AS new_to,
+                    e.kind, e.weight, e.ts
+               FROM context_edges e
+               JOIN context_nodes n ON n.id = e.to_id
+               JOIN memories m ON m.id = json_extract(n.meta_json,'$.memoryId')
+              WHERE n.kind = 'memory'
+                AND n.id <> 'memory:' || json_extract(n.meta_json,'$.memoryId')",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                r.get::<_, String>(0)?,
+                r.get::<_, String>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, i64>(4)?,
+            ))
+        })?;
+        for row in rows {
+            let (from, to, kind, weight, ts) = row?;
+            let slot = merged.entry((from, to, kind)).or_insert((0.0, ts));
+            slot.0 += weight;
+            slot.1 = slot.1.min(ts);
+        }
+    }
+
+    // Drop the legacy edges *before* re-creating them. Otherwise a target that already has an
+    // edge of the same kind would be updated and then inserted, double-counting the weight.
+    tx.execute(
+        "DELETE FROM context_edges
+          WHERE to_id IN (SELECT n.id FROM context_nodes n
+                           JOIN memories m ON m.id = json_extract(n.meta_json,'$.memoryId')
+                          WHERE n.kind = 'memory'
+                            AND n.id <> 'memory:' || json_extract(n.meta_json,'$.memoryId'))",
+        [],
+    )?;
+
+    {
+        let mut upd = tx.prepare(
+            "UPDATE context_edges SET weight = MIN(weight + ?4, 50)
+              WHERE from_id = ?1 AND to_id = ?2 AND kind = ?3",
+        )?;
+        let mut ins = tx.prepare(
+            "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts, meta_json)
+             VALUES ('e:' || ?1 || '->' || ?2 || ':' || ?3, ?1, ?2, ?3, ?4, ?5, NULL)",
+        )?;
+        for ((from, to, kind), (weight, ts)) in &merged {
+            // `MIN(..., 50)` matches the host's ceiling, so a merged edge cannot exceed what a
+            // freshly accumulated one could reach.
+            let weight = weight.min(50.0);
+            if upd.execute(rusqlite::params![from, to, kind, weight])? == 0 {
+                ins.execute(rusqlite::params![from, to, kind, weight, ts])?;
+            }
+        }
+    }
+
+    // Only now are the legacy nodes unreferenced, so the FK has nothing left to cascade.
+    {
+        let mut del = tx.prepare("DELETE FROM context_nodes WHERE id = ?1")?;
+        for n in &legacy {
+            del.execute(rusqlite::params![n.old_id])?;
+        }
+    }
+    Ok(())
+}
+
+/// Every memory node whose id is not the stable `memory:<memoryId>` it should be, resolved through
+/// `meta_json`. A node whose memory no longer exists is deliberately *not* returned: there is no
+/// correct stable id to give it, and inventing one would be worse than leaving the row alone.
+fn load_legacy_memory_nodes(
+    tx: &rusqlite::Transaction<'_>,
+) -> rusqlite::Result<Vec<LegacyNode>> {
+    let mut stmt = tx.prepare(
+        "SELECT n.id,
+                'memory:' || json_extract(n.meta_json,'$.memoryId') AS new_id,
+                n.label, n.source, n.session_id, n.ts, n.meta_json
+           FROM context_nodes n
+           JOIN memories m ON m.id = json_extract(n.meta_json,'$.memoryId')
+          WHERE n.kind = 'memory'
+            AND n.id <> 'memory:' || json_extract(n.meta_json,'$.memoryId')",
+    )?;
+    let rows = stmt.query_map([], |r| {
+        Ok(LegacyNode {
+            old_id: r.get(0)?,
+            new_id: r.get(1)?,
+            label: r.get(2)?,
+            source: r.get(3)?,
+            session_id: r.get(4)?,
+            ts: r.get(5)?,
+            meta_json: r.get(6)?,
+        })
+    })?;
+    rows.collect()
+}
+
 #[derive(Serialize)]
 pub struct StoreInfo {
     pub path: String,
@@ -339,6 +507,10 @@ impl Store {
 
     /// The single migration runner: apply ordered migrations inside transactions,
     /// recording history in schema_version.
+    ///
+    /// SQL migrations are numbered 1..N by their position, and data migrations continue from
+    /// there. Each step commits in its own transaction, so a failure part-way leaves the earlier
+    /// steps applied and recorded — resuming re-runs only what is missing.
     pub fn migrate(&self) -> Result<(), StoreError> {
         let mut conn = self.conn.lock().unwrap();
         // Bootstrap table first: it records history, so it must exist before any migration.
@@ -348,8 +520,10 @@ impl Store {
         let current: i64 = conn
             .query_row("SELECT COALESCE(MAX(version),0) FROM schema_version", [], |r| r.get(0))
             .unwrap_or(0);
-        for (idx, (name, sql)) in MIGRATIONS.iter().enumerate() {
-            let version = (idx + 1) as i64;
+
+        let mut version = 0i64;
+        for (name, sql) in MIGRATIONS.iter() {
+            version += 1;
             if version <= current {
                 continue;
             }
@@ -358,11 +532,25 @@ impl Store {
                 .map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
             let applied: Result<(), rusqlite::Error> = (|| {
                 tx.execute_batch(sql)?;
-                let now = chrono_now_ms();
-                tx.execute(
-                    "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
-                    rusqlite::params![version, name, now],
-                )?;
+                record_migration(&tx, version, name)?;
+                Ok(())
+            })();
+            applied.map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
+            tx.commit()
+                .map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
+        }
+
+        for (name, run) in DATA_MIGRATIONS.iter() {
+            version += 1;
+            if version <= current {
+                continue;
+            }
+            let tx = conn
+                .transaction()
+                .map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
+            let applied: Result<(), rusqlite::Error> = (|| {
+                run(&tx)?;
+                record_migration(&tx, version, name)?;
                 Ok(())
             })();
             applied.map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
@@ -393,6 +581,19 @@ impl Store {
     }
 }
 
+/// Record an applied step. Lives beside the runner so both migration kinds are stamped identically.
+fn record_migration(
+    tx: &rusqlite::Transaction<'_>,
+    version: i64,
+    name: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "INSERT INTO schema_version (version, name, applied_at) VALUES (?,?,?)",
+        rusqlite::params![version, name, chrono_now_ms()],
+    )?;
+    Ok(())
+}
+
 fn chrono_now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -411,8 +612,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories
-        assert_eq!(info.schema_version, 6);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007 data migration.
+        assert_eq!(info.schema_version, 7);
+        // The two lists must stay numbered as one sequence: a data migration that reused a SQL
+        // version number would be silently skipped on every database that already had it.
+        assert_eq!(7, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -469,6 +673,247 @@ mod tests {
         conn.execute("DELETE FROM providers WHERE id='p'", []).unwrap();
         let n: i64 = conn.query_row("SELECT COUNT(*) FROM ledger", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1, "ledger history must survive provider deletion (§7)");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Open a store, seed the pre-fix graph shape, then rewind `schema_version` so the next
+    /// `migrate()` re-runs the 0007 backfill over it. Rewinding rather than calling the backfill
+    /// directly is deliberate: it exercises the real runner path, including version numbering.
+    ///
+    /// The fixture mirrors the shape actually found in the live database — two nodes for one
+    /// memory (one from capture, one from recall) plus a single node for another.
+    fn store_with_legacy_memory_nodes(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        {
+            let conn = s.conn.lock().unwrap();
+            for (id, text) in
+                [("m-L3-aaa", "Hi, i am Tushu"), ("m-L3-bbb", "I am a Software Engineer.")]
+            {
+                conn.execute(
+                    "INSERT INTO memories (id, layer, text, created_at, updated_at) VALUES (?1,'L3',?2,1,1)",
+                    rusqlite::params![id, text],
+                )
+                .unwrap();
+            }
+            for (id, label, mem, ts) in [
+                ("memory:s-1:1", "Hi, i am Tushu", "m-L3-aaa", 1000),
+                ("memory:s-1:5", "Hi, i am Tushu", "m-L3-aaa", 2000),
+                ("memory:s-1:2", "I am a Software Engineer.", "m-L3-bbb", 1500),
+            ] {
+                conn.execute(
+                    "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                     VALUES (?1,'memory',?2,'engine','s-1',?3,?4)",
+                    rusqlite::params![
+                        id,
+                        label,
+                        ts,
+                        format!("{{\"layer\":\"L3\",\"memoryId\":\"{mem}\"}}")
+                    ],
+                )
+                .unwrap();
+            }
+            for (id, kind, label, ts) in [
+                ("message:s-1:3", "message", "hi", 500),
+                ("artifact:s-1:9", "artifact", "notes", 600),
+            ] {
+                conn.execute(
+                    "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                     VALUES (?1,?2,?3,'ui','s-1',?4,NULL)",
+                    rusqlite::params![id, kind, label, ts],
+                )
+                .unwrap();
+            }
+            conn.execute("DELETE FROM schema_version WHERE version = 7", []).unwrap();
+        }
+        (s, dir)
+    }
+
+    fn memory_node_ids(s: &Store) -> Vec<String> {
+        let conn = s.conn.lock().unwrap();
+        let mut stmt =
+            conn.prepare("SELECT id FROM context_nodes WHERE kind='memory' ORDER BY id").unwrap();
+        let ids = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        ids
+    }
+
+    #[test]
+    fn a_legacy_memory_node_is_rekeyed_to_its_stable_id() {
+        let (s, dir) = store_with_legacy_memory_nodes("rekey");
+        s.migrate().expect("backfill runs");
+
+        // Three legacy nodes, two distinct memories: the duplicates collapse to one node each.
+        assert_eq!(memory_node_ids(&s), vec!["memory:m-L3-aaa", "memory:m-L3-bbb"]);
+
+        let conn = s.conn.lock().unwrap();
+        // The survivor keeps the *earliest* sighting. Dated from the duplicate's timestamp, the
+        // graph would claim we learned the fact later than we did.
+        let ts: i64 = conn
+            .query_row("SELECT ts FROM context_nodes WHERE id='memory:m-L3-aaa'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ts, 1000);
+        // Non-memory nodes are untouched.
+        let others: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM context_nodes WHERE kind IN ('message','artifact')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(others, 2);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_merges_edge_weight_instead_of_doubling_it() {
+        let (s, dir) = store_with_legacy_memory_nodes("merge");
+        {
+            let conn = s.conn.lock().unwrap();
+            // A node written *after* the fix, so the stable id already exists. This is the case the
+            // backfill has to merge into rather than duplicate. The node has to be inserted first
+            // because the edge below references it and foreign keys are enforced.
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                 VALUES ('memory:m-L3-aaa','memory','Hi, i am Tushu','engine','s-1',2500,
+                         '{\"layer\":\"L3\",\"memoryId\":\"m-L3-aaa\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e:message:s-1:3->memory:m-L3-aaa:recalled','message:s-1:3','memory:m-L3-aaa','recalled',2.0,900)",
+                [],
+            )
+            .unwrap();
+            // ...plus a legacy edge from the same message to the duplicate node.
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e:message:s-1:3->memory:s-1:1:recalled','message:s-1:3','memory:s-1:1','recalled',3.0,800)",
+                [],
+            )
+            .unwrap();
+        }
+        s.migrate().expect("backfill runs");
+
+        {
+            let conn = s.conn.lock().unwrap();
+            let mut stmt =
+                conn.prepare("SELECT to_id, weight FROM context_edges ORDER BY to_id").unwrap();
+            let edges = stmt
+                .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, f64>(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            // One edge at 5.0. The failure mode this guards is 7.0 — updating the existing edge
+            // and then inserting the merged one over it.
+            assert_eq!(edges, vec![("memory:m-L3-aaa".to_string(), 5.0)]);
+            // The post-fix node is left exactly as it was. The backfill re-keys; it does not
+            // rewrite data a user may already have seen.
+            let ts: i64 = conn
+                .query_row("SELECT ts FROM context_nodes WHERE id='memory:m-L3-aaa'", [], |r| {
+                    r.get(0)
+                })
+                .unwrap();
+            assert_eq!(ts, 2500);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn merged_edge_weight_is_capped_like_the_host_caps_it() {
+        let (s, dir) = store_with_legacy_memory_nodes("cap");
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                 VALUES ('memory:m-L3-aaa','memory','Hi, i am Tushu','engine','s-1',2500,
+                         '{\"layer\":\"L3\",\"memoryId\":\"m-L3-aaa\"}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e:message:s-1:3->memory:m-L3-aaa:recalled','message:s-1:3','memory:m-L3-aaa','recalled',40.0,900)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO context_edges (id, from_id, to_id, kind, weight, ts)
+                 VALUES ('e:message:s-1:3->memory:s-1:1:recalled','message:s-1:3','memory:s-1:1','recalled',30.0,800)",
+                [],
+            )
+            .unwrap();
+        }
+        s.migrate().expect("backfill runs");
+
+        let conn = s.conn.lock().unwrap();
+        let w: f64 = conn
+            .query_row("SELECT weight FROM context_edges WHERE to_id='memory:m-L3-aaa'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(w, 50.0, "merged weight must respect the host's ceiling");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_node_whose_memory_is_gone_is_left_alone() {
+        let (s, dir) = store_with_legacy_memory_nodes("orphan");
+        {
+            let conn = s.conn.lock().unwrap();
+            // `meta_json` names a memory that no longer exists, so there is no correct stable id.
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                 VALUES ('memory:s-1:8','memory','a fact since deleted','engine','s-1',1200,
+                         '{\"layer\":\"L0\",\"memoryId\":\"m-L0-gone\"}')",
+                [],
+            )
+            .unwrap();
+        }
+        s.migrate().expect("backfill runs");
+
+        let ids = memory_node_ids(&s);
+        assert!(
+            ids.contains(&"memory:s-1:8".to_string()),
+            "an unresolvable node must survive rather than be re-keyed to a guess: {ids:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_backfill_does_not_run_twice() {
+        let (s, dir) = store_with_legacy_memory_nodes("once");
+        s.migrate().expect("backfill runs");
+        {
+            let conn = s.conn.lock().unwrap();
+            // A legacy-shaped node written *after* the backfill has been recorded.
+            conn.execute(
+                "INSERT INTO context_nodes (id, kind, label, source, session_id, ts, meta_json)
+                 VALUES ('memory:s-1:7','memory','Hi, i am Tushu','engine','s-1',3000,
+                         '{\"layer\":\"L3\",\"memoryId\":\"m-L3-aaa\"}')",
+                [],
+            )
+            .unwrap();
+        }
+        s.migrate().expect("second migrate is a no-op");
+
+        let conn = s.conn.lock().unwrap();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM context_nodes WHERE id='memory:s-1:7'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "a recorded migration must not re-run");
+        let versions: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_version WHERE version=7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(versions, 1);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
