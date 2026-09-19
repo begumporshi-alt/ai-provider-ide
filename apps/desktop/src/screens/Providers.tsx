@@ -17,6 +17,7 @@ import { useUi } from "../ui-state";
 import {
   Button, Field, KeyFingerprint, Modal, StatusBadge, StatusDot, healthOf, inputCls, inputStyle,
 } from "../components/atoms";
+import { verdictNotice } from "../lib/keys/verdict";
 
 const KNOWN = Object.keys(PROVIDER_PROFILES); // openrouter | opencode | b.ai
 
@@ -114,7 +115,7 @@ export function ProvidersScreen() {
                                 setTesting(k.id);
                                 try {
                                   const r = await testKey(k.id);
-                                  setNotice(`${k.label}: ${r.ok ? "valid" : r.rateLimited ? "rate-limited" : `invalid${r.status ? ` (HTTP ${r.status})` : ""} — ${r.message ?? "unknown error"}`}`);
+                                  setNotice(verdictNotice(k.label, r));
                                   if (r.ok) await refreshCatalog(p.id).catch(() => undefined);
                                 } catch (e) {
                                   setNotice(`${k.label}: ${(e as Error).message}`);

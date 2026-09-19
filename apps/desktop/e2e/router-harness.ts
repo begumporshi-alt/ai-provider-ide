@@ -24,6 +24,7 @@ import {
   type ProviderRecord,
 } from "@aiprovider/router-core";
 import { HostHttp, type EgressAuditEntry } from "./host-http.js";
+import { isConclusive, verdictFor } from "../src/lib/keys/verdict.js";
 
 /** In-memory keychain + the ref->provider join the Rust host does in SQLite. */
 class HarnessVault implements KeyVaultPort {
@@ -223,10 +224,12 @@ export function buildHarness(): RouterHarness {
       if (!k) throw new Error(`unknown key ${keyId}`);
       const { adapter } = await adapters.forProvider(k.providerId);
       const res = await adapter.pingKey(k.secretRef);
-      registry.updateKey(keyId, {
-        status: res.ok ? "active" : res.rateLimited ? "cooldown" : "invalid",
-        lastTestedAt: Date.now(),
-      });
+      // Same rule as store.ts, via the same classifier: an inconclusive test must not overwrite the
+      // status, because `invalid` removes the key from rotation.
+      const verdict = verdictFor(res);
+      const patch: Parameters<typeof registry.updateKey>[1] = { lastTestedAt: Date.now() };
+      if (isConclusive(verdict)) patch.status = verdict;
+      registry.updateKey(keyId, patch);
       return { ok: res.ok, status: res.status };
     },
 

@@ -25,6 +25,12 @@ import {
 } from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
+import {
+  isConclusive,
+  verdictFor,
+  type KeyVerdict,
+  type PingResult,
+} from "./lib/keys/verdict";
 
 // ---------- host row shapes (camelCase, mirror persist.rs) ----------
 
@@ -447,19 +453,26 @@ export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): 
   if (k) await invoke("api_key_upsert", { k: keyToHost(k) });
 }
 
-/** Spec req. 8: cheap validity ping per key. */
-export async function testKey(keyId: string): Promise<{ ok: boolean; status: number; rateLimited: boolean; message?: string }> {
+/**
+ * Spec req. 8: cheap validity ping per key.
+ *
+ * Only a conclusive verdict overwrites the stored status. `invalid` removes a key from rotation
+ * outright (`HealthTracker.isKeyUsable`), so writing it because the network hiccuped would take a
+ * working key out of service — which is what this used to do. `lastTestedAt` is recorded either
+ * way, so even an inconclusive test leaves a trace of when it was tried.
+ */
+export async function testKey(keyId: string): Promise<PingResult & { verdict: KeyVerdict }> {
   const k = registry.getKey(keyId);
   if (!k) throw new Error(`unknown key ${keyId}`);
   const { adapter } = await adapters.forProvider(k.providerId);
   const res = await adapter.pingKey(k.secretRef);
-  registry.updateKey(keyId, {
-    status: res.ok ? "active" : res.rateLimited ? "cooldown" : "invalid",
-    lastTestedAt: Date.now(),
-  });
+  const verdict = verdictFor(res);
+  const patch: Parameters<typeof registry.updateKey>[1] = { lastTestedAt: Date.now() };
+  if (isConclusive(verdict)) patch.status = verdict;
+  registry.updateKey(keyId, patch);
   const fresh = registry.getKey(keyId);
   if (fresh) await invoke("api_key_upsert", { k: keyToHost(fresh) });
-  return res;
+  return { ...res, verdict };
 }
 
 export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
