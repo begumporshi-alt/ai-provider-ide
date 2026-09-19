@@ -276,8 +276,12 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 
 - `app_nap.rs` suppresses App Nap at startup via
   `NSProcessInfo::beginActivityWithOptions_reason` with `UserInitiatedAllowingIdleSystemSleep`.
-  It is the root cause fix for heartbeat lapses and the 60s hang — the earlier gateway fixes
-  only treated symptoms.
+- **It is NOT the root-cause fix for the heartbeat lapse — measured, 2026-09-19.** With it wired in
+  (`lib.rs:162`) the worker beat still hard-stops after ~484s of idleness and the watchdog still
+  fires. Process-level App Nap and a hidden WKWebView's own timer suspension are *different*
+  mechanisms, and suppressing the former does not prevent the latter. What actually handles the lapse
+  is on-demand recovery (`await_core` + `request_warm`). Keep the suppression — a napped process
+  cannot answer regardless — but do not credit it with fixing the lapse.
 - The call must come **after** `tracing_subscriber` init or its confirmation line is dropped.
 - `objc2` / `objc2-foundation` are macOS-target deps pinned to the versions already in
   Cargo.lock (0.6.4 / 0.3.2, pulled in by Tauri). Build with `CARGO_NET_OFFLINE=true`.
@@ -324,6 +328,15 @@ screen without the built app. It is not headless-by-default in spirit: it drives
   `apps/desktop/dist/assets/` — that is what got embedded.
 - Playwright's own cleanup of `web-test/.report` trips the sandbox bulk-delete shim and fails the
   run *after* the tests pass. Move `.report` and `test-results` aside before running.
+- **Test the startup fix on the first launch after a rebuild, or the test proves nothing.** macOS
+  re-validates keychain ACLs per code signature, so the cold-ACL condition exists **once per build**.
+  A repro loop against an already-launched build passes whether or not the code is fixed. Sequence:
+  build → install → test the very first launch.
+- **Beware a repro script that outruns the thing it measures.** `repro-restore.sh` kills each
+  instance ~3s after the socket binds, which is too soon for the keychain probe to finish — so its
+  output shows the *socket* came up but cannot show the *keychain read*. For that, leave one launch
+  alive and time the probe marker directly. A green repro is not automatically evidence for every
+  claim attached to it.
 
 ## API key status
 
