@@ -257,3 +257,61 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 - To see the app's own logs (they go to stderr and `open -a` discards them): run the binary
   directly — `nohup "/Applications/AI-Provider Router.app/Contents/MacOS/ai-provider-router" >
   /tmp/router-app.log 2>&1 &`.
+
+## Migrations (`src-tauri/src/store.rs`)
+
+- **Two ordered lists.** `MIGRATIONS` holds SQL batches, numbered `1..N` by position.
+  `DATA_MIGRATIONS` holds `fn(&Transaction) -> rusqlite::Result<()>` steps for backfills that need
+  real logic, numbered `MIGRATIONS.len() + idx + 1`. Forward-only; never edit an applied entry. A
+  test asserts the combined count so a data migration cannot reuse a SQL version number and be
+  silently skipped.
+- **Why not SQL for backfills.** The edge table has a derived PK `id`, a unique index on
+  `(from_id,to_id,kind)`, and FK cascades. `ON CONFLICT(from_id,to_id,kind)` does *not* catch a PK
+  conflict on the derived `id`, so a merge either errors or needs delete-then-reinsert ordering.
+  Rust with explicit `UPDATE`-then-`INSERT` is clearer and testable.
+- **Rewind to test a backfill:** seed the old shape, `DELETE FROM schema_version WHERE version=N`,
+  then call `migrate()`. That exercises the real runner path rather than the fn in isolation.
+- **Verify a backfill against real data before shipping:** copy the live DB into a temp *directory*
+  as `ai-provider-router.db` and call `Store::open` on that dir — `open` runs migrations on it.
+
+## Context graph
+
+- Node ids must be **stable and derived from the thing they represent** (e.g. `memory:<storageId>`
+  via `memoryNodeId()`), never minted per call. The host upserts nodes on `id` and accumulates
+  `weight = MIN(weight + excluded.weight, 50)`, but `BufferedRecorder` is a naive append log that
+  does *not* dedupe — so a generated id turns the host's machinery into dead code, silently. A
+  memory node's `meta_json` carries `memoryId`, which is what makes old rows re-keyable exactly.
+- The host's node upsert is `ON CONFLICT(id) DO UPDATE SET label=…, session_id=…, ts=excluded.ts,
+  meta_json=…`, so a node's label and ts refresh on every record. Anything derived from the source
+  row (e.g. an edited memory's text) self-heals on the next recall — do not report it as a gap
+  without checking this.
+- Node labels are truncated (`m.text.slice(0, 80)`), so **never match nodes on label** — it is lossy
+  and not unique.
+
+## Verifying the *installed* app
+
+- `osascript` works for pure computation but System Events / Finder UI scripting fails with a
+  privilege violation, so the running app cannot be driven by script.
+- Frontend assets are brotli-compressed inside the binary: `strings` on it proves Rust literals
+  (e.g. a migration name) but **not** frontend strings. Check the frontend against
+  `apps/desktop/dist/assets/` — that is what got embedded.
+- Playwright's own cleanup of `web-test/.report` trips the sandbox bulk-delete shim and fails the
+  run *after* the tests pass. Move `.report` and `test-results` aside before running.
+
+## API key status
+
+- **`invalid` is an eviction, not a label.** `HealthTracker.isKeyUsable` returns false for
+  `disabled` *and* `invalid`, and `ModelCatalog.refreshProvider` only considers `active` keys. So
+  writing `invalid` takes a key out of rotation until a human re-enables it — never write it from an
+  inconclusive test.
+- Classify before writing: `src/lib/keys/verdict.ts` (`verdictFor` / `isConclusive` /
+  `verdictNotice`). `invalid` is reserved for 401/403; 429 is `cooldown`; 5xx and odd 4xx are the
+  provider's problem; `status: 0` means no HTTP response at all (`pingKey` uses 0 for DNS, TLS,
+  timeout, offline *and* "no listModels endpoint") and yields `unverified`, which writes no status.
+- An explicit `rateLimited: true` beats `status: 0` — a positive claim by the adapter is better
+  evidence than the absence of a status. (This ordering was wrong at first; a unit test caught it.)
+- The stored vocabulary is `active | cooldown | invalid | disabled` (schema CHECK). Do not widen it
+  to carry "unknown" — widening needs a SQLite table rebuild, and "don't write a verdict" is enough.
+- `web-test/key-verdict.spec.ts` drives the real `store.testKey` (the shim does not stub it) and
+  forces failure with `page.route`. Verify new specs **fail on the old code** — the two that pin the
+  fixed behaviour must fail, the 401/429 ones must pass both ways.
