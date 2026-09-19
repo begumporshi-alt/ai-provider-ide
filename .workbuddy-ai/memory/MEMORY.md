@@ -38,7 +38,25 @@ through it works end to end.
 - The gateway worker window calls `bootstrap()` and **never** `refreshCatalog`. Anything the
   gateway needs from the catalog (pricing, modality) must come from the persisted
   `models_cache` rows. This is why pricing had to be persisted, not just computed.
-- Auto-restores on launch from `settings.gateway = {"port":8787,"enabled":true}`.
+- Auto-restores on launch from `settings.gateway = {"port":8787,"enabled":true}`. Takes ~20 s
+  (window creation + spawn), so do not conclude it failed before then. Only `gateway_enable` logs
+  `enabled on port N`; the failure path uses `tracing`, which a release GUI build discards — so a
+  restore that fails is *invisible* in `gateway.log`.
+- **A hidden worker's heartbeat stops after ~484 s of idleness and does not wake on its own.**
+  Measured, not inferred: healthy windows are pinned at 484–486 s (18 of 33), every window >500 s
+  contains a `gateway_enable` that re-composited the window, and recovery follows a re-composite
+  within 20–50 ms all 38 times. Load prevents it entirely — 25,367 requests at ~28/s over 900 s
+  produced zero lapses and a p50 of 6.3 ms. So it is *idleness*, not hiddenness.
+  **Consequence for reading the code:** a stale beat means "asleep", not "broken". `is_available()`
+  is the conjunction of operator intent and the beat; `gateway_status.running` is intent only, and
+  `worker_awake` is the beat. `await_core` is what revives a sleeping worker (≤5 s grace), which is
+  why the watchdog no longer pre-warms — it only logs, once per episode. Do not "fix" a lapsed beat
+  by raising `HEARTBEAT_STALE_HIDDEN_MS`: it is a detector, and an unbounded one would make a
+  genuinely dead worker look alive forever.
+- The old comment justifying `HEARTBEAT_STALE_HIDDEN_MS = 30_000` ("~0.33/s, worst observed gap
+  3.0 s, so ordinary throttling can never trip it") was **wrong** and is now replaced. That bound
+  is tripped on every idle period. When a constant's rationale is a measurement, re-measure before
+  trusting it.
 - **Agnes's catalog lies about modality** — it publishes `agnes-image-*` and `agnes-video-*` as
   `modality = 'text'`. So `modality` from `models_cache` cannot be trusted to identify an image
   model for Agnes; `workbuddy.rs` falls back to the model id (`-image`/`-video`). This is why
@@ -63,6 +81,15 @@ through it works end to end.
   focuses the old process and verification tests stale code.
 - GUI apps launched by a tool call are reaped when the call ends — launch and verify in the
   same command.
+- **Every reinstall invalidates the app's keychain ACL, and a keychain read takes ~19 s to
+  negotiate afterwards.** `probe_key_refs` used to run inline in `setup()`, so that 19 s landed
+  *before any window existed* — the process sat alive with no window, no socket and no log line,
+  which reads exactly like "still starting". It is now on its own thread. If a launch ever looks
+  dead, read `gateway.log`: the `startup: <step>` markers name the last step reached, and a hang
+  past `store opened` means something on that path is talking to the keychain. Same ACL applies to
+  `workbuddy::sync` (`workbuddy.rs:316`), which is why it can lag the listener by ~13 s.
+- `ps` is sandbox-blocked; use `pgrep -fl` and `lsof -p <pid>` instead. A GUI app launched by a
+  tool call is NOT reliably reaped (the note above is the conservative rule, not a guarantee).
 
 ## Context graph (P4)
 
