@@ -165,40 +165,90 @@ pub fn run() {
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
             // L0 services: OS keychain (via keyring), egress gateway, sql-store.
+            //
+            // Every step below is marked in `gateway.log` rather than `tracing`. A release GUI
+            // build has no console, and a *hang* in this closure is worse than a failure: the
+            // process stays alive with no window, no socket and no message, so "the gateway
+            // didn't come back" is indistinguishable from "it is still starting". The last
+            // marker written names the step that never returned.
             let data_dir = app.path().app_data_dir()?;
             // Install the panic hook now that we know the real app data dir.
             // This captures panics that happen after setup completes (the common case).
             // Panics during setup itself will print to stderr but won't produce a report —
             // that's an acceptable tradeoff since such panics are rare and obvious.
             crash_report::install_panic_hook(data_dir.clone());
+            crate::gateway_cmds::log_to_file(app.handle(), "startup: opening store");
             let store = Arc::new(
                 store::Store::open(&data_dir).map_err(|e| format!("store init failed: {e}"))?,
             );
-            probe_key_refs(&store);
+            crate::gateway_cmds::log_to_file(app.handle(), "startup: store opened");
+            // Deferred off the startup path deliberately. This reads the OS keychain, and a
+            // keychain read can *block* on an authorization prompt — which is exactly what happens
+            // after the app is rebuilt or reinstalled, because macOS re-checks the stored ACL
+            // against the new code signature. Run inline here it blocked `setup()` before any
+            // window existed, so the prompt had nowhere to appear and the process simply sat
+            // there: alive, no window, no socket, and no log line past this one. Off the startup
+            // path the app is up and the prompt is answerable.
+            //
+            // It also holds no store lock across the keychain read, so moving it cannot deadlock
+            // against the restore task that now runs beside it.
+            let probe_app = app.handle().clone();
+            let probe_store = store.clone();
+            std::thread::spawn(move || {
+                probe_key_refs(&probe_store);
+                crate::gateway_cmds::log_to_file(&probe_app, "startup: key refs probed");
+            });
             let allow = Arc::new(egress::AllowList(RwLock::new(initial_allow_hosts(&store))));
             let egress_state = Arc::new(egress::EgressState::new(allow, store.clone()));
             gateway_cmds::run_rollup(&store);
+            crate::gateway_cmds::log_to_file(app.handle(), "startup: rollup done");
             // Read before `store` is handed to `app.manage` — after that it is gone.
             let restore_port = persisted_gateway_port(&store);
             app.manage(store);
             app.manage(egress_state);
             gateway_cmds::manage(app)?;
+            crate::gateway_cmds::log_to_file(app.handle(), "startup: state managed");
             // R1: tray is best-effort. On failure we log and fall through with close-to-quit
             // intact, so the app can never end up running with no way to reach it.
             if let Err(e) = build_tray(app.handle()) {
                 tracing::warn!("tray icon unavailable — close will quit: {e}");
             }
+            crate::gateway_cmds::log_to_file(
+                app.handle(),
+                &format!("startup: tray done, restore_port={restore_port:?}"),
+            );
             // Bring the gateway back if it was serving when the app last quit. Best-effort: a
             // failure here must never stop the UI from opening, so it is logged and dropped.
+            //
+            // Logged to `gateway.log`, not just `tracing`. A release GUI build has no console, so
+            // the tracing-only version of this left "the app came up without a gateway" with no
+            // evidence anywhere — which is exactly how a silent failure passes for a slow start.
             if let Some(port) = restore_port {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
-                    match crate::gateway_cmds::gateway_enable(handle, Some(port)).await {
-                        Ok(bound) => tracing::info!("gateway restored on port {bound}"),
-                        Err(e) => tracing::warn!("gateway auto-restore failed: {e}"),
+                    crate::gateway_cmds::log_to_file(
+                        &handle,
+                        &format!("auto-restore: requested port {port}"),
+                    );
+                    match crate::gateway_cmds::gateway_enable(handle.clone(), Some(port)).await {
+                        Ok(bound) => {
+                            tracing::info!("gateway restored on port {bound}");
+                            crate::gateway_cmds::log_to_file(
+                                &handle,
+                                &format!("auto-restore: restored on port {bound}"),
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!("gateway auto-restore failed: {e}");
+                            crate::gateway_cmds::log_to_file(
+                                &handle,
+                                &format!("auto-restore FAILED: {e}"),
+                            );
+                        }
                     }
                 });
             }
+            crate::gateway_cmds::log_to_file(app.handle(), "startup: setup complete");
             Ok(())
         })
         .invoke_handler(commands::handlers())
