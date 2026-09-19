@@ -124,17 +124,41 @@ test("memory: an empty store explains itself instead of showing a blank panel", 
   await expect(page.getByText(/No memories yet/)).toBeVisible();
 });
 
-test("memory: a row shows when it was last seen, and only adds 'first' when that differs", async ({ page }) => {
+test("memory: browsing groups rows under a day header and dates each row by clock time", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await seedMemories(page);
 
   await page.getByRole("button", { name: "Memory", exact: true }).click();
-  const row = rowFor(page, "Tushu lives in Dhaka");
-  // Relative age, not an absolute timestamp — recency is what you judge a memory by.
-  await expect(row).toContainText(/just now|\d+[mhd] ago|\d+mo ago/);
+
+  // Browsing is chronological, so the date is the axis and it gets a header with a count.
+  await expect(page.getByTestId("memory-day").first()).toContainText(/Today · \d+/);
+  // The header supplied the date, so the row carries the exact clock time rather than a relative
+  // age that would only restate it. `MemoryWhen`'s `dated` prop is what switches the two.
+  await expect(rowFor(page, "Tushu lives in Dhaka")).toContainText(/\d{1,2}:\d{2}/);
+});
+
+test("memory: a search result shows a relative age, because it is ranked and not dated", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await seedMemories(page);
+
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  await page.getByPlaceholder("search memory…").fill("Dhaka timezone");
+
+  // Grouping ranked results by day would contradict the ranking they came back in, so the list
+  // stays flat and each row is aged relative to now.
+  await expect(page.getByTestId("memory-day")).toHaveCount(0);
+  await expect(rowFor(page, "Tushu lives in Dhaka")).toContainText(/just now|\d+[mhd] ago/);
+});
+
+test("memory: re-recording a fact adds no redundant 'first' line", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await seedMemories(page);
+
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  await expect(rowFor(page, "Tushu lives in Dhaka")).toBeVisible();
 
   // Re-record the same atom, which refreshes `updated_at` in place rather than duplicating. Both
-  // timestamps still read "just now", so the row must not print "just now · first just now".
+  // timestamps still read the same, so the row must not print "… · first …".
   await page.evaluate(async () => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const host = (window as any).__webTest;
@@ -144,8 +168,24 @@ test("memory: a row shows when it was last seen, and only adds 'first' when that
   });
 
   await expect(rowFor(page, "Tushu lives in Dhaka")).not.toContainText("first");
-  // Still one row — refreshing in place is the whole point of the dedupe on (layer, text).
+  // Still four rows — refreshing in place is the whole point of the dedupe on (layer, text).
   await expect.poll(async () => (await store<MemoryRow[]>(page, "memories")).length).toBe(4);
+});
+
+test("memory: an empty window reads differently from an empty store", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  // These are two different facts and must not share a message: "you have recorded nothing" and
+  // "you have recorded nothing *in this window*" call for different next actions.
+  await expect(page.getByText(/No memories yet/)).toBeVisible();
+  await page.getByRole("button", { name: "7d", exact: true }).click();
+  await expect(page.getByText("Nothing recorded in the last 7 days.")).toBeVisible();
+  await expect(page.getByText(/No memories yet/)).toHaveCount(0);
+
+  // And the way back is offered, so the filter cannot strand the user in an empty view.
+  await page.getByRole("button", { name: "all", exact: true }).click();
+  await expect(page.getByText(/No memories yet/)).toBeVisible();
 });
 
 test("memory: the core profile section lets the user add, edit, and forget L3 facts", async ({ page }) => {

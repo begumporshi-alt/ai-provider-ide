@@ -13,6 +13,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Button, EmptyState, inputCls, inputStyle } from "../components/atoms";
 import { useUi } from "../ui-state";
 import { captureCore, editCore } from "../lib/memory/engine";
+import { ago, clock, groupByDay, RANGES, since } from "../lib/memory/timeline";
 import {
   clearMemories,
   forgetMemory,
@@ -40,27 +41,16 @@ const SEARCH_NOTE =
   + "query. There is no embedding model in this app, and that is deliberate. Ties are broken "
   + "toward the more recent memory.";
 
-/** Coarse relative age. Precision is not the point — "3d ago" is what you read to judge recency. */
-function ago(ts: number): string {
-  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
-  if (secs < 45) return "just now";
-  const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins}m ago`;
-  const hours = Math.round(mins / 60);
-  if (hours < 24) return `${hours}h ago`;
-  const days = Math.round(hours / 24);
-  if (days < 30) return `${days}d ago`;
-  const months = Math.round(days / 30);
-  if (months < 12) return `${months}mo ago`;
-  return `${Math.round(months / 12)}y ago`;
-}
-
 /**
  * When a memory was written and when it last came up.
  *
- * Both are worth seeing and they are usually the same, so the second only appears when the two
- * would *read* differently. Comparing the rendered strings rather than the raw delta is what makes
- * that correct: a re-record a few seconds after the first would otherwise print
+ * `dated` is set when a day header already supplies the date, in which case the exact clock time
+ * is the useful half and a relative age would only repeat the header. In the ranked search list
+ * there is no header, so the relative age is what you read.
+ *
+ * Both timestamps are worth seeing and they are usually the same, so the second only appears when
+ * the two would *read* differently. Comparing the rendered strings rather than the raw delta is
+ * what makes that correct: a re-record a few seconds after the first would otherwise print
  * "just now · first just now", which is noise, while a re-record an hour later prints
  * "1h ago · first 3d ago", which is the thing worth knowing.
  *
@@ -68,19 +58,61 @@ function ago(ts: number): string {
  * `updated_at` drifts away from `created_at` with no other visible trace. Showing only
  * `updated_at` would report when we last *saw* a fact as if it were when we learned it.
  */
-function MemoryAge({ m }: { m: Memory }) {
-  const seen = ago(m.updated_at);
+function MemoryWhen({ m, dated }: { m: Memory; dated: boolean }) {
+  const seen = dated ? clock(m.updated_at) : ago(m.updated_at);
   const first = ago(m.created_at);
   return (
     <>
       <span title={new Date(m.updated_at).toLocaleString()}>{seen}</span>
-      {first !== seen && (
+      {first !== ago(m.updated_at) && (
         <>
           {" · first "}
           <span title={new Date(m.created_at).toLocaleString()}>{first}</span>
         </>
       )}
     </>
+  );
+}
+
+/** One memory. Extracted so the ranked list and the day-grouped timeline cannot drift apart. */
+function MemoryRow({
+  m,
+  dated,
+  onPin,
+  onForget,
+}: {
+  m: Memory;
+  dated: boolean;
+  onPin: (m: Memory, pinned: boolean) => void;
+  onForget: (id: string) => void;
+}) {
+  return (
+    <div
+      className="mb-1.5 flex items-start gap-2 rounded border px-3 py-2"
+      style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+    >
+      <span
+        className="mono mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px]"
+        style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
+      >
+        {m.layer}
+      </span>
+      <div className="min-w-0 flex-1">
+        <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed">{m.text}</div>
+        <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
+          {m.subject ? `${m.subject} · ` : ""}
+          <MemoryWhen m={m} dated={dated} />
+          {m.score !== undefined ? ` · bm25 ${m.score.toFixed(2)}` : ""}
+        </div>
+      </div>
+      <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px]" style={{ color: "var(--text-dim)" }}>
+        <input type="checkbox" checked={m.pinned} onChange={(e) => onPin(m, e.target.checked)} />
+        pin
+      </label>
+      <button className="shrink-0 text-[11px]" style={{ color: "var(--danger)" }} onClick={() => onForget(m.id)}>
+        forget
+      </button>
+    </div>
   );
 }
 
@@ -92,6 +124,7 @@ export function MemoryScreen() {
   const [layer, setLayer] = useState<MemoryLayer | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Memory[] | null>(null);
+  const [range, setRange] = useState(0);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -122,8 +155,20 @@ export function MemoryScreen() {
   const shown = useMemo(() => {
     // L3 is owned by CoreSection — excluded from the derived list to keep one source of truth.
     const base = (hits ?? all).filter((m) => m.layer !== "L3");
-    return layer ? base.filter((m) => m.layer === layer) : base;
-  }, [hits, all, layer]);
+    const byLayer = layer ? base.filter((m) => m.layer === layer) : base;
+    // The range cuts on `updated_at` because that is the same timestamp the list is ordered by and
+    // the rows display. Filtering on a different one would make a row's own label contradict why
+    // it is on screen.
+    const cutoff = since(range);
+    return cutoff > 0 ? byLayer.filter((m) => m.updated_at >= cutoff) : byLayer;
+  }, [hits, all, layer, range]);
+
+  // Browse mode gets a date axis; the ranked search list does not. Grouping search results by day
+  // would fight the ranking they came back in.
+  const groups = useMemo(
+    () => (hits ? null : groupByDay(shown, (m) => m.updated_at)),
+    [hits, shown],
+  );
 
   async function doForget(id: string) {
     setError(null);
@@ -180,12 +225,12 @@ export function MemoryScreen() {
 
       <CoreSection all={all} bump={bump} setError={setError} />
 
-      <div className="mb-3 flex items-center gap-2">
+      <div className="mb-3 flex flex-wrap items-center gap-2">
         <input
           value={query}
           onChange={(e) => setQuery(e.target.value)}
           placeholder="search memory…"
-          className={`${inputCls} flex-1`}
+          className={`${inputCls} min-w-[200px] flex-1`}
           style={inputStyle}
         />
         <div className="flex gap-1">
@@ -205,6 +250,30 @@ export function MemoryScreen() {
             </button>
           ))}
         </div>
+        {/* A rule between the two filter groups: without it the "range" label sits flush against
+            the last layer chip and the two read as one control group. */}
+        <div className="flex items-center gap-2 border-l pl-3" style={{ borderColor: "var(--border)" }}>
+          <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+            range
+          </span>
+          <div className="flex gap-1">
+            {RANGES.map((r) => (
+              <button
+                key={r.label}
+                onClick={() => setRange(r.days)}
+                title={r.days === 0 ? "everything recorded" : `recorded in the last ${r.label}`}
+                className="rounded px-2 py-1 text-[11px]"
+                style={{
+                  background: range === r.days ? "var(--accent)" : "var(--surface)",
+                  color: range === r.days ? "var(--accent-fg, #fff)" : "var(--text-dim)",
+                  border: "1px solid var(--border)",
+                }}
+              >
+                {r.label}
+              </button>
+            ))}
+          </div>
+        </div>
       </div>
 
       {shown.length === 0 ? (
@@ -212,32 +281,35 @@ export function MemoryScreen() {
           title={
             hits
               ? "Nothing matches that query."
-              : "No memories yet. Chat with memory enabled in the Playground and durable facts will be distilled here."
+              : range > 0
+                ? `Nothing recorded in the last ${range === 1 ? "24 hours" : `${range} days`}.`
+                : "No memories yet. Chat with memory enabled in the Playground and durable facts will be distilled here."
           }
         />
+      ) : groups ? (
+        // Browsing: the date is the axis, so it gets headers, and each row shows the clock time
+        // rather than a relative age that would only restate the header above it.
+        <div data-testid="memory-list">
+          {groups.map((g) => (
+            <section key={g.key} className="mb-3">
+              <div
+                data-testid="memory-day"
+                className="mb-1.5 text-[10px] uppercase tracking-wide"
+                style={{ color: "var(--text-faint)" }}
+              >
+                {g.label} · {g.items.length}
+              </div>
+              {g.items.map((m) => (
+                <MemoryRow key={m.id} m={m} dated onPin={doPin} onForget={doForget} />
+              ))}
+            </section>
+          ))}
+        </div>
       ) : (
+        // Ranked results: a flat list. Grouping by day would contradict the ranking.
         <div data-testid="memory-list">
           {shown.map((m) => (
-            <div key={m.id} className="mb-1.5 flex items-start gap-2 rounded border px-3 py-2" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-              <span className="mono mt-0.5 shrink-0 rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>
-                {m.layer}
-              </span>
-              <div className="min-w-0 flex-1">
-                <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed">{m.text}</div>
-                <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
-                  {m.subject ? `${m.subject} · ` : ""}
-                  <MemoryAge m={m} />
-                  {m.score !== undefined ? ` · bm25 ${m.score.toFixed(2)}` : ""}
-                </div>
-              </div>
-              <label className="flex shrink-0 cursor-pointer items-center gap-1 text-[11px]" style={{ color: "var(--text-dim)" }}>
-                <input type="checkbox" checked={m.pinned} onChange={(e) => doPin(m, e.target.checked)} />
-                pin
-              </label>
-              <button className="shrink-0 text-[11px]" style={{ color: "var(--danger)" }} onClick={() => doForget(m.id)}>
-                forget
-              </button>
-            </div>
+            <MemoryRow key={m.id} m={m} dated={false} onPin={doPin} onForget={doForget} />
           ))}
         </div>
       )}
@@ -346,7 +418,9 @@ function CoreSection({
                   </div>
                 )}
                 <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
-                  <MemoryAge m={m} />
+                  {/* The core profile is not day-grouped — it is a standing set of facts, not a
+                      stream — so these keep the relative age. */}
+                  <MemoryWhen m={m} dated={false} />
                 </div>
               </div>
               {editingId === m.id ? (
