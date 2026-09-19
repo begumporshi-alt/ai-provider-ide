@@ -43,6 +43,49 @@ const keychain = new Map<string, string>();
 let sessionSeq = 0;
 let auditSeq = 0;
 
+// P4/P5/P6 tables. Mirrors of context.rs / skills.rs / orchestrator.rs — same vocabularies, same
+// rejection rules — so a screen that renders here renders for the same reasons it will there.
+const contextNodes: Row[] = [];
+const contextEdges: Row[] = [];
+const skills: Row[] = [];
+const agentRuns: Row[] = [];
+const agentSteps: Row[] = [];
+
+const NODE_KINDS = ["artifact", "memory", "skill", "message"];
+const EDGE_KINDS = [
+  "produced", "used", "recalled", "follows", "references",
+  "routes_to", "served_by", "aliases", "backed_by",
+];
+const RUN_STATUSES = ["running", "ok", "error", "stopped"];
+const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
+/** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
+const MAX_WEIGHT = 50;
+
+const BUILTIN_SKILLS: { slug: string; name: string; description: string; body: string }[] = [
+  { slug: "code-review", name: "Code review", description: "Review a change for correctness, security and clarity before it lands.", body: "Review the change the user points at.\n\n1. Read the changed files.\n2. Look for correctness bugs, unhandled errors, security problems, then clarity.\n3. Report as a short list: file, line, what is wrong, why it matters." },
+  { slug: "commit-message", name: "Commit message", description: "Write a conventional commit message from what actually changed.", body: "Write a commit message for the pending change.\n\n1. Inspect the change; do not guess from the branch name.\n2. First line: type(scope): summary, imperative, under 72 characters.\n3. Body: why the change was needed, not what it did." },
+  { slug: "explain-code", name: "Explain code", description: "Explain a file, module or symbol to someone seeing it for the first time.", body: "Explain the code the user names.\n\n1. Read it before explaining it.\n2. Lead with the one thing it is for.\n3. Then the shape: entry points, main data flow, dependencies." },
+  { slug: "test-writer", name: "Write tests", description: "Write focused tests for a module, covering behaviour rather than implementation.", body: "Write tests for the module the user names.\n\n1. Read the module and any existing tests.\n2. Cover behaviour: normal path, edge cases, error cases.\n3. Match the conventions already there." },
+];
+
+/** Builtins seed once, exactly as skills.rs does — otherwise a revoked one would come back. */
+function seedSkillsOnce(): void {
+  if (settings.get("skills_seeded") === "1") return;
+  const now = Date.now();
+  for (const b of BUILTIN_SKILLS) {
+    if (!skills.some((s) => s.slug === b.slug)) {
+      skills.push({ id: `builtin-${b.slug}`, slug: b.slug, name: b.name, description: b.description, version: "1.0.0", source: "builtin", body: b.body, enabled: true, installed_at: now });
+    }
+  }
+  settings.set("skills_seeded", "1");
+}
+
+function slugifySkillName(name: string): string {
+  const lowered = name.toLowerCase().replace(/[^a-z0-9]/g, "-").replace(/^-+|-+$/g, "");
+  const collapsed = lowered.replace(/-{2,}/g, "-");
+  return collapsed === "" ? `skill-${Date.now()}` : collapsed;
+}
+
 // ---------------------------------------------------------------------------
 // Persistence: the real host commits every write to SQLite before it replies, so a restart
 // finds the store where the app left it. sessionStorage gives this page the same property —
@@ -64,6 +107,11 @@ interface Snapshot {
   audits: Row[];
   sessions: Row[];
   keychain: [string, string][];
+  contextNodes: Row[];
+  contextEdges: Row[];
+  skills: Row[];
+  agentRuns: Row[];
+  agentSteps: Row[];
 }
 
 function snapshot(): Snapshot {
@@ -79,6 +127,11 @@ function snapshot(): Snapshot {
     audits: [...audits],
     sessions: [...sessions],
     keychain: [...keychain.entries()],
+    contextNodes: [...contextNodes],
+    contextEdges: [...contextEdges],
+    skills: [...skills],
+    agentRuns: [...agentRuns],
+    agentSteps: [...agentSteps],
   };
 }
 
@@ -105,6 +158,16 @@ function restore(s: Snapshot): void {
   sessions.push(...s.sessions);
   keychain.clear();
   for (const [ref, secret] of s.keychain) keychain.set(ref, secret);
+  contextNodes.length = 0;
+  contextNodes.push(...(s.contextNodes ?? []));
+  contextEdges.length = 0;
+  contextEdges.push(...(s.contextEdges ?? []));
+  skills.length = 0;
+  skills.push(...(s.skills ?? []));
+  agentRuns.length = 0;
+  agentRuns.push(...(s.agentRuns ?? []));
+  agentSteps.length = 0;
+  agentSteps.push(...(s.agentSteps ?? []));
 }
 
 function persist(): void {
@@ -239,6 +302,12 @@ let eventSeq = 0;
       cb?.({ event, id: l.eventId, payload });
     }
   },
+  /**
+   * Call a host command the way the UI would, so a spec can seed state the UI has no way to
+   * produce on its own (an agent run, for instance, needs a real model round-trip).
+   * Dev-only: it bypasses the React tree, so it is for arranging, never for asserting.
+   */
+  invoke: (cmd: string, args: Record<string, unknown> = {}) => handle(cmd, args),
   /** Read-only view of the persisted store (spec assertions inspect this). */
   store: {
     providers: () => [...providers.values()],
@@ -247,6 +316,11 @@ let eventSeq = 0;
     aliases: () => [...aliases],
     manifests: () => [...manifests],
     settings: (k: string) => settings.get(k) ?? null,
+    skills: () => [...skills],
+    contextNodes: () => [...contextNodes],
+    contextEdges: () => [...contextEdges],
+    agentRuns: () => [...agentRuns],
+    agentSteps: () => [...agentSteps],
   },
 };
 
@@ -254,8 +328,29 @@ let eventSeq = 0;
 // The command table — mirrors src-tauri command-for-command.
 // ---------------------------------------------------------------------------
 
+/**
+ * Tauri renames command arguments from camelCase (JS) to snake_case (Rust) — the macro does it
+ * unconditionally, see tauri-macros' wrapper: "we always convert to camelCase". The command
+ * table below mirrors Rust, so it has to be handed Rust-side names.
+ *
+ * Without this, a multi-word argument arrives as `undefined` and silently matches nothing:
+ * `agent_run_steps` returned zero steps for a run that had three, because the UI sent `runId`
+ * and the table read `run_id`. That failure mode is invisible without a live call, which is
+ * exactly why it belongs here rather than in a comment.
+ *
+ * Only top-level keys are renamed — nested payloads are deserialized by serde with the names
+ * the caller wrote, so a node's `session_id` is passed through untouched.
+ */
+function toRustArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args)) {
+    out[k.replace(/[A-Z]/g, (c) => `_${c.toLowerCase()}`)] = v;
+  }
+  return out;
+}
+
 async function handle(cmd: string, args: Record<string, unknown>): Promise<unknown> {
-  const result = await dispatch(cmd, args);
+  const result = await dispatch(cmd, toRustArgs(args));
   persist(); // commit before the webview sees the reply, as the Rust host does
   return result;
 }
@@ -266,14 +361,14 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "providers_list":
       return [...providers.values()];
     case "api_keys_list":
-      return [...keys.values()].filter((k) => args.providerId == null || k.providerId === args.providerId);
+      return [...keys.values()].filter((k) => args.provider_id == null || k.providerId === args.provider_id);
     case "models_cache_list":
       return models;
     case "manifests_active":
       return manifests.filter((m) => m.isActive);
     case "manifests_history":
       return manifests
-        .filter((m) => m.providerId === args.providerId)
+        .filter((m) => m.providerId === args.provider_id)
         .sort((a, b) => b.version - a.version);
     case "aliases_list":
       return aliases;
@@ -329,7 +424,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return null;
     }
     case "models_cache_replace": {
-      const pid = args.providerId as string;
+      const pid = args.provider_id as string;
       for (let i = models.length - 1; i >= 0; i--) if (models[i].providerId === pid) models.splice(i, 1);
       models.push(...(args.rows as Row[]));
       return null;
@@ -351,23 +446,23 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return next;
     }
     case "manifest_activate": {
-      const pid = args.providerId as string;
+      const pid = args.provider_id as string;
       const version = args.version as number;
       const prevRow = manifests.find((r) => r.providerId === pid && r.isActive);
       for (const r of manifests.filter((r) => r.providerId === pid)) r.isActive = r.version === version;
       return prevRow && prevRow.version !== version ? prevRow.version : null;
     }
     case "settings_set":
-      settings.set(args.key as string, args.valueJson as string);
+      settings.set(args.key as string, args.value_json as string);
       return null;
     case "ledger_append":
       ledger.push({ ...(args.e as Row) });
       return null;
     case "drift_event_record":
-      drift.push({ providerId: args.providerId as string, triggerJson: args.triggerJson as string, resolved: null });
+      drift.push({ providerId: args.provider_id as string, triggerJson: args.trigger_json as string, resolved: null });
       return null;
     case "drift_event_resolve": {
-      const d = drift.find((d) => d.providerId === args.providerId && !d.resolved);
+      const d = drift.find((d) => d.providerId === args.provider_id && !d.resolved);
       if (d) d.resolved = args.resolution as string;
       return null;
     }
@@ -414,7 +509,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return egressUnary(args.req as WireReq);
     case "egress_stream":
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
-      return egressStream(args.req as WireReq, args.onEvent as string);
+      return egressStream(args.req as WireReq, args.on_event as string);
     case "egress_fetch_image": {
       const req = args.req as { url: string; timeout_ms?: number | null };
       return fetchImage(req.url, req.timeout_ms ?? 30_000);
@@ -437,9 +532,171 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     }
     case "plugin:event|unlisten": {
       const arr = listeners.get(args.event as string) ?? [];
-      const i = arr.findIndex((l) => l.eventId === args.eventId);
+      const i = arr.findIndex((l) => l.eventId === args.event_id);
       if (i >= 0) arr.splice(i, 1);
       return null;
+    }
+
+    // ---- P4: context graph ----
+    case "context_record": {
+      const nodes = (args.nodes ?? []) as Row[];
+      const edges = (args.edges ?? []) as Row[];
+      for (const n of nodes) {
+        if (!NODE_KINDS.includes(n.kind)) throw new Error(`unknown node kind '${n.kind}'`);
+      }
+      for (const e of edges) {
+        if (!EDGE_KINDS.includes(e.kind)) throw new Error(`unknown edge kind '${e.kind}'`);
+      }
+      for (const n of nodes) {
+        const at = contextNodes.findIndex((x) => x.id === n.id);
+        const row = { ...n };
+        if (at >= 0) contextNodes[at] = { ...contextNodes[at], ...row };
+        else contextNodes.push(row);
+      }
+      for (const e of edges) {
+        // Rust rejects a dangling edge inside the same transaction, after the nodes above
+        // landed. The UI must never be handed a line to nothing.
+        const known =
+          contextNodes.some((n) => n.id === e.from_id) && contextNodes.some((n) => n.id === e.to_id);
+        if (!known) {
+          throw new Error(`edge ${e.id} references a node that is not recorded: ${e.from_id} -> ${e.to_id}`);
+        }
+        const at = contextEdges.findIndex((x) => x.from_id === e.from_id && x.to_id === e.to_id && x.kind === e.kind);
+        if (at >= 0) {
+          contextEdges[at] = {
+            ...contextEdges[at],
+            weight: Math.min((contextEdges[at].weight as number) + (e.weight as number), MAX_WEIGHT),
+            ts: e.ts,
+            meta_json: e.meta_json ?? null,
+          };
+        } else {
+          contextEdges.push({ ...e });
+        }
+      }
+      return null;
+    }
+    case "context_graph": {
+      // Newest first, and only edges whose both endpoints survive the node limit — so the
+      // caller never has to reconcile an edge against a node it was not given.
+      const limit = (args.limit as number) ?? 400;
+      const nodes = [...contextNodes].sort((a, b) => (b.ts as number) - (a.ts as number)).slice(0, limit);
+      const keep = new Set(nodes.map((n) => n.id));
+      const edges = [...contextEdges]
+        .filter((e) => keep.has(e.from_id) && keep.has(e.to_id))
+        .sort((a, b) => (b.ts as number) - (a.ts as number))
+        .slice(0, limit * 8);
+      return { nodes, edges };
+    }
+    case "context_clear":
+      contextNodes.length = 0;
+      contextEdges.length = 0;
+      return null;
+
+    // ---- P5: skills ----
+    case "skills_list":
+      seedSkillsOnce();
+      return [...skills].sort((a, b) => String(a.name).localeCompare(String(b.name)));
+    case "skills_catalog":
+      return BUILTIN_SKILLS.map((b) => ({
+        id: `builtin-${b.slug}`, slug: b.slug, name: b.name, description: b.description,
+        version: "1.0.0", source: "builtin", body: b.body, enabled: true, installed_at: 0,
+      }));
+    case "skills_install": {
+      // A skill with no instructions cannot be followed, so it is refused rather than stored.
+      if (typeof args.body !== "string" || args.body.trim() === "") {
+        throw new Error("a skill needs instructions");
+      }
+      const slug = (args.slug as string) || slugifySkillName(String(args.name ?? ""));
+      const row: Row = {
+        id: `user-${slug}`, slug, name: args.name, description: args.description ?? "",
+        version: "1.0.0",
+        source: BUILTIN_SKILLS.some((b) => b.slug === slug) ? "builtin" : "user",
+        body: args.body, enabled: true, installed_at: Date.now(),
+      };
+      const at = skills.findIndex((s) => s.slug === slug);
+      if (at >= 0) skills[at] = { ...skills[at], ...row };
+      else skills.push(row);
+      return skills.find((s) => s.slug === slug);
+    }
+    case "skills_uninstall": {
+      const at = skills.findIndex((s) => s.slug === args.slug);
+      if (at >= 0) skills.splice(at, 1);
+      return null;
+    }
+    case "skills_set_enabled": {
+      const row = skills.find((s) => s.slug === args.slug);
+      if (row) row.enabled = Boolean(args.enabled);
+      return null;
+    }
+    case "skills_parse": {
+      const text = String(args.text ?? "");
+      let name = "";
+      let description = "";
+      let body = text;
+      if (text.startsWith("---")) {
+        const end = text.indexOf("\n---", 3);
+        if (end >= 0) {
+          const front = text.slice(3, end);
+          body = text.slice(end + 4).replace(/^\n+/, "");
+          for (const line of front.split("\n")) {
+            const at = line.indexOf(":");
+            if (at < 0) continue;
+            const k = line.slice(0, at).trim();
+            const v = line.slice(at + 1).trim().replace(/^["']|["']$/g, "");
+            if (k === "name") name = v;
+            else if (k === "description") description = v;
+          }
+        }
+      }
+      return { name, description, body };
+    }
+    case "skills_slugify":
+      return slugifySkillName(String(args.name ?? ""));
+
+    // ---- P6: agent orchestrator ----
+    case "agent_runs_list": {
+      const limit = (args.limit as number) ?? 50;
+      return [...agentRuns].sort((a, b) => (b.started_at as number) - (a.started_at as number)).slice(0, limit);
+    }
+    case "agent_run_start": {
+      if (!RUN_STATUSES.includes("running")) throw new Error("running is not a valid status");
+      agentRuns.push({
+        id: args.id, session_id: args.session_id ?? null, model: args.model,
+        status: "running", prompt: args.prompt ?? null, iterations: 0, tool_calls: 0,
+        started_at: Date.now(), ended_at: null, error: null,
+      });
+      return null;
+    }
+    case "agent_step_append": {
+      const runId = args.run_id as string;
+      if (!agentRuns.some((r) => r.id === runId)) throw new Error(`unknown run ${runId}`);
+      if (!STEP_KINDS.includes(args.kind as string)) throw new Error(`unknown step kind '${args.kind}'`);
+      const seq = agentSteps.filter((s) => s.run_id === runId).length;
+      agentSteps.push({
+        run_id: runId, seq, kind: args.kind, label: args.label ?? null,
+        detail: args.detail ?? null, ok: args.ok ?? null, ts: Date.now(),
+      });
+      if (args.kind === "tool_call") {
+        const run = agentRuns.find((r) => r.id === runId)!;
+        run.tool_calls = (run.tool_calls as number) + 1;
+      }
+      return null;
+    }
+    case "agent_run_finish": {
+      const runId = args.run_id as string;
+      if (!RUN_STATUSES.includes(args.status as string)) throw new Error(`unknown status '${args.status}'`);
+      const run = agentRuns.find((r) => r.id === runId);
+      if (run) {
+        run.status = args.status;
+        run.iterations = args.iterations ?? 0;
+        run.error = args.error ?? null;
+        run.ended_at = Date.now();
+      }
+      return null;
+    }
+    case "agent_run_steps": {
+      const runId = args.run_id as string;
+      return agentSteps.filter((s) => s.run_id === runId).sort((a, b) => (a.seq as number) - (b.seq as number));
     }
 
     default:

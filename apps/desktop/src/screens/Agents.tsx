@@ -77,16 +77,15 @@ export function AgentsScreen() {
   }, [runs]);
 
   function doStop(id: string) {
-    if (!stopRun(id)) {
-      setStopping(id);
-      return;
-    }
     setStopping(id);
+    const asked = stopRun(id);
     // The loop clears the registration when it reports back; bump so the record catches up.
+    // Clear the label either way — a stop that was not observed must not read "stopping…"
+    // forever, which is what a run with no controller would otherwise do.
     setTimeout(() => {
       setStopping(null);
       bump();
-    }, 600);
+    }, asked ? 600 : 0);
   }
 
   return (
@@ -132,11 +131,19 @@ export function AgentsScreen() {
                       </span>
                     </td>
                     <td>
-                      {r.status === "running" && (
-                        <Button onClick={() => doStop(r.id)} disabled={stopping === r.id}>
-                          {stopping === r.id ? "stopping…" : "stop"}
-                        </Button>
-                      )}
+                      {r.status === "running" &&
+                        (live.includes(r.id) ? (
+                          <Button onClick={() => doStop(r.id)} disabled={stopping === r.id}>
+                            {stopping === r.id ? "stopping…" : "stop"}
+                          </Button>
+                        ) : (
+                          // Running but not live: this process has no handle on it (a previous
+                          // session was closed mid-run). Offer nothing rather than a stop button
+                          // that cannot work.
+                          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                            no handle
+                          </span>
+                        ))}
                     </td>
                   </tr>
                 ))}

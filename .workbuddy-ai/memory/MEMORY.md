@@ -73,6 +73,59 @@ through it works end to end.
 - Adding a migration: `MIGRATIONS` in store.rs is a `&[(&str, &str)]` of tuples; also bump the
   hardcoded `schema_version` and the table list in `store::tests::migrations_apply_once...`.
 
+## Skills (P5)
+
+- A skill is a **procedure, not a capability** — it cannot widen the agent's tool surface, only
+  steer how the four sandbox tools get used. Keep that framing for any future skill work.
+- Migration `0004_skills`, module `src-tauri/src/skills.rs`. Builtins seed **once** (marker in
+  `settings.skills_seeded`); `skills_catalog` exists so a revoked builtin can be reinstalled.
+- No install-from-file-picker: that would be arbitrary FS reads from an untrusted webview.
+  Needs the Tauri dialog plugin if Tushu wants it.
+- `Chat` in Playground.tsx is keyed on the UI tick and **remounts on every bump**. Any per-mount
+  state there (recorders, sessions, accumulators) will reset — use module-level state instead.
+
+## Agent orchestrator (P6)
+
+- Migration `0005_agent_runs`: `agent_runs` + `agent_steps` (FK cascade, `UNIQUE(run_id, seq)`),
+  module `src-tauri/src/orchestrator.rs`. Steps append as they happen. A run left `running`
+  stays `running` — an unobserved status is unknown, never relabelled as failed.
+- `src/lib/agent/orchestrator.ts` holds a module-level controller map so the Agents screen can
+  stop a run the Playground started. The `Chat` remount rule above is why this is module-level.
+- Nav: `ScreenId` in `ui-state.ts`, the Tools group in `components/Shell.tsx`, and the route in
+  `App.tsx`. Three places; forgetting `App.tsx` gives a screen that is unreachable but compiles.
+
+## Tauri command args (cost a rebuild once)
+
+- The command macro **always** converts Rust param names to camelCase for the JS side. A Rust
+  param named `runId` compiles, but JS sends `runId` → macro looks for `run_id` → every invoke
+  fails on a missing argument. Rust stays snake_case; JS keys stay camelCase.
+- `commands.rs` exposes `handlers()` (a function returning `impl Fn`), not a `generate_handler!`
+  attribute on the builder — so grepping `lib.rs` for command names finds nothing.
+  Verification: diff the `generate_handler!` list against the `invoke("...")` strings in
+  `store.ts`.
+- Test-only seams (`set_warm`, `set_first_msg_timeout`) need `#[cfg(test)]` or they show up as
+  dead-code warnings in the release build.
+
+## The browser harness (`apps/desktop/web-test`) — use it for any UI work
+
+The genuine React app runs in Chromium against `shim.ts`, an in-memory stand-in for the Rust host
+that mirrors its command-for-command (including rejection rules). This is how to actually *see* a
+screen without the built app. It is not headless-by-default in spirit: it drives real clicks.
+
+- Run: `cd apps/desktop && [ -d test-results ] && mv test-results /tmp/x-$(date +%s) ;
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY=127.0.0.1,localhost
+  pnpm web-test` (types + Playwright, 14 specs).
+- Both workarounds are mandatory: without `env -u`, Playwright's webServer readiness check goes
+  through the dead proxy and dies at 60s; without moving `test-results`, Playwright's cleanup
+  trips the safe-delete shim and aborts with a misleading error.
+- Seeds: `?seed=systemai` (provider "System AI (mock)") and `?seed=or-router` ("OpenRouter (mock)").
+  Provider names matter — "Mock Oracle" only exists in the story that creates it via the wizard.
+- `__webTest` on `window`: `store.*` read-only views, `emit()` for host→webview events, and
+  `invoke(cmd, args)` to arrange state the UI cannot produce itself. Arrange only, never assert.
+- **The shim renames args camelCase→snake_case (`toRustArgs`) because Tauri does.** Any new shim
+  command must read snake_case (`args.run_id`), and any new command with a multi-word argument
+  will silently receive `undefined` otherwise. This already caused one invisible failure.
+
 ## Testing
 
 - **The sandbox sets HTTP_PROXY/HTTPS_PROXY to a local port that can die.** When it does, the app
@@ -81,8 +134,13 @@ through it works end to end.
   `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
-- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (43 tests)
-- Rust: `apps/desktop/src-tauri && cargo test --lib` (119 tests)
+- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (50 tests)
+- Rust: `apps/desktop/src-tauri && cargo test --lib` (140 tests)
+- browser UI: `apps/desktop && pnpm web-test` (14 specs) — see the harness section above
+- **Isolating an egress failure:** test a *second* provider through the same gateway before
+  believing it is a router bug. On 2026-09-19 OpenRouter returned `NETWORK` on every attempt
+  (36–40 ms — far too fast to be a real connection) while Agnes served 200s and `curl` reached
+  openrouter.ai fine. Provider-specific, not app egress.
 - Use `./node_modules/.bin/tsc`, never `npx tsc` (the latter tries to install `tsc@2.0.4`).
 - The sandbox `grep` shim silently returns nothing for alternation (`a|b`) — use the Grep tool.
   This has now bitten twice; it made a real API look absent. Do not trust a shell grep that
