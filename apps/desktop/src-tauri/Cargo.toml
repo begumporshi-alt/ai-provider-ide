@@ -39,6 +39,13 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# macOS only: App Nap suppression. The worker webview is hidden, and macOS suspends JS in
+# hidden/backgrounded processes, which stalls the gateway. Pinned to the versions already in
+# Cargo.lock (pulled in transitively by Tauri) so this resolves without a network fetch.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }
+
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

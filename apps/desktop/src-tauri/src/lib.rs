@@ -1,3 +1,4 @@
+mod app_nap;
 mod commands;
 mod crash_report;
 mod egress;
@@ -150,6 +151,11 @@ pub fn run() {
             std::env::var("GW_LOG").unwrap_or_else(|_| "info".to_string()),
         )
         .try_init();
+
+    // macOS must not nap this process: the gateway's worker is a hidden webview, and a napped
+    // process is a worker that cannot answer, whatever the watchdog does afterwards. Runs after
+    // tracing is installed so the confirmation is actually recorded.
+    app_nap::suppress_app_nap();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())

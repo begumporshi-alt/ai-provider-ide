@@ -39,14 +39,26 @@ through it works end to end.
   gateway needs from the catalog (pricing, modality) must come from the persisted
   `models_cache` rows. This is why pricing had to be persisted, not just computed.
 - Auto-restores on launch from `settings.gateway = {"port":8787,"enabled":true}`.
+- **Agnes's catalog lies about modality** — it publishes `agnes-image-*` and `agnes-video-*` as
+  `modality = 'text'`. So `modality` from `models_cache` cannot be trusted to identify an image
+  model for Agnes; `workbuddy.rs` falls back to the model id (`-image`/`-video`). This is why
+  Agnes image models also publish `supportsImages: false` — a known, unfixed cosmetic wrongness.
+- Chat-templated upstreams (Agnes included) leak `<|im_end|>` / `<|endoftext|>` into streamed
+  text. `gateway::clean_assistant_text` strips them from non-stream replies; streaming deltas
+  are best-effort.
 
 ## Build / install
 
 - `cd apps/desktop && [ -d dist ] && mv dist /tmp/old-dist-$(date +%s)` **before** `npx tauri build`
-  — vite's `emptyOutDir` trips the sandbox safe-delete shim (>50 files).
+  — vite's `emptyOutDir` trips the sandbox safe-delete shim. **This step is mandatory, not
+  optional.** Skipping it makes `npx tauri build` die at `beforeBuildCommand` with a useless
+  `errors: [Getter/Setter]` while `pnpm build` passes standalone (the direct run is escalated,
+  tauri's child process is not). If you ever see that error, check `dist` first.
+- Build with `npx tauri build --bundles app` — skips the always-failing DMG step.
 - `export PATH="$HOME/.cargo/bin:$PATH"`; cargo is not on the default PATH.
 - DMG bundling always fails in this sandbox (`osascript` blocked). The `.app` builds fine —
-  install from `apps/desktop/src-tauri/target/release/bundle/macos/`.
+  install from `apps/desktop/src-tauri/target/release/bundle/macos/`. Install by `mv`ing the
+  existing `/Applications/AI-Provider Router.app` to /tmp (never `rm -rf`), then `cp -R`.
 - Quit any running instance (`pkill -f ai-provider-router`) before installing, or `open -a`
   focuses the old process and verification tests stale code.
 - GUI apps launched by a tool call are reaped when the call ends — launch and verify in the
@@ -56,6 +68,6 @@ through it works end to end.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
 - desktop: `apps/desktop && ./node_modules/.bin/vitest run` (43 tests)
-- Rust: `apps/desktop/src-tauri && cargo test --lib` (111 tests)
+- Rust: `apps/desktop/src-tauri && cargo test --lib` (119 tests)
 - Use `./node_modules/.bin/tsc`, never `npx tsc` (the latter tries to install `tsc@2.0.4`).
 - The sandbox `grep` shim silently returns nothing for alternation (`a|b`) — use the Grep tool.
