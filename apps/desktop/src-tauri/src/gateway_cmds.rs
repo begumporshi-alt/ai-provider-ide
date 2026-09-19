@@ -292,13 +292,20 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     Ok(bound)
 }
 
-/// One watchdog loop per serving period, not one per `gateway_enable`.
+/// At most one watchdog loop per serving period.
 ///
-/// `gateway_enable` is re-entrant — the log shows runs of consecutive enables with no disable
-/// between them — and each call used to spawn another loop. They all polled forever, and each
-/// carried its own re-warm rate limit, which is why a lapse sometimes ran 57s or 62s or 96s
-/// instead of the usual 30s: one loop was still inside its cooldown while the others had already
-/// fired. With the loop now log-only, duplicates would also mean duplicate lines for one episode.
+/// This is defence, not a fix for an observed symptom — worth saying plainly, because the obvious
+/// story is wrong. The old loop could not fire within 60s of `last_warm`, and it anchored
+/// `last_warm` at *spawn*, so a lapse beginning shortly after an enable waited out the remainder
+/// of that window. Checked against the log: of 40 fires, only 3 exceeded the 30s bound (57.6s,
+/// 62.5s, 96.4s), and all three are rate-limit cases — 60s exactly since the previous fire, or 7s
+/// and 16s since the last `enabled on port`. **Zero** were caused by several loops coexisting.
+///
+/// Loops do not pile up in the normal path either: `gateway_enable` returns early while serving,
+/// and a disable makes the old loop exit on its next poll. What remains is a narrow race — the
+/// stale-listener teardown clears `server` and a new loop may spawn before the old one has polled
+/// — and with the loop now log-only that would show up as duplicate lines for one episode. Cheap
+/// to preclude, so preclude it.
 ///
 /// The flag is cleared on the way out so a disable/enable cycle still gets a fresh loop.
 static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
