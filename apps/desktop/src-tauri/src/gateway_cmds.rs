@@ -279,17 +279,63 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     // Keep the entry we publish into third-party clients current: url/port, key, and the
     // capability fields that nobody should have to hand-maintain. Best-effort — a client
     // config we cannot write must never stop the gateway from serving.
+    //
+    // Off this command's own thread. The keychain read inside is slow after a rebuild — macOS
+    // re-validates the ACL against the new code signature, measured at 18-39s — and inline it
+    // delayed `gateway_enable` by exactly that, so pressing Start hung for the same stretch.
+    //
+    // It also *races the startup probe*, which reads the same keychain on its own thread. Two
+    // concurrent reads contend for one ACL prompt and one of them comes back empty; the sync
+    // loses because it retrieves the secret while the probe only checks existence. The result
+    // was `no gateway key yet` on the first launch after every rebuild, so newly added models
+    // waited a launch to appear. Waiting the keychain out removes the race without having to
+    // order the two readers against each other.
     if let Some(store) = app.try_state::<Arc<Store>>() {
-        match crate::workbuddy::sync(store.inner()) {
-            Ok(r) => log_to_file(
-                &app,
-                &format!("workbuddy sync: {} published, {} stale removed", r.updated, r.removed),
-            ),
-            Err(e) => log_to_file(&app, &format!("workbuddy sync skipped: {e}")),
-        }
+        let sync_app = app.clone();
+        let sync_store = store.inner().clone();
+        std::thread::spawn(move || sync_workbuddy_with_retry(&sync_app, &sync_store));
     }
     spawn_watchdog(app, state);
     Ok(bound)
+}
+
+/// How long to wait for the keychain to settle before reporting the sync as skipped.
+///
+/// Sized against the measurement: the cold-ACL read took 39s, so 45s clears it with margin. The
+/// wait costs nothing — it is a sleeping thread, not a blocked command.
+const SYNC_KEY_WAIT: Duration = Duration::from_secs(45);
+const SYNC_KEY_POLL: Duration = Duration::from_secs(3);
+
+/// Whether a sync failure is the transient "keychain not ready" one rather than a real problem.
+///
+/// Split out so the distinction is testable without a keychain. Getting it wrong in the
+/// permissive direction would retry a genuine misconfiguration for the whole wait and then report
+/// it, which is how a real error hides behind a retry loop.
+fn is_key_not_ready(err: &str) -> bool {
+    err == crate::workbuddy::NO_KEY_YET
+}
+
+/// Publish our entries, retrying while the keychain ACL settles.
+fn sync_workbuddy_with_retry(app: &AppHandle, store: &Arc<Store>) {
+    let deadline = std::time::Instant::now() + SYNC_KEY_WAIT;
+    loop {
+        match crate::workbuddy::sync(store) {
+            Ok(r) => {
+                log_to_file(
+                    app,
+                    &format!("workbuddy sync: {} published, {} stale removed", r.updated, r.removed),
+                );
+                return;
+            }
+            Err(e) if is_key_not_ready(&e) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(SYNC_KEY_POLL);
+            }
+            Err(e) => {
+                log_to_file(app, &format!("workbuddy sync skipped: {e}"));
+                return;
+            }
+        }
+    }
 }
 
 /// At most one watchdog loop per serving period.
@@ -682,4 +728,24 @@ pub fn run_rollup(store: &Arc<Store>) {
     );
     let cutoff = now - 90 * 24 * 3600 * 1000;
     let _ = conn.execute("DELETE FROM ledger WHERE ts < ?1", rusqlite::params![cutoff]);
+}
+
+#[cfg(test)]
+mod sync_retry_tests {
+    use super::*;
+
+    /// The retry must fire on exactly one error, and the failure that matters is the permissive
+    /// one: retrying a real problem hides it for the whole wait and then reports it anyway, which
+    /// reads as a hang rather than as a misconfiguration.
+    #[test]
+    fn only_the_missing_key_error_is_worth_waiting_for() {
+        assert!(is_key_not_ready(crate::workbuddy::NO_KEY_YET));
+
+        assert!(!is_key_not_ready(
+            "cannot read /nope/models.json: No such file or directory"
+        ));
+        // Near-misses must not match — the comparison is exact on purpose.
+        assert!(!is_key_not_ready("no gateway key"));
+        assert!(!is_key_not_ready(""));
+    }
 }

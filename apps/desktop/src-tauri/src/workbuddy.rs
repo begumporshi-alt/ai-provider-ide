@@ -293,6 +293,12 @@ pub struct WorkbuddySyncResult {
     pub note: Option<String>,
 }
 
+/// Returned when the master key cannot be read from the keychain yet.
+///
+/// Transient, not fatal, and worth naming: the caller retries on this and only this, so a shared
+/// constant keeps the retry from silently decoupling if the wording ever changes.
+pub const NO_KEY_YET: &str = "no gateway key yet";
+
 /// Rewrite our entries. Safe to call repeatedly; failures are returned, never swallowed here.
 pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
     let path = models_path().ok_or_else(|| "cannot resolve $HOME".to_string())?;
@@ -316,7 +322,7 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
             crate::vault::get(crate::gateway::MASTER_ACCOUNT)
                 .ok()
                 .flatten()
-                .ok_or_else(|| "no gateway key yet".to_string())?,
+                .ok_or_else(|| NO_KEY_YET.to_string())?,
         )
     };
 
