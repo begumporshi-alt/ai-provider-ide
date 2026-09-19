@@ -53,6 +53,24 @@ const agentSteps: Row[] = [];
 // P7 memory. Mirrors memory.rs: same four layers, same dedupe-on-(layer,text) rule.
 const memories: Row[] = [];
 
+/**
+ * Gateway status is host-owned — the Rust side owns the listener and the worker window, so there
+ * is nothing in this page to derive it from. The shim models it as plain settable state and specs
+ * drive it through `__webTest.gatewayStatus`. Until this existed, `gateway_status` was not in the
+ * table at all, so the command threw, `status` stayed null and the Gateway screen rendered in its
+ * "Stopped" branch whatever the host would have said — which made the screen's own copy untestable.
+ */
+const gatewayStatus = {
+  running: false,
+  port: 8787,
+  hasKey: false,
+  endpointUrl: "http://127.0.0.1:8787/v1",
+  background: false,
+  workerAwake: true,
+  heartbeatAgeMs: 0,
+  workerError: null as string | null,
+};
+
 const NODE_KINDS = ["artifact", "memory", "skill", "message"];
 const EDGE_KINDS = [
   "produced", "used", "recalled", "follows", "references",
@@ -354,6 +372,14 @@ let eventSeq = 0;
     /** Outgoing egress bodies, oldest first. Specs use this to assert what the app actually sent. */
     requests: () => [...egressLog],
   },
+  /**
+   * Set what `gateway_status` reports. The host owns the listener and the worker window, so a spec
+   * cannot reach those states through the UI — arranging them here is the only way to test the
+   * screen's copy for a sleeping worker or a lapsed heartbeat.
+   */
+  gatewayStatus: (next: Partial<typeof gatewayStatus>): void => {
+    Object.assign(gatewayStatus, next);
+  },
 };
 
 // ---------------------------------------------------------------------------
@@ -546,6 +572,10 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const req = args.req as { url: string; timeout_ms?: number | null };
       return fetchImage(req.url, req.timeout_ms ?? 30_000);
     }
+
+    // ---- gateway status: host-reported, since the host owns the listener and the worker ----
+    case "gateway_status":
+      return { ...gatewayStatus };
 
     // ---- gateway bridge: the webview calls these; the real Rust gateway consumes them ----
     case "gateway_heartbeat":
