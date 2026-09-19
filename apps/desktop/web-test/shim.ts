@@ -351,6 +351,8 @@ let eventSeq = 0;
     agentRuns: () => [...agentRuns],
     agentSteps: () => [...agentSteps],
     memories: () => [...memories],
+    /** Outgoing egress bodies, oldest first. Specs use this to assert what the app actually sent. */
+    requests: () => [...egressLog],
   },
 };
 
@@ -1009,7 +1011,22 @@ async function egressUnary(req: WireReq): Promise<{ status: number; headers: Rec
   res.headers.forEach((v, k) => (resHeaders[k.toLowerCase()] = v));
   const body = await res.text();
   recordReturnedHosts(body);
+  recordEgress({ url: req.url, body: req.body ?? null });
   return { status: res.status, headers: resHeaders, body };
+}
+
+/**
+ * Outgoing-egress log for the harness. The shim is the only thing that talks to the mock, so
+ * capturing here is equivalent to capturing on the network — and lets a spec assert on what
+ * the app actually sent, including the system messages the Playground injects for memory.
+ *
+ * Dev-only: bounded so a long run can't grow this without limit.
+ */
+const EGRESS_LOG_LIMIT = 50;
+const egressLog: { url: string; body: string | null }[] = [];
+function recordEgress(entry: { url: string; body: string | null }): void {
+  egressLog.push(entry);
+  if (egressLog.length > EGRESS_LOG_LIMIT) egressLog.splice(0, egressLog.length - EGRESS_LOG_LIMIT);
 }
 
 // ---------------------------------------------------------------------------
@@ -1091,6 +1108,7 @@ async function fetchImage(
 }
 
 async function egressStream(req: WireReq, onEvent: string): Promise<null> {
+  recordEgress({ url: req.url, body: req.body ?? null });
   let headers: Record<string, string>;
   try {
     headers = authorize(req);
