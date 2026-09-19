@@ -12,7 +12,7 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, err, forwarded_headers, openai_error, peer_ip, try_slot, BridgeMsg,
+    check_gateway_key, err, err_ra, forwarded_headers, openai_error, peer_ip, try_slot, BridgeMsg,
     BridgeRequest, GatewayCore,
 };
 
@@ -65,7 +65,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
             let mut started = false;
-            while let Some(msg) = slot.rx.recv().await {
+            while let Some(msg) = slot.recv().await {
                 match msg {
                     // An empty delta carries no content, so it is not a wire event at all.
                     // The bridge relies on this: in gateway mode it holds text back until the
@@ -151,7 +151,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     let mut tool_calls_json: Option<String> = None;
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String)> = None;
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
@@ -177,8 +177,18 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                 404 => StatusCode::NOT_FOUND,
                 429 => StatusCode::TOO_MANY_REQUESTS,
                 401 => StatusCode::UNAUTHORIZED,
+                // Not upstream: the worker never answered. Say so, and tell the client it is
+                // worth retrying — a retry re-enters `try_slot`, which re-warms the window.
+                503 => StatusCode::SERVICE_UNAVAILABLE,
                 _ => StatusCode::BAD_GATEWAY,
             };
+            if code == StatusCode::SERVICE_UNAVAILABLE {
+                return err_ra(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "1",
+                    openai_error(&message, "service_unavailable", None),
+                );
+            }
             err(code, openai_error(&message, "upstream_error", None))
         }
         None => {
@@ -217,7 +227,7 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
     let id = slot.id;
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "models", body: json!({}), headers: forwarded_headers(&headers) });
     tracing::info!(request_id = id, kind = "models", "dispatching models request");
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
@@ -261,7 +271,7 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
     let id = slot.id;
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "image", body: req, headers: forwarded_headers(&headers) });
     tracing::info!(request_id = id, kind = "image", "dispatching image request");
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()

@@ -131,7 +131,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new(); // call_id, name, arguments
             let mut usage: Option<(u64, u64)> = None;
             let mut tool_pending = false;
-            while let Some(msg) = slot.rx.recv().await {
+            while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
                         text.push_str(&t);
@@ -209,7 +209,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
     let mut usage: Option<(u64, u64)> = None;
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}

@@ -300,6 +300,8 @@ pub struct GatewayCore {
     warm: Mutex<Option<WarmFn>>,
     /// When the hook last actually fired, for rate limiting.
     last_warm: Mutex<Option<Instant>>,
+    /// Bound on the worker's first response to a request; see `FIRST_MSG_TIMEOUT`.
+    first_msg_timeout: Mutex<Duration>,
 }
 
 /// Minimum gap between re-warms from the request path.
@@ -351,7 +353,20 @@ impl GatewayCore {
             worker_error: Mutex::new(None),
             warm: Mutex::new(None),
             last_warm: Mutex::new(None),
+            first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
         }
+    }
+
+    /// Bound on the worker's first response. A field, not a constant, so a test can shorten it
+    /// instead of waiting 30 seconds to prove the same thing.
+    pub fn set_first_msg_timeout(&self, d: Duration) {
+        if let Ok(mut g) = self.first_msg_timeout.lock() {
+            *g = d;
+        }
+    }
+
+    pub fn first_msg_timeout(&self) -> Duration {
+        self.first_msg_timeout.lock().map(|g| *g).unwrap_or(FIRST_MSG_TIMEOUT)
     }
 
     /// R4: attach per-app key verification. Kept as a builder so `new()` — and therefore every
@@ -528,6 +543,18 @@ impl GatewayCore {
     }
 }
 
+/// How long a request waits for the worker to say ANYTHING before giving up.
+///
+/// The router core lives in a hidden webview whose JS the OS may suspend. When that happens
+/// after a request has already been admitted — the beat looked fresh at `try_slot` — the event
+/// sits in a queue nobody is draining, and the handler would otherwise wait forever with a
+/// socket open and nothing logged. Failing with an error the client can retry is strictly
+/// better than a hang: the retry re-enters `try_slot`, which now re-warms the window.
+///
+/// Only the FIRST message is bounded. Once the worker is demonstrably working on the request, a
+/// slow stream is a slow stream, and cutting it off would break long answers.
+pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
 /// disconnect mid-stream, which is what makes §3.5 cancellation work.
 struct Slot {
@@ -535,6 +562,40 @@ struct Slot {
     _permit: OwnedSemaphorePermit,
     id: u64,
     rx: mpsc::UnboundedReceiver<BridgeMsg>,
+    /// Set once the worker has produced its first message; only that wait is bounded.
+    started: bool,
+}
+
+impl Slot {
+    /// Next bridge message, or `None` when the channel closed.
+    ///
+    /// A first message that never arrives is reported as an `Error` rather than `None` so every
+    /// dialect's existing error path produces a real response — a closed channel would instead
+    /// fall through to "completed, no content", which looks like a successful empty answer.
+    async fn recv(&mut self) -> Option<BridgeMsg> {
+        if self.started {
+            return self.rx.recv().await;
+        }
+        let bound = self.core.first_msg_timeout();
+        match tokio::time::timeout(bound, self.rx.recv()).await {
+            Ok(msg) => {
+                self.started = true;
+                msg
+            }
+            Err(_) => {
+                self.started = true; // already failed once; don't wait again
+                tracing::warn!(
+                    request_id = self.id,
+                    "worker produced nothing for {}ms — failing the request instead of hanging",
+                    bound.as_millis()
+                );
+                Some(BridgeMsg::Error {
+                    status: 503,
+                    message: "the router worker did not respond — the gateway window may be suspended".to_string(),
+                })
+            }
+        }
+    }
 }
 
 impl Drop for Slot {
@@ -603,7 +664,7 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     core.pending.lock().unwrap().insert(id, tx);
-    Ok(Slot { core: core.clone(), _permit: permit, id, rx })
+    Ok(Slot { core: core.clone(), _permit: permit, id, rx, started: false })
 }
 
 // ---------- auth (invariants 10, 11, 15) ----------

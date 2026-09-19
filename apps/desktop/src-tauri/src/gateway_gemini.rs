@@ -210,7 +210,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     if streaming {
         let stream_body = async_stream::stream! {
             let mut usage: Option<(u64, u64)> = None;
-            while let Some(msg) = slot.rx.recv().await {
+            while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
                         let chunk = json!({ "candidates": [{ "content": { "parts": [{ "text": t }], "role": "model" }, "index": 0 }] });
@@ -268,7 +268,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     let mut err_info: Option<(u16, String)> = None;
     let mut has_tool_calls = false;
     let mut tool_parts: Vec<Value> = Vec::new();
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}

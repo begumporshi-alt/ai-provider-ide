@@ -192,7 +192,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
                 .data(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()));
             let mut usage: Option<(u64, u64)> = None;
             let mut has_tool_calls = false;
-            while let Some(msg) = slot.rx.recv().await {
+            while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
                         tracing::info!(request_id = id, delta_len = t.len(), "anthropic stream delta received");
@@ -278,7 +278,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     let mut err_info: Option<(u16, String)> = None;
     let mut tool_content_blocks: Vec<Value> = Vec::new();
     let mut has_tool_calls = false;
-    while let Some(msg) = slot.rx.recv().await {
+    while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
                 tracing::info!(request_id = id, delta_len = t.len(), "anthropic non-stream delta received");

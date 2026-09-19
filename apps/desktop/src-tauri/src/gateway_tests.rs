@@ -15,6 +15,9 @@
         tool_calls: AtomicBool,
         /// Prepend an empty delta — the bridge's between-turns liveness probe.
         empty_delta: AtomicBool,
+        /// Answer nothing at all: stand in for a worker webview whose JS the OS suspended
+        /// after the request was already admitted.
+        silent: AtomicBool,
     }
 
     impl SynthBridge {
@@ -25,10 +28,14 @@
                 slow: AtomicUsize::new(0),
                 tool_calls: AtomicBool::new(false),
                 empty_delta: AtomicBool::new(false),
+                silent: AtomicBool::new(false),
             }
         }
         fn attach(&self, core: &Arc<GatewayCore>) {
             *self.core.lock().unwrap() = Some(core.clone());
+        }
+        fn go_silent(&self, on: bool) {
+            self.silent.store(on, Ordering::Relaxed);
         }
         fn answer_with_tool_calls(&self, on: bool) {
             self.tool_calls.store(on, Ordering::Relaxed);
@@ -40,6 +47,9 @@
 
     impl Bridge for SynthBridge {
         fn dispatch(&self, req: BridgeRequest) {
+            if self.silent.load(Ordering::Relaxed) {
+                return; // never replies — the request must fail, not hang
+            }
             let core = self.core.lock().unwrap().clone().unwrap();
             let slow = self.slow.load(Ordering::Relaxed);
             let with_tools = self.tool_calls.load(Ordering::Relaxed);
@@ -1071,4 +1081,37 @@
         // And once stopped deliberately, it is simply not running.
         core.set_running(false);
         assert!(state.has_stale_server(), "bound but not running is stale too");
+    }
+
+    /// A worker that stops answering must fail the request, not hold the socket open.
+    ///
+    /// This is what an OS-suspended worker webview looks like from here: the beat was fresh when
+    /// the request was admitted, so nothing is stale yet — the reply simply never arrives. Until
+    /// the first message had a bound, the handler waited forever with a socket open and nothing
+    /// logged, which presents as a mysterious hang rather than an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_worker_fails_the_request_instead_of_hanging() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.set_first_msg_timeout(Duration::from_millis(300));
+        s.bridge.go_silent(true);
+
+        let started = std::time::Instant::now();
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .expect("a silent worker must still be answered, not hang");
+        let elapsed = started.elapsed();
+
+        assert_eq!(res.status(), 503, "no answer is unavailable, not an empty success");
+        assert_eq!(
+            res.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+            Some("1"),
+            "the client is told it is worth retrying"
+        );
+        assert!(elapsed < Duration::from_secs(5), "answered in {elapsed:?}");
     }
