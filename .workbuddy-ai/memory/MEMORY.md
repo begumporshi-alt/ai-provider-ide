@@ -144,9 +144,24 @@ through it works end to end.
   in words returns nothing — "remind me of the timezone" does not match an atom containing only
   "Dhaka"/"GMT". Stated as a product limitation, not a bug to fix silently.
 - **Timestamps: stored everywhere, surfaced thinly.** `memories.created_at` / `updated_at` and
-  `context_nodes.ts` are unix **millis** and NOT NULL. The Memory screen renders `updated_at` only;
-  `created_at` is stored and never displayed. The Context graph stores `ts` and never shows it.
-- **Recall ignores time entirely** — `ORDER BY score, CASE layer …`, no recency term. Known gap.
+  `context_nodes.ts` are unix **millis** and NOT NULL. Rows show a *relative* age; "first <age>"
+  appears only when the two would **read** differently (compare the rendered strings, not the raw
+  delta) — otherwise a re-record seconds after the first prints "just now · first just now".
+  Absolute timestamps live in the `title` attribute.
+- **Recall ranking is relevance band → recency → layer** (`rerank` in memory.rs).
+  - The band is measured from the **best hit**, not from the spread of the candidate set: a
+    spread-relative band degenerates when the set is small (with two candidates the extremes *are*
+    the spread, so they never share a band and recency never fires). Two or three candidates is
+    the common case.
+  - A band, not a weighted blend — blending would stop the displayed bm25 scores being monotonic,
+    so a correct list would look broken.
+  - **L3 is exempt from decay**: core because the user wrote it down, not because it is recent.
+  - `recall` fetches `limit * 4` candidates before re-ranking.
+  - `RELEVANCE_BAND = 0.15` is a **tuned default, not a measured optimum** — there is no ground
+    truth for "the right memory". Say so if it is ever questioned.
+- **Assert the candidate set, not just the winner.** A test asserting `hits[0] == wanted` passes
+  vacuously when the distractor shares no query token and is never a candidate. Assert
+  `hits.len()` too.
 
 ## Live database
 
@@ -207,7 +222,10 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
 - desktop: `apps/desktop && ./node_modules/.bin/vitest run` (93 tests)
 - Rust: `apps/desktop/src-tauri && cargo test --lib` (156 tests)
-- browser UI: `apps/desktop && npx playwright test` (29 specs) — see the harness section above
+- browser UI: `apps/desktop && npx playwright test` (30 specs) — see the harness section above
+- **`vitest` is `environment: "node"`, `include: ["e2e/**/*.test.ts", "src/**/*.test.ts"]`** — no
+  jsdom, no testing-library, and `.tsx` is not in the include list. Component logic is only
+  testable through the browser harness, so keep anything needing a unit test out of `.tsx`.
 - **An invariant spec beats an example spec.** `agent-turn.spec.ts` asserted with `find`, which is
   indifferent to a duplicate, so it passed while agent turns recorded the whole conversation twice.
   Asking "does each turn appear exactly once?" found two real bugs immediately. When a data
@@ -216,6 +234,8 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 - **Prove a spec fails before you trust it passing.** For the graph fixes the spec was run first and
   observed failing ("list files" twice after one turn). A spec written after the fix only proves
   the author's model of the bug.
+- A three-key comparator is easy to get backwards in exactly one key, and the compiler will not
+  tell you. `band(b).cmp(&band(a))` sorted bands *descending* when band 0 was the best match.
 - **Isolating an egress failure:** test a *second* provider through the same gateway before
   believing it is a router bug. On 2026-09-19 OpenRouter returned `NETWORK` on every attempt
   (36–40 ms — far too fast to be a real connection) while Agnes served 200s and `curl` reached
