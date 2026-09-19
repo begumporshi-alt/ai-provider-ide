@@ -860,10 +860,27 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
           return { m, score: hits === 0 ? null : -(hits / words.length) };
         })
         .filter((x) => x.score !== null) as { m: Row; score: number }[];
-      // Mirrors memory.rs: score first, then L3 > L2 > L1 > L0 on a tie.
+      // Mirrors memory.rs's ordering policy: relevance band first, then recency, then
+      // L3 > L2 > L1 > L0. The *score* is word overlap rather than BM25 (see the note above), but
+      // the ordering policy is the host's, because that is what specs observe.
       const rank: Record<string, number> = { L3: 0, L2: 1, L1: 2, L0: 3 };
+      const REL_BAND = 0.15;
+      const HALF_LIFE_MS = 30 * 86_400_000;
+      const bestRel = scored.reduce((mx, x) => Math.max(mx, -x.score), 0);
+      // Band 0 is "within REL_BAND of the best match"; each step up is one band worse.
+      const bandOf = (x: { score: number }) =>
+        bestRel <= 0 ? 0 : Math.floor((bestRel + x.score) / bestRel / REL_BAND);
+      // L3 is exempt: a core fact is core because the user wrote it down, not because it is recent.
+      const recencyOf = (x: { m: Row }) =>
+        String(x.m.layer) === "L3"
+          ? 1000
+          : Math.round(
+              Math.pow(0.5, Math.max(0, Date.now() - Number(x.m.updated_at)) / HALF_LIFE_MS) * 1000,
+            );
       scored.sort((a, b) =>
-        a.score - b.score || (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
+        bandOf(a) - bandOf(b) ||
+        recencyOf(b) - recencyOf(a) ||
+        (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
       return scored.slice(0, limit).map((x) => ({ ...x.m, score: x.score }));
     }
     case "memory_list": {

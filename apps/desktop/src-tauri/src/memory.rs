@@ -32,6 +32,31 @@ const MAX_TEXT: usize = 8000;
 /// Cap on how many query tokens reach FTS5. Bounds the work a pathological query can ask for.
 const MAX_QUERY_TOKENS: usize = 32;
 
+/// Recency half-life, in days. A memory this old counts half as much as one written today, two
+/// half-lives a quarter, and so on.
+const RECENCY_HALF_LIFE_DAYS: f64 = 30.0;
+
+/// How much worse than the best match still counts as "comparable", as a fraction of the best
+/// match's own score. Anything within this of the top hit is treated as an equally good answer,
+/// and recency decides between those.
+///
+/// Measured from the best hit rather than from the spread of the candidate set. A spread-relative
+/// band degenerates exactly when the set is small: with two candidates the two extremes are the
+/// whole spread, so they always land in different bands and recency never fires. Two or three
+/// candidates is the common case for a real recall query.
+///
+/// A band rather than a blend, deliberately. Blending relevance and recency into one number would
+/// stop the displayed bm25 scores being monotonic, so a correctly-ranked list would look like a
+/// broken one — the number on each row is the match, and it should stay readable as such.
+///
+/// This is a tuned default, not a measured optimum — there is no ground truth for "the right
+/// memory" to measure against. It is a named constant so it can be moved once there is.
+const RELEVANCE_BAND: f64 = 0.15;
+
+/// How many times `limit` candidates to pull from FTS5 before re-ranking. Recency can only
+/// reorder what it is shown, so the shortlist has to be wider than the answer.
+const CANDIDATE_FACTOR: usize = 4;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Memory {
     pub id: String,
@@ -217,12 +242,77 @@ pub fn capture_batch(store: &Store, items: &[MemoryInput]) -> Result<usize, Stri
     Ok(n)
 }
 
+/// Exponential decay on age, in [0, 1]. Clamped at 0 for the future: a clock that moved backwards
+/// should not make a memory rank as if it were written tomorrow.
+fn recency(ts: i64, now: i64) -> f64 {
+    let age_days = (now - ts).max(0) as f64 / 86_400_000.0;
+    0.5f64.powf(age_days / RECENCY_HALF_LIFE_DAYS)
+}
+
+/// Distillation level as a sort key: at equal relevance and equal recency, the more distilled
+/// layer is the better thing to put in a prompt.
+fn layer_rank(layer: &str) -> u8 {
+    match layer {
+        "L3" => 0,
+        "L2" => 1,
+        "L1" => 2,
+        _ => 3,
+    }
+}
+
+/// Recency as a total order. Quantised to an integer because `f64` is not `Ord`, and a sort that
+/// silently treats two candidates as equal is worse than one that rounds them.
+///
+/// L3 is exempt and always scores full recency. A core fact is core because the user wrote it
+/// down, not because it is recent; decaying it would systematically bury the most stable thing
+/// we know, which is the opposite of what the layer is for.
+fn recency_key(m: &Memory, now: i64) -> i64 {
+    if m.layer == "L3" {
+        return 1000;
+    }
+    (recency(m.updated_at, now) * 1000.0).round() as i64
+}
+
+/// Re-rank FTS5 candidates by relevance band, then recency, then distillation level.
+///
+/// BM25 has no notion of time, so on an equal match a six-month-old atom outranks yesterday's.
+/// This is the fix: relevance still decides, recency only breaks matches that are close enough to
+/// be a coin toss. A clearly better match cannot be displaced — the bands are ordered first and
+/// the worst candidate in a band always beats the best in the one below it.
+fn rerank(rows: &mut Vec<Memory>, now: i64) {
+    // `bm25()` is negative and more negative is a better match, so flip the sign to make
+    // "bigger is better" true throughout.
+    let rel: Vec<f64> = rows.iter().map(|m| -m.score.unwrap_or(0.0)).collect();
+    let best = rel.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+
+    // Band 0 is "within RELEVANCE_BAND of the best match"; each step up is one band worse.
+    let band = |i: usize| -> i64 {
+        if best.abs() <= f64::EPSILON {
+            // Degenerate scores (all zero): there is nothing to rank on, so let recency decide.
+            0
+        } else {
+            (((best - rel[i]) / best.abs()) / RELEVANCE_BAND).floor() as i64
+        }
+    };
+
+    let mut order: Vec<usize> = (0..rows.len()).collect();
+    order.sort_by(|&a, &b| {
+        // Band 0 is the best match, so bands sort ascending; recency and layer descend.
+        band(a)
+            .cmp(&band(b))
+            .then(recency_key(&rows[b], now).cmp(&recency_key(&rows[a], now)))
+            .then(layer_rank(&rows[a].layer).cmp(&layer_rank(&rows[b].layer)))
+    });
+
+    let taken: Vec<Memory> = order.into_iter().map(|i| rows[i].clone()).collect();
+    *rows = taken;
+}
+
 /**
  * BM25 recall.
  *
- * Abstract layers are boosted by ordering ties toward them: L3 > L2 > L1 > L0 at equal
- * relevance, because when two memories match equally well the more distilled one is the
- * better thing to put in a prompt.
+ * Relevance decides; recency and distillation level break matches that are close. See `rerank`
+ * for why recency is a tie-break rather than a weighted term.
  */
 pub fn recall(
     store: &Store,
@@ -246,6 +336,10 @@ pub fn recall(
     };
 
     let placeholders: Vec<String> = (1..=wanted.len()).map(|i| format!("?{}", i + 2)).collect();
+    // Fetch a wider shortlist than we intend to return: recency can only reorder what it is
+    // shown, so pulling exactly `limit` would let the band logic reorder a set that was already
+    // truncated on relevance alone. SQL order still decides *which* candidates those are.
+    let fetch = limit.saturating_mul(CANDIDATE_FACTOR).max(limit);
     let sql = format!(
         "SELECT m.id, m.layer, m.text, m.session_id, m.subject, m.created_at, m.updated_at, m.pinned,
                 bm25(memories_fts) AS score
@@ -260,11 +354,11 @@ pub fn recall(
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
     let mut p: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(expr.clone())];
-    p.push(Box::new(limit as i64));
+    p.push(Box::new(fetch as i64));
     for l in &wanted {
         p.push(Box::new(l.to_string()));
     }
-    let rows = stmt
+    let mut rows = stmt
         .query_map(rusqlite::params_from_iter(p.iter().map(|b| b.as_ref())), |r| {
             Ok(Memory {
                 id: r.get(0)?,
@@ -281,6 +375,11 @@ pub fn recall(
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
+    drop(stmt);
+    drop(conn);
+
+    rerank(&mut rows, now_ms());
+    rows.truncate(limit);
     Ok(rows)
 }
 
@@ -640,6 +739,138 @@ mod memory_tests {
         assert_eq!(a.len(), 2);
         assert_eq!(a[0].text, "a1");
         assert_eq!(a[1].text, "a2");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---- recency in ranking --------------------------------------------------------------
+
+    /// A candidate as `rerank` sees it: no store needed, because ranking is a pure function of
+    /// the rows. `days_old` backdates it, `bm25` is the raw score FTS5 would have produced.
+    fn candidate(layer: &str, text: &str, days_old: i64, bm25: f64) -> Memory {
+        let ts = now_ms() - days_old * 86_400_000;
+        Memory {
+            id: format!("{layer}:{text}"),
+            layer: layer.into(),
+            text: text.into(),
+            session_id: None,
+            subject: None,
+            created_at: ts,
+            updated_at: ts,
+            pinned: false,
+            score: Some(bm25),
+        }
+    }
+
+    /// Backdate a stored memory so recency can be exercised without waiting a month.
+    fn age(store: &Store, id: &str, days: i64) {
+        let ts = now_ms() - days * 86_400_000;
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE memories SET created_at = ?1, updated_at = ?1 WHERE id = ?2",
+                params![ts, id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn recency_halves_every_half_life() {
+        let now = now_ms();
+        let day = 86_400_000;
+        assert!((recency(now, now) - 1.0).abs() < 0.001);
+        assert!((recency(now - 30 * day, now) - 0.5).abs() < 0.01);
+        assert!((recency(now - 60 * day, now) - 0.25).abs() < 0.01);
+        // A clock that moved backwards must not read as a memory from the future.
+        assert!((recency(now + day, now) - 1.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn at_comparable_relevance_the_more_recent_memory_wins() {
+        let mut rows = vec![
+            candidate("L1", "old", 180, -3.00),
+            candidate("L1", "new", 0, -3.05), // a marginally worse match, written today
+        ];
+        rerank(&mut rows, now_ms());
+        assert_eq!(rows[0].text, "new", "within a band, recency decides");
+    }
+
+    #[test]
+    fn a_clearly_better_match_is_not_displaced_by_a_recent_weak_one() {
+        let mut rows = vec![
+            candidate("L1", "strong but old", 365, -8.00),
+            candidate("L1", "weak but new", 0, -2.00),
+        ];
+        rerank(&mut rows, now_ms());
+        assert_eq!(rows[0].text, "strong but old", "recency must not rescue a bad match");
+    }
+
+    #[test]
+    fn an_old_core_fact_keeps_full_recency() {
+        let now = now_ms();
+        // A core fact is core because the user wrote it down, not because it is recent.
+        assert_eq!(recency_key(&candidate("L3", "core", 3650, -3.0), now), 1000);
+        assert!(recency_key(&candidate("L1", "atom", 3650, -3.0), now) < 100);
+    }
+
+    #[test]
+    fn at_equal_band_and_recency_the_more_distilled_layer_still_wins() {
+        let mut rows = vec![
+            candidate("L0", "raw", 0, -3.00),
+            candidate("L2", "scenario", 0, -3.05),
+        ];
+        rerank(&mut rows, now_ms());
+        assert_eq!(rows[0].text, "scenario", "layer remains the final tiebreak");
+    }
+
+    #[test]
+    fn recall_prefers_the_recent_memory_when_two_match_comparably() {
+        let (s, d) = temp_store("recency");
+        // Same shape, same length, differing only in the port — so BM25 cannot separate them and
+        // recency is the only signal left.
+        let old = capture(&s, &input("L1", "The staging gateway port is 8787")).unwrap();
+        let new = capture(&s, &input("L1", "The staging gateway port is 9090")).unwrap();
+        age(&s, &old.id, 365);
+        age(&s, &new.id, 0);
+
+        let hits = recall(&s, "staging gateway port", 10, None).unwrap();
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, new.id, "the newer of two equal matches is the better answer");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn recall_still_returns_the_relevant_memory_when_the_others_are_newer() {
+        let (s, d) = temp_store("recency-relevance");
+        let wanted = capture(&s, &input("L1", "The workspace root must be set before agent mode runs")).unwrap();
+        // The distractor has to share a query token, or it is not a candidate at all and the
+        // test passes without exercising anything.
+        let noise = capture(&s, &input("L1", "Agent mode is one of the Playground toggles")).unwrap();
+        // Make the on-topic memory old and the off-topic one fresh: relevance must still win.
+        age(&s, &wanted.id, 365);
+        age(&s, &noise.id, 0);
+
+        let hits = recall(&s, "workspace root agent mode", 10, None).unwrap();
+        assert_eq!(hits.len(), 2, "both must be candidates for this test to mean anything");
+        assert_eq!(hits[0].id, wanted.id, "recency is a tiebreak, not a signal that outranks match");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn recall_fetches_a_wider_shortlist_than_it_returns() {
+        let (s, d) = temp_store("shortlist");
+        for i in 0..12 {
+            let m = capture(&s, &input("L1", &format!("gateway note number {i}"))).unwrap();
+            // Newest first in capture order, so the oldest is the one recency should demote.
+            age(&s, &m.id, (12 - i) as i64 * 10);
+        }
+        let hits = recall(&s, "gateway note", 3, None).unwrap();
+        assert_eq!(hits.len(), 3);
+        // All twelve match equally well, so with a wider shortlist the three most recent win.
+        assert_eq!(hits[0].text, "gateway note number 11");
+        assert_eq!(hits[1].text, "gateway note number 10");
+        assert_eq!(hits[2].text, "gateway note number 9");
         let _ = std::fs::remove_dir_all(&d);
     }
 }

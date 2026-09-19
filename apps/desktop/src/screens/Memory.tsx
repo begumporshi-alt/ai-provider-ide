@@ -37,7 +37,52 @@ const LAYERS: { id: MemoryLayer | null; label: string; blurb: string }[] = [
 const SEARCH_NOTE =
   "Search is BM25 keyword ranking over SQLite's full-text index — not semantic search. It stems, "
   + "so “routed” matches “routing”, but it will not find a memory that shares no words with your "
-  + "query. There is no embedding model in this app, and that is deliberate.";
+  + "query. There is no embedding model in this app, and that is deliberate. Ties are broken "
+  + "toward the more recent memory.";
+
+/** Coarse relative age. Precision is not the point — "3d ago" is what you read to judge recency. */
+function ago(ts: number): string {
+  const secs = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (secs < 45) return "just now";
+  const mins = Math.round(secs / 60);
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.round(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.round(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.round(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.round(months / 12)}y ago`;
+}
+
+/**
+ * When a memory was written and when it last came up.
+ *
+ * Both are worth seeing and they are usually the same, so the second only appears when the two
+ * would *read* differently. Comparing the rendered strings rather than the raw delta is what makes
+ * that correct: a re-record a few seconds after the first would otherwise print
+ * "just now · first just now", which is noise, while a re-record an hour later prints
+ * "1h ago · first 3d ago", which is the thing worth knowing.
+ *
+ * The distinction matters because a deduped atom is refreshed in place rather than duplicated, so
+ * `updated_at` drifts away from `created_at` with no other visible trace. Showing only
+ * `updated_at` would report when we last *saw* a fact as if it were when we learned it.
+ */
+function MemoryAge({ m }: { m: Memory }) {
+  const seen = ago(m.updated_at);
+  const first = ago(m.created_at);
+  return (
+    <>
+      <span title={new Date(m.updated_at).toLocaleString()}>{seen}</span>
+      {first !== seen && (
+        <>
+          {" · first "}
+          <span title={new Date(m.created_at).toLocaleString()}>{first}</span>
+        </>
+      )}
+    </>
+  );
+}
 
 export function MemoryScreen() {
   const tick = useUi((s) => s.tick);
@@ -181,7 +226,7 @@ export function MemoryScreen() {
                 <div className="whitespace-pre-wrap break-words text-[12px] leading-relaxed">{m.text}</div>
                 <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
                   {m.subject ? `${m.subject} · ` : ""}
-                  {new Date(m.updated_at).toLocaleString()}
+                  <MemoryAge m={m} />
                   {m.score !== undefined ? ` · bm25 ${m.score.toFixed(2)}` : ""}
                 </div>
               </div>
@@ -301,7 +346,7 @@ function CoreSection({
                   </div>
                 )}
                 <div className="mt-0.5 text-[10px]" style={{ color: "var(--text-faint)" }}>
-                  {new Date(m.updated_at).toLocaleString()}
+                  <MemoryAge m={m} />
                 </div>
               </div>
               {editingId === m.id ? (

@@ -69,7 +69,21 @@ through it works end to end.
 - Persisted: `context_nodes` (artifact|memory|skill|message) + `context_edges`, migration
   `0003_context_graph`, module `src-tauri/src/context.rs`. Derived (not stored): routing
   topology and live request flow, built in `src/lib/context/engine.ts` from registry/catalog/ledger.
-- `memory` nodes are supported but **nothing produces them yet** — no memory subsystem exists.
+- **A GENERATED NODE ID IS A SILENT NO-OP FOR EVERY DEDUPE PATH.** The host upserts nodes on id
+  and accumulates edge weight (`weight = MIN(weight + excluded.weight, 50)` on the
+  `(from_id, to_id, kind)` conflict); `BufferedRecorder` is deliberately a naive append log and
+  does **not** dedupe. So any recording path that mints an id instead of reusing a stable one
+  turns that host machinery into dead code — silently, and no test fails unless a spec asserts
+  uniqueness. This has already caused three bugs: `recordAgentTurn` re-recording the whole
+  transcript every turn, the user node being created twice, and `recordRecall` scattering one node
+  per recall (which left every `recalled` edge at weight 1).
+  **Rule: if the thing being recorded already has an identity, pass it.** `Recorder.node(kind,
+  label, meta, id)` takes an optional explicit id; `memoryNodeId(id)` → `memory:<id>`.
+- `recordAgentTurn` takes the caller's `userNode` id and only *this* turn's messages. `runAgentLoop`
+  seeds its working copy from the replayed history and returns all of it, so callers must slice:
+  `fullMessages.slice(history.length)`. Passing the whole transcript makes the graph quadratic.
+- The agent branch flushes in `finally`, not on the success path only — a stopped run would
+  otherwise leave nodes buffered and prepend them to the next turn's batch.
 - Adding a migration: `MIGRATIONS` in store.rs is a `&[(&str, &str)]` of tuples; also bump the
   hardcoded `schema_version` and the table list in `store::tests::migrations_apply_once...`.
 
@@ -124,8 +138,23 @@ through it works end to end.
     Needs oldest-first (use `sessionMemories` / `memory_session_atoms`, not `listMemories`).
   - L3 core: **user-authored**, not auto-distilled — the stable facts about a person are the
     facts the person knows. Pinned by default; the whole point is that L3 always rides along.
-- `memory` nodes in the context graph finally have a producer: `recordRecall()` emits them with
+- `memory` nodes in the context graph have a producer: `recordRecall()` emits them with
   `message -recalled-> memory` edges.
+- **Recall is BM25 over tokens with NO embeddings.** A paraphrase that overlaps in meaning but not
+  in words returns nothing — "remind me of the timezone" does not match an atom containing only
+  "Dhaka"/"GMT". Stated as a product limitation, not a bug to fix silently.
+- **Timestamps: stored everywhere, surfaced thinly.** `memories.created_at` / `updated_at` and
+  `context_nodes.ts` are unix **millis** and NOT NULL. The Memory screen renders `updated_at` only;
+  `created_at` is stored and never displayed. The Context graph stores `ts` and never shows it.
+- **Recall ignores time entirely** — `ORDER BY score, CASE layer …`, no recency term. Known gap.
+
+## Live database
+
+- Path: `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db`
+  (bundle id `dev.aiprovider.router`). **Not** `com.ai-provider-router.app` — that path does not
+  exist and a query against it silently looks like a missing install.
+- Schema version lives in a `schema_version` table (one row per applied migration), not
+  `PRAGMA user_version` (which reads 0).
 
 ## Tauri command args (cost a rebuild once)
 
@@ -158,6 +187,15 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 - **The shim renames args camelCase→snake_case (`toRustArgs`) because Tauri does.** Any new shim
   command must read snake_case (`args.run_id`), and any new command with a multi-word argument
   will silently receive `undefined` otherwise. This already caused one invisible failure.
+- `store.requests()` returns a bounded log of outgoing egress bodies (oldest first), captured in
+  both `egressUnary` and `egressStream`. The shim is the only thing that talks to the mock, so this
+  is equivalent to capturing on the wire — it is how to assert **what the app actually sent**
+  (e.g. that a recalled-memory system message reached `/chat/completions`) rather than what it
+  rendered. Use it for any "is this feature wired up" question.
+- Waiting for a turn to finish: an assistant message node is created after its answer streams and
+  flushed in `finally`, so polling for one more of those is race-free. The answer *bubble* is not
+  a signal (it exists empty from the start), and neither is a recalled edge (written before the
+  model is even called).
 
 ## Testing
 
@@ -167,9 +205,17 @@ screen without the built app. It is not headless-by-default in spirit: it drives
   `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
-- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (55 tests)
-- Rust: `apps/desktop/src-tauri && cargo test --lib` (140 tests)
-- browser UI: `apps/desktop && pnpm web-test` (16 specs) — see the harness section above
+- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (93 tests)
+- Rust: `apps/desktop/src-tauri && cargo test --lib` (156 tests)
+- browser UI: `apps/desktop && npx playwright test` (29 specs) — see the harness section above
+- **An invariant spec beats an example spec.** `agent-turn.spec.ts` asserted with `find`, which is
+  indifferent to a duplicate, so it passed while agent turns recorded the whole conversation twice.
+  Asking "does each turn appear exactly once?" found two real bugs immediately. When a data
+  structure is supposed to hold an invariant (unique ids, one node per thing, linear growth),
+  assert the invariant — do not assert that an example is present.
+- **Prove a spec fails before you trust it passing.** For the graph fixes the spec was run first and
+  observed failing ("list files" twice after one turn). A spec written after the fix only proves
+  the author's model of the bug.
 - **Isolating an egress failure:** test a *second* provider through the same gateway before
   believing it is a router bug. On 2026-09-19 OpenRouter returned `NETWORK` on every attempt
   (36–40 ms — far too fast to be a real connection) while Agnes served 200s and `curl` reached

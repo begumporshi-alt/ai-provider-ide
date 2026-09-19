@@ -124,6 +124,30 @@ test("memory: an empty store explains itself instead of showing a blank panel", 
   await expect(page.getByText(/No memories yet/)).toBeVisible();
 });
 
+test("memory: a row shows when it was last seen, and only adds 'first' when that differs", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await seedMemories(page);
+
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  const row = rowFor(page, "Tushu lives in Dhaka");
+  // Relative age, not an absolute timestamp — recency is what you judge a memory by.
+  await expect(row).toContainText(/just now|\d+[mhd] ago|\d+mo ago/);
+
+  // Re-record the same atom, which refreshes `updated_at` in place rather than duplicating. Both
+  // timestamps still read "just now", so the row must not print "just now · first just now".
+  await page.evaluate(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const host = (window as any).__webTest;
+    const all = await host.invoke("memory_list", { layer: "L1", limit: 50 });
+    const atom = (all as { id: string; text: string }[]).find((m) => m.text.includes("Dhaka"));
+    await host.invoke("memory_update", { id: atom!.id, text: "Tushu lives in Dhaka, which is GMT+6" });
+  });
+
+  await expect(rowFor(page, "Tushu lives in Dhaka")).not.toContainText("first");
+  // Still one row — refreshing in place is the whole point of the dedupe on (layer, text).
+  await expect.poll(async () => (await store<MemoryRow[]>(page, "memories")).length).toBe(4);
+});
+
 test("memory: the core profile section lets the user add, edit, and forget L3 facts", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Memory", exact: true }).click();
