@@ -61,6 +61,27 @@ const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
 const MAX_WEIGHT = 50;
 
+// Tool sandbox emulation — the Rust tool_run lives behind a host that the browser harness does
+// not run, so the shim provides a small virtual FS just enough to let a Playground agent turn
+// complete in tests. Path confinement mirrors tools.rs: paths containing ".." or starting "/"
+// are refused (ok:false), the same way a real escape attempt would be.
+const virtualFs = new Map<string, string>([["README.md", "hello\nworld\n"]]);
+
+const TOOLS_POLICY = {
+  programs: ["ls", "cat", "echo", "grep", "rg", "find", "git", "node", "npm", "npx", "pnpm", "python3", "make", "tar", "sed", "awk"],
+  git_subcommands: ["status", "log", "diff", "show"],
+  max_command_ms: 60_000,
+  max_output_bytes: 64 * 1024,
+};
+
+/** Confinement: real tools.rs refuses paths containing ".." or starting with "/" (the root is
+ *  stripped before resolution). Mirror it so tests catch escape attempts that production would. */
+function isConfinedPath(p: unknown): boolean {
+  if (typeof p !== "string" || p.length === 0) return false;
+  if (p.startsWith("/")) return false;
+  return !p.split("/").includes("..");
+}
+
 const BUILTIN_SKILLS: { slug: string; name: string; description: string; body: string }[] = [
   { slug: "code-review", name: "Code review", description: "Review a change for correctness, security and clarity before it lands.", body: "Review the change the user points at.\n\n1. Read the changed files.\n2. Look for correctness bugs, unhandled errors, security problems, then clarity.\n3. Report as a short list: file, line, what is wrong, why it matters." },
   { slug: "commit-message", name: "Commit message", description: "Write a conventional commit message from what actually changed.", body: "Write a commit message for the pending change.\n\n1. Inspect the change; do not guess from the branch name.\n2. First line: type(scope): summary, imperative, under 72 characters.\n3. Body: why the change was needed, not what it did." },
@@ -652,6 +673,61 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     }
     case "skills_slugify":
       return slugifySkillName(String(args.name ?? ""));
+
+    // ---- Tool sandbox (Playground agent mode) ----
+    case "tools_policy":
+      return TOOLS_POLICY;
+    case "tool_run": {
+      // The Rust host collapses (name, args, root) into a single `req` object — match that shape
+      // so the host-side allowlist, path confinement and timeout run the same code paths in test.
+      const req = args.req as { name: string; arguments: Record<string, unknown>; root: string } | undefined;
+      if (!req) throw new Error("tool_run: missing req");
+      const { name, arguments: toolArgs } = req;
+      const ok = (output: string): { ok: boolean; output: string } => ({ ok: true, output });
+      const fail = (error: string): { ok: boolean; output: string; error: string } => ({ ok: false, output: "", error });
+
+      if (name === "list_dir") {
+        const p = String(toolArgs["path"] ?? ".");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const prefix = p === "." || p === "" ? "" : p + "/";
+        const entries = [...virtualFs.keys()].filter((k) => k.startsWith(prefix));
+        return ok(entries.map((k) => k.slice(prefix.length)).join("\n") || "");
+      }
+      if (name === "read_file") {
+        const p = String(toolArgs["path"] ?? "");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const c = virtualFs.get(p);
+        if (c === undefined) return fail("no such file");
+        return ok(c);
+      }
+      if (name === "write_file") {
+        const p = String(toolArgs["path"] ?? "");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        virtualFs.set(p, String(toolArgs["content"] ?? ""));
+        return ok("");
+      }
+      if (name === "run_command") {
+        const program = String(toolArgs["program"] ?? "");
+        const cmdArgs = Array.isArray(toolArgs["args"]) ? toolArgs["args"].map(String) : [];
+        if (!TOOLS_POLICY.programs.includes(program)) return fail(`program '${program}' is not in the allowlist`);
+        if (program === "ls") {
+          const target = cmdArgs[0] ?? ".";
+          if (!isConfinedPath(target)) return fail("path escapes the workspace");
+          const prefix = target === "." || target === "" ? "" : target + "/";
+          return ok([...virtualFs.keys()].filter((k) => k.startsWith(prefix)).map((k) => k.slice(prefix.length)).join("\n"));
+        }
+        if (program === "cat") {
+          const target = cmdArgs[0] ?? "";
+          if (!isConfinedPath(target)) return fail("path escapes the workspace");
+          const c = virtualFs.get(target);
+          if (c === undefined) return fail("no such file");
+          return ok(c);
+        }
+        if (program === "echo") return ok(cmdArgs.join(" "));
+        return ok("");
+      }
+      return fail(`unknown tool '${name}'`);
+    }
 
     // ---- P6: agent orchestrator ----
     case "agent_runs_list": {

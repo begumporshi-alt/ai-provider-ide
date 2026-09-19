@@ -141,8 +141,11 @@ async function oracle(req, res, path) {
     const system = messages.find((m) => m.role === "system")?.content ?? "";
     const last = messages[messages.length - 1]?.content ?? "";
     const stream = body.stream === true;
+    const tools = Array.isArray(body.tools) && body.tools.length > 0;
+    const sawToolResult = messages.some((m) => m.role === "tool");
 
     let content;
+    let toolCall;
     if (system.includes("Tier-2 code adapters")) {
       // The Tier-2 round: a fenced envelope the extractor can parse.
       content = "```json\n" + JSON.stringify(CODE_ENVELOPE, null, 2) + "\n```";
@@ -150,8 +153,15 @@ async function oracle(req, res, path) {
       // The declarative round: deliberately unusable, so every A/B/C candidate fails and the
       // Tier-2 offer appears in the UI — the honest path for a grammar-inexpressible API.
       content = "```json\n{ \"unusable\": true, \"reason\": \"the exotic API has no declarative mapping\" }\n```";
+    } else if (tools && !sawToolResult) {
+      // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
+      // The interpreter accumulates deltas by index and emits on stream close.
+      toolCall = { name: "list_dir", arguments: JSON.stringify({ path: "." }) };
+      content = "";
     } else {
-      content = `Hello from ${body.model ?? "oracle"}`;
+      content = tools && sawToolResult
+        ? "Done. Here is what I found in the workspace."
+        : `Hello from ${body.model ?? "oracle"}`;
     }
 
     if (!stream) {
@@ -160,7 +170,21 @@ async function oracle(req, res, path) {
         object: "chat.completion",
         created: Math.floor(Date.now() / 1000),
         model: body.model ?? "oracle-mini",
-        choices: [{ index: 0, message: { role: "assistant", content }, finish_reason: "stop" }],
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content,
+            ...(toolCall ? {
+              tool_calls: [{
+                id: "call_mock_1",
+                type: "function",
+                function: { name: toolCall.name, arguments: toolCall.arguments },
+              }],
+            } : {}),
+          },
+          finish_reason: toolCall ? "tool_calls" : "stop",
+        }],
         usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
       });
     }
@@ -169,9 +193,31 @@ async function oracle(req, res, path) {
       "Cache-Control": "no-cache",
       "Access-Control-Allow-Origin": "*",
     });
-    const words = content.split(" ");
-    for (const w of words) {
-      res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: w + " " } }] })}\n\n`);
+    if (toolCall) {
+      // OpenAI streaming shape: one chunk declaring the call (id + name + empty args),
+      // then a chunk with arguments delta, then finish_reason "tool_calls", then [DONE].
+      // The interpreter's collectToolCallDeltas accumulates id/name/args by index and the
+      // pending buffer is flushed once the stream ends.
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0, id: "call_mock_1", type: "function",
+          function: { name: toolCall.name, arguments: "" },
+        }] } }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { tool_calls: [{
+          index: 0,
+          function: { arguments: toolCall.arguments },
+        }] } }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      })}\n\n`);
+    } else {
+      const words = content.split(" ");
+      for (const w of words) {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: w + " " } }] })}\n\n`);
+      }
     }
     res.write("data: [DONE]\n\n");
     return res.end();

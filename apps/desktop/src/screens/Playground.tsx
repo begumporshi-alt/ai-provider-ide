@@ -315,7 +315,10 @@ function Chat() {
         abortRef.current = null;
         return;
       }
-      setMsgs((m) => [...m, { role: "assistant", content: "" }]);
+      // Mirror the new turn into `msgs` so the UI shows it; `history` is what we actually send,
+      // so it must include this turn too — building it from the stale `msgs` closure (as the
+      // non-agent branch does NOT do) was a real bug: the model never saw the user's prompt.
+      setMsgs((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
       setStreamedText("");
       setAgentItems([]);
       // P6: open the run record before the first call, and register this controller so the
@@ -328,14 +331,17 @@ function Chat() {
       const host = createTauriToolHost(root.trim());
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
-      const history: ChatMessage[] = msgs
-        .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls))
-        .map((m) => ({
-          role: m.role,
-          content: m.content,
-          ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-          ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-        })) as ChatMessage[];
+      const history: ChatMessage[] = [
+        ...msgs
+          .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls))
+          .map((m) => ({
+            role: m.role,
+            content: m.content,
+            ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+            ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+          })) as ChatMessage[],
+        { role: "user", content: text },
+      ];
       try {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
@@ -348,8 +354,12 @@ function Chat() {
           onEvent: handleAgentEvent,
           signal: ac.signal,
         });
+        // The loop terminates the moment it sees an answer with no tool calls, but it does NOT
+        // append that final assistant turn — `text` is the answer and `messages` is what came
+        // before. Append it so the UI and the context graph both see the closing line.
+        const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: finalText }];
         setMsgs(
-          messages.map((m) => ({
+          fullMessages.map((m) => ({
             role: m.role as Msg["role"],
             content: m.content,
             ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
@@ -357,7 +367,7 @@ function Chat() {
           })),
         );
         void finalText;
-        lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, messages, chosen);
+        lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, fullMessages, chosen);
         void ctxRef.current!.flush();
         endRun(runId, "ok", iterationsRef.current);
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
