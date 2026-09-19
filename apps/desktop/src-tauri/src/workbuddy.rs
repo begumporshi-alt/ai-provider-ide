@@ -168,6 +168,24 @@ fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
     .map(|body| manifest_forwards_tools(&body))
 }
 
+/**
+ * The display name we publish for one model: provenance AND identity in a single string.
+ *
+ * Two requirements pull on this, and both are the operator's:
+ *  - the `ai-provider router` marker has to survive, because it is how he tells at a glance
+ *    which rows are served by this gateway rather than by one of his other providers;
+ *  - the model id has to be in there too, because six rows all reading "ai-provider router"
+ *    made the picker unusable — and that is how a model with no tool support got selected by
+ *    accident, producing the runaway tool-call text this file's `supportsToolCall` fix answers.
+ *
+ * Because the id is de-duplicated before it reaches here, these names are unique by
+ * construction — which is why `name` is generated rather than preserved. Preserving it would
+ * only work if every preserved name happened to carry both facts, and his did not.
+ */
+pub fn display_name(id: &str) -> String {
+    format!("ai-provider router · {id}")
+}
+
 fn gateway_port(store: &Store) -> u16 {
     let conn = match store.conn.lock() {
         Ok(c) => c,
@@ -296,17 +314,13 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
         })
         .unwrap_or_default();
 
-    // A name is only worth keeping if it tells the operator which model it is. Every published
-    // entry defaulting to "ai-provider router" made five rows in the picker indistinguishable,
-    // which is how a model with no tool support got picked by accident. So a preserved name is
-    // honoured only while it stays unique among what we publish; otherwise fall back to the id.
-    let mut used_names: Vec<String> = Vec::new();
-
     let mut ours = Vec::new();
     for id in &models {
         let Some(key) = key.as_deref() else { break };
         let (ctx, reasoning, modality) = catalog_facts(store, id);
         let old = prior.iter().find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()));
+        // `vendor` is still the operator's to choose; `name` is ours, because it has to carry
+        // two facts at once (see `display_name`).
         let pick = |k: &str, fallback: &str| -> String {
             old.and_then(|e| e.get(k))
                 .and_then(Value::as_str)
@@ -314,17 +328,9 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
                 .unwrap_or(fallback)
                 .to_string()
         };
-        let default_name = format!("Router: {id}");
-        let kept_name = pick("name", &default_name);
-        let name = if used_names.iter().any(|n| n == &kept_name) {
-            default_name.clone()
-        } else {
-            used_names.push(kept_name.clone());
-            kept_name
-        };
         ours.push(json!({
             "id": id,
-            "name": name,
+            "name": display_name(id),
             "vendor": pick("vendor", "AI-Provider Router"),
             "url": our_endpoint,
             "apiKey": key,
@@ -571,34 +577,27 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_display_names_do_not_survive_a_sync() {
-        // Every entry named "ai-provider router" is indistinguishable in the client's picker.
-        let existing = r#"[
-            {"id":"agnes-2.5-flash","name":"ai-provider router","url":"http://127.0.0.1:8787/v1/chat/completions"},
-            {"id":"openai/gpt-4o-mini","name":"ai-provider router","url":"http://127.0.0.1:8787/v1/chat/completions"}
-        ]"#;
-        let prior: Vec<Value> = serde_json::from_str(existing).unwrap();
-        let models = ["agnes-2.5-flash".to_string(), "openai/gpt-4o-mini".to_string()];
-        let mut used: Vec<String> = Vec::new();
-        let mut names = Vec::new();
-        for id in &models {
-            let old = prior.iter().find(|e| e.get("id").and_then(Value::as_str) == Some(id.as_str()));
-            let default_name = format!("Router: {id}");
-            let kept = old
-                .and_then(|e| e.get("name"))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(&default_name)
-                .to_string();
-            names.push(if used.iter().any(|n| n == &kept) {
-                default_name.clone()
-            } else {
-                used.push(kept.clone());
-                kept
-            });
-        }
-        assert_eq!(names, vec!["ai-provider router", "Router: openai/gpt-4o-mini"]);
-        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), 2);
+    fn a_display_name_carries_provenance_and_identity() {
+        // Both halves are load-bearing: the marker says "served by this gateway", the id says
+        // which model. Six rows sharing only the marker were indistinguishable in the picker.
+        let name = display_name("agnes-2.5-flash");
+        assert!(name.starts_with("ai-provider router"), "provenance marker: {name}");
+        assert!(name.ends_with("agnes-2.5-flash"), "model identity: {name}");
+    }
+
+    #[test]
+    fn published_names_are_unique_by_construction() {
+        // Ids are de-duplicated before they reach the sync, and each name embeds its id.
+        let ids = [
+            "openai/gpt-4o-mini",
+            "agnes-2.5-flash",
+            "agnes-3.0-flash",
+            "agnes-2.5-pro-beta",
+            "agnes-2.5-pro-alpha",
+            "agnes-image-2.0-flash",
+        ];
+        let names: Vec<String> = ids.iter().map(|i| display_name(i)).collect();
+        assert_eq!(names.iter().collect::<std::collections::HashSet<_>>().len(), ids.len());
     }
 
     #[test]
