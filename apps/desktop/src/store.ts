@@ -568,6 +568,45 @@ export async function clearContextGraph(): Promise<void> {
   await invoke("context_clear");
 }
 
+// ---------- P5: skills ----------
+
+export interface Skill {
+  id: string; slug: string; name: string; description: string; version: string;
+  source: string; body: string; enabled: boolean; installed_at: number;
+}
+export interface ParsedSkill { name: string; description: string; body: string; }
+
+export async function listSkills(): Promise<Skill[]> {
+  return invoke<Skill[]>("skills_list");
+}
+
+export async function skillsCatalog(): Promise<Skill[]> {
+  return invoke<Skill[]>("skills_catalog");
+}
+
+export async function installSkill(s: {
+  slug: string; name: string; description: string; body: string;
+}): Promise<Skill> {
+  return invoke<Skill>("skills_install", s);
+}
+
+export async function uninstallSkill(slug: string): Promise<void> {
+  await invoke("skills_uninstall", { slug });
+}
+
+export async function setSkillEnabled(slug: string, enabled: boolean): Promise<void> {
+  await invoke("skills_set_enabled", { slug, enabled });
+}
+
+/** Parse pasted SKILL.md without installing, so the UI can show exactly what would be added. */
+export async function parseSkill(text: string): Promise<ParsedSkill> {
+  return invoke<ParsedSkill>("skills_parse", { text });
+}
+
+export async function slugifySkill(name: string): Promise<string> {
+  return invoke<string>("skills_slugify", { name });
+}
+
 // ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------
 
 /** Full portable snapshot (providers, manifests, aliases, settings, key refs — never secrets). */

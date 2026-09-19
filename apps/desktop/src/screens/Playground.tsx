@@ -4,15 +4,15 @@
  * request the calm summary line (`✓ 421ms · OpenRouter · key-03` / `↻ 1 fallback`) with an
  * expandable per-attempt route trace. Acceptance criterion 4: text + image end-to-end.
  */
-import { useCallback, useMemo, useRef, useState } from "react";
-import { catalog, registry, router } from "../store";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { catalog, listSkills, registry, router } from "../store";
 import { fetchImageUrl } from "../ipc-client";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
-import { startSession, type Recorder } from "../lib/context/recorder";
+import { activeSession, type Recorder } from "../lib/context/recorder";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -205,6 +205,7 @@ function AssistantContent({ raw }: { raw: string }) {
 }
 
 function Chat() {
+  const tick = useUi((s) => s.tick);
   const [model, setModel] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
   const [trace, setTrace] = useState<Trace | null>(null);
@@ -220,11 +221,28 @@ function Chat() {
   const [streamedText, setStreamedText] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
-  // P4: the context graph is recorded as the conversation happens. One recorder per mounted
-  // Playground; the last recorded node carries the thread forward turn to turn.
+  // P4: the context graph is recorded as the conversation happens. `activeSession` rather than
+  // `startSession` because this component is keyed on the UI tick and remounts — a fresh
+  // session each time would fragment one conversation into unrelated threads.
   const ctxRef = useRef<Recorder | null>(null);
-  if (!ctxRef.current) ctxRef.current = startSession();
+  if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
+  // P5: enabled skills are appended to the agent's instructions. Re-read on every tick so
+  // installing or revoking a skill changes the agent's behaviour without restarting the app.
+  const [skillsBlock, setSkillsBlock] = useState("");
+  useEffect(() => {
+    listSkills()
+      .then((all) => {
+        const active = all.filter((s) => s.enabled);
+        setSkillsBlock(
+          active.length === 0
+            ? ""
+            : "\n\nInstalled skills — when the task matches one, follow its procedure:\n\n"
+              + active.map((s) => `## ${s.name}\n${s.description}\n\n${s.body}`).join("\n\n"),
+        );
+      })
+      .catch(() => undefined);
+  }, [tick]);
 
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
@@ -297,7 +315,7 @@ function Chat() {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: AGENT_SYSTEM,
+          system: AGENT_SYSTEM + skillsBlock,
           registry: AGENT_TOOLS,
           generate: (req, opts) => router.generateText(req, opts),
           host,

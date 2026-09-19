@@ -16,6 +16,7 @@ const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
       { id: "playground", label: "Playground" },
       { id: "activity", label: "Activity" },
       { id: "context", label: "Context" },
+      { id: "skills", label: "Skills" },
     ],
   },
   {

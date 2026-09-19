@@ -222,6 +222,23 @@ CREATE INDEX idx_context_edges_to ON context_edges(to_id);
 -- duplicating, so a repeated relation reads as a stronger one rather than as more clutter.
 CREATE UNIQUE INDEX uq_context_edges ON context_edges(from_id, to_id, kind);
 "#,
+),
+(
+    "0004_skills",
+    r#"
+CREATE TABLE skills (
+  id           TEXT PRIMARY KEY,
+  slug         TEXT NOT NULL UNIQUE,
+  name         TEXT NOT NULL,
+  description  TEXT NOT NULL,
+  version      TEXT NOT NULL DEFAULT '0.1.0',
+  source       TEXT NOT NULL CHECK (source IN ('builtin','user')),
+  body         TEXT NOT NULL,
+  enabled      INTEGER NOT NULL DEFAULT 1 CHECK (enabled IN (0,1)),
+  installed_at INTEGER NOT NULL
+);
+CREATE INDEX idx_skills_enabled ON skills(enabled);
+"#,
 )];
 
 #[derive(Serialize)]
@@ -326,15 +343,16 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 + 0002 gateway_keys + 0003 context_graph
-        assert_eq!(info.schema_version, 3);
-        // All v1.1 tables exist (§4), plus the R4 gateway-keys and P4 context-graph tables.
+        // 0001 schema_v1_1 + 0002 gateway_keys + 0003 context_graph + 0004 skills
+        assert_eq!(info.schema_version, 4);
+        // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph and P5 skills
+        // tables.
         let conn = s.conn.lock().unwrap();
         for table in [
             "providers", "api_keys", "manifests", "models_cache", "model_aliases",
             "ledger", "ledger_rollups", "drift_events", "onboarding_sessions",
             "generator_audit", "settings", "gateway_keys",
-            "context_nodes", "context_edges",
+            "context_nodes", "context_edges", "skills",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))

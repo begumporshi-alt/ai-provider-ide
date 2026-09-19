@@ -64,7 +64,21 @@ through it works end to end.
 - GUI apps launched by a tool call are reaped when the call ends — launch and verify in the
   same command.
 
+## Context graph (P4)
+
+- Persisted: `context_nodes` (artifact|memory|skill|message) + `context_edges`, migration
+  `0003_context_graph`, module `src-tauri/src/context.rs`. Derived (not stored): routing
+  topology and live request flow, built in `src/lib/context/engine.ts` from registry/catalog/ledger.
+- `memory` nodes are supported but **nothing produces them yet** — no memory subsystem exists.
+- Adding a migration: `MIGRATIONS` in store.rs is a `&[(&str, &str)]` of tuples; also bump the
+  hardcoded `schema_version` and the table list in `store::tests::migrations_apply_once...`.
+
 ## Testing
+
+- **The sandbox sets HTTP_PROXY/HTTPS_PROXY to a local port that can die.** When it does, the app
+  inherits it and every upstream call returns `502 upstream connect failed: Connection refused
+  (os error 61)` — which looks exactly like a regression but is not. Test the app with
+  `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
 - desktop: `apps/desktop && ./node_modules/.bin/vitest run` (43 tests)

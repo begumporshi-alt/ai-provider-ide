@@ -13,6 +13,7 @@ use tauri::State;
 
 use crate::context;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
+use crate::skills;
 use crate::store::{self, Store};
 use crate::vault;
 use crate::crash_report;
@@ -184,6 +185,53 @@ pub fn context_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
     context::clear(&store).map_err(CommandError)
 }
 
+// ---------- skills (P5) ----------
+// Skills are procedures, not capabilities: nothing here can widen the agent's tool surface.
+
+#[tauri::command]
+pub fn skills_list(store: State<'_, Arc<Store>>) -> Result<Vec<skills::Skill>, CommandError> {
+    skills::list(&store).map_err(CommandError)
+}
+
+/// The builtin catalog, whether or not each entry is installed — so a revoked builtin can be
+/// reinstalled deliberately rather than sneaking back on its own.
+#[tauri::command]
+pub fn skills_catalog() -> Vec<skills::Skill> {
+    skills::catalog()
+}
+
+#[tauri::command]
+pub fn skills_install(
+    store: State<'_, Arc<Store>>,
+    slug: String,
+    name: String,
+    description: String,
+    body: String,
+) -> Result<skills::Skill, CommandError> {
+    skills::install(&store, slug, name, description, body).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn skills_uninstall(store: State<'_, Arc<Store>>, slug: String) -> Result<(), CommandError> {
+    skills::uninstall(&store, &slug).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn skills_set_enabled(store: State<'_, Arc<Store>>, slug: String, enabled: bool) -> Result<(), CommandError> {
+    skills::set_enabled(&store, &slug, enabled).map_err(CommandError)
+}
+
+/// Parse pasted `SKILL.md` text without installing it, so the UI can show what would be added.
+#[tauri::command]
+pub fn skills_parse(text: String) -> skills::ParsedSkill {
+    skills::parse_skill_md(&text)
+}
+
+#[tauri::command]
+pub fn skills_slugify(name: String) -> String {
+    skills::slugify(&name)
+}
+
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
 
 #[tauri::command]
@@ -246,6 +294,13 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         context_record,
         context_graph,
         context_clear,
+        skills_list,
+        skills_catalog,
+        skills_install,
+        skills_uninstall,
+        skills_set_enabled,
+        skills_parse,
+        skills_slugify,
         crate::gateway_cmds::gateway_status,
         crate::gateway_cmds::get_tools_enabled,
         crate::gateway_cmds::set_tools_enabled,

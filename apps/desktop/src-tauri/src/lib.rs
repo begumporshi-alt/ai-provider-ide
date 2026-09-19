@@ -6,6 +6,7 @@ mod egress;
 mod gateway;
 mod gateway_cmds;
 mod persist;
+mod skills;
 mod store;
 mod tools;
 mod vault;
