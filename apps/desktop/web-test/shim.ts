@@ -50,6 +50,8 @@ const contextEdges: Row[] = [];
 const skills: Row[] = [];
 const agentRuns: Row[] = [];
 const agentSteps: Row[] = [];
+// P7 memory. Mirrors memory.rs: same four layers, same dedupe-on-(layer,text) rule.
+const memories: Row[] = [];
 
 const NODE_KINDS = ["artifact", "memory", "skill", "message"];
 const EDGE_KINDS = [
@@ -57,6 +59,8 @@ const EDGE_KINDS = [
   "routes_to", "served_by", "aliases", "backed_by",
 ];
 const RUN_STATUSES = ["running", "ok", "error", "stopped"];
+/** memory.rs accepts exactly these four layers. */
+const MEMORY_LAYERS = ["L0", "L1", "L2", "L3"];
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
 const MAX_WEIGHT = 50;
@@ -133,6 +137,7 @@ interface Snapshot {
   skills: Row[];
   agentRuns: Row[];
   agentSteps: Row[];
+  memories: Row[];
 }
 
 function snapshot(): Snapshot {
@@ -153,6 +158,7 @@ function snapshot(): Snapshot {
     skills: [...skills],
     agentRuns: [...agentRuns],
     agentSteps: [...agentSteps],
+    memories: [...memories],
   };
 }
 
@@ -189,6 +195,8 @@ function restore(s: Snapshot): void {
   agentRuns.push(...(s.agentRuns ?? []));
   agentSteps.length = 0;
   agentSteps.push(...(s.agentSteps ?? []));
+  memories.length = 0;
+  memories.push(...(s.memories ?? []));
 }
 
 function persist(): void {
@@ -342,6 +350,7 @@ let eventSeq = 0;
     contextEdges: () => [...contextEdges],
     agentRuns: () => [...agentRuns],
     agentSteps: () => [...agentSteps],
+    memories: () => [...memories],
   },
 };
 
@@ -773,6 +782,124 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "agent_run_steps": {
       const runId = args.run_id as string;
       return agentSteps.filter((s) => s.run_id === runId).sort((a, b) => (a.seq as number) - (b.seq as number));
+    }
+
+    // ---- P7: memory ----
+    // Ranking here is word-overlap, NOT BM25 — the real ranking is SQLite FTS5 and is pinned by
+    // the Rust tests in memory.rs. The shim only has to be good enough for the screen to render
+    // and for the actions to wire up; a test that depended on exact scores would be testing the
+    // emulation, not the app.
+    case "memory_capture": {
+      const layer = String(args.layer ?? "");
+      if (!MEMORY_LAYERS.includes(layer)) throw new Error(`unknown memory layer '${layer}'`);
+      const text = String(args.text ?? "").trim();
+      if (!text) throw new Error("memory text is empty");
+      const now = Date.now();
+      const seen = memories.find((m) => m.layer === layer && m.text === text);
+      if (seen) {
+        seen.updated_at = now;
+        seen.session_id = (args.session_id as string | null) ?? seen.session_id;
+        seen.subject = (args.subject as string | null) ?? seen.subject;
+        if (args.pinned) seen.pinned = 1;
+        return { ...seen };
+      }
+      const row: Row = {
+        id: `m-${layer}-${memories.length + 1}-${now}`, layer, text,
+        session_id: args.session_id ?? null, subject: args.subject ?? null,
+        created_at: now, updated_at: now, pinned: args.pinned ? 1 : 0,
+      };
+      memories.push(row);
+      return { ...row };
+    }
+    case "memory_capture_batch": {
+      const items = (args.items as Row[] | undefined) ?? [];
+      for (const it of items) {
+        if (!MEMORY_LAYERS.includes(String(it.layer))) {
+          throw new Error(`unknown memory layer '${it.layer}'`);
+        }
+      }
+      let n = 0;
+      for (const it of items) {
+        const text = String(it.text ?? "").trim();
+        if (!text) continue;
+        const now = Date.now();
+        const seen = memories.find((m) => m.layer === it.layer && m.text === text);
+        if (seen) {
+          seen.updated_at = now;
+        } else {
+          memories.push({
+            id: `m-${it.layer}-${memories.length + 1}-${now}`, layer: it.layer, text,
+            session_id: it.session_id ?? null, subject: it.subject ?? null,
+            created_at: now, updated_at: now, pinned: it.pinned ? 1 : 0,
+          });
+        }
+        n += 1;
+      }
+      return n;
+    }
+    case "memory_recall": {
+      const limit = (args.limit as number) ?? 8;
+      const layers = (args.layers as string[] | null | undefined) ?? null;
+      if (layers) {
+        for (const l of layers) {
+          if (!MEMORY_LAYERS.includes(l)) throw new Error(`unknown memory layer '${l}'`);
+        }
+      }
+      const words = String(args.query ?? "")
+        .split(/[^A-Za-z0-9]+/)
+        .filter((w) => w.length > 0);
+      if (words.length === 0) return [];
+      const scored = memories
+        .filter((m) => !layers || layers.includes(String(m.layer)))
+        .map((m) => {
+          const hay = String(m.text).toLowerCase();
+          let hits = 0;
+          for (const w of words) if (hay.includes(w.toLowerCase())) hits += 1;
+          return { m, score: hits === 0 ? null : -(hits / words.length) };
+        })
+        .filter((x) => x.score !== null) as { m: Row; score: number }[];
+      // Mirrors memory.rs: score first, then L3 > L2 > L1 > L0 on a tie.
+      const rank: Record<string, number> = { L3: 0, L2: 1, L1: 2, L0: 3 };
+      scored.sort((a, b) =>
+        a.score - b.score || (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
+      return scored.slice(0, limit).map((x) => ({ ...x.m, score: x.score }));
+    }
+    case "memory_list": {
+      const limit = (args.limit as number) ?? 200;
+      const layer = (args.layer as string | null | undefined) ?? null;
+      if (layer && !MEMORY_LAYERS.includes(layer)) throw new Error(`unknown memory layer '${layer}'`);
+      return memories
+        .filter((m) => !layer || m.layer === layer)
+        .sort((a, b) =>
+          (b.pinned as number) - (a.pinned as number) || (b.updated_at as number) - (a.updated_at as number))
+        .slice(0, limit);
+    }
+    case "memory_forget": {
+      const at = memories.findIndex((m) => m.id === args.id);
+      if (at < 0) return false;
+      memories.splice(at, 1);
+      return true;
+    }
+    case "memory_set_pinned": {
+      const row = memories.find((m) => m.id === args.id);
+      if (!row) return false;
+      row.pinned = args.pinned ? 1 : 0;
+      row.updated_at = Date.now();
+      return true;
+    }
+    case "memory_clear":
+      memories.length = 0;
+      return null;
+    case "memory_stats": {
+      const s = { l0: 0, l1: 0, l2: 0, l3: 0, total: memories.length, bytes: 0 };
+      for (const m of memories) {
+        s.bytes += String(m.text).length;
+        if (m.layer === "L0") s.l0 += 1;
+        else if (m.layer === "L1") s.l1 += 1;
+        else if (m.layer === "L2") s.l2 += 1;
+        else if (m.layer === "L3") s.l3 += 1;
+      }
+      return s;
     }
 
     default:

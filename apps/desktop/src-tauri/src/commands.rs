@@ -13,6 +13,7 @@ use tauri::State;
 
 use crate::context;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
+use crate::memory;
 use crate::orchestrator;
 use crate::skills;
 use crate::store::{self, Store};
@@ -283,6 +284,78 @@ pub fn agent_run_steps(store: State<'_, Arc<Store>>, run_id: String) -> Result<V
     orchestrator::steps(&store, &run_id).map_err(CommandError)
 }
 
+// ---------- memory (P7) ----------
+// Four layers — L0 raw conversation, L1 atoms, L2 scenarios, L3 core. BM25 recall through
+// FTS5, so no embedding model and no second process. Distillation is done in the webview
+// (it owns the gateway client); the host only stores and ranks.
+
+#[tauri::command]
+pub fn memory_capture(
+    store: State<'_, Arc<Store>>,
+    layer: String,
+    text: String,
+    session_id: Option<String>,
+    subject: Option<String>,
+    pinned: Option<bool>,
+) -> Result<memory::Memory, CommandError> {
+    memory::capture(
+        &store,
+        &memory::MemoryInput { layer, text, session_id, subject, pinned: pinned.unwrap_or(false) },
+    )
+    .map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_capture_batch(
+    store: State<'_, Arc<Store>>,
+    items: Vec<memory::MemoryInput>,
+) -> Result<usize, CommandError> {
+    memory::capture_batch(&store, &items).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_recall(
+    store: State<'_, Arc<Store>>,
+    query: String,
+    limit: Option<usize>,
+    layers: Option<Vec<String>>,
+) -> Result<Vec<memory::Memory>, CommandError> {
+    memory::recall(&store, &query, limit.unwrap_or(8), layers.as_deref()).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_list(
+    store: State<'_, Arc<Store>>,
+    layer: Option<String>,
+    limit: Option<usize>,
+) -> Result<Vec<memory::Memory>, CommandError> {
+    memory::list(&store, layer.as_deref(), limit.unwrap_or(200)).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_forget(store: State<'_, Arc<Store>>, id: String) -> Result<bool, CommandError> {
+    memory::forget(&store, &id).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_set_pinned(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    pinned: bool,
+) -> Result<bool, CommandError> {
+    memory::set_pinned(&store, &id, pinned).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
+    memory::clear(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn memory_stats(store: State<'_, Arc<Store>>) -> Result<memory::MemoryStats, CommandError> {
+    memory::stats(&store).map_err(CommandError)
+}
+
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
 
 #[tauri::command]
@@ -399,6 +472,14 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::diagnostics_bundle,
         crate::tools::tools_policy,
         crate::tools::tool_run,
+        memory_capture,
+        memory_capture_batch,
+        memory_recall,
+        memory_list,
+        memory_forget,
+        memory_set_pinned,
+        memory_clear,
+        memory_stats,
         // Crash reporting (local-only, no external telemetry)
         crate::commands::crash_count,
         crate::commands::crash_list,

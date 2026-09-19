@@ -18,6 +18,7 @@ const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
       { id: "context", label: "Context" },
       { id: "skills", label: "Skills" },
       { id: "agents", label: "Agents" },
+      { id: "memory", label: "Memory" },
     ],
   },
   {

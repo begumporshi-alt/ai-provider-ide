@@ -5,6 +5,7 @@ mod crash_report;
 mod egress;
 mod gateway;
 mod gateway_cmds;
+mod memory;
 mod orchestrator;
 mod persist;
 mod skills;

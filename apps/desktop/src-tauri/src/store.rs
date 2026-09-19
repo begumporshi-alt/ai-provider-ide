@@ -270,6 +270,43 @@ CREATE TABLE agent_steps (
 CREATE INDEX idx_agent_steps_run ON agent_steps(run_id, seq);
 CREATE UNIQUE INDEX uq_agent_steps_seq ON agent_steps(run_id, seq);
 "#,
+),
+(
+    "0006_memories",
+    r#"
+CREATE TABLE memories (
+  id          TEXT PRIMARY KEY,
+  layer       TEXT NOT NULL CHECK (layer IN ('L0','L1','L2','L3')),
+  text        TEXT NOT NULL,
+  session_id  TEXT,
+  subject     TEXT,
+  created_at  INTEGER NOT NULL,
+  updated_at  INTEGER NOT NULL,
+  pinned      INTEGER NOT NULL DEFAULT 0 CHECK (pinned IN (0,1))
+);
+CREATE INDEX idx_memories_layer ON memories(layer, updated_at DESC);
+CREATE INDEX idx_memories_updated ON memories(updated_at DESC);
+CREATE INDEX idx_memories_session ON memories(session_id);
+
+-- BM25 recall. External-content FTS5 keeps one copy of the text: the triggers below are the
+-- only thing that keeps the index honest, so any future write path must go through them.
+CREATE VIRTUAL TABLE memories_fts USING fts5(
+  text,
+  content='memories',
+  content_rowid='rowid',
+  tokenize='porter unicode61'
+);
+CREATE TRIGGER memories_ai AFTER INSERT ON memories BEGIN
+  INSERT INTO memories_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+CREATE TRIGGER memories_ad AFTER DELETE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+END;
+CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
+  INSERT INTO memories_fts(memories_fts, rowid, text) VALUES ('delete', old.rowid, old.text);
+  INSERT INTO memories_fts(rowid, text) VALUES (new.rowid, new.text);
+END;
+"#,
 )];
 
 #[derive(Serialize)]
@@ -374,10 +411,12 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0005 agent_runs
-        assert_eq!(info.schema_version, 5);
-        // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills and
-        // P6 agent-run tables.
+        // 0001 schema_v1_1 .. 0006 memories
+        assert_eq!(info.schema_version, 6);
+        // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
+        // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
+        // in sqlite_master as a table too — assert it, because BM25 recall silently returns
+        // nothing if the FTS index was never created.
         let conn = s.conn.lock().unwrap();
         for table in [
             "providers", "api_keys", "manifests", "models_cache", "model_aliases",
@@ -385,6 +424,7 @@ mod tests {
             "generator_audit", "settings", "gateway_keys",
             "context_nodes", "context_edges", "skills",
             "agent_runs", "agent_steps",
+            "memories", "memories_fts",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))

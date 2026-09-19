@@ -12,6 +12,7 @@ import { ActivityScreen } from "./screens/Activity";
 import { ContextScreen } from "./screens/Context";
 import { SkillsScreen } from "./screens/Skills";
 import { AgentsScreen } from "./screens/Agents";
+import { MemoryScreen } from "./screens/Memory";
 import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
 import { OnboardingScreen } from "./screens/Onboarding";
@@ -58,6 +59,7 @@ export default function App() {
       {screen === "context" && <ContextScreen />}
       {screen === "skills" && <SkillsScreen />}
       {screen === "agents" && <AgentsScreen />}
+      {screen === "memory" && <MemoryScreen />}
       {screen === "settings" && <SettingsScreen />}
       {screen === "gateway" && <GatewayScreen />}
       {screen === "onboarding" && <OnboardingScreen />}

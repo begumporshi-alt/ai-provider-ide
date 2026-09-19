@@ -645,6 +645,72 @@ export async function agentRunSteps(runId: string): Promise<AgentStep[]> {
   return invoke<AgentStep[]>("agent_run_steps", { runId });
 }
 
+// ---------- P7: memory ----------
+// Four layers: L0 raw conversation, L1 atoms, L2 scenarios, L3 core. Storage and BM25 ranking
+// live in the host; distillation lives here because the webview owns the gateway client.
+
+export type MemoryLayer = "L0" | "L1" | "L2" | "L3";
+
+export interface Memory {
+  id: string;
+  layer: MemoryLayer;
+  text: string;
+  session_id: string | null;
+  subject: string | null;
+  created_at: number;
+  updated_at: number;
+  pinned: boolean;
+  score?: number;
+}
+
+export interface MemoryStats {
+  l0: number; l1: number; l2: number; l3: number; total: number; bytes: number;
+}
+
+export async function captureMemory(m: {
+  layer: MemoryLayer; text: string;
+  sessionId?: string | null; subject?: string | null; pinned?: boolean;
+}): Promise<Memory> {
+  return invoke<Memory>("memory_capture", {
+    layer: m.layer, text: m.text,
+    sessionId: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
+  });
+}
+
+export async function captureMemories(
+  items: Array<{ layer: MemoryLayer; text: string; sessionId?: string | null; subject?: string | null; pinned?: boolean }>,
+): Promise<number> {
+  if (items.length === 0) return 0;
+  return invoke<number>("memory_capture_batch", { items });
+}
+
+/** BM25 recall. `layers` narrows the search; omit it to search all four. */
+export async function recallMemories(
+  query: string, limit = 8, layers?: MemoryLayer[],
+): Promise<Memory[]> {
+  return invoke<Memory[]>("memory_recall", { query, limit, layers: layers ?? null });
+}
+
+export async function listMemories(layer?: MemoryLayer | null, limit = 200): Promise<Memory[]> {
+  return invoke<Memory[]>("memory_list", { layer: layer ?? null, limit });
+}
+
+export async function forgetMemory(id: string): Promise<boolean> {
+  return invoke<boolean>("memory_forget", { id });
+}
+
+export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
+  return invoke<boolean>("memory_set_pinned", { id, pinned });
+}
+
+export async function clearMemories(): Promise<void> {
+  await invoke("memory_clear");
+}
+
+export async function memoryStats(): Promise<MemoryStats> {
+  return invoke<MemoryStats>("memory_stats");
+}
+
 // ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------
 
 /** Full portable snapshot (providers, manifests, aliases, settings, key refs — never secrets). */

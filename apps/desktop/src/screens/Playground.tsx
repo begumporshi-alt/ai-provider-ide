@@ -14,6 +14,9 @@ import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type 
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { activeSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
+import {
+  distilTurn, memoryBlock, recallContext, recordRecall, rememberTurn,
+} from "../lib/memory/engine";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -215,6 +218,9 @@ function Chat() {
   const [input, setInput] = useState("");
   const [noTools, setNoTools] = useState(true);
   const [agentMode, setAgentMode] = useState(false);
+  // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
+  // what the model sees and costs a second call, so it has to be possible to turn it off.
+  const [useMemory, setUseMemory] = useState(true);
   const [root, setRoot] = useState("");
   const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (ok: boolean) => void } | null>(null);
@@ -329,6 +335,13 @@ function Chat() {
       startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: text });
       registerAbort(runId, ac);
       const host = createTauriToolHost(root.trim());
+      // P7: recall before the run so the agent starts from what is already known. Awaited,
+      // because the recalled block has to be in the system prompt before the first call.
+      const recalled = useMemory ? await recallContext(text) : [];
+      if (recalled.length > 0) {
+        const node = ctxRef.current!.node("message", clip(text, 120), { role: "user" });
+        recordRecall(node, recalled);
+      }
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
       const history: ChatMessage[] = [
@@ -346,7 +359,7 @@ function Chat() {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: AGENT_SYSTEM + skillsBlock,
+          system: AGENT_SYSTEM + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
           registry: AGENT_TOOLS,
           generate: (req, opts) => router.generateText(req, opts),
           host,
@@ -369,6 +382,14 @@ function Chat() {
         void finalText;
         lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, fullMessages, chosen);
         void ctxRef.current!.flush();
+        // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
+        // it is an extra model call, and a slow or failing one must not hold up the answer the
+        // user is already reading.
+        if (useMemory) {
+          void rememberTurn(ctxRef.current!.sessionId, text, finalText).then(() =>
+            distilTurn(ctxRef.current!.sessionId, chosen),
+          );
+        }
         endRun(runId, "ok", iterationsRef.current);
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
       } catch (e) {
@@ -395,6 +416,9 @@ function Chat() {
     const rec = ctxRef.current!;
     const userNode = rec.node("message", clip(text, 120), { role: "user", model: chosen });
     if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
+    // P7: recall before answering. Awaited, because the block has to be in the request.
+    const recalled = useMemory ? await recallContext(text) : [];
+    if (recalled.length > 0) recordRecall(userNode, recalled);
     let streamed = "";
     try {
       // A stopped or failed turn leaves an empty assistant bubble behind; replaying it would
@@ -402,11 +426,16 @@ function Chat() {
       const history = msgs
         .filter((m) => m.content.trim().length > 0)
         .map((m) => ({ role: m.role, content: m.content }));
+      // Recalled memory goes in its own system message, never spliced into the user's text:
+      // the model must be able to tell the difference between what was just said and what was
+      // remembered from an earlier conversation.
+      const recallMsg = memoryBlock(recalled);
       const exec = await router.generateText(
         {
           model: chosen,
           messages: [
             ...(noTools ? [{ role: "system" as const, content: NO_TOOLS_SYSTEM }] : []),
+            ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
             ...history,
             { role: "user" as const, content: text },
           ],
@@ -447,6 +476,13 @@ function Chat() {
       // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
       // of what happened, not of what succeeded.
       void ctxRef.current!.flush();
+      // P7: remember whatever was actually said, including a failed or stopped turn — an
+      // exchange the user abandoned is still part of the record. Distillation is not awaited.
+      if (useMemory) {
+        void rememberTurn(ctxRef.current!.sessionId, text, streamed).then(() =>
+          distilTurn(ctxRef.current!.sessionId, chosen),
+        );
+      }
       setBusy(false);
       abortRef.current = null;
     }
@@ -465,6 +501,10 @@ function Chat() {
         <label className="flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
           <input type="checkbox" checked={agentMode} onChange={(e) => onToggleAgent(e.target.checked)} />
           agent mode
+        </label>
+        <label className="flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
+          <input type="checkbox" checked={useMemory} onChange={(e) => setUseMemory(e.target.checked)} />
+          memory
         </label>
       </div>
 
