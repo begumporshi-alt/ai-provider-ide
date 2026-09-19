@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, err, forwarded_headers, map_generic_to_status, peer_ip, try_slot,
-    BridgeMsg, BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, err, forwarded_headers, map_generic_to_status,
+    peer_ip, try_slot, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// OpenAI Responses API ingress (v1.1, 2026-09-16): Codex-style clients. Edge translation
@@ -243,7 +243,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     match err_info {
         Some((_, message)) => err(StatusCode::BAD_GATEWAY, responses_error(&message, "upstream_error")),
         None => {
-            let mut content: Vec<Value> = vec![json!({ "type": "output_text", "text": full, "annotations": [] })];
+            let mut content: Vec<Value> = vec![json!({ "type": "output_text", "text": clean_assistant_text(&full), "annotations": [] })];
             for (call_id, name, args) in &tool_calls {
                 content.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
             }

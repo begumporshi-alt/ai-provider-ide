@@ -154,12 +154,30 @@ fn manifest_forwards_tools(body_json: &str) -> bool {
  * and promising tool calls that will be dropped on the floor is far worse than not offering
  * them. (Same rule as `supportsReasoning`.)
  */
+/// Manifests are per-provider, not per-model, so a provider's text manifest says nothing about
+/// its image models. Without the modality guard an image model inherits `supportsToolCall: true`
+/// from a sibling text manifest and a client then offers it tools it cannot call.
+/// True when the model's own id says it is not a text model, whatever the catalog claims.
+fn id_marks_non_text(native_id: &str) -> bool {
+    let lower = native_id.to_ascii_lowercase();
+    ["-image", "/image", "-video", "/video"]
+        .iter()
+        .any(|m| lower.contains(m))
+}
+
 fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
+    // A provider's catalog is not always honest about modality: Agnes publishes its image and
+    // video models as `text`, so the modality guard below cannot see them. The id can. Offering
+    // tools to an image model is precisely what produces the runaway tool-call text this file
+    // exists to prevent, so the id wins over the catalog when the two disagree.
+    if id_marks_non_text(native_id) {
+        return Some(false);
+    }
     let conn = store.conn.lock().ok()?;
     conn.query_row(
         "SELECT m.body_json FROM models_cache c
          JOIN manifests m ON m.provider_id = c.provider_id AND m.is_active = 1
-         WHERE c.native_id = ?1
+         WHERE c.native_id = ?1 AND c.modality = 'text'
          ORDER BY (c.context_window IS NULL), (c.capabilities_json IS NULL) LIMIT 1",
         rusqlite::params![native_id],
         |r| r.get::<_, String>(0),
@@ -574,6 +592,18 @@ mod tests {
         // A manifest that is not declarative text, or is unparseable, is unknown — never true.
         assert!(!manifest_forwards_tools("not json"));
         assert!(!manifest_forwards_tools("{}"));
+    }
+
+    #[test]
+    fn an_image_model_never_advertises_tool_support_even_if_the_catalog_says_text() {
+        // Agnes publishes its image and video models as modality 'text', so the SQL guard alone
+        // would let them inherit supportsToolCall from the provider's text manifest. The id is
+        // the honest signal here.
+        assert!(id_marks_non_text("agnes-image-2.0-flash"));
+        assert!(id_marks_non_text("agnes-video-2.5"));
+        assert!(id_marks_non_text("google/gemini-2.5-flash-image"));
+        assert!(!id_marks_non_text("agnes-2.5-flash"));
+        assert!(!id_marks_non_text("openai/gpt-4o-mini"));
     }
 
     #[test]

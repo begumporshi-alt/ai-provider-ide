@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    anthropic_error, check_gateway_key, err, forwarded_headers, peer_ip, try_slot, BridgeMsg,
-    BridgeRequest, GatewayCore,
+    anthropic_error, check_gateway_key, clean_assistant_text, err, forwarded_headers, peer_ip,
+    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// Anthropic Messages ingress (2026-09-16 amendment, DECISIONS.md): Claude Code and
@@ -328,7 +328,13 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             let prompt_tokens = usage.as_ref().map(|(pt, _)| pt).unwrap_or(&0);
             let completion_tokens = usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0);
             // Build content: text block first, then any tool_use blocks.
-            let mut content: Vec<Value> = vec![json!({ "type": "text", "text": full })];
+            let text = clean_assistant_text(&full);
+            let mut content: Vec<Value> = Vec::new();
+            // Anthropic carries a text block only when there is text. On a pure tool-call turn
+            // the cleaned text is empty, and emitting an empty block renders as a stray bubble.
+            if !text.trim().is_empty() || tool_content_blocks.is_empty() {
+                content.push(json!({ "type": "text", "text": text }));
+            }
             content.append(&mut tool_content_blocks);
             (
                 StatusCode::OK,

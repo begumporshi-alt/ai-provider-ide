@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, forwarded_headers, map_generic_to_status, peer_ip, try_slot, BridgeMsg,
-    BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, forwarded_headers, map_generic_to_status, peer_ip,
+    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// One Gemini function declaration -> one OpenAI function declaration.
@@ -311,7 +311,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
             let parts = if has_tool_calls && !tool_parts.is_empty() {
                 tool_parts
             } else {
-                vec![json!({ "text": full })]
+                vec![json!({ "text": clean_assistant_text(&full) })]
             };
             (
                 StatusCode::OK,

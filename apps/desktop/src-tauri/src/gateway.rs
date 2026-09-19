@@ -133,6 +133,20 @@ pub enum BridgeMsg {
  * the other dialects' existing readers are simply correct. Already-shaped input is passed
  * through, only gaining `index`/`type` if it lacks them.
  */
+/// Chat-templated upstream models leak their own end-of-turn sentinels into the text they
+/// stream. Left alone a client renders them as visible garbage — most obviously on a turn that
+/// ends in a tool call, where the sentinel is often the only text the model produced.
+///
+/// Stripping is unconditional: these tokens are never meaningful user-visible content, and an
+/// upstream that genuinely wants to talk about them can escape them.
+pub fn clean_assistant_text(raw: &str) -> String {
+    let mut out = raw.to_string();
+    for tok in ["<|im_end|>", "<|im_start|>", "<|endoftext|>", "<|end|>"] {
+        out = out.replace(tok, "");
+    }
+    out
+}
+
 pub fn normalize_tool_calls(calls: Value) -> Value {
     let Some(arr) = calls.as_array() else { return calls };
     Value::Array(
@@ -226,6 +240,26 @@ mod core_recovery_tests {
         core.set_running(false);
         assert!(!core.is_running());
         assert!(!core.is_available());
+    }
+}
+
+#[cfg(test)]
+mod assistant_text_tests {
+    use super::clean_assistant_text;
+
+    #[test]
+    fn a_leaked_end_of_turn_sentinel_is_not_user_visible_text() {
+        // Observed live: a forced tool call on agnes-2.5-flash returned a text block whose entire
+        // content was "<|im_end|>", which an Anthropic client renders as garbage.
+        assert_eq!(clean_assistant_text("<|im_end|>"), "");
+        assert_eq!(clean_assistant_text("hello<|im_end|>"), "hello");
+        assert_eq!(clean_assistant_text("<|im_start|>assistant\npong<|endoftext|>"), "assistant\npong");
+    }
+
+    #[test]
+    fn ordinary_text_is_untouched() {
+        assert_eq!(clean_assistant_text("\n\nping"), "\n\nping");
+        assert_eq!(clean_assistant_text(""), "");
     }
 }
 

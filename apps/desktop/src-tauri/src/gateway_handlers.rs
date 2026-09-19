@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, err, err_ra, forwarded_headers, openai_error, peer_ip, try_slot, BridgeMsg,
-    BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, err, err_ra, forwarded_headers, openai_error, peer_ip,
+    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
@@ -192,7 +192,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             err(code, openai_error(&message, "upstream_error", None))
         }
         None => {
-            let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": full }, "finish_reason": "stop" });
+            let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": clean_assistant_text(&full) }, "finish_reason": "stop" });
             if let Some(tc) = tool_calls_json {
                 let parsed: Value = serde_json::from_str(&tc).unwrap_or_default();
                 if !parsed.is_null() {
