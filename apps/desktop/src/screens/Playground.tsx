@@ -52,28 +52,36 @@ function clip(s: string, n: number): string {
 }
 
 /**
- * Record one agent turn into the context graph: the user message, each following message, and
- * for every tool call a skill node plus the artifact its result produced.
+ * Record what one agent turn produced: each message after the user's, and for every tool call a
+ * skill node plus the artifact its result produced.
  *
  * A tool result is recorded as an artifact because that is what it is to the model — context it
  * was handed, not something it said. That distinction is the whole reason the graph has two node
  * kinds instead of one.
+ *
+ * `userNode` and `produced` are both supplied by the caller, and both matter:
+ *
+ *   - `userNode` is the id of the node the caller already created for this turn's prompt. The
+ *     caller needs that node before the run starts (recall edges anchor to it), so creating a
+ *     second one here would put the same prompt in the graph twice.
+ *   - `produced` is only what THIS turn added. `runAgentLoop` seeds its working copy from the
+ *     replayed history and hands the whole transcript back, so passing that verbatim would
+ *     re-record every earlier turn as brand-new nodes on every turn.
  */
-function recordAgentTurn(rec: Recorder, userText: string, messages: ChatMessage[], model: string): string {
-  const user = rec.node("message", clip(userText, 120), { role: "user", model });
-  let prev: string | null = null;
+function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[], model: string): string {
+  let prev: string = userNode;
   const skillByCall = new Map<string, string>();
 
-  for (const m of messages) {
+  for (const m of produced) {
     const content = typeof m.content === "string" ? m.content : "";
     if (m.role === "tool") {
       const artifact = rec.node("artifact", clip(content, 80), { tool_call_id: m.tool_call_id });
       const skill = m.tool_call_id ? skillByCall.get(m.tool_call_id) : undefined;
-      rec.edge(skill ?? prev ?? user, artifact, "produced");
+      rec.edge(skill ?? prev, artifact, "produced");
       continue;
     }
     const node = rec.node("message", clip(content, 120), { role: m.role, model });
-    rec.edge(prev ?? user, node, "follows");
+    rec.edge(prev, node, "follows");
     // `tool_calls` is `unknown` in the core's message type: the wire shape varies by dialect
     // and the core does not commit to one. The agent loop normalises to OpenAI's shape.
     const calls = (m.tool_calls as ToolCall[] | undefined) ?? [];
@@ -84,7 +92,7 @@ function recordAgentTurn(rec: Recorder, userText: string, messages: ChatMessage[
     }
     prev = node;
   }
-  return prev ?? user;
+  return prev;
 }
 
 function tryParseArgs(raw?: string): Record<string, unknown> {
@@ -335,13 +343,16 @@ function Chat() {
       startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: text });
       registerAbort(runId, ac);
       const host = createTauriToolHost(root.trim());
+      // The user's node is created here rather than inside recordAgentTurn, because the recall
+      // edges need an anchor before the run starts. Same shape as the plain-chat branch below:
+      // one node per turn, reused by everything that needs to point at it.
+      const rec = ctxRef.current!;
+      const userNode = rec.node("message", clip(text, 120), { role: "user", model: chosen });
+      if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
       // P7: recall before the run so the agent starts from what is already known. Awaited,
       // because the recalled block has to be in the system prompt before the first call.
       const recalled = useMemory ? await recallContext(text) : [];
-      if (recalled.length > 0) {
-        const node = ctxRef.current!.node("message", clip(text, 120), { role: "user" });
-        recordRecall(node, recalled);
-      }
+      if (recalled.length > 0) recordRecall(userNode, recalled);
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
       const history: ChatMessage[] = [
@@ -380,8 +391,10 @@ function Chat() {
           })),
         );
         void finalText;
-        lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, fullMessages, chosen);
-        void ctxRef.current!.flush();
+        // Only this turn's messages. `runAgentLoop` seeds its working copy from `history` and
+        // returns the whole transcript, so slicing off the replayed prefix is what keeps an
+        // earlier turn from being re-recorded — and keeps the graph linear in turns.
+        lastNodeRef.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), chosen);
         // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
         // it is an extra model call, and a slow or failing one must not hold up the answer the
         // user is already reading.
@@ -401,6 +414,11 @@ function Chat() {
           setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
         }
       } finally {
+        // Flush here, not on the success path only. The user's node — and any recall edges
+        // anchored to it — is created before the run starts, so a stopped or failed run would
+        // otherwise leave those nodes buffered and silently prepend them to the next turn's
+        // batch. Same policy as the plain-chat branch: a partial turn is still a turn.
+        void ctxRef.current!.flush();
         runIdRef.current = null;
         setBusy(false);
         setPendingConfirm(null);
