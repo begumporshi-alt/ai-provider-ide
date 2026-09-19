@@ -345,6 +345,18 @@ export function memoryBlock(memories: Memory[], budget = DEFAULT_CONTEXT_BUDGET)
 }
 
 /**
+ * Stable graph-node id for a stored memory.
+ *
+ * A memory is one thing, however many times it is used. Deriving the node id from the memory's
+ * own id is what lets the host do its job: it upserts nodes on id and accumulates edge weight
+ * (`MIN(weight + excluded.weight, 50)`), so recalling a memory in ten turns should leave one
+ * node with one thick edge — not ten identical nodes with ten weight-1 edges.
+ */
+export function memoryNodeId(id: string): string {
+  return `memory:${id}`;
+}
+
+/**
  * Put recalled memories into the context graph.
  *
  * `messageNodeId` is the message that consumed them; the edge reads message -recalled-> memory,
@@ -354,7 +366,12 @@ export function recordRecall(messageNodeId: string, memories: Memory[]): void {
   if (memories.length === 0) return;
   const rec = activeSession();
   for (const m of memories) {
-    const id = rec.node("memory", m.text.slice(0, 80), { layer: m.layer, memoryId: m.id });
+    const id = rec.node(
+      "memory",
+      m.text.slice(0, 80),
+      { layer: m.layer, memoryId: m.id },
+      memoryNodeId(m.id),
+    );
     rec.edge(messageNodeId, id, "recalled");
   }
 }
@@ -374,7 +391,9 @@ export async function captureAndRecord(
       pinned: options.pinned ?? false,
     });
     const rec = activeSession();
-    rec.node("memory", m.text.slice(0, 80), { layer, memoryId: m.id });
+    // Same stable id as recordRecall uses, so a memory stored now and recalled later is one
+    // node in the graph rather than two.
+    rec.node("memory", m.text.slice(0, 80), { layer, memoryId: m.id }, memoryNodeId(m.id));
     void rec.flush();
     return m;
   } catch {

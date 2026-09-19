@@ -14,8 +14,8 @@ const APP = "/web-test/";
 type Store = Record<string, (...a: unknown[]) => unknown>;
 
 interface EgressLogEntry { url: string; body: string | null }
-interface ContextNodeRow { id: string; kind: string; session_id: string | null; meta_json: string | null }
-interface ContextEdgeRow { from_id: string; to_id: string; kind: string }
+interface ContextNodeRow { id: string; kind: string; label: string; session_id: string | null; meta_json: string | null }
+interface ContextEdgeRow { from_id: string; to_id: string; kind: string; weight: number }
 
 async function store<T>(page: Page, key: string): Promise<T> {
   return page.evaluate(
@@ -24,11 +24,15 @@ async function store<T>(page: Page, key: string): Promise<T> {
   ) as Promise<T>;
 }
 
-async function seedL1(page: Page, text: string): Promise<void> {
-  await page.evaluate(async (t) => {
+/** Seed an L1 atom and return its stored id, so a spec can predict its graph node id. */
+async function seedL1(page: Page, text: string): Promise<string> {
+  return page.evaluate(async (t) => {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const host = (window as any).__webTest;
-    await host.invoke("memory_capture", { layer: "L1", text: t, session_id: "s-recall", subject: null, pinned: false });
+    const m = await host.invoke("memory_capture", {
+      layer: "L1", text: t, session_id: "s-recall", subject: null, pinned: false,
+    });
+    return (m as { id: string }).id;
   }, text);
 }
 
@@ -76,7 +80,7 @@ test("memory recall: the recalled block lands in the chat-completions request as
 
 test("memory recall: a recalled memory lands in the context graph as a memory node + recalled edge", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
-  await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
+  const memoryId = await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
 
   await page.getByRole("button", { name: "Playground", exact: true }).click();
   await selectModel(page);
@@ -94,8 +98,61 @@ test("memory recall: a recalled memory lands in the context graph as a memory no
   const nodes = await store<ContextNodeRow[]>(page, "contextNodes");
   const edges = await store<ContextEdgeRow[]>(page, "contextEdges");
   const memoryNode = nodes.find((n) => n.kind === "memory");
+  // The node id is derived from the memory's own id, not generated — that is what lets the host
+  // collapse repeat recalls into one node instead of one per occurrence.
+  expect(memoryNode?.id).toBe(`memory:${memoryId}`);
   expect(memoryNode?.meta_json).toContain('"layer":"L1"');
   expect(edges.some((e) => e.kind === "recalled")).toBe(true);
+});
+
+test("memory recall: recalling the same memory twice leaves one node with two edges", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  const memoryId = await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
+
+  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await selectModel(page);
+  const box = page.getByPlaceholder(/Send a message through the router/);
+  const send = page.getByRole("button", { name: "Send" });
+
+  // Both questions must share a token with the stored atom: recall is BM25 over tokens, with no
+  // embeddings behind it, so a paraphrase that overlaps in meaning but not in words returns
+  // nothing. "Tushu" and "Dhaka" are the distinctive ones here.
+  const questions = ["where does Tushu live?", "what is the timezone in Dhaka?"];
+  for (const [i, question] of questions.entries()) {
+    await box.fill(question);
+    await send.click();
+    // Each assistant message node is created after its answer streams and flushed in `finally`,
+    // so waiting for one more of them means this turn has finished AND its batch has landed.
+    // Waiting on the answer bubble instead would race: the recalled edge is written before the
+    // model is even called, so the graph would look done while the turn was still running.
+    await expect
+      .poll(
+        async () =>
+          (await store<ContextNodeRow[]>(page, "contextNodes")).filter(
+            (n) => n.kind === "message" && n.label.startsWith("Hello from "),
+          ).length,
+        { timeout: 30_000 },
+      )
+      .toBe(i + 1);
+  }
+
+  const nodes = await store<ContextNodeRow[]>(page, "contextNodes");
+  const edges = await store<ContextEdgeRow[]>(page, "contextEdges");
+
+  // No id is ever duplicated. The host upserts on id, so a repeat write updates one row — this
+  // is the invariant that a generated node id silently broke.
+  const ids = nodes.map((n) => n.id);
+  expect(new Set(ids).size).toBe(ids.length);
+
+  // The seeded memory has exactly one node, however many turns recalled it. Other memory nodes
+  // may legitimately exist: turn one's own L0 rows become recallable on turn two, which is the
+  // layering doing its job, not duplication.
+  expect(nodes.filter((n) => n.id === `memory:${memoryId}`)).toHaveLength(1);
+
+  // Two different messages recalled it, so two edges point at that one node.
+  const recalled = edges.filter((e) => e.kind === "recalled" && e.to_id === `memory:${memoryId}`);
+  expect(recalled).toHaveLength(2);
+  expect(new Set(recalled.map((e) => e.from_id)).size).toBe(2);
 });
 
 test("memory recall: toggling memory off skips the recall path entirely", async ({ page }) => {

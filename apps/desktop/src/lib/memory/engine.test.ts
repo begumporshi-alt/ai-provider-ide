@@ -12,11 +12,13 @@ import {
   DEFAULT_CONTEXT_BUDGET,
   MAX_ATOM_CHARS,
   SCENARIO_EVERY,
+  captureAndRecord,
   captureCore,
   distilScenarios,
   distilTurn,
   editCore,
   memoryBlock,
+  memoryNodeId,
   parseAtoms,
   parseScenarios,
   recallContext,
@@ -416,6 +418,48 @@ describe("memory engine", () => {
       const [nodes, edges] = recordContext.mock.calls[0]!;
       expect(nodes.filter((n) => n.kind === "memory")).toHaveLength(0);
       expect(edges).toHaveLength(0);
+    });
+
+    it("gives one memory one node id, so repeated recall collapses to one weighted edge", async () => {
+      const rec = startSession("mem-stable");
+      const one = mem("stable-1", "L1", "Lives in Dhaka");
+      const first = rec.node("message", "where do I live?");
+      recordRecall(first, [one]);
+      const second = rec.node("message", "remind me again");
+      recordRecall(second, [one]);
+      await rec.flush();
+
+      const [nodes, edges] = recordContext.mock.calls[0]!;
+      const memoryNodes = nodes.filter((n) => n.kind === "memory");
+      // The buffer is a naive append log: it holds one entry per call, and the HOST is what
+      // collapses them (`INSERT ... ON CONFLICT(id) DO UPDATE`). So the invariant this layer
+      // owns is that every entry carries the same id — not that the buffer is pre-deduped.
+      expect(memoryNodes).toHaveLength(2);
+      expect(new Set(memoryNodes.map((n) => n.id))).toEqual(new Set([memoryNodeId("stable-1")]));
+      // Two distinct messages recalled it, so two edges point at that one node. The host
+      // accumulates weight on the (from_id, to_id, kind) conflict — which is the point.
+      expect(edges.filter((e) => e.to_id === memoryNodeId("stable-1"))).toHaveLength(2);
+      expect(new Set(edges.map((e) => e.from_id))).toEqual(new Set([first, second]));
+    });
+
+    it("captureAndRecord and recordRecall agree on the node id", async () => {
+      const stored = mem("shared-9", "L3", "Prefers terse replies");
+      captureMemory.mockResolvedValueOnce(stored);
+      const rec = startSession("mem-shared");
+
+      await captureAndRecord("L3", "Prefers terse replies");
+      recordRecall(rec.node("message", "how should you reply?"), [stored]);
+      await rec.flush();
+
+      // captureAndRecord flushes on its own, so the two writes land in separate batches — which
+      // is exactly the case the host's upsert exists to reconcile. Storing a memory and later
+      // recalling it must not leave two nodes for one fact.
+      const ids = recordContext.mock.calls
+        .flatMap((call) => call[0])
+        .filter((n) => n.kind === "memory")
+        .map((n) => n.id);
+      expect(ids.length).toBeGreaterThan(1);
+      expect(new Set(ids)).toEqual(new Set([memoryNodeId("shared-9")]));
     });
   });
 });

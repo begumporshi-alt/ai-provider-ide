@@ -14,7 +14,13 @@ import type { ContextNodeKind, ContextEdgeKind } from "./engine";
 
 export interface Recorder {
   readonly sessionId: string;
-  node(kind: ContextNodeKind, label: string, meta?: Record<string, unknown>): string;
+  /**
+   * `id` overrides the generated one. Pass it when the thing being recorded already has a stable
+   * identity — a stored memory, say — so recording it again updates that one node instead of
+   * scattering a parallel copy per occurrence. The host upserts on id and accumulates edge
+   * weight precisely so this works.
+   */
+  node(kind: ContextNodeKind, label: string, meta?: Record<string, unknown>, id?: string): string;
   edge(fromId: string, toId: string, kind: ContextEdgeKind, meta?: Record<string, unknown>): void;
   flush(): Promise<void>;
 }
@@ -31,10 +37,12 @@ class BufferedRecorder implements Recorder {
     return `${kind}:${this.sessionId}:${this.seq}`;
   }
 
-  node(kind: ContextNodeKind, label: string, meta?: Record<string, unknown>): string {
-    const id = this.nextId(kind);
+  node(kind: ContextNodeKind, label: string, meta?: Record<string, unknown>, id?: string): string {
+    // An explicit id does not advance the sequence: generated ids and supplied ones live in
+    // different namespaces, and burning a seq number would only make ids harder to read.
+    const nodeId = id ?? this.nextId(kind);
     this.nodes.push({
-      id,
+      id: nodeId,
       kind,
       label,
       source: "ui",
@@ -42,7 +50,7 @@ class BufferedRecorder implements Recorder {
       ts: Date.now(),
       meta_json: meta ? JSON.stringify(meta) : null,
     });
-    return id;
+    return nodeId;
   }
 
   edge(fromId: string, toId: string, kind: ContextEdgeKind, meta?: Record<string, unknown>): void {
