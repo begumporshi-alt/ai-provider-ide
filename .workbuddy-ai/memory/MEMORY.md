@@ -71,3 +71,18 @@ through it works end to end.
 - Rust: `apps/desktop/src-tauri && cargo test --lib` (119 tests)
 - Use `./node_modules/.bin/tsc`, never `npx tsc` (the latter tries to install `tsc@2.0.4`).
 - The sandbox `grep` shim silently returns nothing for alternation (`a|b`) — use the Grep tool.
+  This has now bitten twice; it made a real API look absent. Do not trust a shell grep that
+  returns nothing when you expected a hit.
+
+## macOS App Nap
+
+- `app_nap.rs` suppresses App Nap at startup via
+  `NSProcessInfo::beginActivityWithOptions_reason` with `UserInitiatedAllowingIdleSystemSleep`.
+  It is the root cause fix for heartbeat lapses and the 60s hang — the earlier gateway fixes
+  only treated symptoms.
+- The call must come **after** `tracing_subscriber` init or its confirmation line is dropped.
+- `objc2` / `objc2-foundation` are macOS-target deps pinned to the versions already in
+  Cargo.lock (0.6.4 / 0.3.2, pulled in by Tauri). Build with `CARGO_NET_OFFLINE=true`.
+- To see the app's own logs (they go to stderr and `open -a` discards them): run the binary
+  directly — `nohup "/Applications/AI-Provider Router.app/Contents/MacOS/ai-provider-router" >
+  /tmp/router-app.log 2>&1 &`.

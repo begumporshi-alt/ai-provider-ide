@@ -1,5 +1,6 @@
 mod app_nap;
 mod commands;
+mod context;
 mod crash_report;
 mod egress;
 mod gateway;

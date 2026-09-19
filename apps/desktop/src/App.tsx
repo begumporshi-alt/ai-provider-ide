@@ -9,6 +9,7 @@ import { ProvidersScreen } from "./screens/Providers";
 import { ModelsScreen } from "./screens/Models";
 import { PlaygroundScreen } from "./screens/Playground";
 import { ActivityScreen } from "./screens/Activity";
+import { ContextScreen } from "./screens/Context";
 import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
 import { OnboardingScreen } from "./screens/Onboarding";
@@ -52,6 +53,7 @@ export default function App() {
       {screen === "models" && <ModelsScreen />}
       {screen === "playground" && <PlaygroundScreen />}
       {screen === "activity" && <ActivityScreen />}
+      {screen === "context" && <ContextScreen />}
       {screen === "settings" && <SettingsScreen />}
       {screen === "gateway" && <GatewayScreen />}
       {screen === "onboarding" && <OnboardingScreen />}

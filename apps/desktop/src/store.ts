@@ -24,6 +24,7 @@ import {
   type RepairPlan,
 } from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
+import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
 
 // ---------- host row shapes (camelCase, mirror persist.rs) ----------
 
@@ -541,6 +542,30 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
 
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
   return invoke<HostLedgerRow[]>("ledger_recent", { limit: 200 });
+}
+
+// ---------- P4: context graph ----------
+
+export type { HostContextNode, HostContextEdge } from "./lib/context/engine";
+
+/**
+ * Record nodes and edges in one batch. Atomic host-side: a turn is never half-present.
+ * Recording is best-effort from the UI's point of view — a graph write must never fail a chat.
+ */
+export async function recordContext(
+  nodes: HostContextNode[],
+  edges: HostContextEdge[],
+): Promise<void> {
+  if (nodes.length === 0 && edges.length === 0) return;
+  await invoke("context_record", { nodes, edges });
+}
+
+export async function loadContextGraph(limit = 400): Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }> {
+  return invoke<{ nodes: HostContextNode[]; edges: HostContextEdge[] }>("context_graph", { limit });
+}
+
+export async function clearContextGraph(): Promise<void> {
+  await invoke("context_clear");
 }
 
 // ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------

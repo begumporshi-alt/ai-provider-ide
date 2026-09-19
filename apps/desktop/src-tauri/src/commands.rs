@@ -11,6 +11,7 @@ use std::sync::Arc;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::context;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::store::{self, Store};
 use crate::vault;
@@ -161,6 +162,28 @@ fn app_data_dir(store: &store::Store) -> std::path::PathBuf {
         .unwrap_or_default()
 }
 
+// ---------- context graph (P4) ----------
+// Nodes and edges are recorded in one batch so a turn is never half-present.
+
+#[tauri::command]
+pub fn context_record(
+    store: State<'_, Arc<Store>>,
+    nodes: Vec<context::ContextNode>,
+    edges: Vec<context::ContextEdge>,
+) -> Result<(), CommandError> {
+    context::record(&store, &nodes, &edges).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn context_graph(store: State<'_, Arc<Store>>, limit: usize) -> Result<context::ContextGraph, CommandError> {
+    context::graph(&store, limit).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn context_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
+    context::clear(&store).map_err(CommandError)
+}
+
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
 
 #[tauri::command]
@@ -220,6 +243,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::ledger_append,
         crate::persist::ledger_recent,
         crate::persist::ledger_rollup_run,
+        context_record,
+        context_graph,
+        context_clear,
         crate::gateway_cmds::gateway_status,
         crate::gateway_cmds::get_tools_enabled,
         crate::gateway_cmds::set_tools_enabled,

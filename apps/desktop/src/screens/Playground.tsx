@@ -12,6 +12,7 @@ import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/a
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
+import { startSession, type Recorder } from "../lib/context/recorder";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -39,6 +40,47 @@ interface AgentItem {
   args: Record<string, unknown>;
   status: "calling" | "ok" | "error" | "denied";
   result?: string;
+}
+
+/** Graph labels are identifiers, not content — a 400-character node is unreadable on canvas. */
+function clip(s: string, n: number): string {
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+/**
+ * Record one agent turn into the context graph: the user message, each following message, and
+ * for every tool call a skill node plus the artifact its result produced.
+ *
+ * A tool result is recorded as an artifact because that is what it is to the model — context it
+ * was handed, not something it said. That distinction is the whole reason the graph has two node
+ * kinds instead of one.
+ */
+function recordAgentTurn(rec: Recorder, userText: string, messages: ChatMessage[], model: string): string {
+  const user = rec.node("message", clip(userText, 120), { role: "user", model });
+  let prev: string | null = null;
+  const skillByCall = new Map<string, string>();
+
+  for (const m of messages) {
+    const content = typeof m.content === "string" ? m.content : "";
+    if (m.role === "tool") {
+      const artifact = rec.node("artifact", clip(content, 80), { tool_call_id: m.tool_call_id });
+      const skill = m.tool_call_id ? skillByCall.get(m.tool_call_id) : undefined;
+      rec.edge(skill ?? prev ?? user, artifact, "produced");
+      continue;
+    }
+    const node = rec.node("message", clip(content, 120), { role: m.role, model });
+    rec.edge(prev ?? user, node, "follows");
+    // `tool_calls` is `unknown` in the core's message type: the wire shape varies by dialect
+    // and the core does not commit to one. The agent loop normalises to OpenAI's shape.
+    const calls = (m.tool_calls as ToolCall[] | undefined) ?? [];
+    for (const c of calls) {
+      const skill = rec.node("skill", c.name ?? "tool");
+      rec.edge(node, skill, "used");
+      if (c.id) skillByCall.set(c.id, skill);
+    }
+    prev = node;
+  }
+  return prev ?? user;
 }
 
 function tryParseArgs(raw?: string): Record<string, unknown> {
@@ -178,6 +220,11 @@ function Chat() {
   const [streamedText, setStreamedText] = useState("");
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  // P4: the context graph is recorded as the conversation happens. One recorder per mounted
+  // Playground; the last recorded node carries the thread forward turn to turn.
+  const ctxRef = useRef<Recorder | null>(null);
+  if (!ctxRef.current) ctxRef.current = startSession();
+  const lastNodeRef = useRef<string | null>(null);
 
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
@@ -267,6 +314,8 @@ function Chat() {
           })),
         );
         void finalText;
+        lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, messages, chosen);
+        void ctxRef.current!.flush();
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
       } catch (e) {
         if (ac.signal.aborted) {
@@ -286,6 +335,9 @@ function Chat() {
 
     // ---- Plain chat (no tools): stream and render as before. ----
     setMsgs((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
+    const rec = ctxRef.current!;
+    const userNode = rec.node("message", clip(text, 120), { role: "user", model: chosen });
+    if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
     let streamed = "";
     try {
       // A stopped or failed turn leaves an empty assistant bubble behind; replaying it would
@@ -310,6 +362,13 @@ function Chat() {
         listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
       }
       const served = exec.served();
+      const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
+        role: "assistant",
+        model: served?.model.nativeId ?? chosen,
+        provider: served?.provider.id,
+      });
+      rec.edge(userNode, assistantNode, "follows");
+      lastNodeRef.current = assistantNode;
       setTrace({
         ms: Date.now() - t0,
         provider: served ? registry.getProvider(served.provider.id)?.name : undefined,
@@ -328,6 +387,9 @@ function Chat() {
         setMsgs((m) => m.map((x, i) => (i === m.length - 1 ? { ...x, content: streamed || `⚠ ${(e as Error).message}` } : x)));
       }
     } finally {
+      // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
+      // of what happened, not of what succeeded.
+      void ctxRef.current!.flush();
       setBusy(false);
       abortRef.current = null;
     }

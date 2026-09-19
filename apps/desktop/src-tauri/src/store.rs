@@ -190,6 +190,38 @@ CREATE TABLE gateway_keys (
 );
 CREATE INDEX idx_gateway_keys_active ON gateway_keys(revoked_at);
 "#,
+),
+(
+    "0003_context_graph",
+    r#"
+CREATE TABLE context_nodes (
+  id         TEXT PRIMARY KEY,
+  kind       TEXT NOT NULL CHECK (kind IN ('artifact','memory','skill','message')),
+  label      TEXT NOT NULL,
+  source     TEXT NOT NULL CHECK (source IN ('ui','gateway','engine')),
+  session_id TEXT,
+  ts         INTEGER NOT NULL,
+  meta_json  TEXT
+);
+CREATE INDEX idx_context_nodes_kind ON context_nodes(kind);
+CREATE INDEX idx_context_nodes_ts ON context_nodes(ts);
+CREATE INDEX idx_context_nodes_session ON context_nodes(session_id);
+
+CREATE TABLE context_edges (
+  id        TEXT PRIMARY KEY,
+  from_id   TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+  to_id     TEXT NOT NULL REFERENCES context_nodes(id) ON DELETE CASCADE,
+  kind      TEXT NOT NULL CHECK (kind IN ('produced','used','recalled','follows','references','routes_to','served_by','aliases','backed_by')),
+  weight    REAL NOT NULL DEFAULT 1,
+  ts        INTEGER NOT NULL,
+  meta_json TEXT
+);
+CREATE INDEX idx_context_edges_from ON context_edges(from_id);
+CREATE INDEX idx_context_edges_to ON context_edges(to_id);
+-- One edge of a given kind between the same pair. Re-recording bumps weight instead of
+-- duplicating, so a repeated relation reads as a stronger one rather than as more clutter.
+CREATE UNIQUE INDEX uq_context_edges ON context_edges(from_id, to_id, kind);
+"#,
 )];
 
 #[derive(Serialize)]
@@ -294,13 +326,15 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        assert_eq!(info.schema_version, 2); // 0001 schema_v1_1 + 0002 gateway_keys
-        // All v1.1 tables exist (§4), plus the R4 gateway-keys table.
+        // 0001 schema_v1_1 + 0002 gateway_keys + 0003 context_graph
+        assert_eq!(info.schema_version, 3);
+        // All v1.1 tables exist (§4), plus the R4 gateway-keys and P4 context-graph tables.
         let conn = s.conn.lock().unwrap();
         for table in [
             "providers", "api_keys", "manifests", "models_cache", "model_aliases",
             "ledger", "ledger_rollups", "drift_events", "onboarding_sessions",
             "generator_audit", "settings", "gateway_keys",
+            "context_nodes", "context_edges",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))
