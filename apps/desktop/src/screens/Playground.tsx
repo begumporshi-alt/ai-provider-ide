@@ -13,6 +13,7 @@ import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream"
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { activeSession, type Recorder } from "../lib/context/recorder";
+import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 
 interface Msg {
   role: "user" | "assistant" | "tool";
@@ -227,6 +228,9 @@ function Chat() {
   const ctxRef = useRef<Recorder | null>(null);
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
+  // P6: the run currently being recorded, and the iteration count the loop reports when it ends.
+  const runIdRef = useRef<string | null>(null);
+  const iterationsRef = useRef(0);
   // P5: enabled skills are appended to the agent's instructions. Re-read on every tick so
   // installing or revoking a skill changes the agent's behaviour without restarting the app.
   const [skillsBlock, setSkillsBlock] = useState("");
@@ -261,6 +265,20 @@ function Chat() {
   );
 
   const handleAgentEvent = useCallback((ev: AgentEvent) => {
+    // P6: every event is appended to the run record as it arrives, not batched at the end, so a
+    // run that is stopped or crashes is still fully inspectable from the dashboard.
+    const run = runIdRef.current;
+    if (run) {
+      if (ev.type === "tool_call") {
+        recordStep(run, "tool_call", ev.call.name ?? "?", ev.call.arguments ?? undefined);
+      } else if (ev.type === "tool_result") {
+        const denied = ev.result.includes("denied");
+        recordStep(run, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
+      } else if (ev.type === "done") {
+        iterationsRef.current = ev.iterations;
+        recordStep(run, "done", ev.iterations ? `${ev.iterations} iterations` : "done", undefined, true);
+      }
+    }
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
     } else if (ev.type === "tool_call") {
@@ -300,6 +318,13 @@ function Chat() {
       setMsgs((m) => [...m, { role: "assistant", content: "" }]);
       setStreamedText("");
       setAgentItems([]);
+      // P6: open the run record before the first call, and register this controller so the
+      // orchestrator dashboard can stop the run even though it did not start it.
+      const runId = newRunId();
+      runIdRef.current = runId;
+      iterationsRef.current = 0;
+      startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: text });
+      registerAbort(runId, ac);
       const host = createTauriToolHost(root.trim());
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
@@ -334,14 +359,18 @@ function Chat() {
         void finalText;
         lastNodeRef.current = recordAgentTurn(ctxRef.current!, text, messages, chosen);
         void ctxRef.current!.flush();
+        endRun(runId, "ok", iterationsRef.current);
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
       } catch (e) {
         if (ac.signal.aborted) {
+          endRun(runId, "stopped", iterationsRef.current);
           setTrace({ ms: Date.now() - t0, fallbacks: [], error: "stopped by you" });
         } else {
+          endRun(runId, "error", iterationsRef.current, (e as Error).message);
           setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
         }
       } finally {
+        runIdRef.current = null;
         setBusy(false);
         setPendingConfirm(null);
         setAgentItems([]);

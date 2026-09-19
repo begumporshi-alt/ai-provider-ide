@@ -607,6 +607,44 @@ export async function slugifySkill(name: string): Promise<string> {
   return invoke<string>("skills_slugify", { name });
 }
 
+// ---------- P6: agent orchestrator ----------
+
+export interface AgentRun {
+  id: string; session_id: string | null; model: string; status: string;
+  prompt: string | null; iterations: number; tool_calls: number;
+  started_at: number; ended_at: number | null; error: string | null;
+}
+export interface AgentStep {
+  seq: number; kind: string; label: string | null;
+  detail: string | null; ok: boolean | null; ts: number;
+}
+
+export async function listAgentRuns(limit = 50): Promise<AgentRun[]> {
+  return invoke<AgentRun[]>("agent_runs_list", { limit });
+}
+
+export async function agentRunStart(a: {
+  id: string; sessionId: string | null; model: string; prompt: string | null;
+}): Promise<void> {
+  await invoke("agent_run_start", a);
+}
+
+export async function agentStepAppend(a: {
+  runId: string; kind: string; label: string | null; detail: string | null; ok: boolean | null;
+}): Promise<void> {
+  await invoke("agent_step_append", a);
+}
+
+export async function agentRunFinish(a: {
+  runId: string; status: string; iterations: number; error: string | null;
+}): Promise<void> {
+  await invoke("agent_run_finish", a);
+}
+
+export async function agentRunSteps(runId: string): Promise<AgentStep[]> {
+  return invoke<AgentStep[]>("agent_run_steps", { runId });
+}
+
 // ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------
 
 /** Full portable snapshot (providers, manifests, aliases, settings, key refs — never secrets). */

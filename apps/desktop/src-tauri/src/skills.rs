@@ -241,19 +241,6 @@ pub fn set_enabled(store: &Store, slug: &str, enabled: bool) -> Result<(), Strin
     Ok(())
 }
 
-/// Bodies of the enabled skills, ready to be appended to an agent prompt.
-pub fn enabled_bodies(store: &Store) -> Result<Vec<(String, String)>, String> {
-    let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    let mut stmt = conn
-        .prepare("SELECT name, body FROM skills WHERE enabled = 1 ORDER BY name ASC")
-        .map_err(|e| e.to_string())?;
-    let rows = stmt
-        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
-        .map_err(|e| e.to_string())?;
-    let out = rows.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
-    Ok(out)
-}
-
 /// Split `SKILL.md` text into frontmatter fields and body.
 ///
 /// Tolerant on purpose: a missing or malformed frontmatter block is not an error, it is a skill
@@ -396,10 +383,10 @@ mod skill_tests {
     #[test]
     fn disabling_a_skill_keeps_it_but_drops_it_from_the_prompt() {
         let (s, d) = temp_store("disable");
-        list(&s).unwrap();
-        let before = enabled_bodies(&s).unwrap().len();
+        let before = list(&s).unwrap().iter().filter(|k| k.enabled).count();
         set_enabled(&s, "code-review", false).unwrap();
-        assert_eq!(enabled_bodies(&s).unwrap().len(), before - 1);
+        let after = list(&s).unwrap().iter().filter(|k| k.enabled).count();
+        assert_eq!(after, before - 1, "dropped from the prompt-eligible set");
         assert!(list(&s).unwrap().iter().any(|k| k.slug == "code-review"), "still installed");
         let _ = std::fs::remove_dir_all(&d);
     }

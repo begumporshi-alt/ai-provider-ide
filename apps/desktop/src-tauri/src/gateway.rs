@@ -393,6 +393,7 @@ impl GatewayCore {
 
     /// Bound on the worker's first response. A field, not a constant, so a test can shorten it
     /// instead of waiting 30 seconds to prove the same thing.
+    #[cfg(test)]
     pub fn set_first_msg_timeout(&self, d: Duration) {
         if let Ok(mut g) = self.first_msg_timeout.lock() {
             *g = d;
@@ -499,6 +500,7 @@ impl GatewayCore {
     /// change: it holds no state that could go stale, and a hook that wants to reference its own
     /// core (the real one re-composites the window that hosts it) can only be installed after
     /// the core exists.
+    #[cfg(test)]
     pub fn set_warm(&self, warm: WarmFn) {
         if let Ok(mut g) = self.warm.lock() {
             *g = Some(warm);

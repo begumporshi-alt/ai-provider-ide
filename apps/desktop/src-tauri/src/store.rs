@@ -239,6 +239,37 @@ CREATE TABLE skills (
 );
 CREATE INDEX idx_skills_enabled ON skills(enabled);
 "#,
+),
+(
+    "0005_agent_runs",
+    r#"
+CREATE TABLE agent_runs (
+  id          TEXT PRIMARY KEY,
+  session_id  TEXT,
+  model       TEXT NOT NULL,
+  status      TEXT NOT NULL CHECK (status IN ('running','ok','error','stopped')),
+  prompt      TEXT,
+  iterations  INTEGER NOT NULL DEFAULT 0,
+  tool_calls  INTEGER NOT NULL DEFAULT 0,
+  started_at  INTEGER NOT NULL,
+  ended_at    INTEGER,
+  error       TEXT
+);
+CREATE INDEX idx_agent_runs_started ON agent_runs(started_at DESC);
+
+CREATE TABLE agent_steps (
+  id      INTEGER PRIMARY KEY AUTOINCREMENT,
+  run_id  TEXT NOT NULL REFERENCES agent_runs(id) ON DELETE CASCADE,
+  seq     INTEGER NOT NULL,
+  kind    TEXT NOT NULL CHECK (kind IN ('assistant','tool_call','tool_result','done','denied')),
+  label   TEXT,
+  detail  TEXT,
+  ok      INTEGER,
+  ts      INTEGER NOT NULL
+);
+CREATE INDEX idx_agent_steps_run ON agent_steps(run_id, seq);
+CREATE UNIQUE INDEX uq_agent_steps_seq ON agent_steps(run_id, seq);
+"#,
 )];
 
 #[derive(Serialize)]
@@ -343,16 +374,17 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 + 0002 gateway_keys + 0003 context_graph + 0004 skills
-        assert_eq!(info.schema_version, 4);
-        // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph and P5 skills
-        // tables.
+        // 0001 schema_v1_1 .. 0005 agent_runs
+        assert_eq!(info.schema_version, 5);
+        // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills and
+        // P6 agent-run tables.
         let conn = s.conn.lock().unwrap();
         for table in [
             "providers", "api_keys", "manifests", "models_cache", "model_aliases",
             "ledger", "ledger_rollups", "drift_events", "onboarding_sessions",
             "generator_audit", "settings", "gateway_keys",
             "context_nodes", "context_edges", "skills",
+            "agent_runs", "agent_steps",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))

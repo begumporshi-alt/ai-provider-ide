@@ -13,6 +13,7 @@ use tauri::State;
 
 use crate::context;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
+use crate::orchestrator;
 use crate::skills;
 use crate::store::{self, Store};
 use crate::vault;
@@ -232,6 +233,56 @@ pub fn skills_slugify(name: String) -> String {
     skills::slugify(&name)
 }
 
+// ---------- agent orchestrator (P6) ----------
+// A record of what ran, not a scheduler of what should. Steps append as they happen so a run
+// that dies midway is still inspectable.
+
+#[tauri::command]
+pub fn agent_runs_list(store: State<'_, Arc<Store>>, limit: usize) -> Result<Vec<orchestrator::AgentRun>, CommandError> {
+    orchestrator::runs(&store, limit).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_run_start(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    session_id: Option<String>,
+    model: String,
+    prompt: Option<String>,
+) -> Result<(), CommandError> {
+    orchestrator::start(&store, id, session_id, model, prompt).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_step_append(
+    store: State<'_, Arc<Store>>,
+    // Tauri converts camelCase JS keys (`runId`) to snake_case Rust params, so these must stay
+    // snake_case — naming them `runId` compiles but the invoke then fails on a missing argument.
+    run_id: String,
+    kind: String,
+    label: Option<String>,
+    detail: Option<String>,
+    ok: Option<bool>,
+) -> Result<(), CommandError> {
+    orchestrator::step(&store, &run_id, kind, label, detail, ok).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_run_finish(
+    store: State<'_, Arc<Store>>,
+    run_id: String,
+    status: String,
+    iterations: i64,
+    error: Option<String>,
+) -> Result<(), CommandError> {
+    orchestrator::finish(&store, &run_id, status, iterations, error).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_run_steps(store: State<'_, Arc<Store>>, run_id: String) -> Result<Vec<orchestrator::AgentStep>, CommandError> {
+    orchestrator::steps(&store, &run_id).map_err(CommandError)
+}
+
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
 
 #[tauri::command]
@@ -301,6 +352,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         skills_set_enabled,
         skills_parse,
         skills_slugify,
+        agent_runs_list,
+        agent_run_start,
+        agent_step_append,
+        agent_run_finish,
+        agent_run_steps,
         crate::gateway_cmds::gateway_status,
         crate::gateway_cmds::get_tools_enabled,
         crate::gateway_cmds::set_tools_enabled,
