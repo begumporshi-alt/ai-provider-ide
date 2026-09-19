@@ -1051,11 +1051,18 @@
         assert!(core.is_tools_enabled());
     }
 
-    /// A bound socket and a working gateway are different states, and conflating them is what
-    /// made Start a dead button: the heartbeat lapses, the UI reads "Stopped", the operator
-    /// presses Start, and a "is the listener set?" check answers yes and does nothing.
+    /// A bound socket and a gateway that is meant to be serving are different states — but the
+    /// difference that matters is *operator intent*, not whether the worker happens to be awake.
+    ///
+    /// This test used to assert the opposite for the lapsed case, because a lapsed beat was the
+    /// only signal available and tearing the listener down was how Start recovered from it. That
+    /// is no longer true: a hidden worker sleeps after ~8 idle minutes (see
+    /// `HEARTBEAT_STALE_HIDDEN_MS`), so calling that "stale" meant destroying a healthy listener
+    /// every time the gateway went quiet — and `await_core` revives the worker from the request
+    /// that needs it anyway. The state that genuinely needs rebuilding is a listener that
+    /// outlived the operator's intent, because nothing else will ever tear it down.
     #[test]
-    fn a_listener_bound_under_a_lapsed_heartbeat_is_stale() {
+    fn a_bound_listener_is_stale_only_when_serving_was_never_asked_for() {
         use crate::gateway_cmds::GatewayState;
         let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
         let (core, _bridge) = test_core(key);
@@ -1073,14 +1080,41 @@
         core.heartbeat();
         assert!(!state.has_stale_server(), "a healthy listener is not stale");
 
-        // Beat lapses while the socket stays bound — the dead-button case.
+        // The beat lapses while the socket stays bound. The worker is asleep, not broken: the
+        // listener is fine and the next request wakes the worker, so this must not be torn down.
         core.set_hidden(false);
         *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(7_000);
-        assert!(state.has_stale_server(), "lapsed beat under a bound listener is stale");
+        assert!(!core.is_available(), "the beat really has lapsed");
+        assert!(
+            !state.has_stale_server(),
+            "a sleeping worker under a bound listener is not stale"
+        );
 
-        // And once stopped deliberately, it is simply not running.
+        // A listener that outlived the operator's intent is the case that needs rebuilding.
         core.set_running(false);
-        assert!(state.has_stale_server(), "bound but not running is stale too");
+        assert!(state.has_stale_server(), "bound but not running is stale");
+    }
+
+    /// `running` (operator intent) and `worker_awake` (the beat) are separable, and a sleeping
+    /// worker must never read as a stopped gateway.
+    ///
+    /// These are exactly the two fields `gateway_status` reports, and conflating them is what
+    /// made the UI say "Stopped — last heard from the worker 31s ago" about a gateway that was
+    /// bound, serving, and would have answered the next request.
+    #[test]
+    fn a_sleeping_worker_is_still_running() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        core.set_hidden(true);
+        core.set_running(true);
+        core.heartbeat();
+        assert!(core.is_running() && core.beat_is_fresh());
+
+        // ~8 idle minutes later the hidden worker's timer has stopped. 31s clears the 30s bound.
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(31_000);
+        assert!(core.is_running(), "operator intent survives a sleeping worker");
+        assert!(!core.beat_is_fresh(), "the beat is the part that went stale");
+        assert!(!core.is_available(), "and is_available is the conjunction of the two");
     }
 
     /// A worker that stops answering must fail the request, not hold the socket open.

@@ -3,6 +3,7 @@
 //! gateway_* commands. Master-key reveal is clipboard-only from Rust (invariant 14): the
 //! key never appears in webview-observable state.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -52,14 +53,15 @@ pub struct GatewayState {
 }
 
 impl GatewayState {
-    /// True when a listener is bound but the gateway cannot actually serve.
+    /// True when a listener is bound but the gateway is not supposed to be serving.
     ///
-    /// These are different states and conflating them is what made the Start button dead: the
-    /// heartbeat can lapse — suspended worker renderer, a page that never booted — while the
-    /// socket is still up, so the UI reads "Stopped", the operator presses Start, and a
-    /// "is `server` set?" check answers yes and does nothing.
+    /// Narrowed from `!is_available()`. That test also fired on a merely *sleeping* worker, and
+    /// tearing the listener down then was the wrong repair twice over: the socket was healthy,
+    /// and `await_core` revives a sleeping worker on demand in ~50ms anyway. The state that
+    /// actually needs rebuilding is the one where a listener outlived the operator's intent —
+    /// e.g. an enable that half-failed — because nothing else will ever tear it down.
     pub fn has_stale_server(&self) -> bool {
-        self.server.lock().unwrap().is_some() && !self.core.is_available()
+        self.server.lock().unwrap().is_some() && !self.core.is_running()
     }
 }
 
@@ -180,6 +182,10 @@ pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {
 #[derive(serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayStatus {
+    /// Whether the operator asked the gateway to serve. Deliberately *not* `is_available()`:
+    /// a hidden worker's beat stops after ~8 idle minutes (see `HEARTBEAT_STALE_HIDDEN_MS`), and
+    /// reporting that as "stopped" made the UI contradict itself — Start appeared dead while the
+    /// socket was bound and serving. Sleeping is `worker_awake: false`, not `running: false`.
     pub running: bool,
     pub port: u16,
     pub has_key: bool,
@@ -187,6 +193,9 @@ pub struct GatewayStatus {
     /// R1: the window is hidden and the gateway is serving in the background. Lets the UI
     /// show real state instead of inferring it ("if you can read this, it isn't hidden").
     pub background: bool,
+    /// Whether the worker's beat is inside its bound — i.e. it is awake right now rather than
+    /// merely reachable. False here is routine and self-healing: the next request revives it.
+    pub worker_awake: bool,
     /// Milliseconds since the worker last reported in. Exposed because "stopped" is ambiguous
     /// without it: `running: false` can mean the operator stopped it, or that the worker's
     /// heartbeat lapsed underneath a socket that is still bound. The age tells you which.
@@ -200,11 +209,12 @@ pub struct GatewayStatus {
 pub fn gateway_status(state: State<'_, Arc<GatewayState>>) -> Result<GatewayStatus, String> {
     let port = state.core.port();
     Ok(GatewayStatus {
-        running: state.core.is_available(),
+        running: state.core.is_running(),
         port,
         has_key: gateway::vault_key_provider()().is_some(),
         endpoint_url: format!("http://127.0.0.1:{port}/v1"),
         background: state.core.is_hidden(),
+        worker_awake: state.core.beat_is_fresh(),
         heartbeat_age_ms: state.core.heartbeat_age_ms(),
         worker_error: state.core.worker_error(),
     })
@@ -240,11 +250,28 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     }
     // R1: the bridge lives in its own window; bring it up before the socket accepts traffic,
     // so no request can arrive with nothing listening.
+    //
+    // Staged logging, and it is not decoration: this path can *hang* rather than fail — creating
+    // a webview window from a spawned task during startup races the main thread's event loop —
+    // and a hang produces no error and no log line, so "the app started without a gateway" was
+    // indistinguishable from a slow start. With these two markers the log says which step never
+    // finished.
+    log_to_file(&app, "enable: starting");
+    let t_window = std::time::Instant::now();
     ensure_bridge_window(&app)?;
+    log_to_file(
+        &app,
+        &format!("enable: worker window ready in {}ms", t_window.elapsed().as_millis()),
+    );
     // Re-warm even when the window already existed: macOS can suspend the JS of a window that
     // has been hidden for a while, and re-compositing it is what resumes the heartbeat.
     warm_bridge_window(&app);
+    let t_bind = std::time::Instant::now();
     let handle = gateway::spawn(state.core.clone(), port.unwrap_or(gateway::DEFAULT_PORT)).await?;
+    log_to_file(
+        &app,
+        &format!("enable: listener bound in {}ms", t_bind.elapsed().as_millis()),
+    );
     state.core.set_running(true);
     let bound = handle.addr.port();
     *state.server.lock().unwrap() = Some(handle);
@@ -265,36 +292,55 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     Ok(bound)
 }
 
-/// Re-composite the worker window if the heartbeat lapses while we are supposed to be serving.
+/// One watchdog loop per serving period, not one per `gateway_enable`.
 ///
-/// A hidden webview is not a guaranteed-running webview: macOS can suspend its JS, and when
-/// that happens the gateway silently stops answering with no operator action to explain it.
-/// Reviving the window is the same trick that makes it work at creation, so try it before
-/// giving up. Rate-limited to once a minute — this is a recovery path, not a pacemaker, and
-/// every attempt briefly puts a window on screen.
+/// `gateway_enable` is re-entrant — the log shows runs of consecutive enables with no disable
+/// between them — and each call used to spawn another loop. They all polled forever, and each
+/// carried its own re-warm rate limit, which is why a lapse sometimes ran 57s or 62s or 96s
+/// instead of the usual 30s: one loop was still inside its cooldown while the others had already
+/// fired. With the loop now log-only, duplicates would also mean duplicate lines for one episode.
+///
+/// The flag is cleared on the way out so a disable/enable cycle still gets a fresh loop.
+static WATCHDOG_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Record a worker lapse so it leaves a trace — without trying to repair it.
+///
+/// This used to re-composite the worker window. That was the right instinct while the beat was
+/// the only recovery path, but it is not one any more: `await_core` revives a sleeping worker
+/// from the request that needs it, in ~50ms, without an operator waiting. All the proactive
+/// re-warm added was a 220x140 window appearing on screen, and because the beat stops on
+/// *idleness* (see `HEARTBEAT_STALE_HIDDEN_MS`) that flash was the normal case on an idle
+/// gateway, not an error case — roughly once every 8.5 minutes, indefinitely.
+///
+/// The record is still worth keeping. A lapse no request ever came along to fix would
+/// otherwise be invisible, and "the gateway went quiet at 3am" is exactly what this log is for.
 fn spawn_watchdog(app: AppHandle, state: Arc<GatewayState>) {
+    if WATCHDOG_STARTED.swap(true, Ordering::SeqCst) {
+        return; // one loop is already watching this serving period
+    }
     tokio::spawn(async move {
-        let mut last_warm = std::time::Instant::now();
+        let mut reported = false;
         loop {
             tokio::time::sleep(Duration::from_secs(5)).await;
             if state.server.lock().unwrap().is_none() {
+                WATCHDOG_STARTED.store(false, Ordering::SeqCst); // arm a fresh loop for the next one
                 return; // stopped by the operator
             }
-            if state.core.is_available() {
+            if state.core.beat_is_fresh() {
+                reported = false; // armed again for the next episode
                 continue;
             }
-            if last_warm.elapsed() < Duration::from_secs(60) {
-                continue;
+            if reported {
+                continue; // one line per episode, not one per poll
             }
-            last_warm = std::time::Instant::now();
+            reported = true;
             log_to_file(
                 &app,
                 &format!(
-                    "watchdog: no heartbeat for {}ms — re-warming worker window",
+                    "watchdog: worker beat stale for {}ms — asleep, revives on the next request",
                     state.core.heartbeat_age_ms()
                 ),
             );
-            warm_bridge_window(&app);
         }
     });
 }
@@ -488,7 +534,11 @@ pub fn gateway_heartbeat(app: AppHandle, state: State<'_, Arc<GatewayState>>) ->
 /// The worker runs in a window nobody can see and the release build has no console, so
 /// without this a misbehaving gateway leaves no trace anywhere. Best-effort: diagnostics
 /// must never be the reason the gateway fails to start.
-fn log_to_file(app: &AppHandle, line: &str) {
+///
+/// `pub(crate)` because the startup restore path needs it too. That path used to report only
+/// through `tracing`, which a release GUI build discards — so "the app came up without a
+/// gateway" left literally no evidence, and a silent failure looked identical to a slow start.
+pub(crate) fn log_to_file(app: &AppHandle, line: &str) {
     use std::io::Write as _;
     use tauri::Manager as _;
     let Ok(dir) = app.path().app_data_dir() else { return };

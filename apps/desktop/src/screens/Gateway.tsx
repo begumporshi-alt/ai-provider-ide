@@ -8,12 +8,16 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Field, inputCls, inputStyle } from "../components/atoms";
 
 interface GatewayStatus {
+  /** Operator intent — the gateway is supposed to be serving. Not the same as "the worker is
+   *  awake": a hidden worker's beat stops after ~8 idle minutes and revives on demand. */
   running: boolean;
   port: number;
   hasKey: boolean;
   endpointUrl: string;
   /** R1: window hidden, gateway serving in the background. */
   background: boolean;
+  /** The worker is awake right now rather than merely reachable. False is routine. */
+  workerAwake: boolean;
   /** Age of the worker's last heartbeat. Distinguishes "you stopped it" from "it lapsed". */
   heartbeatAgeMs: number;
   /** Why the worker page failed to boot, if it did. It runs in an invisible window. */
@@ -247,6 +251,13 @@ export function GatewayScreen() {
               {status.workerError}
             </pre>
           </div>
+        )}
+
+        {running && status && !status.workerAwake && !status.workerError && (
+          <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+            Running — the worker is asleep. macOS suspends a hidden page after roughly eight idle
+            minutes; the next request wakes it and is served normally. Nothing is lost.
+          </p>
         )}
 
         {!running && status && !status.workerError && status.heartbeatAgeMs > 0 && (

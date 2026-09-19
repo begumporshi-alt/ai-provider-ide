@@ -34,15 +34,26 @@ pub const DEFAULT_PORT: u16 = 8787;
 pub const MASTER_ACCOUNT: &str = "masterkey";
 const MAX_TOTAL: usize = 8 + 32; // §3.5: 8 concurrent, queue of 32
 const HEARTBEAT_STALE_MS: u64 = 6_000;
-/// R1: liveness bound while the window is hidden. macOS throttles timers in a hidden window,
-/// so the renderer's 2s heartbeat cannot be expected to land on schedule — but it does still
-/// run. A looser bound keeps the gateway serving in the background; the cost is that a truly
-/// dead renderer is detected after 30s instead of 6s (and only while hidden).
+/// R1: liveness bound while the window is hidden. A looser bound keeps the gateway serving in
+/// the background; the cost is that a truly dead renderer is detected after 30s instead of 6s
+/// (and only while hidden).
 ///
-/// The headroom is measured, not assumed: with nothing on screen a hidden webview's 2s timer
-/// fires at ~0.33/s with a worst observed gap of 3.0s. 30s is 10x that, so ordinary
-/// throttling can never trip it. An unbounded `HEARTBEAT_STALE_HIDDEN_MS` would be the real
-/// hazard — a suspended webview would then look alive forever.
+/// This bound is a *detector*, not a promise that the beat keeps coming. Measured against the
+/// live gateway log (38 lapses over 11h of uptime), a hidden worker's 2s timer does not merely
+/// throttle — it stops outright, and does not resume until something re-composites the window:
+///
+/// - Healthy windows are pinned at 484-486s. 18 of 33 land there exactly; every window longer
+///   than 500s contains a `gateway_enable` (which calls `warm_bridge_window`) inside it.
+/// - Recovery follows a re-composite within 20-50ms, all 38 times — so the *stop* is the event,
+///   and the re-warm is what ends it.
+/// - Load prevents it entirely: 25,367 requests at ~28/s ran 899s with zero lapses and a p50 of
+///   6.3ms. The stop is triggered by idleness, not by being hidden as such.
+///
+/// So a stale beat here means "the worker is asleep", not "the worker is broken" — and the two
+/// need different answers. `await_core` revives a sleeping worker on demand, which is why the
+/// watchdog no longer pre-warms on its own (that was a visible window flash every ~8.5 idle
+/// minutes). An unbounded bound would still be the real hazard: a suspended webview would then
+/// look alive forever, and nothing would ever notice a genuinely dead one.
 const HEARTBEAT_STALE_HIDDEN_MS: u64 = 30_000;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
@@ -455,7 +466,12 @@ impl GatewayCore {
         self.running.load(Ordering::Relaxed)
     }
 
-    fn beat_is_fresh(&self) -> bool {
+    /// Whether the worker's beat is inside the bound for its current visibility.
+    ///
+    /// Public because "the worker is asleep" is a state the UI has to be able to name: a lapsed
+    /// beat is not a stopped gateway, and reporting it as one is what made the Start button look
+    /// dead. See `HEARTBEAT_STALE_HIDDEN_MS` for why a hidden worker stops beating at all.
+    pub fn beat_is_fresh(&self) -> bool {
         let bound = if self.hidden.load(Ordering::Relaxed) {
             HEARTBEAT_STALE_HIDDEN_MS
         } else {
