@@ -224,8 +224,14 @@ screen without the built app. It is not headless-by-default in spirit: it drives
   trips the safe-delete shim and aborts with a misleading error.
 - Seeds: `?seed=systemai` (provider "System AI (mock)") and `?seed=or-router` ("OpenRouter (mock)").
   Provider names matter — "Mock Oracle" only exists in the story that creates it via the wizard.
-- `__webTest` on `window`: `store.*` read-only views, `emit()` for host→webview events, and
-  `invoke(cmd, args)` to arrange state the UI cannot produce itself. Arrange only, never assert.
+- `__webTest` on `window`: `store.*` read-only views, `emit()` for host→webview events,
+  `invoke(cmd, args)` to arrange state the UI cannot produce itself, and `gatewayStatus(partial)` to
+  set what `gateway_status` reports. Arrange only, never assert.
+- **A screen with no shim command cannot be tested, and its specs will pass anyway.** The Gateway
+  screen had no coverage because `gateway_status` was missing from the command table: the invoke
+  threw, `status` stayed `null`, and the screen rendered its "Stopped" branch whatever the host
+  would have said. The one existing gateway spec passed because "Master key" sits outside every
+  status guard. When adding a screen spec, first confirm the command it reads is in the table.
 - **The shim renames args camelCase→snake_case (`toRustArgs`) because Tauri does.** Any new shim
   command must read snake_case (`args.run_id`), and any new command with a multi-word argument
   will silently receive `undefined` otherwise. This already caused one invisible failure.
@@ -249,7 +255,7 @@ screen without the built app. It is not headless-by-default in spirit: it drives
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
 - desktop: `apps/desktop && ./node_modules/.bin/vitest run` (93 tests)
 - Rust: `apps/desktop/src-tauri && cargo test --lib` (156 tests)
-- browser UI: `apps/desktop && npx playwright test` (30 specs) — see the harness section above
+- browser UI: `apps/desktop && npx playwright test` (41 specs) — see the harness section above
 - **`vitest` is `environment: "node"`, `include: ["e2e/**/*.test.ts", "src/**/*.test.ts"]`** — no
   jsdom, no testing-library, and `.tsx` is not in the include list. Component logic is only
   testable through the browser harness, so keep anything needing a unit test out of `.tsx`.
