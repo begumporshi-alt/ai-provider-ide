@@ -28,6 +28,17 @@ through it works end to end.
   (`Router: <id>`) only when a preserved name would collide, because six rows all reading
   "ai-provider router" made the picker unusable — but the *marker* is the point, so prefer
   "ai-provider router" as a prefix over a bare or differently-worded name.
+- **The sync used to skip on the first launch after a rebuild — fixed 2026-09-19.** It raced the
+  startup probe: both read the keychain, macOS re-validates the ACL per code signature, and two
+  concurrent reads contend for one prompt. The sync lost because it *retrieves the secret*
+  (`vault::get(MASTER_ACCOUNT)`) while the probe only checks *existence*. Symptom on a cold launch:
+  `workbuddy sync skipped: no gateway key yet` and `startup: key refs probed` in the same second,
+  where a warm launch has both succeeding.
+  Fixed by moving the sync off `gateway_enable`'s thread — inline it also delayed Start by the whole
+  18–39s keychain read — and retrying while the keychain settles (45s ceiling, 3s polls). The retry
+  fires on exactly one error, held as the shared const `workbuddy::NO_KEY_YET`.
+  **Do not** "fix" this by ordering the sync after the probe: that would publish our entries before
+  the listener is up.
 
 ## Gateway behaviour worth remembering
 
@@ -217,11 +228,18 @@ that mirrors its command-for-command (including rejection rules). This is how to
 screen without the built app. It is not headless-by-default in spirit: it drives real clicks.
 
 - Run: `cd apps/desktop && [ -d test-results ] && mv test-results /tmp/x-$(date +%s) ;
-  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy NO_PROXY=127.0.0.1,localhost
-  pnpm web-test` (types + Playwright, 14 specs).
-- Both workarounds are mandatory: without `env -u`, Playwright's webServer readiness check goes
-  through the dead proxy and dies at 60s; without moving `test-results`, Playwright's cleanup
-  trips the safe-delete shim and aborts with a misleading error.
+  env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy
+  npx playwright test --reporter=list --output=/tmp/pw` (41 specs).
+- **Three workarounds are mandatory, and each failure looks like something else:**
+  1. **`env -u` the proxy vars** — otherwise Playwright's webServer readiness check goes through the
+     dead proxy and dies at 60s.
+  2. **Move `test-results` aside** — otherwise Playwright's startup cleanup trips the safe-delete
+     shim (2389 files against a 50 threshold) and aborts with a misleading error. Pointing
+     `--output=<dir outside the repo>` stops it recurring.
+  3. **Run outside the sandbox** — a sandboxed run cannot bind :1430, so the vite webServer times
+     out at 60s while the mock (which binds fine) looks healthy, which reads as a vite problem.
+     `reuseExistingServer` does **not** rescue it, and it is silently ignored when `CI` is set —
+     `CI=1` makes Playwright bind the port itself and fail with "Port 1430 is already in use".
 - Seeds: `?seed=systemai` (provider "System AI (mock)") and `?seed=or-router` ("OpenRouter (mock)").
   Provider names matter — "Mock Oracle" only exists in the story that creates it via the wizard.
 - `__webTest` on `window`: `store.*` read-only views, `emit()` for host→webview events,
@@ -253,8 +271,8 @@ screen without the built app. It is not headless-by-default in spirit: it drives
   `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
 
 - router-core: `packages/router-core && ./node_modules/.bin/vitest run` (210 tests)
-- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (93 tests)
-- Rust: `apps/desktop/src-tauri && cargo test --lib` (156 tests)
+- desktop: `apps/desktop && ./node_modules/.bin/vitest run` (118 tests)
+- Rust: `apps/desktop/src-tauri && cargo test --lib` (171 tests)
 - browser UI: `apps/desktop && npx playwright test` (41 specs) — see the harness section above
 - **`vitest` is `environment: "node"`, `include: ["e2e/**/*.test.ts", "src/**/*.test.ts"]`** — no
   jsdom, no testing-library, and `.tsx` is not in the include list. Component logic is only
