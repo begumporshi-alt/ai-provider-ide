@@ -15,7 +15,8 @@
 ## Build / install
 - `mv dist /tmp/old-dist-$(date +%s)` **before** `npx tauri build`, or tauri dies at `beforeBuildCommand`.
 - `npx tauri build --bundles app` (skips the failing DMG step); `export PATH="$HOME/.cargo/bin:$PATH"`.
-- Install: `mv` the old `/Applications` app to /tmp (never `rm -rf`), then `cp -R`. `pkill -f ai-provider-router` first.
+- Install: `mv` the old `/Applications` app to /tmp (never `rm -rf`), then `cp -R`. `pkill -f ai-provider-router` first. The bundle is named `AI-Provider Router.app` — **with a space**, which breaks unquoted shell args.
+- **Never call an installed build stale from a missing string alone.** `search_files` is a shipped literal (`tools.rs:805`) but does not appear in `strings` of a *freshly built* binary — nor do `read_file`, `run_command` or `edit_file`, while `write_file`, `list_dir` and `grep` do. Confirm a string is extractable in a new build before treating its absence as staleness; `history_sessions` and the refusal message are extractable and reliable.
 - Test a startup fix on the **first launch after a rebuild**, or it proves nothing.
 - **`pnpm ci:local` (`scripts/ci-local.sh`) is the gate.** It mirrors ci.yml step for step, adds a Node >= 19 preflight, and unsets the proxy vars. Skips `pnpm install` by default (see below); `--install` to include it, `--skip-browser` to drop the ~48s Playwright run.
 - **After renaming a UI concept, grep the old name across the whole repo, not just the frontend.** The Playground → Assistant rename was complete in `src/`, but the old name survived in a Rust *string literal* (`gateway.rs` `gateway_tool_refusal`, read by the model), in Rust doc comments, and throughout `ARCHITECTURE.md`. The literal was the real defect: a model told to use a screen that no longer exists. Test assertions pin the wording too, so they must move with it.
