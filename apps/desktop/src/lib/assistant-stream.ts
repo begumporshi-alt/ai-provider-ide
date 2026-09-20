@@ -2,7 +2,7 @@
  * assistant-stream — keeps provider protocol syntax out of the chat transcript.
  *
  * Why this exists (2026-09-17, mercury-2.5 incident): the router forwards `tools` only when a
- * caller supplies them, and Playground supplies none. A model that was trained on agentic
+ * caller supplies them, and Assistant supplies none. A model that was trained on agentic
  * transcripts but is handed a toolless request will often *role-play* a tool call instead —
  * emitting a pseudo-token dialect inline:
  *

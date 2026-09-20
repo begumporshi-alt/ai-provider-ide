@@ -153,6 +153,12 @@ async function oracle(req, res, path) {
       // The declarative round: deliberately unusable, so every A/B/C candidate fails and the
       // Tier-2 offer appears in the UI — the honest path for a grammar-inexpressible API.
       content = "```json\n{ \"unusable\": true, \"reason\": \"the exotic API has no declarative mapping\" }\n```";
+    } else if (tools && !sawToolResult && /missing/i.test(last)) {
+      // Agent mode, FAILING-tool variant: read a file the shim's virtual FS does not contain.
+      // The shim replies exactly as tools.rs does — `{ok:false, output:"", error:"no such file"}` —
+      // so this is what proves the bridge forwards the reason instead of a blank result.
+      toolCall = { name: "read_file", arguments: JSON.stringify({ path: "nope.txt" }) };
+      content = "";
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.

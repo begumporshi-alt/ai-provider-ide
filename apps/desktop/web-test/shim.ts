@@ -33,7 +33,31 @@ const keys = new Map<string, Row>();
 const models: Row[] = [];
 const manifests: Row[] = []; // every version; isActive marks the live one
 const aliases: Row[] = [];
-const settings = new Map<string, string>();
+/**
+ * Settings, backed by `localStorage` so they survive a page reload.
+ *
+ * Everything else in this mirror is deliberately per-load — a fresh page is a fresh app. Settings
+ * are the exception because that is the entire point of a setting: the app reads it back on the
+ * next launch. Without this, a spec could toggle something, reload, see the default again, and
+ * there would be no way to tell "not persisted" from "the test reloaded the world".
+ */
+const SETTINGS_STORAGE_KEY = "web-test.settings";
+const settings = new Map<string, string>((() => {
+  try {
+    const raw = localStorage.getItem(SETTINGS_STORAGE_KEY);
+    const parsed: unknown = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? (parsed as [string, string][]) : [];
+  } catch {
+    return [];
+  }
+})());
+function persistSettings(): void {
+  try {
+    localStorage.setItem(SETTINGS_STORAGE_KEY, JSON.stringify([...settings]));
+  } catch {
+    // Storage unavailable (private mode, quota) — the in-memory map still works this session.
+  }
+}
 const ledger: Row[] = [];
 const drift: { providerId: string; triggerJson: string; resolved: string | null }[] = [];
 const audits: Row[] = [];
@@ -84,10 +108,16 @@ const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 const MAX_WEIGHT = 50;
 
 // Tool sandbox emulation — the Rust tool_run lives behind a host that the browser harness does
-// not run, so the shim provides a small virtual FS just enough to let a Playground agent turn
+// not run, so the shim provides a small virtual FS just enough to let an Assistant agent turn
 // complete in tests. Path confinement mirrors tools.rs: paths containing ".." or starting "/"
 // are refused (ok:false), the same way a real escape attempt would be.
 const virtualFs = new Map<string, string>([["README.md", "hello\nworld\n"]]);
+/** Directories created by `mkdir`. The virtual fs is flat, so dirs are tracked separately. */
+const virtualDirs = new Set<string>();
+
+/** What `tools_default_root` answers. There is no HOME or filesystem here, so the shim names a
+ *  fixed absolute path — the same shape the host returns (`$HOME/AI-Provider-Router-Workspace`). */
+const DEFAULT_WORKSPACE_ROOT = "/Users/tester/AI-Provider-Router-Workspace";
 
 const TOOLS_POLICY = {
   programs: ["ls", "cat", "echo", "grep", "rg", "find", "git", "node", "npm", "npx", "pnpm", "python3", "make", "tar", "sed", "awk"],
@@ -102,6 +132,19 @@ function isConfinedPath(p: unknown): boolean {
   if (typeof p !== "string" || p.length === 0) return false;
   if (p.startsWith("/")) return false;
   return !p.split("/").includes("..");
+}
+
+/** Sequence number from a node id (`skill:s-1:12` → 12). Ties break on ts, which is what
+ *  re-keyed memory nodes are dated by. Mirrors `seq_of` in context.rs. */
+function seqKey(id: string, ts: number): [number, number] {
+  const tail = id.split(":").pop() ?? "";
+  const n = Number(tail);
+  return [Number.isFinite(n) && tail !== "" ? n : ts, ts];
+}
+
+function flattenPreview(label: string): string {
+  const flat = label.split(/\s+/).filter((s) => s.length > 0).join(" ");
+  return flat.length <= 120 ? flat : `${flat.slice(0, 120)}…`;
 }
 
 const BUILTIN_SKILLS: { slug: string; name: string; description: string; body: string }[] = [
@@ -512,6 +555,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     }
     case "settings_set":
       settings.set(args.key as string, args.value_json as string);
+      persistSettings();
       return null;
     case "ledger_append":
       ledger.push({ ...(args.e as Row) });
@@ -654,6 +698,134 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       contextEdges.length = 0;
       return null;
 
+    // ---- history: sessions and timelines ----
+    // A mirror of context.rs `sessions`/`timeline`, not a stand-in for them. The ordering rule
+    // matters here too: one agent run is recorded in one batch, so timestamps tie and the
+    // sequence number in the node id is what puts the turns in the right order.
+    case "history_sessions": {
+      const limit = (args.limit as number) ?? 100;
+      const groups = new Map<string, Row[]>();
+      for (const n of contextNodes) {
+        const sid = n.session_id;
+        if (sid === null || sid === undefined) continue;
+        const k = String(sid);
+        const arr = groups.get(k) ?? [];
+        arr.push(n);
+        groups.set(k, arr);
+      }
+      const rows = [...groups.entries()].map(([session_id, ns]) => {
+        const ts = ns.map((n) => Number(n.ts ?? 0));
+        return {
+          session_id,
+          started_ts: Math.min(...ts),
+          ended_ts: Math.max(...ts),
+          turns: ns.filter((n) => n.kind === "message").length,
+          tool_calls: ns.filter((n) => n.kind === "skill").length,
+          preview: "",
+          model: null as string | null,
+        };
+      });
+      rows.sort((a, b) => b.ended_ts - a.ended_ts);
+      const page = rows.slice(0, limit);
+
+      const firstUser = new Map<string, string>();
+      const anyMessage = new Map<string, string>();
+      const models = new Map<string, string>();
+      for (const n of [...contextNodes].sort((a, b) => Number(a.ts ?? 0) - Number(b.ts ?? 0))) {
+        const sid = n.session_id;
+        if (sid === null || sid === undefined || n.kind !== "message") continue;
+        const k = String(sid);
+        let meta: Record<string, unknown> = {};
+        try {
+          meta = JSON.parse(String(n.meta_json ?? "{}")) as Record<string, unknown>;
+        } catch {
+          meta = {};
+        }
+        if (typeof meta.model === "string" && !models.has(k)) models.set(k, meta.model);
+        const label = String(n.label ?? "");
+        if (!anyMessage.has(k)) anyMessage.set(k, label);
+        if (meta.role === "user" && !firstUser.has(k)) firstUser.set(k, label);
+      }
+      for (const r of page) {
+        const raw = firstUser.get(r.session_id) ?? anyMessage.get(r.session_id) ?? "";
+        r.preview = flattenPreview(raw);
+        r.model = models.get(r.session_id) ?? null;
+      }
+      return page;
+    }
+    case "history_timeline": {
+      const sessionId = String(args.session_id ?? "");
+      const nodes = contextNodes
+        .filter((n) => String(n.session_id ?? "") === sessionId)
+        .sort((a, b) => {
+          const ka = seqKey(String(a.id ?? ""), Number(a.ts ?? 0));
+          const kb = seqKey(String(b.id ?? ""), Number(b.ts ?? 0));
+          return ka[0] - kb[0] || ka[1] - kb[1];
+        });
+      const byId = new Map(nodes.map((n) => [String(n.id), n]));
+      const edges = contextEdges.filter((e) => byId.has(String(e.from_id)));
+      const toolsOf = new Map<string, string[]>();
+      const resultsOf = new Map<string, string[]>();
+      const recalled = new Map<string, number>();
+      for (const e of edges) {
+        const from = String(e.from_id);
+        const to = String(e.to_id);
+        if (e.kind === "used") {
+          const arr = toolsOf.get(from) ?? [];
+          arr.push(to);
+          toolsOf.set(from, arr);
+        } else if (e.kind === "produced") {
+          const target = byId.get(to);
+          if (target) {
+            const arr = resultsOf.get(from) ?? [];
+            arr.push(String(target.label ?? ""));
+            resultsOf.set(from, arr);
+          }
+        } else if (e.kind === "recalled") {
+          recalled.set(from, (recalled.get(from) ?? 0) + 1);
+        }
+      }
+      const entries: Row[] = [];
+      for (const n of nodes) {
+        if (n.kind !== "message") continue;
+        const id = String(n.id);
+        let meta: Record<string, unknown> = {};
+        try {
+          meta = JSON.parse(String(n.meta_json ?? "{}")) as Record<string, unknown>;
+        } catch {
+          meta = {};
+        }
+        entries.push({
+          kind: meta.role === "user" ? "user" : "assistant",
+          ts: Number(n.ts ?? 0),
+          text: String(n.label ?? ""),
+          detail: null,
+          model: typeof meta.model === "string" ? meta.model : null,
+          memories: recalled.get(id) ?? 0,
+        });
+        const calls = (toolsOf.get(id) ?? []).sort(
+          (x, y) =>
+            seqKey(x, Number(byId.get(x)?.ts ?? 0))[0] - seqKey(y, Number(byId.get(y)?.ts ?? 0))[0],
+        );
+        for (const call of calls) {
+          const target = byId.get(call);
+          const detail = (resultsOf.get(call) ?? [])
+            .map((s) => s.trim())
+            .filter((s) => s.length > 0)
+            .join("\n");
+          entries.push({
+            kind: "tool",
+            ts: Number(target?.ts ?? n.ts ?? 0),
+            text: String(target?.label ?? call),
+            detail: detail === "" ? null : detail,
+            model: null,
+            memories: 0,
+          });
+        }
+      }
+      return { session_id: sessionId, entries };
+    }
+
     // ---- P5: skills ----
     case "skills_list":
       seedSkillsOnce();
@@ -715,9 +887,24 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "skills_slugify":
       return slugifySkillName(String(args.name ?? ""));
 
-    // ---- Tool sandbox (Playground agent mode) ----
+    // ---- Tool sandbox (Assistant agent mode) ----
     case "tools_policy":
       return TOOLS_POLICY;
+    case "tools_default_root":
+      return DEFAULT_WORKSPACE_ROOT;
+    case "tools_check_root": {
+      // Mirrors tools.rs::validate_root closely enough for the UI: absolute, not the filesystem
+      // root, not a system directory. The shim has no real filesystem, so it judges the string —
+      // a spec that needs a root to be REJECTED must therefore pick one of these, not just any
+      // missing path.
+      const r = String(args.root ?? "").trim();
+      if (!r.startsWith("/")) throw new Error("workspace root must be an absolute path");
+      if (r === "/") throw new Error("workspace root cannot be the filesystem root");
+      for (const bad of ["/System", "/usr", "/bin", "/sbin", "/etc", "/private"]) {
+        if (r === bad) throw new Error(`workspace root cannot be a system directory (${bad})`);
+      }
+      return null;
+    }
     case "tool_run": {
       // The Rust host collapses (name, args, root) into a single `req` object — match that shape
       // so the host-side allowlist, path confinement and timeout run the same code paths in test.
@@ -732,20 +919,100 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         if (!isConfinedPath(p)) return fail("path escapes the workspace");
         const prefix = p === "." || p === "" ? "" : p + "/";
         const entries = [...virtualFs.keys()].filter((k) => k.startsWith(prefix));
-        return ok(entries.map((k) => k.slice(prefix.length)).join("\n") || "");
+        // Non-recursive keeps its historical shape (bare names) — specs assert on it.
+        if (toolArgs["recursive"] !== true) {
+          return ok(entries.map((k) => k.slice(prefix.length)).join("\n") || "");
+        }
+        const dirs = [...virtualDirs]
+          .filter((d) => d.startsWith(prefix))
+          .map((d) => d.slice(prefix.length))
+          .filter((d) => d.length > 0);
+        const listed = [
+          ...new Set([...dirs.map((d) => `dir  ${d}`), ...entries.map((k) => `file ${k.slice(prefix.length)}`)]),
+        ];
+        return ok(listed.join("\n") || "");
       }
       if (name === "read_file") {
         const p = String(toolArgs["path"] ?? "");
         if (!isConfinedPath(p)) return fail("path escapes the workspace");
         const c = virtualFs.get(p);
         if (c === undefined) return fail("no such file");
-        return ok(c);
+        const offset = Number(toolArgs["offset"] ?? 0);
+        const limit = toolArgs["limit"] === undefined ? undefined : Number(toolArgs["limit"]);
+        if (!offset && limit === undefined) return ok(c);
+        const lines = c.split("\n");
+        const from = Math.max(0, Math.min(offset - 1, lines.length));
+        const to = limit === undefined ? lines.length : Math.min(from + limit, lines.length);
+        return ok(`[lines ${from + 1}-${to} of ${lines.length}]\n${lines.slice(from, to).join("\n")}`);
+      }
+      if (name === "search_files") {
+        const pattern = String(toolArgs["pattern"] ?? "");
+        if (!pattern) return fail('"pattern" is empty');
+        const p = String(toolArgs["path"] ?? ".");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const cs = toolArgs["case_sensitive"] === true;
+        const needle = cs ? pattern : pattern.toLowerCase();
+        const prefix = p === "." || p === "" ? "" : p + "/";
+        const hits: string[] = [];
+        for (const [k, v] of [...virtualFs.entries()].sort(([a], [b]) => (a < b ? -1 : 1))) {
+          if (!k.startsWith(prefix)) continue;
+          v.split("\n").forEach((line, i) => {
+            const hay = cs ? line : line.toLowerCase();
+            if (hay.includes(needle)) hits.push(`${k}:${i + 1}: ${line.trimEnd()}`);
+          });
+        }
+        return ok(hits.length > 0 ? hits.join("\n") : `no matches for "${pattern}"`);
+      }
+      if (name === "file_info") {
+        const p = String(toolArgs["path"] ?? "");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const c = virtualFs.get(p);
+        if (c !== undefined) {
+          return ok(`path: ${p}\nexists: yes\nkind: file\nsize: ${c.length} bytes\nmodified: 0 (unix seconds)`);
+        }
+        if (virtualDirs.has(p)) {
+          return ok(`path: ${p}\nexists: yes\nkind: directory\nsize: 0 bytes\nmodified: 0 (unix seconds)`);
+        }
+        return ok(`${p}: does not exist`);
       }
       if (name === "write_file") {
         const p = String(toolArgs["path"] ?? "");
         if (!isConfinedPath(p)) return fail("path escapes the workspace");
         virtualFs.set(p, String(toolArgs["content"] ?? ""));
         return ok("");
+      }
+      if (name === "edit_file") {
+        const p = String(toolArgs["path"] ?? "");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const c = virtualFs.get(p);
+        if (c === undefined) return fail("cannot read: no such file");
+        const oldText = String(toolArgs["old"] ?? "");
+        const newText = String(toolArgs["new"] ?? "");
+        if (!oldText) return fail('"old" must not be empty — there is nothing to match');
+        const count = c.split(oldText).length - 1;
+        if (count === 0) {
+          return fail(
+            `the text to replace was not found in ${p} — read the file and quote it exactly, including indentation`,
+          );
+        }
+        const all = toolArgs["replace_all"] === true;
+        if (count > 1 && !all) {
+          return fail(
+            `"old" occurs ${count} times in ${p}. A replacement has to be unambiguous — quote more surrounding lines, or pass replace_all:true to change every one`,
+          );
+        }
+        const updated = all ? c.split(oldText).join(newText) : c.replace(oldText, newText);
+        virtualFs.set(p, updated);
+        return ok(
+          `edited ${p}: replaced ${count} occurrence${count === 1 ? "" : "s"} (${c.length} → ${updated.length} bytes)`,
+        );
+      }
+      if (name === "mkdir") {
+        const p = String(toolArgs["path"] ?? "");
+        if (!isConfinedPath(p)) return fail("path escapes the workspace");
+        const parts = p.split("/").filter((s) => s.length > 0);
+        for (let i = 1; i <= parts.length; i++) virtualDirs.add(parts.slice(0, i).join("/"));
+        return ok(`created directory ${p}`);
       }
       if (name === "run_command") {
         const program = String(toolArgs["program"] ?? "");
@@ -1065,7 +1332,7 @@ async function egressUnary(req: WireReq): Promise<{ status: number; headers: Rec
 /**
  * Outgoing-egress log for the harness. The shim is the only thing that talks to the mock, so
  * capturing here is equivalent to capturing on the network — and lets a spec assert on what
- * the app actually sent, including the system messages the Playground injects for memory.
+ * the app actually sent, including the system messages the Assistant injects for memory.
  *
  * Dev-only: bounded so a long run can't grow this without limit.
  */

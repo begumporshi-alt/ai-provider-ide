@@ -3,8 +3,8 @@
  * sees. Without this, "memory" is just a store the user can browse — recall-before-send could
  * silently be a no-op and the harness would not notice.
  *
- * Strategy: seed an L1 atom, open the Playground with memory on (the default), send a question
- * whose keywords overlap the atom, then read the last outbound egress body. The Playground
+ * Strategy: seed an L1 atom, open the Assistant with memory on (the default), send a question
+ * whose keywords overlap the atom, then read the last outbound egress body. The Assistant
  * injects the recalled block as a system message; that is what we assert on.
  */
 import { expect, test, type Page } from "@playwright/test";
@@ -60,7 +60,7 @@ test("memory recall: the recalled block lands in the chat-completions request as
   await page.goto(`${APP}?seed=systemai`);
   await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
 
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
   await page.getByPlaceholder(/Send a message through the router/)
     .fill("what is the timezone where you live?");
@@ -82,7 +82,7 @@ test("memory recall: a recalled memory lands in the context graph as a memory no
   await page.goto(`${APP}?seed=systemai`);
   const memoryId = await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
 
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
   await page.getByPlaceholder(/Send a message through the router/)
     .fill("what is the timezone where you live?");
@@ -109,7 +109,7 @@ test("memory recall: recalling the same memory twice leaves one node with two ed
   await page.goto(`${APP}?seed=systemai`);
   const memoryId = await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
 
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
   const box = page.getByPlaceholder(/Send a message through the router/);
   const send = page.getByRole("button", { name: "Send" });
@@ -159,7 +159,7 @@ test("memory recall: toggling memory off skips the recall path entirely", async 
   await page.goto(`${APP}?seed=systemai`);
   await seedL1(page, "Tushu lives in Dhaka, which is GMT+6");
 
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
   // Uncheck the memory toggle — it is on by default. The label wraps the input, so
   // getByLabel is the reliable handle here (the same form as the "agent mode" toggle).

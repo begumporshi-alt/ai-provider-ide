@@ -581,6 +581,46 @@ export async function clearContextGraph(): Promise<void> {
   await invoke("context_clear");
 }
 
+// ---------- history: sessions and their timelines ----------
+// Read-only readings of the same context graph. Field names are snake_case on the wire,
+// matching every other host row in this file.
+
+export interface HistorySession {
+  session_id: string;
+  started_ts: number;
+  ended_ts: number;
+  /** User and assistant messages only — a tool-heavy run has few turns and many tools. */
+  turns: number;
+  tool_calls: number;
+  preview: string;
+  model: string | null;
+}
+
+export interface TimelineEntry {
+  /** `user` | `assistant` | `tool`. */
+  kind: string;
+  ts: number;
+  text: string;
+  /** For a tool entry, the result the sandbox returned. */
+  detail: string | null;
+  model: string | null;
+  /** Memories recalled for this turn, collapsed to a count. */
+  memories: number;
+}
+
+export interface HistoryTimeline {
+  session_id: string;
+  entries: TimelineEntry[];
+}
+
+export async function loadHistorySessions(limit = 100): Promise<HistorySession[]> {
+  return invoke<HistorySession[]>("history_sessions", { limit });
+}
+
+export async function loadHistoryTimeline(sessionId: string): Promise<HistoryTimeline> {
+  return invoke<HistoryTimeline>("history_timeline", { sessionId });
+}
+
 // ---------- P5: skills ----------
 
 export interface Skill {

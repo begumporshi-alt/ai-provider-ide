@@ -30,11 +30,11 @@ async function startWizard(page: Page, name: string, baseUrl: string, key: strin
 }
 
 /**
- * Playground: pick the model whose option text matches `model`, send `prompt`, and wait for the
+ * Assistant: pick the model whose option text matches `model`, send `prompt`, and wait for the
  * streamed assistant text matching `answer`. Returns the full answer (newlines preserved).
  */
-async function sendInPlayground(page: Page, model: RegExp, prompt: string, answer: RegExp): Promise<string> {
-  await page.getByRole("button", { name: "Playground" }).click();
+async function sendInAssistant(page: Page, model: RegExp, prompt: string, answer: RegExp): Promise<string> {
+  await page.getByRole("button", { name: "Assistant" }).click();
   // selectOption needs a concrete string, and the option label carries the provider slug
   // (`slug/nativeId`), which the caller shouldn't have to know — match on text, select by value.
   const combo = page.getByRole("combobox");
@@ -72,7 +72,7 @@ test("zero-config wizard: connect an OpenAI-compatible provider and route throug
   await expect.poll(() => store<{ status: string }[]>(page, "providers").then((r) => r.filter((p) => p.status === "enabled").length)).toBe(1);
 
   // A real request leaves the browser through egress and is routed back as a stream.
-  const answer = await sendInPlayground(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
+  const answer = await sendInAssistant(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
   expect(answer).toContain("Hello from oracle-mini");
   await expect(page.getByText(/Mock Oracle/)).toBeVisible(); // the route-trace line: ✓ Nms · Mock Oracle · key-01
 });
@@ -121,7 +121,7 @@ test("Tier-2: AI-written sandboxed code adapter is gated, approved, and routes r
   expect(codeManifests).toHaveLength(1);
 
   // Traffic now flows THROUGH the AI-written module: plain-text, newline-delimited, not JSON.
-  const answer = await sendInPlayground(page, /nd-lite/, "Hello", /nd-lite/);
+  const answer = await sendInAssistant(page, /nd-lite/, "Hello", /nd-lite/);
   expect(answer).toContain("from");
   expect(answer).toContain("nd-lite");
 
@@ -157,7 +157,7 @@ test("image URL from a provider is fetched through egress and rendered", async (
   await page.goto(`${APP}?seed=systemai`);
   await expect(page.getByText("System AI (mock)")).toBeVisible();
 
-  await page.getByRole("button", { name: "Playground" }).click();
+  await page.getByRole("button", { name: "Assistant" }).click();
   await page.getByRole("button", { name: "Image" }).click();
   await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
 
@@ -216,7 +216,7 @@ test("OpenRouter: image models are discovered from provider metadata, not their 
   await expect(page.getByText("2 text models")).toBeVisible();
 
   // And generation routes to the provider's real image API, rendering the returned base64.
-  await page.getByRole("button", { name: "Playground" }).click();
+  await page.getByRole("button", { name: "Assistant" }).click();
   await page.getByRole("button", { name: "Image" }).click();
   await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
   const combo = page.getByRole("combobox");
@@ -262,11 +262,11 @@ test("gateway: the master key is keychain-resident and never rendered", async ({
  */
 test("activity: requests are logged with source attribution", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
-  await sendInPlayground(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
+  await sendInAssistant(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
 
   await page.getByRole("button", { name: "Activity" }).click();
   await expect(page.getByRole("columnheader", { name: "Source" })).toBeVisible({ timeout: 10_000 });
-  // Sent from the Playground, so it is attributed to `ui`, not `gateway`.
+  // Sent from the Assistant, so it is attributed to `ui`, not `gateway`.
   await expect(page.getByText("ui", { exact: true }).first()).toBeVisible();
 });
 
@@ -277,7 +277,7 @@ test("activity: requests are logged with source attribution", async ({ page }) =
 test("provider failover: the serving provider is visible in activity log", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   // The log is only interesting once something has been routed, so make a request first.
-  await sendInPlayground(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
+  await sendInAssistant(page, /oracle-mini/, "Hello", /Hello from oracle-mini/);
 
   await page.getByRole("button", { name: "Activity" }).click();
   // The Provider column names who actually served it. `systemai` seeds "System AI (mock)" —
@@ -295,6 +295,42 @@ test("config: basic settings are persisted", async ({ page }) => {
 
   // Settings UI should be accessible. By heading — the sidebar and status chip also say "Router".
   await expect(page.getByRole("heading", { name: "Router Settings" })).toBeVisible({ timeout: 10_000 });
+});
+
+test("router settings: the per-provider cap is persisted, bounded, and 0 means unlimited", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByRole("heading", { name: "Router Settings" })).toBeVisible({ timeout: 10_000 });
+
+  const cap = page.getByLabel("in-flight requests per provider");
+  await expect(cap).toHaveValue("4");
+
+  // 999 is not a different setting from the cap, it is the cap with the failure arriving later.
+  await cap.fill("999");
+  await cap.blur();
+  await expect(cap).toHaveValue("64");
+
+  // A negative is not "unlimited" — `maxPerProvider <= 0` would make it behave as one while
+  // displaying a number. Removing the cap has to be deliberate.
+  await cap.fill("-3");
+  await cap.blur();
+  await expect(cap).toHaveValue("4");
+
+  await cap.fill("2");
+  await cap.blur();
+  await expect(cap).toHaveValue("2");
+
+  // Reload: only what was actually saved comes back.
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Settings" }).click();
+  await expect(page.getByLabel("in-flight requests per provider")).toHaveValue("2");
+
+  // 0 is a real setting, not a missing one — and it must say so, or the screen implies a cap.
+  await cap.fill("0");
+  await cap.blur();
+  await expect(cap).toHaveValue("0");
+  // Exact: the hint above the field also contains the word, so a substring match is ambiguous.
+  await expect(page.getByText("unlimited", { exact: true })).toBeVisible();
 });
 
 // ---------------------------------------------------------------------------
@@ -315,22 +351,122 @@ test("human approval gate exists for code adapters", async ({ page }) => {
 // itself until a path is set, so the user cannot send a tool call into the void.
 // ---------------------------------------------------------------------------
 
-test("playground: agent mode refuses to send without a workspace root", async ({ page }) => {
+test("assistant: agent mode refuses to send without a workspace root", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
   // Pick the only model the seeded provider advertises — matches the option whose label carries
-  // the provider slug (same approach sendInPlayground uses).
+  // the provider slug (same approach sendInAssistant uses).
   const combo = page.getByRole("combobox");
   const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
   await combo.selectOption(value);
 
-  // Flip agent mode on without filling the root.
+  // Flip agent mode on. The root is now filled in for you — the host's default workspace — so a
+  // fresh screen is usable instead of dead on arrival.
   await page.getByLabel("agent mode").check();
-  // Send must be disabled — the guard is the disabled attribute, not a post-hoc error.
+  const rootBox = page.getByPlaceholder(/absolute\/path/);
+  await expect(rootBox).toHaveValue(/AI-Provider-Router-Workspace/);
+  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+
+  // The guard is unchanged: emptying the root re-arms it. Send's disabled state is the guard,
+  // not a post-hoc error.
+  await rootBox.fill("");
   await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
 
   // Filling the root unsticks it.
-  await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await rootBox.fill("/tmp");
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
+});
+
+// ---------------------------------------------------------------------------
+// Story 12 — The screen's behaviour switches live under the title.
+// They are not per-request choices: the model picker decides where one message goes, these
+// decide how the screen behaves for everything after. Sitting them in the picker's row buried a
+// screen-level setting among request-level controls, and put them inside `Chat` — which
+// unmounts on a tab switch — so the tab switch silently reset them.
+// ---------------------------------------------------------------------------
+
+test("assistant: agent mode, memory and the no-tools switch sit under the title", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+
+  const title = page.getByRole("heading", { name: "Assistant" });
+  const agent = page.getByLabel("agent mode");
+  const memory = page.getByLabel("memory");
+  const noTools = page.getByLabel("tell the model it has no tools");
+  const picker = page.getByRole("combobox");
+
+  await expect(agent).toBeVisible();
+  await expect(memory).toBeVisible();
+  await expect(noTools).toBeVisible();
+
+  const t = await title.boundingBox();
+  const a = await agent.boundingBox();
+  const p = await picker.boundingBox();
+  // Below the title, and above the model picker rather than beside it.
+  expect(a!.y).toBeGreaterThan(t!.y);
+  expect(a!.y).toBeLessThan(p!.y - 8);
+});
+
+// ---------------------------------------------------------------------------
+// Story 13 — The Assistant's switches and workspace root are settings.
+// They describe how the user wants the screen to behave, not what one conversation is doing, so
+// they outlive the session: same per-screen JSON blob the Gateway and Background screens use.
+// ---------------------------------------------------------------------------
+
+test("assistant: the switches and the workspace root survive a reload", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+
+  await page.getByLabel("agent mode").check();
+  await page.getByLabel("memory").uncheck();
+  await page.getByPlaceholder(/absolute\/path/).fill("/tmp/persisted-workspace");
+  // The root is typed, so its write is debounced; a reload before it lands would test the
+  // debounce rather than the persistence.
+  await page.waitForTimeout(700);
+
+  // Reload: a new page is a new app, so only what was actually saved comes back.
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+
+  await expect(page.getByLabel("agent mode")).toBeChecked();
+  await expect(page.getByLabel("memory")).not.toBeChecked();
+  await expect(page.getByPlaceholder(/absolute\/path/)).toHaveValue("/tmp/persisted-workspace");
+});
+
+test("assistant: the tool-step budget is a setting, and a value past the cap is clamped", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+
+  const budget = page.getByLabel("tool steps");
+
+  // Without agent mode there is no loop to step through, so the field is not offered — a budget
+  // you can set but that does nothing is worse than one that is greyed out.
+  await expect(budget).toBeDisabled();
+  await expect(budget).toHaveValue("8");
+
+  // These edits are deliberately back-to-back with no settling time. The root's write is
+  // debounced, and it used to serialise the snapshot from when it was SCHEDULED rather than
+  // from when it fired — so anything changed inside the debounce window was written, then
+  // clobbered by the pre-edit copy. A human is slower than the debounce and never saw it;
+  // this driver is not, which is why the reload below is the assertion that catches it.
+  await page.getByLabel("agent mode").check();
+  await expect(budget).toBeEnabled();
+
+  // 999 is not a different setting from the cap, it is the cap with the answer arriving late.
+  await budget.fill("999");
+  await budget.blur();
+  await expect(budget).toHaveValue("50");
+
+  // Typing is not clamped mid-edit: "12" passes through "1", and clamping on the keystroke
+  // would make the second digit impossible to enter.
+  await budget.fill("12");
+  await expect(budget).toHaveValue("12");
+  await budget.blur();
+  await expect(budget).toHaveValue("12");
+
+  await page.waitForTimeout(700);
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await expect(page.getByLabel("tool steps")).toHaveValue("12");
 });

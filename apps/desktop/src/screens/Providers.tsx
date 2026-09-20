@@ -191,7 +191,7 @@ export function ProvidersScreen() {
           </div>
         </Modal>
       )}
-      <TryInPlayground />
+      <TryInAssistant />
     </div>
   );
 }
@@ -319,13 +319,13 @@ function AddKeyModal({
   );
 }
 
-function TryInPlayground() {
+function TryInAssistant() {
   const { go } = useUi();
   const providers = registry.listProviders().filter((p) => p.status === "enabled");
   if (!providers.length) return null;
   return (
     <div className="mt-4 text-[12px]" style={{ color: "var(--text-dim)" }}>
-      Router live. <button className="underline decoration-dotted" onClick={() => go("playground")}>Try a model</button>
+      Router live. <button className="underline decoration-dotted" onClick={() => go("assistant")}>Try a model</button>
     </div>
   );
 }

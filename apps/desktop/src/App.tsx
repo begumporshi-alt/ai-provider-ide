@@ -7,9 +7,10 @@ import { useUi } from "./ui-state";
 import { Shell } from "./components/Shell";
 import { ProvidersScreen } from "./screens/Providers";
 import { ModelsScreen } from "./screens/Models";
-import { PlaygroundScreen } from "./screens/Playground";
+import { AssistantScreen } from "./screens/Assistant";
 import { ActivityScreen } from "./screens/Activity";
 import { ContextScreen } from "./screens/Context";
+import { HistoryScreen } from "./screens/History";
 import { SkillsScreen } from "./screens/Skills";
 import { AgentsScreen } from "./screens/Agents";
 import { MemoryScreen } from "./screens/Memory";
@@ -54,9 +55,10 @@ export default function App() {
     <Shell>
       {screen === "providers" && <ProvidersScreen />}
       {screen === "models" && <ModelsScreen />}
-      {screen === "playground" && <PlaygroundScreen />}
+      {screen === "assistant" && <AssistantScreen />}
       {screen === "activity" && <ActivityScreen />}
       {screen === "context" && <ContextScreen />}
+      {screen === "history" && <HistoryScreen />}
       {screen === "skills" && <SkillsScreen />}
       {screen === "agents" && <AgentsScreen />}
       {screen === "memory" && <MemoryScreen />}

@@ -283,7 +283,7 @@ export function MemoryScreen() {
               ? "Nothing matches that query."
               : range > 0
                 ? `Nothing recorded in the last ${range === 1 ? "24 hours" : `${range} days`}.`
-                : "No memories yet. Chat with memory enabled in the Playground and durable facts will be distilled here."
+                : "No memories yet. Chat with memory enabled in the Assistant and durable facts will be distilled here."
           }
         />
       ) : groups ? (

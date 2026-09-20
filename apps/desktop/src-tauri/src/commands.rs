@@ -35,12 +35,68 @@ impl From<vault::VaultError> for CommandError {
 }
 impl From<crate::store::StoreError> for CommandError {
     fn from(e: crate::store::StoreError) -> Self {
-        CommandError(e.to_string())
+        match e {
+            crate::store::StoreError::Sql(inner) => CommandError(ui_db_error(&inner)),
+            crate::store::StoreError::Io(inner) => {
+                tracing::warn!("store io error (detail withheld from the UI): {inner}");
+                CommandError(match inner.kind() {
+                    std::io::ErrorKind::NotFound => "a required file or folder is missing".to_string(),
+                    std::io::ErrorKind::PermissionDenied => "permission was denied".to_string(),
+                    std::io::ErrorKind::AlreadyExists => "that already exists".to_string(),
+                    _ => "a file operation failed".to_string(),
+                })
+            }
+            // A migration carries its own id, which is safe and is the one thing the operator
+            // needs — the rest of the detail is SQL.
+            crate::store::StoreError::Migration(id, detail) => {
+                tracing::warn!("migration {id} failed: {detail}");
+                CommandError(format!("migration {id} failed"))
+            }
+        }
     }
 }
 impl From<rusqlite::Error> for CommandError {
     fn from(e: rusqlite::Error) -> Self {
-        CommandError(e.to_string())
+        CommandError(ui_db_error(&e))
+    }
+}
+
+/// What the webview is told when the store fails.
+///
+/// rusqlite's `Display` is honest, and that is exactly the problem — measured, not assumed:
+///
+/// | failure | `e.to_string()` |
+/// |---|---|
+/// | cannot open | `unable to open database file: /Users/<account>/Library/…/ai-provider-router.db` |
+/// | bad SQL | `near "FROM": syntax error in SELECT FROM WHERE at offset 7` |
+/// | missing column | `no such column: nope in SELECT nope FROM t at offset 7` |
+///
+/// All three carry something the person using the app does not need: an absolute path that
+/// names the account, or the schema's own table and column names. None of it helps them decide
+/// what to do next. So the detail is logged host-side and the boundary returns a stable
+/// sentence that still names the *class* of failure.
+///
+/// Deliberately not applied to hand-written messages (`context::record`'s "unknown node kind")
+/// — those are already written for a person to read, and sanitising them would strip the one
+/// thing that makes them useful.
+fn ui_db_error(e: &rusqlite::Error) -> String {
+    tracing::warn!("store error (detail withheld from the UI): {e}");
+    match e {
+        // The SQL text is embedded in this variant by construction.
+        rusqlite::Error::SqlInputError { .. } => "an internal query failed".to_string(),
+        rusqlite::Error::SqliteFailure(ffi, _) => match ffi.code {
+            rusqlite::ErrorCode::CannotOpen => "the database could not be opened".to_string(),
+            rusqlite::ErrorCode::NotADatabase => "the database file is not a valid database".to_string(),
+            rusqlite::ErrorCode::DatabaseBusy => "the database is busy; try again".to_string(),
+            rusqlite::ErrorCode::DiskFull => "the disk is full".to_string(),
+            rusqlite::ErrorCode::ReadOnly => "the database is read-only".to_string(),
+            rusqlite::ErrorCode::ConstraintViolation => {
+                "the change was rejected by a database constraint".to_string()
+            }
+            _ => "a database error occurred".to_string(),
+        },
+        rusqlite::Error::QueryReturnedNoRows => "no matching row was found".to_string(),
+        _ => "a database error occurred".to_string(),
     }
 }
 
@@ -185,6 +241,16 @@ pub fn context_graph(store: State<'_, Arc<Store>>, limit: usize) -> Result<conte
 #[tauri::command]
 pub fn context_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
     context::clear(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn history_sessions(store: State<'_, Arc<Store>>, limit: usize) -> Result<Vec<context::HistorySession>, CommandError> {
+    context::sessions(&store, limit).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn history_timeline(store: State<'_, Arc<Store>>, session_id: String) -> Result<context::HistoryTimeline, CommandError> {
+    context::timeline(&store, &session_id).map_err(CommandError)
 }
 
 // ---------- skills (P5) ----------
@@ -437,6 +503,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         context_record,
         context_graph,
         context_clear,
+        history_sessions,
+        history_timeline,
         skills_list,
         skills_catalog,
         skills_install,
@@ -452,6 +520,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_status,
         crate::gateway_cmds::get_tools_enabled,
         crate::gateway_cmds::set_tools_enabled,
+        // Audit H1b: gateway-side mutation is opt-in.
+        crate::gateway_cmds::get_tools_mutation_enabled,
+        crate::gateway_cmds::set_tools_mutation_enabled,
         crate::gateway_cmds::gateway_enable,
         crate::gateway_cmds::gateway_disable,
         crate::gateway_cmds::gateway_key_generate,
@@ -490,6 +561,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::persist::config_import,
         crate::persist::diagnostics_bundle,
         crate::tools::tools_policy,
+        crate::tools::tools_check_root,
+        crate::tools::tools_default_root,
         crate::tools::tool_run,
         memory_capture,
         memory_capture_batch,
@@ -508,4 +581,120 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::commands::crash_clear,
         crate::commands::crash_clear_all,
     ]
+}
+
+#[cfg(test)]
+mod ui_error_tests {
+    use super::*;
+
+    fn temp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("aip-uierr-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).expect("temp dir");
+        d
+    }
+
+    /// The path is the leak: it names the account, and it is the whole string rusqlite produced
+    /// for a database it could not open.
+    #[test]
+    fn a_database_that_cannot_be_opened_does_not_name_its_path() {
+        let dir = temp_dir("open");
+        let db = dir.join(format!("secret-{}-path", whoamiish())).join("db.sqlite");
+        let err = rusqlite::Connection::open(&db).expect_err("a missing parent must fail");
+        assert!(err.to_string().contains("secret"), "the raw error really does carry the path");
+        let ui = ui_db_error(&err);
+        assert!(!ui.contains("secret"), "path leaked to the UI: {ui}");
+        assert!(!ui.contains('/'), "path leaked to the UI: {ui}");
+        assert_eq!(ui, "the database could not be opened");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn whoamiish() -> String {
+        std::env::var("USER").unwrap_or_else(|_| "someone".to_string())
+    }
+
+    #[test]
+    fn bad_sql_does_not_reach_the_ui_with_the_statement_in_it() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        // The statement text is echoed back in the error verbatim, which is the leak: it names
+        // the table the schema actually has.
+        let err = c
+            .prepare("SELECT api_secret FROM private_table WHERE FROM")
+            .expect_err("malformed SQL must fail");
+        assert!(err.to_string().contains("private_table"), "raw error carries the SQL: {err}");
+        let ui = ui_db_error(&err);
+        assert!(!ui.contains("private_table"), "SQL leaked to the UI: {ui}");
+        assert!(!ui.contains("api_secret"), "SQL leaked to the UI: {ui}");
+    }
+
+    #[test]
+    fn a_missing_column_does_not_name_the_table() {
+        let c = rusqlite::Connection::open_in_memory().unwrap();
+        c.execute_batch("CREATE TABLE keys (id TEXT PRIMARY KEY);").unwrap();
+        let err = c.prepare("SELECT api_secret FROM keys").expect_err("unknown column");
+        let ui = ui_db_error(&err);
+        assert!(!ui.contains("api_secret"), "column leaked to the UI: {ui}");
+        assert!(!ui.contains("keys"), "table leaked to the UI: {ui}");
+    }
+
+    #[test]
+    fn a_corrupt_database_is_still_actionable() {
+        // The one case where the class of failure IS the advice: the UI tells the operator to
+        // restore from a backup. Scrubbing it to "a database error occurred" would be a
+        // regression, not a hardening.
+        let dir = temp_dir("corrupt");
+        let db = dir.join("db.sqlite");
+        std::fs::write(&db, vec![0u8; 4096]).unwrap();
+        let err = (|| -> rusqlite::Result<()> {
+            let c = rusqlite::Connection::open(&db)?;
+            c.query_row("SELECT count(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))?;
+            Ok(())
+        })()
+        .expect_err("a zeroed file is not a database");
+        let ui = ui_db_error(&err);
+        assert!(ui.contains("not a valid database"), "was: {ui}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_migration_failure_names_the_migration_but_not_the_sql() {
+        let e = crate::store::StoreError::Migration(
+            "0007_ledger_error_class".into(),
+            "near \"FROM\": syntax error in UPDATE ledger SET FROM WHERE".into(),
+        );
+        let ui: CommandError = e.into();
+        assert_eq!(ui.0, "migration 0007_ledger_error_class failed");
+        assert!(!ui.0.contains("UPDATE"), "SQL leaked to the UI: {}", ui.0);
+    }
+
+    #[test]
+    fn an_io_failure_names_only_its_kind() {
+        let e = crate::store::StoreError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "No such file or directory (os error 2)",
+        ));
+        let ui: CommandError = e.into();
+        assert_eq!(ui.0, "a required file or folder is missing");
+    }
+
+    #[test]
+    fn a_hand_written_message_passes_through_untouched() {
+        // Sanitising these would strip the one thing that makes them useful: they come from the
+        // module, not from rusqlite, and they are already written for a person to read. The
+        // guard is that this class of message still names what was wrong.
+        let dir = temp_dir("handwritten");
+        let s = crate::store::Store::open(&dir).expect("open");
+        let node = context::ContextNode {
+            id: "n1".into(),
+            kind: "vibe".into(),
+            label: "x".into(),
+            source: "ui".into(),
+            session_id: None,
+            ts: 1,
+            meta_json: None,
+        };
+        let err = context::record(&s, &[node], &[]).expect_err("an unknown kind is refused");
+        assert!(err.contains("unknown node kind 'vibe'"), "was: {err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

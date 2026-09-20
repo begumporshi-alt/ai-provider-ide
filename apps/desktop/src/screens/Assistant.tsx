@@ -1,5 +1,5 @@
 /**
- * Playground — a router diagnostic console, not a chatbot (UI_UX_PLAN.md §3): model picker,
+ * Assistant — a router console for talking to any routed model (UI_UX_PLAN.md §3): model picker,
  * streaming assistant text, a STOP button (cancellation, spec req. 9), and after every
  * request the calm summary line (`✓ 421ms · OpenRouter · key-03` / `↻ 1 fallback`) with an
  * expandable per-attempt route trace. Acceptance criterion 4: text + image end-to-end.
@@ -7,10 +7,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { catalog, listSkills, registry, router } from "../store";
 import { fetchImageUrl } from "../ipc-client";
+import { invoke } from "@tauri-apps/api/core";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
-import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import { toolCallName } from "../lib/tools/wire";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { activeSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
@@ -28,16 +30,63 @@ interface Msg {
 }
 
 /**
+ * Replay prior turns for a follow-up request — the one place both the agent and the plain-chat
+ * paths build history from.
+ *
+ * `tool_calls` and `tool_call_id` have to survive the replay, not just `role` and `content`. A
+ * tool-result message without its `tool_call_id` is rejected by every OpenAI-compatible provider
+ * with HTTP 400, and the assistant turn that asked for it is meaningless without `tool_calls`.
+ *
+ * These were two separate mappings and only the agent's kept the tool fields, so any session that
+ * had used agent mode failed on the *next plain message* with `BAD_REQUEST_SCHEMA` — the request
+ * was refused for replaying a tool result the provider could not match to a call. Keeping one
+ * mapping is the point: the bug was the divergence, not either version of the filter.
+ *
+ * The filter also drops the empty assistant bubble a stopped or failed turn leaves behind —
+ * `{ role: "assistant", content: "" }` is rejected with 400 by most providers too.
+ */
+function replayHistory(msgs: Msg[]): ChatMessage[] {
+  return msgs
+    .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls))
+    .map((m) => ({
+      role: m.role,
+      content: m.content,
+      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+    })) as ChatMessage[];
+}
+
+/**
  * Agent-mode system prompt. Unlike the no-tools guard (which suppresses tool-call markup),
  * this one tells the model it DOES have tools and how to use them — confined to the workspace
  * root the user sets. It is deliberately terse; the sandbox, not the prompt, is the enforcement.
  */
 const AGENT_SYSTEM =
   "You are an agent inside AI-Provider Router. You have file and shell tools confined to the " +
-  "workspace root the user specified. Complete the task by calling tools: read_file and " +
-  "list_dir to inspect, write_file to create or edit, run_command for allowlisted commands. " +
-  "Prefer inspecting before editing. Never ask the user to run a command — call the tool. " +
+  "workspace root the user specified. Complete the task by calling tools: search_files to find " +
+  "where something is, read_file (with offset/limit for large files) and list_dir to inspect, " +
+  "file_info to check a path exists, edit_file to change one exact snippet, write_file to " +
+  "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
+  "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +
+  "Never ask the user to run a command — call the tool. " +
   "Stop calling tools once the task is done and give a concise final answer.";
+
+/**
+ * The agent's system prompt, plus where it actually is.
+ *
+ * Without the root, "what is the exact path?" is a question the agent cannot answer: it has to
+ * spend a tool call on `pwd`, and if that call is denied or fails it reports that it cannot tell.
+ * The root is the user's own setting, so naming it costs nothing and answers the question outright.
+ */
+function agentSystem(root: string): string {
+  const r = root.trim();
+  if (!r) return AGENT_SYSTEM;
+  return (
+    AGENT_SYSTEM +
+    `\n\nYour workspace root is: ${r}. Every relative path resolves inside it — answer questions ` +
+    `about the path from this rather than spending a tool call on \`pwd\`.`
+  );
+}
 
 interface AgentItem {
   name: string;
@@ -83,10 +132,12 @@ function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[
     const node = rec.node("message", clip(content, 120), { role: m.role, model });
     rec.edge(prev, node, "follows");
     // `tool_calls` is `unknown` in the core's message type: the wire shape varies by dialect
-    // and the core does not commit to one. The agent loop normalises to OpenAI's shape.
+    // and the core does not commit to one. A stored transcript may hold either the flat internal
+    // shape or OpenAI's nested one (the agent loop writes the latter), so the name is read
+    // tolerantly rather than assuming whichever shape the current writer produces.
     const calls = (m.tool_calls as ToolCall[] | undefined) ?? [];
     for (const c of calls) {
-      const skill = rec.node("skill", c.name ?? "tool");
+      const skill = rec.node("skill", toolCallName(c));
       rec.edge(node, skill, "used");
       if (c.id) skillByCall.set(c.id, skill);
     }
@@ -106,13 +157,13 @@ function tryParseArgs(raw?: string): Record<string, unknown> {
 }
 
 /**
- * Guard against the mercury-2.5 failure: Playground declares no tools, and a model handed a
+ * Guard against the mercury-2.5 failure: Assistant declares no tools, and a model handed a
  * toolless request will sometimes invent tool-call markup from its agentic training data.
  * Saying so outright in the system turn stops it at the source. Off = raw model behaviour,
  * which is what you want when probing a provider's own prompting.
  */
 const NO_TOOLS_SYSTEM =
-  "You are answering inside AI-Provider Router's Playground — a plain chat console. " +
+  "You are answering inside AI-Provider Router's Assistant — a plain chat console. " +
   "You have no tools, functions, plugins, or file/shell access of any kind. " +
   "Never emit tool-call markup (for example <tool_call>, <|tool_call_start|>, or <function=...>). " +
   "When a request would need a tool, say so in plain prose and describe the steps instead.";
@@ -126,13 +177,245 @@ interface Trace {
   error?: string;
 }
 
-export function PlaygroundScreen() {
-  const tick = useUi((s) => s.tick);
+/**
+ * One of the screen's behavioural switches — agent mode, memory, the no-tools guard.
+ *
+ * These sit under the title rather than beside the model picker because they are not
+ * per-request choices: the picker changes what this one message is sent to, these change how the
+ * screen behaves for everything after. Grouping them with the picker buried a screen-level
+ * setting among request-level controls.
+ */
+function OptionCheck({
+  label,
+  checked,
+  onChange,
+  disabled,
+}: {
+  label: string;
+  checked: boolean;
+  onChange: (v: boolean) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label
+      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
+      style={{ color: "var(--text-dim)" }}
+    >
+      <input
+        type="checkbox"
+        checked={checked}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.checked)}
+      />
+      {label}
+    </label>
+  );
+}
+
+/**
+ * Tool-step ceiling for one agent turn.
+ *
+ * The draft is held as text while the field is focused: clamping on every keystroke would fight
+ * the user — typing "12" passes through "1", and clearing the field to retype it would snap back
+ * to a number mid-edit. The value is clamped when the edit is finished, not while it is in
+ * progress.
+ */
+function StepBudget({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+  disabled?: boolean;
+}) {
+  const [draft, setDraft] = useState(String(value));
+  // Follow the value when it changes from outside this field — hydration, or a reset.
+  useEffect(() => setDraft(String(value)), [value]);
+
+  const commit = () => {
+    // The raw string, not `Number(draft)`: an emptied field must read as "no answer" and fall
+    // back to the default, and `Number("")` is 0 — which would clamp to the minimum and turn a
+    // cleared box into a one-step loop that returns an empty answer and reports success.
+    const next = clampIterations(draft);
+    onChange(next);
+    setDraft(String(next));
+  };
+
+  return (
+    <label
+      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
+      style={{ color: "var(--text-dim)" }}
+      title={
+        disabled
+          ? "only applies in agent mode — without tools there is nothing to step through"
+          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}); the loop also stops as soon as the model answers without calling a tool`
+      }
+    >
+      tool steps
+      <input
+        type="number"
+        min={1}
+        max={MAX_ITERATIONS_CAP}
+        value={draft}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        className="w-14 rounded border px-1 py-0.5 text-[11px]"
+        style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+      />
+    </label>
+  );
+}
+
+/**
+ * The Assistant's settings, persisted under the `assistant` key.
+ *
+ * They are settings rather than per-session state because they describe how the user wants the
+ * screen to behave, not what this one conversation is doing — and the workspace root in
+ * particular is something nobody wants to retype. Same shape the Gateway and Background screens
+ * use: one JSON blob per screen, read on mount, written on change.
+ */
+interface AssistantSettings {
+  root?: string;
+  agentMode?: boolean;
+  useMemory?: boolean;
+  noTools?: boolean;
+  /** Ceiling on tool-calling rounds in one turn. Stored raw; clamped on read, because a value
+   *  written by a future build may sit outside today's bounds and must not crash the screen. */
+  maxIterations?: number;
+}
+
+const ASSISTANT_SETTINGS_KEY = "assistant";
+
+async function loadAssistantSettings(): Promise<AssistantSettings> {
+  try {
+    const raw = await invoke<string | null>("settings_get", { key: ASSISTANT_SETTINGS_KEY });
+    if (!raw) return {};
+    const parsed: unknown = JSON.parse(raw);
+    return parsed && typeof parsed === "object" ? (parsed as AssistantSettings) : {};
+  } catch {
+    return {}; // no stored settings is not an error — it is the first run
+  }
+}
+
+function saveAssistantSettings(s: AssistantSettings): void {
+  // Fire and forget: a failed write must not stop the user from using the screen.
+  void invoke("settings_set", { key: ASSISTANT_SETTINGS_KEY, valueJson: JSON.stringify(s) }).catch(
+    () => undefined,
+  );
+}
+
+export function AssistantScreen() {
+  // `Chat` subscribes to the tick itself (the skills block re-reads on it), so this shell does
+  // not — and not subscribing is what keeps a store bump from tearing down the transcript.
   const [tab, setTab] = useState<"text" | "image">("text");
+  // The switches live here, above `Chat`, so switching Chat/Image does not silently reset them.
+  // `Chat` unmounts on a tab switch; how the user has configured the screen outliving that is
+  // the difference between "the tab changed" and "my settings changed".
+  const [noTools, setNoTools] = useState(true);
+  const [agentMode, setAgentMode] = useState(false);
+  // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
+  // what the model sees and costs a second call, so it has to be possible to turn it off.
+  const [useMemory, setUseMemory] = useState(true);
+  // The tool-step ceiling. It is a setting rather than a constant because it is the one knob
+  // that trades cost against thoroughness per run: a one-shot question wants 1, a real refactor
+  // across a repo doesn't finish in 8.
+  const [maxIterations, setMaxIterations] = useState(DEFAULT_MAX_ITERATIONS);
+  const [root, setRoot] = useState("");
+  // The workspace the host offers as a default, remembered so the UI can say "this is the
+  // default" instead of silently filling a field the user did not fill.
+  const [defaultRoot, setDefaultRoot] = useState<string | null>(null);
+  // A root that will not work is worth saying before the run, not after it. An unusable root
+  // used to reach the model as a blank tool result, which reads as "the agent is broken" rather
+  // than "the path you typed does not exist" — and the model echoes that back.
+  const [rootError, setRootError] = useState<string | null>(null);
+  // Nothing is written until the stored settings have been read. Without this the first render
+  // would save the defaults over whatever the user had actually chosen.
+  const [hydrated, setHydrated] = useState(false);
+
+  // Hydrate: stored settings first, then the host's default workspace, then empty.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const [stored, fallback] = await Promise.all([loadAssistantSettings(), fetchDefaultRoot()]);
+      if (cancelled) return;
+      if (typeof stored.noTools === "boolean") setNoTools(stored.noTools);
+      if (typeof stored.agentMode === "boolean") setAgentMode(stored.agentMode);
+      if (typeof stored.useMemory === "boolean") setUseMemory(stored.useMemory);
+      // Clamped, not trusted: the stored JSON is ours but not written by this build.
+      if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
+      setDefaultRoot(fallback);
+      setRoot(stored.root ?? fallback ?? "");
+      setHydrated(true);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // One literal, not one per write site. The switches used to be serialised twice — adding a
+  // field meant editing both, and forgetting one saved a settings object with the new key
+  // missing, which reads back as "the user never changed it".
+  const saveAll = useCallback(
+    () => saveAssistantSettings({ root, agentMode, useMemory, noTools, maxIterations }),
+    [root, agentMode, useMemory, noTools, maxIterations],
+  );
+
+  // The debounced write below must serialise the state as it is WHEN IT FIRES, not as it was
+  // when it was scheduled. `setTimeout(saveAll, 400)` captures the `saveAll` of the render that
+  // scheduled it, and this effect only re-runs on `root` — so a switch toggled inside the
+  // debounce window was written, then overwritten with the pre-toggle snapshot. A human is
+  // slower than 400 ms and never saw it; a driver is not, and the setting silently reverted.
+  const latestSave = useRef(saveAll);
+  latestSave.current = saveAll;
+
+  // Persist. The switches are single clicks, so they are written immediately.
+  useEffect(() => {
+    if (!hydrated) return;
+    saveAll();
+    // `root` is written by the debounced effect below; depending on it here would write twice.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations]);
+
+  // ...but the root is typed one character at a time, so it is debounced instead.
+  useEffect(() => {
+    if (!hydrated) return;
+    const t = window.setTimeout(() => latestSave.current(), 400);
+    return () => window.clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [hydrated, root]);
+
+  // Judge the workspace root against the same rule the host enforces.
+  useEffect(() => {
+    if (!agentMode || !root.trim()) {
+      setRootError(null);
+      return;
+    }
+    let cancelled = false;
+    invoke("tools_check_root", { root: root.trim() })
+      .then(() => {
+        if (!cancelled) setRootError(null);
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        const msg = String(e);
+        // "I could not check" is not "I checked and it is unusable" — an older backend without
+        // this command must not be the reason Send is disabled.
+        setRootError(/not found/i.test(msg) ? null : msg);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [agentMode, root]);
+
   return (
     <div className="mx-auto flex h-full max-w-3xl flex-col">
-      <div className="mb-3 flex items-center gap-3">
-        <h1 className="text-[20px] font-semibold">Playground</h1>
+      <div className="mb-2 flex items-center gap-3">
+        <h1 className="text-[20px] font-semibold">Assistant</h1>
         <div className="ml-auto flex gap-1 rounded border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
           {(["text", "image"] as const).map((t) => (
             <button
@@ -146,7 +429,39 @@ export function PlaygroundScreen() {
           ))}
         </div>
       </div>
-      {tab === "text" ? <Chat key={tick} /> : <ImageBox />}
+      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5">
+        <OptionCheck label="agent mode" checked={agentMode} onChange={setAgentMode} />
+        <OptionCheck label="memory" checked={useMemory} onChange={setUseMemory} />
+        <OptionCheck
+          label="tell the model it has no tools"
+          checked={noTools}
+          onChange={setNoTools}
+          disabled={agentMode}
+        />
+        <StepBudget
+          value={maxIterations}
+          onChange={setMaxIterations}
+          disabled={!agentMode}
+        />
+      </div>
+      {/* No `key={tick}` here. Keying on the tick remounted Chat on every store bump, which
+          wiped the conversation mid-session — a settings save took the transcript with it.
+          Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
+          and the model list comes from the store. */}
+      {tab === "text" ? (
+        <Chat
+          noTools={noTools}
+          agentMode={agentMode}
+          useMemory={useMemory}
+          maxIterations={maxIterations}
+          root={root}
+          rootError={rootError}
+          defaultRoot={defaultRoot}
+          onRootChange={setRoot}
+        />
+      ) : (
+        <ImageBox />
+      )}
     </div>
   );
 }
@@ -188,7 +503,7 @@ function ToolCallChip({ seg }: { seg: ToolSegment }) {
       ))}
       {seg.complete && (
         <div className="mt-1.5 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          Playground has no tool layer — this was model output, not a real function call.
+          Assistant has no tool layer — this was model output, not a real function call.
         </div>
       )}
     </div>
@@ -216,7 +531,30 @@ function AssistantContent({ raw }: { raw: string }) {
   );
 }
 
-function Chat() {
+/**
+ * `noTools`, `agentMode`, `useMemory` and `root` are owned by `AssistantScreen`, which renders
+ * the switches under the title and persists all four as settings. `Chat` only consumes them —
+ * one source of truth, and a tab switch cannot silently reset what the user chose.
+ */
+function Chat({
+  noTools,
+  agentMode,
+  useMemory,
+  maxIterations,
+  root,
+  rootError,
+  defaultRoot,
+  onRootChange,
+}: {
+  noTools: boolean;
+  agentMode: boolean;
+  useMemory: boolean;
+  maxIterations: number;
+  root: string;
+  rootError: string | null;
+  defaultRoot: string | null;
+  onRootChange: (v: string) => void;
+}) {
   const tick = useUi((s) => s.tick);
   const [model, setModel] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>([]);
@@ -224,21 +562,16 @@ function Chat() {
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
-  const [noTools, setNoTools] = useState(true);
-  const [agentMode, setAgentMode] = useState(false);
-  // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
-  // what the model sees and costs a second call, so it has to be possible to turn it off.
-  const [useMemory, setUseMemory] = useState(true);
-  const [root, setRoot] = useState("");
   const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (ok: boolean) => void } | null>(null);
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
+  const [showPolicy, setShowPolicy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   // P4: the context graph is recorded as the conversation happens. `activeSession` rather than
-  // `startSession` because this component is keyed on the UI tick and remounts — a fresh
-  // session each time would fragment one conversation into unrelated threads.
+  // `startSession` so any remount — switching tabs, for one — reuses the open session instead of
+  // fragmenting one conversation into unrelated threads.
   const ctxRef = useRef<Recorder | null>(null);
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
@@ -262,14 +595,20 @@ function Chat() {
       .catch(() => undefined);
   }, [tick]);
 
+  // Surface the live sandbox allowlist once when agent mode is first enabled.
+  useEffect(() => {
+    if (!agentMode || policy) return;
+    void fetchToolsPolicy().then(setPolicy).catch(() => setPolicy(null));
+  }, [agentMode, policy]);
+
+  // Follow the turn as it arrives. The plain-chat path scrolls itself while streaming, but agent
+  // mode grows the transcript from tool events too and used to leave the newest line offscreen.
+  useEffect(() => {
+    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+  }, [streamedText, agentItems]);
+
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
-
-  // Surface the live sandbox allowlist once when agent mode is first enabled.
-  const onToggleAgent = (next: boolean) => {
-    setAgentMode(next);
-    if (next && !policy) fetchToolsPolicy().then(setPolicy).catch(() => setPolicy(null));
-  };
 
   // Per-call confirmation gate: suspend the loop until the user allows or denies.
   const confirmGate = useCallback(
@@ -355,25 +694,18 @@ function Chat() {
       if (recalled.length > 0) recordRecall(userNode, recalled);
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
-      const history: ChatMessage[] = [
-        ...msgs
-          .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls))
-          .map((m) => ({
-            role: m.role,
-            content: m.content,
-            ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-            ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-          })) as ChatMessage[],
-        { role: "user", content: text },
-      ];
+      const history: ChatMessage[] = [...replayHistory(msgs), { role: "user", content: text }];
       try {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: AGENT_SYSTEM + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
+          system: agentSystem(root) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
           registry: AGENT_TOOLS,
           generate: (req, opts) => router.generateText(req, opts),
           host,
+          // Clamped again at the call site: this is the number that actually bounds the spend,
+          // and it is reached from a setting that a future build may have written differently.
+          maxIterations: clampIterations(maxIterations),
           confirm: confirmGate,
           onEvent: handleAgentEvent,
           signal: ac.signal,
@@ -439,11 +771,10 @@ function Chat() {
     if (recalled.length > 0) recordRecall(userNode, recalled);
     let streamed = "";
     try {
-      // A stopped or failed turn leaves an empty assistant bubble behind; replaying it would
-      // send { role: "assistant", content: "" }, which most providers reject with 400.
-      const history = msgs
-        .filter((m) => m.content.trim().length > 0)
-        .map((m) => ({ role: m.role, content: m.content }));
+      // The same replay the agent path uses. Sharing it is the fix: this path used to map only
+      // {role, content}, so a session that had used agent mode sent its tool results with no
+      // tool_call_id and the provider answered 400.
+      const history = replayHistory(msgs);
       // Recalled memory goes in its own system message, never spliced into the user's text:
       // the model must be able to tell the difference between what was just said and what was
       // remembered from an earlier conversation.
@@ -512,35 +843,42 @@ function Chat() {
       <div className="mb-2 flex items-center gap-2">
         <ModelPicker modality="text" value={chosen} onChange={setModel} />
         <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{chosen || "—"}</span>
-        <label className="ml-auto flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
-          <input type="checkbox" checked={noTools} onChange={(e) => setNoTools(e.target.checked)} disabled={agentMode} />
-          tell the model it has no tools
-        </label>
-        <label className="flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
-          <input type="checkbox" checked={agentMode} onChange={(e) => onToggleAgent(e.target.checked)} />
-          agent mode
-        </label>
-        <label className="flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
-          <input type="checkbox" checked={useMemory} onChange={(e) => setUseMemory(e.target.checked)} />
-          memory
-        </label>
+        {/* The switches are under the title now (AssistantScreen) — this row is per-request
+            only: what this message is sent to. */}
       </div>
 
       {agentMode && (
-        <div className="mb-2 flex items-center gap-2">
-          <span className="shrink-0 text-[11px]" style={{ color: "var(--text-dim)" }}>root</span>
-          <input
-            value={root}
-            onChange={(e) => setRoot(e.target.value)}
-            placeholder="/absolute/path the tools are confined to"
-            className={`${inputCls} flex-1`}
-            style={inputStyle}
-          />
+        <div className="mb-2">
+          <div className="flex items-center gap-2">
+            <span className="shrink-0 text-[11px]" style={{ color: "var(--text-dim)" }}>root</span>
+            <input
+              value={root}
+              onChange={(e) => onRootChange(e.target.value)}
+              placeholder="/absolute/path the tools are confined to"
+              className={`${inputCls} flex-1`}
+              style={rootError ? { ...inputStyle, borderColor: "var(--danger)" } : inputStyle}
+              aria-invalid={rootError ? true : undefined}
+            />
+          </div>
+          {rootError ? (
+            <p className="mt-1 text-[11px]" style={{ color: "var(--danger)" }}>{rootError}</p>
+          ) : root.trim() && root.trim() === defaultRoot ? (
+            // Say it is the default. A filled field the user did not fill is otherwise
+            // indistinguishable from one they did, and the agent will write there.
+            <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              default workspace — tools are confined to this folder
+            </p>
+          ) : null}
         </div>
       )}
       {agentMode && policy && (
         <div className="mb-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          sandbox: {policy.programs.slice(0, 10).join(", ")}… · git without push/pull/fetch/clone · capped at {policy.max_command_ms}ms · {policy.max_output_bytes / 1024}KB out
+          <button className="underline decoration-dotted" onClick={() => setShowPolicy((v) => !v)}>
+            sandbox · {policy.programs.length} programs · git without push/pull/fetch/clone · capped at {policy.max_command_ms}ms · {policy.max_output_bytes / 1024}KB out
+          </button>
+          {showPolicy && (
+            <div className="mono mt-1 break-all">{policy.programs.join(", ")}</div>
+          )}
         </div>
       )}
 
@@ -614,7 +952,7 @@ function Chat() {
         {busy ? (
           <Button variant="danger" onClick={() => abortRef.current?.abort()}>■ Stop</Button>
         ) : (
-          <Button variant="primary" disabled={!chosen || (agentMode && !root.trim())} onClick={() => void send()}>Send</Button>
+          <Button variant="primary" disabled={!chosen || (agentMode && (!root.trim() || !!rootError))} onClick={() => void send()}>Send</Button>
         )}
       </div>
 
@@ -635,14 +973,21 @@ function Chat() {
 /** Compact, collapsible view of a tool-result turn persisted in the transcript. */
 function ToolResultBubble({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
+  // An empty result used to render as "tool result · " with nothing after it — indistinguishable
+  // from a collapsed result the user simply had not opened, and the reason a run could end with
+  // "the tool results came back empty" and no clue why. Say it outright.
+  const empty = content.trim().length === 0;
   const preview = content.replace(/\n/g, " ").slice(0, 70);
   return (
-    <div className="rounded border px-2.5 py-1.5" style={{ borderColor: "var(--border)", background: "var(--surface-2)" }}>
+    <div className="rounded border px-2.5 py-1.5" style={{ borderColor: empty ? "var(--warn)" : "var(--border)", background: "var(--surface-2)" }}>
       <button className="mono text-[11px]" style={{ color: "var(--text-dim)" }} onClick={() => setOpen((v) => !v)}>
-        {open ? "▾" : "▸"} tool result{open ? "" : ` · ${preview}${content.length > 70 ? "…" : ""}`}
+        {open ? "▾" : "▸"} tool result
+        {open ? "" : ` · ${empty ? "(no output)" : `${preview}${content.length > 70 ? "…" : ""}`}`}
       </button>
       {open && (
-        <pre className="mono mt-1 max-h-60 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text)" }}>{content}</pre>
+        <pre className="mono mt-1 max-h-60 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text)" }}>
+          {empty ? "(no output — the tool returned nothing, and said nothing about why)" : content}
+        </pre>
       )}
     </div>
   );

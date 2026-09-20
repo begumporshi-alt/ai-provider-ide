@@ -1,10 +1,10 @@
 /**
  * Agent orchestrator dashboard (P6).
  *
- * Answers the two questions the Playground cannot, because it discards the run when the turn
+ * Answers the two questions the Assistant cannot, because it discards the run when the turn
  * ends: what did the agent actually do, and can I stop it.
  *
- * Stop works across screens on purpose. The run is started by the Playground but registered in
+ * Stop works across screens on purpose. The run is started by the Assistant but registered in
  * a module-level controller map, so this dashboard can abort a run it did not begin — which is
  * the whole point of an orchestrator view.
  *
@@ -98,7 +98,7 @@ export function AgentsScreen() {
       </div>
 
       {runs.length === 0 ? (
-        <EmptyState title="No agent runs yet. Turn on agent mode in the Playground, set a workspace root, and give it a task — every run is recorded here step by step." />
+        <EmptyState title="No agent runs yet. Turn on agent mode in the Assistant, set a workspace root, and give it a task — every run is recorded here step by step." />
       ) : (
         <div className="flex gap-3">
           <div className="min-w-0 flex-1">

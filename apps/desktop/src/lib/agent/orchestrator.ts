@@ -11,7 +11,7 @@
  * this module that is allowed to change what the agent does.
  *
  * The registry is module-level, not React state, because the run outlives the component that
- * started it — you can navigate to the dashboard and stop a run that the Playground began.
+ * started it — you can navigate to the dashboard and stop a run that the Assistant began.
  */
 import {
   agentRunFinish,

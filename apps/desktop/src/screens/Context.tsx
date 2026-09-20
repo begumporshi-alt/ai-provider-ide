@@ -223,9 +223,9 @@ export function ContextScreen() {
         <EmptyState
           title={
             mode === "conversation"
-              ? "No context recorded yet. Messages, artifacts, skills and memories appear here as the Playground records them."
+              ? "No context recorded yet. Messages, artifacts, skills and memories appear here as the Assistant records them."
               : mode === "routing"
-                ? "No routing data yet. Send a request in the Playground and the requested-to-served chain appears here."
+                ? "No routing data yet. Send a request in the Assistant and the requested-to-served chain appears here."
                 : "No requests yet. The last 60 requests and the providers they touched appear here."
           }
         />
