@@ -196,11 +196,16 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
 - `cd apps/desktop && [ -d test-results ] && mv test-results /tmp/x-$(date +%s) ; env -u HTTP_PROXY
   -u HTTPS_PROXY -u http_proxy -u https_proxy -u ALL_PROXY -u all_proxy npx playwright test
   --reporter=list --output=/tmp/pw`
-- **Three mandatory workarounds, each of which looks like something else:** `env -u` the proxy vars
-  (readiness check dies at 60s); move `test-results` aside (Playwright's cleanup trips the safe-delete
-  shim at 2389 files vs a 50 threshold); run **outside the sandbox** (a sandboxed run cannot bind
-  :1430, so vite times out at 60s while the mock looks healthy). `reuseExistingServer` does not rescue
-  it and is ignored when `CI` is set.
+- **Two workarounds, each of which looks like something else:** `env -u` the proxy vars (readiness
+  check dies at 60s); move `test-results` aside (Playwright's cleanup trips the safe-delete shim at
+  2389 files vs a 50 threshold). `reuseExistingServer` does not rescue it and is ignored when `CI`
+  is set.
+- **Corrected 2026-09-20: "run outside the sandbox" is no longer true.** It used to be listed as a
+  third mandatory workaround (a sandboxed run allegedly could not bind :1430, so vite timed out at
+  60s). `bash scripts/ci-local.sh` ran the full browser suite **inside** the sandbox: 53 passed in
+  50.1s, as part of an ALL GREEN gate. What actually matters is the proxy vars being unset and
+  `test-results` moved aside — both of which `ci-local.sh` does for you. Prefer the script to a
+  hand-rolled `npx playwright test`.
 - Seeds `?seed=systemai` and `?seed=or-router`; provider *names* matter ("Mock Oracle" exists only in
   the wizard story).
 - `__webTest`: `store.*` read-only views, `emit()`, `invoke(cmd,args)` and `gatewayStatus(partial)` to
@@ -516,3 +521,204 @@ handling, the fix belongs in retry/continuation, not in the error class.
 **Fix generalises past Agnes:** the tool-result pair was re-tested on **Cline**
 (`cline/anthropic/claude-sonnet-4.5`), a different provider and an Anthropic-family model — 200
 direct and 200 through the gateway, with two `ok` ledger rows.
+
+## Test counts (measured 2026-09-20)
+router-core **231** · desktop vitest **151** (14 files) · Rust `cargo test --lib` **267** · browser
+**53**. (Rust was 254 before the gateway tool-audit + context-graph work added 13 on 2026-09-20.)
+Supersedes the older numbers in *Testing*.
+
+## The local gate: `pnpm ci:local` (`scripts/ci-local.sh`)
+Mirrors `ci.yml` step for step, adds a Node >= 19 preflight, and unsets the proxy vars. Skips
+`pnpm install` by default; `--install` to include it, `--skip-browser` to drop the ~48s Playwright
+run. **Use this, not CI** (see next).
+
+## CI is dead for billing reasons, not code (since ~2026-09-16)
+Every run reports `failure` in ~8s with "The job was not started because recent account payments
+have failed or your spending limit needs to be increased". Do not chase it as a regression. Run
+locally instead: `pnpm typecheck` · `pnpm test` (managed Node 22 on PATH) · `pnpm key-leak-grep` ·
+`pnpm check-ts-version` · `cargo check` + `cargo test` under `apps/desktop/src-tauri` ·
+`pnpm --filter ai-provider-router-desktop web-test` (53, `mv test-results /tmp/...` first).
+
+## Gotchas that each cost real time (distilled 2026-09-20)
+- **Managed Node 22 must be first on PATH** (`~/.workbuddy-ai/binaries/node/versions/22.22.2-2/bin`)
+  for JS tests. Under system Node 18 `pnpm -r test` dies with `ReferenceError: crypto is not
+  defined` in `provider-registry.ts` — 27 failures that look exactly like a regression and are not.
+  Probing `typeof globalThis.crypto` returns "object" on BOTH interpreters, so that check misleads;
+  trust the suite result instead.
+- **`apps/desktop/e2e/` is LIVE — I once concluded the opposite.** `vitest.config.ts` sets
+  `include: ["e2e/**/*.test.ts", "src/**/*.test.ts"]`, so all four specs (`acceptance` 9,
+  `onboarding` 6, `code-adapter` 6, `drift-repair` 6) run under `pnpm test` — 27 of the desktop 151.
+  They are **vitest** specs driving real HTTP against spawned mock providers, not Playwright, so
+  they need no script entry. Grepping `package.json`/`ci.yml` for "e2e" finds nothing and will
+  mislead you; `playwright.config.ts`'s `testDir: "./web-test"` is the separate browser harness.
+  *Lesson: absence of a reference is not evidence a thing does not run — check the runner's glob.*
+- **ci.yml has no build step.** It typechecks and tests but never bundles, so a change that
+  typechecks and passes tests can still fail `vite build` while CI stays green. `pnpm ci:local`
+  adds a Build step for exactly this.
+- **`pnpm install` is destructive here.** The broker denies pnpm's symlink writes
+  (`ERR_PNPM_CODEBUDDY_BROKER_DENY ... EEXIST`) and it fails *after* unlinking entries, leaving
+  `packages/adapter-spec/node_modules/typescript` and `packages/router-core/node_modules/typescript`
+  missing — which breaks `pnpm typecheck` with `Cannot find module .../typescript/bin/tsc`. Running
+  outside the sandbox does NOT help; the denial is broker-level. Repair by re-linking by hand:
+  `ln -s ../../../node_modules/.pnpm/typescript@6.0.3/node_modules/typescript packages/<pkg>/node_modules/typescript`
+- **Never call an installed build stale from a missing `strings` hit alone.** `search_files` is a
+  shipped literal (`tools.rs:805`) yet absent from `strings` of a *freshly built* binary — as are
+  `read_file`, `run_command`, `edit_file`, while `write_file`, `list_dir`, `grep` appear. Confirm a
+  string is extractable in a new build before treating its absence as staleness; `history_sessions`
+  and the tool-refusal message are extractable and reliable.
+- **Cargo needs `export PATH="$HOME/.cargo/bin:$PATH"`.** `cargo check --lib` ~3s, `--all-targets`
+  ~4s once deps are warm.
+
+## Sandbox tool policy — audited 2026-09-20 (verdict: robust)
+`src-tauri/src/tools.rs`. Five layers, each closing a class: (1) **no shell** —
+`Command::new(prog).args(argv)`, never `sh -c`, so `;`, `&&`, `|`, backticks and `$(...)` are inert
+text; (2) **allowlist** of ~32 programs + `git` restricted to non-network subcommands; (3) **root
+confinement** via `resolve_within` (no absolute path, no `..`, canonicalize + re-check defeats
+symlinks); (4) **bounded** — `env_clear`, 60s command timeout, output/byte caps, scrubbed env;
+(5) **mutation gated host-side on the gateway** (`MUTATING_TOOLS = [write_file, edit_file, mkdir,
+run_command]`, default off, enforced in `gateway_tool_run`).
+- Two things that LOOK like holes and are not: `gateway_set_workspace_root` used to check only
+  `path.exists()`, but `tool_run` calls `validate_root` on EVERY call, so a bad root was never
+  exploitable; and the gateway DOES have a tool budget —
+  `MAX_TOOL_ITERATIONS = DEFAULT_MAX_ITERATIONS` (`gateway-bridge.ts:86`).
+- `validate_root` refuses `/`, `$HOME`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/private`, and
+  non-directories. Refusing beats clamping (silently rewriting `/` would hand over a workspace the
+  user did not ask for).
+- Accepted, not missing: read tools can read workspace-resident secrets (a committed `.env`). That
+  is the risk you accept by pointing the agent at a folder.
+
+## Gateway tool audit trail (implemented 2026-09-20)
+`gateway_cmds.rs`. Before: `_request_id` was accepted and **discarded**, and the log line was
+`tool run: <name> in <root>` — no arguments, no outcome, no correlation id. Now logged after the
+call as `tool req=<id> tool=<name> root=<r> args=<digest> -> ok=<b> out=<n>B err=<trunc>`; refusals
+log `-> REFUSED:`.
+- **The result body is never logged** — for `read_file` it IS the file's contents. Only ok, byte
+  count and a bounded error.
+- **`tool_arg_digest` redacts bodies to lengths**: `write_file` content and `edit_file` old/new
+  become byte counts. Logging them verbatim would make `gateway.log` the leak the audit exists to
+  catch. Paths, patterns and `run_command` program+argv ARE logged (300/200-char caps) — the
+  Assistant's confirmation modal already shows them, so the log is no wider than the UI.
+- `truncate_chars` cuts on **char** boundaries: `&s[..n]` panics mid-UTF-8 and a model controls
+  that string.
+- Pure and separate from the command so it is testable without an `AppHandle` — the same reasoning
+  as `gateway_tool_refusal` living on `GatewayCore`.
+
+## Sandbox tool argument keys (verified by reading each handler)
+`read_file` path/offset/limit · `write_file` path,content · `list_dir` path,recursive ·
+`file_info` path · `search_files` pattern,path,case_sensitive · `edit_file`
+path,old,new,replace_all · `mkdir` path · `run_command` program,args.
+
+## Skills are frontend-only; the gateway is blind to them
+Bodies live in the SQLite `skills` table (migration `0004_skills`), not files. Consumed ONLY in
+`Assistant.tsx` (~581-596 builds `skillsBlock` from enabled skills; ~702 concatenates
+`agentSystem(root) + skillsBlock + memoryBlock` into the system prompt). No `skill` reference exists
+in any `gateway*.rs`; the only router-core hit is a cosmetic display-name map (`skill: "Skill"`,
+`gateway-normalizer.ts:477`). Keep it that way — skills in the gateway would bill tokens on every
+request from every client and make instructions invisible at a layer with no review step.
+
+## Gateway → context graph wiring (implemented 2026-09-20, "Fix 3", Route A)
+`GatewayState` now carries `store: Arc<Store>` — it previously held only `core` and `server`, so
+`context::record` was unreachable from `gateway_tool_run` and gateway tool runs existed only as
+lines in `gateway.log`. Two construction sites: `gateway_cmds.rs::manage()` (production, pulls the
+Arc back out with `(*app.state::<Arc<Store>>()).clone()` — `app.manage(store)` already ran earlier
+in lib.rs setup, and cloning matters because every other command needs the same store) and
+`gateway_tests.rs` (test, via a new `gateway_test_store(tag)` temp-dir helper).
+- `record_gateway_tool_call(store, request_id, tool, digest, ok, out_bytes, refused)` writes one
+  `skill`-kind node (the kind the Assistant already uses for a tool call; the set of four is
+  deliberately closed), `source: "gateway"`, id `gateway:<request_id>:<tool>:<ts>`.
+- **Spawned, never awaited.** `context::record` takes `store.conn.lock()` — the same connection
+  the ledger writes to — so awaiting inline would put a lock acquisition on the request path.
+  Fire-and-forget mirrors the Assistant's `BufferedRecorder.flush()`.
+- **`session_id: None` is load-bearing.** `context::sessions` excludes unsessioned nodes, so a
+  gateway call lands in the Context graph without inventing a History row that has no messages.
+  Proved by test: setting it to a real session id makes two tests fail.
+- The node carries the **digest, never the result** — for `read_file` the result IS the file's
+  contents and the graph is plaintext on disk.
+- Refused calls are recorded too (`refused: true`); they are the ones most worth having.
+
+## Tauri commands: extract the body so it is testable (the house pattern)
+A `#[tauri::command]` cannot be unit-tested — it needs an `AppHandle`. So put the logic in a
+`pub(crate) fn` and leave the command as a 2–3 line wrapper. Done three times now:
+`gateway_tool_refusal` on `GatewayCore` ("the decision lives here rather than in the command so it
+can be tested without an `AppHandle`"), then `run_gateway_tool`, then `set_gateway_workspace_root`.
+- **Inject the logger as `&dyn Fn(&str)`, not `Option<&AppHandle>`.** With an Option the test
+  skips logging entirely and the log format goes unasserted; with a closure the test captures the
+  lines and can assert them. Prod: `let log = |line: &str| log_to_file(&app, line);`
+  Test: push into a `Mutex<Vec<String>>` (or `RefCell`) and read it back.
+- Tests for `run_gateway_tool`/`set_gateway_workspace_root` live in `gateway_tests.rs`, which
+  already has `test_core()` and `gateway_test_store()`; `tool_test_state(tag)` builds a full
+  `GatewayState` on a temp workspace root.
+- **Why it was worth doing:** testing a helper directly proves the helper works, not that the
+  command calls it. Deleting the two `record_gateway_tool_call(...)` call sites inside
+  `run_gateway_tool` left all 10 helper tests passing — only the 3 extracted-body tests failed.
+  That asymmetry is the reason to extract.
+
+## Verifying on an installed build (the gate is not enough)
+`pnpm ci:local` typechecks, tests and *vite*-builds — but never bundles a Tauri app. Do this
+before committing anything touching Rust:
+1. `cd apps/desktop && [ -d dist ] && mv dist /tmp/old-dist-$(date +%s)` — **mandatory**, tauri
+   dies at `beforeBuildCommand` without it.
+2. `export PATH="$HOME/.workbuddy-ai/binaries/node/versions/22.22.2-2/bin:$HOME/.cargo/bin:$PATH"`
+   then `npx tauri build --bundles app` (skips the failing DMG step). ~3 min.
+3. `pkill -f ai-provider-router`; `mv "/Applications/AI-Provider Router.app" /tmp/old-app-$(date +%s)`
+   (never `rm -rf`); `cp -R <bundle> /Applications/`. Quote the path — the name has a space.
+4. `open -a "AI-Provider Router"`, wait ~25s (post-reinstall keychain ACL renegotiation costs
+   ~15s and looks like a hang), then: `pgrep -fl ai-provider-router`; tail
+   `~/Library/Application Support/dev.aiprovider.router/gateway.log` for `startup:` markers and
+   `enabled on port`; `curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/v1/models`
+   → 401 means the listener is alive and auth is enforced. (`ps` is sandbox-blocked; use `pgrep`.)
+- **The gateway tool path cannot be reached from the UI.** `run_gateway_tool` is called only by an
+  external client sending a tool-using request to the local gateway; the Assistant goes through the
+  agent loop with its own confirmation and never touches it. Exercising it end to end needs the
+  gateway master key.
+
+## Exercising gateway tools end to end (verified 2026-09-20 on an installed build)
+**The gotcha that cost a wrong hypothesis:** gateway tools only engage when the client brings
+**no `tools` field** — `gateway-bridge.ts:160`, `if (!clientTools) { gatewayTools = await
+invoke("get_tools_enabled") }`. Send a request with your own `tools` array and it is pure
+pass-through: the declared tool is forwarded upstream, the model's `tool_calls` come straight back
+to you, and `gateway_tool_run` is never invoked — so no audit line and no context node. I first
+read that as "gateway tools are off"; they are on by default (`tools_enabled: AtomicBool::new(true)`,
+pinned by `tools_are_enabled_by_default`). **Omit `tools` entirely** to exercise the gateway path.
+- Working recipe (no `tools` key, master key in the header, `--noproxy '*'` / `ProxyHandler({})`):
+  POST `http://127.0.0.1:8787/v1/chat/completions`, model `cline/anthropic/claude-sonnet-4.5`,
+  prompt "List the files in the current directory using your tools…".
+- Then verify: `grep "tool req=" ~/Library/Application\ Support/dev.aiprovider.router/gateway.log`
+  and `sqlite3 "file:<db>?mode=ro" "SELECT id,source,session_id,meta_json FROM context_nodes WHERE id LIKE 'gateway:%'"`.
+- **Observed, both paths, on the real build:**
+  `tool req=39 tool=list_dir root=/Users/tushershikder/AI-Provider-Router-Workspace args=path=. -> ok=true out=55B err=-`
+  `tool req=40 tool=write_file args=path=. content=0B -> REFUSED: "write_file" is disabled on the gateway…(+8 chars)`
+  Nodes: `gateway:39:list_dir:…` source `gateway`, session_id NULL, meta `{"args":"path=.","ok":true,"out_bytes":55,"refused":false,…}`.
+  The mutating call was **refused**, the file was **not written**, and the model relayed the
+  "enable it in Gateway settings, or use the Assistant" escape hatch — the refusal message works.
+- Default gateway workspace root is `~/AI-Provider-Router-Workspace` (not cwd, not `$HOME`).
+- Redaction holds in production: a canary string in a `write_file` body appeared in neither
+  `gateway.log` nor any `context_nodes` row.
+
+## Releasing / bumping the version (first done 2026-09-20 for v1.0.0)
+Four files must move together — Tauri v2 fails the build when `tauri.conf.json` and `Cargo.toml`
+disagree:
+- `apps/desktop/package.json` → `version`
+- `apps/desktop/src-tauri/tauri.conf.json` → `version`
+- `apps/desktop/src-tauri/Cargo.toml` → `[package] version`
+- `apps/desktop/src-tauri/Cargo.lock` → the `ai-provider-router` entry. It does not follow the
+  manifest until cargo runs, so edit it or let cargo rewrite it, then assert:
+  `cargo metadata --offline --locked --format-version 1 --no-deps` (non-zero exit = drift).
+
+**Two decoys that read "0.1.0" and are NOT the app version:** the `skills` table column default in
+`store.rs` (part of a shipped migration — changing it breaks migration tests) and the builtin skill
+versions in `skills.rs`. Also three third-party crates at 0.1.0 in `Cargo.lock` (byteorder-lite and
+friends) and an illustrative updater path in `SIGNING.md:94`. `git grep 0\.1\.0` catches all six;
+bump only the four above.
+
+No frontend code reads the app version — there is no `getVersion` / `CARGO_PKG_VERSION` anywhere
+under `apps/desktop/src` — so a bump needs no UI change.
+
+`cargo` is not on PATH in a non-login shell: `export PATH="$HOME/.cargo/bin:$PATH"`.
+
+Recipe: commit the bump alone → `git tag -a vX.Y.Z -m '<msg>' <sha>` → `git push origin main` then
+`git push origin vX.Y.Z`. Verify with `git ls-remote origin refs/tags/v1.0.0^{}` — an annotated tag
+has its own object sha; the `^{}` deref is what reveals the commit it points at.
+`gh` is not installed, so no GitHub Release page can be created from here; the tag is the release.
+**v1.0.0 = `d2aa481`** and deliberately excludes the gateway tool-audit work (it was cut first,
+per instruction), which landed as a later commit.
