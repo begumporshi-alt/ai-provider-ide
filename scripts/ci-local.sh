@@ -78,6 +78,9 @@ else
 fi
 step "Typecheck"              pnpm typecheck
 step "Unit tests"             pnpm test
+# ci.yml has no build step at all, so nothing in CI would catch a bundle that no
+# longer compiles -- typecheck passing does not mean vite can bundle it.
+step "Build"                  pnpm build
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
 
