@@ -127,7 +127,7 @@ describe("A7 zero-AI onboarding bootstrap", () => {
     expect(orch.session.state).toBe("human_confirmation");
   });
 
-  it("enables the provider and serves a Playground request with zero AI calls", async () => {
+  it("enables the provider and serves an Assistant request with zero AI calls", async () => {
     const p = harness.registry.providerBySlug("mock")!;
     const orch = new OnboardingOrchestrator(harness.http, memoryPersistence());
     await orch.resume({
