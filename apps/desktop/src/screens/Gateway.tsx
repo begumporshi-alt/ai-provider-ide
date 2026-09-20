@@ -58,6 +58,9 @@ export function GatewayScreen() {
   // Mirrors the Rust default (GatewayCore::new) so the toggle does not flash "Disabled"
   // for a beat before the invoke resolves.
   const [toolsEnabled, setToolsEnabled] = useState<boolean>(true);
+  // Audit H1b: gateway mutation (write_file / run_command) is OFF by default — the gateway has
+  // no confirmation UI, unlike the Assistant. Mirrors the Rust default so it does not flash.
+  const [mutationEnabled, setMutationEnabled] = useState<boolean>(false);
   // R4
   const [appKeys, setAppKeys] = useState<AppKey[]>([]);
   const [newKeyLabel, setNewKeyLabel] = useState("");
@@ -70,6 +73,7 @@ export function GatewayScreen() {
   const refresh = useCallback(() => {
     invoke<GatewayStatus>("gateway_status").then(setStatus).catch((e) => setError(String(e)));
     invoke<boolean>("get_tools_enabled").then(setToolsEnabled).catch(() => {});
+    invoke<boolean>("get_tools_mutation_enabled").then(setMutationEnabled).catch(() => {});
   }, []);
 
   const refreshKeys = useCallback(() => {
@@ -196,6 +200,16 @@ export function GatewayScreen() {
     try {
       await invoke("set_tools_enabled", { enabled: !toolsEnabled });
       setToolsEnabled((prev) => !prev);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function toggleMutation() {
+    setError(null);
+    try {
+      await invoke("set_tools_mutation_enabled", { enabled: !mutationEnabled });
+      setMutationEnabled((prev) => !prev);
     } catch (e) {
       setError(String(e));
     }
@@ -394,7 +408,7 @@ export function GatewayScreen() {
         <h2 className="mb-1 text-[14px] font-semibold">Monthly spend cap</h2>
         <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
           Stops a runaway consumer — an agent loop in a connected IDE — from spending past a budget. Month-to-date is
-          measured from the ledger at the UTC month boundary and counts <b>all</b> router usage (Playground and generator
+          measured from the ledger at the UTC month boundary and counts <b>all</b> router usage (Assistant and generator
           included), not just gateway traffic, so it is a real ceiling on what you pay. When it is reached the gateway
           answers 402 instead of forwarding. Leave blank to disable.
         </p>
@@ -507,6 +521,26 @@ export function GatewayScreen() {
             onClick={() => void toggleTools()}
           >
             {toolsEnabled ? "Enabled" : "Disabled"}
+          </Button>
+        </div>
+
+        <div className="mt-3 flex items-center justify-between border-t pt-3" style={{ borderColor: "var(--border)" }}>
+          <div>
+            <span className="text-[13px] font-medium">Gateway writes &amp; commands</span>
+            <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+              Off (default): the gateway&apos;s sandbox serves the four read-only tools — <code className="mono">read_file</code>,
+              <code className="mono">list_dir</code>, <code className="mono">search_files</code>, <code className="mono">file_info</code> — and refuses
+              <code className="mono">write_file</code>, <code className="mono">edit_file</code>, <code className="mono">mkdir</code> and
+              <code className="mono">run_command</code>. The Assistant asks before every call,
+              the gateway cannot — there is no UI on that path — so mutation is opt-in. Every gateway tool
+              execution is written to <span className="mono">gateway.log</span> either way.
+            </p>
+          </div>
+          <Button
+            variant={mutationEnabled ? "primary" : "ghost"}
+            onClick={() => void toggleMutation()}
+          >
+            {mutationEnabled ? "Enabled" : "Disabled"}
           </Button>
         </div>
       </section>

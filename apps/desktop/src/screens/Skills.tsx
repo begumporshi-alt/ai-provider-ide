@@ -26,8 +26,9 @@ import {
 
 const TRUST_NOTE =
   "A skill is a procedure, not a permission. Installed skills are appended to the agent's system " +
-  "prompt and can only use the four sandbox tools it already has — read_file, write_file, " +
-  "list_dir, run_command. Read the instructions before installing: you are deciding what your " +
+  "prompt and can only use the sandbox tools the agent already has — reading, searching, " +
+  "editing and allowlisted commands, confined to the workspace root. A skill cannot grant " +
+  "itself anything new. Read the instructions before installing: you are deciding what your " +
   "agent will try to do, not what it is allowed to do.";
 
 export function SkillsScreen() {
