@@ -707,7 +707,7 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
 ///
 /// `resolve_within` confines every path TO the root and does that correctly — what it cannot do is
 /// judge the root itself. A root of `/`, `$HOME`, or a system directory is confinement to nothing:
-/// the model gets the whole disk. The root is a free-text user input (Playground.tsx), so this is a
+/// the model gets the whole disk. The root is a free-text user input (Assistant.tsx), so this is a
 /// footgun rather than an exploitable hole — but the host is the enforcement boundary, and a check
 /// that only exists in the UI is a check the model's own path does not pass through.
 ///
@@ -769,7 +769,7 @@ fn is_escaping_path(arg: &str) -> bool {
 
 /// Normalise the `arguments` payload into an object.
 ///
-/// The two callers disagree: the Playground host (`host.ts`) sends a real object, while the
+/// The two callers disagree: the Assistant host (`host.ts`) sends a real object, while the
 /// gateway bridge sends `JSON.stringify(args)` — OpenAI's wire format, where a tool call's
 /// `arguments` is a string. Both land in the same `serde_json::Value`, and `Value::get` on a
 /// `Value::String` returns `None` rather than failing, so every gateway tool call answered
@@ -1028,7 +1028,7 @@ mod tests {
         assert!(!res.ok, "'..' in an argument must be refused");
     }
 
-    // --- the gateway sends `arguments` as a JSON string, the Playground as an object ---
+    // --- the gateway sends `arguments` as a JSON string, the Assistant as an object ---
     //
     // `Value::get` on a `Value::String` returns `None` instead of failing, so the mismatch was
     // invisible: every gateway call said `missing argument "program"`, and `list_dir` quietly

@@ -735,7 +735,7 @@ pub fn gateway_key_delete(store: &Store, id: &str) -> Result<(), CommandError> {
 /// Month-to-date spend in micro-USD, at the UTC month boundary.
 ///
 /// Scope: all ledger rows, whatever the `source` (ui / gateway / generator). A cap that only
-/// counted gateway traffic would be silently understated by Playground usage — the user sets a
+/// counted gateway traffic would be silently understated by Assistant usage — the user sets a
 /// budget on what they pay, not on one client.
 ///
 /// The boundary is computed in SQL rather than by hand: month lengths vary, and a hand-rolled

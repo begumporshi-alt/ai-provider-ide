@@ -461,7 +461,7 @@ pub struct GatewayCore {
     ///
     /// Distinct from `tools_enabled`. Read-only tools are safe to leave on because the worst a
     /// misled model can do is read inside the workspace; the mutating ones execute code and write
-    /// files with no human in the loop — the Playground path has a per-call Allow/Deny modal, the
+    /// files with no human in the loop — the Assistant path has a per-call Allow/Deny modal, the
     /// gateway path has none. Default off: enabling it is a deliberate act, and it is enforced
     /// host-side in `gateway_tool_run` so no caller can talk its way past it.
     tools_mutation_enabled: AtomicBool,
@@ -780,7 +780,7 @@ impl GatewayCore {
             Some(format!(
                 "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
                  confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
-                 the Playground, which asks before every call."
+                 the Assistant, which asks before every call."
             ))
         } else {
             None

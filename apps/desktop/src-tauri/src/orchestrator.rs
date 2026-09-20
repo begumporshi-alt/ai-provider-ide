@@ -1,7 +1,7 @@
 /**
  * Agent run ledger (P6).
  *
- * The Playground runs an agent and throws the run away: when the turn ends, the only trace is
+ * The Assistant runs an agent and throws the run away: when the turn ends, the only trace is
  * whatever the model said. That is fine for chatting and useless for operating — you cannot
  * answer "what did it actually do?" or "how many runs failed this afternoon?" after the fact.
  *

@@ -1124,7 +1124,7 @@
 
     // --- audit H1b: gateway-side mutation is opt-in ---
     //
-    // The Playground has a per-call Allow/Deny modal; the gateway has no UI at all, so a model
+    // The Assistant has a per-call Allow/Deny modal; the gateway has no UI at all, so a model
     // driven by untrusted content can write files and run code there with nobody watching.
     // Read-only tools stay on; mutation defaults off and is enforced host-side.
 
@@ -1180,7 +1180,7 @@
         assert!(reason.contains("run_command"), "name the tool: {reason}");
         // A model told only "forbidden" retries the call. It needs the way out.
         assert!(reason.contains("Gateway settings"), "say how to enable it: {reason}");
-        assert!(reason.contains("Playground"), "offer the confirmed path: {reason}");
+        assert!(reason.contains("Assistant"), "offer the confirmed path: {reason}");
     }
 
     /// A bound socket and a gateway that is meant to be serving are different states — but the

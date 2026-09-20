@@ -577,7 +577,7 @@ pub fn gateway_tool_run(
         .workspace_root()
         .ok_or_else(|| "workspace root not set — call gateway_set_workspace_root first".to_string())?;
 
-    // Audit H1b: the Playground asks before every call; the gateway cannot — there is no UI on
+    // Audit H1b: the Assistant asks before every call; the gateway cannot — there is no UI on
     // that path. So mutation is gated here, host-side, where no caller can talk past it.
     if let Some(reason) = state.core.gateway_tool_refusal(&tool_name) {
         log_to_file(&app, &format!("tool refused (mutation disabled): {tool_name}"));
