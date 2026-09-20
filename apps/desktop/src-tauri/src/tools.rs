@@ -713,7 +713,7 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
 ///
 /// Refusing is deliberate over clamping: silently rewriting `/` to a subdirectory would hand the
 /// user a workspace they did not ask for and would not notice.
-fn validate_root(root: &Path) -> Result<PathBuf, String> {
+pub(crate) fn validate_root(root: &Path) -> Result<PathBuf, String> {
     // Canonicalize first, so `..`, symlinks and trailing slashes cannot carry a bad root past
     // the comparisons below.
     let canonical = fs::canonicalize(root).map_err(|_| {

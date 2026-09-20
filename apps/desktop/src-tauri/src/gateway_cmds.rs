@@ -50,6 +50,10 @@ const WORKER_WARMUP_H: f64 = 140.0;
 pub struct GatewayState {
     pub core: Arc<GatewayCore>,
     pub server: Mutex<Option<gateway::ServerHandle>>,
+    /// The store, so a gateway tool call can be recorded in the context graph. Nothing on the
+    /// request path reads it — it exists only to give the audit path somewhere to write, which
+    /// is why it is the last field and the last thing anyone thinks about.
+    pub store: Arc<Store>,
 }
 
 impl GatewayState {
@@ -541,17 +545,28 @@ pub fn set_tools_mutation_enabled(
 
 /// Set the workspace root for local tool execution (write_file, mkdir, run_command).
 /// Must be called before tools are used in gateway mode.
+/// Set the workspace root. Split out of the command so the refusal is testable without an
+/// `AppHandle` — this one does not log, so there is nothing to inject.
+pub(crate) fn set_gateway_workspace_root(
+    state: &Arc<GatewayState>,
+    root: &str,
+) -> Result<(), String> {
+    let path = std::path::PathBuf::from(root);
+    // Validate at set time, not only at call time. `tool_run` re-validates on every call, so
+    // accepting a bad root was never a breach — but `gateway_get_workspace_root` reported it as
+    // set, and the refusal then surfaced mid-request as a tool error the model had to interpret.
+    // Storing the canonical path also freezes `..` and symlinks: what is set is what is used.
+    let canonical = crate::tools::validate_root(&path)?;
+    state.core.set_workspace_root(canonical);
+    Ok(())
+}
+
 #[tauri::command]
 pub fn gateway_set_workspace_root(
     state: State<'_, Arc<GatewayState>>,
     root: String,
 ) -> Result<(), String> {
-    let path = std::path::PathBuf::from(&root);
-    if !path.exists() {
-        return Err(format!("workspace root does not exist: {}", root));
-    }
-    state.core.set_workspace_root(path);
-    Ok(())
+    set_gateway_workspace_root(&state, &root)
 }
 
 /// Get the current workspace root, or null if not set.
@@ -562,13 +577,127 @@ pub fn gateway_get_workspace_root(
     Ok(state.core.workspace_root().map(|p| p.to_string_lossy().to_string()))
 }
 
-/// Execute a tool call locally (write_file, read_file, list_dir, run_command).
-/// Returns the result to the bridge for re-dispatch back to the model.
-#[tauri::command]
-pub fn gateway_tool_run(
-    app: AppHandle,
-    state: State<'_, Arc<GatewayState>>,
-    _request_id: u64,
+/// One-line digest of a tool call's arguments for the audit log.
+///
+/// The arguments are simultaneously the most useful thing to record and the most dangerous.
+/// `write_file` carries the entire file body in `content`; `edit_file` carries the old and new
+/// text. Logging those verbatim would make the audit trail the leak it exists to catch — a model
+/// asked to write a `.env` would write the secret twice, once to the workspace and once to
+/// `gateway.log` in plaintext. So bodies become a length. Paths, patterns, and the `run_command`
+/// program and argv ARE logged: they are what an operator needs to see what was attempted, and
+/// the Assistant's confirmation modal already shows them, so the log is no wider than the UI.
+///
+/// Pure, and deliberately not a method on the command, so it can be tested without an
+/// `AppHandle` — the same reason `gateway_tool_refusal` lives on `GatewayCore`.
+fn tool_arg_digest(name: &str, args: &serde_json::Value) -> String {
+    const MAX_ARG_CHARS: usize = 300;
+    let path = args.get("path").and_then(|v| v.as_str()).unwrap_or(".");
+    let raw = match name {
+        // Lengths, never bodies: the content IS the user's data.
+        "write_file" => format!("path={path} content={}B", value_len(args.get("content"))),
+        "edit_file" => format!(
+            "path={path} old={}B new={}B",
+            value_len(args.get("old")),
+            value_len(args.get("new"))
+        ),
+        "run_command" => format!(
+            "program={} args={}",
+            args.get("program").and_then(|v| v.as_str()).unwrap_or("?"),
+            args.get("args").map(|v| v.to_string()).unwrap_or_else(|| "[]".to_string())
+        ),
+        "search_files" => format!(
+            "path={path} pattern={}",
+            args.get("pattern").and_then(|v| v.as_str()).unwrap_or("?")
+        ),
+        "read_file" | "file_info" | "list_dir" | "mkdir" => format!("path={path}"),
+        // An unrecognised tool is not a reason to log blindly, but it is also not a reason to
+        // log nothing: fall back to the whole object, still bounded below.
+        _ => args.to_string(),
+    };
+    truncate_chars(&raw, MAX_ARG_CHARS)
+}
+
+/// Size of a JSON value as it would land on disk.
+fn value_len(v: Option<&serde_json::Value>) -> usize {
+    match v {
+        Some(serde_json::Value::String(s)) => s.len(),
+        Some(other) => other.to_string().len(),
+        None => 0,
+    }
+}
+
+/// Truncate on a char boundary, not a byte one: `&raw[..n]` panics mid-UTF-8, and a model
+/// writing a multi-byte filename is enough to reach it.
+fn truncate_chars(s: &str, max: usize) -> String {
+    let total = s.chars().count();
+    if total <= max {
+        s.to_string()
+    } else {
+        let head: String = s.chars().take(max).collect();
+        format!("{head}…(+{} chars)", total - max)
+    }
+}
+
+/// Record one gateway tool call in the context graph, fire-and-forget.
+///
+/// Spawned, never awaited: `context::record` takes `store.conn.lock()` — the same connection the
+/// ledger writes to — so awaiting it inline would put a lock acquisition on the request path and
+/// let a slow graph write stall the tool call the model is waiting on. Spawned, a failed write
+/// can only ever lose a graph node, never the result.
+///
+/// `session_id` is None on purpose. `context::sessions` excludes unsessioned nodes, so a gateway
+/// call appears in the Context graph without inventing a History row that has no messages in it.
+///
+/// The node carries the digest, not the result: for `read_file` the result IS the file's
+/// contents, and the graph is written to disk in plaintext.
+fn record_gateway_tool_call(
+    store: Arc<Store>,
+    request_id: u64,
+    tool: &str,
+    digest: &str,
+    ok: bool,
+    out_bytes: usize,
+    refused: bool,
+) {
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let node = crate::context::ContextNode {
+        id: format!("gateway:{request_id}:{tool}:{ts}"),
+        // `skill` is the kind the Assistant already uses for a tool call, and the closed set of
+        // four kinds is deliberate — a tool call is not a fifth kind of thing.
+        kind: "skill".into(),
+        label: tool.into(),
+        source: "gateway".into(),
+        session_id: None,
+        ts,
+        meta_json: Some(
+            serde_json::json!({
+                "request_id": request_id,
+                "ok": ok,
+                "out_bytes": out_bytes,
+                "refused": refused,
+                "args": digest,
+            })
+            .to_string(),
+        ),
+    };
+    std::thread::spawn(move || {
+        let _ = crate::context::record(&store, &[node], &[]);
+    });
+}
+
+/// Execute a gateway tool call: gate it, run it, record it, log it.
+///
+/// Split out of the Tauri command so the whole path is testable without an `AppHandle` — the
+/// same reason `gateway_tool_refusal` lives on `GatewayCore`. `log` is a closure rather than an
+/// `Option<&AppHandle>` so a test can capture the line and assert its shape instead of skipping
+/// it; the audit format is part of what this function promises.
+pub(crate) fn run_gateway_tool(
+    state: &Arc<GatewayState>,
+    log: &dyn Fn(&str),
+    request_id: u64,
     tool_name: String,
     arguments: serde_json::Value,
 ) -> Result<crate::tools::ToolResult, String> {
@@ -580,7 +709,22 @@ pub fn gateway_tool_run(
     // Audit H1b: the Assistant asks before every call; the gateway cannot — there is no UI on
     // that path. So mutation is gated here, host-side, where no caller can talk past it.
     if let Some(reason) = state.core.gateway_tool_refusal(&tool_name) {
-        log_to_file(&app, &format!("tool refused (mutation disabled): {tool_name}"));
+        // A refused call is the most worth recording — it is the one that did not happen.
+        let digest = tool_arg_digest(&tool_name, &arguments);
+        // A refused call is the most worth recording — it is the one that did not happen.
+        record_gateway_tool_call(
+            state.store.clone(),
+            request_id,
+            &tool_name,
+            &digest,
+            false,
+            0,
+            true,
+        );
+        log(&format!(
+            "tool req={request_id} tool={tool_name} args={digest} -> REFUSED: {}",
+            truncate_chars(&reason, 200)
+        ));
         return Ok(crate::tools::ToolResult {
             ok: false,
             output: String::new(),
@@ -590,14 +734,54 @@ pub fn gateway_tool_run(
 
     // Audit trail. A gateway tool call is model-driven action on the user's filesystem with no
     // human in the loop; if it is never written down it cannot be reviewed after the fact.
-    log_to_file(&app, &format!("tool run: {tool_name} in {}", root.display()));
-
+    //
+    // Written AFTER the call so it can carry the outcome, and carrying the request id so a line
+    // can be tied back to the request that produced it. The result's *body* is deliberately not
+    // logged — for `read_file` it is the file's contents — only whether it worked, how big it
+    // was, and a bounded error.
+    let log_name = tool_name.clone();
+    let digest = tool_arg_digest(&tool_name, &arguments);
     let req = crate::tools::ToolRunRequest {
         name: tool_name,
         arguments,
         root: root.to_string_lossy().to_string(),
     };
-    Ok(crate::tools::tool_run(req))
+    let result = crate::tools::tool_run(req);
+    record_gateway_tool_call(
+        state.store.clone(),
+        request_id,
+        &log_name,
+        &digest,
+        result.ok,
+        result.output.len(),
+        false,
+    );
+    log(&format!(
+        "tool req={request_id} tool={log_name} root={} args={digest} -> ok={} out={}B err={}",
+        root.display(),
+        result.ok,
+        result.output.len(),
+        result
+            .error
+            .as_deref()
+            .map(|e| truncate_chars(e, 200))
+            .unwrap_or_else(|| "-".to_string())
+    ));
+    Ok(result)
+}
+
+/// Execute a tool call locally (write_file, read_file, list_dir, run_command).
+/// Returns the result to the bridge for re-dispatch back to the model.
+#[tauri::command]
+pub fn gateway_tool_run(
+    app: AppHandle,
+    state: State<'_, Arc<GatewayState>>,
+    request_id: u64,
+    tool_name: String,
+    arguments: serde_json::Value,
+) -> Result<crate::tools::ToolResult, String> {
+    let log = |line: &str| log_to_file(&app, line);
+    run_gateway_tool(&state, &log, request_id, tool_name, arguments)
 }
 
 /// Webview liveness heartbeat (2s cadence from bridge.ts): proves the router core answers.
@@ -733,7 +917,10 @@ pub fn gateway_error(
 
 pub fn manage(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     let core = build_core(app.handle());
-    app.manage(Arc::new(GatewayState { core, server: Mutex::new(None) }));
+    // `app.manage(store)` already ran in lib.rs setup, so the state is there; this clones the
+    // Arc rather than moving it, because every other command still needs the same store.
+    let store = (*app.state::<Arc<Store>>()).clone();
+    app.manage(Arc::new(GatewayState { core, server: Mutex::new(None), store }));
     Ok(())
 }
 
@@ -780,5 +967,162 @@ mod sync_retry_tests {
         // Near-misses must not match — the comparison is exact on purpose.
         assert!(!is_key_not_ready("no gateway key"));
         assert!(!is_key_not_ready(""));
+    }
+}
+
+#[cfg(test)]
+mod tool_audit_tests {
+    use super::*;
+
+    fn args(json: serde_json::Value) -> serde_json::Value {
+        json
+    }
+
+    /// The whole reason the digest exists: a `write_file` body is the user's data, and the log
+    /// is a plaintext file. Recording it would make the audit trail the leak it exists to catch.
+    #[test]
+    fn a_written_body_is_logged_as_a_length_never_as_content() {
+        let secret = "OPENAI_API_KEY=sk-live-DEADBEEFnotarealkey";
+        let a = args(serde_json::json!({ "path": "app/.env", "content": secret }));
+        let d = tool_arg_digest("write_file", &a);
+        assert!(d.contains("path=app/.env"), "the path is what matters: {d}");
+        assert!(d.contains(&format!("content={}B", secret.len())), "length not body: {d}");
+        assert!(!d.contains("sk-live"), "the secret must not reach the log: {d}");
+    }
+
+    #[test]
+    fn edit_file_logs_both_lengths_and_neither_body() {
+        let a = args(serde_json::json!({ "path": "a.txt", "old": "hunter2", "new": "*******" }));
+        let d = tool_arg_digest("edit_file", &a);
+        assert!(d.contains("old=7B"), "{d}");
+        assert!(d.contains("new=7B"), "{d}");
+        assert!(!d.contains("hunter2"), "neither side of the edit is logged: {d}");
+    }
+
+    /// `run_command` is the tool whose arguments matter most — it is the one that executes — and
+    /// the Assistant already shows them in the confirmation modal, so the log is no wider.
+    #[test]
+    fn run_command_logs_the_program_and_argv() {
+        let a = args(serde_json::json!({ "program": "git", "args": ["status", "--short"] }));
+        let d = tool_arg_digest("run_command", &a);
+        assert!(d.contains("program=git"), "{d}");
+        assert!(d.contains("status"), "argv is the point of the record: {d}");
+    }
+
+    /// Read tools have no body to protect, so the path is recorded verbatim.
+    #[test]
+    fn read_tools_log_their_path() {
+        let a = args(serde_json::json!({ "path": "src/lib/x.ts" }));
+        assert_eq!(tool_arg_digest("read_file", &a), "path=src/lib/x.ts");
+        let s = args(serde_json::json!({ "pattern": "TODO", "path": "src" }));
+        assert_eq!(tool_arg_digest("search_files", &s), "path=src pattern=TODO");
+    }
+
+    /// A model controls the string, so a pathological one must not wedge an unbounded line into
+    /// the log — and the truncation must not panic on a multi-byte char boundary.
+    #[test]
+    fn an_oversized_argument_is_bounded_and_survives_multibyte_text() {
+        let huge = "é".repeat(5000);
+        let a = args(serde_json::json!({ "path": huge }));
+        let d = tool_arg_digest("read_file", &a);
+        assert!(d.chars().count() < 400, "bounded: {}", d.chars().count());
+        assert!(d.contains("+"), "the cut is marked, not silent: {d}");
+    }
+
+    #[test]
+    fn truncate_chars_leaves_short_strings_alone() {
+        assert_eq!(truncate_chars("hello", 10), "hello");
+        assert_eq!(truncate_chars("hello", 5), "hello");
+        assert_eq!(truncate_chars("hello", 2), "he…(+3 chars)");
+    }
+
+    /// A workspace root of `/` or `$HOME` must be refused when it is SET, not discovered later
+    /// as a tool error mid-request. `tool_run` re-validates, so this was never a breach — it was
+    /// a root the getter reported as set while every call refused it.
+    #[test]
+    fn a_bad_workspace_root_is_refused_at_set_time() {
+        assert!(crate::tools::validate_root(std::path::Path::new("/")).is_err());
+        let home = std::env::var("HOME").unwrap_or_default();
+        if !home.is_empty() {
+            assert!(crate::tools::validate_root(std::path::Path::new(&home)).is_err());
+        }
+        for d in ["/System", "/usr", "/bin", "/sbin", "/etc", "/private"] {
+            assert!(
+                crate::tools::validate_root(std::path::Path::new(d)).is_err(),
+                "{d} must be refused"
+            );
+        }
+    }
+
+    fn temp_ctx_store(tag: &str) -> (Arc<Store>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-gwctx-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Arc::new(Store::open(&dir).unwrap()), dir)
+    }
+
+    /// The reason `GatewayState` carries a store at all: a gateway tool call becomes reviewable
+    /// in the Context screen instead of living only in a flat text log.
+    #[test]
+    fn a_gateway_tool_call_is_recorded_in_the_context_graph() {
+        let (store, _dir) = temp_ctx_store("record");
+        record_gateway_tool_call(store.clone(), 42, "read_file", "path=a.txt", true, 10, false);
+
+        // Spawned, so poll — but bound the wait so a regression fails instead of hanging.
+        let found = (0..200).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::context::graph(&store, 100)
+                .ok()?
+                .nodes
+                .into_iter()
+                .find(|n| n.id.starts_with("gateway:42:"))
+        });
+        let node = found.expect("the call is recorded");
+        assert_eq!(node.kind, "skill", "a tool call, not a new node kind");
+        assert_eq!(node.source, "gateway", "distinguishable from Assistant activity");
+        assert_eq!(node.label, "read_file");
+        assert!(
+            node.session_id.is_none(),
+            "unsessioned — it belongs to the graph, not History"
+        );
+        let meta = node.meta_json.as_deref().unwrap_or("{}");
+        assert!(meta.contains("path=a.txt"), "the digest is kept: {meta}");
+        assert!(meta.contains("\"out_bytes\":10"), "{meta}");
+    }
+
+    /// Unsessioned nodes are excluded from `sessions()`, which is the whole point: a gateway
+    /// tool call must not invent a History row containing no messages.
+    #[test]
+    fn a_recorded_gateway_call_does_not_invent_a_history_session() {
+        let (store, _dir) = temp_ctx_store("nosession");
+        record_gateway_tool_call(store.clone(), 7, "list_dir", "path=.", true, 3, false);
+        for _ in 0..200 {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            if !crate::context::graph(&store, 100).unwrap().nodes.is_empty() {
+                break;
+            }
+        }
+        assert!(
+            crate::context::sessions(&store, 50).unwrap().is_empty(),
+            "no phantom History session"
+        );
+    }
+
+    /// A refused call is the one most worth recording — it is the action that did NOT happen.
+    #[test]
+    fn a_refused_call_is_recorded_as_refused() {
+        let (store, _dir) = temp_ctx_store("refused");
+        record_gateway_tool_call(store.clone(), 9, "run_command", "program=rm", false, 0, true);
+        let found = (0..200).find_map(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            crate::context::graph(&store, 100)
+                .ok()?
+                .nodes
+                .into_iter()
+                .find(|n| n.id.starts_with("gateway:9:"))
+        });
+        let node = found.expect("a refused call is recorded too");
+        let meta = node.meta_json.as_deref().unwrap_or("{}");
+        assert!(meta.contains("\"refused\":true"), "{meta}");
+        assert!(meta.contains("\"ok\":false"), "{meta}");
     }
 }

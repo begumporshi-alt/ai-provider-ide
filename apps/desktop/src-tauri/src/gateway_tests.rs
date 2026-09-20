@@ -131,6 +131,20 @@
         _handle: ServerHandle,
     }
 
+    /// A real store on a temp dir, because `GatewayState` now carries one for the context-graph
+    /// audit path. Returns the dir so the caller keeps it alive until the test ends.
+    fn gateway_test_store(
+        tag: &str,
+    ) -> (Arc<crate::store::Store>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "aip-gw-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Arc::new(crate::store::Store::open(&dir).unwrap()), dir)
+    }
+
     /// Key provider backed by a mutable slot — simulates rotate/revoke without the keychain.
     fn test_core(key: Arc<Mutex<Option<String>>>) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
         let bridge = Arc::new(SynthBridge::new());
@@ -1198,7 +1212,8 @@
         use crate::gateway_cmds::GatewayState;
         let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
         let (core, _bridge) = test_core(key);
-        let state = GatewayState { core: core.clone(), server: Mutex::new(None) };
+        let (store, _dir) = gateway_test_store("stale-listener");
+        let state = GatewayState { core: core.clone(), server: Mutex::new(None), store };
 
         // Nothing bound: not stale, just stopped.
         assert!(!state.has_stale_server());
@@ -1846,4 +1861,142 @@
             acc.contains("invalid_request_error"),
             "a message alone leaves the client guessing whether to retry: {acc}"
         );
+    }
+
+    /// These three drive `gateway_cmds::run_gateway_tool` — the extracted command body — rather
+    /// than its helper. That is the coverage the isolated helper tests could not give: they
+    /// proved `record_gateway_tool_call` works, not that the command ever calls it. Deleting the
+    /// call site now fails a test.
+    fn tool_test_state(tag: &str) -> (Arc<crate::gateway_cmds::GatewayState>, std::path::PathBuf) {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        let (store, _sdir) = gateway_test_store(tag);
+        let ws = std::env::temp_dir().join(format!("aip-ws-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&ws);
+        std::fs::create_dir_all(&ws).unwrap();
+        core.set_workspace_root(ws.clone());
+        (
+            Arc::new(crate::gateway_cmds::GatewayState {
+                core,
+                server: Mutex::new(None),
+                store,
+            }),
+            ws,
+        )
+    }
+
+    #[test]
+    fn a_refused_gateway_tool_call_is_gated_logged_and_recorded() {
+        let (state, _ws) = tool_test_state("refused");
+        let store = state.store.clone();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        };
+        let res = crate::gateway_cmds::run_gateway_tool(
+            &state,
+            &sink,
+            42,
+            "write_file".into(),
+            json!({ "path": "a.txt", "content": "hunter2" }),
+        )
+        .unwrap();
+
+        assert!(!res.ok, "mutation is off by default on the gateway");
+        let captured = lines.lock().unwrap().clone();
+        assert!(
+            captured.iter().any(|l| l.contains("req=42") && l.contains("REFUSED")),
+            "the refusal is logged with its request id: {captured:?}"
+        );
+        assert!(
+            captured.iter().all(|l| !l.contains("hunter2")),
+            "the body is never logged: {captured:?}"
+        );
+
+        let node = (0..200)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                crate::context::graph(&store, 200)
+                    .ok()?
+                    .nodes
+                    .into_iter()
+                    .find(|n| n.id.starts_with("gateway:42:"))
+            })
+            .expect("the refused call is recorded");
+        assert_eq!(node.source, "gateway");
+        let meta = node.meta_json.unwrap_or_default();
+        assert!(meta.contains("\"refused\":true"), "{meta}");
+        assert!(meta.contains("path=a.txt"), "the digest, not the body: {meta}");
+        assert!(!meta.contains("hunter2"), "the body is never stored: {meta}");
+    }
+
+    #[test]
+    fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
+        let (state, ws) = tool_test_state("success");
+        let store = state.store.clone();
+        std::fs::write(ws.join("a.txt"), "hello").unwrap();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = {
+            let lines = lines.clone();
+            move |line: &str| lines.lock().unwrap().push(line.to_string())
+        };
+        let res = crate::gateway_cmds::run_gateway_tool(
+            &state,
+            &sink,
+            43,
+            "read_file".into(),
+            json!({ "path": "a.txt" }),
+        )
+        .unwrap();
+
+        assert!(res.ok, "read_file is not a mutating tool");
+        assert_eq!(res.output.trim(), "hello", "the tool actually ran");
+        let captured = lines.lock().unwrap().clone();
+        let line = captured
+            .iter()
+            .find(|l| l.contains("req=43"))
+            .unwrap_or_else(|| panic!("one line per call: {captured:?}"));
+        assert!(line.contains("ok=true"), "{line}");
+        assert!(line.contains("out=5B"), "the size, not the contents: {line}");
+        assert!(!line.contains("hello"), "the result body is never logged: {line}");
+
+        let node = (0..200)
+            .find_map(|_| {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                crate::context::graph(&store, 200)
+                    .ok()?
+                    .nodes
+                    .into_iter()
+                    .find(|n| n.id.starts_with("gateway:43:"))
+            })
+            .expect("the successful call is recorded");
+        let meta = node.meta_json.unwrap_or_default();
+        assert!(meta.contains("\"ok\":true"), "{meta}");
+        assert!(meta.contains("\"out_bytes\":5"), "{meta}");
+        assert!(meta.contains("\"refused\":false"), "{meta}");
+    }
+
+    #[test]
+    fn a_bad_workspace_root_is_refused_before_anything_stores_it() {
+        let (state, _ws) = tool_test_state("wsroot");
+        assert!(
+            crate::gateway_cmds::set_gateway_workspace_root(&state, "/").is_err(),
+            "the filesystem root is refused"
+        );
+        let home = std::env::var("HOME").unwrap_or_default();
+        assert!(
+            crate::gateway_cmds::set_gateway_workspace_root(&state, &home).is_err(),
+            "the home directory is refused"
+        );
+        // A refused root must not replace the good one already set.
+        assert!(state.core.workspace_root().is_some());
+
+        let good = std::env::temp_dir().join(format!("aip-ws-good-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&good);
+        std::fs::create_dir_all(&good).unwrap();
+        assert!(
+            crate::gateway_cmds::set_gateway_workspace_root(&state, &good.to_string_lossy()).is_ok()
+        );
+        assert!(state.core.workspace_root().is_some());
     }
