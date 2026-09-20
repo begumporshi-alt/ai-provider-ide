@@ -164,6 +164,16 @@ which one happened.
   alive process, no window, no socket, no log line, which reads exactly like "still starting". It is
   now on its own thread. Same ACL applies to `workbuddy::sync`, which is why it can lag the listener.
   If a launch looks dead, read `gateway.log`: `startup: <step>` markers name the last step reached.
+- **After a reinstall `/v1/models` returns 503, not 401, and that is the keychain, not a
+  regression.** Body: `master key unavailable — the OS keychain did not respond; approve the
+  keychain prompt for this app, then retry`. A newly installed binary has a new code signature, so
+  macOS invalidates the ACL. **Waiting does not fix it — a human click on the prompt does.**
+  Learn the pair: **503 = keychain not yet approved; 401 = alive and enforcing auth.** Probing
+  right after an install and reading 503 as "the gateway is dead" is the trap. Corroborate with
+  `pgrep -fl` (process up), `lsof -nP -iTCP:8787 -sTCP:LISTEN` (bound) and `startup:` /
+  `auto-restore:` lines in `gateway.log` before concluding anything is broken.
+- **`pkill -f ai-provider-router` kills the shell that runs it** — the pattern matches that shell's
+  own command line. Use `pkill -x` / `pgrep -x` (exact process name) instead.
 - `ps` is sandbox-blocked; use `pgrep -fl` and `lsof -p <pid>`.
 - **Test the startup fix on the first launch after a rebuild, or the test proves nothing** — the
   cold-ACL condition exists once per build. And beware a repro script that outruns what it measures:
