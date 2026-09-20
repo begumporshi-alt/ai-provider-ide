@@ -17,6 +17,9 @@
 - `npx tauri build --bundles app` (skips the failing DMG step); `export PATH="$HOME/.cargo/bin:$PATH"`.
 - Install: `mv` the old `/Applications` app to /tmp (never `rm -rf`), then `cp -R`. `pkill -f ai-provider-router` first.
 - Test a startup fix on the **first launch after a rebuild**, or it proves nothing.
+- **`pnpm ci:local` (`scripts/ci-local.sh`) is the gate.** It mirrors ci.yml step for step, adds a Node >= 19 preflight, and unsets the proxy vars. Skips `pnpm install` by default (see below); `--install` to include it, `--skip-browser` to drop the ~48s Playwright run.
+- **`pnpm install` is destructive in this environment.** The broker denies pnpm's symlink writes (`ERR_PNPM_CODEBUDDY_BROKER_DENY ... EEXIST`) and it fails *after* unlinking entries, so it left `packages/adapter-spec/node_modules/typescript` and `packages/router-core/node_modules/typescript` missing — which broke `pnpm typecheck` with `Cannot find module .../typescript/bin/tsc`. Running outside the sandbox does **not** help; the denial is broker-level. Repair by re-linking by hand:
+  `ln -s ../../../node_modules/.pnpm/typescript@6.0.3/node_modules/typescript packages/<pkg>/node_modules/typescript`
 - **CI has not actually started a job since ~2026-09-16.** Every run reports `failure` in ~8s with the annotation "The job was not started because recent account payments have failed or your spending limit needs to be increased". That is billing, not code — do not chase it as a regression. Run the gate locally instead: `pnpm typecheck`; `pnpm test` (managed Node 22 on PATH); `pnpm key-leak-grep`; `pnpm check-ts-version`; `cargo check` and `cargo test` under `apps/desktop/src-tauri`; `pnpm --filter ai-provider-router-desktop web-test` (53 browser tests, `mv test-results /tmp/...` first).
 
 ## Gateway
