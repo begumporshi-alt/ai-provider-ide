@@ -12,7 +12,8 @@
  */
 import { describe, expect, it } from "vitest";
 import { ExecutionEngine, AllAttemptsFailedError } from "../src/execution-engine.js";
-import { ProviderLimiter, PER_PROVIDER_DEFAULT } from "../src/concurrency.js";
+import { ProviderLimiter, PER_PROVIDER_DEFAULT, MAX_PER_PROVIDER, clampConcurrency } from "../src/concurrency.js";
+import { ModelRouter } from "../src/model-router.js";
 import { HealthTracker } from "../src/health-tracker.js";
 import { ManifestInterpreter } from "../src/manifest-interpreter.js";
 import { PROVIDER_PROFILES } from "../src/builtin-templates.js";
@@ -242,5 +243,82 @@ describe("ExecutionEngine — per-provider cap (R3)", () => {
 
     hold.resolve();
     await p;
+  });
+});
+
+describe("clampConcurrency", () => {
+  // The cap is a *bound*, so the dangerous values are the ones that look like a bound and are
+  // not — not the ones a type checker would reject.
+
+  it("leaves a sane value alone", () => {
+    for (const n of [0, 1, 4, 32, MAX_PER_PROVIDER]) {
+      expect(clampConcurrency(n)).toBe(n);
+    }
+  });
+
+  it("keeps zero — it means unlimited, by design", () => {
+    // `hasCapacity` tests `maxPerProvider <= 0`, so 0 is a real setting, not a missing one.
+    // Flooring it to 1 would silently turn "no cap" into "one request at a time".
+    expect(clampConcurrency(0)).toBe(0);
+    expect(clampConcurrency("0")).toBe(0);
+  });
+
+  it("rejects a negative number rather than letting it mean unlimited", () => {
+    // This is the one that bites: -1 passes `maxPerProvider <= 0` and therefore behaves as
+    // unlimited while displaying as a bound. Removing the cap must take a deliberate 0 —
+    // a stored negative is corruption, and corruption must yield a real cap, not no cap.
+    expect(clampConcurrency(-1)).toBe(PER_PROVIDER_DEFAULT);
+    expect(clampConcurrency(-12)).toBe(PER_PROVIDER_DEFAULT);
+  });
+
+  it("caps a value that would only delay the failure", () => {
+    expect(clampConcurrency(5000)).toBe(MAX_PER_PROVIDER);
+  });
+
+  it("falls back to the default for input that is not a number at all", () => {
+    // `Number(null)` is 0, which would silently become "unlimited" — a missing setting must
+    // not read as a deliberate removal of the cap.
+    for (const v of [NaN, Infinity, undefined, null, "four", {}, [], true]) {
+      expect(clampConcurrency(v)).toBe(PER_PROVIDER_DEFAULT);
+    }
+  });
+
+  it("accepts a numeric string, because that is what a text field produces", () => {
+    expect(clampConcurrency("8")).toBe(8);
+  });
+});
+
+describe("syncConcurrency", () => {
+  // `router.settings` is hydrated with `Object.assign(router.settings, JSON.parse(raw))` — no
+  // validation — so whatever the stored blob holds is what reaches the limiter.
+  const makeRouter = (): ModelRouter =>
+    new ModelRouter(
+      { listProviders: () => [] } as never,
+      { forProvider: () => undefined } as never,
+      { forModality: () => [] } as never,
+      { append: () => undefined } as never,
+    );
+
+  it("clamps a stored value rather than trusting it", () => {
+    const r = makeRouter();
+    r.settings.perProviderConcurrency = -1;
+    r.syncConcurrency();
+    // -1 would otherwise read as unlimited (maxPerProvider <= 0) — the cap silently gone while
+    // the screen showed a number. Now it degrades to the default, which is still a cap.
+    expect(r.limiter.maxPerProvider).toBe(PER_PROVIDER_DEFAULT);
+    expect(r.limiter.hasCapacity("p1")).toBe(true);
+    // ...and it really is a bound, not unlimited: the 5th concurrent attempt must be refused.
+    for (let i = 0; i < PER_PROVIDER_DEFAULT; i++) expect(r.limiter.acquire("p1")).not.toBeNull();
+    expect(r.limiter.acquire("p1")).toBeNull();
+  });
+
+  it("applies a good stored value to the live limiter", () => {
+    const r = makeRouter();
+    r.settings.perProviderConcurrency = 2;
+    r.syncConcurrency();
+    expect(r.limiter.maxPerProvider).toBe(2);
+    expect(r.limiter.acquire("p1")).not.toBeNull();
+    expect(r.limiter.acquire("p1")).not.toBeNull();
+    expect(r.limiter.acquire("p1")).toBeNull(); // third is refused
   });
 });

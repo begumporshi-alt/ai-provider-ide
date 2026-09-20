@@ -17,6 +17,36 @@
  */
 export const PER_PROVIDER_DEFAULT = 4;
 
+/** Upper bound when the cap is user-set. Not a security control — `0` already means unlimited,
+ *  and that is a legitimate choice — but 5000 in-flight requests to one provider is not a
+ *  different setting from 64, it is 64 with the failure arriving later. */
+export const MAX_PER_PROVIDER = 64;
+
+/**
+ * Clamp a user-supplied (or stored) per-provider cap into `[0, MAX_PER_PROVIDER]`.
+ *
+ * `0` is preserved: it is the documented "unlimited" and a deliberate choice. A NEGATIVE is not
+ * the same thing — `hasCapacity` tests `maxPerProvider <= 0`, so `-1` would behave as unlimited
+ * while displaying as a bound. It falls back to the default: removing the cap should take a
+ * deliberate `0`, and a corrupted value must yield a real cap rather than no cap at all.
+ *
+ * Numbers and numeric strings only; anything else falls back to the default, because
+ * `null`/`[]`/`true` all coerce to a number in JS and would turn a missing setting into a real
+ * one.
+ */
+export function clampConcurrency(value: unknown): number {
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(n)) return PER_PROVIDER_DEFAULT;
+  const floored = Math.floor(n);
+  if (floored < 0) return PER_PROVIDER_DEFAULT;
+  return Math.min(MAX_PER_PROVIDER, floored);
+}
+
 export class ProviderLimiter {
   /** Mutable so Router Settings can change it at runtime. `<= 0` means unlimited. */
   maxPerProvider: number;

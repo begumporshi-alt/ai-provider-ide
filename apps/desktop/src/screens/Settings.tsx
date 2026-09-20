@@ -6,6 +6,7 @@
  */
 import { useEffect, useMemo, useState, type ReactNode } from "react";
 import type { ProviderRecord } from "@aiprovider/router-core";
+import { clampConcurrency, MAX_PER_PROVIDER } from "@aiprovider/router-core";
 import {
   catalog, clearAllCrashes, clearCrash, exportConfig, getCrashCount,
   getDiagnosticsBundle, importConfig, listCrashes, readCrash,
@@ -146,6 +147,20 @@ export function SettingsScreen() {
       <Section title="Routing">
         <Row label="Provider failover" hint="When every key of a provider fails, continue with the next provider that carries the model.">
           <Toggle checked={settings.failoverEnabled} onChange={(v) => { settings.failoverEnabled = v; persistRouterSettings(); bump(); }} />
+        </Row>
+        <Row
+          label="In-flight requests per provider"
+          hint={`How many requests one provider may serve at once (0–${MAX_PER_PROVIDER}, 0 = unlimited). A saturated provider is skipped in favour of one that can serve, so a single degraded provider cannot occupy the gateway's whole budget.`}
+        >
+          <CapInput
+            value={settings.perProviderConcurrency}
+            onChange={(v) => {
+              settings.perProviderConcurrency = v;
+              router.syncConcurrency(); // take effect now, not on the next request
+              persistRouterSettings();
+              bump();
+            }}
+          />
         </Row>
         <div className="mt-2 grid grid-cols-2 gap-3">
           {(["text", "image"] as const).map((mod) => (
@@ -410,6 +425,42 @@ function Row({ label, hint, children }: { label: string; hint: string; children:
       </div>
       <div className="ml-auto">{children}</div>
     </div>
+  );
+}
+
+/**
+ * A bounded numeric field. The draft is kept as text while it is being edited: clamping on every
+ * keystroke would fight the user (typing "12" passes through "1"), and `Number("")` is 0 — which
+ * here means *unlimited*, so an emptied field must not silently remove the cap.
+ */
+function CapInput({ value, onChange }: { value: number; onChange: (v: number) => void }) {
+  const [draft, setDraft] = useState(String(value));
+  useEffect(() => setDraft(String(value)), [value]);
+  const commit = () => {
+    const next = clampConcurrency(draft);
+    onChange(next);
+    setDraft(String(next));
+  };
+  return (
+    <>
+      <input
+        type="number"
+        min={0}
+        max={MAX_PER_PROVIDER}
+        aria-label="in-flight requests per provider"
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        className="w-16 rounded border px-1.5 py-0.5 text-[12px]"
+        style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+      />
+      <span className="ml-1.5 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        {value === 0 ? "unlimited" : `of ${MAX_PER_PROVIDER}`}
+      </span>
+    </>
   );
 }
 

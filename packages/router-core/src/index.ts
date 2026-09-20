@@ -13,7 +13,7 @@ export { ProviderRegistry } from "./provider-registry.js";
 export { HealthTracker } from "./health-tracker.js";
 export { buildPlan, orderKeys, type Candidate, type PlanContext, type PlanInput } from "./route-planner.js";
 export { ExecutionEngine, AllAttemptsFailedError, MAX_ATTEMPTS_DEFAULT, type AttemptOutcome, type TextExecution } from "./execution-engine.js";
-export { ProviderLimiter, PER_PROVIDER_DEFAULT } from "./concurrency.js";
+export { ProviderLimiter, PER_PROVIDER_DEFAULT, MAX_PER_PROVIDER, clampConcurrency } from "./concurrency.js";
 export { parsePricing, estimateCostMicros, priceRank, type PricingMicros } from "./pricing.js";
 export { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
 export { UsageLedger, type LedgerEntry, type LedgerSource } from "./usage-ledger.js";

@@ -6,7 +6,6 @@
 import { describe, expect, it } from "vitest";
 import { DriftMonitor, type DriftAttempt } from "../src/drift-monitor.js";
 import { RepairOrchestrator } from "../src/repair-orchestrator.js";
-import { ManifestInterpreter } from "../src/manifest-interpreter.js";
 import { BUILTIN_TEMPLATES } from "../src/builtin-templates.js";
 import { FakeHttp } from "./fakes.js";
 

@@ -6,7 +6,6 @@
   "scripts": {
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "lint": "pnpm -r --if-present lint",
     "key-leak-grep": "bash scripts/key-leak-grep.sh",
     "check-ts-version": "bash scripts/check-ts-version.sh",
     "dev": "pnpm --filter ai-provider-router-desktop tauri dev",
