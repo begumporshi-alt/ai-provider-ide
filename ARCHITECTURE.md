@@ -49,7 +49,7 @@ injection so the TypeScript layer never holds a raw secret.
 Dependency rule: arrows only point downward.
 
 ```
-L4  Presentation        React screens (Providers, Models, Playground, Usage,
+L4  Presentation        React screens (Providers, Models, Assistant, Usage,
                          Router Settings, Onboarding Wizard)
 L3  Application         Provider Registry svc, Onboarding Orchestrator,
                          Drift Monitor, Model Catalog svc, Usage Ledger svc
@@ -93,7 +93,7 @@ allowlisting, secret scrubbing).
 | `ui-shell` | L4 | App shell, screen routing, global state |
 | `screen-providers` | L4 | Provider cards, key rows, Test/add/remove (mirrors the sketch) |
 | `screen-models` | L4 | Model Browser, Text/Image tabs, defaults |
-| `screen-playground` | L4 | Text chat + image box against any routed model |
+| `screen-assistant` | L4 | Text chat + image box against any routed model |
 | `screen-usage` | L4 | Ledger view, failures and fallbacks |
 | `screen-router-settings` | L4 | Failover, rotation strategy, timeouts, system-AI pick |
 | `screen-gateway` | L4 | Local Gateway settings: enable, port/endpoint URL, master key generate/rotate/revoke, copy presets for popular apps |
@@ -144,7 +144,7 @@ onboarding-orchestrator ──> probe-runner ──http──> egress-gateway
 onboarding-orchestrator ──> adapter-generator ──redacted report──> (AI via router)
 onboarding-orchestrator ──> contract-suite ──> adapter-runtime
 onboarding-orchestrator ──register manifest──> provider-registry
-model-router ──stream chunks──(Tauri Channel)──> ipc-client ──> screen-playground
+model-router ──stream chunks──(Tauri Channel)──> ipc-client ──> screen-assistant
 external apps ──HTTP, Bearer master key──> local-gateway (Rust) ──auth ok──> model-router
 local-gateway ──verify key──> keychain-vault
 ```
@@ -381,7 +381,7 @@ Self-construction needs a working AI model, but the first provider has no adapte
 ### 3.1 Text generation (streaming, with rotation and failover)
 
 ```
-User (Playground)
+User (Assistant)
   │  router.generateText({ model | capability, messages, stream: true })
   ▼
 model-router ──> route-planner
@@ -401,21 +401,21 @@ execution-engine ──attempt 1──> adapter-runtime ──manifest──> ma
 health-tracker: mark key1 (invalid | cooldown=Retry-After) ──> execution-engine advances plan
   │
   ├─ attempt 2 (OpenRouter,key2) … all keys fail ──> provider breaker opens ──> failover
-  ├─ attempt 3 (OpenCode,key1) ── 200 SSE ── chunks via Tauri Channel ──> ipc-client ──> Playground
+  ├─ attempt 3 (OpenCode,key1) ── 200 SSE ── chunks via Tauri Channel ──> ipc-client ──> Assistant
   └─ usage-ledger.append({ provider, key, model, tokens, latency, fallbackChain:[OR→OR→OC], ok })
 ```
 
 ### 3.2 Image generation
 
 ```
-User (Playground) ──router.generateImage({ model, prompt, size })──> model-router
+User (Assistant) ──router.generateImage({ model, prompt, size })──> model-router
   ▼
 route-planner (modality=image, via model-catalog modality tags)
   ▼
 execution-engine ──> manifest-interpreter (image endpoint mapping: b64_json | url)
   │                    └─http-port ──> egress-gateway (credential injection) ──> provider
   ▼
-ImageResult { data, mime, provider, keyId, latency }  ── progress events ──> Playground
+ImageResult { data, mime, provider, keyId, latency }  ── progress events ──> Assistant
 usage-ledger.append({ modality: "image", … })
 ```
 
@@ -482,7 +482,7 @@ specified, not left implicit (audit H1):
   **`503` + `Retry-After: 1`** immediately; no request is queued against a dead core.
 - **Cancellation:** every request carries an abort signal. A client disconnecting mid-stream
   propagates: axum disconnect → internal IPC abort → execution-engine stops the attempt →
-  egress stream is closed to the provider. The same mechanism backs the Playground "stop"
+  egress stream is closed to the provider. The same mechanism backs the Assistant "stop"
   button and app shutdown (`router.generateText(req, { signal })`).
 - **Concurrency:** max concurrent routed requests (default 8) with a bounded queue (default 32);
   overflow answers `429` + `Retry-After`. Excess load degrades gracefully instead of stalling
@@ -685,7 +685,7 @@ CREATE TABLE settings (
 aggregates complete months into `ledger_rollups` (idempotent `INSERT … ON CONFLICT DO UPDATE`)
 and deletes raw rows past the cutoff. Drift windows only ever read 15 minutes of raw rows —
 rollups never affect drift detection. No request/response bodies are stored by default
-(privacy + size); opt-in capture per playground session.
+(privacy + size); opt-in capture per assistant session.
 
 **Local-file hygiene.** Every connection (both drivers) sets
 `journal_mode=WAL, synchronous=NORMAL, foreign_keys=ON, busy_timeout=5000` (SQLite defaults
@@ -802,7 +802,7 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 **Lifecycle & hygiene (v1 decisions, from the audit):** port-conflict on 8787 is a loud error
 with remediation UX; deleting a key removes its keychain entry in the same transaction;
 deleting a provider cascades keys/manifests/catalog rows (ledger history is preserved — it has
-no FKs by design); Playground conversations persist per session only (v1); models-cache TTL
+no FKs by design); Assistant conversations persist per session only (v1); models-cache TTL
 24 h with manual refresh and stale-fallback; the app is single-window (a second window would
 instantiate a second router core — rejected); i18n and a11y beyond platform defaults are
 declared **non-goals for v1**; a single master key (no per-app keys) is a **stated v1
@@ -875,7 +875,7 @@ Risks added from the 2026-09-15 audit, each now carried by a design section:
 - `ui-shell`, `ipc-client`, CSP + capability scoping from day one (invariants 12–14)
 - `screen-providers` (cards, key rows, Test, **minimal manual add-provider form** — superseded
   by the Phase 3 wizard) — acceptance criterion 1
-- `screen-models` (discovery, Text/Image tabs, defaults, alias editor), `screen-playground` (text then image, **stop button**) — criterion 4
+- `screen-models` (discovery, Text/Image tabs, defaults, alias editor), `screen-assistant` (text then image, **stop button**) — criterion 4
 - `screen-usage` (with `source` attribution), `screen-router-settings` (incl. system-AI pick)
 
 **Phase 2b — Local Gateway (M) — entry-gated by the SSE-through-IPC spike (§3.5)**
@@ -912,10 +912,10 @@ Risks added from the 2026-09-15 audit, each now carried by a design section:
 | 1. Three providers, 3 keys, cards | Phase 2a (`screen-providers`, registry) |
 | 2. Key rotation transparent | Phase 1 (`route-planner`, `execution-engine`) |
 | 3. Provider failover + visible in log | Phase 1 + 2a (fallback chains in ledger → `screen-usage`) |
-| 4. Text + image end-to-end via Playground | Phase 2a |
+| 4. Text + image end-to-end via Assistant | Phase 2a |
 | 5. No plaintext keys on disk | Phase 1 (invariants 1–2, CI grep test) |
 | 6. New provider = data, no UI change | Phase 1 manifests + Phase 3 wizard; OpenAI/Anthropic-compatible providers need only the wizard |
-| 7. Zero-AI bootstrap: fresh install → wizard → Playground request | Phase 3 (fingerprint → template → contract → confirm) |
+| 7. Zero-AI bootstrap: fresh install → wizard → Assistant request | Phase 3 (fingerprint → template → contract → confirm) |
 | 8. Gateway: curl + master key streams; wrong key 401; rotation kills old key | Phase 2b |
 | 9. Drift: detect → patch → confirm → rollback | Phase 5 |
 | 10. Gateway traffic queryable with source attribution | Phase 1 (`ledger.source`) + 2b |
