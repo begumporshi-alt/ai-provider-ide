@@ -10,6 +10,7 @@
 - Use `./node_modules/.bin/tsc`, never `npx tsc`. Sandbox `grep` shim is broadly unreliable, not just on alternation — plain `grep -rn "x"` returned empty for a string present in the file. Use the Grep tool, and verify a "not found" before acting on it.
 - **Never trust a diagnostic message's own asserted cause.** The 503 blamed "the gateway window may be suspended"; measurement showed the window was healthy and the request was merely slow. A message reports what was observed, not why.
 - Test counts (2026-09-20, after the first-turn liveness fix): router-core 231 · desktop vitest 151 (14 files) · Rust `cargo test --lib` 254 · browser 53. All green.
+- **Run JS tests with managed Node 22 first on PATH** (`~/.workbuddy-ai/binaries/node/versions/22.22.2-2/bin`). Under system Node 18 `pnpm -r test` dies with `ReferenceError: crypto is not defined` in `provider-registry.ts` — 27 failures that look exactly like a regression and are not. Probing `typeof globalThis.crypto` on both interpreters returns "object", so that check will mislead you; trust the suite result instead.
 
 ## Build / install
 - `mv dist /tmp/old-dist-$(date +%s)` **before** `npx tauri build`, or tauri dies at `beforeBuildCommand`.
