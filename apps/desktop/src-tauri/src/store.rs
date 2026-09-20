@@ -317,8 +317,10 @@ END;
 /// `MIGRATIONS.len() + idx + 1`. Keeping the two lists separate rather than interleaved means the
 /// SQL list stays a literal list of schemas; the numbering is the only coupling, and it is
 /// asserted by `migrations_apply_once_and_are_idempotent`.
-const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>)] =
-    &[("0007_stable_memory_node_ids", backfill_stable_memory_node_ids)];
+const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>)] = &[
+    ("0007_stable_memory_node_ids", backfill_stable_memory_node_ids),
+    ("0008_ledger_error_class", backfill_ledger_error_class),
+];
 
 /// One legacy graph node, paired with the stable id it should have carried.
 struct LegacyNode {
@@ -601,6 +603,56 @@ fn chrono_now_ms() -> i64 {
         .unwrap_or(0)
 }
 
+/// Recover the error class of ledger rows written before the failure path recorded it.
+///
+/// `wrapLedger`'s catch wrote the literal `NO_ROUTE` for *every* failure, while storing the real
+/// class in `fallback_chain_json` on the same row — so a row contradicted itself: the status column
+/// read "no route" beside a chain naming a provider, a key and `BAD_REQUEST_SCHEMA`. The writer is
+/// fixed, but these rows keep the wrong string forever unless they are repaired.
+///
+/// The intended value is *recoverable exactly*, not guessed: the last chain entry is the attempt
+/// that decided the outcome — the same entry `wrapLedger` reads — and its `cls` is the class. Two
+/// things are deliberately left alone:
+///
+///   - Rows whose chain is empty. `NO_ROUTE` is what that means, so they are already correct.
+///   - `http_status`. The chain never carried it, so it stays NULL rather than being invented.
+///
+/// Parsed in Rust rather than with `json_extract` so a single unparsable row is skipped instead of
+/// aborting the migration: a failed migration fails `Store::open`, which is app startup.
+fn backfill_ledger_error_class(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let mut recovered: Vec<(String, i64)> = Vec::new();
+    {
+        let mut stmt = tx.prepare(
+            "SELECT id, fallback_chain_json FROM ledger
+              WHERE error_class = 'NO_ROUTE' AND fallback_chain_json IS NOT NULL",
+        )?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let raw: String = row.get(1)?;
+            let Ok(chain) = serde_json::from_str::<Vec<serde_json::Value>>(&raw) else {
+                continue;
+            };
+            let Some(cls) = chain.last().and_then(|a| a.get("cls")).and_then(|c| c.as_str()) else {
+                continue;
+            };
+            // A chain whose own last entry says NO_ROUTE agrees with the column; leave it.
+            if cls.is_empty() || cls == "NO_ROUTE" {
+                continue;
+            }
+            recovered.push((cls.to_string(), id));
+        }
+    }
+    if recovered.is_empty() {
+        return Ok(());
+    }
+    let mut upd = tx.prepare("UPDATE ledger SET error_class = ?1 WHERE id = ?2")?;
+    for (cls, id) in &recovered {
+        upd.execute(rusqlite::params![cls, id])?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,11 +664,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007 data migration.
-        assert_eq!(info.schema_version, 7);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007 and 0008 data migrations.
+        assert_eq!(info.schema_version, 8);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(7, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(8, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -726,7 +778,12 @@ mod tests {
                 )
                 .unwrap();
             }
-            conn.execute("DELETE FROM schema_version WHERE version = 7", []).unwrap();
+            // `>= 7`, not `= 7`. The runner skips a step when `version <= MAX(version)`, so once a
+            // later migration exists, deleting only 0007 leaves the max at 0008 and this rewind is
+            // silently a no-op — the fixture then asserts against un-backfilled data and the test
+            // fails for a reason that has nothing to do with the backfill. Rewinding a migration
+            // that is no longer the last one must delete the whole tail.
+            conn.execute("DELETE FROM schema_version WHERE version >= 7", []).unwrap();
         }
         (s, dir)
     }
@@ -914,6 +971,96 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_version WHERE version=7", [], |r| r.get(0))
             .unwrap();
         assert_eq!(versions, 1);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn error_class_of(conn: &rusqlite::Connection, id: i64) -> Option<String> {
+        conn.query_row("SELECT error_class FROM ledger WHERE id=?1", [id], |r| r.get(0)).unwrap()
+    }
+
+    /// Seed ledger rows in the shape the old failure path wrote — `error_class` forced to
+    /// `NO_ROUTE` while the real class sits in `fallback_chain_json` on the same row — then rewind
+    /// `schema_version` so the next `migrate()` re-runs the 0008 backfill over them.
+    ///
+    /// The cases are the ones the live database actually contained, plus the three that must be
+    /// left alone: a chain that really is empty, one that cannot be parsed, and a row that already
+    /// carries its real class.
+    fn store_with_legacy_ledger(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        {
+            let conn = s.conn.lock().unwrap();
+            for (id, status, cls, chain) in [
+                (
+                    1,
+                    "error",
+                    Some("NO_ROUTE"),
+                    Some(r#"[{"provider":"agnes","key":"key-01","cls":"BAD_REQUEST_SCHEMA"}]"#),
+                ),
+                // Two attempts: the last one decided the outcome, so AUTH_FAILED is the answer.
+                (
+                    2,
+                    "error",
+                    Some("NO_ROUTE"),
+                    Some(r#"[{"provider":"a","key":"k1","cls":"NETWORK"},{"provider":"b","key":"k2","cls":"AUTH_FAILED"}]"#),
+                ),
+                // Genuinely no route: nothing was attempted, so the column is already right.
+                (3, "error", Some("NO_ROUTE"), Some("[]")),
+                (4, "error", Some("NO_ROUTE"), None),
+                // Unparsable: skipped, never fatal — a failed migration fails `Store::open`.
+                (5, "error", Some("NO_ROUTE"), Some("{ not json")),
+                // A success, and an error that already carries its real class: both untouched.
+                (6, "ok", None, Some("[]")),
+                (
+                    7,
+                    "error",
+                    Some("SERVER_ERROR"),
+                    Some(r#"[{"provider":"c","key":"k3","cls":"SERVER_ERROR"}]"#),
+                ),
+            ] {
+                conn.execute(
+                    "INSERT INTO ledger (id, ts, modality, source, requested_model, model, status,
+                                         error_class, latency_ms, tokens_in, tokens_out,
+                                         cost_estimate_micros, fallback_chain_json)
+                     VALUES (?1, ?1, 'text', 'ui', 'm', 'm', ?2, ?3, 5, 0, 0, 0, ?4)",
+                    rusqlite::params![id, status, cls, chain],
+                )
+                .unwrap();
+            }
+            // Same rule as the 0007 fixture: rewind the tail, not just this version.
+            conn.execute("DELETE FROM schema_version WHERE version >= 8", []).unwrap();
+        }
+        (s, dir)
+    }
+
+    #[test]
+    fn a_legacy_no_route_row_recovers_its_real_class() {
+        let (s, dir) = store_with_legacy_ledger("ledgercls");
+        s.migrate().expect("backfill runs");
+
+        let conn = s.conn.lock().unwrap();
+        // Recovered from the chain stored on the same row, not guessed.
+        assert_eq!(error_class_of(&conn, 1).as_deref(), Some("BAD_REQUEST_SCHEMA"));
+        // The LAST attempt decided the outcome — the same entry `wrapLedger` itself reads. A
+        // backfill that took the first entry instead would disagree with the writer.
+        assert_eq!(error_class_of(&conn, 2).as_deref(), Some("AUTH_FAILED"));
+        // Left alone: an empty chain is exactly what `NO_ROUTE` means.
+        assert_eq!(error_class_of(&conn, 3).as_deref(), Some("NO_ROUTE"));
+        assert_eq!(error_class_of(&conn, 4).as_deref(), Some("NO_ROUTE"));
+        // Left alone: one bad row must not abort the migration, because that fails app startup.
+        assert_eq!(error_class_of(&conn, 5).as_deref(), Some("NO_ROUTE"));
+        // Untouched: a success, and a row that already carried its real class.
+        assert_eq!(error_class_of(&conn, 6), None);
+        assert_eq!(error_class_of(&conn, 7).as_deref(), Some("SERVER_ERROR"));
+
+        // `http_status` is NOT invented: the chain never carried it, so it stays NULL. Writing a
+        // plausible-looking number here would repeat the very mistake this migration repairs.
+        let hs: Option<i64> = conn
+            .query_row("SELECT http_status FROM ledger WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(hs, None);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

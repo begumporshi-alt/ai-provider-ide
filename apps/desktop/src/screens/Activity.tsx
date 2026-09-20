@@ -25,6 +25,8 @@ function costFor(providerId: string | null, model: string, micros: number): numb
   if (!providerId) return null;
   return catalog.pricingFor(providerId, model) ? micros : null;
 }
+
+import { finalLine, servedLine, statusTitle } from "../lib/ledger/format";
 import { useUi } from "../ui-state";
 import { EmptyState } from "../components/atoms";
 
@@ -52,6 +54,7 @@ export function ActivityScreen() {
       model: e.model,
       requested: e.requestedModel,
       status: e.status,
+      httpStatus: e.httpStatus ?? null,
       errorClass: e.errorClass ?? null,
       latencyMs: e.latencyMs ?? null,
       tokensIn: e.tokensIn,
@@ -70,6 +73,7 @@ export function ActivityScreen() {
         model: p.model,
         requested: p.requestedModel ?? p.model,
         status: p.status as "ok" | "error",
+        httpStatus: p.httpStatus,
         errorClass: p.errorClass,
         latencyMs: p.latencyMs,
         tokensIn: p.tokensIn,
@@ -99,7 +103,7 @@ export function ActivityScreen() {
         </span>
       </div>
       {rows.length === 0 ? (
-        <EmptyState title="No requests yet. Try a model in the Playground — every routed request lands here, including which key served it." />
+        <EmptyState title="No requests yet. Try a model in the Assistant — every routed request lands here, including which key served it." />
       ) : (
         <table className="w-full">
           <thead>
@@ -111,7 +115,7 @@ export function ActivityScreen() {
               <th className="w-16 font-medium">Source</th>
               <th className="w-20 font-medium">Latency</th>
               <th className="w-24 font-medium">Cost</th>
-              <th className="w-24 font-medium">Status</th>
+              <th className="w-36 font-medium">Status</th>
             </tr>
           </thead>
           <tbody>
@@ -128,7 +132,13 @@ export function ActivityScreen() {
                     {formatCost(r.cost)}
                   </td>
                   <td>
-                    <span className="text-[12px]" style={{ color: r.status === "ok" ? (r.fallbacks.length ? "var(--warn)" : "var(--success)") : "var(--danger)" }}>
+                    <span
+                      className="text-[12px]"
+                      // The cell carries the class; the raw status and who (if anyone) served live
+                      // in the tooltip so a 400 is distinguishable from a connection that never landed.
+                      title={statusTitle(r)}
+                      style={{ color: r.status === "ok" ? (r.fallbacks.length ? "var(--warn)" : "var(--success)") : "var(--danger)" }}
+                    >
                       {r.status === "ok" ? (r.fallbacks.length ? `↻ ${r.fallbacks.length} fallback` : "✓ ok") : `✕ ${r.errorClass ?? "failed"}`}
                     </span>
                   </td>
@@ -137,14 +147,17 @@ export function ActivityScreen() {
                   <tr key={`${i}-detail`} className="border-t" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
                     <td colSpan={8} className="px-3 py-2">
                       <div className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
-                        <div>requested: {r.requested} → served: {r.model} ({r.modality})</div>
+                        <div>{servedLine(r, r.requested, r.model, r.modality)}</div>
                         <div>tokens in/out: {r.tokensIn}/{r.tokensOut}{r.source === "generator" ? " · System AI request (§2.8 exclusion path)" : ""}</div>
                         {r.cost === null && <div>cost: unknown — this provider publishes no pricing for {r.model}</div>}
-                        {r.fallbacks.length > 0 && (
+                        {(r.fallbacks.length > 0 || r.status !== "ok") && (
                           <div className="mt-1">
                             <div className="mb-0.5" style={{ color: "var(--warn)" }}>routing chain:</div>
+                            {r.fallbacks.length === 0 && (
+                              <div>no attempt recorded — nothing was tried for this model</div>
+                            )}
                             {r.fallbacks.map((f, j) => <div key={j}>attempt {j + 1}: {f}</div>)}
-                            <div>final: {r.provider} · {r.key} → ✓</div>
+                            <div>final: {finalLine(r)}</div>
                           </div>
                         )}
                       </div>
@@ -157,7 +170,7 @@ export function ActivityScreen() {
         </table>
       )}
       <p className="mt-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
-        Sources: <b>ui</b> = Playground · <b>gateway</b> = external apps via the Local Gateway (Phase 2b) · <b>generator</b> = System AI (Phase 4). Raw entries kept 90 days; monthly rollups kept indefinitely (§4).
+        Sources: <b>ui</b> = Assistant · <b>gateway</b> = external apps via the Local Gateway (Phase 2b) · <b>generator</b> = System AI (Phase 4). Raw entries kept 90 days; monthly rollups kept indefinitely (§4).
       </p>
     </div>
   );

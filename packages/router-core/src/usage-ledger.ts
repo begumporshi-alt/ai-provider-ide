@@ -35,13 +35,53 @@ export interface LedgerSink {
   append(entry: LedgerEntry): Promise<void>;
 }
 
+/**
+ * How many entries the in-memory mirror keeps.
+ *
+ * The database is the record — every entry still goes to the sink — so this bounds only the
+ * window the Usage screen can answer without re-reading it. Left unbounded, the array grew for
+ * the lifetime of the process: a gateway left running holds every request it ever served in RAM,
+ * forever, and `run_rollup` prunes the database without ever touching this copy.
+ */
+export const DEFAULT_MAX_MEM_ENTRIES = 50_000;
+
 export class UsageLedger {
   private mem: LedgerEntry[] = [];
-  constructor(private readonly sink?: LedgerSink) {}
+  private evicted = 0;
+  constructor(
+    private readonly sink?: LedgerSink,
+    private readonly maxEntries: number = DEFAULT_MAX_MEM_ENTRIES,
+  ) {}
 
   async append(e: LedgerEntry): Promise<void> {
     this.mem.push(e);
     if (this.sink) await this.sink.append(e);
+    // Trim after the append, not before: the newest entry survives even at maxEntries=1, and
+    // the sink has already seen every entry, so dropping one from memory loses no data.
+    const over = this.mem.length - Math.max(0, this.maxEntries);
+    if (over > 0) {
+      this.mem.splice(0, over);
+      this.evicted += over;
+    }
+  }
+
+  /**
+   * How many entries have fallen out of the in-memory window.
+   *
+   * Non-zero means `query({ since })` cannot answer about the oldest traffic: those rows are in
+   * the database, not here. Reporting the count is the point — a silently truncated result looks
+   * like "there was no traffic then", which is exactly the kind of blank the ledger exists to
+   * explain rather than produce.
+   */
+  get evictedCount(): number {
+    return this.evicted;
+  }
+
+  /** Oldest timestamp still in memory — `query({ since })` before this is incomplete. */
+  oldestTs(): number | undefined {
+    let min: number | undefined;
+    for (const e of this.mem) if (min === undefined || e.ts < min) min = e.ts;
+    return min;
   }
 
   query(filter: { since?: number; source?: LedgerSource; providerId?: string } = {}): LedgerEntry[] {

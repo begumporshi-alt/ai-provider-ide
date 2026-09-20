@@ -13,7 +13,7 @@ import type { CatalogModel } from "./domain.js";
 import { buildPlan, type Candidate, type PlanContext } from "./route-planner.js";
 import { HealthTracker } from "./health-tracker.js";
 import { ExecutionEngine, type TextExecution } from "./execution-engine.js";
-import { ProviderLimiter, PER_PROVIDER_DEFAULT } from "./concurrency.js";
+import { ProviderLimiter, PER_PROVIDER_DEFAULT, clampConcurrency } from "./concurrency.js";
 import { estimateCostMicros } from "./pricing.js";
 import { UsageLedger, type LedgerSource } from "./usage-ledger.js";
 
@@ -74,14 +74,20 @@ export class ModelRouter implements RouterFacade, AiTextPort {
 
   /** Apply `settings.perProviderConcurrency` to the live limiter (Router Settings changes). */
   syncConcurrency(): void {
-    this.limiter.maxPerProvider = this.settings.perProviderConcurrency;
+    // Clamped rather than trusted: the value arrives from persisted JSON (`Object.assign` over
+    // `router.settings` with no validation), so a stored `-1` or `"4"` would reach the limiter
+    // as-is — and `-1` reads as a bound while behaving as unlimited.
+    this.limiter.maxPerProvider = clampConcurrency(this.settings.perProviderConcurrency);
   }
 
   async generateText(req: TextRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<TextExecution> {
     const t0 = Date.now();
     this.syncConcurrency();
     const plan = this.plan(req.model, "text");
-    if (!plan.length) throw new Error(`no route for model "${req.model}" (no enabled provider carries it)`);
+    if (!plan.length) {
+      await this.recordNoRoute(req.model, "text", opts?.source ?? "ui", t0);
+      throw new Error(`no route for model "${req.model}" (no enabled provider carries it)`);
+    }
     const exec = await this.engine.executeText({
       plan,
       messages: req.messages,
@@ -101,14 +107,17 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       onUsage: req.onUsage,
       signal: opts?.signal,
     });
-    return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0);
+    return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0, opts?.signal);
   }
 
   async generateImage(req: ImageRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<{ url?: string; base64?: string }> {
     const t0 = Date.now();
     this.syncConcurrency();
     const plan = this.plan(req.model, "image");
-    if (!plan.length) throw new Error(`no route for image model "${req.model}"`);
+    if (!plan.length) {
+      await this.recordNoRoute(req.model, "image", opts?.source ?? "ui", t0);
+      throw new Error(`no route for image model "${req.model}"`);
+    }
     const res = await this.engine.executeImage({ plan, prompt: req.prompt, model: req.model, signal: opts?.signal });
     await this.ledger.append({
       ts: Date.now(),
@@ -265,12 +274,44 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     return plan;
   }
 
+  /**
+   * Record a request that found no route at all.
+   *
+   * An empty plan means no candidate was ever attempted — which is precisely and only what
+   * `NO_ROUTE` describes, so this is the one place that class is written. Until this existed the
+   * guard threw before the engine ran, so a model nothing could serve failed in the UI and left no
+   * trace here: the ledger was silent about the request the user is most likely to be confused by.
+   * `fallbackChain: []` is the honest value — there were no attempts to record.
+   */
+  private async recordNoRoute(
+    requestedModel: string,
+    modality: Modality,
+    source: LedgerSource,
+    t0: number,
+  ): Promise<void> {
+    await this.ledger.append({
+      ts: Date.now(),
+      modality,
+      source,
+      requestedModel,
+      model: requestedModel,
+      status: "error",
+      errorClass: "NO_ROUTE",
+      latencyMs: Date.now() - t0,
+      tokensIn: 0,
+      tokensOut: 0,
+      costEstimateMicros: 0,
+      fallbackChain: [],
+    });
+  }
+
   private wrapLedger(
     exec: TextExecution,
     requestedModel: string,
     modality: Modality,
     source: LedgerSource,
     t0: number,
+    signal?: AbortSignal,
   ): TextExecution {
     const ledger = this.ledger;
     const router = this;
@@ -280,6 +321,30 @@ export class ModelRouter implements RouterFacade, AiTextPort {
         const served = exec.served();
         const tokensIn = exec.usage()?.prompt_tokens ?? 0;
         const tokensOut = exec.usage()?.completion_tokens ?? 0;
+        if (!served) {
+          // A stream that completes without ever serving is not a success. The engine returns
+          // normally in that state only when the caller aborted (plan exhaustion throws
+          // AllAttemptsFailedError) or when a provider answered 200 with an empty body — neither
+          // is an answer. Writing "ok" here claimed a success for a request that never reached a
+          // provider: the live ledger held 7 such rows, and the 99.5s / 83s latencies among them
+          // are client timeouts, not answers. No provider is named because none produced a token.
+          await ledger.append({
+            ts: Date.now(),
+            modality,
+            source,
+            requestedModel,
+            model: requestedModel,
+            status: "error",
+            errorClass: signal?.aborted ? "CANCELLED" : "PARSE_ERROR",
+            latencyMs: Date.now() - t0,
+            tokensIn,
+            tokensOut,
+            costEstimateMicros: 0,
+            fallbackChain: exec.fallbackChain(),
+          });
+          router.observeAttempts(exec, requestedModel);
+          return;
+        }
         await ledger.append({
           ts: Date.now(),
           modality,
@@ -305,21 +370,37 @@ export class ModelRouter implements RouterFacade, AiTextPort {
         router.observeAttempts(exec, requestedModel);
       } catch (e) {
         const served = exec.served();
+        // Nothing served: the last attempt IS the route that was tried, and its class IS the
+        // reason. `NO_ROUTE` used to be written for every failure, which threw the cause away —
+        // the row read "no route" while the chain stored beside it named a provider, a key and a
+        // class. It is now reserved for what it describes: no candidate was ever attempted.
+        const chain = exec.fallbackChain();
+        const last = chain[chain.length - 1];
         await ledger.append({
           ts: Date.now(),
           modality,
           source,
+          // `served` only — deliberately NOT the last attempt. "Provider"/"Key" mean *who
+          // served*, so a null provider on an error row is itself the signal that nothing served
+          // at all; filling it from the failed attempt would erase that distinction and name a
+          // provider that never produced a token. The attempt that failed is in the chain below.
           providerId: served?.provider.id,
           keyId: served?.key.id,
           requestedModel,
           model: served?.model.nativeId ?? requestedModel,
           status: "error",
-          errorClass: served ? "NETWORK" : "NO_ROUTE",
+          // The upstream status the provider actually returned, so a 400 is distinguishable
+          // from a connection that never landed.
+          httpStatus: served ? undefined : last?.status,
+          // `?? "NO_ROUTE"` is now genuinely unreachable here: an empty plan is rejected by
+          // `generateText` before the engine runs, and `recordNoRoute` writes the row for it. What
+          // remains is a defensive default for an engine throw with an empty chain.
+          errorClass: served ? "NETWORK" : (last?.cls ?? "NO_ROUTE"),
           latencyMs: Date.now() - t0,
           tokensIn: exec.usage()?.prompt_tokens ?? 0,
           tokensOut: exec.usage()?.completion_tokens ?? 0,
           costEstimateMicros: 0,
-          fallbackChain: exec.fallbackChain(),
+          fallbackChain: chain,
         });
         router.observeAttempts(exec, requestedModel);
         throw e;
