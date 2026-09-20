@@ -12,8 +12,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    anthropic_error, check_gateway_key, clean_assistant_text, err, forwarded_headers, peer_ip,
-    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
+    anthropic_error, anthropic_error_kind, check_gateway_key, clean_assistant_text, err,
+    forwarded_headers, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// Anthropic Messages ingress (2026-09-16 amendment, DECISIONS.md): Claude Code and
@@ -142,7 +142,7 @@ fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
 
 pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r;
+        return r.anthropic();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, anthropic_error("invalid JSON body", "invalid_request_error"));
@@ -166,12 +166,17 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => {
-            // map the generic responses to anthropic shape
-            let status = r.status().as_u16();
-            return err(
-                StatusCode::from_u16(status).unwrap_or(StatusCode::SERVICE_UNAVAILABLE),
-                anthropic_error("gateway unavailable or at capacity", "overloaded_error"),
-            );
+            // The status is already right; only the envelope and the error type need translating.
+            // This used to hardcode `overloaded_error` / "at capacity" for every refusal, so a
+            // *stopped* gateway asserted a capacity problem and told Claude Code to back off and
+            // retry a service that was simply switched off.
+            let status = r.status();
+            let message = if status == StatusCode::TOO_MANY_REQUESTS {
+                "gateway at capacity"
+            } else {
+                "AI-Provider Router core unavailable — is the app open?"
+            };
+            return err(status, anthropic_error(message, anthropic_error_kind(status)));
         }
     };
     let id = slot.id;
@@ -201,8 +206,13 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => break,
-                    BridgeMsg::Error { message, .. } => {
-                        let e = json!({ "type": "error", "error": { "type": "overloaded_error", "message": message } });
+                    BridgeMsg::Error { status, message } => {
+                        // The SSE response is already committed as 200, so the HTTP status can no
+                        // longer carry the outcome — the error type is the only signal the client
+                        // receives. Hardcoding `overloaded_error` here told Claude Code to back off
+                        // and retry a request that had failed on its own contents.
+                        let kind = anthropic_error_kind(worker_status(status));
+                        let e = json!({ "type": "error", "error": { "type": kind, "message": message } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("error").data(e.to_string()));
                         return;
                     }
@@ -323,7 +333,10 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     }
     drop(slot);
     match err_info {
-        Some((_, message)) => err(StatusCode::BAD_GATEWAY, anthropic_error(&message, "api_error")),
+        Some((status, message)) => {
+            let code = worker_status(status);
+            err(code, anthropic_error(&message, anthropic_error_kind(code)))
+        }
         None => {
             let prompt_tokens = usage.as_ref().map(|(pt, _)| pt).unwrap_or(&0);
             let completion_tokens = usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0);

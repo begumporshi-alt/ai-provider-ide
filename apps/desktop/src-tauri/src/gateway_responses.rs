@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 
 use crate::gateway::{
     check_gateway_key, clean_assistant_text, err, forwarded_headers, map_generic_to_status,
-    peer_ip, try_slot, BridgeMsg, BridgeRequest, GatewayCore,
+    peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// OpenAI Responses API ingress (v1.1, 2026-09-16): Codex-style clients. Edge translation
@@ -67,6 +67,21 @@ fn responses_error(message: &str, code: &str) -> Value {
     json!({ "error": { "message": message, "type": "invalid_request_error", "code": code } })
 }
 
+/// The `(type, code)` pair that belongs to an HTTP status for an *upstream* failure.
+///
+/// `responses_error` hardcodes `type: "invalid_request_error"`, which is correct for the local
+/// validation failures it was written for but wrong for a fault that came from upstream: a 503
+/// labelled `invalid_request_error` tells the client its request was malformed and that editing
+/// it will help. Derive both fields from the status instead.
+fn responses_error_kind(status: StatusCode) -> (&'static str, &'static str) {
+    match status.as_u16() {
+        400 | 404 | 413 | 422 => ("invalid_request_error", "invalid_request_error"),
+        429 => ("rate_limit_error", "rate_limit_exceeded"),
+        503 => ("server_error", "service_unavailable"),
+        _ => ("server_error", "server_error"),
+    }
+}
+
 /// Strip tools/tool_choice/response_format from a forwarded chat body when the
 /// gateway's tools toggle is disabled. Called after translating ingress dialects
 /// so the router core never receives those fields when tools are off.
@@ -84,7 +99,8 @@ fn strip_tool_fields(body: &mut Value, enabled: bool) {
 pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r;
+        // The Responses API error envelope is the OpenAI one, so this needs no translation.
+        return r.openai();
     }
     let _ = uri;
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
@@ -140,9 +156,15 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => break,
-                    BridgeMsg::Error { message, .. } => {
+                    BridgeMsg::Error { status, message } => {
+                        // The SSE stream is already committed as 200, so the failure has to be
+                        // described in the event payload. Emitting only a message left the client
+                        // to guess whether to retry, re-authenticate, or fix the request.
+                        let code = worker_status(status);
+                        let (ty, kind) = responses_error_kind(code);
                         yield ev("response.failed", json!({ "type": "response.failed",
-                            "response": { "id": rid, "object": "response", "status": "failed", "error": { "message": message } } }));
+                            "response": { "id": rid, "object": "response", "status": "failed",
+                                          "error": { "message": message, "type": ty, "code": kind } } }));
                         return;
                     }
                     BridgeMsg::ToolCalls(calls) => {
@@ -241,7 +263,11 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     }
     drop(slot);
     match err_info {
-        Some((_, message)) => err(StatusCode::BAD_GATEWAY, responses_error(&message, "upstream_error")),
+        Some((status, message)) => {
+            let code = worker_status(status);
+            let (ty, kind) = responses_error_kind(code);
+            err(code, json!({ "error": { "message": message, "type": ty, "code": kind } }))
+        }
         None => {
             let mut content: Vec<Value> = vec![json!({ "type": "output_text", "text": clean_assistant_text(&full), "annotations": [] })];
             for (call_id, name, args) in &tool_calls {

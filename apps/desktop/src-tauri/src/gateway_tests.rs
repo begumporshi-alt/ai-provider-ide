@@ -18,6 +18,10 @@
         /// Answer nothing at all: stand in for a worker webview whose JS the OS suspended
         /// after the request was already admitted.
         silent: AtomicBool,
+        /// When non-zero, answer every dispatched request with `BridgeMsg::Error { status }`.
+        /// Lets a test drive the worker's own status decision into the edge — which is exactly
+        /// where that decision used to be discarded.
+        fail_status: AtomicUsize,
     }
 
     impl SynthBridge {
@@ -29,6 +33,7 @@
                 tool_calls: AtomicBool::new(false),
                 empty_delta: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
+                fail_status: AtomicUsize::new(0),
             }
         }
         fn attach(&self, core: &Arc<GatewayCore>) {
@@ -43,6 +48,10 @@
         fn answer_with_empty_delta(&self, on: bool) {
             self.empty_delta.store(on, Ordering::Relaxed);
         }
+        /// Make the worker answer with `BridgeMsg::Error` carrying this status.
+        fn fail_with(&self, status: u16) {
+            self.fail_status.store(status as usize, Ordering::Relaxed);
+        }
     }
 
     impl Bridge for SynthBridge {
@@ -54,9 +63,18 @@
             let slow = self.slow.load(Ordering::Relaxed);
             let with_tools = self.tool_calls.load(Ordering::Relaxed);
             let with_empty = self.empty_delta.load(Ordering::Relaxed);
+            let fail = self.fail_status.load(Ordering::Relaxed);
             std::thread::spawn(move || {
                 if slow > 0 {
                     std::thread::sleep(Duration::from_millis(slow as u64 * 20));
+                }
+                if fail > 0 {
+                    // The worker decided this status. Everything downstream must respect it.
+                    core.reply(
+                        req.request_id,
+                        BridgeMsg::Error { status: fail as u16, message: "upstream refused the request".into() },
+                    );
+                    return;
                 }
                 match req.kind {
                     "chat" => {
@@ -199,9 +217,12 @@
             .await
             .unwrap();
         assert_eq!(res.status(), 200);
-        // rotate (overwrite keychain slot)
+        // rotate (overwrite keychain slot) — and drop the cached key, exactly as
+        // `GatewayCore::rotate_master_key` does. The two steps are one operation in production
+        // precisely so this cannot be half-done.
         *key.lock().unwrap() = Some("sk-aip-new".to_string());
-        // old key now 401, new key 200 — no restart, per-request read
+        s.core.invalidate_master_key();
+        // old key now 401, new key 200 — no restart
         let res_old = s
             .client
             .post(format!("{}/v1/chat/completions", s.base))
@@ -838,6 +859,56 @@
         assert_eq!(post_chat(&s, "wrong").await.status(), 401, "success resets the counter");
     }
 
+    /// H2, re-scoped: how far the merged backoff bucket actually reaches.
+    ///
+    /// Two *separate* clients, both presenting bad keys — the second inherits the first's window,
+    /// so its very first failure answers 429 rather than 401. That is the whole of the merging.
+    /// A caller with a valid key is never throttled (see
+    /// `r4_valid_key_not_throttled_by_another_callers_failures`): `auth_allowed` is consulted only
+    /// after the key has already failed to match, so the window cannot touch a good credential.
+    /// The audit's claim that "one misconfigured consumer locks out all other consumers" is
+    /// therefore false, and this test is the evidence.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_failing_caller_inherits_the_first_callers_window() {
+        let s = start_with(None, None).await;
+        let other = reqwest::Client::new();
+        let post = |c: &reqwest::Client, bearer: &str| {
+            c.post(format!("{}/v1/chat/completions", s.base))
+                .header("authorization", format!("Bearer {bearer}"))
+                .json(&chat_body(false))
+                .send()
+        };
+        assert_eq!(post(&s.client, "wrong").await.unwrap().status(), 401);
+        assert_eq!(post(&s.client, "wrong").await.unwrap().status(), 429, "window opens");
+        // Different client, different connection, same bucket: its first failure is throttled too.
+        assert_eq!(
+            post(&other, "wrong").await.unwrap().status(),
+            429,
+            "a second caller shares the bucket — this is H2 in full"
+        );
+        // ...but a good key still gets through from either client, which is why H2 is not a lockout.
+        assert_eq!(post(&other, "sk-aip-master").await.unwrap().status(), 200);
+    }
+
+    /// Invariant 11, pinned: the listener binds loopback only.
+    ///
+    /// This is *what makes* a single backoff bucket defensible — every peer really is 127.0.0.1, so
+    /// `peer_ip()` returning LOCALHOST is correct today rather than a bug. It becomes a bug the
+    /// moment the bind widens, at which point one bucket would merge genuinely distinct clients.
+    /// Fail here rather than let that change land silently.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_listener_binds_loopback_only() {
+        let master = Arc::new(Mutex::new(Some("sk-aip-master".to_string())));
+        let (core, _bridge) = core_with(master, None, None);
+        core.set_running(true);
+        let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+        assert!(
+            handle.addr.ip().is_loopback(),
+            "peer_ip() assumes every peer is loopback, but the server bound {}",
+            handle.addr
+        );
+    }
+
     /// R4(b): at or over the cap the gateway refuses with 402 instead of spending more.
     #[tokio::test(flavor = "multi_thread")]
     async fn r4_spend_cap_blocks_at_threshold() {
@@ -1051,6 +1122,67 @@
         assert!(core.is_tools_enabled());
     }
 
+    // --- audit H1b: gateway-side mutation is opt-in ---
+    //
+    // The Playground has a per-call Allow/Deny modal; the gateway has no UI at all, so a model
+    // driven by untrusted content can write files and run code there with nobody watching.
+    // Read-only tools stay on; mutation defaults off and is enforced host-side.
+
+    #[test]
+    fn mutation_is_disabled_by_default() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        assert!(
+            !core.is_tools_mutation_enabled(),
+            "gateway mutation must default to off — there is no confirmation on that path"
+        );
+    }
+
+    #[test]
+    fn mutating_tools_are_refused_while_read_only_still_works() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        for tool in ["write_file", "run_command"] {
+            assert!(
+                core.gateway_tool_refusal(tool).is_some(),
+                "{tool} must be refused by default"
+            );
+        }
+        for tool in ["read_file", "list_dir"] {
+            assert!(
+                core.gateway_tool_refusal(tool).is_none(),
+                "{tool} is read-only and must stay available"
+            );
+        }
+    }
+
+    #[test]
+    fn enabling_mutation_lifts_the_refusal() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        core.set_tools_mutation_enabled(true);
+        assert!(core.is_tools_mutation_enabled());
+        for tool in ["write_file", "run_command", "read_file", "list_dir"] {
+            assert!(
+                core.gateway_tool_refusal(tool).is_none(),
+                "{tool} must be allowed once mutation is enabled"
+            );
+        }
+        core.set_tools_mutation_enabled(false);
+        assert!(core.gateway_tool_refusal("run_command").is_some());
+    }
+
+    #[test]
+    fn the_refusal_message_tells_the_model_what_to_do() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let (core, _bridge) = test_core(key);
+        let reason = core.gateway_tool_refusal("run_command").unwrap();
+        assert!(reason.contains("run_command"), "name the tool: {reason}");
+        // A model told only "forbidden" retries the call. It needs the way out.
+        assert!(reason.contains("Gateway settings"), "say how to enable it: {reason}");
+        assert!(reason.contains("Playground"), "offer the confirmed path: {reason}");
+    }
+
     /// A bound socket and a gateway that is meant to be serving are different states — but the
     /// difference that matters is *operator intent*, not whether the worker happens to be awake.
     ///
@@ -1148,4 +1280,570 @@
             "the client is told it is worth retrying"
         );
         assert!(elapsed < Duration::from_secs(5), "answered in {elapsed:?}");
+    }
+
+    /// A running server whose master-key lookup and key wait the test supplies, so a stalled
+    /// keychain can be reproduced and the number of lookups counted.
+    async fn start_with_key_lookup(lookup: KeyProvider, wait: Duration) -> TestServer {
+        let bridge = Arc::new(SynthBridge::new());
+        let core = Arc::new(GatewayCore::new_with_key_wait(bridge.clone(), lookup, wait));
+        bridge.attach(&core);
+        core.set_running(true);
+        let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+        TestServer {
+            client: reqwest::Client::new(),
+            base: format!("http://{}", handle.addr),
+            core,
+            bridge,
+            _handle: handle,
+        }
+    }
+
+    /// A keychain that never answers must not take the HTTP surface with it.
+    ///
+    /// This is what a reinstall produces: it invalidates the item's ACL, so the next read waits on
+    /// a SecurityAgent prompt. The read used to happen inline on every request with no bound, so
+    /// one stalled keychain wedged everything — the listener kept accepting connections and never
+    /// answered one, `/v1/models` included, with nothing logged because the failure was a hang
+    /// rather than an error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stalled_keychain_answers_503_instead_of_hanging() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let s = start_with_key_lookup(
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_secs(30));
+                Some("sk-aip-test".to_string())
+            }),
+            Duration::from_millis(200),
+        )
+        .await;
+
+        let started = std::time::Instant::now();
+        let res = tokio::time::timeout(
+            Duration::from_secs(10),
+            s.client
+                .get(format!("{}/v1/models", s.base))
+                .header("authorization", "Bearer sk-aip-test")
+                .send(),
+        )
+        .await
+        .expect("the gateway must answer while the keychain is stalled — it hung instead")
+        .expect("request failed");
+        let elapsed = started.elapsed();
+
+        assert_eq!(res.status(), 503, "an unreadable key is unavailable, not invalid");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "service_unavailable");
+        assert!(elapsed < Duration::from_secs(5), "answered in {elapsed:?}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "a stalled keychain must not be re-read once per request"
+        );
+    }
+
+    /// The keychain is consulted once, not once per request. Reading it per request was what made
+    /// rotation instant, and that is now the cache's generation stamp instead.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_master_key_is_read_once_not_once_per_request() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let s = start_with_key_lookup(
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Some("sk-aip-test".to_string())
+            }),
+            Duration::from_millis(500),
+        )
+        .await;
+
+        for _ in 0..3 {
+            let res = s
+                .client
+                .get(format!("{}/v1/models", s.base))
+                .header("authorization", "Bearer sk-aip-test")
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(res.status(), 200);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "three requests must not mean three keychain reads"
+        );
+    }
+
+    /// Concurrent callers share one in-flight read. Without this, a stalled keychain would park
+    /// one thread per request instead of one in total — and nothing can cancel a blocking
+    /// `SecKeychainFindGenericPassword`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_requests_share_a_single_keychain_read() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = calls.clone();
+        let s = start_with_key_lookup(
+            Arc::new(move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(400));
+                Some("sk-aip-test".to_string())
+            }),
+            Duration::from_secs(5),
+        )
+        .await;
+
+        let requests = (0..8).map(|_| {
+            s.client
+                .get(format!("{}/v1/models", s.base))
+                .header("authorization", "Bearer sk-aip-test")
+                .send()
+        });
+        for r in futures_util::future::join_all(requests).await {
+            assert_eq!(r.unwrap().status(), 200);
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "eight concurrent requests must share one keychain read"
+        );
+    }
+
+    /// `Unavailable` and `Absent` must not collapse into each other.
+    ///
+    /// The first means "the keychain did not answer"; the second means "no key has been
+    /// configured". Both used to be `None`, and the request path reported both as 401 — telling a
+    /// correctly-configured client that its credential was wrong.
+    #[test]
+    fn an_unanswered_keychain_is_not_reported_as_a_missing_key() {
+        let absent = MasterKeyCache::new(Arc::new(|| None), Duration::from_millis(500));
+        assert_eq!(absent.get(), MasterKeyLookup::Absent);
+
+        let stalled = MasterKeyCache::new(
+            Arc::new(|| {
+                std::thread::sleep(Duration::from_secs(30));
+                Some("sk-aip-test".to_string())
+            }),
+            Duration::from_millis(150),
+        );
+        assert_eq!(stalled.get(), MasterKeyLookup::Unavailable);
+    }
+
+    /// A rotation that lands while the first load is still in flight must yield the NEW key.
+    ///
+    /// Reading the generation once, up front, made this request answer `Unavailable` instead:
+    /// the load it was waiting on finished stamped with the generation it started under, so the
+    /// waiter concluded its answer was not in hand and gave up — one spurious 503 per rotation
+    /// that happened to overlap a cold load.
+    #[test]
+    fn rotation_during_a_cold_load_yields_the_new_key() {
+        let slot = Arc::new(Mutex::new("sk-aip-old".to_string()));
+        let entered = Arc::new(AtomicBool::new(false));
+        let cache = {
+            let slot = slot.clone();
+            let entered = entered.clone();
+            Arc::new(MasterKeyCache::new(
+                Arc::new(move || {
+                    entered.store(true, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(200));
+                    Some(slot.lock().unwrap().clone())
+                }),
+                Duration::from_secs(5),
+            ))
+        };
+
+        // Hold the load open on another thread, rotate while it is inside the lookup, then let
+        // it finish. The caller that was already waiting is the one under test.
+        let waiting = {
+            let cache = cache.clone();
+            std::thread::spawn(move || cache.get())
+        };
+        while !entered.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *slot.lock().unwrap() = "sk-aip-new".to_string();
+        cache.invalidate();
+
+        assert_eq!(
+            waiting.join().unwrap(),
+            MasterKeyLookup::Ready("sk-aip-new".to_string()),
+            "the waiter must fetch the key the rotation installed, not give up"
+        );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The worker's status decision must survive the edge
+    // -------------------------------------------------------------------------------------------
+    //
+    // The webview's `gatewayStatus()` already applies a deliberate whitelist: it passes through
+    // client-attributable upstream codes (400/404/413/422/429), maps a missing route to 404, and
+    // maps everything else to 502. The Rust edge then re-decided with a second, narrower list and
+    // discarded most of that — so a schema error the worker had correctly labelled 400 reached the
+    // client as 502, and the client retried a request that could never succeed. These specs pin the
+    // worker's decision to the wire, per dialect.
+
+    #[test]
+    fn worker_status_preserves_every_error_status_the_worker_may_send() {
+        for code in [400u16, 401, 403, 404, 413, 422, 429, 500, 502, 503] {
+            assert_eq!(
+                worker_status(code).as_u16(),
+                code,
+                "the worker decided {code}; the edge must not overrule it"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_status_refuses_a_value_that_is_not_an_error_status() {
+        // A success or redirect status carrying an error body would be worse than a 502 — the
+        // client would read the error as a payload and report success.
+        for code in [0u16, 99, 200, 204, 301, 600, 65535] {
+            assert_eq!(
+                worker_status(code),
+                StatusCode::BAD_GATEWAY,
+                "{code} is not an error status and must degrade to 502"
+            );
+        }
+    }
+
+    #[test]
+    fn anthropic_error_kind_tracks_the_status() {
+        // Anthropic clients branch on error.type, so a 400 answered as `api_error` reads as
+        // "try again" and invites a retry that cannot succeed.
+        assert_eq!(anthropic_error_kind(StatusCode::BAD_REQUEST), "invalid_request_error");
+        assert_eq!(anthropic_error_kind(StatusCode::UNAUTHORIZED), "authentication_error");
+        assert_eq!(anthropic_error_kind(StatusCode::TOO_MANY_REQUESTS), "rate_limit_error");
+        assert_eq!(anthropic_error_kind(StatusCode::SERVICE_UNAVAILABLE), "overloaded_error");
+        assert_eq!(anthropic_error_kind(StatusCode::BAD_GATEWAY), "api_error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_400_reaches_an_openai_client_as_400() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400, "a client-attributable error must not become a gateway error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_400_reaches_an_anthropic_client_as_400() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(
+            body["error"]["type"], "invalid_request_error",
+            "the Anthropic error type must describe the failure, not just say `api_error`"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_400_reaches_a_responses_client_as_400() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "input": "hi" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_429_reaches_a_gemini_client_as_429_not_503() {
+        // The old code collapsed 429 into a 503 labelled "gateway unavailable or at capacity",
+        // telling a rate-limited client that the gateway itself was broken.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(429);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429, "a rate limit is not a gateway outage");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], 429);
+        assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_400_reaches_an_image_client_as_400() {
+        // The image handler carried its own narrower whitelist — `404` else `502` — so a schema
+        // error became a gateway error here too. It was a third list, and it was missed.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/images/generations", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({ "model": "mock-image", "prompt": "a cat" }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400, "a client-attributable error must not become a gateway error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streamed_openai_failure_carries_the_status_in_the_payload() {
+        // The OpenAI streaming arm discarded the status entirely and emitted a fixed
+        // `upstream_error` with a null code, so a client could not tell a bad request from an
+        // outage — the same defect as the other dialects, in the dialect that started it all.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(true))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "the SSE response is committed before the worker answers");
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("\"error\"") {
+                break;
+            }
+        }
+        assert!(
+            acc.contains("\"status\":400"),
+            "the payload must carry the real status: {acc}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stopped_gateway_answers_a_gemini_client_in_gemini_shape() {
+        // `try_slot` fails before any dispatch (stopped / unavailable / at capacity), and the
+        // shared helper that frames that failure writes an OpenAI-shaped body. Gemini clients read
+        // `error.code` as an integer and `error.status` as the enum; both are wrong in that
+        // envelope, so the failure cannot be classified by a strict SDK.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.set_running(false);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], 503, "a Gemini client reads error.code as an integer");
+        assert_eq!(body["error"]["status"], "UNAVAILABLE");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_anthropic_request_gets_an_anthropic_error_envelope() {
+        // Same shared gate, same defect: an Anthropic client reads a top-level `type: "error"` and
+        // branches on `error.type`. The OpenAI envelope has neither.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.set_running(false);
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["type"], "error", "an Anthropic client reads the top-level `type`");
+        assert_eq!(body["error"]["type"], "overloaded_error");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_gateway_still_reports_its_status_to_an_openai_client() {
+        // The OpenAI paths must keep the envelope they had — the gate refactor is about *shape*,
+        // and the status it carries must not drift.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.set_running(false);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 503);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "service_unavailable");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_capacity_refusal_is_framed_for_anthropic_as_a_rate_limit() {
+        // `try_slot` failing is a *different* site from the auth gate, and it used to hardcode
+        // `overloaded_error` / "at capacity" for every refusal. Closing the slot pool reaches it
+        // without dispatching anything.
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.core.permits.close();
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429, "an exhausted slot pool is a capacity refusal");
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(
+            body["error"]["type"], "rate_limit_error",
+            "429 must not be reported as an overload — the two have different retry semantics"
+        );
+    }
+
+    // A streamed response is committed as 200 before the worker answers, so once the worker fails
+    // the HTTP status can no longer carry the outcome — the event payload is the only channel left.
+    // Every streaming arm used to hardcode a failure it had not been told: Anthropic always said
+    // `overloaded_error`, Gemini always said `code: 502 / INTERNAL`. Both told the client to treat a
+    // bad request as a transient outage.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streamed_anthropic_failure_describes_itself_in_the_event() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64, "stream": true,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200, "the SSE response is committed before the worker answers");
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("event: error") {
+                break;
+            }
+        }
+        assert!(acc.contains("event: error"), "expected an error event: {acc}");
+        assert!(
+            acc.contains("invalid_request_error"),
+            "the event must name the real failure: {acc}"
+        );
+        assert!(
+            !acc.contains("overloaded_error"),
+            "a 400 is not an overload — that tells the client to retry: {acc}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streamed_gemini_failure_carries_the_real_code() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(429);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:streamGenerateContent?alt=sse", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("RESOURCE_EXHAUSTED") {
+                break;
+            }
+        }
+        assert!(acc.contains("\"code\":429"), "the payload must carry the real code: {acc}");
+        assert!(
+            acc.contains("RESOURCE_EXHAUSTED"),
+            "the payload must carry the real status label: {acc}"
+        );
+        assert!(
+            !acc.contains("INTERNAL"),
+            "a rate limit is not an internal error: {acc}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streamed_responses_failure_carries_a_code() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(400);
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "input": "hi", "stream": true }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let mut acc = String::new();
+        let mut stream = res.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+            if acc.contains("response.failed") {
+                break;
+            }
+        }
+        assert!(acc.contains("response.failed"), "expected a failure event: {acc}");
+        assert!(
+            acc.contains("invalid_request_error"),
+            "a message alone leaves the client guessing whether to retry: {acc}"
+        );
     }

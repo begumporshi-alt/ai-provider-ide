@@ -13,12 +13,12 @@ use serde_json::{json, Value};
 
 use crate::gateway::{
     check_gateway_key, clean_assistant_text, err, err_ra, forwarded_headers, openai_error, peer_ip,
-    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
+    try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r;
+        return r.openai();
     }
     let Ok(mut req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
@@ -111,10 +111,14 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
                         break;
                     }
-                    BridgeMsg::Error { message, .. } => {
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(
-                            json!({ "error": { "message": message, "type": "upstream_error", "code": null } }).to_string(),
-                        ));
+                    BridgeMsg::Error { status, message } => {
+                        // SSE is already committed as 200, so the payload is the only channel left.
+                        // The non-stream path puts the status on the wire; here it has to be in the
+                        // body, or a client cannot tell a bad request from a broken gateway.
+                        let code = worker_status(status);
+                        let mut body = openai_error(&message, "upstream_error", None);
+                        body["error"]["status"] = json!(code.as_u16());
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(body.to_string()));
                         break;
                     }
                     BridgeMsg::ToolCalls(calls) => {
@@ -173,18 +177,12 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     drop(slot);
     match err_info {
         Some((status, message)) => {
-            let code = match status {
-                404 => StatusCode::NOT_FOUND,
-                429 => StatusCode::TOO_MANY_REQUESTS,
-                401 => StatusCode::UNAUTHORIZED,
-                // Not upstream: the worker never answered. Say so, and tell the client it is
-                // worth retrying — a retry re-enters `try_slot`, which re-warms the window.
-                503 => StatusCode::SERVICE_UNAVAILABLE,
-                _ => StatusCode::BAD_GATEWAY,
-            };
+            let code = worker_status(status);
+            // Not upstream: the worker never answered. Say so, and tell the client it is
+            // worth retrying — a retry re-enters `try_slot`, which re-warms the window.
             if code == StatusCode::SERVICE_UNAVAILABLE {
                 return err_ra(
-                    StatusCode::SERVICE_UNAVAILABLE,
+                    code,
                     "1",
                     openai_error(&message, "service_unavailable", None),
                 );
@@ -218,7 +216,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
 
 pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r;
+        return r.openai();
     }
     let mut slot = match try_slot(&core).await {
         Ok(s) => s,
@@ -232,8 +230,8 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Result(v) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
             }
-            BridgeMsg::Error { message, .. } => {
-                return err(StatusCode::BAD_GATEWAY, openai_error(&message, "upstream_error", None))
+            BridgeMsg::Error { status, message } => {
+                return err(worker_status(status), openai_error(&message, "upstream_error", None))
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
@@ -254,7 +252,7 @@ pub(crate) async fn unknown_route() -> Response {
 
 pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r;
+        return r.openai();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
@@ -277,8 +275,7 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
             }
             BridgeMsg::Error { status, message } => {
-                let code = if status == 404 { StatusCode::NOT_FOUND } else { StatusCode::BAD_GATEWAY };
-                return err(code, openai_error(&message, "upstream_error", None));
+                return err(worker_status(status), openai_error(&message, "upstream_error", None));
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}

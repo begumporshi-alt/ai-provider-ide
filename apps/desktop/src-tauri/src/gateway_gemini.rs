@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, clean_assistant_text, forwarded_headers, map_generic_to_status, peer_ip,
-    try_slot, BridgeMsg, BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, forwarded_headers, peer_ip, try_slot, worker_status,
+    BridgeMsg, BridgeRequest, GatewayCore,
 };
 
 /// One Gemini function declaration -> one OpenAI function declaration.
@@ -105,13 +105,24 @@ mod tool_conversion_tests {
     }
 }
 
+/// Gemini error body. `code` and `status` are both derived from the HTTP status so the two cannot
+/// disagree — which they did: the old 429 branch answered `code: 503, status: "INTERNAL"` while
+/// claiming the gateway was "at capacity", so a rate-limited client was told to treat a capacity
+/// problem as its own fault, or vice versa. It also backs the SSE arm, which is committed as 200
+/// and so has no HTTP status left to carry the outcome.
+pub(crate) fn gemini_error_body(message: &str, status: StatusCode) -> Value {
+    json!({ "error": { "code": status.as_u16(), "message": message, "status": match status.as_u16() {
+        400 => "INVALID_ARGUMENT",
+        401 => "UNAUTHENTICATED",
+        403 => "PERMISSION_DENIED",
+        404 => "NOT_FOUND",
+        429 => "RESOURCE_EXHAUSTED",
+        503 => "UNAVAILABLE",
+        _ => "INTERNAL" } } })
+}
+
 fn gemini_error(message: &str, status: StatusCode) -> Response {
-    (
-        status,
-        axum::Json(json!({ "error": { "code": status.as_u16(), "message": message, "status": match status.as_u16() {
-            400 => "INVALID_ARGUMENT", 401 => "UNAUTHENTICATED", 429 => "RESOURCE_EXHAUSTED", 503 => "UNAVAILABLE", _ => "INTERNAL" } } })),
-    )
-        .into_response()
+    (status, axum::Json(gemini_error_body(message, status))).into_response()
 }
 
 /// Gemini generateContent ingress (v1.1, 2026-09-16): `x-goog-api-key` or `?key=`, model
@@ -135,7 +146,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         }
     }
     if let Some(r) = check_gateway_key(&core, &headers2, peer_ip(&headers)) {
-        return r;
+        return r.gemini();
     }
     // path: /v1beta/models/<model>:generateContent | :streamGenerateContent
     let path = uri.path().to_string();
@@ -200,7 +211,18 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     }
     let mut slot = match try_slot(&core).await {
         Ok(s) => s,
-        Err(r) => return map_generic_to_status(r),
+        Err(r) => {
+            // `map_generic_to_status` preserves the status but writes an OpenAI-shaped body. A
+            // Gemini client reads `error.code` as an integer and `error.status` as the enum — both
+            // are wrong or absent in that envelope, so a strict SDK cannot classify the failure.
+            let status = r.status();
+            let message = if status == StatusCode::TOO_MANY_REQUESTS {
+                "router at capacity"
+            } else {
+                "AI-Provider Router core unavailable — is the app open?"
+            };
+            return gemini_error(message, status);
+        }
     };
     let id = slot.id;
     let fwd = forwarded_headers(&headers);
@@ -223,8 +245,9 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
                         break;
                     }
-                    BridgeMsg::Error { message, .. } => {
-                        let e = json!({ "error": { "code": 502, "message": message, "status": "INTERNAL" } });
+                    BridgeMsg::Error { status, message } => {
+                        // SSE is already committed as 200, so the payload is the only channel left.
+                        let e = gemini_error_body(&message, worker_status(status));
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(e.to_string()));
                         break;
                     }
@@ -300,11 +323,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     }
     drop(slot);
     match err_info {
-        Some((503, _)) | Some((429, _)) => {
-            let code = StatusCode::from_u16(503).unwrap();
-            gemini_error("gateway unavailable or at capacity", code)
-        }
-        Some((_, message)) => gemini_error(&message, StatusCode::BAD_GATEWAY),
+        Some((status, message)) => gemini_error(&message, worker_status(status)),
         None => {
             let (pt, ct) = usage.unwrap_or((0, 0));
             let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };

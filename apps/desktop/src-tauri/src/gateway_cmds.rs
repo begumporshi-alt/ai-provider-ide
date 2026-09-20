@@ -211,7 +211,7 @@ pub fn gateway_status(state: State<'_, Arc<GatewayState>>) -> Result<GatewayStat
     Ok(GatewayStatus {
         running: state.core.is_running(),
         port,
-        has_key: gateway::vault_key_provider()().is_some(),
+        has_key: matches!(state.core.master_key_state(), gateway::MasterKeyLookup::Ready(_)),
         endpoint_url: format!("http://127.0.0.1:{port}/v1"),
         background: state.core.is_hidden(),
         worker_awake: state.core.beat_is_fresh(),
@@ -410,8 +410,8 @@ pub fn gateway_disable(state: State<'_, Arc<GatewayState>>) -> Result<(), String
 /// Generate (or rotate) the master key. The value goes straight to the clipboard — the
 /// webview only learns "it happened" (invariants 10, 14).
 #[tauri::command]
-pub fn gateway_key_generate() -> Result<(), String> {
-    let _key = gateway::generate_master_key()?;
+pub fn gateway_key_generate(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+    let _key = state.core.rotate_master_key()?;
     gateway::copy_master_key()
 }
 
@@ -421,8 +421,8 @@ pub fn gateway_key_copy() -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn gateway_key_revoke() -> Result<(), String> {
-    gateway::revoke_master_key()
+pub fn gateway_key_revoke(state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+    state.core.revoke_master_key()
 }
 
 // ---------- audit R4: per-app gateway keys ----------
@@ -523,6 +523,22 @@ pub fn set_tools_enabled(enabled: bool, state: State<'_, Arc<GatewayState>>) -> 
     Ok(())
 }
 
+/// Audit H1b: whether gateway-side tools may mutate the workspace (`write_file`, `run_command`).
+/// Read-only tools stay available regardless. Defaults to false — see `GatewayCore`.
+#[tauri::command]
+pub fn get_tools_mutation_enabled(state: State<'_, Arc<GatewayState>>) -> Result<bool, String> {
+    Ok(state.core.is_tools_mutation_enabled())
+}
+
+#[tauri::command]
+pub fn set_tools_mutation_enabled(
+    enabled: bool,
+    state: State<'_, Arc<GatewayState>>,
+) -> Result<(), String> {
+    state.core.set_tools_mutation_enabled(enabled);
+    Ok(())
+}
+
 /// Set the workspace root for local tool execution (write_file, mkdir, run_command).
 /// Must be called before tools are used in gateway mode.
 #[tauri::command]
@@ -550,6 +566,7 @@ pub fn gateway_get_workspace_root(
 /// Returns the result to the bridge for re-dispatch back to the model.
 #[tauri::command]
 pub fn gateway_tool_run(
+    app: AppHandle,
     state: State<'_, Arc<GatewayState>>,
     _request_id: u64,
     tool_name: String,
@@ -559,6 +576,22 @@ pub fn gateway_tool_run(
         .core
         .workspace_root()
         .ok_or_else(|| "workspace root not set — call gateway_set_workspace_root first".to_string())?;
+
+    // Audit H1b: the Playground asks before every call; the gateway cannot — there is no UI on
+    // that path. So mutation is gated here, host-side, where no caller can talk past it.
+    if let Some(reason) = state.core.gateway_tool_refusal(&tool_name) {
+        log_to_file(&app, &format!("tool refused (mutation disabled): {tool_name}"));
+        return Ok(crate::tools::ToolResult {
+            ok: false,
+            output: String::new(),
+            error: Some(reason),
+        });
+    }
+
+    // Audit trail. A gateway tool call is model-driven action on the user's filesystem with no
+    // human in the loop; if it is never written down it cannot be reviewed after the fact.
+    log_to_file(&app, &format!("tool run: {tool_name} in {}", root.display()));
+
     let req = crate::tools::ToolRunRequest {
         name: tool_name,
         arguments,

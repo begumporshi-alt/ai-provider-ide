@@ -18,7 +18,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::http::{header, HeaderMap, StatusCode};
@@ -66,6 +66,127 @@ pub type AppKeyProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync + 'static>;
 
 pub fn vault_key_provider() -> KeyProvider {
     Arc::new(|| vault::get(MASTER_ACCOUNT).ok().flatten())
+}
+
+/// How long a request waits for the master key before answering without it.
+///
+/// The lookup is a macOS keychain read, and that call can block *indefinitely*: when the item's
+/// ACL no longer matches the app's code signature — which is what every reinstall produces — the
+/// Security framework raises a SecurityAgent prompt and waits for a human. Unbounded, that does
+/// not fail one request, it wedges the entire HTTP surface: the listener keeps accepting
+/// connections and never answers one, and nothing is logged because the failure is a hang rather
+/// than an error. Bounded, it degrades to a 503 on the requests that need the key.
+const MASTER_KEY_WAIT: Duration = Duration::from_millis(1500);
+
+/// Outcome of a master-key lookup.
+///
+/// `Unavailable` is deliberately distinct from `Absent`. The first means "the keychain did not
+/// answer"; the second means "no key has been configured". Collapsing them would tell a
+/// correctly-configured client that its key is wrong.
+#[derive(Debug, PartialEq, Eq)]
+pub enum MasterKeyLookup {
+    Ready(String),
+    Absent,
+    Unavailable,
+}
+
+struct CacheState {
+    /// The value found at `generation`. `None` alongside a matching generation means a load
+    /// completed and found no key — which is `Absent`, not "not loaded yet".
+    value: Option<String>,
+    /// Generation this state describes. Starts at `u64::MAX` ("never loaded") so the first call
+    /// always loads, even though generation 0 is itself a valid generation.
+    generation: u64,
+    loading: bool,
+}
+
+/// A cached, bounded, single-flight wrapper around the raw keychain lookup.
+///
+/// Each property fixes a different half of the same bug:
+/// - **Cached** — the keychain is read once, not once per request. The old code re-read it on
+///   every request precisely so rotation would take effect immediately; `invalidate()` keeps that
+///   guarantee by stamping each value with a generation that rotation bumps.
+/// - **Bounded** — no caller waits longer than `wait`, so a stalled keychain cannot hang the
+///   request path.
+/// - **Single-flight** — concurrent callers share one in-flight load, so a stuck keychain occupies
+///   one thread instead of one per request. That thread is abandoned deliberately: nothing can
+///   cancel a blocking `SecKeychainFindGenericPassword`, and it frees itself once the prompt is
+///   answered.
+struct MasterKeyCache {
+    inner: KeyProvider,
+    wait: Duration,
+    /// Bumped by `invalidate`. A cached value stamped with an older generation is stale.
+    generation: AtomicU64,
+    shared: Arc<(Mutex<CacheState>, Condvar)>,
+}
+
+impl MasterKeyCache {
+    fn new(inner: KeyProvider, wait: Duration) -> Self {
+        Self {
+            inner,
+            wait,
+            generation: AtomicU64::new(0),
+            shared: Arc::new((
+                Mutex::new(CacheState { value: None, generation: u64::MAX, loading: false }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    /// Force the next `get` to re-read the keychain. Call after writing or deleting the key.
+    fn invalidate(&self) {
+        self.generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn get(&self) -> MasterKeyLookup {
+        let (lock, ready) = &*self.shared;
+        let deadline = Instant::now() + self.wait;
+
+        loop {
+            // Re-read the generation on every pass. A rotation landing mid-load supersedes the
+            // load already in flight, and re-reading here is what makes the next pass fetch the
+            // new key rather than answering from the superseded one.
+            let generation = self.generation.load(Ordering::SeqCst);
+            // A poisoned lock means an earlier caller panicked while holding it; the state it
+            // guards is still coherent, so recover rather than propagate that panic into a request.
+            let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+
+            if !state.loading && state.generation == generation {
+                return resolve(&state.value);
+            }
+
+            if !state.loading {
+                state.loading = true;
+                let inner = Arc::clone(&self.inner);
+                let shared = Arc::clone(&self.shared);
+                std::thread::spawn(move || {
+                    // The only call that may block on the keychain, and never on a request path.
+                    let found = inner();
+                    let (lock, ready) = &*shared;
+                    let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    state.value = found;
+                    state.generation = generation;
+                    state.loading = false;
+                    ready.notify_all();
+                });
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+                return MasterKeyLookup::Unavailable;
+            };
+            let (guard, _) = ready
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(|e| e.into_inner());
+            drop(guard);
+        }
+    }
+}
+
+fn resolve(value: &Option<String>) -> MasterKeyLookup {
+    match value {
+        Some(v) => MasterKeyLookup::Ready(v.clone()),
+        None => MasterKeyLookup::Absent,
+    }
 }
 
 /// Keychain account prefix for a per-app gateway key (audit R4).
@@ -322,7 +443,9 @@ pub struct GatewayCore {
     last_heartbeat: Mutex<Instant>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     bridge: Arc<dyn Bridge>,
-    key_provider: KeyProvider,
+    /// Bounded, cached, single-flight wrapper around the injected master-key lookup. Request paths
+    /// must go through this and never touch the keychain directly — see `MasterKeyCache`.
+    master_key: MasterKeyCache,
     /// R4: optional per-app key secrets. `None` = master key only (all existing tests).
     /// Behind a Mutex so it can be swapped after create/revoke without rebuilding the core.
     app_key_provider: Mutex<Option<AppKeyProvider>>,
@@ -334,6 +457,14 @@ pub struct GatewayCore {
     running: AtomicBool,
     port: Mutex<u16>,
     tools_enabled: AtomicBool,
+    /// Audit H1b: whether gateway-side tools may MUTATE (`write_file`, `run_command`).
+    ///
+    /// Distinct from `tools_enabled`. Read-only tools are safe to leave on because the worst a
+    /// misled model can do is read inside the workspace; the mutating ones execute code and write
+    /// files with no human in the loop — the Playground path has a per-call Allow/Deny modal, the
+    /// gateway path has none. Default off: enabling it is a deliberate act, and it is enforced
+    /// host-side in `gateway_tool_run` so no caller can talk its way past it.
+    tools_mutation_enabled: AtomicBool,
     /// Workspace root for local tool execution (write_file, mkdir, run_command).
     /// Set via `gateway_set_workspace_root` Tauri command before first tool use.
     workspace_root: Mutex<Option<std::path::PathBuf>>,
@@ -356,6 +487,9 @@ pub struct GatewayCore {
 /// not so fast that a run of requests during one lapse turns into a flickering window.
 const WARM_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
+/// Gateway-side tools that can change the workspace. Everything else only reads it.
+pub const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "mkdir", "run_command"];
+
 /// Re-composites the worker window. Provided by the host, since only it can touch windows.
 pub type WarmFn = Arc<dyn Fn() + Send + Sync + 'static>;
 
@@ -375,6 +509,12 @@ pub fn default_workspace_root() -> Option<std::path::PathBuf> {
 
 impl GatewayCore {
     pub fn new(bridge: Arc<dyn Bridge>, key_provider: KeyProvider) -> Self {
+        Self::new_with_key_wait(bridge, key_provider, MASTER_KEY_WAIT)
+    }
+
+    /// `new` with an explicit key wait, so tests can exercise the bounded path without sitting
+    /// through the production timeout.
+    pub fn new_with_key_wait(bridge: Arc<dyn Bridge>, key_provider: KeyProvider, key_wait: Duration) -> Self {
         Self {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -382,7 +522,7 @@ impl GatewayCore {
             last_heartbeat: Mutex::new(Instant::now()),
             failures: Mutex::new(HashMap::new()),
             bridge,
-            key_provider,
+            master_key: MasterKeyCache::new(key_provider, key_wait),
             app_key_provider: Mutex::new(None),
             spend_provider: Mutex::new(None),
             hidden: AtomicBool::new(false),
@@ -394,12 +534,52 @@ impl GatewayCore {
             // confined to `default_workspace_root()`. Off means tool parameters are stripped
             // before the request ever leaves, which breaks coding agents, so off is opt-in.
             tools_enabled: AtomicBool::new(true),
+            // Off by default: see the field. `tools_enabled` stays on so read-only tools and
+            // pass-through of a client's own tools keep working unchanged.
+            tools_mutation_enabled: AtomicBool::new(false),
             workspace_root: Mutex::new(default_workspace_root()),
             worker_error: Mutex::new(None),
             warm: Mutex::new(None),
             last_warm: Mutex::new(None),
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
         }
+    }
+
+    /// Drop the cached master key so the next request re-reads the keychain.
+    ///
+    /// Call this after writing or deleting the key. Caching the key would otherwise silently
+    /// break rotation: the old key would keep working until the cache aged out, and
+    /// `criterion8_rotation_kills_old_key_instantly` exists precisely to forbid that.
+    pub fn invalidate_master_key(&self) {
+        self.master_key.invalidate();
+    }
+
+    /// Master-key state for the status surface.
+    ///
+    /// Goes through the bounded cache for the same reason requests do: `gateway_status` is polled
+    /// by the UI, and a raw keychain read here froze the Gateway screen whenever the keychain
+    /// stalled. Note the cache keeps its last value across a stall, so a key read once stays
+    /// reported as present.
+    pub fn master_key_state(&self) -> MasterKeyLookup {
+        self.master_key.get()
+    }
+
+    /// Rotate the master key, dropping the cached one as part of the same operation.
+    ///
+    /// One method rather than two calls on purpose: a caller that wrote the keychain and forgot
+    /// to invalidate would leave the old key working, silently. Returns the new key for one-time
+    /// display (§3.3); the webview never sees it (invariant 10).
+    pub fn rotate_master_key(&self) -> Result<String, String> {
+        let key = self::generate_master_key()?;
+        self.invalidate_master_key();
+        Ok(key)
+    }
+
+    /// Delete the master key, dropping the cached one as part of the same operation.
+    pub fn revoke_master_key(&self) -> Result<(), String> {
+        self::revoke_master_key()?;
+        self.invalidate_master_key();
+        Ok(())
     }
 
     /// Bound on the worker's first response. A field, not a constant, so a test can shorten it
@@ -584,6 +764,33 @@ impl GatewayCore {
         self.tools_enabled.store(enabled, Ordering::Relaxed);
     }
 
+    /// Audit H1b: may gateway-side tools mutate the workspace? See the field for why this is
+    /// separate from `tools_enabled` and why it defaults to false.
+    pub fn is_tools_mutation_enabled(&self) -> bool {
+        self.tools_mutation_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
+    ///
+    /// The decision lives here rather than in the command so it can be tested without an
+    /// `AppHandle`. The message is written for the model that will read it: it says what is
+    /// disabled, why, and what to do instead — a bare "forbidden" sends the model retrying.
+    pub fn gateway_tool_refusal(&self, tool: &str) -> Option<String> {
+        if MUTATING_TOOLS.contains(&tool) && !self.is_tools_mutation_enabled() {
+            Some(format!(
+                "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
+                 confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
+                 the Playground, which asks before every call."
+            ))
+        } else {
+            None
+        }
+    }
+
+    pub fn set_tools_mutation_enabled(&self, enabled: bool) {
+        self.tools_mutation_enabled.store(enabled, Ordering::Relaxed);
+    }
+
     /// Set the workspace root for local tool execution. Must be set before any tool calls.
     pub fn set_workspace_root(&self, root: std::path::PathBuf) {
         *self.workspace_root.lock().unwrap() = Some(root);
@@ -643,7 +850,15 @@ impl Slot {
                 );
                 Some(BridgeMsg::Error {
                     status: 503,
-                    message: "the router worker did not respond — the gateway window may be suspended".to_string(),
+                    // Report what was OBSERVED, not a guessed cause. This used to assert the
+                    // window "may be suspended" — a hypothesis, never a measurement. That
+                    // guess actively misdirected a diagnosis: a worker that was alive and
+                    // merely slow on a large prompt was reported to the client as a dead
+                    // window, and the search went after suspension instead of latency.
+                    message: format!(
+                        "the router worker produced no response within {}ms — the request was abandoned; retry",
+                        bound.as_millis()
+                    ),
                 })
             }
         }
@@ -748,8 +963,12 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
     e.1 = Instant::now() + delay;
 }
 
-/// Returns Some(response) to deny, None to allow. Reads the key providers per request so a
-/// rotation/revocation kills the old key instantly (§3.3, criterion 8).
+/// Returns Some(response) to deny, None to allow.
+///
+/// The master key comes from a bounded cache that `gateway_key_generate` / `gateway_key_revoke`
+/// invalidate, so rotation still kills the old key on the very next request (§3.3, criterion 8)
+/// — but without a keychain read per request. That read can block indefinitely, and unbounded it
+/// takes the entire HTTP surface down with it. Per-app keys are still read per request.
 ///
 /// Accepts the master key OR any active per-app key (audit R4). Master is tried first because
 /// it is the common case; per-app secrets are only read when the master does not match, so
@@ -760,12 +979,38 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
 /// the loopback — with per-app keys (R4) that is one misconfigured app locking out all the
 /// others. Throttling only attempts that would have been rejected anyway keeps the same
 /// anti-brute-force bound (one attempt per backoff window) without collateral damage.
-fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<Response> {
+fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<GateRefusal> {
     if !core.running.load(Ordering::Relaxed) {
-        return Some(err_ra(StatusCode::SERVICE_UNAVAILABLE, "1", openai_error("gateway disabled", "service_unavailable", None)));
+        return Some(GateRefusal {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            message: "gateway disabled".into(),
+            retry_after: Some("1"),
+            openai_type: "service_unavailable",
+            openai_code: None,
+        });
     }
-    let Some(stored) = (core.key_provider)() else {
-        return Some(err(StatusCode::UNAUTHORIZED, openai_error("no master key configured", "invalid_request", Some("invalid_api_key"))));
+    let stored = match core.master_key.get() {
+        MasterKeyLookup::Ready(k) => k,
+        MasterKeyLookup::Absent => {
+            return Some(GateRefusal {
+                status: StatusCode::UNAUTHORIZED,
+                message: "no master key configured".into(),
+                retry_after: None,
+                openai_type: "invalid_request",
+                openai_code: Some("invalid_api_key"),
+            });
+        }
+        MasterKeyLookup::Unavailable => {
+            // The keychain did not answer in time. A 401 here would blame the caller's credential
+            // for a purely local fault and send it hunting for a new key, so say what happened.
+            return Some(GateRefusal {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: "master key unavailable — the OS keychain did not respond; approve the keychain prompt for this app, then retry".into(),
+                retry_after: Some("5"),
+                openai_type: "service_unavailable",
+                openai_code: None,
+            });
+        }
     };
     let presented = headers
         .get(header::AUTHORIZATION)
@@ -796,10 +1041,22 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
         return spend_gate(core);
     }
     if !auth_allowed(core, ip) {
-        return Some(err_ra(StatusCode::TOO_MANY_REQUESTS, "30", openai_error("too many failed auth attempts — backing off", "rate_limit", None)));
+        return Some(GateRefusal {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            message: "too many failed auth attempts — backing off".into(),
+            retry_after: Some("30"),
+            openai_type: "rate_limit",
+            openai_code: None,
+        });
     }
     note_auth_failure(core, ip);
-    Some(err(StatusCode::UNAUTHORIZED, openai_error("invalid gateway key", "invalid_request", Some("invalid_api_key"))))
+    Some(GateRefusal {
+        status: StatusCode::UNAUTHORIZED,
+        message: "invalid gateway key".into(),
+        retry_after: None,
+        openai_type: "invalid_request",
+        openai_code: Some("invalid_api_key"),
+    })
 }
 
 /// R4: deny once month-to-date spend has reached the cap. Checked *after* auth so the cap
@@ -807,20 +1064,18 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
 ///
 /// 402 is deliberate: it is the one status clients already read as "you are out of credit",
 /// so a runaway agent loop stops retrying instead of hammering a 429/403.
-fn spend_gate(core: &GatewayCore) -> Option<Response> {
+fn spend_gate(core: &GatewayCore) -> Option<GateRefusal> {
     // Clone the Arc out of the lock before calling it — never hold a mutex across a DB read.
     let provider = core.spend_provider.lock().ok().and_then(|g| g.clone())?;
     let (spent, cap) = provider();
     if cap > 0 && spent >= cap {
-        return Some(err_ra(
-            StatusCode::PAYMENT_REQUIRED,
-            "0",
-            openai_error(
-                &format!("monthly spend cap reached — {spent}/{cap} micro-USD this month"),
-                "insufficient_quota",
-                Some("spend_cap_exceeded"),
-            ),
-        ));
+        return Some(GateRefusal {
+            status: StatusCode::PAYMENT_REQUIRED,
+            message: format!("monthly spend cap reached — {spent}/{cap} micro-USD this month"),
+            retry_after: Some("0"),
+            openai_type: "insufficient_quota",
+            openai_code: Some("spend_cap_exceeded"),
+        });
     }
     None
 }
@@ -834,16 +1089,115 @@ fn anthropic_error(message: &str, kind: &str) -> Value {
     json!({ "type": "error", "error": { "type": kind, "message": message } })
 }
 
+/// Why the gate refused a request, before any upstream work.
+///
+/// Deliberately **not** a `Response`. The gate is shared by every dialect, and *framing* its refusal
+/// is the dialect's job — returning a finished response from here is what put an OpenAI-shaped error
+/// envelope in front of Anthropic, Responses and Gemini clients, whose SDKs read different fields
+/// (`error.type`; `error.code` as an integer plus `error.status` as an enum). A Gemini client was
+/// handed `error.code: null` with no `status` at all, so it could not classify its own auth failure.
+///
+/// Same rule as `worker_status`: the layer holding the evidence decides the outcome, and the dialect
+/// decides the shape.
+pub(crate) struct GateRefusal {
+    pub status: StatusCode,
+    pub message: String,
+    /// Seconds before a retry is worth attempting. Only set where retrying can actually help.
+    pub retry_after: Option<&'static str>,
+    /// OpenAI's `(type, code)` pair — used only by the dialects that share that envelope.
+    pub openai_type: &'static str,
+    pub openai_code: Option<&'static str>,
+}
+
+impl GateRefusal {
+    fn frame(self, body: Value) -> Response {
+        match self.retry_after {
+            Some(secs) => (self.status, [(header::RETRY_AFTER, secs)], axum::Json(body)).into_response(),
+            None => (self.status, axum::Json(body)).into_response(),
+        }
+    }
+
+    /// OpenAI envelope. Also correct for the Responses API, which shares the shape.
+    pub fn openai(self) -> Response {
+        let body = openai_error(&self.message, self.openai_type, self.openai_code);
+        self.frame(body)
+    }
+
+    /// Anthropic envelope — `error.type` follows the status, because clients branch on it.
+    pub fn anthropic(self) -> Response {
+        let body = anthropic_error(&self.message, anthropic_error_kind(self.status));
+        self.frame(body)
+    }
+
+    /// Gemini envelope — `code` and `status` both follow the HTTP status.
+    pub fn gemini(self) -> Response {
+        let body = gemini::gemini_error_body(&self.message, self.status);
+        self.frame(body)
+    }
+}
+
 fn err(status: StatusCode, body: Value) -> Response {
     (status, axum::Json(body)).into_response()
+}
+
+/// Map the status the worker decided onto the status we answer with.
+///
+/// The worker has already applied a deliberate whitelist (`gatewayStatus()` in
+/// `gateway-bridge.ts`): it passes through only client-attributable upstream codes
+/// (400/404/413/422/429), maps a missing route to 404, and maps everything else to 502.
+///
+/// Re-deciding here with a second, narrower list silently threw most of that away. The OpenAI chat
+/// path knew only 404/429/401/503, so a 400 became 502; the Anthropic, Responses, models and Gemini
+/// paths discarded the status entirely and answered 502 for everything. The effect was to tell a
+/// client its request had hit a broken gateway when the request itself could never succeed —
+/// inviting retries that can never work.
+///
+/// So trust the worker's decision, and reject only a value that cannot be a real HTTP error status.
+pub(crate) fn worker_status(status: u16) -> StatusCode {
+    StatusCode::from_u16(status)
+        .ok()
+        .filter(|c| c.is_client_error() || c.is_server_error())
+        .unwrap_or(StatusCode::BAD_GATEWAY)
+}
+
+/// The Anthropic error `type` that belongs to an HTTP status.
+///
+/// Anthropic clients branch on `error.type`, not on the status alone — Claude Code decides whether
+/// to retry, re-authenticate, or fix the request from it. Answering `api_error` to a 400 tells the
+/// client to retry a request that can never succeed, which is the same defect as answering 502.
+/// The mapping mirrors Anthropic's published error taxonomy.
+pub(crate) fn anthropic_error_kind(status: StatusCode) -> &'static str {
+    match status.as_u16() {
+        400 => "invalid_request_error",
+        401 => "authentication_error",
+        403 => "permission_error",
+        404 => "not_found_error",
+        413 => "request_too_large",
+        429 => "rate_limit_error",
+        503 | 529 => "overloaded_error",
+        _ => "api_error",
+    }
 }
 
 fn err_ra(status: StatusCode, retry: &'static str, body: Value) -> Response {
     (status, [(header::RETRY_AFTER, retry)], axum::Json(body)).into_response()
 }
 
+/// The peer identity the auth backoff is bucketed by.
+///
+/// Returning a constant looks like a bug and is not one. `spawn()` binds `127.0.0.1` (invariant
+/// 11, pinned by `the_listener_binds_loopback_only`), so *every* peer genuinely is loopback —
+/// reading the real address would return this same value. One bucket is therefore correct today.
+///
+/// Two things follow, and both are deliberate:
+/// 1. If the bind is ever widened, this MUST change to the real peer address, or distinct clients
+///    merge into one bucket. The test above fails the build when that day comes.
+/// 2. Keying on the peer *socket* (IP + port) instead would separate concurrent callers, but a
+///    client that opens a fresh connection per attempt then gets a fresh bucket each time —
+///    trading cross-caller attribution for a backoff any attacker can reset. On a loopback-only
+///    gateway the shared bucket is the stronger of the two. See audit finding H2.
 fn peer_ip(_headers: &HeaderMap) -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST) // loopback bind: single peer namespace (v1)
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 /// Extract headers relevant for client detection (User-Agent, X-Client-Name, etc.).
@@ -896,9 +1250,6 @@ fn map_generic_to_status(r: Response) -> Response {
 
 // ---------- master key + server lifecycle ----------
 
-/// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the keychain, return it
-/// exactly once for display (§3.3). Rotation = call again: the old key dies instantly
-/// because every request re-reads the keychain.
 /// A crypto-random gateway credential. 32 hex chars from OsRng (same shape as the master key,
 /// so external apps cannot tell a per-app key from the master one).
 pub fn generate_random_key() -> String {
@@ -912,14 +1263,22 @@ pub fn copy_text(text: &str) -> Result<(), String> {
     cb.set_text(text.to_string()).map_err(|e| e.to_string())
 }
 
-pub fn generate_master_key() -> Result<String, String> {
+/// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the keychain, return it
+/// exactly once for display (§3.3).
+///
+/// Private deliberately. Rotation must go through `GatewayCore::rotate_master_key`, which drops
+/// the cached key as part of the same operation. A caller that wrote the keychain without
+/// invalidating the cache would leave the OLD key working — silently, with no failing test,
+/// because the write itself succeeds.
+fn generate_master_key() -> Result<String, String> {
     let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
     let key = format!("sk-aip-{raw}");
     vault::put(MASTER_ACCOUNT, &key).map_err(|e| e.to_string())?;
     Ok(key)
 }
 
-pub fn revoke_master_key() -> Result<(), String> {
+/// Delete the master key. Private for the same reason as `generate_master_key`.
+fn revoke_master_key() -> Result<(), String> {
     vault::delete(MASTER_ACCOUNT).map_err(|e| e.to_string())
 }
 

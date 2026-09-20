@@ -73,8 +73,26 @@ impl AllowList {
     }
 }
 
+/// Is `host` this machine?
+///
+/// **The port is not part of this decision and never was.** Every caller passes
+/// `Url::host_str()`, which excludes it, so "localhost on any port" is permitted — and that is
+/// deliberate, not an oversight: Ollama is on 11434, LM Studio on 1234, and a per-port allowlist
+/// entry would break local providers, which are a primary use case. Widening or narrowing this
+/// function does not change that; the port is simply not an input.
+///
+/// The whole `127/8` block is loopback (RFC 1122 §3.2.1.3), not just `127.0.0.1`. A provider
+/// bound to `127.0.0.2` is exactly as local as one bound to `127.0.0.1`, and the previous
+/// four-string match refused it for no reason — it was an arbitrary list, not a rule.
 pub fn is_local(host: &str) -> bool {
-    matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]")
+    if matches!(host, "localhost" | "localhost." | "::1" | "[::1]") {
+        return true;
+    }
+    // Parsed rather than prefix-matched: "127.0.0", "127.0.0.1.5" and "127.evil.example" must
+    // all stay remote, and a `strip_prefix("127.")` test gets those wrong in at least one case.
+    host.parse::<std::net::Ipv4Addr>()
+        .map(|ip| ip.octets()[0] == 127)
+        .unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -303,10 +321,28 @@ pub async fn fetch_image(state: &EgressState, req: ImageFetchRequest) -> Result<
 /// SSE streaming request: lines flow through the channel. When the webview stops consuming
 /// (channel send fails), the loop breaks and the reqwest stream future drops — closing the
 /// provider connection (§3.5 cancellation).
+/// How long an upstream may go completely silent before we give up on it.
+///
+/// A post-connect stall is the one upstream failure nothing else reports: TCP stays open, no
+/// RST, no FIN, and `send()` or `stream.next()` simply never resolves. `connect_timeout` covers
+/// the handshake only, and `req.timeout_ms` is passed as `null` for chat, so before this a
+/// provider that accepted the connection and then sat there held the request open forever —
+/// while looking healthy to every layer above it.
+///
+/// Sized against measurement, not preference. The slowest request on the live gateway took
+/// ~27s (a ~150k-token prompt), and the failure that prompted this was a turn that ran past
+/// 30s. 120s is more than 4x the worst observed, so no legitimate request is at risk, while a
+/// genuine stall now ends in two minutes instead of never. It bounds *silence*, not duration:
+/// a stream that keeps producing data is never cut off, however long it runs.
+const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<StreamEvent>) -> Result<(), EgressError> {
     let b = build(state, req).await?;
-    match b.send().await {
-        Ok(res) => {
+    // Bounded the same way as the chunks below: headers are progress too, and a server that
+    // completes the handshake and then never answers is indistinguishable from a stall.
+    let sent = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, b.send()).await;
+    match sent {
+        Ok(Ok(res)) => {
             let status = res.status().as_u16();
             let headers = res
                 .headers()
@@ -328,7 +364,23 @@ pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<St
             }
             let mut stream = res.bytes_stream();
             let mut buf = String::new();
-            while let Some(chunk) = stream.next().await {
+            loop {
+                // Each wait for the next chunk is bounded, not the stream as a whole: a
+                // provider that keeps sending is never cut off, however long it runs.
+                let next = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, stream.next()).await;
+                let chunk = match next {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break, // upstream closed the stream
+                    Err(_) => {
+                        let _ = channel.send(StreamEvent::Error {
+                            message: format!(
+                                "upstream went silent for {}s — abandoning the stream",
+                                UPSTREAM_IDLE_TIMEOUT.as_secs()
+                            ),
+                        });
+                        return Ok(());
+                    }
+                };
                 match chunk {
                     Ok(bytes) => {
                         buf.push_str(&String::from_utf8_lossy(&bytes));
@@ -352,9 +404,18 @@ pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<St
             let _ = channel.send(StreamEvent::Done);
             Ok(())
         }
-        Err(e) => {
+        Ok(Err(e)) => {
             let _ = channel.send(StreamEvent::Error { message: e.to_string() });
             Err(e.into())
+        }
+        Err(_) => {
+            let _ = channel.send(StreamEvent::Error {
+                message: format!(
+                    "upstream sent no response headers for {}s — abandoning the request",
+                    UPSTREAM_IDLE_TIMEOUT.as_secs()
+                ),
+            });
+            Ok(())
         }
     }
 }
@@ -421,31 +482,7 @@ impl EgressState {
         if body.len() > 2 * 1024 * 1024 {
             return; // provider-returned image URLs live in small JSON envelopes
         }
-        let mut hosts = HashSet::new();
-        let mut rest = body;
-        while let Some(pos) = rest.find("http") {
-            let tail = &rest[pos..];
-            let (scheme_len, body_start) = if tail.starts_with("https://") {
-                (8, 8)
-            } else if tail.starts_with("http://") {
-                (7, 7)
-            } else {
-                (0, 1) // advance one byte; not a URL marker
-            };
-            if scheme_len > 0 {
-                let after = &tail[body_start..];
-                let host_len = after
-                    .bytes()
-                    .take_while(|b| b.is_ascii_alphanumeric() || *b == b'.' || *b == b'-' || *b == b'_' || *b == b'[' || *b == b']')
-                    .count();
-                let host = &after[..host_len];
-                if !host.is_empty() {
-                    hosts.insert(host.to_lowercase());
-                }
-            }
-            // Always advance at least one byte so malformed text can't loop forever.
-            rest = &tail[scheme_len.max(1)..];
-        }
+        let hosts = hosts_in_body(body);
         if hosts.is_empty() {
             return;
         }
@@ -462,6 +499,52 @@ impl EgressState {
         let map = self.returned_hosts.read().unwrap();
         map.get(host).is_some_and(|t| t.elapsed() < RETURNED_HOST_TTL)
     }
+}
+
+/// Where a URL stops, in practice: the end of a JSON string, an HTML attribute, or prose.
+fn url_token_end(s: &str) -> usize {
+    s.find(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | '\\' | '`')
+    })
+    .unwrap_or(s.len())
+}
+
+/// The hosts of the http(s) URLs in `body`, parsed — not guessed.
+///
+/// The previous scan read "bytes after the scheme until the first non-hostname character", which
+/// was wrong in two opposite directions:
+///
+///   - `https://cdn.example/x?next=http://attacker.example` read as TWO urls, minting a lease for
+///     `attacker.example` from a string that merely appeared inside another URL's query; and
+///   - `https://user:pw@cdn.example:8443/a.png` read the host as `user`.
+///
+/// Both feed the same carve-out: a host recorded here may be fetched by `fetch_image` for the
+/// next `RETURNED_HOST_TTL`. Over-recording grants that to any URL a body happens to mention;
+/// recording something that is not the host is worse than recording nothing, because the lease
+/// is looked up by that string. Taking the whole token and asking the URL parser is the
+/// difference: one URL, one host, and the host is the one the URL actually addresses.
+fn hosts_in_body(body: &str) -> HashSet<String> {
+    let mut hosts = HashSet::new();
+    let mut rest = body;
+    while let Some(pos) = rest.find("http") {
+        let tail = &rest[pos..];
+        if !tail.starts_with("https://") && !tail.starts_with("http://") {
+            rest = &tail[1..]; // advance one byte; not a URL marker
+            continue;
+        }
+        let candidate = &tail[..url_token_end(tail)];
+        if let Ok(u) = reqwest::Url::parse(candidate) {
+            if matches!(u.scheme(), "http" | "https") {
+                if let Some(h) = u.host_str() {
+                    hosts.insert(h.to_lowercase());
+                }
+            }
+        }
+        // Skip the whole token. Scanning *into* it is what minted a host from another URL's
+        // query string; the max(1) keeps malformed text from looping forever.
+        rest = &tail[candidate.len().max(1)..];
+    }
+    hosts
 }
 
 #[cfg(test)]
@@ -486,6 +569,79 @@ mod tests {
         let a = AllowList::default();
         assert!(check_url(&a, "http://127.0.0.1:11434/api").is_ok());
         assert!(check_url(&a, "http://localhost:1234/v1").is_ok());
+    }
+
+    /// The audit flagged `is_local` as "trusts any port on localhost". It cannot: every caller
+    /// passes `Url::host_str()`, which excludes the port, so the port is not an input to the
+    /// decision at all. Pinned so the question does not have to be re-litigated.
+    #[test]
+    fn the_port_is_not_an_input_to_the_host_decision() {
+        assert!(!is_local("127.0.0.1:8080"), "a host string never carries a port");
+        // …and the URL is still permitted, because the port was never what was being judged.
+        assert!(check_url(&AllowList::default(), "http://127.0.0.1:8080/v1").is_ok());
+        assert!(check_url(&AllowList::default(), "http://127.0.0.2:9999/v1").is_ok());
+    }
+
+    /// The real defect was the opposite of the audit's: the old four-string match covered only
+    /// 127.0.0.1 of a /8 that is entirely loopback.
+    #[test]
+    fn loopback_is_the_whole_127_block_not_just_dot_one() {
+        for host in ["127.0.0.1", "127.0.0.2", "127.1.2.3", "127.255.255.255"] {
+            assert!(is_local(host), "{host} is loopback");
+        }
+        for host in [
+            "128.0.0.1",
+            "126.255.255.255",
+            "127.0.0",           // too few octets
+            "127.0.0.1.5",       // too many
+            "127.evil.example",  // looks local, is not
+            "17.0.0.1",          // prefix of nothing
+        ] {
+            assert!(!is_local(host), "{host} is not loopback");
+        }
+        assert!(is_local("localhost") && is_local("::1"));
+    }
+
+    /// A local host that is NOT registered as a provider is allowed by `is_local`; a remote one
+    /// is not. This is the boundary the allowlist cannot cover on its own.
+    #[test]
+    fn an_unregistered_remote_host_is_still_denied() {
+        assert!(check_url(&AllowList::default(), "http://127.0.0.2:11434/v1").is_ok());
+        assert!(check_url(&AllowList::default(), "https://attacker.example/v1").is_err());
+    }
+
+    #[test]
+    fn a_url_inside_a_query_string_earns_no_lease_of_its_own() {
+        let hosts = hosts_in_body(r#"{"url":"https://cdn.example/x?next=http://attacker.example"}"#);
+        assert!(hosts.contains("cdn.example"));
+        assert!(
+            !hosts.contains("attacker.example"),
+            "a URL that appears only inside another URL's query must not be fetchable"
+        );
+    }
+
+    #[test]
+    fn userinfo_and_port_are_not_the_host() {
+        let hosts = hosts_in_body("see https://user:pw@cdn.example:8443/a.png");
+        assert_eq!(hosts.into_iter().collect::<Vec<_>>(), vec!["cdn.example".to_string()]);
+    }
+
+    #[test]
+    fn prose_that_merely_says_http_records_nothing() {
+        assert!(hosts_in_body("the http spec does not define a host").is_empty());
+    }
+
+    #[test]
+    fn only_http_schemes_earn_a_lease() {
+        assert!(hosts_in_body("ftp://files.example/a.png").is_empty());
+        assert!(hosts_in_body("https://cdn.example/a.png").contains("cdn.example"));
+    }
+
+    #[test]
+    fn two_urls_in_one_body_both_earn_a_lease() {
+        let hosts = hosts_in_body(r#"["https://a.example/1", "https://b.example/2"]"#);
+        assert!(hosts.contains("a.example"));
+        assert!(hosts.contains("b.example"));
     }
 
     #[test]
