@@ -17,6 +17,7 @@
 - `npx tauri build --bundles app` (skips the failing DMG step); `export PATH="$HOME/.cargo/bin:$PATH"`.
 - Install: `mv` the old `/Applications` app to /tmp (never `rm -rf`), then `cp -R`. `pkill -f ai-provider-router` first.
 - Test a startup fix on the **first launch after a rebuild**, or it proves nothing.
+- **CI has not actually started a job since ~2026-09-16.** Every run reports `failure` in ~8s with the annotation "The job was not started because recent account payments have failed or your spending limit needs to be increased". That is billing, not code — do not chase it as a regression. Run the gate locally instead: `pnpm typecheck`; `pnpm test` (managed Node 22 on PATH); `pnpm key-leak-grep`; `pnpm check-ts-version`; `cargo check` and `cargo test` under `apps/desktop/src-tauri`; `pnpm --filter ai-provider-router-desktop web-test` (53 browser tests, `mv test-results /tmp/...` first).
 
 ## Gateway
 - `/v1/models` advertises only provider-qualified ids (`<slug>/<native>`); worker calls `bootstrap()`, never `refreshCatalog`.
