@@ -29,9 +29,9 @@ async function nodes(page: Page): Promise<NodeRow[]> {
   );
 }
 
-/** Open the Playground in agent mode with a model and a workspace root. */
+/** Open the Assistant in agent mode with a model and a workspace root. */
 async function openAgent(page: Page): Promise<void> {
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   const combo = page.getByRole("combobox");
   const value = await combo
     .locator("option")

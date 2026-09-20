@@ -11,7 +11,8 @@
  */
 import type { ChatMessage, TextRequest, TextStream } from "@aiprovider/router-core";
 
-/** A tool the agent may call. Mirrors, 1:1, the four handlers the Rust sandbox allows. */
+/** A tool the agent may call. Every entry maps 1:1 to a handler in the Rust sandbox — a name
+ *  the host does not implement is a call that can only ever fail. */
 export interface ToolSpec {
   name: string;
   description: string;

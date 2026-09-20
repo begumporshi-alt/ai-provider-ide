@@ -18,7 +18,9 @@ const h = vi.hoisted(() => ({
   invokes: [] as Array<{ cmd: string; args: Record<string, unknown> }>,
   impl: null as null | ((cmd: string, args: Record<string, unknown>) => unknown),
   genCalls: [] as Array<Record<string, unknown>>,
-  steps: [] as Array<{ text: string; calls?: Array<{ id: string; name: string; arguments: string }> }>,
+  /** How many IPC calls had been made when each model turn started — used to prove ordering. */
+  invokesAtGen: [] as number[],
+  steps: [] as Array<{ text: string; calls?: Array<{ id?: string; name: string; arguments: string }> }>,
   chunkDelayMs: 0,
 }));
 
@@ -48,6 +50,7 @@ vi.mock("./store", () => ({
   router: {
     generateText: async (req: Record<string, unknown>) => {
       const i = h.genCalls.length;
+      h.invokesAtGen.push(h.invokes.length);
       h.genCalls.push(req);
       const step = h.steps[Math.min(i, h.steps.length - 1)];
       const onToolCall = req.onToolCall as ((c: unknown) => void) | undefined;
@@ -67,7 +70,8 @@ vi.mock("./store", () => ({
   },
 }));
 
-import { startGatewayBridge } from "./gateway-bridge";
+import { startGatewayBridge, gatewayStatus } from "./gateway-bridge";
+import { AllAttemptsFailedError, type AttemptOutcome } from "@aiprovider/router-core";
 import { AGENT_TOOLS, registryToOpenAI } from "./lib/tools/registry";
 
 const calls = (cmd: string) => h.invokes.filter((i) => i.cmd === cmd);
@@ -98,6 +102,7 @@ beforeAll(async () => {
 beforeEach(() => {
   h.invokes.length = 0;
   h.genCalls.length = 0;
+  h.invokesAtGen.length = 0;
   h.steps = [];
   h.chunkDelayMs = 0;
   h.impl = (cmd) => {
@@ -149,6 +154,41 @@ describe("gateway-bridge tool loop", () => {
     expect(streamed).toBe("wrote it");
     expect(streamed).not.toContain("on it: ");
     expect(calls("gateway_done").length).toBe(1);
+  });
+
+  it("a provider that omits the call id still gets a matched, wire-shaped pair", async () => {
+    // The real-world case: `manifest-interpreter` emits `id: undefined` when the provider's
+    // tool-call payload carries no id (or the manifest maps none). The assistant turn and the
+    // tool result then each applied their OWN fallback — "" in one, the tool *name* in the
+    // other — so the ids could never match and the provider answered 400 on the continuation.
+    h.steps = [
+      {
+        text: "on it: ",
+        calls: [{ name: "write_file", arguments: '{"path":"a.txt","content":"hi"}' }],
+      },
+      { text: "wrote it" },
+    ];
+
+    await send({ model: "m1", messages: [{ role: "user", content: "write a file" }] });
+
+    const msgs = h.genCalls[1].messages as Array<Record<string, unknown>>;
+    const assistantTurn = msgs.find(
+      (m) => m.role === "assistant" && Array.isArray(m.tool_calls) && m.tool_calls.length > 0,
+    );
+    expect(assistantTurn).toBeTruthy();
+    const declared = (assistantTurn!.tool_calls as Array<Record<string, unknown>>)[0]!;
+    const toolMsg = msgs.find((m) => m.role === "tool");
+
+    // The pairing rule: a tool result must name a call the assistant turn actually declared.
+    expect(typeof declared.id).toBe("string");
+    expect(declared.id).not.toBe("");
+    expect(toolMsg?.tool_call_id).toBe(declared.id);
+
+    // And the entry has to be OpenAI's wire shape — `type` plus a nested `function` — not the
+    // flat internal `{id,name,arguments}`, which servers reject as malformed.
+    expect(declared.type).toBe("function");
+    expect(declared.function).toMatchObject({ name: "write_file" });
+    expect(typeof (declared.function as Record<string, unknown>).arguments).toBe("string");
   });
 
   it("pass-through: emits the client's calls and ends, without executing them", async () => {
@@ -208,6 +248,31 @@ describe("gateway-bridge tool loop", () => {
     expect(calls("gateway_done").length).toBe(1);
   });
 
+  it("proves liveness before the first turn, so a slow turn is not failed as a dead window", async () => {
+    // The regression: the probe used to be skipped on iteration 1 (`iter > 1`). Gateway mode
+    // emits nothing until a turn finishes, so Rust's first-message bound saw silence for the
+    // whole of turn 1 and answered 503 — blaming a suspended window for what was really a
+    // long turn. Measured on a live gateway: a ~150k-token prompt ran past the bound and was
+    // reported as "the gateway window may be suspended" while the window was serving
+    // normally on both sides of the failure.
+    h.steps = [{ text: "eventually" }];
+
+    await send({ model: "m1", messages: [{ role: "user", content: "a very large prompt" }] });
+
+    // A probe is an empty chunk: nothing on the wire, purely "the worker is alive".
+    const probes = calls("gateway_chunk").filter((c) => c.args.text === "");
+    expect(probes.length).toBeGreaterThan(0);
+
+    // And it has to land BEFORE the first model call — that precedence is the entire point.
+    // It is what tells Rust the worker is working rather than suspended.
+    const beforeFirstTurn = h.invokes.slice(0, h.invokesAtGen[0]!);
+    expect(beforeFirstTurn.some((i) => i.cmd === "gateway_chunk" && i.args.text === "")).toBe(true);
+
+    // Probing changed liveness reporting, not the stream: the answer still arrives intact.
+    expect(calls("gateway_chunk").map((c) => c.args.text).join("")).toBe("eventually");
+    expect(calls("gateway_done").length).toBe(1);
+  });
+
   it("aborts when the client is gone instead of paying for more tokens", async () => {
     // A chunk that fails means the HTTP request died; that is the loop's only backpressure.
     h.impl = (cmd) => {
@@ -228,10 +293,60 @@ describe("gateway-bridge tool loop", () => {
 
     // Neither finished nor errored: it just stopped.
     expect(calls("gateway_done").length).toBe(0);
-    // Turn 1's call already ran before the disconnect was noticed — holding text back means
-    // we find out at the next turn boundary rather than mid-turn. What matters is that it
-    // is bounded at one extra turn, not eight: no second turn was ever requested.
-    expect(calls("gateway_tool_run").length).toBe(1);
-    expect(h.genCalls.length).toBe(1);
+    // Strictly better than before: the probe now runs BEFORE turn 1 instead of after it, so
+    // a dead client is caught without ever calling the model or the sandbox. Previously the
+    // disconnect surfaced only at the next turn boundary — after turn 1 had run its tool and
+    // its tokens had been paid for.
+    expect(h.genCalls.length).toBe(0);
+    expect(calls("gateway_tool_run").length).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The status handed to the client when a request fails.
+// ---------------------------------------------------------------------------
+
+/**
+ * `AllAttemptsFailedError` is the only thing that knows the upstream status, so the failure path
+ * reads it instead of pattern-matching the message. Before this it chose the status with
+ * `/no route|not found/i.test(msg) ? 404 : 502`, which reported every schema rejection as 502 —
+ * "the gateway is broken" — inviting a retry for a request that can never succeed.
+ */
+describe("gatewayStatus", () => {
+  const attempt = (status: number, cls: string) =>
+    ({
+      candidate: {
+        provider: { id: "p", slug: "agnes" },
+        key: { id: "k", label: "key-01" },
+        model: { nativeId: "agnes-2.5-flash" },
+      },
+      cls,
+      status,
+    }) as unknown as AttemptOutcome;
+
+  const failed = (status: number, cls: string) =>
+    new AllAttemptsFailedError("agnes/agnes-2.5-flash", [attempt(status, cls)]);
+
+  it("reports the upstream status when the client's own request was the cause", () => {
+    expect(gatewayStatus(failed(400, "BAD_REQUEST_SCHEMA"), "all attempts failed")).toBe(400);
+    expect(gatewayStatus(failed(429, "RATE_LIMITED"), "all attempts failed")).toBe(429);
+    expect(gatewayStatus(failed(404, "NOT_FOUND"), "all attempts failed")).toBe(404);
+  });
+
+  it("does not pass through a status that is about our key, not the client's", () => {
+    // A 401 here means *our* stored key was rejected. Echoing it would send the client hunting for
+    // a credential problem it does not have.
+    expect(gatewayStatus(failed(401, "AUTH_FAILED"), "all attempts failed")).toBe(502);
+    expect(gatewayStatus(failed(500, "SERVER_ERROR"), "all attempts failed")).toBe(502);
+  });
+
+  it("treats status 0 as a gateway-side failure", () => {
+    // 0 means the attempt never reached the provider at all (DNS, TLS, timeout).
+    expect(gatewayStatus(failed(0, "NETWORK"), "all attempts failed")).toBe(502);
+  });
+
+  it("falls back to the message only for errors that carry no attempt", () => {
+    expect(gatewayStatus(new Error('no route for model "x"'), 'no route for model "x"')).toBe(404);
+    expect(gatewayStatus(new Error("boom"), "boom")).toBe(502);
   });
 });

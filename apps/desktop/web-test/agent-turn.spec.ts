@@ -1,7 +1,7 @@
 /**
  * web-test/agent-turn.spec.ts — drive a real agent turn end to end.
  *
- * This is the one Playground path that exercises P4 (recordAgentTurn: message + skill + artifact
+ * This is the one Assistant path that exercises P4 (recordAgentTurn: message + skill + artifact
  * nodes, follows/used/produced edges), P5 (skills prompt block is appended to the agent's
  * system turn), and P6 (startRun / recordStep / endRun from the actual loop) together. Until
  * the harness could emulate tool calls, this had never been driven — every previous P6 spec
@@ -19,8 +19,8 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
   await page.setViewportSize({ width: 1280, height: 860 });
   await page.goto(`${APP}?seed=systemai`);
 
-  // --- set up the Playground for agent mode -------------------------------------------
-  await page.getByRole("button", { name: "Playground", exact: true }).click();
+  // --- set up the Assistant for agent mode -------------------------------------------
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
   const combo = page.getByRole("combobox");
   const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
   await combo.selectOption(value);
@@ -85,4 +85,36 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
   for (const kind of ["tool_call", "tool_result", "done"]) {
     await expect(page.getByText(kind, { exact: true }).first()).toBeVisible();
   }
+});
+
+/**
+ * A tool that FAILS must still tell the model — and the user — why.
+ *
+ * The bug this guards: `host.ts` forwarded only `output`, and Rust sends `output:""` with the
+ * reason in `error`, so every refusal reached the model as a blank tool result. The model then
+ * reported "the tool results came back empty, which is unusual" and could not say why. The shim
+ * reproduces the exact wire shape, so this drives the real bridge, not a stand-in.
+ */
+test("agent turn: a failed tool call shows the host's reason, not a blank result", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 860 });
+  await page.goto(`${APP}?seed=systemai`);
+
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  const combo = page.getByRole("combobox");
+  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
+  await combo.selectOption(value);
+  await page.getByLabel("agent mode").check();
+  await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+
+  // "missing" routes the oracle to read_file of a file the virtual FS does not have.
+  await page.getByPlaceholder(/Describe a task for the agent/).fill("read the missing file");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow" }).click();
+
+  // The reason itself, surfaced through the real host bridge.
+  await expect(page.getByText(/no such file/)).toBeVisible({ timeout: 30_000 });
+  // And not the blank row the bug produced.
+  await expect(page.getByText(/\(no output/)).toHaveCount(0);
 });

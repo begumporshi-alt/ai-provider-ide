@@ -435,18 +435,26 @@ function ensureArrayContent(messages: NormalizedMessage[]): void {
   }
 }
 
-function ensureUserTurnAfterToolCalls(messages: NormalizedMessage[]): void {
-  // Some providers require a user turn after tool results before the next assistant turn
-  if (messages.length === 0) return;
-  const last = messages[messages.length - 1];
-  if (!last || typeof last !== "object") return;
-  if (last.role === "tool") {
-    // Check if next-to-last is also tool — if so, the sequence is assistant -> tools, which is fine
-    // But if the last is tool and there's no trailing user, some providers 400
-    // Insert an empty user placeholder
-    messages.push({ role: "user", content: "" });
-  }
-}
+/**
+ * Removed (2026-09-20): this used to append `{role: "user", content: ""}` whenever the last
+ * message was a `tool` message, on the premise that "some providers require a user turn after
+ * tool results".
+ *
+ * Measured against a live upstream (Agnes, `agnes-2.5-flash`), that premise is false and the cure
+ * was worse than the disease. The appended turn is *empty*, and Agnes rejects an empty
+ * user turn outright:
+ *
+ *   HTTP 400 — "messages: Validation error: message content cannot be empty"
+ *
+ * Because the placeholder is appended on **every** request that ends in a tool result, it broke
+ * precisely the request it was meant to protect: turn 1 (which ends in text) succeeded, the
+ * continuation that carries the tool result was rejected. Identical payload, no placeholder → 200;
+ * placeholder present → 400. A non-empty trailing user turn → 200.
+ *
+ * A tool-result-terminated conversation is already well-formed for the OpenAI dialect: the
+ * assistant turn declared the `tool_calls`, the results answer them, and the model speaks next.
+ * Do not reintroduce a trailing turn here without provider-gated evidence and non-empty content.
+ */
 
 // ── 6. Client-Specific Adaptations ────────────────────────────────────────
 
@@ -634,15 +642,23 @@ function normalizeCodexRequest(body: Record<string, unknown>): void {
   }
 }
 
-// z.ai / GLM family: ensure at least one user turn
-function ensureUserTurnForZai(body: Record<string, unknown>): void {
-  const messages = body.messages as NormalizedMessage[] | undefined;
-  if (!Array.isArray(messages)) return;
-  const hasUser = messages.some((m) => m?.role === "user");
-  if (!hasUser) {
-    messages.push({ role: "user", content: "" });
-  }
-}
+/**
+ * Removed (2026-09-20): this pushed `{role: "user", content: ""}` when a request had no user turn,
+ * for the "z.ai / GLM family".
+ *
+ * Measured on Agnes, a request with no user turn is rejected outright:
+ *
+ *   HTTP 400 — "No user query found in messages."
+ *
+ * and an **empty** user turn does not satisfy it either — it is rejected as
+ * "message content cannot be empty". So this filler could never have rescued the request it was
+ * written for; it could only inject a bogus turn into a conversation. It was also gated on
+ * `clientHint`, which describes who *called*, not which provider *serves* — so it fired for a
+ * zcode client even when the request was routed to Agnes.
+ *
+ * A request with no user turn is a malformed request from the client. The upstream's own 400 now
+ * passes through unchanged, which is the honest answer; fabricating a turn is not.
+ */
 
 // ── 7. Main Pipeline ──────────────────────────────────────────────────────
 
@@ -691,7 +707,8 @@ export function normalizeGatewayRequest(
   // Phase F: Message shape fixes
   if (Array.isArray(result.messages)) {
     ensureArrayContent(result.messages as NormalizedMessage[]);
-    ensureUserTurnAfterToolCalls(result.messages as NormalizedMessage[]);
+    // No trailing user turn is appended after a tool result — see the block above this pipeline
+    // for the measurement that removed it.
   }
 
   // Phase G: Client-specific adaptations
@@ -699,9 +716,8 @@ export function normalizeGatewayRequest(
     remapClaudeToolNamesInRequest(result);
   }
 
-  if (clientHint === "zcode" || targetProvider.includes("zhipu") || targetProvider.includes("glm") || /glm|zhipu|z-ai/i.test(targetModel)) {
-    ensureUserTurnForZai(result);
-  }
+  // No user turn is fabricated when one is missing — see the block above for the measurement.
+  // (`clientHint` remains in scope for the Claude Code remapping only.)
 
   // Final pass: ensure tool-call ids again (after any client remapping)
   ensureToolCallIds(result, { use9CharId: false });

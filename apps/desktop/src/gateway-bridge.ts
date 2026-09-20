@@ -34,10 +34,45 @@ import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { router } from "./store";
-import { normalizeGatewayRequest, detectClient } from "@aiprovider/router-core";
+import { normalizeGatewayRequest, detectClient, AllAttemptsFailedError } from "@aiprovider/router-core";
 import type { LedgerSource } from "@aiprovider/router-core";
 import { parseAssistantStream, type ToolSegment } from "./lib/assistant-stream";
 import { AGENT_TOOLS, registryToOpenAI } from "./lib/tools/registry";
+import { DEFAULT_MAX_ITERATIONS } from "./lib/tools/agentLoop";
+import { toWireToolCalls } from "./lib/tools/wire";
+
+/**
+ * Upstream statuses that may be handed to the client unchanged.
+ *
+ * A whitelist, deliberately, not an echo. A `401`/`403` from an upstream means *our stored key* was
+ * rejected — the client's own credentials are not in question, so passing it through would send the
+ * client hunting for a problem it does not have. A 5xx is the provider's failure, which from the
+ * client's side is a gateway failure. What remains is the set where the client's request is the
+ * cause and a retry either helps (429) or never will (400/404/413/422).
+ */
+const CLIENT_ATTRIBUTABLE_STATUS = new Set([400, 404, 413, 422, 429]);
+
+/**
+ * The HTTP status to report to the client for a failed request.
+ *
+ * This used to be `const status = /no route|not found/i.test(msg) ? 404 : 502` — a regex over the
+ * error *message*, which is not a contract. It reported every schema rejection as 502, telling the
+ * client the gateway was broken and inviting retries for a request that can never succeed, and any
+ * rewording of a message would have silently changed the status. The router already knows: an
+ * `AllAttemptsFailedError` carries the attempts, and each one holds the upstream's own status.
+ *
+ * The message heuristic survives only for errors that carry no attempt at all — the empty-plan
+ * guard, or a throw from outside the engine.
+ */
+export function gatewayStatus(e: unknown, msg: string): number {
+  if (e instanceof AllAttemptsFailedError) {
+    const last = e.chain[e.chain.length - 1];
+    // `status: 0` means the attempt never reached the provider (DNS, TLS, timeout) — a gateway-side
+    // failure, not a client one.
+    if (last && CLIENT_ATTRIBUTABLE_STATUS.has(last.status)) return last.status;
+  }
+  return /no route|not found/i.test(msg) ? 404 : 502;
+}
 
 interface BridgeRequest {
   requestId: number;
@@ -46,10 +81,9 @@ interface BridgeRequest {
   headers: Record<string, string>;
 }
 
-/** Matches `maxIterations` in lib/tools/agentLoop.ts. A model that will not stop calling
- *  tools must not be able to spend without limit; 8 turns is enough for real work and
- *  bounded when something goes wrong. */
-const MAX_TOOL_ITERATIONS = 8;
+// Imported, not re-declared. This used to be a second `= 8` kept in step with agentLoop's by a
+// comment — so the gateway and the Assistant silently disagree the moment either one changes.
+const MAX_TOOL_ITERATIONS = DEFAULT_MAX_ITERATIONS;
 
 interface ToolCall {
   id?: string;
@@ -109,7 +143,9 @@ async function handle(req: BridgeRequest): Promise<void> {
         role: "user" | "assistant" | "system" | "tool";
         content: string;
         tool_call_id?: string;
-        tool_calls?: Array<{ id?: string; name?: string; arguments?: string }>;
+        // Left as `unknown[]`: an incoming client turn carries whatever shape its dialect uses,
+        // and the turns we append carry the OpenAI wire shape from `toWireToolCalls`.
+        tool_calls?: unknown[];
       }>;
       const clientTools = Array.isArray(normalizedBody.tools) && normalizedBody.tools.length > 0
         ? normalizedBody.tools
@@ -174,8 +210,9 @@ async function handle(req: BridgeRequest): Promise<void> {
         }).catch(() => undefined);
       };
 
-      const executeLocally = async (calls: ToolCall[]) => {
-        for (const call of calls) {
+      const executeLocally = async (calls: ToolCall[], ids: string[]) => {
+        for (let i = 0; i < calls.length; i++) {
+          const call = calls[i]!;
           const name = call.name ?? "";
           let args: unknown = {};
           try {
@@ -193,7 +230,8 @@ async function handle(req: BridgeRequest): Promise<void> {
           } catch (e) {
             resultText = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;
           }
-          messages.push({ role: "tool", content: resultText, tool_call_id: call.id ?? name });
+          // Paired with the id the assistant turn declared — never a second, independent guess.
+          messages.push({ role: "tool", content: resultText, tool_call_id: ids[i]! });
         }
       };
 
@@ -201,12 +239,10 @@ async function handle(req: BridgeRequest): Promise<void> {
        *  the assistant message that requested the calls, then one result per call. Providers
        *  reject a `tool` message that is not answering a preceding `tool_calls` turn. */
       const sandboxTurn = async (turnText: string, calls: ToolCall[]) => {
-        messages.push({
-          role: "assistant",
-          content: turnText,
-          tool_calls: calls.map((c) => ({ id: c.id ?? "", name: c.name ?? "", arguments: c.arguments ?? "{}" })),
-        });
-        await executeLocally(calls);
+        // One decision builds both halves, so the declared ids and the result ids cannot drift.
+        const { wire, ids } = toWireToolCalls(calls);
+        messages.push({ role: "assistant", content: turnText, tool_calls: wire });
+        await executeLocally(calls, ids);
       };
 
       for (let iter = 1; iter <= MAX_TOOL_ITERATIONS; iter++) {
@@ -218,10 +254,21 @@ async function handle(req: BridgeRequest): Promise<void> {
 
         // Holding text back removes our only backpressure: `gateway_chunk` failing is how we
         // learn the client is gone, and in gateway mode nothing is emitted until the end. So
-        // probe before every turn after the first. An empty chunk is answered with nothing on
-        // the wire (Rust drops empty deltas) — it is purely a liveness check, and a failure
-        // here stops us paying for tokens nobody will read.
-        if (gatewayTools && iter > 1) {
+        // probe before EVERY turn — including the first.
+        //
+        // The first turn is the one that needed it. It used to be skipped (`iter > 1`), which
+        // left Rust's first-message bound measuring silence that meant nothing: a healthy
+        // worker grinding through a long turn looked exactly like a suspended one, so slow
+        // requests failed as though the window had died. Measured on a live gateway — a
+        // ~150k-token prompt ran past the bound finishing turn 1 and was answered 503 blaming
+        // suspension, while the window was serving normally on both sides of it.
+        //
+        // Probing is safe by construction: the probe is sent BY the worker, so a genuinely
+        // suspended worker still sends nothing and the bound still fires. What arrives is
+        // proof of liveness — a better signal than any timeout. An empty chunk is answered
+        // with nothing on the wire (Rust drops empty deltas); it is purely a liveness check,
+        // and a failure here stops us paying for tokens nobody will read.
+        if (gatewayTools) {
           const alive = await invoke("gateway_chunk", { requestId: req.requestId, text: "" })
             .then(() => true)
             .catch(() => false);
@@ -345,7 +392,7 @@ async function handle(req: BridgeRequest): Promise<void> {
   } catch (e) {
     if (ac.signal.aborted) return;
     const msg = String((e as Error)?.message ?? e);
-    const status = /no route|not found/i.test(msg) ? 404 : 502;
+    const status = gatewayStatus(e, msg);
     await invoke("gateway_error", { requestId: req.requestId, status, message: msg }).catch(() => undefined);
   }
 }

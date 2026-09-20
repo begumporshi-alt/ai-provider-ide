@@ -3,7 +3,10 @@
  * Pure-function unit tests — no network, no I/O.
  */
 import { describe, expect, it } from "vitest";
-import { normalizeGatewayRequest, ensureToolCallIds, fixMissingToolResponses, stripOrphanedToolResults, sanitizeOpenAITools } from "../src/gateway-normalizer.js";
+// `fixMissingToolResponses` / `stripOrphanedToolResults` are covered through
+// `normalizeGatewayRequest` ("tool response hygiene", below) — importing them here as well was
+// dead weight that only a noUnusedLocals run would notice.
+import { normalizeGatewayRequest, ensureToolCallIds, sanitizeOpenAITools } from "../src/gateway-normalizer.js";
 import { detectClient } from "../src/gateway-client-detector.js";
 
 describe("detectClient", () => {
@@ -144,11 +147,56 @@ describe("normalizeGatewayRequest — tool response hygiene", () => {
       ],
     });
     const msgs = out.messages as Array<{ role: string; tool_call_id?: string }>;
-    // assistant + inserted tool result + trailing user turn = 3
-    expect(msgs).toHaveLength(3);
+    // assistant + inserted tool result = 2. No trailing user turn: see the regression spec
+    // below for why appending one breaks every tool continuation.
+    expect(msgs).toHaveLength(2);
     expect(msgs[1]!.role).toBe("tool");
     expect(msgs[1]!.tool_call_id).toBe("call_1");
-    expect(msgs[2]!.role).toBe("user");
+    expect(msgs[2]).toBeUndefined();
+  });
+
+  /**
+   * Regression (2026-09-20). The normalizer used to append `{role:"user", content:""}` whenever
+   * the last message was a `tool` message — a workaround for providers said to need a user turn
+   * after tool results. Agnes answers that with HTTP 400
+   * "messages: Validation error: message content cannot be empty", so *every* tool-call
+   * continuation through the gateway failed: turn 1 succeeded, turn 2 was rejected. Verified
+   * against the live upstream — an identical pair is 200 without the appended turn and 400 with
+   * it, and a non-empty trailing user turn is 200.
+   */
+  it("does not append a trailing user turn after a tool result", () => {
+    const out = normalizeGatewayRequest({
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "a.txt" },
+      ],
+    });
+    const msgs = out.messages as Array<{ role: string }>;
+    expect(msgs).toHaveLength(3);
+    expect(msgs[msgs.length - 1]!.role).toBe("tool");
+  });
+
+  it("never leaves a user or assistant message with empty content", () => {
+    const out = normalizeGatewayRequest({
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{}" } }],
+        },
+        { role: "tool", tool_call_id: "call_1", content: "a.txt" },
+      ],
+    });
+    const empties = (out.messages as Array<{ role?: string; content?: unknown }>).filter(
+      (m) => (m.role === "user" || m.role === "assistant") && m.content === "",
+    );
+    expect(empties).toEqual([]);
   });
 
   it("strips orphaned tool results", () => {
@@ -282,7 +330,7 @@ describe("normalizeGatewayRequest — message shape fixes", () => {
     expect(msg.content).toEqual([{ type: "text", text: "Hello" }]);
   });
 
-  it("adds trailing user turn after tool results", () => {
+  it("leaves a tool-result-terminated conversation as the last turn", () => {
     const out = normalizeGatewayRequest({
       messages: [
         {
@@ -293,7 +341,10 @@ describe("normalizeGatewayRequest — message shape fixes", () => {
       ],
     });
     const msgs = out.messages as Array<{ role: string }>;
-    expect(msgs[msgs.length - 1]!.role).toBe("user");
+    // No trailing user turn: appending an empty one makes Agnes reject the whole continuation
+    // with HTTP 400 "message content cannot be empty" — see the regression spec above.
+    expect(msgs).toHaveLength(2);
+    expect(msgs[msgs.length - 1]!.role).toBe("tool");
   });
 });
 
@@ -332,12 +383,20 @@ describe("normalizeGatewayRequest — Claude Code adaptations", () => {
 });
 
 describe("normalizeGatewayRequest — zcode / z.ai adaptations", () => {
-  it("adds empty user turn when no user exists", () => {
+  /**
+   * Regression (2026-09-20). This used to append `{role: "user", content: ""}` when no user turn
+   * existed. Measured on Agnes: a request with no user turn is rejected with
+   * `"No user query found in messages."` — and an *empty* user turn does not satisfy it either
+   * (`"message content cannot be empty"`). So the filler could never help. It was also gated on
+   * `clientHint`, which says who *called*, not which provider *serves*.
+   */
+  it("does not fabricate an empty user turn", () => {
     const out = normalizeGatewayRequest({
       messages: [{ role: "assistant", content: "Hi" }],
     }, { clientHint: "zcode" });
-    const msgs = out.messages as Array<{ role: string }>;
-    expect(msgs.some((m) => m.role === "user")).toBe(true);
+    const msgs = out.messages as Array<{ role: string; content?: unknown }>;
+    expect(msgs.some((m) => m.role === "user")).toBe(false);
+    expect(msgs.filter((m) => m.content === "")).toHaveLength(0);
   });
 
   it("does not add user turn when one already exists", () => {

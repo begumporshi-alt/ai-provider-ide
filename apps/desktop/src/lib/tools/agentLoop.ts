@@ -20,9 +20,40 @@
  */
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { registryToOpenAI } from "./registry";
+import { toWireToolCalls } from "./wire";
 import type { AgentLoopOptions } from "./types";
 
-const DEFAULT_MAX_ITERATIONS = 8;
+/**
+ * Ceiling on model round-trips in one agent turn. A model that will not stop calling tools
+ * must not be able to spend without limit; 8 is enough for real work and bounded when
+ * something goes wrong.
+ *
+ * Exported because the gateway path bounds its own loop with the same number. Those used to be
+ * two separate `= 8` constants kept in step by a comment — the kind of duplication that survives
+ * exactly until someone edits one of them.
+ */
+export const DEFAULT_MAX_ITERATIONS = 8;
+
+/** Upper bound when the ceiling is user-set. Not a security control — the loop is bounded
+ *  either way — but a value of 5000 would just be a slow way to burn tokens. */
+export const MAX_ITERATIONS_CAP = 50;
+
+/** Clamp a user-supplied ceiling into `[1, MAX_ITERATIONS_CAP]`. Non-finite and non-numeric
+ *  input falls back to the default rather than to 1: a corrupted setting should degrade to the
+ *  value that works, not to a loop that gives up immediately. */
+export function clampIterations(value: unknown): number {
+  // Numbers and numeric strings only. A blanket `Number(value)` would coerce `null`, `[]` and
+  // `true` into 0, 0 and 1 — a JSON blob that lost its field would then read as "run one step",
+  // which is indistinguishable from a broken agent rather than a missing setting.
+  const n =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && value.trim() !== ""
+        ? Number(value)
+        : NaN;
+  if (!Number.isFinite(n)) return DEFAULT_MAX_ITERATIONS;
+  return Math.max(1, Math.min(MAX_ITERATIONS_CAP, Math.floor(n)));
+}
 
 /** Best-effort parse of a model-supplied arguments string into a plain object. A malformed
  *  payload yields {} — the host will see unfamiliar/empty args and the model gets a clear
@@ -95,9 +126,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
 
     // Replay the assistant turn with its tool_calls so the provider accepts the results.
-    messages.push({ role: "assistant", content: text, tool_calls: collected });
+    // The wire entries and the ids come from ONE decision (`toWireToolCalls`), so the results
+    // appended below are guaranteed to name a call this turn actually declared — the pairing
+    // providers check before accepting a continuation.
+    const { wire, ids } = toWireToolCalls(collected);
+    messages.push({ role: "assistant", content: text, tool_calls: wire });
 
-    for (const call of collected) {
+    for (let i = 0; i < collected.length; i++) {
+      const call = collected[i]!;
       if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
       onEvent?.({ type: "tool_call", call });
       const name = call.name ?? "(unknown)";
@@ -116,6 +152,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           const r = await host.run(name, args);
           resultText = r.output;
           ok = r.ok;
+          // Belt and braces: `ToolHost` is an interface, and a host that reports a failure with
+          // an empty string sends the model a blank tool result — it cannot tell "nothing to
+          // report" from "something went wrong", and answers as if the tool had no output.
+          // A failure must always carry a reason.
+          if (!ok && !resultText.trim()) {
+            resultText = `Tool "${name}" failed and reported no reason.`;
+          }
         } catch (e) {
           resultText = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;
           ok = false;
@@ -123,7 +166,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       }
 
       onEvent?.({ type: "tool_result", call, result: resultText, ok });
-      messages.push({ role: "tool", content: resultText, tool_call_id: call.id ?? name });
+      messages.push({ role: "tool", content: resultText, tool_call_id: ids[i]! });
     }
   }
 
