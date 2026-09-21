@@ -240,6 +240,14 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
   `PRAGMA user_version` (which reads 0). Read concurrently with `file:…?mode=ro`.
 - Column names are the snake_case ones (`fallback_chain_json`, `http_status`); guessing a name
   silently returns `None` and looks like missing data.
+- **An external `sqlite3` client cannot DELETE from `memories` by default.** The `memories_ad`
+  trigger writes to the `memories_fts` virtual table, so a plain delete fails at prepare time with
+  `unsafe use of virtual table "memories_fts"` and changes nothing. Prefix
+  `PRAGMA trusted_schema=ON;`. **The app's own connection is unaffected** — rusqlite does not set
+  that off, and `forgetting_removes_the_row_and_its_fts_entry` (memory.rs) covers it. So a failing
+  external delete is a client quirk, not evidence that "forget" is broken.
+- Verify a delete by re-counting in a **new** query: `SELECT changes()` in a separate `sqlite3`
+  invocation is a separate connection and always reports 0.
 
 ## Migrations (`src-tauri/src/store.rs`)
 - **Two ordered lists.** `MIGRATIONS` = SQL batches numbered by position; `DATA_MIGRATIONS` =
