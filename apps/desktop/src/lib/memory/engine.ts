@@ -344,8 +344,13 @@ export async function recallContext(
       // given to the specific ones, so neither tier can starve the other.
       const abstract = await recallMemories(query, Math.ceil(limit / 2), ["L3", "L2"]);
       const remaining = limit - abstract.length;
+      // L0 is deliberately NOT recalled here. It is verbatim conversation and this path applies no
+      // session filter, so an L0 hit can be another session's turns — the privacy inversion the
+      // gateway already refuses (`context_scope.rs:593` hardcodes L1/L2/L3). Nothing is lost by
+      // dropping it: `replayHistory` already puts this session's turns in the request verbatim, so
+      // an L0 recall of the current session only duplicates them.
       const specific =
-        remaining > 0 ? await recallMemories(query, remaining, ["L1", "L0"]) : [];
+        remaining > 0 ? await recallMemories(query, remaining, ["L1"]) : [];
       hits = [...abstract, ...specific];
     }
 

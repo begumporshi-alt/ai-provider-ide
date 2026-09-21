@@ -327,14 +327,27 @@ describe("memory engine", () => {
 
   describe("recallContext", () => {
     it("gives the distilled layers first refusal on half the budget", async () => {
+      // The mock honours the layers it was asked for — an L0 row comes back only when L0 was
+      // requested — so the expectation below describes what the code can actually receive.
       recallMemories.mockImplementation(async (_q, _limit, layers) => {
         if (layers && layers.includes("L3")) return [mem("a", "L3", "core")];
-        return [mem("b", "L1", "atom"), mem("c", "L0", "raw")];
+        return layers?.includes("L0")
+          ? [mem("b", "L1", "atom"), mem("c", "L0", "raw")]
+          : [mem("b", "L1", "atom")];
       });
       const hits = await recallContext("anything", { limit: 4 });
-      expect(hits.map((m) => m.id)).toEqual(["a", "b", "c"]);
+      expect(hits.map((m) => m.id)).toEqual(["a", "b"]);
       const abstractCall = recallMemories.mock.calls.find((c) => (c[2] ?? []).includes("L3"));
       expect(abstractCall?.[1]).toBe(2); // half of a limit of 4
+    });
+
+    it("never recalls L0 — this session's turns are already replayed as history", async () => {
+      recallMemories.mockResolvedValue([]);
+      await recallContext("q", { limit: 6 });
+      const requested = recallMemories.mock.calls.flatMap((c) => c[2] ?? []);
+      expect(requested).not.toContain("L0");
+      const specificCall = recallMemories.mock.calls.find((c) => (c[2] ?? []).includes("L1"));
+      expect(specificCall?.[2]).toEqual(["L1"]);
     });
 
     it("lets the specific layers use whatever the abstract ones did not", async () => {

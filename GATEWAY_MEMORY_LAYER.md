@@ -933,6 +933,27 @@ the DB unavailable, every request still succeeds.
    leave it and build the per-scope flag for both paths. Recommendation: drop it from the default
    now — the distilled layers are what the feature is for. **Not changed**, because it is a
    behaviour change to a pre-existing feature and therefore the operator's call.
+   **The gap is wider than layers — measured 2026-09-21.** The two paths also differ on *scope*. The
+   gateway recalls through `recall_scoped` with a `RecallScope{user, project, agent}`; the Assistant
+   reaches `memory_recall` (`commands.rs:384`) → `memory::recall` → `recall_inner(..., None)` — **no
+   scope at all**, so it sees every row in the database. That is the "absence is not global"
+   contamination engine the three reviewers flagged (`memory.rs:406-412`), reached from a path that
+   always *has* a project and simply never passes it. `memory.rs:420-421` describes the unscoped path
+   as the Assistant's *Memory screen*; that is stale, because the Assistant's *request* path uses it
+   too. So the Assistant path is looser on **both** axes at once — L0 included, and unscoped.
+   **Why the L0 half is nearly free to drop.** `replayHistory` (`Assistant.tsx:48-57`) maps the entire
+   in-memory `msgs` array with no window or truncation, so the current session's turns are already in
+   the request verbatim and correctly attributed (tool_calls / tool_call_id intact). L0 recall of the
+   current session is therefore redundant with history; L0 recall of *other* sessions is the leak. The
+   only capability given up is cross-session verbatim bridging — which §0.4 forbids by default anyway.
+   Revised options: (a) drop `L0` from `engine.ts`'s default — small, matches the gateway, near-zero
+   recall cost; (b) additionally thread a `RecallScope` through `memory_recall` so the Assistant scopes
+   as the gateway does. (a) is separable from (b), and (a) is the safe half.
+   **Resolved 2026-09-21 — (a) done, (b) still open.** `engine.ts:348` now requests `["L1"]`. Pinned by
+   a test that asserts the *requested* layer list excludes L0 — asserting the returned rows would have
+   proved nothing, since a mock that filters by layer passes either way — and falsified by restoring
+   `["L1","L0"]`. (b) remains the operator's call: the Assistant's recall is still unscoped, and scoping
+   it is a genuine behaviour change for cross-project continuity, not a bug fix.
 4. **Multi-user.** `scope_user` is modelled but this is a single-user desktop app; the dimension is
    speculative until headless/service mode exists (§7 of `ARCHITECTURE.md` lists it as a non-goal).
    → **Decided 2026-09-21: keep the column, build none of the semantics.** `scope_user` is a
