@@ -151,6 +151,12 @@ which one happened.
   hardcoded `✓`, so a failed row read `final: — · — → ✓`.
 
 ## Build / install / verify the installed app
+- `pnpm build` at the repo root is **frontend only** (vite) — it does not compile Rust. The bundle
+  is `pnpm tauri build` from `apps/desktop` (~2m12s for the release profile).
+- **`pnpm tauri build` fails at the DMG step under the sandbox** — it is blocked from writing
+  `/Volumes/AI-Provider Router/`. The `.app` is still produced correctly at
+  `apps/desktop/src-tauri/target/release/bundle/macos/`. That error is environmental, not a broken
+  build: check for the `.app` before believing anything is wrong.
 - `cd apps/desktop && [ -d dist ] && mv dist /tmp/old-dist-$(date +%s)` **before** `npx tauri build`.
   **Mandatory.** Otherwise tauri dies at `beforeBuildCommand` with a useless `errors: [Getter/Setter]`
   while `pnpm build` passes standalone (the direct run is escalated, tauri's child is not).
