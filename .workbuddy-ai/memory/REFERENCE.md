@@ -223,6 +223,21 @@ No cdhash, so the ACL keeps matching across rebuilds. The build log names it —
 `codesign --verify --deep --strict` passes. Notarization is skipped (no Apple credentials; not wanted
 for a dev build).
 
+**The decisive test is "cdhash moves, requirement doesn't" — and a plain rebuild will not show it.**
+A second `tauri build` with no source change produced a **byte-identical** bundle (same
+`CDHash=0e9a2aad…`), because cargo had nothing to recompile. A no-op rebuild tests nothing. Force a
+different binary instead: copy the bundle, add a file under `Contents/Resources/` (the code-directory
+seal covers resources, so the cdhash must change), and re-sign with the same identity.
+
+```
+before   CDHash=0e9a2aadad76503a59455393c9e11f58082834f1
+after    CDHash=b569b1e4db034cac789dafe79ff7ad622dd9fced
+both     designated => identifier "dev.aiprovider.router" and certificate leaf = H"9e56e7cc…"
+```
+
+Same requirement on both sides, with the cdhash moved — exactly what ad-hoc signing could not do,
+since there the requirement *was* the cdhash.
+
 **Expect one final prompt.** The stored ACL entry still holds the old cdhash requirement, so the first
 signed build prompts once. **Always Allow** stores the certificate requirement, and rebuilds after
 that should not prompt. If prompts ever return, check whether `signingIdentity` was dropped or the
