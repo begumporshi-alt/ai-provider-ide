@@ -116,6 +116,27 @@ test("memory: a host that does not report the budget shows no budget line", asyn
   await expect(page.getByText("3 awaiting distillation")).toBeVisible();
 });
 
+/**
+ * The behavioural half of the shim-gap guard (the systemic half is in smoke.spec.ts).
+ *
+ * This screen loads four host values in one `Promise.all(...).catch(() => undefined)`. One
+ * unknown command rejects all four, and the section then renders as though it had loaded with
+ * nothing to report: a **disabled** switch reading "off" — exactly what "off" is meant to look
+ * like — plus "queue —". Asserting the section rendered is therefore worthless here; only the
+ * loaded state distinguishes the two.
+ */
+test("memory: the master switch is live, proving the screen's host load succeeded", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  // `enabled === null` disables the checkbox; non-null means gatewayMemoryEnabled() resolved.
+  const sw = page.getByLabel("Memory layer");
+  await expect(sw).toBeEnabled();
+  await expect(sw).not.toBeChecked();
+  // Same batch: the queue resolved too, so it reports a number rather than a dash.
+  await expect(page.getByText("0 awaiting distillation")).toBeVisible();
+});
+
 test("memory: a layer filter narrows the list", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await seedMemories(page);

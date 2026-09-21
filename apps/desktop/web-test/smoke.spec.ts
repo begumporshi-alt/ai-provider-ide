@@ -5,10 +5,10 @@
  * screenshot", not as "ScopeSelect crashed reading `.global`". That whole bug class disappears
  * if one spec visits each nav item and asserts zero `pageerror` events landed.
  *
- * The shim throws on unknown commands, screens wrap loads in `Promise.all(...).catch(undefined)`,
- * and the result is a silently empty screen, not an error — so this guard also catches a fresh
- * shim gap whose only symptom is a missing section. It is intentionally cheap: no assertions on
- * content, just "no React tree crashed while painting this screen".
+ * This guard deliberately checks only "no React tree crashed". It does NOT catch a shim gap: the
+ * shim rejects an unknown command, screens swallow the rejection, and the section renders empty
+ * rather than crashing — body text is still well over 20 chars because the rest of the shell
+ * painted. `unknownCommands` below is the guard for that; see it before trusting this one.
  *
  * Some bugs only crash *when the data is there* (Memory's ScopeSelect reads `m.scope.global`).
  * The general case below does not catch those, because an empty list renders no rows. A
@@ -58,6 +58,32 @@ test.describe("smoke", () => {
       expect(bodyText.length, `blank body on "${label}"`).toBeGreaterThan(20);
     });
   }
+});
+
+/**
+ * The guard the render checks above cannot provide.
+ *
+ * The shim rejects a command it has no case for, exactly as Rust would. Screens load several in
+ * one `Promise.all([...]).catch(() => undefined)`: one rejection nulls the whole batch, every
+ * value stays at its initial state, and the section renders looking precisely like a screen that
+ * loaded and had nothing to report. No error, no crash, no failing test — and a control that
+ * should be live is silently disabled.
+ *
+ * `router_model_context_count` was missing from the shim for the entire memory feature. The
+ * Memory screen's master switch never loaded; it rendered disabled and reading "off", which is
+ * what "off" is supposed to look like anyway. Nothing caught it.
+ */
+test("smoke: no screen calls a command the shim does not implement", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  for (const label of NAV_LABELS) {
+    await page.getByRole("button", { name: label, exact: true }).click();
+    // Screens fire their loads on mount and poll; one beat is enough for them to land.
+    await page.waitForTimeout(300);
+  }
+  const unknown = await page.evaluate(() =>
+    (window as unknown as { __webTest: { unknownCommands: () => string[] } }).__webTest.unknownCommands(),
+  );
+  expect(unknown, "commands the app calls that the shim has no case for").toEqual([]);
 });
 
 test("smoke: memory renders without an uncaught error when rows are present", async ({ page }) => {

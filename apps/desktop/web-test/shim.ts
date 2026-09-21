@@ -110,6 +110,44 @@ const queueStatus = {
   budget_left: 60 as number | undefined,
 };
 
+// ---- host state with no UI input, modelled so the screens that read it can actually load ----
+//
+// Every one of these backs a command the app calls. A command the shim does not know about throws,
+// and screens that load several at once (`Promise.all(...).catch(() => undefined)`) turn that single
+// throw into a section that renders as though it had loaded with no data — no test fails, and the
+// screen quietly lies. Keep this list in step with the audit in REFERENCE.md.
+
+/** R4: per-app gateway keys. Mirrors persist.rs — revoke marks, delete removes, revoking twice
+ * reports rather than silently succeeding. */
+const appKeys: Row[] = [];
+/** R4 spend cap in micro-USD. `capped` is "at or over the cap", not "a cap is set" — that is what
+ * gateway_cmds.rs computes, and the UI colours the number off it. */
+const spendStatus = { monthMicros: 0, capMicros: 0, capped: false };
+/** Mirrors the Rust defaults (GatewayCore::new): tools on, gateway-side mutation off (audit H1b). */
+const toolsState = { enabled: true, mutationEnabled: false };
+/**
+ * What `gateway_tool_run` answers. Fails by default: the harness has no tool sandbox, and a run
+ * that reported success would let a spec conclude a file had been written when nothing was.
+ */
+const toolRunResult = { ok: false, output: "", error: "web-test shim: no tool sandbox" };
+/** §3.4 context windows published by the webview. `router_model_context_replace` upserts by
+ * `model_key` — a refresh covers one provider and must not drop another's rows. */
+const modelContexts: Row[] = [];
+/** §6.4 per-principal memory policy. `enabled: null` is "inherit", which *removes* the row. */
+const principalPolicies: Row[] = [];
+/**
+ * Commands the app called that this shim does not implement. Always empty in a correct tree — see
+ * the `default:` case for why a rejection alone is not enough to notice one.
+ */
+const unknownCommands: string[] = [];
+/** The client the router publishes models into (workbuddy.rs). */
+const workbuddy = {
+  published: [] as string[],
+  path: "",
+  endpoint: "http://127.0.0.1:8787/v1",
+  clientPresent: false,
+};
+
 const NODE_KINDS = ["artifact", "memory", "skill", "message"];
 const EDGE_KINDS = [
   "produced", "used", "recalled", "follows", "references",
@@ -426,6 +464,24 @@ let eventSeq = 0;
   queueStatus: (next: Partial<typeof queueStatus>): void => {
     Object.assign(queueStatus, next);
   },
+  /** Month-to-date spend, so a spec can put the cap in force without faking a month of traffic. */
+  spendStatus: (next: Partial<typeof spendStatus>): void => {
+    Object.assign(spendStatus, next);
+  },
+  /** What a gateway tool run answers — see `toolRunResult` above. */
+  toolRunResult: (next: Partial<typeof toolRunResult>): void => {
+    Object.assign(toolRunResult, next);
+  },
+  /** Whether the client's config file is there (the Models screen greys itself out if not). */
+  workbuddy: (next: Partial<typeof workbuddy>): void => {
+    Object.assign(workbuddy, next);
+  },
+  /**
+   * Commands the app called that the shim has no case for. A screen that swallows a rejected
+   * `Promise.all` looks identical whether it loaded or not, so this is the only way a missing
+   * case can fail a test rather than quietly emptying a screen.
+   */
+  unknownCommands: (): string[] => [...unknownCommands],
   /** Read-only view of the persisted store (spec assertions inspect this). */
   store: {
     providers: () => [...providers.values()],
@@ -1295,16 +1351,50 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "memory_conflicts":
       // No contradictions in the shim.
       return [];
+    // §6.4 — an upsert; `enabled: null` returns the principal to inheriting, which is a delete.
     case "memory_principal_list":
-      return [];
+      return principalPolicies.map((r) => ({ ...r }));
+    case "memory_principal_set": {
+      const policy = args.policy as { principal?: string; enabled?: boolean | null } | undefined;
+      const principal = String(policy?.principal ?? "");
+      if (!principal) throw new Error("memory_principal_set needs a principal");
+      const enabled = policy?.enabled ?? null;
+      const i = principalPolicies.findIndex((r) => r.principal === principal);
+      if (enabled === null) {
+        if (i >= 0) principalPolicies.splice(i, 1);
+      } else {
+        const row = { principal, enabled, last_seen_at: null };
+        if (i >= 0) principalPolicies[i] = row;
+        else principalPolicies.push(row);
+      }
+      return true;
+    }
     // Mirrors Rust exactly: the command is `router_model_context_count` (commands.rs). It was
     // listed here unprefixed, and because the Memory screen loads this inside a `Promise.all` that
     // swallows rejections, the throw silently nulled the whole section — the master switch, the
     // queue and the principal list all rendered as "no data" while looking like they had loaded.
     case "router_model_context_count":
-      return 0;
+      return modelContexts.length;
+    case "router_model_context_replace": {
+      const rows = (args.rows ?? []) as Row[];
+      for (const r of rows) {
+        const i = modelContexts.findIndex((m) => m.model_key === r.model_key);
+        if (i >= 0) modelContexts[i] = { ...r };
+        else modelContexts.push({ ...r });
+      }
+      return rows.length;
+    }
     case "capture_queue_status":
       return { ...queueStatus };
+    // The drain. Nothing is ever enqueued here — no gateway request path runs in the harness — so
+    // the queue is honestly empty rather than pretending to have work it cannot distil.
+    case "capture_claim":
+      return [];
+    case "capture_complete":
+    case "capture_release":
+      return false;
+    case "capture_requeue_stale":
+      return 0;
     case "capture_purge_finished":
       return 0;
     case "gateway_memory_enabled":
@@ -1315,6 +1405,106 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return { l0_expired: 0, l0_ring: 0, decayed: 0 };
     case "gateway_prune_live_context":
       return { turns_by_count: 0, turns_by_age: 0, sessions_reaped: 0 };
+
+    // ---- gateway listener and its keys (R4) ----
+    case "gateway_enable": {
+      const port = Number(args.port) || 8787;
+      Object.assign(gatewayStatus, { running: true, port });
+      return port; // the command answers with the port it bound
+    }
+    case "gateway_disable":
+      gatewayStatus.running = false;
+      return null;
+    case "gateway_key_generate":
+      gatewayStatus.hasKey = true;
+      return null;
+    case "gateway_key_copy":
+      return null; // clipboard side effect; the screen only reports success
+    case "gateway_key_revoke":
+      gatewayStatus.hasKey = false;
+      return null;
+    case "gateway_app_keys":
+      return appKeys.map((k) => ({ ...k }));
+    case "gateway_app_key_create": {
+      const label = String(args.label ?? "untitled");
+      // Only {id, label} come back: the secret is generated and copied host-side and never
+      // enters the webview (R4).
+      const row = {
+        id: `ak-${appKeys.length + 1}`,
+        label,
+        createdAt: Date.now(),
+        lastUsedAt: null,
+        revokedAt: null,
+      };
+      appKeys.push(row);
+      return { id: row.id, label };
+    }
+    case "gateway_app_key_revoke": {
+      const row = appKeys.find((k) => k.id === args.id);
+      // Mirrors persist.rs: revoking a key that is missing or already revoked reports, rather
+      // than silently succeeding.
+      if (!row || row.revokedAt) throw new Error("gateway key not found or already revoked");
+      row.revokedAt = Date.now();
+      return null;
+    }
+    case "gateway_app_key_delete": {
+      // A hard delete, unlike revoke: no error when the row is already gone.
+      const i = appKeys.findIndex((k) => k.id === args.id);
+      if (i >= 0) appKeys.splice(i, 1);
+      return null;
+    }
+    case "gateway_spend_status":
+      return { ...spendStatus };
+    case "gateway_spend_cap_set": {
+      // Negative is clamped to 0, and 0 means "no cap" — which is also why `capped` is false then.
+      spendStatus.capMicros = Math.max(0, Number(args.capMicros) || 0);
+      spendStatus.capped = spendStatus.capMicros > 0 && spendStatus.monthMicros >= spendStatus.capMicros;
+      return null;
+    }
+
+    // ---- gateway tools (audit H1b) ----
+    case "get_tools_enabled":
+      return toolsState.enabled;
+    case "set_tools_enabled":
+      toolsState.enabled = Boolean(args.enabled);
+      return null;
+    case "get_tools_mutation_enabled":
+      return toolsState.mutationEnabled;
+    case "set_tools_mutation_enabled":
+      toolsState.mutationEnabled = Boolean(args.enabled);
+      return null;
+    case "gateway_tool_calls":
+      return null;
+    case "gateway_tool_run":
+      return { ...toolRunResult };
+    case "gateway_usage":
+      return null;
+    // Reported host-side because the worker window is never visible — without this the only
+    // symptom of a dead worker is a gateway that stops answering.
+    case "gateway_worker_error":
+      gatewayStatus.workerError = String(args.message ?? "");
+      return null;
+
+    // ---- workbuddy: the client the router publishes models into ----
+    case "workbuddy_status":
+      return {
+        published: [...workbuddy.published],
+        path: workbuddy.path,
+        endpoint: workbuddy.endpoint,
+        clientPresent: workbuddy.clientPresent,
+      };
+    case "workbuddy_set_models": {
+      const models = (args.models ?? []) as string[];
+      workbuddy.published = [...models];
+      return {
+        path: workbuddy.path,
+        endpoint: workbuddy.endpoint,
+        models: [...models],
+        updated: models.length,
+        removed: 0,
+        note: null,
+      };
+    }
     case "crash_count":
       return 0;
     case "crash_list":
@@ -1350,6 +1540,13 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 
     default:
       // Unknown commands must reject, exactly as Rust would, so a typo can't pass silently.
+      //
+      // They are also *recorded*, because rejecting is not enough. Screens load several commands
+      // in one `Promise.all(...).catch(() => undefined)`: the rejection is swallowed, every value
+      // in the batch stays null, and the section renders as though it had loaded with nothing to
+      // report. `router_model_context_count` was missing for the whole memory feature and no test
+      // failed. `unknownCommands` turns that silence into an assertion.
+      unknownCommands.push(cmd);
       throw new Error(`web-test shim: unknown command "${cmd}"`);
   }
 }
