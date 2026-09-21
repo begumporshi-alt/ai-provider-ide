@@ -29,6 +29,7 @@ const NAV_LABELS = [
   "Skills",
   "Agents",
   "Memory",
+  "Control",
   "Router Settings",
   "Local Gateway",
 ];
@@ -99,7 +100,7 @@ test("smoke: memory renders without an uncaught error when rows are present", as
     await host.invoke("memory_capture", {
       layer: "L1",
       text: "Tushu lives in Dhaka, which is GMT+6",
-      session_id: "s1",
+      sessionId: "s1",
       subject: null,
       pinned: false,
     });

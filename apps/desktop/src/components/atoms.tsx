@@ -71,10 +71,19 @@ export function EmptyState({ title, action }: { title: string; action?: ReactNod
 }
 
 export function Button({
-  children, onClick, disabled, variant = "default", type = "button",
+  children, onClick, disabled, variant = "default", type = "button", ariaLabel,
 }: {
   children: ReactNode; onClick?: () => void; disabled?: boolean;
   variant?: "default" | "primary" | "danger" | "ghost"; type?: "button" | "submit";
+  /**
+   * Overrides the accessible name when the visible text is not unique on the screen.
+   *
+   * Two cards that each render a button reading "Refresh" are ambiguous to a screen reader, not only to
+   * a test selector — the name is what a user hears with no way to see which card they are in. The label
+   * must still *contain* the visible text (WCAG 2.5.3 Label in Name), so "Refresh drift history" rather
+   * than "Reload".
+   */
+  ariaLabel?: string;
 }) {
   const styles: Record<string, React.CSSProperties> = {
     default: { background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text)" },
@@ -85,6 +94,7 @@ export function Button({
   return (
     <button
       type={type}
+      aria-label={ariaLabel}
       onClick={onClick}
       disabled={disabled}
       style={styles[variant]}

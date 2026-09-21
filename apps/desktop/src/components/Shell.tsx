@@ -25,6 +25,7 @@ const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
   {
     group: "System",
     items: [
+      { id: "control", label: "Control" },
       { id: "settings", label: "Router Settings" },
       { id: "gateway", label: "Local Gateway" },
     ],

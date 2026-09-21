@@ -277,8 +277,11 @@ describe("clampConcurrency", () => {
 
   it("falls back to the default for input that is not a number at all", () => {
     // `Number(null)` is 0, which would silently become "unlimited" — a missing setting must
-    // not read as a deliberate removal of the cap.
-    for (const v of [NaN, Infinity, undefined, null, "four", {}, [], true]) {
+    // not read as a deliberate removal of the cap. `""` has exactly the same shape, and it is what
+    // a text field produces when the user clears it, so it is the one that reaches a real user:
+    // hence the explicit `value.trim() !== ""` guard in `clampConcurrency`. Whitespace-only is the
+    // same input as far as a person is concerned.
+    for (const v of [NaN, Infinity, undefined, null, "four", "", " ", "   ", {}, [], true]) {
       expect(clampConcurrency(v)).toBe(PER_PROVIDER_DEFAULT);
     }
   });

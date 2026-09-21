@@ -297,10 +297,17 @@ test("config: basic settings are persisted", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Router Settings" })).toBeVisible({ timeout: 10_000 });
 });
 
-test("router settings: the per-provider cap is persisted, bounded, and 0 means unlimited", async ({ page }) => {
+/** Nav → Control → one tab. Control is where the cross-cutting switches live. */
+async function openControlTab(page: Page, tab: string): Promise<void> {
+  await page.getByRole("button", { name: "Control" }).click();
+  await expect(page.getByRole("heading", { name: "Control" })).toBeVisible({ timeout: 10_000 });
+  // `tab`, not `button`: the Findings list renders jump buttons labelled with tab names too.
+  await page.getByRole("tab", { name: tab }).click();
+}
+
+test("control → routing: the per-provider cap is persisted, bounded, and 0 means unlimited", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
-  await page.getByRole("button", { name: "Settings" }).click();
-  await expect(page.getByRole("heading", { name: "Router Settings" })).toBeVisible({ timeout: 10_000 });
+  await openControlTab(page, "Routing");
 
   const cap = page.getByLabel("in-flight requests per provider");
   await expect(cap).toHaveValue("4");
@@ -316,13 +323,19 @@ test("router settings: the per-provider cap is persisted, bounded, and 0 means u
   await cap.blur();
   await expect(cap).toHaveValue("4");
 
+  // An emptied field is the same trap by a second route: `Number("")` is 0, and 0 here means
+  // unlimited. Clearing the box must not quietly remove the cap.
+  await cap.fill("");
+  await cap.blur();
+  await expect(cap).toHaveValue("4");
+
   await cap.fill("2");
   await cap.blur();
   await expect(cap).toHaveValue("2");
 
   // Reload: only what was actually saved comes back.
   await page.goto(`${APP}?seed=systemai`);
-  await page.getByRole("button", { name: "Settings" }).click();
+  await openControlTab(page, "Routing");
   await expect(page.getByLabel("in-flight requests per provider")).toHaveValue("2");
 
   // 0 is a real setting, not a missing one — and it must say so, or the screen implies a cap.
@@ -331,6 +344,65 @@ test("router settings: the per-provider cap is persisted, bounded, and 0 means u
   await expect(cap).toHaveValue("0");
   // Exact: the hint above the field also contains the word, so a substring match is ambiguous.
   await expect(page.getByText("unlimited", { exact: true })).toBeVisible();
+});
+
+/** The persisted `gateway` row, as the host would restore it at launch. */
+async function readGatewayRow(page: Page): Promise<Record<string, unknown>> {
+  const raw = await page.evaluate(() =>
+    (
+      window as unknown as { __webTest: { store: { settings: (k: string) => string | null } } }
+    ).__webTest.store.settings("gateway"),
+  );
+  return JSON.parse(raw ?? "{}") as Record<string, unknown>;
+}
+
+test("control → gateway: the switch starts the gateway without erasing the rest of the row", async ({
+  page,
+}) => {
+  await page.goto(`${APP}?seed=systemai`);
+
+  /*
+   * Pre-seed the row the way a previous session would have left it, with the tool switches already
+   * in it. `settings_set` is a whole-row UPSERT, so the hazard this arranges is a writer that
+   * serialises only the keys it knows about: it would erase these two, silently, and nothing would
+   * say so until the next launch. The argument name is the *Rust-side* one — this call goes
+   * straight at the command table, not through the UI's `toRustArgs`.
+   */
+  await page.evaluate(() =>
+    (
+      window as unknown as { __webTest: { invoke: (c: string, a: Record<string, unknown>) => unknown } }
+    ).__webTest.invoke("settings_set", {
+      key: "gateway",
+      value_json: JSON.stringify({ port: 8787, toolsEnabled: true, mutationEnabled: true }),
+    }),
+  );
+
+  await openControlTab(page, "Gateway");
+
+  const sw = page.getByRole("switch", { name: "Gateway" });
+  await expect(sw).toHaveAttribute("aria-checked", "false");
+  await expect(page.getByText("Stopped", { exact: true })).toBeVisible();
+
+  // Wait for the persisted row to have been read before typing. The field is seeded
+  // asynchronously, so a `fill` that raced the seed would be overwritten by it — and the assertion
+  // below would then pass against 8787, the value the fallback would print anyway.
+  const port = page.getByLabel("Gateway port");
+  await expect(port).not.toHaveValue("");
+  await port.fill("8899");
+  await sw.click();
+
+  await expect(sw).toHaveAttribute("aria-checked", "true");
+  await expect(page.getByText("Running", { exact: true })).toBeVisible();
+
+  const row = await readGatewayRow(page);
+  expect(row).toMatchObject({ port: 8899, enabled: true });
+  // The clobber guard: a writer that sent `{port, enabled}` alone loses these two.
+  expect(row).toMatchObject({ toolsEnabled: true, mutationEnabled: true });
+
+  // Reload: the port the operator chose is the one the host restores at launch.
+  await page.goto(`${APP}?seed=systemai`);
+  await openControlTab(page, "Gateway");
+  await expect(page.getByLabel("Gateway port")).toHaveValue("8899");
 });
 
 // ---------------------------------------------------------------------------

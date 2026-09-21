@@ -6,23 +6,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
 import { Button, Field, inputCls, inputStyle } from "../components/atoms";
-
-interface GatewayStatus {
-  /** Operator intent — the gateway is supposed to be serving. Not the same as "the worker is
-   *  awake": a hidden worker's beat stops after ~8 idle minutes and revives on demand. */
-  running: boolean;
-  port: number;
-  hasKey: boolean;
-  endpointUrl: string;
-  /** R1: window hidden, gateway serving in the background. */
-  background: boolean;
-  /** The worker is awake right now rather than merely reachable. False is routine. */
-  workerAwake: boolean;
-  /** Age of the worker's last heartbeat. Distinguishes "you stopped it" from "it lapsed". */
-  heartbeatAgeMs: number;
-  /** Why the worker page failed to boot, if it did. It runs in an invisible window. */
-  workerError: string | null;
-}
+import { readGatewaySettings, type GatewayStatus } from "../store";
 
 /** Audit R4: metadata only — the secret lives in the keychain and is never returned here. */
 interface AppKey {
@@ -33,99 +17,44 @@ interface AppKey {
   revokedAt: number | null;
 }
 
-/** Audit R4: month-to-date spend vs. the cap, both in micro-USD (cap 0 = disabled). */
-interface SpendStatus {
-  monthMicros: number;
-  capMicros: number;
-  capped: boolean;
-}
-
-/** Canonical cost unit is micro-USD (see packages/router-core/src/pricing.ts). */
-function usd(micros: number): string {
-  return (micros / 1_000_000).toLocaleString(undefined, {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: micros < 10_000 ? 4 : 2,
-  });
-}
-
 export function GatewayScreen() {
   const [status, setStatus] = useState<GatewayStatus | null>(null);
-  // null = loading the persisted port; keeps the chosen port across restarts (§3.3 UX)
-  const [portInput, setPortInput] = useState<string | null>(null);
+  /**
+   * Read once, and only for the endpoint URL's fallback before the host has answered.
+   *
+   * The port is *set* on Control → Gateway now. This screen keeps a read of the same row because it
+   * is the screen that prints the URL, and printing `8787` while the live port is something else
+   * would hand out an address that does not exist.
+   */
+  const [port, setPort] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [copied, setCopied] = useState<string | null>(null);
-  // Mirrors the Rust default (GatewayCore::new) so the toggle does not flash "Disabled"
-  // for a beat before the invoke resolves.
-  const [toolsEnabled, setToolsEnabled] = useState<boolean>(true);
-  // Audit H1b: gateway mutation (write_file / run_command) is OFF by default — the gateway has
-  // no confirmation UI, unlike the Assistant. Mirrors the Rust default so it does not flash.
-  const [mutationEnabled, setMutationEnabled] = useState<boolean>(false);
   // R4
   const [appKeys, setAppKeys] = useState<AppKey[]>([]);
   const [newKeyLabel, setNewKeyLabel] = useState("");
-  const [spend, setSpend] = useState<SpendStatus | null>(null);
-  const [capInput, setCapInput] = useState("");
   // R1: closing the window hides the app instead of quitting, so the gateway keeps serving.
   // Persisted under settings key "background"; defaults ON (that is the point of the feature).
   const [hideOnClose, setHideOnClose] = useState<boolean | null>(null);
 
   const refresh = useCallback(() => {
     invoke<GatewayStatus>("gateway_status").then(setStatus).catch((e) => setError(String(e)));
-    invoke<boolean>("get_tools_enabled").then(setToolsEnabled).catch(() => {});
-    invoke<boolean>("get_tools_mutation_enabled").then(setMutationEnabled).catch(() => {});
   }, []);
 
   const refreshKeys = useCallback(() => {
     invoke<AppKey[]>("gateway_app_keys").then(setAppKeys).catch((e) => setError(String(e)));
   }, []);
-  const refreshSpend = useCallback(() => {
-    invoke<SpendStatus>("gateway_spend_status")
-      .then((s) => {
-        setSpend(s);
-        // Mirror the persisted cap into the field. Only runs on mount and after a save, so it
-        // cannot clobber an in-progress edit.
-        setCapInput(s.capMicros > 0 ? String(s.capMicros / 1_000_000) : "");
-      })
-      .catch((e) => setError(String(e)));
-  }, []);
   useEffect(() => {
     refresh();
     refreshKeys();
-    refreshSpend();
-    invoke<string | null>("settings_get", { key: "gateway" })
-      .then((v) => {
-        const p = v ? (JSON.parse(v) as { port?: number }).port : undefined;
-        setPortInput(String(p ?? 8787));
-      })
-      .catch(() => setPortInput("8787"));
+    readGatewaySettings()
+      .then((s) => setPort(s.port ?? 8787))
+      .catch(() => setPort(8787));
     invoke<string | null>("settings_get", { key: "background" })
       .then((v) => setHideOnClose(v ? (JSON.parse(v) as { hideOnClose?: boolean }).hideOnClose ?? true : true))
       .catch(() => setHideOnClose(true));
     const t = window.setInterval(refresh, 2500);
     return () => window.clearInterval(t);
-  }, [refresh, refreshKeys, refreshSpend]);
-
-  async function toggle() {
-    setError(null);
-    try {
-      if (status?.running) {
-        await invoke("gateway_disable");
-        // Persist the off state too: "enabled" is what startup restores, so leaving a stale
-        // `true` behind would start the gateway again on the next launch.
-        const port = Number(portInput) || undefined;
-        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port, enabled: false }) });
-      } else {
-        const port = Number(portInput) || undefined;
-        await invoke("gateway_enable", { port });
-        await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify({ port, enabled: true }) });
-        if (!status?.hasKey) await invoke("gateway_key_generate");
-      }
-      refresh();
-    } catch (e) {
-      setError(String(e)); // invariant 16: port-squat surfaces here, loudly
-    }
-  }
+  }, [refresh, refreshKeys]);
 
   /**
    * R4: the secret is generated and copied host-side (Rust arboard) and never enters the
@@ -176,45 +105,6 @@ export function GatewayScreen() {
     }
   }
 
-  /** `override` bypasses the text field (Disable button) — setState is async, so the field
-   *  value cannot be read back in the same tick. */
-  async function saveCap(override?: number) {
-    setError(null);
-    const micros =
-      override ??
-      (() => {
-        const usdValue = Number(capInput);
-        if (capInput.trim() === "" || !Number.isFinite(usdValue)) return 0;
-        return Math.max(0, Math.round(usdValue * 1_000_000));
-      })();
-    try {
-      await invoke("gateway_spend_cap_set", { capMicros: micros });
-      refreshSpend();
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function toggleTools() {
-    setError(null);
-    try {
-      await invoke("set_tools_enabled", { enabled: !toolsEnabled });
-      setToolsEnabled((prev) => !prev);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
-  async function toggleMutation() {
-    setError(null);
-    try {
-      await invoke("set_tools_mutation_enabled", { enabled: !mutationEnabled });
-      setMutationEnabled((prev) => !prev);
-    } catch (e) {
-      setError(String(e));
-    }
-  }
-
   async function copy(text: string, label: string) {
     await navigator.clipboard.writeText(text).catch(() => undefined);
     flash(label);
@@ -226,7 +116,7 @@ export function GatewayScreen() {
   }
 
   const running = status?.running ?? false;
-  const endpoint = status?.endpointUrl ?? `http://127.0.0.1:${portInput || 8787}/v1`;
+  const endpoint = status?.endpointUrl ?? `http://127.0.0.1:${port ?? 8787}/v1`;
 
   return (
     <div className="mx-auto max-w-2xl">
@@ -238,47 +128,24 @@ export function GatewayScreen() {
       </p>
 
       <section className="rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        {/*
+          State, not control. Starting and stopping the gateway, and choosing its port, live on
+          Control → Gateway (§3: move, don't mirror) — a switch rendered in two places has two
+          sources of truth, and they drift. What stays here is the *read*: this is the screen that
+          prints the endpoint URL, so it has to say whether that URL answers.
+        */}
         <div className="mb-3 flex items-center gap-3">
           <span className={`inline-block h-2.5 w-2.5 rounded-full ${running ? "dot-healthy" : "dot-disabled"}`} />
           <span className="text-[14px] font-semibold">{running ? "Running" : "Stopped"}</span>
-          <div className="ml-auto flex items-center gap-2">
-            <input
-              className={`${inputCls} w-24`}
-              style={inputStyle}
-              value={portInput ?? ""}
-              onChange={(e) => setPortInput(e.target.value.replace(/\D/g, ""))}
-              disabled={running || portInput === null}
-              inputMode="numeric"
-            />
-            <Button variant={running ? "danger" : "primary"} onClick={() => void toggle()}>
-              {running ? "Stop" : "Start"}
-            </Button>
-          </div>
+          {status?.workerError && (
+            <span className="text-[11px]" style={{ color: "var(--danger)" }}>
+              · the worker failed to start — the error is on Control
+            </span>
+          )}
+          <span className="ml-auto text-[11px]" style={{ color: "var(--text-faint)" }}>
+            Start, stop and port are on <b>Control → Gateway</b>
+          </span>
         </div>
-
-        {status?.workerError && (
-          <div className="mb-3 rounded border p-2.5" style={{ borderColor: "var(--danger)", background: "var(--danger-soft, transparent)" }}>
-            <p className="text-[12px] font-medium" style={{ color: "var(--danger)" }}>
-              The gateway worker failed to start, so nothing can answer requests.
-            </p>
-            <pre className="mono mt-1.5 max-h-40 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-faint)" }}>
-              {status.workerError}
-            </pre>
-          </div>
-        )}
-
-        {running && status && !status.workerAwake && !status.workerError && (
-          <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Running — the worker is asleep. macOS suspends a hidden page after roughly eight idle
-            minutes; the next request wakes it and is served normally. Nothing is lost.
-          </p>
-        )}
-
-        {!running && status && !status.workerError && status.heartbeatAgeMs > 0 && (
-          <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Stopped — last heard from the worker {Math.round(status.heartbeatAgeMs / 1000)}s ago.
-          </p>
-        )}
 
         <div className="mb-2">
           <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Endpoint URL</span>
@@ -292,7 +159,7 @@ export function GatewayScreen() {
           <div>
             <span className="text-[13px]">Master key</span>
             <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              {status?.hasKey ? "Stored in your OS keychain. Shown once on generation; reveal = copy to clipboard (never shown here)." : "None yet — starting the gateway generates one."}
+              {status?.hasKey ? "Stored in your OS keychain. Shown once on generation; reveal = copy to clipboard (never shown here)." : "None yet — starting the gateway on Control generates one."}
             </p>
           </div>
           <div className="flex gap-2">
@@ -311,11 +178,6 @@ export function GatewayScreen() {
         {error && (
           <div className="mt-3 rounded border px-3 py-2 text-[12px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
             {error}
-            {/cannot bind/.test(error) && (
-              <div className="mt-1" style={{ color: "var(--text-dim)" }}>
-                Another process owns that port. Pick a different port above and press Start. Note: the default 8787 is fixed so app URLs stay predictable — a local process could squat it (documented v1 trade-off).
-              </div>
-            )}
           </div>
         )}
       </section>
@@ -405,51 +267,6 @@ export function GatewayScreen() {
       </section>
 
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        <h2 className="mb-1 text-[14px] font-semibold">Monthly spend cap</h2>
-        <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          Stops a runaway consumer — an agent loop in a connected IDE — from spending past a budget. Month-to-date is
-          measured from the ledger at the UTC month boundary and counts <b>all</b> router usage (Assistant and generator
-          included), not just gateway traffic, so it is a real ceiling on what you pay. When it is reached the gateway
-          answers 402 instead of forwarding. Leave blank to disable.
-        </p>
-
-        <div className="mb-3 flex items-center gap-4">
-          <div>
-            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>This month</span>
-            <span className="mono text-[15px] font-semibold" style={{ color: spend?.capped ? "var(--danger)" : "var(--text)" }}>
-              {spend ? usd(spend.monthMicros) : "—"}
-            </span>
-          </div>
-          <div>
-            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Cap (USD)</span>
-            <div className="flex items-center gap-2">
-              <input
-                className={`${inputCls} w-28`}
-                style={inputStyle}
-                value={capInput}
-                placeholder="none"
-                inputMode="decimal"
-                onChange={(e) => setCapInput(e.target.value.replace(/[^\d.]/g, ""))}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") void saveCap();
-                }}
-              />
-              <Button onClick={() => void saveCap()}>{spend?.capMicros ? "Update" : "Set cap"}</Button>
-              {spend?.capMicros ? (
-                <Button variant="ghost" onClick={() => { setCapInput(""); void saveCap(0); }}>Disable</Button>
-              ) : null}
-            </div>
-          </div>
-        </div>
-
-        {spend?.capped && (
-          <div className="rounded border px-3 py-2 text-[12px]" style={{ borderColor: "var(--danger)", color: "var(--danger)" }}>
-            Cap reached — the gateway is refusing requests with 402 until the month rolls over or you raise the cap.
-          </div>
-        )}
-      </section>
-
-      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
         <h2 className="mb-2 text-[14px] font-semibold">Copy-paste presets</h2>
         <PresetRow
           label="openai-python"
@@ -503,47 +320,17 @@ export function GatewayScreen() {
         </ul>
       </section>
 
-      <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        <h2 className="mb-2 text-[14px] font-semibold">Feature toggles</h2>
-        <div className="flex items-center justify-between">
-          <div>
-            <span className="text-[13px] font-medium">Gateway tools</span>
-            <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              On (default): a client that brings its own <code className="mono">tools</code> has them forwarded
-              upstream and runs them itself; a client that brings none gets the gateway&apos;s own sandboxed
-              tools, confined to <span className="mono">~/AI-Provider-Router-Workspace</span>. Off strips
-              <code className="mono">tools</code>, <code className="mono">tool_choice</code> and
-              <code className="mono">response_format</code> from every request.
-            </p>
-          </div>
-          <Button
-            variant={toolsEnabled ? "primary" : "ghost"}
-            onClick={() => void toggleTools()}
-          >
-            {toolsEnabled ? "Enabled" : "Disabled"}
-          </Button>
-        </div>
-
-        <div className="mt-3 flex items-center justify-between border-t pt-3" style={{ borderColor: "var(--border)" }}>
-          <div>
-            <span className="text-[13px] font-medium">Gateway writes &amp; commands</span>
-            <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              Off (default): the gateway&apos;s sandbox serves the four read-only tools — <code className="mono">read_file</code>,
-              <code className="mono">list_dir</code>, <code className="mono">search_files</code>, <code className="mono">file_info</code> — and refuses
-              <code className="mono">write_file</code>, <code className="mono">edit_file</code>, <code className="mono">mkdir</code> and
-              <code className="mono">run_command</code>. The Assistant asks before every call,
-              the gateway cannot — there is no UI on that path — so mutation is opt-in. Every gateway tool
-              execution is written to <span className="mono">gateway.log</span> either way.
-            </p>
-          </div>
-          <Button
-            variant={mutationEnabled ? "primary" : "ghost"}
-            onClick={() => void toggleMutation()}
-          >
-            {mutationEnabled ? "Enabled" : "Disabled"}
-          </Button>
-        </div>
-      </section>
+      {/*
+        Pointers, not copies. Every switch that used to be on this screen now lives on Control, for
+        the same reason this screen's own copy gives about per-app keys: a value rendered in two
+        places has two sources of truth, and they drift. What is left here is the per-*thing* half —
+        the master key, the per-app keys, the endpoint, and the snippets you paste into a client.
+      */}
+      <p className="mt-4 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        The gateway's on/off switch, its port and the monthly spend cap now live on the{" "}
+        <b>Control</b> screen under <b>Gateway</b>; the tool switches — including writes and
+        commands — are under <b>Tools</b>, where they persist across restarts.
+      </p>
     </div>
   );
 }

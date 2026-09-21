@@ -2,7 +2,7 @@
  * AI-Provider Router — app root. Bootstraps the core from the host, then routes screens.
  */
 import { useEffect, useState } from "react";
-import { bootstrap, systemAiModel } from "./store";
+import { applyPersistedGatewaySwitches, bootstrap, systemAiModel } from "./store";
 import { startCaptureDrain, stopCaptureDrain } from "./lib/memory/drain";
 import { startRetention, stopRetention } from "./lib/memory/retention";
 import { useUi } from "./ui-state";
@@ -18,6 +18,7 @@ import { AgentsScreen } from "./screens/Agents";
 import { MemoryScreen } from "./screens/Memory";
 import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
+import { ControlScreen } from "./screens/Control";
 import { OnboardingScreen } from "./screens/Onboarding";
 
 export default function App() {
@@ -54,6 +55,15 @@ export default function App() {
     return stopRetention;
   }, [ready]);
 
+  // Persisted gateway tool switches (§6 must-have 5). The core holds them as in-memory atomics, so
+  // they have to be pushed back in at startup or they silently reset to their compiled-in defaults
+  // every launch — and Control would then report a state the core is not in, which is what §4.5
+  // forbids. Best-effort: a failure here must not stop the UI from opening.
+  useEffect(() => {
+    if (!ready) return;
+    void applyPersistedGatewaySwitches().catch(() => undefined);
+  }, [ready]);
+
   if (bootError) {
     return (
       <div className="flex h-full items-center justify-center p-8">
@@ -84,6 +94,7 @@ export default function App() {
       {screen === "memory" && <MemoryScreen />}
       {screen === "settings" && <SettingsScreen />}
       {screen === "gateway" && <GatewayScreen />}
+      {screen === "control" && <ControlScreen />}
       {screen === "onboarding" && <OnboardingScreen />}
     </Shell>
   );

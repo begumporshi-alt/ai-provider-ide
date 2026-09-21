@@ -4,7 +4,7 @@
  */
 import { create } from "zustand";
 
-export type ScreenId = "providers" | "models" | "assistant" | "activity" | "context" | "history" | "skills" | "agents" | "memory" | "settings" | "gateway" | "onboarding";
+export type ScreenId = "providers" | "models" | "assistant" | "activity" | "context" | "history" | "skills" | "agents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
 interface UiState {
   screen: ScreenId;
