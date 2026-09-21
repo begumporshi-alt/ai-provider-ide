@@ -107,11 +107,15 @@ export async function rememberTurn(
   sinceDistil += 1;
   try {
     await captureMemories([
-      { layer: "L0", text: userText, sessionId, subject: "user" },
-      { layer: "L0", text: assistantText, sessionId, subject: "assistant" },
+      { layer: "L0", text: userText, session_id: sessionId, subject: "user" },
+      { layer: "L0", text: assistantText, session_id: sessionId, subject: "assistant" },
     ]);
-  } catch {
-    // Intentionally swallowed — see the note above.
+  } catch (err) {
+    // Intentionally swallowed — a memory write must never fail a chat (see above). But *logged*:
+    // `MemoryInput` is `deny_unknown_fields`, so a field-spelling mismatch now reaches here as a hard
+    // error rather than a silent null. Swallowing it silently is what let a NULL `session_id` go
+    // unnoticed for months; swallowing it loudly keeps the chat alive without losing the signal.
+    console.warn("[memory] L0 capture failed", err);
   }
 }
 
@@ -165,9 +169,13 @@ export async function distilTurn(
     pending.length = 0;
     sinceDistil = 0;
     return atoms;
-  } catch {
+  } catch (err) {
     // Counter and window both survive: a transient failure retries on the next turn instead of
-    // waiting another full batch, and the exchanges are not lost.
+    // waiting another full batch, and the exchanges are not lost. Logged, because a *permanent*
+    // failure — a rejected payload — retries forever and, without this, is indistinguishable from a
+    // clean run. The control flow is deliberately unchanged: retrying is still the right answer for
+    // the transient case, which is the common one.
+    console.warn("[memory] distillation failed; window retained for retry", err);
     return [];
   }
 }
@@ -193,7 +201,9 @@ async function distillAndStore(
   const reply = await (generate ?? defaultGenerator)(model, `${DISTIL_PROMPT}${script}`);
   const atoms = parseAtoms(reply);
   if (atoms.length === 0) return [];
-  await captureMemories(atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, sessionId })));
+  await captureMemories(
+    atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, session_id: sessionId })),
+  );
   // Scenarios ride along with the atoms that produced them — fire-and-forget, so a slow or
   // failing second call never delays what the user is reading.
   void distilScenarios(sessionId, model, generate);
@@ -280,13 +290,15 @@ export async function distilScenarios(
       scenarios.map((s) => ({
         layer: "L2" as MemoryLayer,
         text: s.text,
-        sessionId,
+        session_id: sessionId,
         subject: s.subject,
       })),
     );
     return scenarios.length;
-  } catch {
-    // Roll the cursor back so the next pass retries the same atoms.
+  } catch (err) {
+    // Roll the cursor back so the next pass retries the same atoms. Logged for the same reason as
+    // the L0 path above: a rejected payload must not look identical to a clean run.
+    console.warn("[memory] L2 scenario capture failed", err);
     lastScenarioAt.set(sessionId, seen);
     return 0;
   }

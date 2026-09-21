@@ -30,7 +30,7 @@ async function seedL1(page: Page, text: string): Promise<string> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const host = (window as any).__webTest;
     const m = await host.invoke("memory_capture", {
-      layer: "L1", text: t, session_id: "s-recall", subject: null, pinned: false,
+      layer: "L1", text: t, sessionId: "s-recall", subject: null, pinned: false,
     });
     return (m as { id: string }).id;
   }, text);

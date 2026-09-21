@@ -136,7 +136,7 @@ describe("drainOnce", () => {
 
     expect(captureMemories).toHaveBeenCalledTimes(1);
     const items = captureMemories.mock.calls[0]![0];
-    expect(items[0]).toMatchObject({ layer: "L1", text: "Uses Postgres", sessionId: "s-42" });
+    expect(items[0]).toMatchObject({ layer: "L1", text: "Uses Postgres", session_id: "s-42" });
     // The row carries a project scope, and the drain must not apply it: an atom becomes injectable
     // only when someone scopes it on purpose (§4b).
     expect(assignScope).not.toHaveBeenCalled();

@@ -45,16 +45,16 @@ async function seedMemories(page: Page): Promise<void> {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const host = (window as any).__webTest;
     await host.invoke("memory_capture", {
-      layer: "L0", text: "what timezone are you in?", session_id: "s1", subject: "user", pinned: false,
+      layer: "L0", text: "what timezone are you in?", sessionId: "s1", subject: "user", pinned: false,
     });
     await host.invoke("memory_capture", {
-      layer: "L1", text: "Tushu lives in Dhaka, which is GMT+6", session_id: "s1", subject: null, pinned: false,
+      layer: "L1", text: "Tushu lives in Dhaka, which is GMT+6", sessionId: "s1", subject: null, pinned: false,
     });
     await host.invoke("memory_capture", {
-      layer: "L1", text: "Prefers answers that lead with the conclusion", session_id: "s1", subject: null, pinned: false,
+      layer: "L1", text: "Prefers answers that lead with the conclusion", sessionId: "s1", subject: null, pinned: false,
     });
     await host.invoke("memory_capture", {
-      layer: "L3", text: "Works on the AI-Provider Router desktop app", session_id: "s1", subject: null, pinned: false,
+      layer: "L3", text: "Works on the AI-Provider Router desktop app", sessionId: "s1", subject: null, pinned: false,
     });
   });
 }
@@ -310,14 +310,77 @@ test("memory: pinned L3 rows survive a recall that did not rank them", async ({ 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const host = (window as any).__webTest;
     // L1 atoms that will dominate the BM25 ranking
-    await host.invoke("memory_capture", { layer: "L1", text: "Router gateway listens on 8787", session_id: "s1", subject: null, pinned: false });
-    await host.invoke("memory_capture", { layer: "L1", text: "Workspace root must be set before agent mode", session_id: "s1", subject: null, pinned: false });
+    await host.invoke("memory_capture", { layer: "L1", text: "Router gateway listens on 8787", sessionId: "s1", subject: null, pinned: false });
+    await host.invoke("memory_capture", { layer: "L1", text: "Workspace root must be set before agent mode", sessionId: "s1", subject: null, pinned: false });
     // A pinned L3 that shares no words with the query — pinned must still surface it.
-    await host.invoke("memory_capture", { layer: "L3", text: "Building a Tauri app", session_id: null, subject: null, pinned: true });
+    await host.invoke("memory_capture", { layer: "L3", text: "Building a Tauri app", sessionId: null, subject: null, pinned: true });
   });
   await page.getByRole("button", { name: "Memory", exact: true }).click();
 
   // The L3 fact shows in the Core profile section even when the L1 filter is selected.
   await page.getByRole("button", { name: "L1 atoms" }).click();
   await expect(page.getByText("Building a Tauri app")).toBeVisible();
+});
+
+/**
+ * The batched write path — `rememberTurn`'s route into the host, and the one this file had no
+ * coverage for at all.
+ *
+ * That gap is not incidental. `memory_capture_batch` is the *only* path that had the serde
+ * field-spelling bug, and it survived for months precisely because nothing here exercised it: the
+ * single-capture path was covered and correct, so hand-testing the screen looked fine while every
+ * batched capture stored a NULL session.
+ *
+ * Both halves matter. The first pins the working spelling. The second pins that a wrong one is
+ * *rejected* — `MemoryInput` declares `deny_unknown_fields` and the shim mirrors it, so a camelCase
+ * key is a hard error naming the offending key rather than the silent null that started all this.
+ */
+test("memory: batched capture keeps the session id, and a camelCase key is rejected", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  const outcome = await page.evaluate(async () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const host = (window as any).__webTest;
+    await host.invoke("memory_capture_batch", {
+      items: [
+        {
+          layer: "L1",
+          text: "batch path keeps its session",
+          session_id: "s-batch",
+          subject: null,
+          pinned: false,
+        },
+      ],
+    });
+    let camelError: string | null = null;
+    try {
+      await host.invoke("memory_capture_batch", {
+        items: [
+          {
+            layer: "L1",
+            text: "camel key must never land",
+            sessionId: "s-batch",
+            subject: null,
+            pinned: false,
+          },
+        ],
+      });
+    } catch (e) {
+      camelError = String((e as Error)?.message ?? e);
+    }
+    return { camelError };
+  });
+
+  const rows = await store<Array<MemoryRow & { session_id: string | null }>>(page, "memories");
+  const written = rows.filter((r) => r.text === "batch path keeps its session");
+  expect(written).toHaveLength(1);
+  expect(written[0]!.session_id).toBe("s-batch");
+
+  // Refused, and refused loudly — the message names the key so the fix is obvious.
+  expect(
+    outcome.camelError,
+    "a camelCase item key must be rejected, not silently accepted",
+  ).not.toBeNull();
+  expect(outcome.camelError).toContain("sessionId");
+  // Rejection is not a partial write: nothing from the refused payload may reach the store.
+  expect(rows.some((r) => r.text === "camel key must never land")).toBe(false);
 });

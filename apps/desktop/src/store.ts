@@ -793,8 +793,18 @@ export async function captureMemory(m: {
   });
 }
 
+/**
+ * Batched capture — the path `rememberTurn` uses.
+ *
+ * The spelling here differs from `captureMemory` above, and that is not an oversight: the two cross
+ * different boundaries. `memory_capture`'s fields are **command arguments**, which Tauri renames
+ * camelCase→snake on the way in, so `sessionId` is correct there. `items` is a **nested payload**, so
+ * serde does the mapping instead — and `MemoryInput` declares `deny_unknown_fields` with snake fields,
+ * so a camelCase key here is a hard error rather than a silent null. The two spellings differ because
+ * the two boundaries differ.
+ */
 export async function captureMemories(
-  items: Array<{ layer: MemoryLayer; text: string; sessionId?: string | null; subject?: string | null; pinned?: boolean }>,
+  items: Array<{ layer: MemoryLayer; text: string; session_id?: string | null; subject?: string | null; pinned?: boolean }>,
 ): Promise<number> {
   if (items.length === 0) return 0;
   return invoke<number>("memory_capture_batch", { items });
@@ -1002,6 +1012,250 @@ export async function gatewayMemoryEnabled(): Promise<boolean> {
 
 export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean> {
   return invoke<boolean>("gateway_set_memory_enabled", { enabled });
+}
+
+// ---------- Control screen: observability + cross-cutting switches ----------
+
+/**
+ * `gateway_status`. Defined once and imported by both the Local Gateway screen and Control — two
+ * copies of a ten-field DTO drift, and then the switchboard lies about the system state.
+ */
+export interface GatewayStatus {
+  /** Operator intent — the gateway is supposed to be serving. Deliberately *not* "the worker is
+   *  awake": a hidden worker's beat stops after ~8 idle minutes and revives on demand. */
+  running: boolean;
+  port: number;
+  hasKey: boolean;
+  endpointUrl: string;
+  /** R1: the window is hidden and the gateway is serving in the background. */
+  background: boolean;
+  /** The worker is awake right now rather than merely reachable. False here is routine. */
+  workerAwake: boolean;
+  /** Age of the worker's last heartbeat. Distinguishes "you stopped it" from "it lapsed". */
+  heartbeatAgeMs: number;
+  /** Why the worker page failed to boot, if it did. It runs in an invisible window. */
+  workerError: string | null;
+}
+
+/** Month-to-date spend vs. the cap, both in micro-USD (cap 0 = disabled). */
+export interface GatewaySpendStatus {
+  monthMicros: number;
+  capMicros: number;
+  capped: boolean;
+}
+
+export async function gatewayStatus(): Promise<GatewayStatus> {
+  return invoke<GatewayStatus>("gateway_status");
+}
+
+export async function gatewaySpendStatus(): Promise<GatewaySpendStatus> {
+  return invoke<GatewaySpendStatus>("gateway_spend_status");
+}
+
+
+/**
+ * One request's memory outcome, as reported by `gateway_injection_stats`.
+ *
+ * Carries scope and counts, **never memory text**: the injected block is already in the prompt, and
+ * duplicating it into a diagnostic buffer would add exposure for no diagnostic gain.
+ *
+ * Field names are camelCase because the Rust DTO carries `rename_all = "camelCase"`
+ * (`injection_log.rs`). A Rust spec pins that, because dropping the attribute would break this screen
+ * at runtime with no compile error anywhere to warn about it.
+ */
+export interface InjectionEvent {
+  tsMs: number;
+  /** The client-visible id (`gw-{n}`) — the string a client quotes when it reports a failure. */
+  id: string;
+  model: string;
+  scope: string;
+  injected: boolean;
+  items: number;
+  /** Live-context turns injected alongside the memory block — a different store from `items`. */
+  context: number;
+  tokens: number;
+  /** `SkipReason::as_str()`. `"injected"` on success, so one map covers both outcomes. */
+  reason: string;
+}
+
+export interface InjectionStats {
+  /** Every request recorded since launch — **not** the ring length. */
+  total: number;
+  /** Counts by reason, including `injected`. Survives ring eviction. */
+  counts: Record<string, number>;
+  /** Newest first. Bounded; the counters above are not. */
+  recent: InjectionEvent[];
+}
+
+/** What the memory layer has done since launch. In-memory, so it resets with the app. */
+export async function gatewayInjectionStats(): Promise<InjectionStats> {
+  return invoke<InjectionStats>("gateway_injection_stats");
+}
+
+/**
+ * One line of the gateway's tool audit log (`{app_data_dir}/gateway.log`).
+ *
+ * `tsMs` is null for a line the host did not stamp. `log_to_file` is called from paths that write
+ * bare lines, and those are startup evidence rather than noise, so they are kept and rendered
+ * without a time.
+ */
+export interface GatewayLogLine {
+  tsMs: number | null;
+  text: string;
+}
+
+/**
+ * The tail of the tool audit log, oldest line first.
+ *
+ * The log has been appended to since 2026-09-20 and is never rotated, so the host bounds the read at
+ * both ends: at most `limit` lines, taken from the last 128 KB. An absent log answers `[]` rather
+ * than failing — a gateway that has never run has nothing to report, and the screen must not show
+ * that as an error.
+ */
+export async function gatewayLogTail(limit?: number): Promise<GatewayLogLine[]> {
+  return invoke<GatewayLogLine[]>("gateway_log_tail", { limit: limit ?? null });
+}
+
+/**
+ * One recorded AI generation — an adapter the assistant wrote for us.
+ *
+ * The trail exists so "an AI wrote the code that routes my traffic" is answerable: which model, how
+ * much text, and a hash of the redacted prompt.
+ *
+ * Two things this type is deliberately honest about:
+ * - **`promptTokens` / `completionTokens` are estimates.** Both producers send `chars / 4`, not a
+ *   tokenizer count. The card must label them as estimates rather than presenting a precision that
+ *   was never measured.
+ * - **There is no session id.** The table has a `session_id` column, but `generator_audit_record`'s
+ *   INSERT omits it, so it is NULL on every row and nothing can join a generation back to the
+ *   onboarding session that produced it. Adding the field here would be a promise the host cannot keep.
+ */
+export interface GeneratorAuditEntry {
+  id: number;
+  tsMs: number;
+  modelUsed: string;
+  promptTokens: number;
+  completionTokens: number;
+  redactionHash: string;
+}
+
+/**
+ * The AI generation trail, newest first.
+ *
+ * Read on mount and on `tick`, not on demand: Providers is where a generation is *created* — approving a
+ * repair writes a row and bumps the tick — so a mount-only read would leave the operator looking at a
+ * trail that does not contain what they just approved. An empty table answers `[]`; a missing one cannot
+ * happen, since the schema creates it on open.
+ */
+export async function generatorAuditList(limit?: number): Promise<GeneratorAuditEntry[]> {
+  return invoke<GeneratorAuditEntry[]>("generator_audit_list", { limit: limit ?? null });
+}
+
+export interface DriftEventEntry {
+  id: number;
+  providerId: string;
+  detectedAt: number;
+  /** Raw `DriftEvidence` JSON, as the host recorded it — `{}` when the column was NULL. */
+  triggerJson: string;
+  /** `null` while the drift is open. Not "unknown": an open event is a live fact about this provider. */
+  resolution: string | null;
+  resolvedAt: number | null;
+}
+
+/**
+ * The recorded drift history, newest first.
+ *
+ * This is the reader the table never had. `drift_events` is written on every detection and every repair,
+ * and until now its only reader was the clipboard diagnostics bundle — so the history was visible solely
+ * as raw JSON pasted into a bug report. Same shape as `generatorAuditList`, and for the same reason: the
+ * two cards sit on one screen and must not disagree about what an empty trail means.
+ */
+export async function driftEventsList(limit?: number): Promise<DriftEventEntry[]> {
+  return invoke<DriftEventEntry[]>("drift_events_list", { limit: limit ?? null });
+}
+
+/**
+ * Gateway-side tool switches.
+ *
+ * `toolsEnabled` gates the gateway's sandboxed tool registry entirely; `mutationEnabled` gates only
+ * the tools that write or execute (`write_file`, `run_command`). Read-only tools stay available
+ * regardless of the second one.
+ *
+ * Both persist — see `patchGatewaySettings`. Their in-memory state read as incidental, so a reset on
+ * every launch looked like a bug rather than a policy.
+ */
+export async function gatewayToolsEnabled(): Promise<boolean> {
+  return invoke<boolean>("get_tools_enabled");
+}
+
+export async function setGatewayToolsEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_tools_enabled", { enabled });
+}
+
+export async function gatewayMutationEnabled(): Promise<boolean> {
+  return invoke<boolean>("get_tools_mutation_enabled");
+}
+
+export async function setGatewayMutationEnabled(enabled: boolean): Promise<void> {
+  await invoke("set_tools_mutation_enabled", { enabled });
+}
+
+/**
+ * The persisted `gateway` settings row: the listener plus the switch state that has to outlive a
+ * restart.
+ *
+ * Every field is optional because a row written before a field existed simply does not have it. That
+ * is the whole compatibility story — there is **no Rust struct** for this object to keep in sync.
+ * The startup restore reads it as a `serde_json::Value` and looks keys up by name
+ * (`persisted_gateway_port`, `lib.rs:77`), so adding a key is invisible to it and no `serde(default)`
+ * is involved. (The design doc originally specified one; that assumed a typed struct that does not
+ * exist.)
+ */
+export interface GatewaySettings {
+  port?: number;
+  enabled?: boolean;
+  toolsEnabled?: boolean;
+  mutationEnabled?: boolean;
+}
+
+export async function readGatewaySettings(): Promise<GatewaySettings> {
+  const raw = await invoke<string | null>("settings_get", { key: "gateway" });
+  if (!raw) return {};
+  try {
+    return JSON.parse(raw) as GatewaySettings;
+  } catch {
+    return {}; // a corrupt row must not take a screen down
+  }
+}
+
+/**
+ * Merge into the `gateway` settings row. **A merge, never a replace.**
+ *
+ * That row is one JSON object shared by unrelated concerns — the listener (`port`/`enabled`), the
+ * tool switches, and whatever is added next. A writer that serialises only the keys it happens to
+ * know about erases the rest, and the loss is invisible until the next launch. Not hypothetical: the
+ * Start/Stop handler wrote `JSON.stringify({ port, enabled })`, so adding the tool switches without
+ * this helper would have wiped them every time the gateway was restarted.
+ */
+export async function patchGatewaySettings(patch: GatewaySettings): Promise<GatewaySettings> {
+  const next = { ...(await readGatewaySettings()), ...patch };
+  await invoke("settings_set", { key: "gateway", valueJson: JSON.stringify(next) });
+  return next;
+}
+
+/**
+ * Push the persisted tool switches back into the gateway core at startup.
+ *
+ * The core holds them as in-memory atomics, so without this they silently reset to their compiled-in
+ * defaults on every launch — and Control would report a state the core is not in, which is precisely
+ * the dishonesty §4.5 forbids.
+ *
+ * Best-effort by design: a failure here must not stop the UI from opening.
+ */
+export async function applyPersistedGatewaySwitches(): Promise<void> {
+  const s = await readGatewaySettings();
+  if (typeof s.toolsEnabled === "boolean") await setGatewayToolsEnabled(s.toolsEnabled);
+  if (typeof s.mutationEnabled === "boolean") await setGatewayMutationEnabled(s.mutationEnabled);
 }
 
 /**

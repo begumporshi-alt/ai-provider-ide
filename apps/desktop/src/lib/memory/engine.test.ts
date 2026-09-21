@@ -109,7 +109,7 @@ describe("memory engine", () => {
       expect(got).toEqual(["Lives in Dhaka", "Prefers terse replies"]);
       const stored = captureMemories.mock.calls.filter((c) => (c[0][0] as { layer: string }).layer === "L1");
       expect(stored).toHaveLength(1);
-      expect(stored[0]![0][0]).toMatchObject({ layer: "L1", text: "Lives in Dhaka", sessionId: "s" });
+      expect(stored[0]![0][0]).toMatchObject({ layer: "L1", text: "Lives in Dhaka", session_id: "s" });
     });
 
     it("does not call the model until a full batch has accumulated", async () => {
@@ -203,7 +203,7 @@ describe("memory engine", () => {
         layer: "L2",
         text: "we are fixing the gateway",
         subject: "router work",
-        sessionId: "s",
+        session_id: "s",
       });
       // First pass: every atom is unseen, so the prompt contains all of them.
       const firstPrompt = generate.mock.calls[0]![1] as string;
