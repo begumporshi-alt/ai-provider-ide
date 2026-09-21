@@ -76,8 +76,8 @@ const SCOPE_NOTE =
  * gateway performs no memory reads and no writes, so behaviour is byte-identical to a build with
  * no memory layer at all. Saying that here is cheaper than having someone discover it in a log.
  */
-const CAPTURE_NOTE =
-  "Capture is off until you turn it on. With it off the gateway does nothing extra: no context is "
+const MEMORY_NOTE =
+  "The memory layer is off until you turn it on. With it off the gateway does nothing extra: no context is "
   + "injected into a request and no turn is recorded, so an agent IDE's traffic is handled exactly "
   + "as it was before this feature existed. Turning it on makes the gateway record the tail of each "
   + "plain-prose request and, off to the side, distil it into the atoms listed below.";
@@ -181,7 +181,7 @@ function PrincipalList({
   );
 }
 
-function CaptureSection({
+function MemoryLayerSection({
   tick,
   bump,
   setError,
@@ -254,22 +254,23 @@ function CaptureSection({
     <section
       className="mb-4 rounded border p-3"
       style={{ borderColor: "var(--border)", background: "var(--surface)" }}
-      data-testid="capture-section"
+      data-testid="memory-layer-section"
     >
       <div className="mb-2 flex items-baseline justify-between">
-        <h2 className="text-[13px] font-semibold">Capture</h2>
+        <h2 className="text-[13px] font-semibold">Memory layer</h2>
         <label className="flex cursor-pointer items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
           <input
             type="checkbox"
             checked={enabled ?? false}
             disabled={enabled === null}
             onChange={(e) => void doToggle(e.target.checked)}
+            aria-label="Memory layer"
           />
           {enabled ? "on" : "off"}
         </label>
       </div>
       <p className="mb-3 text-[11px] leading-relaxed" style={{ color: "var(--text-faint)" }}>
-        {CAPTURE_NOTE}
+        {MEMORY_NOTE}
       </p>
       <div className="flex flex-wrap items-center gap-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
         <span>
@@ -726,7 +727,7 @@ export function MemoryScreen() {
 
       {error && <p className="mb-3 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
 
-      <CaptureSection tick={tick} bump={bump} setError={setError} />
+      <MemoryLayerSection tick={tick} bump={bump} setError={setError} />
 
       <ConflictSection tick={tick} bump={bump} setError={setError} />
 

@@ -64,7 +64,9 @@ test("memory: the four layers are listed and the header counts them separately",
   await seedMemories(page);
 
   await page.getByRole("button", { name: "Memory", exact: true }).click();
-  await expect(page.getByRole("heading", { name: "Memory" })).toBeVisible();
+  // Exact: the screen title is "Memory", but the master-switch section on this screen is headed
+  // "Memory layer", and name matching is a substring match by default.
+  await expect(page.getByRole("heading", { name: "Memory", exact: true })).toBeVisible();
 
   // Per-layer counts are the only way to tell L0 from L1 at a glance.
   await expect(page.getByText("1 raw · 2 atoms · 0 scenarios · 1 core")).toBeVisible();
