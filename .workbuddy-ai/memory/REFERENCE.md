@@ -1116,33 +1116,81 @@ exercised. Recorded in the design doc as §5.4a.
 - `source=ui` traffic (the Assistant screen) is **not** captured by the gateway memory path — only
   `source=gateway` requests go through `prepare_capture`. Probes must go through port 8787.
 
-## L0 recall: the two paths disagree (found 2026-09-21, unresolved)
+## L0 recall: the two paths disagreed — L0 fixed, the scope axis still open (2026-09-21)
 
-There are **two** recall paths and they take opposite positions on L0 (verbatim conversation):
+There are **two** recall paths and they differ on **two** axes, not one.
 
-| path | where | L0? |
-|---|---|---|
-| gateway memory layer | `context_scope.rs:593` — `let layers = ["L1","L2","L3"]`, a literal | **never**, no opt-in |
-| Assistant / webview engine | `Assistant.tsx:693` and `:770` → `recallContext(text)` with **no `layers`** → `engine.ts:345-348` default branch | **always** — `["L3","L2"]` then `["L1","L0"]` |
+| path | recall fn | scope | layers | L0? |
+|---|---|---|---|---|
+| gateway memory layer | `memory::recall_scoped` | `RecallScope{user,project,agent}` | `context_scope.rs:593` literal `["L1","L2","L3"]` | **never** |
+| Assistant / webview | `store.recallMemories` → `memory_recall` → `memory::recall` | **none** | `engine.ts:345-348` default → `["L3","L2"]` then `["L1","L0"]` | **always** |
 
-The gateway path carries the comment "L0 is excluded by default… opting in is deliberate and
-per-scope (design §0.4)". The Assistant path does the opposite and has no session filter, so another
-session's verbatim turns can land in the prompt. That is the privacy inversion §0.4 names.
+The layer axis was already known. The **scope axis is the newer and quieter finding**: `recall_scoped`
+takes a `RecallScope`; the Assistant calls `memory_recall` (`commands.rs:384`), which calls
+`memory::recall` → `recall_inner(..., None)` — no scope at all, so it sees every row in the DB. That is
+the "absence is not global" contamination engine the three reviewers flagged (`memory.rs:406-412`),
+reached from a path that always *has* a project and simply never passes it.
 
-There is **no L0 opt-in anywhere**: grepping `include_l0|allow_l0|l0_enabled|allow_verbatim` across
-the Rust source returns nothing, and the gateway's layer list is a literal.
+`memory.rs:420-421` documents the unscoped path as "the Assistant's **Memory screen**". That is stale:
+the Assistant's *request* path uses it too (`Assistant.tsx:693` and `:770`, feeding `memoryBlock(recalled)`
+into the system prompt at `:702` and a system message at `:787`). Do not read that comment as a scope
+guarantee.
 
-**Not changed.** It is a behaviour change to a pre-existing feature, so it is the operator's call.
-Recommendation on record: drop `L0` from the default in `engine.ts` so both paths deny by default.
-Written up in `GATEWAY_MEMORY_LAYER.md` §10(3).
+**Why dropping L0 is nearly free — the argument that settles it.** `replayHistory` (`Assistant.tsx:48-57`)
+maps the **entire** in-memory `msgs` array with no window or truncation, so the current session's turns
+are already in the request verbatim, correctly ordered and attributed (tool_calls / tool_call_id intact).
+L0 recall of the current session is therefore **redundant** with history; L0 recall of *other* sessions is
+the leak. The only capability lost by dropping L0 is cross-session verbatim bridging — exactly what §0.4
+forbids by default.
 
-## `mcp.json` is not what it looks like
+**Fixed 2026-09-21 — option (a) only.** `engine.ts:348` now requests `["L1"]`. Pinned by the test
+"never recalls L0 — this session's turns are already replayed as history", which asserts the *requested*
+layer list excludes L0 rather than the returned rows — a mock that filtered would have passed either way,
+so asserting the result would have proved nothing. Falsified by restoring `["L1","L0"]`, which fails it
+with `expected [ 'L3', 'L2', 'L1', 'L0' ] to not include 'L0'`. The pre-existing budget test had a mock
+that returned an L0 row even when L0 was never requested — testing a case that cannot occur; it now
+honours the layers it is given and fails too when L0 is restored. Desktop suite 169 → **170**.
 
-`~/.workbuddy-ai/mcp.json` has `ai-hub` → `http://127.0.0.1:8787/mcp`. Measured 2026-09-21:
+**Still open — option (b), the scope axis.** The Assistant's recall remains unscoped. Deliberately not
+bundled into the same change: it is a real behaviour change for cross-project continuity, and the
+operator chose the narrow fix. Written up in `GATEWAY_MEMORY_LAYER.md` §10(3).
 
-- 8787 is **this app's** port; the router returns **404 on `/mcp`** for GET and POST.
-- Grepping the Rust source for `mcp` gives **no matches** — the router has no MCP surface.
-- Nothing is on 8788. An earlier note claiming it "should be 8788" was a **guess and wrong**.
+## The 8787 collision: `mcp.json` is correct, and two apps want the same port (measured 2026-09-21)
 
-So the entry targets a port owned by an app that is not an MCP server. AI Hub's real port is unknown
-and must come from the user. Left untouched — user-level tooling config, not project code.
+`~/.workbuddy-ai/mcp.json` has `ai-hub` → `http://127.0.0.1:8787/mcp` with a bearer token. The entry is
+**legitimate and correctly generated** — verified against AI Hub's own store
+(`~/Library/Application Support/AI Hub/aihub-store.json`): `connectorEnabled: true`, `connectorPort: 8787`,
+and the token **matches mcp.json byte-for-byte**. An earlier note here claiming it "should be 8788" was a
+**guess and wrong**; 8788 is `ai-hub-v3`'s port, and v3 is a dormant reserve.
+
+The real defect is a **port collision between two of the user's own apps**:
+
+| app | port | configurable? | on conflict |
+|---|---|---|---|
+| AI-Provider Router gateway | 8787 (`gateway.rs:33 DEFAULT_PORT`) | yes — persisted `settings.gateway.port` (`lib.rs:76`, `persist.rs:941`) | bind fails |
+| AI Hub v2 connector | 8787 (`connector.js:154 start(preferredPort = 8787)`) | yes — `settings.connectorPort` | **slides up to +10** (`connector.js:164`, `EADDRINUSE`) |
+
+So whoever starts first wins 8787. If the router wins, AI Hub silently slides to 8788 — and `mcp.json`'s
+hardcoded 8787 then points at the router, which returns **404 on `/mcp`** (the router has no MCP surface;
+grepping its Rust for `mcp` gives no matches). Same silent-failure shape as the capture-id bug: nothing
+errors, the tool is simply absent.
+
+Measured 2026-09-21: AI Hub was **not running**; `ai-provid` pid 7404 held 8787.
+
+**How to move the router — it is a UI action, and it self-heals the WorkBuddy side.** The port is not a
+constant: `gateway_enable(app, port)` (`gateway_cmds.rs:232`) takes it from the Gateway screen's port
+field, which loads from `settings.gateway.port` (`Gateway.tsx:96-101`) and is persisted on every toggle.
+The field is **`disabled={running}`** (`Gateway.tsx:250`), so the order is forced:
+
+1. **Stop** the gateway (the port field is disabled while it runs).
+2. Edit the port field.
+3. **Start** it again — `gateway_enable` binds the new port and persists it.
+
+**No manual merge is needed.** `gateway_enable` calls `sync_workbuddy_with_retry` (`gateway_cmds.rs:327`),
+which re-derives the endpoint from the store via `workbuddy::gateway_port` and rewrites the entries —
+documented as "safe to call repeatedly". Port-squat already surfaces loudly at that point
+(`Gateway.tsx:126`, invariant 16).
+
+Pick a port **outside AI Hub's slide range 8787..8797**, or AI Hub can land on it while falling back.
+`8800` was verified free and is the recommendation. Editing the `settings` row directly also works but is
+worse: the WorkBuddy re-sync only runs on the enable path, so it would have to be triggered separately.

@@ -25,7 +25,7 @@ Gotchas that each cost real time · Releasing / bumping the version
   for `system`; **skills are frontend-only**.
 - Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` — `file:…?mode=ro`;
   version in `schema_version`, not `PRAGMA user_version`.
-- Tests: router-core 231 · desktop 169 (incl. 27 e2e) · Rust `cargo test --lib` **405** · browser
+- Tests: router-core 231 · desktop **170** (incl. 27 e2e) · Rust `cargo test --lib` **405** · browser
   **70 passing** (59 declarations — the screen sweep runs once per screen). Gate `pnpm ci:local`
   includes the browser.
 - **`cargo` is not on PATH** — use `~/.cargo/bin/cargo`. CI has not run since ~2026-09-16 (billing).
@@ -84,10 +84,15 @@ Gotchas that each cost real time · Releasing / bumping the version
 - **Every new `#[tauri::command]` needs a case in `web-test/shim.ts`** the same day. The shim throws on
   unknown commands, screens wrap loads in `Promise.all(...).catch(() => undefined)`, and the result is a
   silently blank screen. `--skip-browser` hides it completely.
-- **Two recall paths disagree on L0.** Gateway `context_scope.rs:593` hardcodes `[L1,L2,L3]` — never L0.
-  Assistant `Assistant.tsx:693,770` call `recallContext(text)` with no `layers`, so `engine.ts`'s default
-  pulls `["L1","L0"]` with no session filter. Never claim "L0 is never injected" of the *product* — only
-  of the gateway layer.
+- **L0 is now denied on both recall paths** (fixed 2026-09-21). The gateway hardcoded `[L1,L2,L3]`
+  (`context_scope.rs:593`); the Assistant's default pulled `["L1","L0"]` (`engine.ts:348`) and is now
+  `["L1"]`. Nothing is lost — `replayHistory` already sends this session's turns verbatim, so L0 recall
+  only duplicated them. **Still open:** the Assistant's recall is *unscoped* (`memory_recall` →
+  `recall_inner(..., None)`) while the gateway passes a `RecallScope`. Never claim "L0 is never
+  injected" of the *product* without checking this.
+- **8787 is contested.** The router gateway (`gateway.rs:33`) and AI Hub v2's connector
+  (`connector.js:154`, slides +10 on conflict) both want it. Moving the router is a UI action in the
+  Gateway screen — `gateway_enable` also re-syncs WorkBuddy's endpoint, so no manual merge.
 - **Testing a queue/claim cap live: plant the budget rows as `status='done'`** with a fresh `claimed_at`.
   `budget_left` reads only `claimed_at` so they count, but `claim()` selects `WHERE status='queued'` so
   they are never candidates — nothing fake gets distilled and no race with the drain tick. Planting them
