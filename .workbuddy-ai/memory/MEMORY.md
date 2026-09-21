@@ -17,6 +17,7 @@
 | Topic | Section |
 |---|---|
 | Build / install / verify installed app | Build / install / verify the installed app |
+| Code signing, keychain prompts | Code signing — why the keychain prompted on every single build |
 | Testing, counts, vitest include globs | Testing · Test counts |
 | Browser harness (`web-test`) | Browser harness |
 | Gateway behaviour, error status, keychain | Gateway behaviour · Error status propagation · Keychain |
@@ -65,6 +66,12 @@
   for 7 days — so after a restart the §3.5.5 idempotency guard read real captures as replays and
   dropped them, silently. Scope ids with a boot marker (`millis-pid`). Measured live: 6 requests,
   the 3 whose ids already existed vanished. Depth: REFERENCE.md §Capture ids.
+- **An ad-hoc signed app's designated requirement is its cdhash, which changes every build** — so any
+  keychain ACL anchored to it breaks on every rebuild and re-prompts. That was the "keychain password
+  every time" complaint. Sign with a stable identity instead
+  (`bundle.macOS.signingIdentity = "AI-Provider IDE Dev Signing"`); the requirement becomes
+  `identifier … and certificate leaf = H"9e56e7cc…"` and survives rebuilds. Depth: REFERENCE.md
+  §Code signing.
 - `runAgentLoop` returns `{text, messages}` where `messages` EXCLUDES the closing assistant turn.
 - A tool failure must never reach the model as `""` — guard at bridge *and* consumer.
 - `invalid` is an eviction, not a label (`src/lib/keys/verdict.ts`).

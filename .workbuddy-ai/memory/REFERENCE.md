@@ -165,11 +165,13 @@ which one happened.
   (never `rm -rf`) then `cp -R`. `export PATH="$HOME/.cargo/bin:$PATH"` first.
 - `pkill -f ai-provider-router` before installing, or `open -a` focuses the old process and tests
   stale code. Launch and verify in the same command — a GUI app launched by a tool call may be reaped.
-- **Every reinstall invalidates the app's keychain ACL; the next read takes ~19s to negotiate.**
+- **Every reinstall used to invalidate the app's keychain ACL; the next read takes ~19s to negotiate.**
   `probe_key_refs` used to run inline in `setup()`, so that 19s landed before any window existed —
   alive process, no window, no socket, no log line, which reads exactly like "still starting". It is
   now on its own thread. Same ACL applies to `workbuddy::sync`, which is why it can lag the listener.
   If a launch looks dead, read `gateway.log`: `startup: <step>` markers name the last step reached.
+  **The "every reinstall" part is now fixed** — it was a consequence of ad-hoc signing. See
+  §Code signing below.
 - **After a reinstall `/v1/models` returns 503, not 401, and that is the keychain, not a
   regression.** Body: `master key unavailable — the OS keychain did not respond; approve the
   keychain prompt for this app, then retry`. A newly installed binary has a new code signature, so
@@ -184,6 +186,56 @@ which one happened.
 - **Test the startup fix on the first launch after a rebuild, or the test proves nothing** — the
   cold-ACL condition exists once per build. And beware a repro script that outruns what it measures:
   `repro-restore.sh` kills each instance ~3s after the socket binds, too soon for the keychain probe.
+
+## Code signing — why the keychain prompted on every single build (fixed 2026-09-21)
+
+Tushu: "entering keychain password everytime is annoying." He was right, and the cause was the
+signature, not the keychain.
+
+The installed app was **ad-hoc signed**:
+
+```
+Identifier=ai_provider_router-15382172ab762b3d
+Signature=adhoc
+TeamIdentifier=not set
+# designated => cdhash H"b111e8381fb7f54fc4039d877a3d05de5789a53b"
+```
+
+**The designated requirement was the cdhash, and a cdhash changes on every build.** macOS matches
+keychain ACL entries against the designated requirement, so every rebuild produced a requirement no
+stored ACL entry could match → prompt. `bundle.macOS` was `{}` in `tauri.conf.json` (no
+`signingIdentity`), so Tauri fell back to linker-signed/ad-hoc. "Every time" was literally correct:
+in a dev loop every build is a new identity.
+
+**Fix:** `bundle.macOS.signingIdentity = "AI-Provider IDE Dev Signing"` in
+`apps/desktop/src-tauri/tauri.conf.json`. That identity already existed in the login keychain
+(SHA-1 `9E56E7CCD0DD43012B06B86CA5D1C21237A21A6D`, self-signed, valid to 2036) and was never wired up.
+
+Verify the property, do not assume it — sign twice and diff the requirement. A scratch copy and a
+real `tauri build` gave **byte-identical** output:
+
+```
+designated => identifier "dev.aiprovider.router" and certificate leaf = H"9e56e7ccd0dd43012b06b86ca5d1c21237a21a6d"
+```
+
+No cdhash, so the ACL keeps matching across rebuilds. The build log names it —
+`Signing with identity "AI-Provider IDE Dev Signing"` for the binary and then the bundle — and
+`codesign --verify --deep --strict` passes. Notarization is skipped (no Apple credentials; not wanted
+for a dev build).
+
+**Expect one final prompt.** The stored ACL entry still holds the old cdhash requirement, so the first
+signed build prompts once. **Always Allow** stores the certificate requirement, and rebuilds after
+that should not prompt. If prompts ever return, check whether `signingIdentity` was dropped or the
+certificate was recreated — a recreated cert has a new hash and is a new identity.
+
+Caveats:
+- **Machine-specific.** The config now names a certificate that only exists on this machine; another
+  machine's build fails unless it has the same cert or overrides the setting.
+- **Trust widens slightly.** Before, only that exact binary could read the master key silently; now
+  anything signed with that certificate can. Standard for a single-user dev machine, and the reason
+  the private key must stay in the login keychain and never be exported.
+- `Identifier` changed from `ai_provider_router-15382172ab762b3d` (ad-hoc) to the real bundle id
+  `dev.aiprovider.router`. An improvement, but it is a change in app identity.
 
 ## Testing
 - **The sandbox sets HTTP_PROXY/HTTPS_PROXY to a local port that can die.** The app then returns
