@@ -23,10 +23,12 @@
 | Ledger honesty | The ledger must not lie |
 | Migrations, live DB | Migrations · Live database |
 | Context graph rules | Context graph |
+| Gateway memory/context layer (proposed) | Gateway memory layer: request-path facts |
 | Skills / orchestrator / memory | Skills · orchestrator · memory engine |
 | Sandbox tool policy + audit trail | Sandbox tool policy · Gateway tool audit trail |
 | Gate, and why CI is dead | `pnpm ci:local` · CI is dead |
 | e2e LIVE, `pnpm install` destructive | Gotchas that each cost real time |
+| `vite build` blocked by safe-delete shim | Gotchas that each cost real time |
 | Version bump, tag, push | Releasing / bumping the version |
 
 ## Quick orientation
@@ -34,7 +36,17 @@
 - Gateway is a blind proxy for `system`; **skills are frontend-only** (`Assistant.tsx`).
 - Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` —
   `file:…?mode=ro`; version in `schema_version`, not `PRAGMA user_version`.
-- Tests: router-core 231 · desktop 151 · Rust `cargo test --lib` **267** · browser 53.
+- Tests: router-core 231 · desktop 169 (incl. 27 e2e) · Rust `cargo test --lib` **394** · browser
+  **65 passing** (53 + 12 smoke). Gate is `pnpm ci:local` (browser included by default).
+- Per-principal identity is now **two** strings, either may deny: the `AIP-Agent` label and
+  `key:<id>` from the presented app key (`principal::allows(_, _, agent, app_key)`). Principals
+  named `key:<id>` are offered by `principal::list` from active `gateway_keys` rows.
+- `AppKeyProvider` returns `Vec<AppKey { id, secret }>` (was `Vec<String>`). Request paths must go
+  through `core.app_keys()`, never the provider directly — it is memoised (see REFERENCE.md).
+- `memories.superseded_at` (migration 0014, schema_version 14): set by `supersede`, excluded from
+  `recall_inner`/`session_atoms`/`stats.injectable`, **not** excluded from `list` (the UI shows and
+  restores). Superseding a pinned or L3 row is refused by policy (§6.4.5).
+- **`cargo` is not on PATH** — use `~/.cargo/bin/cargo` (and unset the proxies or it stalls).
 - Gate is `pnpm ci:local`. CI has not started a job since ~2026-09-16 (billing, not code).
 
 ## Rules that each cost a bug
@@ -44,9 +56,37 @@
 - A tool failure must never reach the model as `""` — guard at bridge *and* consumer.
 - `invalid` is an eviction, not a label (`src/lib/keys/verdict.ts`).
 - Migration = `MIGRATIONS`/`DATA_MIGRATIONS` + bump hardcoded `schema_version` + update the count
-  assertion. Rewind tests delete `WHERE version >= N`.
+  assertion and the table-existence list. Rewind tests delete `WHERE version >= N`.
+- Precedence on the memory path: operator (master switch → per-principal row) beats the client's
+  `AIP-Memory` header. A denied principal is denied in *both* directions — no injection, no capture.
 - Nav = three edits: `ui-state.ts`, `Shell.tsx`, `App.tsx`.
 - `panic = "abort"` — never write poison handling for `.lock().unwrap()`.
 - A debounced save reads state when it **fires** (latest-ref), not when scheduled.
+- Parallel Rust tests must not share a temp dir by `pid + timestamp` — two opening in the same
+  millisecond hit `DatabaseBusy`. Use a monotonic `AtomicUsize` counter.
+- Falsify one probe at a time. Running two at once got 5/5 failures and attributed nothing.
+- Two fixes for the same property mask each other: an end-to-end test passes with either one
+  removed. Test the inner function directly (drive it with adversarial input) or you proved nothing.
+  Cost a wasted probe on §5.5 — the SQL `ORDER BY` fix alone satisfied the e2e ordering test.
+- A test that passes with the fix removed is not evidence. Label it as pinning a property, or delete
+  it — don't leave it implying coverage it does not have.
+- **vitest does not typecheck.** A test can run green and still fail `tsc`. Notably
+  `expect(x).toBe(true, "msg")` / `toHaveBeenCalledTimes(2, "msg")` — neither takes a message; use
+  `expect(x, "msg").toBe(true)`. Always run the gate, not just vitest.
+- Never let "newer than" depend on two captures landing in different **milliseconds** — they usually
+  land in the same one. A test that passed alone and failed in the full suite cost a gate run; force
+  the timestamps explicitly.
+- **A cache needs an authority, not just a TTL.** Keying the app-key memo on the SQLite active-id
+  set (not time) is what keeps revocation immediate; keying it on time alone broke a *pre-existing*
+  contract test. If the only validator is a clock, don't cache it.
+- **Check whether the mutation sites can even reach the cache** before designing invalidation.
+  `gateway_app_key_create/revoke/delete` take `State<Arc<Store>>` only — no core — so explicit
+  invalidation was impossible and the design had to be self-maintaining.
+- A timing property needs an observable proxy to be asserted. "The scan does not short-circuit" is
+  untestable by asserting a correct result (`find` passes); giving two candidates the *same* secret
+  makes `find` and a full scan answer differently.
 - Clamp user numbers from numbers/numeric strings only.
 - Recover from stored data, never invent it.
+- **Every new `#[tauri::command]` needs a case in `web-test/shim.ts`** on the same day. The shim
+  throws on unknown commands, screens wrap loads in `Promise.all(...).catch(() => undefined)`, and
+  the result is a silently blank screen, not an error. `--skip-browser` hides this completely.
