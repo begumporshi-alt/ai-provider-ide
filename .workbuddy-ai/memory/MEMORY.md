@@ -93,6 +93,7 @@ bug. The host injects this file up to **8,000 chars** (hardcoded in `app.asar`).
 - **A swallowed write is invisible to every reader of its table.** Where a card claims completeness, report it
   — one `writeTrail` helper, one channel scoped **per trail** (a global counter makes both cards wrong) — and
   keep the swallow: the work happened.
-- **Four losses, four shapes** (depth: REFERENCE.md §Trail health). Lost *row* → count it. Lost *ending* → keep
-  the observed value per id (`unrecordedEnd`), not a count. Lost *start* → count the run **once**, since its
-  step appends fail for the same cause. Stranded *state* → register the failure **before** anything can fail.
+- **Four losses, four shapes** — row→count, ending→keep per id, start→count once, stranded→register first.
+  Depth: REFERENCE.md §Trail health.
+- **The repo is PUBLIC** (2026-09-22). Never commit a real key, token or identifier — `pnpm key-leak-grep` is a
+  gate step. Test fixtures: synthetic shapes only (`AKIAIOSFODNN7EXAMPLE`, `sk-abcdef…`).
