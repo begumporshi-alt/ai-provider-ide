@@ -180,6 +180,19 @@ which one happened.
   right after an install and reading 503 as "the gateway is dead" is the trap. Corroborate with
   `pgrep -fl` (process up), `lsof -nP -iTCP:8787 -sTCP:LISTEN` (bound) and `startup:` /
   `auto-restore:` lines in `gateway.log` before concluding anything is broken.
+- **Measured 2026-09-21 (reinstall at ~17:05): a reinstall still triggers the prompt even though the
+  signing fix is in the artifact.** Old and new bundles carry a **byte-identical designated requirement**
+  (`identifier "dev.aiprovider.router" and certificate leaf = H"9e56e7cc…"`, Authority
+  `AI-Provider IDE Dev Signing`), so this is not a requirement change. The ledger proves the gateway was
+  serving minutes earlier (`source=gateway status=ok` at 16:38), so the 503 was install-caused, not
+  pre-existing — **attribute a 503 only after checking the ledger, or you will blame the wrong thing.**
+  Most likely the stored ACL entry was created under the earlier *ad-hoc* identity and needs one
+  re-approval against the certificate requirement. **The discriminator is the next rebuild:** no prompt
+  means the "every reinstall" fix is complete and this was the one-time migration.
+- **A running `SecurityAgent` next to a 503 means a prompt is waiting for a human.** `pgrep -fl
+  SecurityAgent` is the tell; neither waiting nor retrying clears it, which is why the 503 message says to
+  approve and retry. Do not report the gateway as broken while one is pending — and do not claim a
+  reinstall was verified end-to-end until the 401 comes back.
 - **`pkill -f ai-provider-router` kills the shell that runs it** — the pattern matches that shell's
   own command line. Use `pkill -x` / `pgrep -x` (exact process name) instead.
 - `ps` is sandbox-blocked; use `pgrep -fl` and `lsof -p <pid>`.
@@ -333,6 +346,29 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
   the wizard story).
 - `__webTest`: `store.*` read-only views, `emit()`, `invoke(cmd,args)` and `gatewayStatus(partial)` to
   **arrange only, never assert**.
+- **`__webTest.failNext(cmd, message, afterMs?)` (added 2026-09-21) makes `cmd` reject once.** Without it
+  a UI `catch` branch is unreachable from a spec — every shim case either answers or throws only because
+  the command is unknown — so "the read failed" and "the read answered with nothing" render identically,
+  which is the exact distinction several cards exist to make. Checked in `handle()` before `dispatch()`
+  so it also covers an unknown command and skips `persist()`, matching the host. One-shot and cleared on
+  use, so a spec arranges the precise call it means to fail.
+- **An immediate `failNext` cannot test supersession, and a deferred one needs a deferred assertion.**
+  Which read loses the race is the *microtask ordering*, not the code under test: a fault thrown inside a
+  microtask always lands before a later read resolves, so the newer read's success wipes the older one's
+  error whichever way the guard is written. `afterMs` defers the rejection so the superseded read lands
+  last — but then the fault arrives *after* the assertions have run, so the spec must also outlive it
+  (`toHaveCount(0)` and `toBeVisible()` both succeed instantly on the happy path, so an early assertion is
+  green by construction). The `GenerationAuditCard` overlap spec passed **with its guard deleted, twice**,
+  before both halves were right. Full account: `CONTROL_SCREEN_BUILD.md` §4a.2.
+- **A second card on a screen breaks `getByRole(..., { name: "Refresh" })` — and that is a real defect, not
+  a selector problem.** Two controls sharing one accessible name are ambiguous to a screen reader too, on a
+  page the user cannot see. `Button` (`atoms.tsx`) takes an optional `ariaLabel`; the label must still
+  *contain* the visible text (WCAG 2.5.3 Label in Name), so "Refresh drift history" and not "Reload". Select
+  with `exact: true`, or Playwright's substring match hits both and reports a strict-mode violation.
+- **Locate rows by content, not by index, in a spec that is not about ordering.** Reaching a row by
+  `nth(n)` makes any ordering bug fail the test too, so a failure names two rules at once. `rows.filter({
+  hasText })` costs nothing and keeps one bug to one test — measured on the drift spec, where reversing the
+  sort failed the ordering test *and* the open/resolved test until it was decoupled.
 - **A screen with no shim command cannot be tested and its specs pass anyway.** Gateway had no
   coverage because `gateway_status` was missing: the invoke threw, `status` stayed null and the screen
   rendered its "Stopped" branch whatever the host would have said. Confirm the command is in the table
@@ -353,6 +389,12 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
   `PRAGMA user_version` (which reads 0). Read concurrently with `file:…?mode=ro`.
 - Column names are the snake_case ones (`fallback_chain_json`, `http_status`); guessing a name
   silently returns `None` and looks like missing data.
+- **The `settings` table is `key`/`value_json`** — there is no `value` column (querying it fails outright
+  with `no such column: value`, which is the good failure mode). One row per feature: `router`, `gateway`,
+  `workbuddy`, `assistant`, plus `background` and `skills_seeded`. Values are JSON:
+  `gateway = {"port":8800,"enabled":true}`, `assistant = {root, agentMode, useMemory, noTools,
+  maxIterations}`. **`DEFAULT_PORT` in `gateway.rs:33` is only a fallback** (still 8787) — the live port is
+  this row, which is why reading the constant tells you nothing about where the gateway is listening.
 - **An external `sqlite3` client cannot DELETE from `memories` by default.** The `memories_ad`
   trigger writes to the `memories_fts` virtual table, so a plain delete fails at prepare time with
   `unsafe use of virtual table "memories_fts"` and changes nothing. Prefix
@@ -398,6 +440,13 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
   returns all of its working copy, so callers must `slice(history.length)` or the graph goes quadratic.
 - The agent branch flushes in `finally`, not only on success — otherwise a stopped run leaves nodes
   buffered and prepends them to the next batch.
+- **Gateway conversation turns do not land in the graph — they land in `session_turns`.** Nothing in the
+  gateway calls `context::record`; `context_scope.rs:777` calls `session_context::record_turns`
+  (`session_context.rs:125-162`), which writes `session_turns` (per-session ring keyed `(session_id, seq)`,
+  skipping a turn identical to the session's most recent one so a retry does not append a copy). The
+  gateway's only graph writes are tool-call nodes (`gateway_cmds.rs:691-727`). So a gateway session shows
+  in History as tool nodes with no conversation **even though the conversation is on disk** — if that is
+  ever fixed, reading `session_turns` is cheaper than writing a second copy into `context_nodes`.
 
 ## Skills · orchestrator · memory engine
 - A skill is a **procedure, not a capability** — it cannot widen the tool surface, only steer how the
@@ -471,6 +520,16 @@ mirrors it command-for-command. It drives real clicks, not a headless approximat
   privilege violation — the running app cannot be driven by script.
 - Frontend assets are brotli-compressed inside the binary: `strings` proves Rust literals but **not**
   frontend strings. Check the frontend against `apps/desktop/dist/assets/` — that is what got embedded.
+- **To prove *which* frontend shipped, match the content-hashed asset names.** The binary embeds a manifest
+  naming `assets/<name>-<hash>.js` (e.g. `main--s791IoF`, `store-DFJUn371`), and those hashes come from the
+  file contents — so finding the same names the build just emitted is content-addressed proof the new
+  bundle is inside. One line:
+  `python3 -c 'print(open("…/MacOS/ai-provider-router","rb").read().count(b"main--s791IoF"))'`. Do **not**
+  try to grep the frontend *code* out of the binary: it is compressed, and every plaintext hit is Rust.
+- **The bundler emits template literals, not double-quoted strings.** Grepping a built asset for `"L0"`
+  finds nothing because it is `` `L0` ``. Search the bare token (`L0`, `session_id`) and print context
+  instead — a quote-anchored regex reports "not present" and reads as "the change did not ship". This cost
+  a full false negative on 2026-09-21 while verifying a fix that *had* shipped.
 - Playwright's cleanup of `web-test/.report` trips the bulk-delete shim and fails the run *after* the
   tests pass; move `.report` and `test-results` aside first.
 - **Never infer the shipped schema from the live DB.** The DB under
@@ -662,22 +721,50 @@ handling, the fix belongs in retry/continuation, not in the error class.
 direct and 200 through the gateway, with two `ok` ledger rows.
 
 ## Test counts (measured 2026-09-21)
-router-core **231** · desktop vitest **169** (incl. 27 e2e) · Rust `cargo test --lib` **394** ·
-adapter-spec **18** · browser **65 passing** (53 functional + 12 smoke).
+router-core **231** · desktop vitest **193** · Rust `cargo test --lib` **433** · adapter-spec **18** ·
+browser **98 passing** (87 declarations; the smoke spec's screen sweep expands one of them to 12, so
+87 − 1 + 12 = 98 — the arithmetic closing is how the declaration count is checked).
 Gate is `pnpm ci:local` (browser included by default). `npx tauri build --bundles app` also
 passes — see the build section below.
+**Run the gate with `PATH="$HOME/.cargo/bin:$PATH"`.** Without it the gate ends
+`FAILED (1): Rust (cargo missing)` while every other stage passes — which reads like a Rust failure and
+is not one. Cost two full 4-minute runs on 2026-09-21.
 (Rust: 254 before the gateway tool-audit + context-graph work on 2026-09-20 → 280 → 345 → 352 →
 358 → 363 after Phase 6 → 366 after §5.6's three deadline tests → 373 after §5.5's seven →
-377 after Phase 5's four prune tests → 381 after §6.4's four conflict tests → **394 after the
-app-key principal's thirteen**. Desktop vitest 163 → 169 (retention). Browser 44+9 = 53 in the
-old memory — but 9 were silently failing because the gate had been running with `--skip-browser`,
-and the failure mode (render crash → blank screenshot → 30s timeout per test) read as
-"intermittent", not "the shim is missing data the Rust host always provides".)
+377 after Phase 5's four prune tests → 381 after §6.4's four conflict tests → 394 after the
+app-key principal's thirteen → 408 → 414 after the injection ring buffer's six →
+**420 after the gateway.log reader's six**, **426 after the `generator_audit` reader's six**, **433 after the
+drift history reader's seven**.
+Desktop vitest 163 → 169 (retention) → 170 → 177 (the settings-merge spec's seven) → 181 after the
+trail-writes spec's four → **183 after the generation producer's two** → **186 after the lost-ending specs'
+three** → **190 after the run-omission specs' four** → **193 after the stranded-repair specs' three**.
+Browser 44+9 = 53 in the old memory — but 9 were silently failing because the gate had been
+running with `--skip-browser`, and the failure mode (render crash → blank screenshot → 30s timeout
+per test) read as "intermittent", not "the shim is missing data the Rust host always provides".
+Then 72 → 73 (two retargets + the gateway-move spec) → **78 after the audit-log spec's five** →
+**84 after the generation-audit spec's six** → **91 after the drift-history spec's seven** →
+**93 after the trail-health spec's two** → **94 after the wizard's producer** → **95 after the repair
+path's producer** → **96 after the lost-ending spec** → **97 after the never-recorded-run spec** →
+**98 after the stranded-repair spec**.)
 **Do not run the gate with `--skip-browser` and call it green.**
 **Run the smoke spec when adding a new screen or a new shim field.** It is in `web-test/smoke.spec.ts`
 and includes one *seeded* Memory case that catches data-shape render crashes — the empty-store
 sweep alone cannot.
 Supersedes the older numbers in *Testing* below (215 / 126 / 267) — those are stale.
+
+### `MEMORY_DEADLINE` differs between builds, on purpose (2026-09-21)
+`context_scope.rs` defines it twice: 15 ms normally, **30 s under `cfg(test)`**. The 15 ms budget is a
+product decision, but it is a *wall-clock* budget, and `cargo test` runs tests in parallel — a store open
+plus a recall on a loaded machine can exceed it. The failure reads as `injected=0;reason=deadline`, which
+looks like a policy bug, and because it is load-dependent it **moved from test to test**: one run failed
+`a_principal_denied_memory_is_refused_even_when_it_asks_for_it`, the next failed
+`the_master_key_is_governable_by_a_policy_on_its_own_name`, and each passed in isolation. ~25 tests call
+`inject_context` as scaffolding for properties about recall, scope and policy; none assert anything about
+15 ms. Widening one call site only moved the noise, so it is widened at the constant. The deadline itself
+is still tested for real: `a_deadline_that_is_already_gone_misses_and_stays_missed` drives
+`Deadline::new(Duration::ZERO)` and the §5.6 tests pass explicit budgets to `inject_context_deadline` —
+which is what that parameter exists for. Verified by three consecutive full runs at 420 passed, and again
+at 426 after the `generator_audit` reader.
 
 ## The local gate: `pnpm ci:local` (`scripts/ci-local.sh`)
 Mirrors `ci.yml` step for step, adds a Node >= 19 preflight, and unsets the proxy vars. Skips
@@ -759,6 +846,28 @@ run_command]`, default off, enforced in `gateway_tool_run`).
 `tool run: <name> in <root>` — no arguments, no outcome, no correlation id. Now logged after the
 call as `tool req=<id> tool=<name> root=<r> args=<digest> -> ok=<b> out=<n>B err=<trunc>`; refusals
 log `-> REFUSED:`.
+
+**The reader landed 2026-09-21** — `gateway_log_tail` (`gateway_cmds.rs`) + the Control → Tools card.
+It was write-only for a day, which made the trail evidence nobody could consult; the UI even said so.
+- `LOG_TAIL_BYTES = 128 KB`. The log is never rotated, so a whole read to show 20 lines grows without
+  bound. The command seeks to `len - LOG_TAIL_BYTES` when larger and decodes with
+  `String::from_utf8_lossy` — **required, not lazy**: a byte seek can land mid-codepoint.
+- `parse_log_tail(text, limit, truncated_head)` is pure, so it is testable without an `AppHandle` (the
+  house pattern — see *Tauri commands: extract the body so it is testable*).
+- **The head fragment is dropped only when the read was truncated.** A tail read starts mid-line and
+  half a line reads as corrupt; dropping it unconditionally would silently eat the oldest line of every
+  log short enough to fit the window.
+- **The floor of one is in the parser; the ceiling of 1000 is in the command.** Each bound is enforced
+  where it is tested — the command has no unit test. The floor was found by the test failing, not by
+  review: the first draft returned zero lines for `limit: 0`.
+- `ts_ms` is `None` for an unstamped line (kept, rendered as `—`), because `log_to_file` is called from
+  paths that write bare lines and those are startup evidence. Disk stores **seconds**, the wire carries
+  **milliseconds** — converting in the reader keeps the UI from knowing the format.
+- An absent file answers `Ok(vec![])`, not an error: a gateway that has never run has nothing to report.
+- Frontend: read **on opening the disclosure**, not with the tab. A `logTried` flag separate from
+  `log !== null` stops a *failed* read re-triggering the effect that started it. A failed read **clears**
+  the lines rather than leaving them under the error notice — a stale tail under a failure is a claim
+  about *now* (§4.3's rule for an unloaded metric applies to a list too).
 - **The result body is never logged** — for `read_file` it IS the file's contents. Only ok, byte
   count and a bounded error.
 - **`tool_arg_digest` redacts bodies to lengths**: `write_file` content and `edit_file` old/new
@@ -769,6 +878,213 @@ log `-> REFUSED:`.
   that string.
 - Pure and separate from the command so it is testable without an `AppHandle` — the same reasoning
   as `gateway_tool_refusal` living on `GatewayCore`.
+
+## AI generation audit trail (`generator_audit`)
+Written since the onboarding wizard existed — every adapter the assistant wrote, with the model, an
+estimated text volume and a hash of the redacted prompt — and read by nothing until **2026-09-21**. The
+same class of gap as `gateway.log`: recorded evidence nobody could consult, with the UI not even saying so.
+- **Read path in `persist.rs`**, not `gateway_cmds.rs`. `list_generator_audit(store, limit)` is the
+  testable body behind a thin `generator_audit_list` command (`State<Arc<Store>>`) — the house pattern.
+- `ORDER BY ts DESC, id DESC`. **The tie-break is load-bearing**: `now_ms()` on two consecutive inserts
+  lands in the same millisecond, so `ts` alone is not a total order. The tests insert with an explicit
+  timestamp via a `record_at` helper for the same reason.
+- Limit clamped `1..=500`, default 50.
+- **Surfaced on Providers, not Control → Tools.** Both of its producers are adapter work (wizard candidate
+  generation, drift repair), repair already lives there, and the rows carry no provider id — the INSERT
+  omits `session_id`, so it is NULL on every row and a per-provider panel would invent an attribution the
+  host never recorded. It is a page-level card, rendered even with zero providers: hiding a record because
+  the thing it describes was deleted is the failure the trail exists to prevent.
+- **Read on mount and on `tick`**, unlike the gateway log's on-disclosure read. Providers is a flat screen,
+  so a card there is layer 1 by construction; and `tick` moves on user actions alone, so approving a repair
+  shows the row it just wrote. It is not a poll.
+- Two honesty caveats are in the UI, not only in the code: the counts are `chars / 4` **estimates** (both
+  headers carry `≈` *and* the copy says "estimates"), and the hash is truncated to 12 characters because it
+  is a summary rather than a verification tool.
+- **The card holds a generation counter so only the newest read writes.** StrictMode fires mount effects
+  twice (the harness runs vite **dev**), so an older read that rejects after a newer one resolves would
+  render "Could not read the trail" directly above "Nothing recorded yet". Testing that guard took three
+  attempts — see *Browser harness*, the `failNext` entry.
+
+## Drift events: written twice, read by one command
+`drift_events` is written on every drift detection (`store.ts:143`, `drift_event_record`) and on every
+repair (`store.ts:220`, `drift_event_resolve`, which sets `resolution`/`resolved_at`).
+- **The UI reader landed 2026-09-21** — `DriftEventEntry` + `list_drift_events` (`persist.rs`), ordered
+  `detected_at DESC, id DESC`, behind a `drift_events_list` command, rendered by `DriftHistoryCard` on
+  Providers. Before it the only reader was `diagnostics_json` (`persist.rs:1400`) → `diagnostics_bundle` →
+  `getDiagnosticsBundle()` → `Settings.tsx:280`: a scrubbed clipboard JSON blob.
+- **`COALESCE(trigger_json,'{}')`, and the card parses it defensively.** The column is nullable and the host
+  does not validate the blob, so a NULL or malformed body must render as "no detail recorded" without
+  dropping the row. Losing the event is the failure this reader exists to prevent.
+- **`resolution` is `Option`/`null`, not a defaulted string.** "Open" means *still drifting*; it must not be
+  confusable with "unknown", and an open row must not render like a repaired one.
+- **The Providers drift panel does not read the table.** `RepairModal` (`Providers.tsx:362`) reads the
+  in-memory `pendingRepairs` map (`store.ts:130`) — session-only, and about *pending plans*. An earlier note
+  claiming `drift_events` was "surfaced inside Providers" conflated the two.
+- `drift_event_resolve` closes **every** open row for that provider (`WHERE provider_id=?1 AND resolution IS
+  NULL`), so one provider cannot hold an open and a resolved row at once — the browser spec needs two
+  providers to test both states.
+- Both writes were fire-and-forget with `.catch(() => undefined)`, so a failed drift write was **silent**.
+  **Fixed 2026-09-21** — see *Trail health* below: the writes now report, and the cards render it.
+
+## Trail health: a trail cannot detect its own gaps (2026-09-21)
+
+Three commands record work that has already happened — `generator_audit_record`, `drift_event_record`,
+`drift_event_resolve` — and they were issued from **four** call sites, all four with
+`.catch(() => undefined)`. That is right for the property it was protecting (a repair that applied must not
+be reported as failed because its *record* did not land, or the operator is told to retry a live repair) and
+wrong for the one nobody checked: every reader of those tables claims completeness, and **a read cannot
+detect a write that never happened** — a dropped row is simply absent. So the swallow stays and the
+*failure* is kept.
+
+**The four sites.** `drift_event_record` (`store.ts:170`, `driftMonitor.observe`); `drift_event_resolve`
+(`store.ts:260`, `approveRepair`); and `generator_audit_record` **twice** — `buildRepairPlan`'s audit
+callback (`store.ts:239`) and the **wizard's** candidate generation (`Onboarding.tsx:231`). The fourth was
+missed when the first three were rewired: a `Grep` for the command name returned only `store.ts`, and the
+miss surfaced only by reading the wizard's `audit` callback after a doc comment contradicted the search.
+Both generator producers now share one exported `recordGeneratorAudit(...)`, so the payload and the trail id
+live in one place — a duplicated call site is a duplicated place to forget.
+
+- **The channel is scoped per trail** (`src/lib/trail-health.ts`, a zustand store; `TrailId =
+  "generator_audit" | "drift"`). One global counter would make both cards wrong — the generation-audit card
+  announcing a lost drift write, and the reverse. `noteTrailFailure(trail, msg)` is the imperative handle
+  `store.ts` uses, since a plain module has no hook to call.
+- **The wiring is one helper**: `writeTrail(trail, cmd, args)` in `store.ts` returns whether the write
+  landed and does **not** throw. The three call sites still carry on — the original property, preserved.
+- **`approveRepair` returns `resolveRecorded`**, and the repair modal appends "· its drift event could not be
+  closed" when false. This is the sharpest case: after a successful repair the modal says "Repaired", the
+  provider card shows no drift, and the drift history one card below still reads **Open** in red — while the
+  card's own copy asserts "nothing has closed it yet". And that is *also* exactly what **declining** a repair
+  looks like: "Keep current adapter" (`Providers.tsx:422`) calls only `setProviderStatus(enabled)` and never
+  resolves the row. Before this flag the two were indistinguishable on screen, and one of them is a lost
+  record.
+- Rendered by one shared `TrailWriteWarning({ trail })` component, reading the channel rather than the card's
+  own read (the read cannot know). A card only ever makes claims about its own table.
+- **A session counter, and the copy says "since launch"** — persisting it would mean a table recording
+  failures to write to tables.
+
+**Testing it: the browser spec needs no host hook.** "Check health" (`Providers.tsx:87`) calls
+`buildRepairPlan` straight from the UI with a synthetic evidence blob, and the orchestrator re-fingerprints
+**before** it considers the AI (`repair-orchestrator.ts:60-73`) — the seeded provider is a known dialect, so
+the plan comes back `planned` with no AI round, which is what puts "Approve & apply" on screen.
+`failNext("drift_event_resolve", …)` then fails a genuine write from a genuine click. The wiring itself is
+unit-tested in `src/store.trail-writes.test.ts`, driving `approveRepair` and `driftMonitor.observe`.
+
+**`generator_audit_record` has browser coverage on both producers.** The trail has two: `buildRepairPlan`'s
+audit callback (`store.ts:239`) and the wizard's candidate generation (`Onboarding.tsx:231`).
+
+- The **wizard** path: `trail-health.spec.ts` drives guided setup against `EXOTIC_BASE`/`EXOTIC_KEY`, waits
+  for "No candidate passed the free contract checks", then navigates to AI Providers mid-wizard — which works
+  because `App.tsx:85` wraps every screen, onboarding included, in `Shell`.
+- The **repair** path: `?seed=repair-ai` plus `Check health` on the drifted provider. That seed is what made
+  it reachable, and the reason recorded here previously was **wrong** — "`mock.mjs` does not provide a
+  scripted AI repair round". It does: the mock matches the generator round on its **system prompt**
+  (`mock.mjs:152`), and `adapter-generator.ts:99` builds that prompt identically for both callers, so the mock
+  has always served the repair round too. The audit is also awaited *before* the output is parsed
+  (`adapter-generator.ts:254`), so a round yielding no usable manifest still writes a row. What actually gated
+  it was **state, not scripting**: `RepairOrchestrator.plan()` only reaches `generateCandidates` when the free
+  re-fingerprint matches no dialect (`repair-orchestrator.ts:60-77`), and `buildRepairPlan` refuses to spend an
+  AI round without another ENABLED provider (`store.ts:221`). No seed had both.
+
+Both specs prove their call site uses the shared `recordGeneratorAudit` rather than a local `invoke` — which
+matters because a grep for the command name had missed the wizard's copy entirely.
+
+**Harness trap found while adding `?seed=repair-ai`: a seed's `secretRef` must be unique across providers.**
+`resolveSecret` (`shim.ts:1749`) finds a key by ref across *all* keys and pins the result to that key's own
+provider host, so two providers sharing a ref resolve to whichever was seeded first. The oracle keeps
+`key-01`; the exotic uses `key-02`.
+
+### The second shape: a lost ending, not a lost row (2026-09-21, later the same day)
+
+The first shape was an omission — a row that never arrived — so it is counted. The Agents screen is the same
+class and needed the opposite shape.
+
+`orchestrator.endRun` (`lib/agent/orchestrator.ts`) drops the controller **before** it writes the finish, and
+swallows the write. A finish that does not land therefore leaves a row that says `running` with no controller
+— the identical picture a session closed mid-run leaves. The screen did not merely omit, it *explained*: "A
+run left **running** means the app was closed mid-run — it is not marked failed, because no failure was
+observed", and the `no handle` cell said the same. A failed finish write makes that cause false, which is
+worse than the bug it resembles: an absent row is silent, a wrong cause is *asserted*.
+
+- The status is **not in doubt** — `endRun` was handed it, and only the write failed. So the failure is kept
+  per run (`useTrailHealth().unrecordedEnd: Record<runId, status>`), not counted: a count answers a question
+  nobody asks, while the row can still show what actually happened.
+- `shownStatus(r, unrecorded)` is the one place the row and the header tally both read, so the tally cannot
+  drift from the row it summarises. The `no handle` branch additionally requires `!observed`.
+- Rendered as `{status} ⚠ unrecorded` in `--warn`, reason in the `title`; the footer carries the legend.
+- **A legend that names a state satisfies an unscoped assertion about that state.** Adding "no handle" to the
+  footer made `expect(page.getByText("no handle")).toHaveCount(0)` match the *legend* and assert nothing — and
+  silently did the same to the pre-existing `toBeVisible()` at `context-skills-agents.spec.ts:146`. Both are
+  scoped to `tbody` now.
+- Covered by `agent-turn.spec.ts` "an unrecorded ending shows the status it was, not a closed session" (a real
+  loop with `failNext("agent_run_finish")`) plus three specs in `store.trail-writes.test.ts`.
+
+### The third shape: a run the dashboard will never list (2026-09-21, same day)
+
+A lost *start* is the one loss that leaves nothing behind. `agent_run_start` failing means no row, no status
+and no ending to mark — the run is absent from the list entirely — **and every later step append for it fails
+for the same reason** (a foreign key in Rust, `unknown run` at `shim.ts:1262`). Counting each failure would
+report "4 writes could not be recorded" for one lost run with three steps, and a two-run outage as eight
+separate faults. (This is what the previous "still open" note was pointing at; the empty state's "every run
+is recorded here step by step" had already been narrowed to "runs are recorded here step by step".)
+
+- `startRun` records the id in a module-level `unrecordedStarts` set; `recordStep` reports a failure **only
+  when its run was recorded**. One cause, one count.
+- The set is deliberately **never cleared**: an append from a run that has since ended can still be in
+  flight, and clearing on end would let that late failure be counted for a run the channel already
+  reported. Bounded by the runs of one session — the channel's own lifetime.
+- `agent_run` is a third `TrailId`, not the `drift`/`generator_audit` counts: a run loss must not appear on
+  either provider card. **The noun is the screen's, not the component's** — the provider cards lose **rows**,
+  the run history loses **writes** — so `TrailWriteWarning` moved to `components/TrailWriteWarning.tsx` and
+  takes `noun` / `nounPlural` instead of hardcoding "row".
+- **The warning renders above the empty-state branch, not beside the rows.** The run whose start failed is
+  absent, so a warning gated on rows goes unseen in exactly the case that matters.
+- The finish write contributes nothing here either way: both `shim.ts`'s `case "agent_run_finish"` and
+  `orchestrator.rs:123` update **without checking a row count**, so they report success for a run that does
+  not exist. A lost ending is only visible when the row is there to be wrong about — the second shape.
+
+**Falsified, one probe at a time.** Reverting `startRun`'s catch → 2 unit specs fail ("expected +0 to be 1",
+"expected 3 to be 1") + the browser spec. Removing `recordStep`'s suppression → 1 unit spec fails ("expected
+4 to be 1") + the browser spec. Gating the warning on `runs.length > 0` → the browser spec fails at the "1
+write" assertion. **Assertion order matters for this:** the two inflated-count probes land on the same
+browser assertion (any count >= 2), so the *inflated* count is asserted first — which is what gives the
+placement probe its own failure line, while 3-vs-4 is distinguished at the unit level.
+
+### The fourth shape: a stranded repair, whose card claimed work that had stopped (2026-09-21, same day)
+
+`driftMonitor.onTrigger` (`store.ts:198-203`) sets the provider `repairing` and fires `buildRepairPlan` with
+`.catch(() => undefined)`. The card rendered **"Building a repair plan…"** for as long as `pendingRepairs`
+held no entry — so any failure *before* the entry was created left that sentence on screen permanently, in the
+identical words used for a build genuinely in flight. **Waiting was indistinguishable from broken.** Two
+ordinary causes, neither exotic:
+
+1. `adapters.forProvider` throws `no active manifest` for a provider hydration could not register — which is
+   exactly what a corrupt manifest body leaves behind (`store.ts:350-357`, whose own comment promises "Phase 5
+   drift/repair surfaces it"). It sat **outside** the `try`, so the throw rejected `buildRepairPlan` itself and
+   `onTrigger` swallowed it. Nothing surfaced it.
+2. `pendingRepairs` is a plain in-memory `Map`, never persisted. A provider still `repairing` after a restart
+   has no entry and no plan, and **nothing is building** — the same sentence about a different truth.
+
+And there was no way out: `Check health` was hidden for `repairing` (`Providers.tsx:87` excluded it), so the
+only remaining button, "Repair…", opened a modal saying "No drift event recorded" — which is *also* false,
+since the drift event was recorded; what was missing was the plan. **A provider stuck in `repairing` was
+unrecoverable through the UI.**
+
+- `buildRepairPlan` now registers the entry **before** anything can fail, and the two silent early returns are
+  errors (`!secretRef` → `no key to probe … with`). The entry's *existence*, not its message, is what the
+  screen's copy is driven by.
+- The card is four-way: plan / error / entry-still-building / **no entry** → "No repair is running in this
+  session — use Check health to rebuild one."
+- `Check health` is offered for `repairing` too, because otherwise the truthful copy is a dead end.
+- Seeded as `?seed=repair-stuck` (a persisted `repairing` provider with an unparseable manifest).
+
+**Probes.** Reverting the failure paths fails all 3 unit specs (the first with the raw throw escaping
+`buildRepairPlan` — the clearest evidence of what `onTrigger` was swallowing) and the browser spec at the
+"could not be built" assertion. Restoring the old two-way copy fails the browser spec at the "No repair is
+running" assertion. Distinct lines, so each branch has teeth.
+
+**Harness trap:** `adapters` is a module singleton, and `approveRepair` hot-swaps an adapter in for the
+provider it repairs (`store.ts:282`). A spec that reuses a provider id an earlier spec repaired will have a
+manifest it is specifically trying not to have — and fails with the *next* error along.
 
 ## Sandbox tool argument keys (verified by reading each handler)
 `read_file` path/offset/limit · `write_file` path,content · `list_dir` path,recursive ·
@@ -1062,6 +1378,46 @@ test that only checks the heading is visible passes against a screen whose data 
   assertion. Redirect to a log and read it, or raise the timeout.
 - The shim's state is **per page load**. To arrange host state, `page.evaluate` the setter and then
   navigate away and back so the screen remounts — `page.reload()` discards what you just arranged.
+- **A screen that renders jump-buttons labelled with tab names makes `getByRole("button", …)`
+  ambiguous.** Control's Findings list does exactly that, so its tabs carry `role="tab"` and specs
+  address them with `getByRole("tab", { name })`. Before adding a second control with a tab's name,
+  give the strip real tab semantics rather than reaching for `exact: true`.
+- **A negative assertion against an auto-dismissing surface cannot fail.** `expect(locator).toHaveCount(0)`
+  retries for the whole expect timeout (30 s here), so against text inside the repair modal — which dismisses
+  itself 1.2 s after its message — it just waits for the modal to close and passes whatever the message said.
+  Measured: with `approveRepair` hardcoded to report `resolveRecorded: false`, `trail-health.spec.ts`'s
+  cross-check still passed. Capture the text and assert on the string (`expect(await loc.textContent())
+  .not.toContain(…)`). The same shape against a **persistent** element is sound, because a wrong value would
+  still be there 30 s later — which is why the warning's own absence assertion is fine.
+- **The sandbox bulk-delete guard counts cumulatively per tool call, threshold 50.** Two build tools
+  bulk-delete their own output dirs and trip it:
+  - Playwright empties `test-results` at the start of every run, and a run leaves ~1150 trace
+    screenshots there (`trace: "retain-on-failure"` records per test, discards on pass). `web-test`
+    now moves the stale dir to `/tmp` first — what `ci-local.sh:96` always did, for the same reason.
+  - Vite's `emptyOutDir` empties `dist/assets`. A blocked reporter cleanup is *swallowed*; a blocked
+    `emptyOutDir` is **fatal** — `[plugin vite:prepare-out-dir] Error: [safe-delete]
+    [SAFE_DELETE_BULK_CONFIRM_REQUIRED]`, and the gate ends `FAILED (1): Build`. The delete is only
+    ~13 files alone; it fails because earlier steps already spent the budget.
+  - **Fixed at the source (2026-09-21, evening).** `apps/desktop/package.json` gained `build:clean`
+    (`mv dist /tmp/build-dist-$(date +%s)`) composed into `build`, mirroring the existing `web-test:clean`.
+    With `dist` absent, `emptyDir` issues **no `fs.rm` call at all**, so the step is immune even when the
+    budget is already spent — that is the mechanism, not merely "a rename is cheaper". It belongs in the
+    **package** script, not the root's: the gate reaches it through `pnpm -r build`. `pnpm ci:local` is now
+    ALL GREEN with no manual pre-step.
+  - **Never `rm -rf` an artifact directory by hand — that trips the guard too.** `rm -rf
+    apps/desktop/test-results` was refused with `count: 960` and cost a gate run on 2026-09-21. `mv` to
+    `/tmp`, which is what `web-test:clean` and `build:clean` do. The reflex "tidy up before running" is
+    the one to suppress: the gate's own scripts already do it, and doing it yourself spends the budget.
+  - **The consumer is not the directory you are staring at.** The failing count was **641** against a
+    `dist` holding **17** files — a stale number, not a mysterious one. The budget is spent *before* `Build`
+    by **vitest's `node_modules/.vite-temp` churn**. The proof is a **single-file** target carrying a count in
+    the thousands, which no per-operation reading can explain:
+    `{"count":3062,…,"targetCount":1,"targets":["…/.vite-temp/vitest.config.ts.timestamp-….mjs"]}`.
+    Two explanations were discarded first — the sandbox (the gate failed unsandboxed too) and the target's
+    size. Both were plausible and both were wrong.
+  - The guard's own state is readable at `$CODEBUDDY_SAFE_DELETE_BULK_STATE_DIR/<session>/signal-*.json`
+    — each records the target and the count it saw. That is how the cumulative behaviour was
+    identified, rather than guessed.
 
 ## §10(2) distillation budget — landed 2026-09-21
 
@@ -1154,18 +1510,28 @@ exercised. Recorded in the design doc as §5.4a.
 
 ## L0 recall: the two paths disagreed — L0 fixed, the scope axis still open (2026-09-21)
 
-There are **two** recall paths and they differ on **two** axes, not one.
+There are **two** recall paths. Since the 2026-09-21 L0 fix they agree on **layers** and differ on
+exactly **one** axis: **scope**.
 
 | path | recall fn | scope | layers | L0? |
 |---|---|---|---|---|
 | gateway memory layer | `memory::recall_scoped` | `RecallScope{user,project,agent}` | `context_scope.rs:593` literal `["L1","L2","L3"]` | **never** |
-| Assistant / webview | `store.recallMemories` → `memory_recall` → `memory::recall` | **none** | `engine.ts:345-348` default → `["L3","L2"]` then `["L1","L0"]` | **always** |
+| Assistant / webview | `store.recallMemories` → `memory_recall` → `memory::recall` | **none** | `engine.ts:345` `["L3","L2"]` + `:353` `["L1"]` → L1/L2/L3 | **never** |
 
-The layer axis was already known. The **scope axis is the newer and quieter finding**: `recall_scoped`
+The layer axis is closed. The **scope axis is the quieter finding**: `recall_scoped`
 takes a `RecallScope`; the Assistant calls `memory_recall` (`commands.rs:384`), which calls
 `memory::recall` → `recall_inner(..., None)` — no scope at all, so it sees every row in the DB. That is
 the "absence is not global" contamination engine the three reviewers flagged (`memory.rs:406-412`),
 reached from a path that always *has* a project and simply never passes it.
+
+**The scope axis, measured 2026-09-21.** On the live corpus the two paths return **0 vs 14** rows. The
+reason is upstream of recall: **every atom is born unscoped.** `capture`'s INSERT (`memory.rs:290`) omits
+the scope columns, so rows land with `scope_project=NULL, scope_global=0` — measured as **all 55 rows**
+NULL-project and **0** rows `scope_global=1`. `assign_scope` (`memory.rs:741`) is the only way in, exposed
+as a per-row `ScopeSelect` (`Memory.tsx:605`), and the drain must NOT auto-bind (`drain.test.ts:142`).
+Consequence: the gateway's read machinery is complete but **field-unexercised** — the deadline stages and
+the freeze cache have never once produced a non-empty block. Loosening the scope predicate to "fix" the
+0-vs-14 gap would destroy the contamination guarantee (`store.rs:664-668`). **Not a bug.**
 
 `memory.rs:420-421` documents the unscoped path as "the Assistant's **Memory screen**". That is stale:
 the Assistant's *request* path uses it too (`Assistant.tsx:693` and `:770`, feeding `memoryBlock(recalled)`
@@ -1187,9 +1553,47 @@ with `expected [ 'L3', 'L2', 'L1', 'L0' ] to not include 'L0'`. The pre-existing
 that returned an L0 row even when L0 was never requested — testing a case that cannot occur; it now
 honours the layers it is given and fails too when L0 is restored. Desktop suite 169 → **170**.
 
-**Still open — option (b), the scope axis.** The Assistant's recall remains unscoped. Deliberately not
-bundled into the same change: it is a real behaviour change for cross-project continuity, and the
-operator chose the narrow fix. Written up in `GATEWAY_MEMORY_LAYER.md` §10(3).
+**Option (b), the scope axis — measured 2026-09-21, and NOT a safe fix.** The Assistant's recall is
+still unscoped.
+
+Live corpus: **55 rows** — L0 41, L1 12, L3 2; every row `scope_user='local'`, `scope_project=NULL`,
+`scope_global=0` (all `Unscoped`); 53 live unpinned + 2 live pinned, 0 superseded. Consequence:
+
+| path | rows reachable |
+|---|---|
+| gateway (`recall_scoped`) | **0** |
+| Assistant chat (`recall(..., None)`) | **14** (L1 12 + L3 2) |
+
+`recall_scoped` semantics (`memory.rs:471-502`): `user` → plain equality; `project: Some(p)` →
+`scope_global = 1 OR (scope_project = p AND (scope_agent IS NULL OR scope_agent = a))`; `project: None` →
+`scope_global = 1 AND pinned = 1`. An `Unscoped` row matches **none** of these, so the gateway refuses it
+by construction — that is the intended boundary ("absence is not global", `memory.rs:418-424`).
+
+**Why scoping the Assistant is the wrong move today.** It would not filter recall, it would **turn it
+off**: with 0 rows satisfying a scope, `recallContext` returns nothing — and it swallows failures with
+`catch { return [] }` (`engine.ts:365`), so the regression would be **silent**. The scope axis exists to
+govern *which agent may receive a memory through the gateway*; the Assistant has no agent or project
+identity to scope against, so `None` is not a missing filter but the correct answer for a caller that
+has no scope.
+
+**And never "fix" it by scoping `recall` itself.** The unscoped `recall` has three consumers and the
+gateway is the only path that does *not* use it: `memory_recall` (`commands.rs:384`) serves both the
+Memory screen's search *and* the Assistant's chat recall. The screen is a management view and **must**
+see every row (including superseded ones), so scoping the shared function would break it while looking
+like it tightened the chat path.
+
+**Recommendation: document the third consumer, pin the behaviour, add no parameter.**
+1. `memory.rs:432-433` names only the gateway and the *Memory screen*, omitting the chat path — the one
+   that reaches a model request. That comment is the real defect.
+2. `Scope::Unscoped`'s doc ("Not injectable anywhere") and the `Memory` struct doc ("capture-only and
+   never injected") are **false as written** for the chat path. Correct to "not injectable *by the
+   gateway*".
+3. Pin the Assistant's unscoped recall with a test, labelled as *pinning a property* — this project's rule
+   is that a test passing with the fix removed is not evidence, so it must say what it is.
+4. If the boundary should apply to the Assistant too, the prerequisite is a **fourth scope**
+   (`Local`/`Assistant`) plus a migration mapping existing `Unscoped` rows onto it. Without that
+   migration, enforcing scope drops recall to zero. Migration + `ScopeSelect` + both paths + tests — worth
+   doing only when a second consumer of gateway memory actually appears.
 
 ## The 8787 collision: `mcp.json` is correct, and two apps want the same port (measured 2026-09-21)
 
@@ -1203,7 +1607,7 @@ The real defect is a **port collision between two of the user's own apps**:
 
 | app | port | configurable? | on conflict |
 |---|---|---|---|
-| AI-Provider Router gateway | 8787 (`gateway.rs:33 DEFAULT_PORT`) | yes — persisted `settings.gateway.port` (`lib.rs:76`, `persist.rs:941`) | bind fails |
+| AI-Provider Router gateway | 8787 (`gateway.rs:33 DEFAULT_PORT`) | yes — persisted `settings.gateway` (read `lib.rs:76`; write `settings_set` `commands.rs:197` ← `Gateway.tsx:117,121`) | bind fails |
 | AI Hub v2 connector | 8787 (`connector.js:154 start(preferredPort = 8787)`) | yes — `settings.connectorPort` | **slides up to +10** (`connector.js:164`, `EADDRINUSE`) |
 
 So whoever starts first wins 8787. If the router wins, AI Hub silently slides to 8788 — and `mcp.json`'s
@@ -1230,3 +1634,87 @@ documented as "safe to call repeatedly". Port-squat already surfaces loudly at t
 Pick a port **outside AI Hub's slide range 8787..8797**, or AI Hub can land on it while falling back.
 `8800` was verified free and is the recommendation. Editing the `settings` row directly also works but is
 worse: the WorkBuddy re-sync only runs on the enable path, so it would have to be triggered separately.
+
+**Done 2026-09-21 — the router is on 8800, and the wiring is intact.** Verified after the move:
+
+- `8787` has **no listener**; the installed app (`/Applications/AI-Provider Router.app`, pid 12976) holds
+  `127.0.0.1:8800` (loopback only).
+- `settings.gateway` = `{"port":8800,"enabled":true}` — so the UI action persisted, not just a runtime bind.
+- AI Hub got 8787 back: `aihub-store.json` → `settings.connectorEnabled = true`,
+  `settings.connectorPort = 8787`. Note the keys are under **`settings`**, not top-level.
+- `~/.workbuddy-ai/mcp.json` → `ai-hub` = `http://127.0.0.1:8787/mcp`, and its
+  `Authorization: Bearer …` **matches `settings.connectorToken` byte-for-byte**. The router's
+  `gateway_enable` re-sync did not disturb it — correct, because that sync only rewrites *router* entries.
+
+So the collision is closed and no manual merge was needed, which is what the `sync_workbuddy_with_retry`
+path promised.
+
+## The two boundaries at the host edge (resolved 2026-09-21)
+
+Every `invoke(cmd, args)` crosses **two** different boundaries, and they obey different rules. Getting this
+wrong is silent either way, which is why it cost months.
+
+| | what crosses | who maps the names | correct spelling |
+|---|---|---|---|
+| **command arguments** | the top-level keys of `args` | Tauri, camelCase → snake_case | **camelCase** (`sessionId`) |
+| **nested payloads** | anything inside a `Vec<T>` or struct field | serde, against the Rust field names | whatever `T` declares |
+
+`shim.ts:toRustArgs` (`:529-535`) mirrors the *first* boundary only — it rewrites `[A-Z]` to `_lower` on
+top-level keys and passes the values through untouched, so a nested item keeps the caller's spelling.
+
+**Serde's default is to IGNORE an unknown key.** That is the entire bug: a mismatched nested field is not an
+error, it is *absent* — so an `Option<String>` becomes `None` with no log, no error, and no failing test.
+
+### The decision: `MemoryInput` is snake_case, and strict
+
+`MemoryInput` (`memory.rs:130`) carried `rename_all = "camelCase"` while its read counterpart `Memory`
+(`:62`) had none — so one feature disagreed with itself: reads returned `session_id`, writes wanted
+`sessionId`. Both worked, which is exactly why it survived unnoticed.
+
+Resolved by making the **DTO match its read struct**, not the reverse:
+
+- `MemoryInput` is now **snake** (`session_id`), matching `Memory` and its siblings `ContextNode.session_id`
+  and `ContextEdge.from_id`/`to_id`. The same `session_id` string flows through memory rows and context
+  nodes, so two spellings there is a trap for whoever next joins them.
+- The `persist::*` registry rows stay **camelCase**, and that is not an inconsistency: they are symmetric
+  read+write rows, which is precisely why `providerToHost`/`keyToHost` can pass a record straight through
+  and why the zero-conversion trick works there.
+- Blast radius was measured before choosing: `Memory`'s snake fields are read at ~10 production sites
+  (`drain.ts:82`, `Memory.tsx`), while `captureMemories` has 3 call sites in a single module
+  (`engine.ts:110,200,285`). Change the narrower thing.
+- `captureMemory` (singular) still sends `sessionId`, and correctly so — its fields are command
+  *arguments*. `captureMemories` (plural) sends `session_id` inside `items`. The two spellings differ
+  because the two boundaries differ; `store.ts` says so at the definition.
+
+### The mechanism, which matters more than the spelling
+
+**`#[serde(deny_unknown_fields)]` on every nested payload type.** `rename_all` makes *one* spelling work and
+still fails silently for every other one — it converts a bug into a convention rather than removing it.
+`deny_unknown_fields` makes any mismatch a hard error that names the key:
+
+    unknown field `sessionId`, expected one of `layer`, `text`, `session_id`, `subject`, `pinned`
+
+Pinned by `capture_input_rejects_the_camel_case_spelling`. Falsified by removing the attribute: the parse
+then **succeeded** with `session_id: None` — the original bug, reproduced in the failure message.
+
+### The harness had the same blind spot, which is why it survived
+
+The shim's `memory_capture_batch` case read the **camel** spelling, so it agreed with the very defect it
+existed to catch. It now validates the item key set against `["layer","text","session_id","subject",
+"pinned"]` and throws on anything else — mirroring `deny_unknown_fields` in JS.
+
+**And the path had no coverage at all.** No browser spec reached `memory_capture_batch`; the single-capture
+command was covered and correct, so hand-testing the screen looked fine while every batched capture stored
+a NULL session. `memory.spec.ts:338` now drives the batch path both ways: the working spelling stores the
+session id, and the camelCase one is refused *and writes nothing*. Falsified by removing the shim's check —
+the spec failed with `Received: null`, i.e. the camel payload was silently accepted.
+
+### Rules to carry forward
+
+1. A DTO and its read struct share **one** spelling. Decide per subsystem, not per struct.
+2. Every nested payload type gets `deny_unknown_fields`.
+3. A hand-written test double must be **as strict as the host**, or it certifies the bug.
+4. Ask whether the harness exercises the path at all — a green suite says nothing about an uncovered one.
+5. `MemoryInput`'s consumer swallows a capture failure on purpose ("a memory write must never fail a chat")
+   but now **logs** it (`engine.ts:113,172,294`). Detection belongs at the boundary, visibility at the
+   consumer: without the first the second never fires, and without the second the first is invisible.
