@@ -909,8 +909,34 @@ the DB unavailable, every request still succeeds.
    holding rows on purpose is otherwise indistinguishable from a drain that has stopped.
    No migration: `claimed_at` was already written on every claim.
 3. **L0 opt-in granularity.** Per scope or global? Per scope is safer and more annoying.
+   → **Decided 2026-09-21: per scope — and the opt-in is deliberately not built, because nothing
+   needs it yet.** The question presumes an opt-in exists; it does not. The gateway recall path
+   hardcodes `[L1, L2, L3]` (`context_scope.rs:593`), so L0 is never injected there and the *deny*
+   half is what ships. Per scope rather than global for the reason §0.4 already gives: L0 is verbatim
+   conversation, and a global switch is the one control whose failure mode is shipping one vendor's
+   session to another. A global flag is also the easier mistake to make later, which is why it is
+   worth writing down that it is wrong.
+   **Gap found while resolving this — still open, needs a call.** The webview path disagrees with the
+   gateway path. `Assistant.tsx:693` and `:770` call `recallContext(text)` with no `layers`, so
+   `engine.ts:345-348` takes its default two-pass branch — `["L3","L2"]` then `["L1","L0"]` — and L0
+   rows are recalled with **no session filter and no opt-in**. So the same app both forbids L0
+   injection (gateway) and performs it by default (Assistant), and the Assistant's version can pull
+   another session's verbatim turns into the prompt. That is exactly the privacy inversion §0.4
+   names. Two options: drop `L0` from the default in `engine.ts` (small, matches the gateway), or
+   leave it and build the per-scope flag for both paths. Recommendation: drop it from the default
+   now — the distilled layers are what the feature is for. **Not changed**, because it is a
+   behaviour change to a pre-existing feature and therefore the operator's call.
 4. **Multi-user.** `scope_user` is modelled but this is a single-user desktop app; the dimension is
    speculative until headless/service mode exists (§7 of `ARCHITECTURE.md` lists it as a non-goal).
+   → **Decided 2026-09-21: keep the column, build none of the semantics.** `scope_user` is a
+   *reserved dimension*, not a feature — it defaults to `'local'`, no UI writes it, no policy reads
+   it per user. Keeping it costs a column; adding it later costs a migration plus re-scoping every
+   stored row, and re-scoping is precisely what §3.5 rule 4 forbids ("a queued turn distilled after
+   its project changed must not be re-scoped"). The column is therefore cheap insurance against a
+   migration that would otherwise be lossy.
+   *Correction to the parenthetical:* headless mode is an explicit **v1 non-goal** (ARCHITECTURE.md,
+   window policy) **and** a listed **v2 extension point** (§7) — so it is deferred, not ruled out.
+   Multi-user proper arrives with it; until then the dimension is written but never read.
 5. **Cross-vendor privacy.** Even L1/L2 carries project facts to whichever vendor served the call.
    Worth an explicit statement in the UI, not just the docs.
    → **Decided 2026-09-21, stated beside the master switch** (`PRIVACY_NOTE` in `Memory.tsx`,
