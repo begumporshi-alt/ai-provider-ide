@@ -95,6 +95,21 @@ const gatewayStatus = {
   workerError: null as string | null,
 };
 
+/**
+ * The capture queue is host-owned exactly like gateway status: the UI reads it and cannot derive
+ * it. Settable here so a spec can arrange the one branch it could never otherwise produce — rows
+ * waiting while the hourly distillation budget is spent (§10(2)) — and so `budget_left` can be
+ * dropped to stand in for an older host that never reported it.
+ */
+const queueStatus = {
+  queued: 0,
+  processing: 0,
+  done: 0,
+  failed: 0,
+  outstanding: 0,
+  budget_left: 60 as number | undefined,
+};
+
 const NODE_KINDS = ["artifact", "memory", "skill", "message"];
 const EDGE_KINDS = [
   "produced", "used", "recalled", "follows", "references",
@@ -404,6 +419,13 @@ let eventSeq = 0;
    * Dev-only: it bypasses the React tree, so it is for arranging, never for asserting.
    */
   invoke: (cmd: string, args: Record<string, unknown> = {}) => handle(cmd, args),
+  /**
+   * Set what `capture_queue_status` reports — same reason as `gatewayStatus`: the drain and its
+   * budget live in the host, so the capped branch can only be arranged here.
+   */
+  queueStatus: (next: Partial<typeof queueStatus>): void => {
+    Object.assign(queueStatus, next);
+  },
   /** Read-only view of the persisted store (spec assertions inspect this). */
   store: {
     providers: () => [...providers.values()],
@@ -1275,10 +1297,14 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return [];
     case "memory_principal_list":
       return [];
-    case "model_context_count":
+    // Mirrors Rust exactly: the command is `router_model_context_count` (commands.rs). It was
+    // listed here unprefixed, and because the Memory screen loads this inside a `Promise.all` that
+    // swallows rejections, the throw silently nulled the whole section — the master switch, the
+    // queue and the principal list all rendered as "no data" while looking like they had loaded.
+    case "router_model_context_count":
       return 0;
     case "capture_queue_status":
-      return { queued: 0, processing: 0, done: 0, failed: 0, outstanding: 0 };
+      return { ...queueStatus };
     case "capture_purge_finished":
       return 0;
     case "gateway_memory_enabled":

@@ -250,6 +250,11 @@ function MemoryLayerSection({
     }
   }
 
+  // Older hosts do not report the budget; `undefined` must render as "unknown", not as zero —
+  // showing "0 left" on a host that has no cap would be a lie about work being withheld.
+  const budget = queue?.budget_left ?? null;
+  const held = budget === 0 && (queue?.outstanding ?? 0) > 0;
+
   return (
     <section
       className="mb-4 rounded border p-3"
@@ -277,6 +282,19 @@ function MemoryLayerSection({
           {queue ? `${queue.outstanding} awaiting distillation` : "queue —"}
           {queue && queue.outstanding > 0 ? ` (${queue.queued} queued · ${queue.processing} in flight)` : ""}
         </span>
+        {/* §10(2). A queue that is holding because the hourly budget is spent has to say so: without
+            this, "5 awaiting distillation" that never moves reads as a stuck drain rather than as a
+            cap doing its job. Optional because an older host does not report it. */}
+        {budget !== null && (
+          <span
+            data-testid="distill-budget"
+            style={held ? { color: "var(--warning)" } : undefined}
+          >
+            {held
+              ? "holding — hourly distillation budget spent"
+              : `${budget} distillations left this hour`}
+          </span>
+        )}
         <Button onClick={doDrain} disabled={busy}>
           {busy ? "distilling…" : "distil now"}
         </Button>

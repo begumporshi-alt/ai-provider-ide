@@ -902,3 +902,74 @@ has its own object sha; the `^{}` deref is what reveals the commit it points at.
 `gh` is not installed, so no GitHub Release page can be created from here; the tag is the release.
 **v1.0.0 = `d2aa481`** and deliberately excludes the gateway tool-audit work (it was cut first,
 per instruction), which landed as a later commit.
+
+---
+
+## The shim command audit — run this after adding any `#[tauri::command]`
+
+Found 2026-09-21 while adding a browser test for the distillation budget: the Memory screen's data
+load had **never succeeded in `web-test`**, and no test had failed.
+
+Mechanism: screens wrap loads in `Promise.all([...]).catch(() => undefined)`. One unknown command
+rejects the whole batch, so every other value in it stays `null` and the section renders as though
+it had loaded with no data. The concrete case was `modelContextCount()` calling
+`router_model_context_count` while the shim only had `model_context_count`.
+
+```bash
+cd apps/desktop && python3 - <<'PY'
+import re, pathlib
+pat = re.compile(r'invoke(?:<[^>]*>)?\(\s*"([a-z0-9_]+)"')
+src = set()
+for g in ('*.ts', '*.tsx'):
+    for p in pathlib.Path('src').rglob(g):
+        src |= set(pat.findall(p.read_text()))
+cases = set(re.findall(r'case "([a-z0-9_]+)":', pathlib.Path('web-test/shim.ts').read_text()))
+print("app calls", len(src), "shim cases", len(cases))
+print("MISSING FROM SHIM:", sorted(src - cases))
+print("SHIM-ONLY (dead cases):", sorted(cases - src))
+PY
+```
+
+Measured 2026-09-21: app calls **114**, shim has **87**, **27 missing**. Still outstanding
+(not fixed, reported to the user): `capture_claim`, `capture_complete`, `capture_release`,
+`capture_requeue_stale` (the whole "distil now" path), `memory_principal_set` (the per-client deny
+UI), `gateway_app_key_*`, `gateway_key_*`, `gateway_enable/disable`, `gateway_spend_*`,
+`gateway_tool_*`, `gateway_usage`, `gateway_worker_error`, `get/set_tools_*`,
+`router_model_context_replace`, `workbuddy_set_models`, `workbuddy_status`.
+
+Corollary for writing specs: **assert on the loaded state, not just on the section rendering.** A
+test that only checks the heading is visible passes against a screen whose data never arrived.
+
+## Browser-harness traps (2026-09-21)
+
+- **Unset the proxy env or Playwright cannot start its webServers.** With `HTTP_PROXY` set,
+  `playwright test` dies with `Error: Timed out waiting 30000ms from config.webServer` even though
+  both servers are up and curling fine — Playwright's own readiness probe goes through the proxy.
+  Always `env -u NODE_OPTIONS -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
+- **A vite started with `&` inside a Bash tool call dies when that call returns.** Use
+  `run_in_background: true`. Symptom: `lsof` shows the port listening, `curl` gets 000.
+- **The nav button is "Local Gateway", not "Gateway".** `getByRole("button", { name: "Gateway" })`
+  (no `exact`) only matches because matching is substring — with `exact: true` it resolves to
+  nothing and the test hangs to timeout.
+- **A Playwright run that hits a 30s expect timeout can push the whole run past the 120s Bash
+  default and get SIGTERM'd (exit 137)**, which looks like a crashed harness rather than a failing
+  assertion. Redirect to a log and read it, or raise the timeout.
+- The shim's state is **per page load**. To arrange host state, `page.evaluate` the setter and then
+  navigate away and back so the screen remounts — `page.reload()` discards what you just arranged.
+
+## §10(2) distillation budget — landed 2026-09-21
+
+`capture.rs`: `DISTILL_BUDGET_PER_HOUR = 60`, `DISTILL_WINDOW_MS = 60 * 60 * 1000`,
+`fn budget_left(conn)` counting `memory_pending` rows with `claimed_at > now - window`.
+`claim()` returns empty when the budget is 0 and otherwise takes `CLAIM_LIMIT.min(budget)`.
+`QueueStatus.budget_left` surfaces it; `Memory.tsx` renders `data-testid="distill-budget"`.
+
+Two design constraints worth keeping:
+- The cap sits **inside `claim()`**, before the row is marked `processing`. Claiming and then
+  declining to call would spend an `attempt`, and three attempts retire the row as `failed` — the
+  cap would delete the work it was meant to delay.
+- Counted at **claim**, not completion: the provider call is made on claim, so a call that then
+  failed was still paid for. Needs no migration, `claimed_at` was already written.
+
+Todo carried forward: `clear_app_key_cache` (gateway.rs:807, `#[cfg(test)]`) is never called and
+produces the crate's only warning. Harmless, but it is vestigial from the app-key cache work.

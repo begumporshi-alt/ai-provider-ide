@@ -44,6 +44,37 @@ const STALE_CLAIM_MS: i64 = 10 * 60 * 1000;
 /// How many rows one drain batch may claim.
 const CLAIM_LIMIT: usize = 8;
 
+/// §10(2) — who pays for distillation. Every captured turn costs one system-route call, so a queue
+/// that drains everything it is given turns "memory is on" into an unbudgeted line item on a
+/// provider bill. This caps **spend**, not queue size: at most this many distillations per rolling
+/// hour, across all sessions.
+///
+/// Chosen to match the drain's own cadence — one per minute against a 60s poll — so the queue keeps
+/// moving at a predictable rate instead of either stalling or bursting. It is a constant rather than
+/// a setting because the failure mode it prevents is a *silent* one; making it tunable invites
+/// setting it to something that defeats it. Raise it here if a real workload needs more.
+pub const DISTILL_BUDGET_PER_HOUR: usize = 60;
+
+/// The rolling window the budget is spent against.
+const DISTILL_WINDOW_MS: i64 = 60 * 60 * 1000;
+
+/// How much of the hourly budget is left, measured by rows **claimed** in the window.
+///
+/// Claims, not completions: the cost is incurred when the call is made, so a row that is claimed and
+/// then fails has still been paid for. Using `claimed_at` needs no migration — it is already written
+/// on every claim — and it cannot drift from what the host actually did.
+fn budget_left(conn: &rusqlite::Connection) -> usize {
+    let used: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_pending
+              WHERE claimed_at IS NOT NULL AND claimed_at > ?1",
+            params![now_ms() - DISTILL_WINDOW_MS],
+            |r| r.get(0),
+        )
+        .unwrap_or(0);
+    DISTILL_BUDGET_PER_HOUR.saturating_sub(used.max(0) as usize)
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -393,13 +424,22 @@ pub struct PendingRow {
 /// and so a crash mid-batch can be recovered by `requeue_stale`.
 pub fn claim(store: &Store) -> Result<Vec<PendingRow>, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    // §10(2): a claim takes at most what the hourly budget has left. When it is exhausted nothing
+    // is marked and no attempt is spent — the rows simply wait for the window to roll, which is the
+    // whole point. Claiming and then declining to call would burn their three attempts on calls
+    // that were never going to happen.
+    let budget = budget_left(&conn);
+    if budget == 0 {
+        return Ok(Vec::new());
+    }
+    let limit = CLAIM_LIMIT.min(budget);
     let mut ids: Vec<i64> = Vec::new();
     {
         let mut stmt = conn
             .prepare("SELECT id FROM memory_pending WHERE status='queued' ORDER BY id LIMIT ?1")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![CLAIM_LIMIT as i64], |r| r.get::<_, i64>(0))
+            .query_map(params![limit as i64], |r| r.get::<_, i64>(0))
             .map_err(|e| e.to_string())?;
         for r in rows {
             ids.push(r.map_err(|e| e.to_string())?);
@@ -503,11 +543,17 @@ pub struct QueueStatus {
     /// Rows the drain has not finished with. Computed host-side so the UI cannot get it wrong by
     /// adding the wrong two fields together.
     pub outstanding: usize,
+    /// Distillations still available in this hour (§10(2)). Zero means the queue is holding rows
+    /// deliberately, not that anything is stuck — without it, "5 awaiting distillation" that never
+    /// moves looks like a bug rather than a budget doing its job.
+    pub budget_left: usize,
 }
 
 pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    let mut out = QueueStatus { queued: 0, processing: 0, done: 0, failed: 0, outstanding: 0 };
+    let mut out = QueueStatus {
+        queued: 0, processing: 0, done: 0, failed: 0, outstanding: 0, budget_left: 0,
+    };
     let mut stmt = conn
         .prepare("SELECT status, COUNT(*) FROM memory_pending GROUP BY status")
         .map_err(|e| e.to_string())?;
@@ -525,6 +571,7 @@ pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
         }
     }
     out.outstanding = out.queued + out.processing;
+    out.budget_left = budget_left(&conn);
     Ok(out)
 }
 
@@ -572,6 +619,23 @@ mod capture_tests {
         let dir = std::env::temp_dir().join(format!("aip-cap-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         (Store::open(&dir).unwrap(), dir)
+    }
+
+    /// Spend `n` of the hourly budget on rows that were claimed at `at` (default: now). This is
+    /// what the host would have left behind by actually making `n` calls; faking it keeps the test
+    /// about the budget rather than about the drain.
+    fn spend_budget(s: &Store, tag: &str, n: usize, at: Option<i64>) {
+        let conn = s.conn.lock().unwrap();
+        let at = at.unwrap_or_else(now_ms);
+        for i in 0..n {
+            conn.execute(
+                "INSERT INTO memory_pending
+                   (request_id, scope_user, content_class, user_text, status, created_at, claimed_at)
+                 VALUES (?1, 'local', 'fact', 'spent', 'processing', ?2, ?2)",
+                params![format!("spend-{tag}-{i}"), at],
+            )
+            .unwrap();
+        }
     }
 
     // ---------- §3.5.1 ----------
@@ -847,6 +911,112 @@ mod capture_tests {
         let st = queue_status(&s).unwrap();
         assert_eq!((st.done, st.queued, st.processing), (2, 0, 0));
         assert_eq!(st.outstanding, 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------- §10(2): distillation spend is capped ----------
+
+    const PROSE: &str = "a sufficiently long piece of conversational prose to be worth capturing";
+
+    /// The point of the cap: a queue that is full but over budget must hold, not drain.
+    #[test]
+    fn an_exhausted_budget_claims_nothing() {
+        let (s, d) = temp_store("budget-out");
+        let sc = scope(Some("p1"), None);
+        let body = json!({"messages":[{"role":"user","content":"x"}]});
+        enqueue(&s, &req(&body, &sc, PROSE, None));
+        spend_budget(&s, "out", DISTILL_BUDGET_PER_HOUR, None);
+
+        assert!(claim(&s).unwrap().is_empty(), "an hour's worth of calls is enough");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The failure this guards against is quiet and permanent: a claimed row that is never called
+    /// would still be counted as an attempt, and three of those retire the turn as `failed` — so a
+    /// budget cap that burns attempts would delete the work it is meant only to delay.
+    #[test]
+    fn a_capped_claim_burns_no_attempts_and_loses_no_rows() {
+        let (s, d) = temp_store("budget-attempts");
+        let sc = scope(Some("p1"), None);
+        let body = json!({"messages":[{"role":"user","content":"x"}]});
+        enqueue(&s, &req(&body, &sc, PROSE, None));
+        spend_budget(&s, "attempts", DISTILL_BUDGET_PER_HOUR, None);
+
+        for _ in 0..DISTILL_BUDGET_PER_HOUR {
+            assert!(claim(&s).unwrap().is_empty());
+        }
+
+        let conn = s.conn.lock().unwrap();
+        let (status, attempts): (String, i64) = conn
+            .query_row("SELECT status, attempts FROM memory_pending WHERE id = 1", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(status, "queued", "the row is waiting, not retired");
+        assert_eq!(attempts, 0, "a call that never happened spent nothing");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_partially_spent_budget_claims_the_remainder_not_the_batch_limit() {
+        let (s, d) = temp_store("budget-partial");
+        let sc = scope(Some("p1"), None);
+        let body = json!({"messages":[{"role":"user","content":"x"}]});
+        // Three left: fewer than a full batch, so the cap is what binds, not `CLAIM_LIMIT`.
+        spend_budget(&s, "partial", DISTILL_BUDGET_PER_HOUR - 3, None);
+        for i in 0..CLAIM_LIMIT {
+            let text = format!("a sufficiently long piece of prose number {i}");
+            let rid = format!("gw-{i}");
+            let mut r = req(&body, &sc, &text, None);
+            r.request_id = &rid;
+            assert!(matches!(enqueue(&s, &r), Enqueue::Queued(_)));
+        }
+
+        assert_eq!(claim(&s).unwrap().len(), 3, "the cap is a remainder, not an all-or-nothing");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A cap that never releases would make the memory feature silently dead rather than merely
+    /// rate-limited.
+    #[test]
+    fn the_budget_recovers_as_the_window_rolls() {
+        let (s, d) = temp_store("budget-rolls");
+        let sc = scope(Some("p1"), None);
+        let body = json!({"messages":[{"role":"user","content":"x"}]});
+        enqueue(&s, &req(&body, &sc, PROSE, None));
+        spend_budget(&s, "rolls", DISTILL_BUDGET_PER_HOUR, None);
+        assert!(claim(&s).unwrap().is_empty());
+
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE memory_pending SET claimed_at = ?1",
+                params![now_ms() - DISTILL_WINDOW_MS - 1],
+            )
+            .unwrap();
+        }
+        assert_eq!(claim(&s).unwrap().len(), 1, "an hour later the row is drainable again");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The Memory screen needs this or a queue that is holding on purpose reads as a stuck queue.
+    #[test]
+    fn the_queue_reports_the_budget_that_is_left() {
+        let (s, d) = temp_store("budget-status");
+        assert_eq!(
+            queue_status(&s).unwrap().budget_left,
+            DISTILL_BUDGET_PER_HOUR,
+            "nothing spent yet"
+        );
+        spend_budget(&s, "recent", 4, None);
+        assert_eq!(queue_status(&s).unwrap().budget_left, DISTILL_BUDGET_PER_HOUR - 4);
+        spend_budget(&s, "old", DISTILL_BUDGET_PER_HOUR, Some(now_ms() - DISTILL_WINDOW_MS - 1));
+        assert_eq!(
+            queue_status(&s).unwrap().budget_left,
+            DISTILL_BUDGET_PER_HOUR - 4,
+            "claims older than the window are not still being paid for"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

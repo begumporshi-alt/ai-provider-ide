@@ -74,6 +74,48 @@ test("memory: the four layers are listed and the header counts them separately",
   await expect(page.getByText("Works on the AI-Provider Router desktop app")).toBeVisible();
 });
 
+/**
+ * §10(2). Distillation costs a provider call per captured turn, so the queue is capped per hour.
+ * A cap that shows nothing is indistinguishable from a drain that has stopped, which is the whole
+ * reason the screen states it.
+ */
+test("memory: the distillation budget is stated, and a queue held by it says why", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  await expect(page.getByTestId("distill-budget")).toContainText("60 distillations left this hour");
+
+  // Arrange the capped branch: five rows waiting, nothing left to spend on them this hour. Set
+  // before the screen mounts — the shim's state is per-page, so a reload would discard it.
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__webTest.queueStatus({ queued: 5, outstanding: 5, budget_left: 0 });
+  });
+  // Away and back: `load()` runs on mount, and the shim's state is per-page, so a reload would
+  // discard what was just arranged.
+  await page.getByRole("button", { name: "Local Gateway", exact: true }).click();
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  await expect(page.getByTestId("distill-budget")).toContainText("holding");
+  await expect(page.getByTestId("distill-budget")).toContainText("budget spent");
+});
+
+/**
+ * `budget_left` is optional on the wire: a host built before the cap does not send it. Showing
+ * "0 left" there would be a lie about work being withheld, so the line has to vanish instead.
+ */
+test("memory: a host that does not report the budget shows no budget line", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__webTest.queueStatus({ queued: 3, outstanding: 3, budget_left: undefined });
+  });
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  await expect(page.getByTestId("distill-budget")).toHaveCount(0);
+  // The queue itself is still reported — only the unknown field is withheld.
+  await expect(page.getByText("3 awaiting distillation")).toBeVisible();
+});
+
 test("memory: a layer filter narrows the list", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await seedMemories(page);

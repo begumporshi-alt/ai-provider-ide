@@ -905,6 +905,8 @@ export interface PendingRow {
 
 export interface QueueStatus {
   queued: number; processing: number; done: number; failed: number; outstanding: number;
+  /** §10(2): distillations still available in this rolling hour. Absent on an older host. */
+  budget_left?: number;
 }
 
 /**

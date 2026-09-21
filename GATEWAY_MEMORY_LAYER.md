@@ -850,6 +850,15 @@ the DB unavailable, every request still succeeds.
    not a feature. Decide before Phase 1, not after.
 2. **Who pays for distillation.** Every captured turn costs a system-route call. Cap per session or
    per hour, or the memory feature becomes a quiet line item on the bill.
+   → **Decided 2026-09-21, per hour, host-wide.** `capture::DISTILL_BUDGET_PER_HOUR` = 60
+   distillations per rolling hour, counted by rows **claimed** (not completed) in the last hour —
+   the cost is incurred when the call is made, so a call that then failed was still paid for. The
+   cap lives inside `claim()`, so an over-budget drain takes nothing: it does not mark rows
+   `processing` and does not spend an `attempt`, which matters because three attempts retire a row
+   as `failed` — a cap that burned attempts would quietly **delete** the work it meant only to
+   delay. `queue_status` reports `budget_left` and the Memory screen shows it, because a queue
+   holding rows on purpose is otherwise indistinguishable from a drain that has stopped.
+   No migration: `claimed_at` was already written on every claim.
 3. **L0 opt-in granularity.** Per scope or global? Per scope is safer and more annoying.
 4. **Multi-user.** `scope_user` is modelled but this is a single-user desktop app; the dimension is
    speculative until headless/service mode exists (§7 of `ARCHITECTURE.md` lists it as a non-goal).
