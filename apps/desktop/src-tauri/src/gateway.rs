@@ -28,6 +28,7 @@ use rand::Rng as _;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
+use crate::injection_log::{InjectionEvent, InjectionLog, InjectionStats};
 use crate::vault;
 
 pub const DEFAULT_PORT: u16 = 8787;
@@ -568,6 +569,17 @@ pub struct GatewayCore {
     /// How long a frozen block is served before recall runs again. A field, not a constant, for the
     /// same reason `first_msg_timeout` is one: ten minutes is not something a test can wait for.
     memory_freeze_ttl: Mutex<Duration>,
+    /// What the memory layer actually did, request by request, for the Control screen.
+    ///
+    /// The `AIP-Memory` response header already carries these facts — but it goes to the *client* and
+    /// nowhere else, so the operator had no way to answer "why didn't the model know X" without
+    /// attaching a proxy to their own gateway. This keeps a bounded in-process copy.
+    ///
+    /// In-memory deliberately: the memory path is built never to block a request (`MEMORY_DEADLINE`,
+    /// 15 ms), so its telemetry must not either. One uncontended lock, no SQLite write — a per-request
+    /// row would contradict the design it exists to observe. A field rather than a global so tests
+    /// stay isolated; see `injection_log`.
+    injection_log: Mutex<InjectionLog>,
 }
 
 /// §5.5: a composed memory block held still across requests.
@@ -670,6 +682,7 @@ impl GatewayCore {
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
             memory_freeze: Mutex::new(HashMap::new()),
             memory_freeze_ttl: Mutex::new(MEMORY_FREEZE_TTL),
+            injection_log: Mutex::new(InjectionLog::new()),
         }
     }
 
@@ -899,6 +912,38 @@ impl GatewayCore {
 
     pub fn memory_freeze_ttl(&self) -> Duration {
         self.memory_freeze_ttl.lock().map(|g| *g).unwrap_or(MEMORY_FREEZE_TTL)
+    }
+
+    /// Record one request's memory outcome, for the Control screen.
+    ///
+    /// Called from the four ingress handlers — the only place that holds both the outcome and the
+    /// client-visible request id. Deliberately *not* called from inside `inject_context`: that
+    /// function has ~30 call sites in tests, none of which should be writing telemetry, and keeping
+    /// the injection contract free of side effects is worth the four extra call sites.
+    ///
+    /// The `InjectionOutcome` → `InjectionEvent` mapping lives here rather than in the handlers: it is
+    /// mechanical, and four copies of it are four chances to drop a field. `id` is the bridge slot id;
+    /// the client-visible form is `gw-{id}`.
+    ///
+    /// Cannot fail a request. A poisoned lock is impossible (`panic = "abort"`), so the `unwrap` needs
+    /// no handling.
+    pub fn record_injection(&self, id: u64, model: &str, outcome: &context_scope::InjectionOutcome) {
+        self.injection_log.lock().unwrap().record(InjectionEvent {
+            ts_ms: crate::injection_log::now_ms(),
+            id: format!("gw-{id}"),
+            model: model.to_string(),
+            scope: outcome.scope.clone(),
+            injected: outcome.injected,
+            items: outcome.items,
+            context: outcome.context,
+            tokens: outcome.tokens,
+            reason: outcome.reason.as_str().to_string(),
+        });
+    }
+
+    /// What the memory layer has done since launch.
+    pub fn injection_stats(&self) -> InjectionStats {
+        self.injection_log.lock().unwrap().snapshot()
     }
 
     /// R4: attach the monthly spend gate. Builder, like `with_app_keys`, so `new()` keeps the

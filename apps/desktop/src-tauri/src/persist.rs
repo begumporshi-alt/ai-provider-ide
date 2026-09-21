@@ -578,6 +578,70 @@ pub struct GeneratorAuditRow {
     pub redaction_hash: String,
 }
 
+/// One recorded generation, as read back for the audit card.
+///
+/// Deliberately a different type from `GeneratorAuditRow`: this one carries the `id` and the host's
+/// `ts`, and the write shape must not, or a caller could backdate an entry or collide ids.
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GeneratorAuditEntry {
+    pub id: i64,
+    pub ts_ms: i64,
+    pub model_used: String,
+    /// **Estimated, not measured.** Both producers send `chars / 4`. The column is named `tokens`
+    /// and this DTO keeps that name, but the card must not present the number as a tokenizer count.
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub redaction_hash: String,
+}
+
+/// A caller asking for more than this is not reading a trail, it is scraping one.
+const AUDIT_MAX_LIMIT: usize = 500;
+
+/// Read the generation audit, newest first.
+///
+/// Extracted from the command because a `#[tauri::command]` needs a `State` and cannot be
+/// unit-tested — the house pattern (REFERENCE.md §Tauri commands).
+///
+/// `ORDER BY ts DESC, id DESC`: `ts` is `now_ms()` and two generations in the same millisecond are
+/// ordinary, so ordering on the clock alone would leave their order to SQLite. `id` is the rowid and
+/// is monotonic, which makes the tie deterministic — the same rule that forbids ordering two captures
+/// on the clock without a tiebreak.
+///
+/// The floor of one matches `gateway_log_tail`'s. Two readers of two trails, sitting on the same
+/// screen, should not disagree about what `limit: 0` means.
+pub(crate) fn list_generator_audit(
+    store: &Store,
+    limit: usize,
+) -> Result<Vec<GeneratorAuditEntry>, CommandError> {
+    let limit = limit.clamp(1, AUDIT_MAX_LIMIT);
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, ts, model_used, prompt_tokens, completion_tokens, redaction_hash \
+         FROM generator_audit ORDER BY ts DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok(GeneratorAuditEntry {
+            id: r.get(0)?,
+            ts_ms: r.get(1)?,
+            model_used: r.get(2)?,
+            prompt_tokens: r.get(3)?,
+            completion_tokens: r.get(4)?,
+            redaction_hash: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The AI generation trail, newest first — see `list_generator_audit`.
+#[tauri::command]
+pub fn generator_audit_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+) -> Result<Vec<GeneratorAuditEntry>, CommandError> {
+    list_generator_audit(&store, limit.unwrap_or(50))
+}
+
 // ---------- drift events + repair staging (§2.10, Phase 5) ----------
 
 #[tauri::command]
@@ -598,6 +662,74 @@ pub fn drift_event_resolve(store: State<'_, Arc<Store>>, provider_id: String, re
         params![provider_id, resolution, now_ms()],
     )?;
     Ok(())
+}
+
+/// A caller asking for more than this is not reading a trail, it is scraping one.
+const DRIFT_MAX_LIMIT: usize = 500;
+
+/// One recorded drift event, as read back for the history card.
+///
+/// `trigger_json` is passed through raw: it is the host's own `DriftEvidence` blob, and the card renders
+/// a summary from it rather than the reader inventing a shape. `resolution` and `resolved_at` are
+/// `Option` because an open event has neither — "still drifting" versus "repaired" is the whole reason
+/// the row exists, so the read shape must be able to express both.
+#[derive(Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct DriftEventEntry {
+    pub id: i64,
+    pub provider_id: String,
+    pub detected_at: i64,
+    pub trigger_json: String,
+    pub resolution: Option<String>,
+    pub resolved_at: Option<i64>,
+}
+
+/// Read the drift history, newest first.
+///
+/// Extracted from the command because a `#[tauri::command]` needs a `State` and cannot be unit-tested —
+/// the house pattern (REFERENCE.md §Tauri commands).
+///
+/// `ORDER BY detected_at DESC, id DESC`: two events in the same millisecond are ordinary — a detection
+/// and the repair that answers it can land together — so ordering on the clock alone would leave their
+/// order to SQLite. `id` is the rowid and is monotonic, which makes the tie deterministic. Same rule,
+/// same reason, as `list_generator_audit`.
+///
+/// `COALESCE(trigger_json,'{}')` rather than a nullable field: the column *is* nullable, and the other
+/// reader of this table (`diagnostics_json`) already coalesces, so the two agree. An empty object parses
+/// to an empty summary instead of failing the row.
+///
+/// The floor of one matches the other two trail readers. Three readers of three trails on one screen
+/// must not disagree about what `limit: 0` means.
+pub(crate) fn list_drift_events(
+    store: &Store,
+    limit: usize,
+) -> Result<Vec<DriftEventEntry>, CommandError> {
+    let limit = limit.clamp(1, DRIFT_MAX_LIMIT);
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn.prepare(
+        "SELECT id, provider_id, detected_at, COALESCE(trigger_json,'{}'), resolution, resolved_at \
+         FROM drift_events ORDER BY detected_at DESC, id DESC LIMIT ?1",
+    )?;
+    let rows = stmt.query_map([limit as i64], |r| {
+        Ok(DriftEventEntry {
+            id: r.get(0)?,
+            provider_id: r.get(1)?,
+            detected_at: r.get(2)?,
+            trigger_json: r.get(3)?,
+            resolution: r.get(4)?,
+            resolved_at: r.get(5)?,
+        })
+    })?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// The recorded drift history, newest first — see `list_drift_events`.
+#[tauri::command]
+pub fn drift_events_list(
+    store: State<'_, Arc<Store>>,
+    limit: Option<usize>,
+) -> Result<Vec<DriftEventEntry>, CommandError> {
+    list_drift_events(&store, limit.unwrap_or(50))
 }
 
 #[tauri::command]
@@ -1380,4 +1512,285 @@ fn diagnostics_json(conn: &rusqlite::Connection) -> Result<String, rusqlite::Err
         "driftEvents": drift,
     })
     .to_string())
+}
+
+#[cfg(test)]
+mod generator_audit_tests {
+    use super::*;
+
+    fn tmp_store(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-gen-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::open(&dir).unwrap(), dir)
+    }
+
+    /// Insert with an **explicit** timestamp. `now_ms()` on two consecutive calls usually lands in the
+    /// same millisecond, so a test that let the host stamp these could not tell the ordering rule from
+    /// the tiebreak rule.
+    fn record_at(store: &Store, model: &str, ts: i64) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash) \
+             VALUES (?1,?2,?3,?4,?5)",
+            params![ts, model, 10i64, 20i64, "deadbeef"],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_newest_generation_comes_first() {
+        let (store, dir) = tmp_store("order");
+        record_at(&store, "oldest", 1_000);
+        record_at(&store, "middle", 2_000);
+        record_at(&store, "newest", 3_000);
+
+        let got = list_generator_audit(&store, 10).unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.model_used.as_str()).collect::<Vec<_>>(),
+            vec!["newest", "middle", "oldest"]
+        );
+        // The read shape carries the host's stamp, which the write shape deliberately cannot set.
+        assert_eq!(got[0].ts_ms, 3_000);
+        assert!(got[0].id > got[2].id, "ids are the rowid and increase with insertion");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two generations in the same millisecond are ordinary — a repair plan and its patch, or two
+    /// candidates in one wizard run. Ordering on the clock alone would leave their order to SQLite.
+    #[test]
+    fn a_tie_on_the_timestamp_is_broken_by_the_newer_row() {
+        let (store, dir) = tmp_store("tie");
+        record_at(&store, "first", 5_000);
+        record_at(&store, "second", 5_000);
+
+        let got = list_generator_audit(&store, 10).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].model_used, "second", "the later insert wins the tie");
+        assert_eq!(got[1].model_used, "first");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_limit_keeps_the_newest_and_drops_the_rest() {
+        let (store, dir) = tmp_store("limit");
+        record_at(&store, "one", 1_000);
+        record_at(&store, "two", 2_000);
+        record_at(&store, "three", 3_000);
+
+        let got = list_generator_audit(&store, 2).unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.model_used.as_str()).collect::<Vec<_>>(),
+            vec!["three", "two"],
+            "a tail read that dropped the recent end would be useless"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same floor as `gateway_log_tail`: a caller asking for nothing is a bug, and the newest
+    /// entry is the more useful reading of it. Two readers of two trails on one screen must not
+    /// disagree about what `limit: 0` means.
+    #[test]
+    fn a_zero_limit_still_returns_one_entry() {
+        let (store, dir) = tmp_store("zero");
+        record_at(&store, "only", 1_000);
+        assert_eq!(list_generator_audit(&store, 0).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling is a real bound, not a comment: asking for more than `AUDIT_MAX_LIMIT` must return
+    /// the cap rather than the table.
+    #[test]
+    fn the_ceiling_is_enforced() {
+        let (store, dir) = tmp_store("ceiling");
+        {
+            let conn = store.conn.lock().unwrap();
+            for i in 0..(AUDIT_MAX_LIMIT + 1) {
+                conn.execute(
+                    "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash) \
+                     VALUES (?1,?2,?3,?4,?5)",
+                    params![i as i64, "m", 1i64, 1i64, "h"],
+                )
+                .unwrap();
+            }
+        }
+
+        let got = list_generator_audit(&store, 10_000).unwrap();
+        assert_eq!(got.len(), AUDIT_MAX_LIMIT);
+        // The newest survived the cap, which is the point of capping the read rather than the write.
+        assert_eq!(got[0].ts_ms, AUDIT_MAX_LIMIT as i64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_trail_is_empty_not_an_error() {
+        let (store, dir) = tmp_store("empty");
+        assert!(list_generator_audit(&store, 50).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod drift_history_tests {
+    use super::*;
+
+    /// `foreign_keys` is ON (`store.rs:508`), so the FK to `providers` is enforced and a drift row cannot
+    /// exist without its provider. Seeding one is a precondition of every test here, not scaffolding for
+    /// one of them.
+    fn tmp_store(tag: &str) -> (Store, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-drift-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Store::open(&dir).unwrap();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id, slug, name, base_url, created_at, updated_at) \
+                 VALUES ('p','p-slug','P','https://x',0,0)",
+                [],
+            )
+            .unwrap();
+        }
+        (store, dir)
+    }
+
+    /// Insert with an **explicit** timestamp. `now_ms()` on two consecutive calls usually lands in the
+    /// same millisecond, so a test that let the host stamp these could not tell the ordering rule from
+    /// the tiebreak rule.
+    fn event_at(store: &Store, ts: i64, trigger: &str) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES ('p',?1,?2)",
+            params![ts, trigger],
+        )
+        .unwrap();
+    }
+
+    fn resolve_open(store: &Store, resolution: &str, ts: i64) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE drift_events SET resolution=?1, resolved_at=?2 WHERE resolution IS NULL",
+            params![resolution, ts],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_newest_drift_event_comes_first() {
+        let (store, dir) = tmp_store("order");
+        event_at(&store, 1_000, r#"{"errors":5}"#);
+        event_at(&store, 2_000, r#"{"errors":6}"#);
+        event_at(&store, 3_000, r#"{"errors":7}"#);
+
+        let got = list_drift_events(&store, 10).unwrap();
+        assert_eq!(
+            got.iter().map(|e| e.detected_at).collect::<Vec<_>>(),
+            vec![3_000, 2_000, 1_000]
+        );
+        assert_eq!(got[0].trigger_json, r#"{"errors":7}"#);
+        assert!(got[0].id > got[2].id, "ids are the rowid and increase with insertion");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A detection and the repair that answers it can land in one millisecond. Ordering on the clock
+    /// alone would leave their order to SQLite.
+    #[test]
+    fn a_tie_on_the_detection_time_is_broken_by_the_newer_row() {
+        let (store, dir) = tmp_store("tie");
+        event_at(&store, 5_000, r#"{"errors":1}"#);
+        event_at(&store, 5_000, r#"{"errors":2}"#);
+
+        let got = list_drift_events(&store, 10).unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].trigger_json, r#"{"errors":2}"#, "the later insert wins the tie");
+        assert_eq!(got[1].trigger_json, r#"{"errors":1}"#);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The distinction the row exists for. An open event and a repaired one must not read alike, and
+    /// neither may read as a *missing* value — `None` here means "still drifting", not "unknown".
+    #[test]
+    fn an_open_event_is_unresolved_and_a_repaired_one_carries_its_resolution() {
+        let (store, dir) = tmp_store("resolution");
+        event_at(&store, 1_000, r#"{"errors":5}"#);
+        event_at(&store, 2_000, r#"{"errors":5}"#);
+        resolve_open(&store, "repaired v2", 3_000);
+
+        let got = list_drift_events(&store, 10).unwrap();
+        assert_eq!(got.len(), 2);
+        // Both were open, so both were resolved by the same statement — the host's own semantics.
+        assert!(got.iter().all(|e| e.resolution.as_deref() == Some("repaired v2")));
+        assert!(got.iter().all(|e| e.resolved_at == Some(3_000)));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `trigger_json` is nullable, and the other reader of this table coalesces. A NULL must not drop
+    /// the row from the trail or fail the whole call — losing the event is the exact failure this
+    /// reader exists to prevent.
+    #[test]
+    fn a_null_trigger_reads_as_an_empty_object_rather_than_failing() {
+        let (store, dir) = tmp_store("nulltrigger");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES ('p',1,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let got = list_drift_events(&store, 10).unwrap();
+        assert_eq!(got.len(), 1, "the row is kept, not dropped");
+        assert_eq!(got[0].trigger_json, "{}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The same floor as `gateway_log_tail` and `list_generator_audit`. Three readers of three trails
+    /// on one screen must not disagree about what `limit: 0` means.
+    #[test]
+    fn a_zero_limit_still_returns_one_entry() {
+        let (store, dir) = tmp_store("zero");
+        event_at(&store, 1_000, "{}");
+        assert_eq!(list_drift_events(&store, 0).unwrap().len(), 1);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The ceiling is a real bound, not a comment: asking for more than `DRIFT_MAX_LIMIT` must return
+    /// the cap rather than the table.
+    #[test]
+    fn the_ceiling_is_enforced() {
+        let (store, dir) = tmp_store("ceiling");
+        {
+            let conn = store.conn.lock().unwrap();
+            for i in 0..(DRIFT_MAX_LIMIT + 1) {
+                conn.execute(
+                    "INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES ('p',?1,'{}')",
+                    params![i as i64],
+                )
+                .unwrap();
+            }
+        }
+
+        let got = list_drift_events(&store, 10_000).unwrap();
+        assert_eq!(got.len(), DRIFT_MAX_LIMIT);
+        // The newest survived the cap, which is the point of capping the read rather than the write.
+        assert_eq!(got[0].detected_at, DRIFT_MAX_LIMIT as i64);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_empty_history_is_empty_not_an_error() {
+        let (store, dir) = tmp_store("empty");
+        assert!(list_drift_events(&store, 50).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

@@ -63,6 +63,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     // + injects a memory block when the toggle allows it. The outcome is reported on the response
     // as `AIP-Memory` / `AIP-Memory-Scope`.
     let outcome = inject_context(&core, &headers, None, &mut req);
+    core.record_injection(id, &model, &outcome);
     // Capture inputs are computed before dispatch: the stream branch builds a `'static` body and so
     // cannot borrow the request.
     let prep = prepare_capture(&core, &headers, &req, id);

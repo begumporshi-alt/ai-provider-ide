@@ -116,7 +116,30 @@ pub enum ScopeAssignment {
     Unscoped,
 }
 
+/// A memory as the webview submits it.
+///
+/// **Field names are snake_case on the wire — there is no `rename_all` here, deliberately.**
+/// `MemoryInput` is the write half of a pair whose read half is `Memory` (below), which also carries
+/// no `rename_all` and therefore serialises as `session_id`. The webview's own `Memory` type matches
+/// that, as do this struct's siblings in the same subsystem — `ContextNode.session_id`,
+/// `ContextEdge.from_id`/`to_id`. A DTO and its read struct must agree on one spelling: two spellings
+/// for the same `session_id` is a defect waiting for whoever next joins a memory row to a context
+/// node. (The `persist::*` registry rows are camelCase and that is fine — they are symmetric
+/// read+write rows, which is exactly why passing a webview record through unchanged works there.)
+///
+/// `deny_unknown_fields` is the other half of the fix and is **not** cosmetic. Serde's default is to
+/// *ignore* an unknown key, so a misspelled field does not error — it silently becomes `None`. That is
+/// precisely how `memory_capture_batch` dropped `sessionId` for months: every L0 row written through
+/// `rememberTurn` landed with `session_id = NULL`, which in turn disabled the per-session ring cap in
+/// `prune` (it is guarded by `session_id IS NOT NULL`). With this attribute a wrong spelling is a hard
+/// error at the boundary rather than a silent null, and
+/// `capture_input_rejects_the_camel_case_spelling` pins that.
+///
+/// The consumer (`engine.ts`) still swallows a capture failure on purpose — a memory write must never
+/// fail a chat — so it *logs* rather than rethrowing. Detection lives here; visibility lives there.
+/// Both are required: without this attribute the consumer's catch never even fires.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MemoryInput {
     pub layer: String,
     pub text: String,
@@ -1596,6 +1619,55 @@ mod memory_tests {
         assert_eq!(list(&s, None, 10).unwrap().len(), 1);
         assert!(b.updated_at >= a.updated_at);
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The webview sends `session_id` — the snake spelling, matching the `Memory` read struct and the
+    /// webview's own `Memory` type.
+    ///
+    /// This asserts the *deserialised struct*, not the database, because the serde boundary is where
+    /// the field was historically lost; a store round-trip would have been satisfied by the `input()`
+    /// helper, which builds the struct by literal and so never goes through serde at all.
+    #[test]
+    fn capture_input_reads_the_snake_case_session_id_the_webview_sends() {
+        let parsed: MemoryInput = serde_json::from_str(
+            r#"{"layer":"L0","text":"hello","session_id":"s-1","subject":"user","pinned":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.session_id.as_deref(),
+            Some("s-1"),
+            "the webview's `session_id` must reach `session_id`"
+        );
+        assert_eq!(parsed.subject.as_deref(), Some("user"));
+        assert_eq!(parsed.layer, "L0");
+    }
+
+    /// The guard that makes the spelling *enforceable* rather than merely conventional.
+    ///
+    /// Serde ignores unknown fields by default, so before `deny_unknown_fields` a camelCase key was
+    /// not an error — it was silently absent. That is how `memory_capture_batch` dropped every session
+    /// id for months with no failing test anywhere in the suite. This test would have caught it.
+    #[test]
+    fn capture_input_rejects_the_camel_case_spelling() {
+        let err = serde_json::from_str::<MemoryInput>(
+            r#"{"layer":"L0","text":"hello","sessionId":"s-1","subject":"user","pinned":false}"#,
+        )
+        .expect_err("a camelCase key must be a hard error, not a silent null");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("sessionId"),
+            "the error must name the offending key so the fix is obvious; got: {msg}"
+        );
+    }
+
+    /// The other half of the claim: a payload with no session must still deserialize. Otherwise the
+    /// snake_case switch would have traded a silent drop for a hard failure on session-less writes.
+    #[test]
+    fn capture_input_still_accepts_a_missing_session_id() {
+        let parsed: MemoryInput =
+            serde_json::from_str(r#"{"layer":"L1","text":"no session here"}"#).unwrap();
+        assert_eq!(parsed.session_id, None);
+        assert!(!parsed.pinned);
     }
 
     #[test]

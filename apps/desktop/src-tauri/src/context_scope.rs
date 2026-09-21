@@ -47,7 +47,24 @@ pub const MAX_BUDGET_TOKENS: usize = 1500;
 /// 15ms sits inside the 10–20ms band the design gives. Being wrong here costs one request its
 /// memory block, which is the intended failure mode; the alternative costs every request its
 /// latency budget.
+#[cfg(not(test))]
 pub const MEMORY_DEADLINE: Duration = Duration::from_millis(15);
+
+/// The same budget, widened under `cargo test`.
+///
+/// 15 ms is a product decision, not something a test can rely on: `cargo test` runs tests in
+/// parallel, and a store open plus a recall on a loaded machine can exceed the budget. The failure
+/// then reads as `injected=0;reason=deadline`, which looks like a policy bug and is not one — and
+/// because it is load-dependent it moved from test to test, so widening one call site only moved the
+/// noise rather than removing it. Roughly two dozen tests call `inject_context` as scaffolding for
+/// properties about recall, scope and policy; none of them are asserting anything about 15 ms.
+///
+/// This is the single place the two builds differ, and the deadline is still tested for real:
+/// `a_deadline_that_is_already_gone_misses_and_stays_missed` drives `Deadline::new(Duration::ZERO)`
+/// directly, and the §5.6 tests call `inject_context_deadline` with explicit budgets — which is what
+/// that parameter exists for.
+#[cfg(test)]
+pub const MEMORY_DEADLINE: Duration = Duration::from_secs(30);
 
 /// A wall-clock budget for the memory path: started once per request, checked at every stage
 /// boundary.
@@ -1509,6 +1526,9 @@ mod context_scope_tests {
             {"role": "user", "content": "what database does this project use"}
         ]});
 
+        // Plain `inject_context`: this test is about per-principal policy, not about the clock.
+        // `MEMORY_DEADLINE` is widened under `cfg(test)` so the production budget cannot turn this
+        // into a flake — see the constant.
         // Before any policy: both principals are treated as inheriting, so both inject.
         let mut ok = body();
         let out = inject_context(&core, &hdr(&[("aip-agent", "cursor")]), None, &mut ok);

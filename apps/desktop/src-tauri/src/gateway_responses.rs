@@ -132,6 +132,9 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     let resp_id = format!("resp_gw_{id}");
     let fwd = forwarded_headers(&headers);
     let outcome = inject_context(&core, &headers, Some(&req), &mut chat);
+    // Read from `chat`, not `req`: translation is what puts a model on the canonical body, and the
+    // same value is what the upstream dispatch below reports.
+    core.record_injection(id, chat.get("model").and_then(Value::as_str).unwrap_or(""), &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: fwd.clone() });

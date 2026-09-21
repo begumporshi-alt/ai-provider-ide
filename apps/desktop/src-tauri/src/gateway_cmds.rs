@@ -11,6 +11,7 @@ use std::time::Duration;
 use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
 use crate::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
+use crate::injection_log::InjectionStats;
 use crate::store::Store;
 
 /// R1: label of the dedicated window that hosts the router core for gateway requests. Keeping
@@ -615,6 +616,21 @@ pub fn gateway_set_memory_enabled(
     Ok(state.core.memory_enabled())
 }
 
+/// What the memory layer has actually done since launch.
+///
+/// The `AIP-Memory` response header already reports this — per request, to the client — and nowhere
+/// else. So the operator running the gateway had no way to answer "why didn't the model know X"
+/// short of attaching a proxy to their own machine. This is that view.
+///
+/// Read-only: nothing here changes behaviour. In-memory and process-scoped, so it resets when the
+/// app restarts — deliberate, because the question it answers is "what is happening now", and the
+/// memory path is built never to block a request, so its telemetry must not touch SQLite either.
+/// See `injection_log`.
+#[tauri::command]
+pub fn gateway_injection_stats(state: State<'_, Arc<GatewayState>>) -> Result<InjectionStats, String> {
+    Ok(state.core.injection_stats())
+}
+
 /// One-line digest of a tool call's arguments for the audit log.
 ///
 /// The arguments are simultaneously the most useful thing to record and the most dangerous.
@@ -867,6 +883,105 @@ pub(crate) fn log_to_file(app: &AppHandle, line: &str) {
     let _ = writeln!(f, "{secs} {line}");
 }
 
+/// How much of the tail to read. The log is appended to for the life of the install, so reading it
+/// whole to show twenty lines would grow without bound.
+const LOG_TAIL_BYTES: u64 = 128 * 1024;
+
+/// One line of `gateway.log`, split into its timestamp and its text.
+#[derive(serde::Serialize, PartialEq, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct GatewayLogLine {
+    /// Unix **milliseconds**, or `None` for a line that does not start with a timestamp. The file
+    /// stores seconds; converting here keeps the UI from having to know the format.
+    pub ts_ms: Option<u64>,
+    pub text: String,
+}
+
+/// Split a log tail into lines, oldest first, at most `limit` of them.
+///
+/// Pure and separate from the file read so it is testable without an `AppHandle` — the same
+/// reasoning as `tool_arg_digest` beside it.
+///
+/// `truncated_head` says whether the read started mid-file. When it did, the first line is a
+/// fragment of a line that began before the window and is dropped: half a line reads as a corrupt
+/// line, and finding the real boundary would mean reading forwards from the start, which is the
+/// unbounded read this exists to avoid. When the whole file fit in the window, the first line is
+/// complete and must survive — dropping it there would silently eat the oldest line on every short
+/// log, which is the bug this flag exists to prevent.
+pub(crate) fn parse_log_tail(text: &str, limit: usize, truncated_head: bool) -> Vec<GatewayLogLine> {
+    // The floor lives here, not in `gateway_log_tail`, because this is the function the floor is a
+    // property *of* — and the command cannot be unit-tested without an `AppHandle`, so a floor
+    // enforced only there would be an untested rule. The ceiling stays in the command: it is a
+    // policy about scraping, not about parsing.
+    let limit = limit.max(1);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if truncated_head && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let start = lines.len().saturating_sub(limit);
+    lines[start..]
+        .iter()
+        .map(|raw| {
+            // `log_to_file` writes `{unix_secs} {text}`.
+            let (ts_ms, body) = match raw.split_once(' ') {
+                Some((head, rest))
+                    if !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()) =>
+                {
+                    (head.parse::<u64>().ok().map(|s| s * 1_000), rest)
+                }
+                _ => (None, *raw),
+            };
+            GatewayLogLine {
+                ts_ms,
+                // A second bound after the one `tool_arg_digest` applies: `log_to_file` is also
+                // called with format strings built elsewhere, and a model controls part of what
+                // reaches this file.
+                text: truncate_chars(body, 500),
+            }
+        })
+        .collect()
+}
+
+/// The tail of `{app_data_dir}/gateway.log`, oldest line first.
+///
+/// The tool audit trail has been written since 2026-09-20 with no way to read it back, which made
+/// it evidence nobody could consult — the log existed to answer "what did an agent do on this
+/// machine", and the only answer was a file path the UI never mentioned.
+///
+/// Bounded at both ends: at most `limit` lines (capped), read from the last `LOG_TAIL_BYTES`.
+#[tauri::command]
+pub fn gateway_log_tail(app: AppHandle, limit: Option<usize>) -> Result<Vec<GatewayLogLine>, String> {
+    use std::io::{Read as _, Seek as _};
+    use tauri::Manager as _;
+
+    /// A caller asking for more than this is not reading a log, it is scraping one.
+    const MAX_LIMIT: usize = 1_000;
+    // Only the ceiling. The floor of one is `parse_log_tail`'s, so it is enforced where it is
+    // tested rather than in a command no unit test can reach.
+    let limit = limit.unwrap_or(200).min(MAX_LIMIT);
+
+    let dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    let mut f = match std::fs::File::open(dir.join("gateway.log")) {
+        Ok(f) => f,
+        // No log yet is not an error — a gateway that has never run has nothing to report, and
+        // this screen must not show a failure for it.
+        Err(_) => return Ok(Vec::new()),
+    };
+
+    let len = f.metadata().map_err(|e| e.to_string())?.len();
+    let truncated_head = len > LOG_TAIL_BYTES;
+    if truncated_head {
+        f.seek(std::io::SeekFrom::Start(len - LOG_TAIL_BYTES))
+            .map_err(|e| e.to_string())?;
+    }
+    let mut buf = Vec::new();
+    f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+
+    // Lossy is required, not lazy: seeking to a byte offset can land mid-codepoint.
+    let text = String::from_utf8_lossy(&buf);
+    Ok(parse_log_tail(&text, limit, truncated_head))
+}
+
 /// The worker page reporting that it failed to boot.
 ///
 /// It runs in a window nobody can ever see, so an exception during `bootstrap()` or
@@ -986,6 +1101,94 @@ pub fn run_rollup(store: &Arc<Store>) {
     );
     let cutoff = now - 90 * 24 * 3600 * 1000;
     let _ = conn.execute("DELETE FROM ledger WHERE ts < ?1", rusqlite::params![cutoff]);
+}
+
+#[cfg(test)]
+mod log_tail_tests {
+    use super::*;
+
+    /// The reason the reader is bounded: the log is appended to forever and the UI wants the end.
+    #[test]
+    fn only_the_last_lines_are_returned_oldest_first() {
+        let got = parse_log_tail("1 a\n2 b\n3 c\n4 d\n", 2, false);
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].text, "c");
+        assert_eq!(got[1].text, "d");
+        // Seconds on disk, milliseconds on the wire — the conversion is the reader's job.
+        assert_eq!(got[0].ts_ms, Some(3_000));
+    }
+
+    /// A tail read from the middle of the file starts mid-line. Showing that fragment reads as a
+    /// corrupt line, so it goes — but only when the read really did start mid-file. Dropping it
+    /// unconditionally would silently eat the oldest line of every log short enough to fit.
+    #[test]
+    fn a_fragment_at_the_head_is_dropped_only_when_the_read_was_truncated() {
+        let text = "alf a line\n2 a whole line\n";
+
+        let cut = parse_log_tail(text, 10, true);
+        assert_eq!(cut.len(), 1);
+        assert_eq!(cut[0].text, "a whole line");
+
+        let whole = parse_log_tail(text, 10, false);
+        assert_eq!(whole.len(), 2);
+        assert_eq!(whole[0].text, "alf a line");
+    }
+
+    /// A line with no timestamp is still evidence. `log_to_file` is called from paths that do not
+    /// stamp their lines, and dropping those would hide exactly the startup evidence it exists for.
+    ///
+    /// The lines it asserts on are placed **after the first**, and neither the length nor the first
+    /// line is referenced: put the untimed line first and this test also fails whenever the
+    /// head-fragment rule breaks, so a failure here could mean either thing.
+    #[test]
+    fn a_line_without_a_timestamp_is_kept() {
+        let got = parse_log_tail("1 first\nno stamp here\n3 a stamped line\n", 10, false);
+        let untimed = got
+            .iter()
+            .find(|l| l.text == "no stamp here")
+            .expect("the untimed line survives");
+        assert_eq!(untimed.ts_ms, None);
+        // And a stamped neighbour is still stamped, so "no timestamp" is this line's property
+        // rather than the parser having given up on stamps altogether.
+        assert_eq!(
+            got.iter().find(|l| l.text == "a stamped line").unwrap().ts_ms,
+            Some(3_000)
+        );
+    }
+
+    /// A model controls part of what reaches the log, so one line must not grow without bound —
+    /// and the cut has to land on a char boundary or it panics mid-UTF-8.
+    ///
+    /// Selected by content for the same reason as the test above.
+    #[test]
+    fn a_very_long_line_is_capped_on_a_char_boundary() {
+        let got = parse_log_tail(&format!("1 short\n2 {}", "é".repeat(2_000)), 10, false);
+        let long = got
+            .iter()
+            .find(|l| l.text.starts_with('é'))
+            .expect("the long line survives");
+        assert_eq!(long.ts_ms, Some(2_000));
+        assert!(
+            long.text.chars().count() < 600,
+            "capped, got {}",
+            long.text.chars().count()
+        );
+        assert!(long.text.starts_with('é'), "the cut is on a char boundary");
+    }
+
+    /// `limit` is a floor of one, not zero: a caller asking for nothing is a bug, and returning
+    /// the newest line is the more useful reading of it.
+    #[test]
+    fn a_zero_limit_still_returns_one_line() {
+        assert_eq!(parse_log_tail("1 a\n2 b\n", 0, false).len(), 1);
+    }
+
+    /// An empty log is not an error and not a blank line.
+    #[test]
+    fn an_empty_tail_returns_nothing() {
+        assert!(parse_log_tail("", 10, false).is_empty());
+        assert!(parse_log_tail("", 10, true).is_empty());
+    }
 }
 
 #[cfg(test)]

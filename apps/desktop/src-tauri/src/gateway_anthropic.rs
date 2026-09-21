@@ -190,6 +190,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     // `Some(&req)`: translation rebuilds the body and drops unknown fields, so the `metadata.aip`
     // fallback has to be read from what the client actually sent.
     let outcome = inject_context(&core, &headers, Some(&req), &mut chat);
+    core.record_injection(id, &model, &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });

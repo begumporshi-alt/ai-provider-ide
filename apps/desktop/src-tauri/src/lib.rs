@@ -6,6 +6,7 @@ mod crash_report;
 mod egress;
 mod gateway;
 mod gateway_cmds;
+mod injection_log;
 mod memory;
 mod orchestrator;
 mod persist;
