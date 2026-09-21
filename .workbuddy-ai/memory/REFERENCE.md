@@ -1255,8 +1255,11 @@ can be tested without an `AppHandle`"), then `run_gateway_tool`, then `set_gatew
 ## Verifying on an installed build (the gate is not enough)
 `pnpm ci:local` typechecks, tests and *vite*-builds — but never bundles a Tauri app. Do this
 before committing anything touching Rust:
-1. `cd apps/desktop && [ -d dist ] && mv dist /tmp/old-dist-$(date +%s)` — **mandatory**, tauri
-   dies at `beforeBuildCommand` without it.
+1. ~~`cd apps/desktop && [ -d dist ] && mv dist /tmp/old-dist-$(date +%s)`~~ — this was **mandatory**
+   because tauri died at `beforeBuildCommand`, and **no longer is** (measured 2026-09-22). `build:clean`
+   — added the same week for the bulk-delete guard — does exactly this inside `build`, which is what
+   `beforeBuildCommand` runs. Verified by building with a 17-file `dist` present and *not* moving it:
+   `BUILD_EXIT=0` in 2m 36s. The step is harmless to keep, but it is no longer the reason a build works.
 2. `export PATH="$HOME/.workbuddy-ai/binaries/node/versions/22.22.2-2/bin:$HOME/.cargo/bin:$PATH"`
    then `npx tauri build --bundles app` (skips the failing DMG step). ~3 min.
 3. `pkill -f ai-provider-router`; `mv "/Applications/AI-Provider Router.app" /tmp/old-app-$(date +%s)`
@@ -1264,8 +1267,13 @@ before committing anything touching Rust:
 4. `open -a "AI-Provider Router"`, wait ~25s (post-reinstall keychain ACL renegotiation costs
    ~15s and looks like a hang), then: `pgrep -fl ai-provider-router`; tail
    `~/Library/Application Support/dev.aiprovider.router/gateway.log` for `startup:` markers and
-   `enabled on port`; `curl -s --noproxy '*' -o /dev/null -w '%{http_code}' http://127.0.0.1:8787/v1/models`
-   → 401 means the listener is alive and auth is enforced. (`ps` is sandbox-blocked; use `pgrep`.)
+   `enabled on port`;    `env -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy curl -s --noproxy '*' -m 6
+   -o /dev/null -w '%{http_code}' http://127.0.0.1:8800/v1/models` → 401 means the listener is alive
+   and auth is enforced. (`ps` is sandbox-blocked; use `pgrep`.)
+   **Two corrections, both measured 2026-09-22.** The port is **8800** (`settings.gateway`), not 8787 —
+   8787 is only `DEFAULT_PORT` in the code and has no listener, so the old probe always read 000. And
+   `--noproxy '*'` alone is **not** enough: with the proxy vars still exported the same curl returns
+   000, and unsetting them turns it into 401. A 000 here is a proxy artefact, not a dead gateway.
 - **The gateway tool path cannot be reached from the UI.** `run_gateway_tool` is called only by an
   external client sending a tool-using request to the local gateway; the Assistant goes through the
   agent loop with its own confirmation and never touches it. Exercising it end to end needs the
