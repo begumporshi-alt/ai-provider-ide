@@ -930,12 +930,15 @@ print("SHIM-ONLY (dead cases):", sorted(cases - src))
 PY
 ```
 
-Measured 2026-09-21: app calls **114**, shim has **87**, **27 missing**. Still outstanding
-(not fixed, reported to the user): `capture_claim`, `capture_complete`, `capture_release`,
-`capture_requeue_stale` (the whole "distil now" path), `memory_principal_set` (the per-client deny
-UI), `gateway_app_key_*`, `gateway_key_*`, `gateway_enable/disable`, `gateway_spend_*`,
-`gateway_tool_*`, `gateway_usage`, `gateway_worker_error`, `get/set_tools_*`,
-`router_model_context_replace`, `workbuddy_set_models`, `workbuddy_status`.
+Measured 2026-09-21: app calls **114**, shim had **87**, **27 missing**. **All 27 were added the
+same day** (commits `851b0ee`); the audit now reports 114/114 with no dead cases. Keep running it.
+
+The gap is guarded two ways, both falsified by re-breaking `router_model_context_count`:
+- the shim **records** unknown commands before throwing (`__webTest.unknownCommands()`), and
+  `smoke: no screen calls a command the shim does not implement` walks every nav screen and asserts
+  that list is empty — catches a gap on any screen, including ones no test visits;
+- `memory: the master switch is live…` asserts the checkbox is **enabled**, which is only true once
+  the load resolved.
 
 Corollary for writing specs: **assert on the loaded state, not just on the section rendering.** A
 test that only checks the heading is visible passes against a screen whose data never arrived.
