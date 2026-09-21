@@ -75,6 +75,39 @@ fn budget_left(conn: &rusqlite::Connection) -> usize {
     DISTILL_BUDGET_PER_HOUR.saturating_sub(used.max(0) as usize)
 }
 
+/// The identity of a request in the capture queue.
+///
+/// The counter behind `request_id` lives on `GatewayCore` and **starts at 1 on every launch**, but
+/// `memory_pending.request_id` is UNIQUE for the life of the *database* — finished rows are kept
+/// for seven days (retention). So on the first run after a restart, ids repeat, and the
+/// idempotency guard (§3.5.5) reads each repeat as a replay of an old request and drops it.
+///
+/// Measured on the installed build 2026-09-21: after a restart, request `gw-5` collided with a row
+/// from the previous session and was silently not captured, while `gw-6` — free — was. Captures are
+/// lost after every restart until the counter passes the previous high-water mark, and nothing
+/// reports it. The boot marker scopes the id to this process so the two never meet.
+pub fn request_id(n: u64) -> String {
+    format!("gw-{}-{n}", boot_marker())
+}
+
+/// Set once per process. Time alone could collide if two builds started in the same millisecond
+/// against the same database; the pid makes that not worth worrying about.
+fn boot_marker() -> String {
+    use std::sync::OnceLock;
+    static BOOT: OnceLock<String> = OnceLock::new();
+    BOOT.get_or_init(|| {
+        format!(
+            "{:x}-{:x}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            std::process::id()
+        )
+    })
+    .clone()
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -997,6 +1030,46 @@ mod capture_tests {
             .unwrap();
         }
         assert_eq!(claim(&s).unwrap().len(), 1, "an hour later the row is drainable again");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The counter behind `request_id` restarts at 1 on every launch, but the UNIQUE constraint on
+    /// `memory_pending.request_id` spans the life of the database. Without the boot marker the two
+    /// meet on the first run after a restart and the idempotency guard eats the capture.
+    ///
+    /// This asserts the property rather than the format: any id this process produces must not
+    /// collide with one a previous process left behind, whatever the marker happens to be.
+    #[test]
+    fn a_fresh_processs_request_ids_do_not_collide_with_a_previous_runs() {
+        let (s, d) = temp_store("reqid");
+        let sc = scope(Some("p1"), None);
+        let body = json!({"messages":[{"role":"user","content":"x"}]});
+
+        // What a previous run left behind: ids 1..3, already distilled.
+        for n in 1..=3 {
+            let old = format!("gw-{n}");
+            let mut r = req(&body, &sc, PROSE, None);
+            r.request_id = &old;
+            assert!(matches!(enqueue(&s, &r), Enqueue::Queued(_)));
+        }
+
+        // This process starts its counter at 1 again. Every one of those must still be captured —
+        // a bare `gw-{n}` would report AlreadyQueued for all three.
+        for n in 1..=3 {
+            let mut r = req(&body, &sc, PROSE, None);
+            let id = request_id(n);
+            r.request_id = &id;
+            assert!(
+                matches!(enqueue(&s, &r), Enqueue::Queued(_)),
+                "gw-{n} from this process collided with the previous run's: {id}"
+            );
+        }
+
+        // The reverse: the same id twice in one process is still a replay and is still refused.
+        let mut r = req(&body, &sc, PROSE, None);
+        let id = request_id(1);
+        r.request_id = &id;
+        assert_eq!(enqueue(&s, &r), Enqueue::Skipped(SkipCapture::AlreadyQueued));
         let _ = std::fs::remove_dir_all(&d);
     }
 

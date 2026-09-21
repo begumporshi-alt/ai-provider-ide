@@ -441,6 +441,45 @@ One real hazard remains: if the agent replays its history *and* the router injec
 `session_turns`, the last turns appear twice. Rule: hash the last N user turns of the incoming
 request and drop any injected turn whose hash is already present.
 
+#### 5.4a The capture-side guard ate real captures — found live 2026-09-21
+
+The same idea on the write path is "a request id is queued once". Implemented as `UNIQUE` on
+`memory_pending.request_id`, checked before insert. The guard was correct; the **id was not**. The
+counter behind it lives on `GatewayCore` and starts at 1 on every launch, while the `UNIQUE`
+constraint spans the life of the *database* — finished rows are retained seven days (§6.2). So after
+every restart the first ids repeat, the guard reads each repeat as a replay, and the capture is
+dropped. Silently: `Enqueue::Skipped(AlreadyQueued)` is a normal return, so nothing logs, nothing
+errors, and the queue simply looks empty.
+
+Measured in the live database, not reasoned about. Two sessions, one install:
+
+| session | ids written | what happened |
+|---|---|---|
+| 1 (09:32–11:03) | `gw-3`, `gw-5`, `gw-7`, `gw-8`, `gw-11`, `gw-14`, `gw-15` | all captured |
+| 2 (13:31, 13:35) | alpha → `gw-4` ✅ · beta → `gw-5` ❌ · gamma → `gw-6` ✅ | beta collided with the 09:41:46 row and was **not captured** |
+
+The loss window is not one request. It is every id in `1..=previous_high_water` — here the next
+launch would lose ids 3, 5, 7, 8, 11, 14 and 15 all over again. Nothing reports it, so it reads as
+"the gateway stopped learning".
+
+Fix: scope the id to the process. `capture::request_id(n)` → `gw-{boot_marker}-{n}`, where
+`boot_marker()` is a `OnceLock` of `{unix_millis}-{pid}`, computed once per launch. Time alone could
+collide if two builds started in the same millisecond against the same database; the pid closes
+that. The string stays **opaque** — nothing parses it, the only production query is
+`WHERE request_id = ?1`, and the client-visible completion id (`gw-{id}`, `resp_gw_{id}`) is a
+different string built for the wire.
+
+The property is pinned by `a_fresh_processs_request_ids_do_not_collide_with_a_previous_runs`, which
+plants a previous run's `gw-1..3` and then requires this process's ids 1..3 to still be accepted —
+and re-asserts that the *same* id twice in one process is still refused. Reverting `request_id` to
+the bare `format!("gw-{n}")` fails it on the first id.
+
+The generalisable lesson, and it is the same one as §5.4: **a guard is only as good as the identity
+it is given.** The reviewer constraint here was "don't distil a turn twice"; the implementation
+satisfied it and broke the constraint next to it ("don't lose a turn"). Neither the unit tests nor
+the gate could see it — every test constructed its own ids, so the generator was never exercised.
+It took two sessions against one database to surface.
+
 ### 5.5 Prompt-cache stability — **the finding I missed**
 
 Coding agents are the one workload deliberately architected around provider prompt caching (Claude

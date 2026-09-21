@@ -724,7 +724,7 @@ pub fn prepare_capture(
     );
     Some(PreparedCapture {
         store,
-        request_id: format!("gw-{request_id}"),
+        request_id: crate::capture::request_id(request_id),
         session: crate::gateway::session_context::resolve_session(&meta, &scope),
         user_text: recall_query(body),
         model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
