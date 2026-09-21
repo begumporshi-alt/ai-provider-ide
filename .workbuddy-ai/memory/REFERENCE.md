@@ -974,5 +974,98 @@ Two design constraints worth keeping:
 - Counted at **claim**, not completion: the provider call is made on claim, so a call that then
   failed was still paid for. Needs no migration, `claimed_at` was already written.
 
-Todo carried forward: `clear_app_key_cache` (gateway.rs:807, `#[cfg(test)]`) is never called and
-produces the crate's only warning. Harmless, but it is vestigial from the app-key cache work.
+**Verification status.** The cap is proven by five unit tests, and they were falsified rather than
+assumed: making `budget_left` return `usize::MAX` fails all five; replacing `CLAIM_LIMIT.min(budget)`
+with a bare `CLAIM_LIMIT` fails exactly one — which is what proves that line is the *sole* guard on
+the remainder logic. The live end-to-end version was attempted and **invalidated**: the probe planted
+60 `processing` rows with a fresh `claimed_at` and expected row 9 to stay `queued`, but `CLAIM_LIMIT`
+is 8 and the drain fires twice a minute, so the 60 fake rows left only ~2 rows of headroom before the
+real drain's own claims pushed the count over. Row 9 went `done`; `claimed_last_hour` read 62. The
+test neither confirmed nor disproved the cap. A valid retry needs ~35 fake rows so a full 8-row drain
+fits inside the remaining headroom.
+
+**DB pollution that probe left behind** (cleaned 2026-09-21): 60 `cap-fake-*` rows had been drained
+and distilled into 5 memories — "(Alpha check)", "(Beta check)", "(Gamma check)" are unmistakable.
+Deleting from `memories` fires the `memories_ad` FTS trigger, so an external `sqlite3` needs
+`PRAGMA trusted_schema=ON` or the write is refused. Verify `memories` and `memories_fts` counts match
+afterwards.
+
+`clear_app_key_cache` (the vestigial `#[cfg(test)]` fn) has been **removed** — `cargo check --lib` is
+silent again.
+
+## Capture ids must be scoped to the process — fixed 2026-09-21
+
+`GatewayCore.next_id` is `AtomicU64::new(1)`: it **starts at 1 on every launch**. `memory_pending.
+request_id` is UNIQUE for the life of the *database*, and finished rows are retained seven days. So
+after a restart the ids repeat, the §3.5.5 idempotency guard reads each repeat as a replay, and the
+capture is dropped — as a **normal return** (`Enqueue::Skipped(AlreadyQueued)`), so nothing logs and
+the queue just looks empty.
+
+Reproduced live on the installed build with a control in the same batch (memory on — every response
+carried `aip-memory: injected=1`). Six requests hit ids 7..12:
+
+| id | pre-existing? | outcome |
+|---|---|---|
+| gw-7 | yes (09:42:25) | **dropped** |
+| gw-8 | yes (09:42:50) | **dropped** |
+| gw-9 | free | captured |
+| gw-10 | free | captured |
+| gw-11 | yes (11:02:09) | **dropped** |
+| gw-12 | free | captured |
+
+The captures prove the queue worked; the drops are exactly the ids that already existed. The loss
+window is not one request — it is every id in `1..=previous_high_water`.
+
+Fix: `capture::request_id(n)` → `gw-{boot_marker}-{n}`, `boot_marker()` a `OnceLock` of
+`{unix_millis}-{pid}` computed once per launch. `context_scope.rs:727` repointed. The string is
+**opaque** — the only production query is `WHERE request_id = ?1`, and the client-visible completion
+id (`gw-{id}`, `resp_gw_{id}`) is a different string built for the wire. Pinned by
+`a_fresh_processs_request_ids_do_not_collide_with_a_previous_runs`, which fails on the first id when
+`request_id` is reverted to the bare `format!("gw-{n}")`.
+
+Generalisable lesson: **a guard is only as good as the identity it is given.** The reviewer constraint
+was "don't distil a turn twice"; the implementation satisfied it and broke the one beside it ("don't
+lose a turn"). No test could see it — every test built its own ids, so the generator was never
+exercised. Recorded in the design doc as §5.4a.
+
+## Probing a running app from the sandbox (measured 2026-09-21)
+
+- `ps` and `osascript` Apple Events are **blocked** ("privilege violation (-10004)"). `lsof -nP
+  -iTCP:8787 -sTCP:LISTEN` works, and plain `kill <pid>` works.
+- Installed-app swap: `kill` → `mv` the old bundle to /tmp (never `rm -rf`) → `ditto` the new one in.
+- The injected session clock can disagree with the machine by hours (context said 11:10 +06, `date`
+  said 13:55 +06). **Trust `date`** whenever a rolling window is involved.
+- Gateway probes need `model: "agnes/agnes-2.5-flash"` and the master key, with the proxy vars unset.
+- `source=ui` traffic (the Assistant screen) is **not** captured by the gateway memory path — only
+  `source=gateway` requests go through `prepare_capture`. Probes must go through port 8787.
+
+## L0 recall: the two paths disagree (found 2026-09-21, unresolved)
+
+There are **two** recall paths and they take opposite positions on L0 (verbatim conversation):
+
+| path | where | L0? |
+|---|---|---|
+| gateway memory layer | `context_scope.rs:593` — `let layers = ["L1","L2","L3"]`, a literal | **never**, no opt-in |
+| Assistant / webview engine | `Assistant.tsx:693` and `:770` → `recallContext(text)` with **no `layers`** → `engine.ts:345-348` default branch | **always** — `["L3","L2"]` then `["L1","L0"]` |
+
+The gateway path carries the comment "L0 is excluded by default… opting in is deliberate and
+per-scope (design §0.4)". The Assistant path does the opposite and has no session filter, so another
+session's verbatim turns can land in the prompt. That is the privacy inversion §0.4 names.
+
+There is **no L0 opt-in anywhere**: grepping `include_l0|allow_l0|l0_enabled|allow_verbatim` across
+the Rust source returns nothing, and the gateway's layer list is a literal.
+
+**Not changed.** It is a behaviour change to a pre-existing feature, so it is the operator's call.
+Recommendation on record: drop `L0` from the default in `engine.ts` so both paths deny by default.
+Written up in `GATEWAY_MEMORY_LAYER.md` §10(3).
+
+## `mcp.json` is not what it looks like
+
+`~/.workbuddy-ai/mcp.json` has `ai-hub` → `http://127.0.0.1:8787/mcp`. Measured 2026-09-21:
+
+- 8787 is **this app's** port; the router returns **404 on `/mcp`** for GET and POST.
+- Grepping the Rust source for `mcp` gives **no matches** — the router has no MCP surface.
+- Nothing is on 8788. An earlier note claiming it "should be 8788" was a **guess and wrong**.
+
+So the entry targets a port owned by an app that is not an MCP server. AI Hub's real port is unknown
+and must come from the user. Left untouched — user-level tooling config, not project code.

@@ -24,6 +24,9 @@
 | Migrations, live DB | Migrations · Live database |
 | Context graph rules | Context graph |
 | Gateway memory/context layer (proposed) | Gateway memory layer: request-path facts |
+| Capture ids, distillation budget | Capture ids must be scoped to the process · §10(2) distillation budget |
+| Probing a running app from the sandbox | Probing a running app from the sandbox |
+| L0 recall — the two paths disagree | L0 recall: the two paths disagree |
 | Skills / orchestrator / memory | Skills · orchestrator · memory engine |
 | Sandbox tool policy + audit trail | Sandbox tool policy · Gateway tool audit trail |
 | Gate, and why CI is dead | `pnpm ci:local` · CI is dead |
@@ -36,8 +39,9 @@
 - Gateway is a blind proxy for `system`; **skills are frontend-only** (`Assistant.tsx`).
 - Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` —
   `file:…?mode=ro`; version in `schema_version`, not `PRAGMA user_version`.
-- Tests: router-core 231 · desktop 169 (incl. 27 e2e) · Rust `cargo test --lib` **394** · browser
-  **65 passing** (53 + 12 smoke). Gate is `pnpm ci:local` (browser included by default).
+- Tests: router-core 231 · desktop 169 (incl. 27 e2e) · Rust `cargo test --lib` **405** · browser
+  **70 passing** (59 declarations — the screen sweep runs once per screen). Gate is `pnpm ci:local`
+  (browser included by default).
 - Per-principal identity is now **two** strings, either may deny: the `AIP-Agent` label and
   `key:<id>` from the presented app key (`principal::allows(_, _, agent, app_key)`). Principals
   named `key:<id>` are offered by `principal::list` from active `gateway_keys` rows.
@@ -46,12 +50,21 @@
 - `memories.superseded_at` (migration 0014, schema_version 14): set by `supersede`, excluded from
   `recall_inner`/`session_atoms`/`stats.injectable`, **not** excluded from `list` (the UI shows and
   restores). Superseding a pinned or L3 row is refused by policy (§6.4.5).
+- Capture ids are `gw-{millis}-{pid}-{n}` (`capture::request_id`), **not** `gw-{n}`. The bare form
+  collided across restarts against a DB-lifetime UNIQUE constraint and silently dropped captures.
+  The client-visible completion id is still `gw-{n}` / `resp_gw_{n}` — different strings, don't
+  conflate them.
 - **`cargo` is not on PATH** — use `~/.cargo/bin/cargo` (and unset the proxies or it stalls).
 - Gate is `pnpm ci:local`. CI has not started a job since ~2026-09-16 (billing, not code).
 
 ## Rules that each cost a bug
 - Pass the identity a thing already has; a generated node id is a silent no-op for dedupe. Never
   match nodes on label (80-char truncation).
+- **An id that is UNIQUE for the life of the DB must not come from a counter that restarts per
+  process.** `GatewayCore.next_id` starts at 1 every launch; `memory_pending.request_id` is UNIQUE
+  for 7 days — so after a restart the §3.5.5 idempotency guard read real captures as replays and
+  dropped them, silently. Scope ids with a boot marker (`millis-pid`). Measured live: 6 requests,
+  the 3 whose ids already existed vanished. Depth: REFERENCE.md §Capture ids.
 - `runAgentLoop` returns `{text, messages}` where `messages` EXCLUDES the closing assistant turn.
 - A tool failure must never reach the model as `""` — guard at bridge *and* consumer.
 - `invalid` is an eviction, not a label (`src/lib/keys/verdict.ts`).
@@ -90,3 +103,7 @@
 - **Every new `#[tauri::command]` needs a case in `web-test/shim.ts`** on the same day. The shim
   throws on unknown commands, screens wrap loads in `Promise.all(...).catch(() => undefined)`, and
   the result is a silently blank screen, not an error. `--skip-browser` hides this completely.
+- **There are two recall paths and they disagree on L0.** Gateway: `context_scope.rs:593` hardcodes
+  `[L1,L2,L3]` — never L0. Assistant: `Assistant.tsx:693,770` call `recallContext(text)` with no
+  `layers`, so `engine.ts`'s default branch pulls `["L1","L0"]` with no session filter. Never claim
+  "L0 is never injected" of the product — only of the gateway layer. Depth: REFERENCE.md §L0 recall.
