@@ -243,6 +243,15 @@ signed build prompts once. **Always Allow** stores the certificate requirement, 
 that should not prompt. If prompts ever return, check whether `signingIdentity` was dropped or the
 certificate was recreated — a recreated cert has a new hash and is a new identity.
 
+**Confirmed live 2026-09-21 on a real rebuild + install.** cdhash `…b569b1e4` → `9b7c9ca3`, requirement
+unchanged, and the new binary came up **with no keychain click**. Reading that correctly needs a time
+series, not one probe: a probe at t+1.5 s returns **503**, and it only flips to **401 at t+20 s** — the
+same cold-read lag both builds show (listener +0 s, `workbuddy sync` +16/+21 s, `key refs probed`
++24/+27 s). The clincher is `workbuddy sync: 11 published` succeeding, since that path returns
+`NO_KEY_YET` and logs `sync skipped` when the keychain is unreadable. **503-then-401 with no click is the
+ACL matching; 503 forever is the ACL missing.** Note the ~18–27 s 503 window after *every* launch is
+pre-existing, not caused by the signing change.
+
 Caveats:
 - **Machine-specific.** The config now names a certificate that only exists on this machine; another
   machine's build fails unless it has the same cert or overrides the setting.
@@ -251,6 +260,33 @@ Caveats:
   the private key must stay in the login keychain and never be exported.
 - `Identifier` changed from `ai_provider_router-15382172ab762b3d` (ad-hoc) to the real bundle id
   `dev.aiprovider.router`. An improvement, but it is a change in app identity.
+
+## Verifying the *deployed frontend* — three ways to get a false negative (2026-09-21)
+
+Checking that a webview change actually shipped is harder than it looks, and each failure mode looks
+like a pass.
+
+1. **Do not grep the `.app` binary.** Tauri **embeds** the frontend into the Rust binary and
+   **compresses** it, so plaintext is absent — `strings | grep` returns 0 for a string that is definitely
+   there. `Contents/Resources/` holds only `icon.icns`. Check the `dist` that got embedded instead.
+2. **The bundler emits backticks, not quotes.** The recall code ships as
+   `` let t=await Ge(e,Math.ceil(n/2),[`L3`,`L2`]),r=n-t.length,a=r>0?await Ge(e,r,[`L1`]):[] ``. Searching
+   for `"L1"` or `'L1'` finds **nothing** and reads as a clean pass. Search the backtick form.
+3. **The bash `grep` shim lies.** `grep -q` for a control string returned nothing while the Grep tool
+   found it in `main-DR8YZbzV.js`. Use the Grep tool, and put a **control string from the same source
+   file** in the same batch — a 0 from a failed search is indistinguishable from a real absence.
+
+The decisive check is a **before/after across saved `dist` snapshots**, not a single absence:
+
+| dist (moved at) | `` [`L1`,`L0`] `` | `` [`L1`] `` |
+|---|---|---|
+| ≤ 13:04:33 | 1 | 0 |
+| 15:07:29 → current | 0 | 1 |
+
+Also: **`pnpm ci:local` runs `pnpm build` as its `Build` step** (`scripts/ci-local.sh:83`). So a `dist`
+moved just before a later `tauri build` can be byte-identical to the new one without anything being stale
+— the gate already rebuilt it. Check whether the gate ran between the edit and the move before concluding
+"cached".
 
 ## Testing
 - **The sandbox sets HTTP_PROXY/HTTPS_PROXY to a local port that can die.** The app then returns

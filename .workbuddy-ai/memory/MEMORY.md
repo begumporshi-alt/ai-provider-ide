@@ -13,7 +13,8 @@
 
 ## REFERENCE.md sections
 Build / install / verify the installed app · **Code signing — why the keychain prompted on every build**
-· Testing · Test counts · Browser harness (`web-test`) · Gateway behaviour · Error status propagation ·
+· **Verifying the *deployed frontend*** · Testing · Test counts · Browser harness (`web-test`) · Gateway
+behaviour · Error status propagation ·
 Keychain (ACL + fix) · The ledger must not lie · Migrations · Live database · Context graph · Skills ·
 orchestrator · memory engine · Gateway memory layer: request-path facts · Capture ids must be scoped to
 the process · §10(2) distillation budget · Probing a running app from the sandbox · L0 recall: the two
