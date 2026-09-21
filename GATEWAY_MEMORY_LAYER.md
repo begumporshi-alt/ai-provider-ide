@@ -864,6 +864,18 @@ the DB unavailable, every request still succeeds.
    speculative until headless/service mode exists (§7 of `ARCHITECTURE.md` lists it as a non-goal).
 5. **Cross-vendor privacy.** Even L1/L2 carries project facts to whichever vendor served the call.
    Worth an explicit statement in the UI, not just the docs.
+   → **Decided 2026-09-21, stated beside the master switch** (`PRIVACY_NOTE` in `Memory.tsx`,
+   `data-testid="memory-privacy-note"`). It names the two egresses separately, because they have
+   different controls:
+   - *Distillation* sends the tail of every captured turn to whichever provider serves the system
+     model. This happens whatever the memory's scope — a capture-only memory has still been read
+     by a model once, to distil it. Scope does not stop this.
+   - *Injection* puts a recalled fact into whatever request is being served, and the router may
+     send that to a different provider than the one the fact came from. Scope *does* gate this: a
+     capture-only memory is never injected.
+   Collapsing the two would let "it's capture-only, so it never left" be believed when it is false.
+   With the layer off, neither happens — which is why the note sits next to the switch rather than
+   in a settings pane nobody opens.
 
 ---
 

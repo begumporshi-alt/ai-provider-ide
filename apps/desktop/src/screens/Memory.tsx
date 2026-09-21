@@ -83,6 +83,21 @@ const MEMORY_NOTE =
   + "plain-prose request and, off to the side, distil it into the atoms listed below.";
 
 /**
+ * §10(5) — cross-vendor privacy, stated in the UI rather than only in the docs.
+ *
+ * It sits beside the switch on purpose. The decision to turn the layer on *is* the decision to let
+ * facts cross vendors, and a notice nobody reads at that moment is not a notice. The two distinct
+ * egresses are named separately because they have different controls: distillation happens to
+ * everything captured, whatever its scope, while injection is what scope gates.
+ */
+const PRIVACY_NOTE =
+  "With this on, text leaves this machine for two separate reasons. The tail of every captured turn is "
+  + "sent to whichever provider serves the system model, to be distilled — that happens whether or not "
+  + "the memory is ever injected. And a recalled fact is injected into whatever request is being served, "
+  + "which the router may send to a different provider than the one the fact came from. Scope limits the "
+  + "second: a capture-only memory is never injected. Neither happens while this is off.";
+
+/**
  * The write path, made observable.
  *
  * Everything below the atoms on this screen is derived work, and derived work that cannot be seen
@@ -276,6 +291,13 @@ function MemoryLayerSection({
       </div>
       <p className="mb-3 text-[11px] leading-relaxed" style={{ color: "var(--text-faint)" }}>
         {MEMORY_NOTE}
+      </p>
+      <p
+        className="mb-3 text-[11px] leading-relaxed"
+        style={{ color: "var(--text-faint)" }}
+        data-testid="memory-privacy-note"
+      >
+        {PRIVACY_NOTE}
       </p>
       <div className="flex flex-wrap items-center gap-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
         <span>

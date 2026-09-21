@@ -137,6 +137,24 @@ test("memory: the master switch is live, proving the screen's host load succeede
   await expect(page.getByText("0 awaiting distillation")).toBeVisible();
 });
 
+/**
+ * §10(5). A distilled atom is project context, and it is injected into whatever request the router
+ * happens to serve — so memory carries facts across vendors. That belongs beside the switch, not
+ * only in the docs: turning the layer on *is* the decision to let it happen.
+ */
+test("memory: the switch is presented with what it sends off this machine", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  const note = page.getByTestId("memory-privacy-note");
+  // Both egresses, named separately: distillation happens to everything captured, injection is
+  // what scope gates. Collapsing them would hide that scope does not stop the first one.
+  await expect(note).toContainText("whichever provider serves the system model");
+  await expect(note).toContainText("different provider than the one the fact came from");
+  // And the lever, because a warning with no control is just noise.
+  await expect(note).toContainText("capture-only memory is never injected");
+});
+
 test("memory: a layer filter narrows the list", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await seedMemories(page);
