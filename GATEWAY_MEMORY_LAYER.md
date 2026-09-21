@@ -908,6 +908,13 @@ the DB unavailable, every request still succeeds.
    delay. `queue_status` reports `budget_left` and the Memory screen shows it, because a queue
    holding rows on purpose is otherwise indistinguishable from a drain that has stopped.
    No migration: `claimed_at` was already written on every claim.
+   **Verified live 2026-09-21**, in the real drain loop rather than only in `claim()`. With the
+   window at 2 claims, 55 budget-consuming rows brought `budget_left` to 3; five real requests were
+   then enqueued. The next tick claimed exactly **3** — `min(CLAIM_LIMIT=8, budget=3)` — and the two
+   it left stayed `queued` with `attempts = 0`. A second tick, with the budget exhausted at 60/60,
+   claimed nothing; still `queued`, still zero attempts, and **zero rows `failed`**. That is the
+   property the cap exists to preserve: a cap that burned attempts would have quietly *deleted* the
+   work it meant only to delay.
 3. **L0 opt-in granularity.** Per scope or global? Per scope is safer and more annoying.
    → **Decided 2026-09-21: per scope — and the opt-in is deliberately not built, because nothing
    needs it yet.** The question presumes an opt-in exists; it does not. The gateway recall path

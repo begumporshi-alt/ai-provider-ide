@@ -107,3 +107,8 @@
   `[L1,L2,L3]` — never L0. Assistant: `Assistant.tsx:693,770` call `recallContext(text)` with no
   `layers`, so `engine.ts`'s default branch pulls `["L1","L0"]` with no session filter. Never claim
   "L0 is never injected" of the product — only of the gateway layer. Depth: REFERENCE.md §L0 recall.
+- **Testing a queue/claim cap live: plant the budget-consuming rows as `status='done'`** with a fresh
+  `claimed_at`. `budget_left` reads only `claimed_at`, so they count against the cap — but `claim()`
+  selects `WHERE status='queued'`, so they are never candidates: nothing fake gets distilled and
+  there is no race with the drain tick. Planting them `queued` races the tick and proves nothing
+  (cost a wasted probe on §10(2)).

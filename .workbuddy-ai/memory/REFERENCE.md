@@ -974,15 +974,25 @@ Two design constraints worth keeping:
 - Counted at **claim**, not completion: the provider call is made on claim, so a call that then
   failed was still paid for. Needs no migration, `claimed_at` was already written.
 
-**Verification status.** The cap is proven by five unit tests, and they were falsified rather than
-assumed: making `budget_left` return `usize::MAX` fails all five; replacing `CLAIM_LIMIT.min(budget)`
-with a bare `CLAIM_LIMIT` fails exactly one — which is what proves that line is the *sole* guard on
-the remainder logic. The live end-to-end version was attempted and **invalidated**: the probe planted
-60 `processing` rows with a fresh `claimed_at` and expected row 9 to stay `queued`, but `CLAIM_LIMIT`
-is 8 and the drain fires twice a minute, so the 60 fake rows left only ~2 rows of headroom before the
-real drain's own claims pushed the count over. Row 9 went `done`; `claimed_last_hour` read 62. The
-test neither confirmed nor disproved the cap. A valid retry needs ~35 fake rows so a full 8-row drain
-fits inside the remaining headroom.
+**Verification status — verified live 2026-09-21.** Five unit tests, falsified rather than assumed:
+making `budget_left` return `usize::MAX` fails all five; replacing `CLAIM_LIMIT.min(budget)` with a
+bare `CLAIM_LIMIT` fails exactly one — which is what proves that line is the *sole* guard on the
+remainder logic. Then confirmed end-to-end in the real drain loop:
+
+- Baseline 2 claimed in the hour → plant 55 fakes → `budget_left` = **3**.
+- Enqueue 5 real requests. **Tick 1:** exactly **3** claimed — `min(CLAIM_LIMIT=8, budget=3)` = 3,
+  not 8. **Tick 2** with the budget exhausted at 60/60: the other two still `queued` with
+  `attempts = 0`, and **0 rows `failed`**. Nothing lost, nothing retired by a burned attempt.
+
+**Method — the earlier attempt was invalid, and this is why.** The first probe planted 60 rows as
+`processing` with a fresh `claimed_at` and expected row 9 to stay `queued`. But `CLAIM_LIMIT` is 8 and
+the drain fires twice a minute, so 60 fake rows left only ~2 rows of headroom before the drain's own
+claims pushed the count over; row 9 went `done` and `claimed_last_hour` read 62. It proved nothing.
+
+The fix is to plant the budget-consuming rows as **`status='done'`**. `budget_left` reads only
+`claimed_at`, so they still count — but `claim()` selects `WHERE status='queued' ORDER BY id`, so they
+are never candidates. Nothing fake gets distilled, and there is no race with the drain. Plant
+*claimable* rows and you are racing the tick; plant `done` rows and you are not.
 
 **DB pollution that probe left behind** (cleaned 2026-09-21): 60 `cap-fake-*` rows had been drained
 and distilled into 5 memories — "(Alpha check)", "(Beta check)", "(Gamma check)" are unmistakable.
