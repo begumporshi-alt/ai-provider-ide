@@ -207,6 +207,10 @@ which one happened.
 - A three-key comparator is easy to get backwards in one key and the compiler will not say so.
 
 ## Browser harness (`apps/desktop/web-test`) — use it for UI work
+- **`getByRole("heading", { name })` matches a *substring*, not the whole name.** Adding a section
+  heading "Memory layer" broke a test that matched the screen title "Memory": the locator then
+  resolved to two elements and failed on strict mode. Any heading that is a substring of another
+  heading on the same screen will do this. Pass `exact: true` when you mean one specific heading.
 The real React app runs in Chromium against `shim.ts`, an in-memory stand-in for the Rust host that
 mirrors it command-for-command. It drives real clicks, not a headless approximation.
 - `cd apps/desktop && [ -d test-results ] && mv test-results /tmp/x-$(date +%s) ; env -u HTTP_PROXY
