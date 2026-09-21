@@ -64,8 +64,14 @@ export const SCENARIO_EVERY = 6;
 /** One scenario pass yields at most this many L2 rows. Bound the prompt. */
 const MAX_SCENARIOS_PER_PASS = 3;
 
+/** One exchange: what the user said and what came back. */
+export interface Exchange {
+  user: string;
+  assistant: string;
+}
+
 /** The exchanges awaiting distillation, oldest first, capped at one batch. */
-const pending: { user: string; assistant: string }[] = [];
+const pending: Exchange[] = [];
 let sinceDistil = 0;
 
 /** Test seam: forget the accumulated window and the scenario-pass marker. */
@@ -151,30 +157,66 @@ export async function distilTurn(
   if (!model || pending.length === 0) return [];
   if (sinceDistil < DISTIL_EVERY) return [];
 
-  const script = pending
-    .slice(-DISTIL_EVERY)
-    .map((t) => `User: ${t.user}\n\nAssistant: ${t.assistant}`)
-    .join("\n\n---\n\n");
+  const batch = pending.slice(-DISTIL_EVERY);
   try {
-    const reply = await (generate ?? defaultGenerator)(model, `${DISTIL_PROMPT}${script}`);
-    const atoms = parseAtoms(reply);
+    const atoms = await distillAndStore(sessionId, model, batch, generate);
     // An empty result is a successful look that found nothing durable, so the window is dropped
     // either way — otherwise a model that never returns JSON would be re-asked forever.
     pending.length = 0;
     sinceDistil = 0;
-    if (atoms.length === 0) return [];
-    await captureMemories(
-      atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, sessionId })),
-    );
-    // Scenarios ride along with the atoms that produced them — fire-and-forget, so a slow or
-    // failing second call never delays what the user is reading.
-    void distilScenarios(sessionId, model, generate);
     return atoms;
   } catch {
     // Counter and window both survive: a transient failure retries on the next turn instead of
     // waiting another full batch, and the exchanges are not lost.
     return [];
   }
+}
+
+/**
+ * One model call and the store step that follows it. Throws on failure — the two callers decide
+ * what a failure means, and they disagree: the chat path keeps its window and retries, the queue
+ * drain gives the row back so it can be claimed again.
+ *
+ * Shared so the drain distils through the same prompt and the same parsing as a chat turn. A second
+ * copy of `DISTIL_PROMPT` would drift, and drift here is invisible: it produces slightly worse
+ * atoms, which nothing detects.
+ */
+async function distillAndStore(
+  sessionId: string,
+  model: string,
+  exchanges: Exchange[],
+  generate?: Generator,
+): Promise<string[]> {
+  const script = exchanges
+    .map((t) => `User: ${t.user}\n\nAssistant: ${t.assistant}`)
+    .join("\n\n---\n\n");
+  const reply = await (generate ?? defaultGenerator)(model, `${DISTIL_PROMPT}${script}`);
+  const atoms = parseAtoms(reply);
+  if (atoms.length === 0) return [];
+  await captureMemories(atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, sessionId })));
+  // Scenarios ride along with the atoms that produced them — fire-and-forget, so a slow or
+  // failing second call never delays what the user is reading.
+  void distilScenarios(sessionId, model, generate);
+  return atoms;
+}
+
+/**
+ * Distil one exchange into L1 atoms. The queue drain's entry point (§3.3): unlike `distilTurn`
+ * there is no batching window — the host has already decided this turn is worth distilling, so
+ * waiting for two more would only delay learning.
+ *
+ * Throws on failure, which is the opposite of `distilTurn`'s contract and deliberately so: the
+ * drain has to tell "distilled, nothing durable" (`[]`) apart from "the call failed", because the
+ * first completes its queue row and the second gives it back for another attempt.
+ */
+export async function distilExchange(
+  sessionId: string,
+  model: string,
+  exchange: Exchange,
+  generate?: Generator,
+): Promise<string[]> {
+  if (!model) return [];
+  return distillAndStore(sessionId, model, [exchange], generate);
 }
 
 /** The real generator: one non-streaming call through the router, so fallback and the ledger

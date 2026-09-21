@@ -15,6 +15,9 @@ use crate::gateway::{
     check_gateway_key, clean_assistant_text, err, err_ra, forwarded_headers, openai_error, peer_ip,
     try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 
 pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
@@ -56,6 +59,13 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     };
     let id = slot.id;
     let fwd = forwarded_headers(&headers);
+    // Memory/context layer: strips the gateway-invented `metadata.aip` before dispatch, and recalls
+    // + injects a memory block when the toggle allows it. The outcome is reported on the response
+    // as `AIP-Memory` / `AIP-Memory-Scope`.
+    let outcome = inject_context(&core, &headers, None, &mut req);
+    // Capture inputs are computed before dispatch: the stream branch builds a `'static` body and so
+    // cannot borrow the request.
+    let prep = prepare_capture(&core, &headers, &req, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req.clone(), headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "chat", model = %req.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching chat request");
 
@@ -63,8 +73,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         // Slot (and its Drop -> bridge.cancel) lives inside the SSE stream: axum drops the
         // stream exactly when the client disconnects or the body finishes.
         let stream_body = async_stream::stream! {
+            // Moved in: the stream must be 'static, so it cannot borrow the request or headers.
+            let prep = prep;
             let mut usage: Option<(u64, u64)> = None;
             let mut started = false;
+            let mut streamed = String::new();
             while let Some(msg) = slot.recv().await {
                 match msg {
                     // An empty delta carries no content, so it is not a wire event at all.
@@ -73,6 +86,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                     // which must reach the client as nothing.
                     BridgeMsg::Delta(t) if t.is_empty() => {}
                     BridgeMsg::Delta(t) => {
+                        streamed.push_str(&t);
                         // The first content frame opens the message the way OpenAI does it, so
                         // clients that read delta.role instead of inferring it see an assistant.
                         let delta = if started {
@@ -87,6 +101,9 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
+                        if let Some(p) = &prep {
+                            let _ = finish_capture(p, &streamed);
+                        }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                             json!({
@@ -146,9 +163,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             }
             drop(slot);
         };
-        return Sse::new(stream_body)
+        let mut r = Sse::new(stream_body)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response();
+        apply_memory_headers(&mut r, &outcome);
+        return r;
     }
 
     let mut full = String::new();
@@ -159,7 +178,12 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if let Some(p) = &prep {
+                    let _ = finish_capture(p, &full);
+                }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
@@ -181,13 +205,13 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             // Not upstream: the worker never answered. Say so, and tell the client it is
             // worth retrying — a retry re-enters `try_slot`, which re-warms the window.
             if code == StatusCode::SERVICE_UNAVAILABLE {
-                return err_ra(
-                    code,
-                    "1",
-                    openai_error(&message, "service_unavailable", None),
-                );
+                let mut r = err_ra(code, "1", openai_error(&message, "service_unavailable", None));
+                apply_memory_headers(&mut r, &outcome);
+                return r;
             }
-            err(code, openai_error(&message, "upstream_error", None))
+            let mut r = err(code, openai_error(&message, "upstream_error", None));
+            apply_memory_headers(&mut r, &outcome);
+            r
         }
         None => {
             let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": clean_assistant_text(&full) }, "finish_reason": "stop" });
@@ -201,7 +225,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
             if let Some((pt, ct)) = usage {
                 choice["usage"] = json!({ "prompt_tokens": pt, "completion_tokens": ct });
             }
-            (
+            let mut r = (
                 StatusCode::OK,
                 [(header::CONTENT_TYPE, "application/json")],
                 json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
@@ -209,7 +233,9 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                     "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct })) })
                     .to_string(),
             )
-                .into_response()
+                .into_response();
+            apply_memory_headers(&mut r, &outcome);
+            r
         }
     }
 }

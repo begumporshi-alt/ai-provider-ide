@@ -17,6 +17,9 @@ use crate::gateway::{
     check_gateway_key, clean_assistant_text, forwarded_headers, peer_ip, try_slot, worker_status,
     BridgeMsg, BridgeRequest, GatewayCore,
 };
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 
 /// One Gemini function declaration -> one OpenAI function declaration.
 fn declaration_to_openai(d: &Value) -> Option<Value> {
@@ -226,20 +229,30 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     };
     let id = slot.id;
     let fwd = forwarded_headers(&headers);
+    let outcome = inject_context(&core, &headers, Some(&req), &mut chat);
+    // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
+    let prep = prepare_capture(&core, &headers, &chat, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "gemini", "dispatching gemini request");
 
     if streaming {
         let stream_body = async_stream::stream! {
+            // Moved in: the stream must be 'static, so it cannot borrow the request or headers.
+            let prep = prep;
             let mut usage: Option<(u64, u64)> = None;
+            let mut streamed = String::new();
             while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
+                        streamed.push_str(&t);
                         let chunk = json!({ "candidates": [{ "content": { "parts": [{ "text": t }], "role": "model" }, "index": 0 }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Done => {
+                        if let Some(p) = &prep {
+                            let _ = finish_capture(p, &streamed);
+                        }
                         let (pt, ct) = usage.unwrap_or((0, 0));
                         let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
@@ -283,7 +296,9 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
             }
             drop(slot);
         };
-        return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        let mut r = Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        apply_memory_headers(&mut r, &outcome);
+        return r;
     }
 
     let mut full = String::new();
@@ -295,7 +310,12 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if let Some(p) = &prep {
+                    let _ = finish_capture(p, &full);
+                }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
@@ -322,7 +342,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         }
     }
     drop(slot);
-    match err_info {
+    let mut r = match err_info {
         Some((status, message)) => gemini_error(&message, worker_status(status)),
         None => {
             let (pt, ct) = usage.unwrap_or((0, 0));
@@ -343,6 +363,8 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
             )
                 .into_response()
         }
-    }
+    };
+    apply_memory_headers(&mut r, &outcome);
+    r
 }
 

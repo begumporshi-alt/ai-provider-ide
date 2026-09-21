@@ -22,6 +22,10 @@
         /// Lets a test drive the worker's own status decision into the edge — which is exactly
         /// where that decision used to be discarded.
         fail_status: AtomicUsize,
+        /// Everything handed to the worker, verbatim. Phase 6 needs to see what actually leaves
+        /// for the provider — asserting on the *ingress* body would prove nothing, because every
+        /// dialect is translated twice and either hop can drop the injected block.
+        sent: Mutex<Vec<(String, Value, HashMap<String, String>)>>,
     }
 
     impl SynthBridge {
@@ -34,7 +38,13 @@
                 empty_delta: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
                 fail_status: AtomicUsize::new(0),
+                sent: Mutex::new(Vec::new()),
             }
+        }
+
+        /// `(kind, body, headers)` of the nth dispatch.
+        fn sent(&self, n: usize) -> Option<(String, Value, HashMap<String, String>)> {
+            self.sent.lock().unwrap().get(n).cloned()
         }
         fn attach(&self, core: &Arc<GatewayCore>) {
             *self.core.lock().unwrap() = Some(core.clone());
@@ -59,6 +69,11 @@
             if self.silent.load(Ordering::Relaxed) {
                 return; // never replies — the request must fail, not hang
             }
+            self.sent.lock().unwrap().push((
+                req.kind.to_string(),
+                req.body.clone(),
+                req.headers.clone(),
+            ));
             let core = self.core.lock().unwrap().clone().unwrap();
             let slow = self.slow.load(Ordering::Relaxed);
             let with_tools = self.tool_calls.load(Ordering::Relaxed);
@@ -778,11 +793,18 @@
 
     // ---------- audit R4: per-app keys + monthly spend cap ----------
 
+    /// Stand-in for the vault-backed provider: `(id, secret)` pairs.
+    fn ak(pairs: &[(&str, &str)]) -> Arc<Mutex<Vec<AppKey>>> {
+        Arc::new(Mutex::new(
+            pairs.iter().map(|(id, s)| AppKey { id: (*id).into(), secret: (*s).into() }).collect(),
+        ))
+    }
+
     /// `start()` plus the two R4 providers. Both are `Option` so each test opts into exactly
     /// the behaviour it exercises; `None` reproduces the pre-R4 (master-only, uncapped) path.
     fn core_with(
         key: Arc<Mutex<Option<String>>>,
-        app_keys: Option<Arc<Mutex<Vec<String>>>>,
+        app_keys: Option<Arc<Mutex<Vec<AppKey>>>>,
         spend: Option<Arc<Mutex<(i64, i64)>>>,
     ) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
         let bridge = Arc::new(SynthBridge::new());
@@ -800,7 +822,7 @@
     }
 
     async fn start_with(
-        app_keys: Option<Arc<Mutex<Vec<String>>>>,
+        app_keys: Option<Arc<Mutex<Vec<AppKey>>>>,
         spend: Option<Arc<Mutex<(i64, i64)>>>,
     ) -> TestServer {
         let master = Arc::new(Mutex::new(Some("sk-aip-master".to_string())));
@@ -830,7 +852,7 @@
     /// lets an app be onboarded without handing out the master credential.
     #[tokio::test(flavor = "multi_thread")]
     async fn r4_app_key_authenticates() {
-        let s = start_with(Some(Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]))), None).await;
+        let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
         let res = post_chat(&s, "sk-aip-app1").await;
         assert_eq!(res.status(), 200, "per-app key must be accepted");
     }
@@ -839,7 +861,7 @@
     /// from the active list kills it on the NEXT request — no restart, no master rotation.
     #[tokio::test(flavor = "multi_thread")]
     async fn r4_revoked_app_key_rejected_immediately() {
-        let keys = Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]));
+        let keys = ak(&[("ak-1", "sk-aip-app1")]);
         let s = start_with(Some(keys.clone()), None).await;
         assert_eq!(post_chat(&s, "sk-aip-app1").await.status(), 200);
         keys.lock().unwrap().clear(); // == revoke
@@ -852,11 +874,147 @@
     /// failure is recorded (so the brute-force backoff still applies).
     #[tokio::test(flavor = "multi_thread")]
     async fn r4_unknown_key_still_rejected() {
-        let s = start_with(Some(Arc::new(Mutex::new(vec!["sk-aip-app1".to_string()]))), None).await;
+        let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
         let res = post_chat(&s, "sk-aip-nope").await;
         assert_eq!(res.status(), 401);
         let body: Value = res.json().await.unwrap();
         assert_eq!(body["error"]["code"], "invalid_api_key");
+    }
+
+    // ---------- §4a: app-key principal (deferred from Phase 1) ----------
+    //
+    // The design blocked this on "a cached id→secret map" because otherwise resolving a presented
+    // key back to its id costs one keychain read per key *per request*. These tests pin the cache
+    // and, more importantly, that the cache does not break revocation.
+
+    /// A core with a real store and a provider shaped like the vault-backed one: it filters by
+    /// the active id set and counts every call.
+    ///
+    /// The store is load-bearing, not incidental — it is the only thing that can say authorita-
+    /// tively whether the memo is still valid, and with no store nothing is cached at all.
+    fn key_core(tag: &str, keys: &[(&str, &str)]) -> (Arc<GatewayCore>, Arc<AtomicUsize>, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("aip-appkey-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
+        let reads = Arc::new(AtomicUsize::new(0));
+        let (r, s2) = (reads.clone(), store.clone());
+        let all: Vec<AppKey> =
+            keys.iter().map(|(id, sec)| AppKey { id: (*id).into(), secret: (*sec).into() }).collect();
+        let bridge = Arc::new(SynthBridge::new());
+        let core = GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-master".into())))
+            .with_app_keys(Arc::new(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                let active = crate::persist::active_gateway_key_ids(&s2).unwrap_or_default();
+                all.iter().filter(|k| active.contains(&k.id)).cloned().collect()
+            }))
+            .with_store(store);
+        let core = Arc::new(core);
+        bridge.attach(&core);
+        (core, reads, dir)
+    }
+
+    /// The property the design was waiting for: N requests do not mean N keychain passes.
+    #[test]
+    fn the_app_key_map_is_read_once_not_once_per_request() {
+        let (core, reads, dir) = key_core("memo", &[("ak-1", "sk-aip-app1")]);
+        crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 1, "three requests, one keychain pass");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The property that made a bare TTL cache wrong. Revocation takes effect on the very next
+    /// request today; a memo served purely on a timer would keep a revoked key authenticating for
+    /// the rest of its TTL, which is a security regression dressed as an optimisation.
+    #[test]
+    fn revoking_a_key_invalidates_the_memo_on_the_next_request() {
+        let (core, reads, dir) = key_core("revoke", &[("ak-1", "sk-aip-app1")]);
+        let store = core.store().unwrap();
+        crate::persist::gateway_key_insert(store, "ak-1", "cursor").unwrap();
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        crate::persist::gateway_key_revoke(store, "ak-1").unwrap();
+        assert!(core.app_keys().is_empty(), "a revoked key must authenticate nobody");
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "the memo was not served");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The mirror of the above: a newly created key works on the next request, which is the
+    /// contract `gateway_app_key_create` documents ("no provider refresh needed").
+    #[test]
+    fn creating_a_key_invalidates_the_memo_on_the_next_request() {
+        let (core, _reads, dir) = key_core("create", &[("ak-1", "s1"), ("ak-2", "s2")]);
+        let store = core.store().unwrap();
+        crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+        assert_eq!(core.app_keys().len(), 1);
+        crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+        assert_eq!(core.app_keys().len(), 2, "a new key authenticates on the very next request");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The TTL is the backstop for the one case SQLite cannot see: a secret removed from the
+    /// keychain out from under an active row. An expired memo must not be served.
+    #[test]
+    fn the_memo_stops_being_served_once_its_ttl_expires() {
+        let (core, reads, dir) = key_core("ttl", &[("ak-1", "sk-aip-app1")]);
+        crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
+        core.set_app_key_cache_ttl(Duration::ZERO);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "an expired memo is re-read, not served");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No store means no authoritative id set, so nothing is memoised. This is what keeps
+    /// `r4_revoked_app_key_rejected_immediately` honest: that harness mutates the provider's vec
+    /// directly, and a cache would have masked the change.
+    #[test]
+    fn without_a_store_nothing_is_cached() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let r = reads.clone();
+        let keys = ak(&[("ak-1", "sk-aip-app1")]);
+        let bridge = Arc::new(SynthBridge::new());
+        let core = GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-master".into())))
+            .with_app_keys(Arc::new(move || {
+                r.fetch_add(1, Ordering::SeqCst);
+                keys.lock().unwrap().clone()
+            }));
+        let core = Arc::new(core);
+        bridge.attach(&core);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(core.app_keys().len(), 1);
+        assert_eq!(reads.load(Ordering::SeqCst), 2, "never cache what cannot be validated");
+    }
+
+    #[test]
+    fn a_presented_key_resolves_to_its_id_and_a_strange_one_to_nothing() {
+        let (core, _reads, dir) = key_core("resolve", &[("ak-1", "s1"), ("ak-2", "s2")]);
+        let store = core.store().unwrap();
+        crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+        crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+        // Deliberately not the first entry: resolution must not depend on position.
+        assert_eq!(core.app_key_for("s2").as_deref(), Some("ak-2"));
+        assert_eq!(core.app_key_for("s1").as_deref(), Some("ak-1"));
+        assert_eq!(core.app_key_for("nope"), None);
+        assert_eq!(core.app_key_for(""), None, "no credential presented means no key identity");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Pins the no-early-break rule observably. Two candidates sharing a secret cannot both win:
+    /// a `find` (first match, then stop) answers `ak-1`, a scan that runs to completion answers
+    /// `ak-2`. That makes this the one assertion that can see the difference — the property it
+    /// exists for is timing, and timing is not assertable.
+    #[test]
+    fn resolving_a_key_scans_every_candidate_rather_than_stopping_at_the_first() {
+        let (core, _reads, dir) = key_core("scan", &[("ak-1", "shared"), ("ak-2", "shared")]);
+        let store = core.store().unwrap();
+        crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+        crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+        assert_eq!(core.app_key_for("shared").as_deref(), Some("ak-2"), "the scan runs to the end");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// R4(a): the backoff window opened by a bad credential must not throttle a caller that
@@ -1999,4 +2157,212 @@
             crate::gateway_cmds::set_gateway_workspace_root(&state, &good.to_string_lossy()).is_ok()
         );
         assert!(state.core.workspace_root().is_some());
+    }
+
+    // ---------- Phase 6: injection across all four ingress dialects ----------
+    //
+    // Every dialect is translated twice — native request -> canonical chat -> whatever the provider
+    // speaks — and the injected block is added to the canonical body in between. A test that asserts
+    // on the *ingress* body would prove nothing: either translation can silently drop it. So these
+    // assert on what was actually handed to the bridge, and on what was not.
+
+    const MEMORY_TEXT: &str = "this project uses Postgres for the database";
+    const QUESTION: &str = "what database does this project use";
+
+    /// One temp dir per test. A monotonic counter, not a timestamp: these run in parallel and two
+    /// that opened in the same millisecond shared a database and locked each other out.
+    fn phase6_dir() -> std::path::PathBuf {
+        static SEQ: AtomicUsize = AtomicUsize::new(0);
+        let n = SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("aip-phase6-{}-{n}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    /// A server with a real store, one memory scoped to the default workspace's project, and the
+    /// memory layer switched on. Returns the temp dir so the caller can clean it up.
+    async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
+        let dir = phase6_dir();
+        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
+        let project = crate::gateway::context_scope::project_key_from_root(
+            &crate::gateway::default_workspace_root().unwrap().to_string_lossy(),
+        )
+        .unwrap();
+        let m = crate::memory::capture(
+            &store,
+            &crate::memory::MemoryInput {
+                layer: "L1".into(),
+                text: MEMORY_TEXT.into(),
+                session_id: None,
+                subject: None,
+                pinned: false,
+            },
+        )
+        .unwrap();
+        // Scoped on purpose: an unscoped memory is invisible to every scope, which would make the
+        // whole suite pass on "no candidates" instead of proving injection.
+        assert!(crate::memory::assign_scope(
+            &store,
+            &m.id,
+            crate::memory::ScopeAssignment::Project { project, agent: None },
+        )
+        .unwrap());
+
+        let master = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let bridge = Arc::new(SynthBridge::new());
+        let core = GatewayCore::new(bridge.clone(), Arc::new(move || master.lock().unwrap().clone()))
+            .with_store(store.clone());
+        let core = Arc::new(core);
+        bridge.attach(&core);
+        core.set_memory_enabled(true);
+        core.set_running(true);
+        let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+        (
+            TestServer { client: reqwest::Client::new(), base: format!("http://{}", handle.addr), core, bridge, _handle: handle },
+            dir,
+        )
+    }
+
+    /// The block the gateway prepends, as the bridge saw it. Panics with the whole body, because
+    /// "the system message did not contain the text" is useless without seeing what it did contain.
+    fn injected_system_text(sent: &(String, Value, HashMap<String, String>)) -> String {
+        let ms = sent.1.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+        let first = ms.first().cloned().unwrap_or_else(|| json!({}));
+        assert_eq!(first["role"], "system", "the block must be prepended: {:?}", ms);
+        first["content"].as_str().unwrap_or("").to_string()
+    }
+
+    fn assert_no_aip_headers(sent: &(String, Value, HashMap<String, String>)) {
+        let leaked: Vec<&String> = sent
+            .2
+            .keys()
+            .filter(|k| k.to_ascii_lowercase().starts_with("aip-"))
+            .collect();
+        assert!(leaked.is_empty(), "AIP headers reached the provider: {leaked:?}");
+    }
+
+    /// Every dialect's contract, in one helper, so a fifth dialect cannot be added without
+    /// agreeing to the same three assertions. `kind` differs by design — the Responses API is
+    /// dispatched as `responses` and re-framed at the edge, not folded into `chat`.
+    fn assert_injected_and_clean(
+        sent: &(String, Value, HashMap<String, String>),
+        dialect: &str,
+        kind: &str,
+    ) {
+        assert_eq!(sent.0, kind, "{dialect}: unexpected dispatch kind");
+        let block = injected_system_text(sent);
+        assert!(
+            block.contains(MEMORY_TEXT),
+            "{dialect}: the recalled memory did not reach the provider — block was: {block}"
+        );
+        assert_no_aip_headers(sent);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase6_openai_chat_injects_and_leaks_no_aip_headers() {
+        let (s, dir) = start_with_memory().await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("aip-agent", "cursor")
+            // Deliberately no `aip-project`: that header overrides the resolved project, and the
+            // memory here is bound to the workspace-root hash. Sending a literal project name is
+            // *supposed* to suppress injection — it is a different project — so including it here
+            // would test the wrong thing. The egress test below sends one on purpose.
+            .json(&json!({ "model": "mock-fast", "messages": [ { "role": "user", "content": QUESTION } ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        assert_injected_and_clean(&sent, "openai chat", "chat");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase6_anthropic_messages_injects_and_leaks_no_aip_headers() {
+        let (s, dir) = start_with_memory().await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("aip-agent", "claude-code")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [ { "role": "user", "content": QUESTION } ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        assert_injected_and_clean(&sent, "anthropic messages", "chat");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase6_openai_responses_injects_and_leaks_no_aip_headers() {
+        let (s, dir) = start_with_memory().await;
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("aip-agent", "codex")
+            .json(&json!({ "model": "mock-fast", "input": QUESTION }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        assert_injected_and_clean(&sent, "openai responses", "responses");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase6_gemini_generate_content_injects_and_leaks_no_aip_headers() {
+        let (s, dir) = start_with_memory().await;
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("aip-agent", "gemini-cli")
+            .json(&json!({ "contents": [ { "role": "user", "parts": [ { "text": QUESTION } ] } ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        assert_injected_and_clean(&sent, "gemini", "chat");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The egress allowlist, asserted rather than reviewed. A client can send any header it likes;
+    /// `AIP-*` is the gateway's own control surface and must never leave — it carries project and
+    /// agent identity that a provider has no business seeing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn phase6_no_aip_header_of_any_kind_reaches_the_provider() {
+        let (s, dir) = start_with_memory().await;
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("aip-memory", "on")
+            .header("aip-memory-budget", "400")
+            .header("aip-agent", "cursor")
+            .header("aip-project", "ai-provider-router")
+            .header("aip-session", "s-1")
+            .header("aip-internal", "1")
+            .header("aip-open-files", "src/main.rs")
+            .header("x-client-name", "cursor")
+            .json(&json!({ "model": "mock-fast", "messages": [ { "role": "user", "content": QUESTION } ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        assert_no_aip_headers(&sent);
+        // And the allowlist is not simply empty: a legitimate client header still goes through,
+        // otherwise this test would pass against a bridge that forwards nothing at all.
+        assert!(!sent.2.is_empty(), "the forwarding allowlist must not be empty");
+        let _ = std::fs::remove_dir_all(&dir);
     }

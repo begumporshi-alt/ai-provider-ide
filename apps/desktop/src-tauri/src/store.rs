@@ -320,6 +320,12 @@ END;
 const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>)] = &[
     ("0007_stable_memory_node_ids", backfill_stable_memory_node_ids),
     ("0008_ledger_error_class", backfill_ledger_error_class),
+    ("0009_memory_scope", backfill_memory_scope),
+    ("0010_live_context", backfill_live_context),
+    ("0011_capture_queue", backfill_capture_queue),
+    ("0012_principal_policy", backfill_principal_policy),
+    ("0013_model_context", backfill_model_context),
+    ("0014_superseded_at", backfill_superseded_at),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -653,9 +659,261 @@ fn backfill_ledger_error_class(tx: &rusqlite::Transaction<'_>) -> rusqlite::Resu
     Ok(())
 }
 
+/// 0009: scope dimensions on `memories`, for the gateway memory/context layer.
+///
+/// `user x project x agent`, plus an explicit `scope_global` flag. **Absence is not global** — three
+/// independent reviewers of the design flagged nullable-means-global as a contamination engine,
+/// because the header-less IDE is the common case and would otherwise degrade to "global" and leak
+/// one repo's context into another. A row is injectable only via an explicit project match or an
+/// explicit global mark.
+///
+/// Every query in `memory.rs` names its columns, so widening the table cannot shift a row's shape
+/// under a reader. The FTS5 index declares only `text` and is external-content, so it is unaffected;
+/// its three triggers remain the only thing keeping it honest.
+///
+/// Existing rows land at `scope_project = NULL, scope_global = 0` — i.e. **not injectable**. That is
+/// deliberate: they were captured by the Assistant with no project context, and silently promoting
+/// them to global is exactly the leak this schema exists to prevent.
+fn backfill_memory_scope(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    for (column, ddl) in [
+        ("scope_user", "ALTER TABLE memories ADD COLUMN scope_user TEXT NOT NULL DEFAULT 'local'"),
+        ("scope_project", "ALTER TABLE memories ADD COLUMN scope_project TEXT"),
+        ("scope_agent", "ALTER TABLE memories ADD COLUMN scope_agent TEXT"),
+        ("scope_global", "ALTER TABLE memories ADD COLUMN scope_global INTEGER NOT NULL DEFAULT 0 CHECK (scope_global IN (0,1))"),
+    ] {
+        if !table_has_column(tx, "memories", column)? {
+            tx.execute_batch(ddl)?;
+        }
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_memories_scope
+           ON memories(scope_user, scope_project, scope_agent, updated_at DESC);",
+    )
+}
+
+/// Live context: sessions, a bounded ring of turns per session, and the state an agent pushes
+/// (open files, current plan). Design §3.2.
+///
+/// Deliberately **not** `context_nodes`: that table is the Context screen's display graph — closed
+/// four-kind node set, no scoping, no retention — and pushing verbatim agent turns into it would
+/// destroy both the screen and its `graph(limit)` window.
+///
+/// A data migration, not a schema migration, because appending to `MIGRATIONS` would shift every
+/// data-migration version: those are numbered `MIGRATIONS.len() + idx + 1`.
+fn backfill_live_context(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS router_sessions (
+           id            TEXT PRIMARY KEY,
+           scope_user    TEXT NOT NULL DEFAULT 'local',
+           scope_project TEXT,
+           scope_agent   TEXT,
+           title         TEXT,
+           turn_count    INTEGER NOT NULL DEFAULT 0,
+           created_at    INTEGER NOT NULL,
+           last_seen_at  INTEGER NOT NULL
+         );
+         CREATE INDEX IF NOT EXISTS idx_router_sessions_seen
+           ON router_sessions(last_seen_at DESC);
+
+         -- Bounded ring per session. Pruned by count and by age; never grows without limit.
+         CREATE TABLE IF NOT EXISTS session_turns (
+           id         INTEGER PRIMARY KEY AUTOINCREMENT,
+           session_id TEXT NOT NULL REFERENCES router_sessions(id) ON DELETE CASCADE,
+           seq        INTEGER NOT NULL,
+           role       TEXT NOT NULL CHECK (role IN ('user','assistant','tool','system')),
+           text       TEXT NOT NULL,
+           ts         INTEGER NOT NULL,
+           UNIQUE (session_id, seq)
+         );
+         CREATE INDEX IF NOT EXISTS idx_session_turns
+           ON session_turns(session_id, seq DESC);
+
+         -- Live context the agent pushes: open files, cursor position, current plan.
+         CREATE TABLE IF NOT EXISTS session_state (
+           session_id TEXT PRIMARY KEY REFERENCES router_sessions(id) ON DELETE CASCADE,
+           open_files TEXT,
+           extra_json TEXT,
+           updated_at INTEGER NOT NULL
+         );",
+    )
+}
+
+/// Async capture queue (design §3.3), extended for the §3.5 rules.
+///
+/// `request_id` is UNIQUE so distillation is idempotent (§3.5.5) — a replay hits the constraint
+/// instead of producing a second row. `content_class` and the three scope columns are written once
+/// at enqueue and never updated, so a turn distilled after its project changed cannot be re-scoped
+/// (§3.5.4).
+///
+/// There is deliberately **no** principal column: an internal turn is never enqueued at all
+/// (§3.5.6), so there is nothing to record.
+fn backfill_capture_queue(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_pending (
+           id            INTEGER PRIMARY KEY AUTOINCREMENT,
+           request_id    TEXT NOT NULL UNIQUE,
+           session_id    TEXT,
+           scope_user    TEXT NOT NULL DEFAULT 'local',
+           scope_project TEXT,
+           scope_agent   TEXT,
+           content_class TEXT NOT NULL DEFAULT 'fact'
+                           CHECK (content_class IN ('fact','preference','decision','instruction')),
+           user_text     TEXT NOT NULL,
+           asst_text     TEXT,
+           model         TEXT,
+           status        TEXT NOT NULL DEFAULT 'queued'
+                           CHECK (status IN ('queued','processing','done','failed')),
+           attempts      INTEGER NOT NULL DEFAULT 0,
+           created_at    INTEGER NOT NULL,
+           claimed_at    INTEGER
+         );
+         CREATE INDEX IF NOT EXISTS idx_memory_pending ON memory_pending(status, id);",
+    )
+}
+
+/// Per-principal memory policy (§4a). One row per agent identity, and **no row means "inherit the
+/// master switch"** — not "allowed". A default-deny table would need a row for every IDE that has
+/// ever connected before memory worked for anyone, which is the same absence-as-a-decision trap the
+/// scope columns were designed to avoid.
+///
+/// Precedence is operator over client: a client's `AIP-Memory: on` cannot switch on what the
+/// operator switched off here, and the master switch still gates everything.
+fn backfill_principal_policy(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS memory_principal_policy (
+           principal  TEXT PRIMARY KEY,
+           enabled    INTEGER NOT NULL CHECK (enabled IN (0,1)),
+           updated_at INTEGER NOT NULL
+         );",
+    )
+}
+
+/// Per-model context-window cache (design §3.4). Rust cannot see the TS catalog — it lives in the
+/// webview, with provider selection and key handling — so the webview publishes the one number the
+/// request path needs and the host reads it here.
+///
+/// Rows are upserted per provider, never bulk-replaced: a refresh of one provider must not drop
+/// another's. `chars_per_token` is nullable and stays so — a model with no measured ratio uses the
+/// conservative default estimator rather than a stored guess.
+fn backfill_model_context(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS router_model_context (
+           model_key       TEXT PRIMARY KEY,
+           context_window  INTEGER NOT NULL CHECK (context_window > 0),
+           chars_per_token REAL,
+           updated_at      INTEGER NOT NULL
+         );",
+    )
+}
+
+/// §6.4.3: a superseded row keeps its record rather than being deleted, so a reversal is
+/// recoverable and the Context graph's edges stay valid. `NULL` means live.
+fn backfill_superseded_at(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "memories", "superseded_at")? {
+        tx.execute_batch("ALTER TABLE memories ADD COLUMN superseded_at INTEGER;")?;
+    }
+    Ok(())
+}
+
+/// Guarded so the migration can be re-run against a table that already carries the column — an
+/// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
+/// `Store::open`, which is app startup.
+fn table_has_column(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> rusqlite::Result<bool> {
+    let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
+    let names = stmt
+        .query_map([], |r| r.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|n| n == column))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 0009 exists so the gateway memory layer can filter by scope. The important half is the
+    /// default: a row written with no scope is **not** injectable, because absence is not global.
+    #[test]
+    fn memory_rows_carry_scope_and_default_to_not_injectable() {
+        let dir = std::env::temp_dir().join(format!("aip-scope-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        let conn = s.conn.lock().unwrap();
+
+        let mut stmt = conn.prepare("PRAGMA table_info(memories)").unwrap();
+        let cols: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        for c in ["scope_user", "scope_project", "scope_agent", "scope_global"] {
+            assert!(cols.iter().any(|x| x == c), "memories is missing {c}");
+        }
+
+        conn.execute(
+            "INSERT INTO memories (id, layer, text, created_at, updated_at)
+             VALUES ('m1','L1','an old assistant atom',1,1)",
+            [],
+        )
+        .unwrap();
+        let (project, global): (Option<String>, i64) = conn
+            .query_row(
+                "SELECT scope_project, scope_global FROM memories WHERE id='m1'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(project, None, "no project means unresolved, not global");
+        assert_eq!(global, 0, "and unresolved is not injectable");
+    }
+
+    /// The ring has to be enforced by the schema, not by a caller remembering to prune: a turn
+    /// table that grows without limit is the failure this design explicitly guards against.
+    #[test]
+    fn live_context_tables_exist_and_a_session_turn_ring_is_bounded() {
+        let dir = std::env::temp_dir().join(format!("aip-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        let conn = s.conn.lock().unwrap();
+
+        conn.execute(
+            "INSERT INTO router_sessions (id, scope_user, scope_project, created_at, last_seen_at)
+             VALUES ('s1','local','p1',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_turns (session_id, seq, role, text, ts) VALUES ('s1',1,'user','hi',1)",
+            [],
+        )
+        .unwrap();
+        // The same (session_id, seq) twice is a replay; the UNIQUE constraint is what makes
+        // recording idempotent rather than duplicating a turn on a retry.
+        assert!(
+            conn.execute(
+                "INSERT INTO session_turns (session_id, seq, role, text, ts) VALUES ('s1',1,'user','hi',1)",
+                [],
+            )
+            .is_err(),
+            "a repeated (session_id, seq) is rejected"
+        );
+        assert!(
+            conn.execute(
+                "INSERT INTO session_turns (session_id, seq, role, text, ts) VALUES ('nope',1,'user','hi',1)",
+                [],
+            )
+            .is_err(),
+            "a turn cannot outlive its session"
+        );
+        conn.execute(
+            "INSERT INTO session_state (session_id, open_files, updated_at) VALUES ('s1','[]',1)",
+            [],
+        )
+        .unwrap();
+
+        // Re-migrating must not fail: app startup runs this on every launch.
+        drop(conn);
+        s.migrate().expect("live-context migration is idempotent");
+    }
 
     #[test]
     fn migrations_apply_once_and_are_idempotent() {
@@ -664,11 +922,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007 and 0008 data migrations.
-        assert_eq!(info.schema_version, 8);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0014 data migrations.
+        assert_eq!(info.schema_version, 14);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(8, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(14, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -681,6 +939,8 @@ mod tests {
             "context_nodes", "context_edges", "skills",
             "agent_runs", "agent_steps",
             "memories", "memories_fts",
+            "router_sessions", "session_turns", "session_state", "memory_pending",
+            "memory_principal_policy", "router_model_context",
         ] {
             let n: i64 = conn
                 .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))

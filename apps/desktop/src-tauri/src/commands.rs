@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use serde::Deserialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
@@ -421,6 +422,38 @@ pub fn memory_update(
     memory::update(&store, &id, &text).map_err(CommandError)
 }
 
+/// Wire shape for `memory_assign_scope`. Flat rather than a tagged enum because this crosses into
+/// TypeScript, where a Rust enum variant is an awkward thing to construct.
+#[derive(Debug, Deserialize)]
+pub struct MemoryScopeInput {
+    /// `project` | `global` | `unscoped`.
+    pub kind: String,
+    pub project: Option<String>,
+    pub agent: Option<String>,
+}
+
+/// Bind a memory to a scope. This is the review surface: an atom is never injectable until someone
+/// puts it in a project or marks it global on purpose.
+#[tauri::command]
+pub fn memory_assign_scope(
+    store: State<'_, Arc<Store>>,
+    id: String,
+    scope: MemoryScopeInput,
+) -> Result<bool, CommandError> {
+    let assignment = match scope.kind.trim().to_ascii_lowercase().as_str() {
+        "project" => memory::ScopeAssignment::Project {
+            // An absent project falls through to `assign_scope`'s "project scope is empty"
+            // refusal rather than being silently defaulted here.
+            project: scope.project.unwrap_or_default(),
+            agent: scope.agent,
+        },
+        "global" => memory::ScopeAssignment::Global,
+        "unscoped" => memory::ScopeAssignment::Unscoped,
+        other => return Err(CommandError(format!("unknown scope kind '{other}'"))),
+    };
+    memory::assign_scope(&store, &id, assignment).map_err(CommandError)
+}
+
 #[tauri::command]
 pub fn memory_session_atoms(
     store: State<'_, Arc<Store>>,
@@ -436,9 +469,157 @@ pub fn memory_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
     memory::clear(&store).map_err(CommandError)
 }
 
+/// Bound the live-context tables: turn ring per session, TTL on turns, TTL on idle sessions.
+///
+/// A command rather than something the request path does, because pruning there would add a second
+/// write to the hottest code in the app. Scheduling it on idle is Phase 5; until then the host can
+/// call it and nothing grows without limit in between.
+#[tauri::command]
+pub fn gateway_prune_live_context(
+    store: State<'_, Arc<Store>>,
+) -> Result<crate::gateway::session_context::PruneStats, CommandError> {
+    crate::gateway::session_context::prune(&store).map_err(CommandError)
+}
+
+/// §6.2 retention for the `memories` table: L0 TTL and ring, L1/L2 decay. Pinned and L3 are exempt.
+///
+/// Separate from `gateway_prune_live_context` because the two tables have completely different
+/// retention policies, and one stats struct covering both would hide which rule removed what.
+#[tauri::command]
+pub fn gateway_prune_memories(
+    store: State<'_, Arc<Store>>,
+) -> Result<memory::MemoryPruneStats, CommandError> {
+    memory::prune(&store).map_err(CommandError)
+}
+
 #[tauri::command]
 pub fn memory_stats(store: State<'_, Arc<Store>>) -> Result<memory::MemoryStats, CommandError> {
     memory::stats(&store).map_err(CommandError)
+}
+
+/// §6.4.3: mark one memory as superseded by another. The old row is kept, not deleted.
+///
+/// Errors on a pinned or L3 row — §6.4.5 forbids quietly replacing either, and that refusal is the
+/// whole reason conflicts are surfaced to a human rather than resolved here.
+#[tauri::command]
+pub fn memory_supersede(
+    store: State<'_, Arc<Store>>,
+    old: String,
+    new: String,
+) -> Result<bool, CommandError> {
+    memory::supersede(&store, &old, &new).map_err(CommandError)
+}
+
+/// §6.4.3: undo a supersession. The row was never deleted, so this only makes it reachable again.
+#[tauri::command]
+pub fn memory_unsupersede(
+    store: State<'_, Arc<Store>>,
+    id: String,
+) -> Result<bool, CommandError> {
+    memory::unsupersede(&store, &id).map_err(CommandError)
+}
+
+/// §6.4.5: what the Memory screen has to put in front of a human.
+#[tauri::command]
+pub fn memory_conflicts(store: State<'_, Arc<Store>>) -> Result<Vec<memory::Conflict>, CommandError> {
+    memory::conflicts(&store).map_err(CommandError)
+}
+
+// ── capture queue drain (§3.3) ──────────────────────────────────────────────
+//
+// The host enqueues at `BridgeMsg::Done` and never calls a model. The webview pulls a batch,
+// distils it, and reports back here. Splitting it this way is what keeps distillation — the most
+// expensive and least reliable step — off the request path entirely: a slow, broken or offline
+// model delays learning, never a response.
+
+#[tauri::command]
+pub fn capture_claim(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<crate::capture::PendingRow>, CommandError> {
+    crate::capture::claim(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn capture_complete(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, CommandError> {
+    crate::capture::complete(&store, id).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn capture_release(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, CommandError> {
+    crate::capture::release(&store, id).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn capture_requeue_stale(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
+    crate::capture::requeue_stale(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn capture_queue_status(
+    store: State<'_, Arc<Store>>,
+) -> Result<crate::capture::QueueStatus, CommandError> {
+    crate::capture::queue_status(&store).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn capture_purge_finished(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
+    crate::capture::purge_finished(&store).map_err(CommandError)
+}
+
+// ── per-principal memory policy (§4a) ───────────────────────────────────────
+//
+// Which client may use memory, independent of whether the machine does. `enabled: null` means
+// "inherit the master switch", and the master switch still beats every row here — turning memory
+// off globally has to remain a single, unambiguous act.
+
+#[tauri::command]
+pub fn memory_principal_list(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<crate::gateway::principal::PrincipalRow>, CommandError> {
+    crate::gateway::principal::list(&store).map_err(CommandError)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PrincipalPolicyInput {
+    pub principal: String,
+    /// `true` | `false` for an override, `null` to return to inheriting.
+    pub enabled: Option<bool>,
+}
+
+#[tauri::command]
+pub fn memory_principal_set(
+    store: State<'_, Arc<Store>>,
+    policy: PrincipalPolicyInput,
+) -> Result<bool, CommandError> {
+    match policy.enabled {
+        Some(on) => crate::gateway::principal::set(&store, &policy.principal, on),
+        None => crate::gateway::principal::clear(&store, &policy.principal),
+    }
+    .map_err(CommandError)
+}
+
+// ── model context-window cache (§3.4) ───────────────────────────────────────
+//
+// The webview owns the catalog, so it publishes the numbers and the host reads them. Nothing here
+// is on the critical path of a request that has no memory to inject — the lookup is one indexed
+// read of a tiny table, and a miss degrades to the conservative default.
+
+/// Publish windows for the models the catalog knows. An upsert, because a refresh covers one
+/// provider and must not drop another's rows.
+#[tauri::command]
+pub fn router_model_context_replace(
+    store: State<'_, Arc<Store>>,
+    rows: Vec<crate::gateway::model_context::ModelContextInput>,
+) -> Result<usize, CommandError> {
+    crate::gateway::model_context::upsert(&store, &rows).map_err(CommandError)
+}
+
+/// How many models the gateway can plan a budget against. Shown in the UI because "why is so
+/// little memory being injected" is otherwise unanswerable: with zero rows every request plans
+/// against the 8k default.
+#[tauri::command]
+pub fn router_model_context_count(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
+    crate::gateway::model_context::count(&store).map_err(CommandError)
 }
 
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
@@ -545,6 +726,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_usage,
         crate::gateway_cmds::gateway_set_workspace_root,
         crate::gateway_cmds::gateway_get_workspace_root,
+        crate::gateway_cmds::gateway_project_key,
+        crate::gateway_cmds::gateway_memory_enabled,
+        crate::gateway_cmds::gateway_set_memory_enabled,
         crate::gateway_cmds::gateway_tool_run,
         crate::workbuddy::workbuddy_sync,
         crate::workbuddy::workbuddy_status,
@@ -570,10 +754,26 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         memory_list,
         memory_forget,
         memory_set_pinned,
+        memory_assign_scope,
         memory_update,
         memory_session_atoms,
         memory_clear,
+        gateway_prune_live_context,
+        gateway_prune_memories,
+        memory_supersede,
+        memory_unsupersede,
+        memory_conflicts,
         memory_stats,
+        capture_claim,
+        capture_complete,
+        capture_release,
+        capture_requeue_stale,
+        capture_queue_status,
+        capture_purge_finished,
+        memory_principal_list,
+        memory_principal_set,
+        router_model_context_replace,
+        router_model_context_count,
         // Crash reporting (local-only, no external telemetry)
         crate::commands::crash_count,
         crate::commands::crash_list,

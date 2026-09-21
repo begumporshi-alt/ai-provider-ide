@@ -60,9 +60,22 @@ const HEARTBEAT_STALE_HIDDEN_MS: u64 = 30_000;
 /// OS keychain. Production passes the vault-backed closure.
 pub type KeyProvider = Arc<dyn Fn() -> Option<String> + Send + Sync + 'static>;
 
-/// R4: active per-app key secrets (keychain-backed). Returns only NON-revoked keys, so
+/// R4: one active per-app key — its stable id *and* its secret.
+///
+/// The secret is what auth compares. The id is what the memory layer needs (§4a: a principal has
+/// to be nameable by the operator). Returning both from one read is the whole reason identity is
+/// affordable at all: the provider costs one keychain round-trip per key, so a second call that
+/// asked only "which id was that secret?" would double the cost of every request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppKey {
+    /// `ak-<hex>`, matching the `gateway_keys.id` row.
+    pub id: String,
+    pub secret: String,
+}
+
+/// R4: active per-app keys (keychain-backed). Returns only NON-revoked keys, so
 /// revocation takes effect on the very next request without rotating anything else.
-pub type AppKeyProvider = Arc<dyn Fn() -> Vec<String> + Send + Sync + 'static>;
+pub type AppKeyProvider = Arc<dyn Fn() -> Vec<AppKey> + Send + Sync + 'static>;
 
 pub fn vault_key_provider() -> KeyProvider {
     Arc::new(|| vault::get(MASTER_ACCOUNT).ok().flatten())
@@ -197,10 +210,66 @@ pub const APP_KEY_PREFIX: &str = "gwkey:";
 pub fn vault_app_key_provider(store: Arc<crate::store::Store>) -> AppKeyProvider {
     Arc::new(move || {
         let ids = crate::persist::active_gateway_key_ids(&store).unwrap_or_default();
-        ids.iter()
-            .filter_map(|id| vault::get(&format!("{APP_KEY_PREFIX}{id}")).ok().flatten())
+        ids.into_iter()
+            .filter_map(|id| {
+                let secret = vault::get(&format!("{APP_KEY_PREFIX}{id}")).ok().flatten()?;
+                Some(AppKey { id, secret })
+            })
             .collect()
     })
+}
+
+/// How long the memoised app-key map may be replayed without re-reading the keychain.
+///
+/// This is a **backstop, not the primary invalidation**. The primary one is the active-key set
+/// (see `AppKeyCache`), which is re-read from SQLite on every request precisely so that creating
+/// and revoking a key still take effect on the very next call — the contract the provider's own
+/// comment promises. The TTL covers the one case SQLite cannot see: a secret changed or deleted
+/// in the keychain underneath an active row.
+const APP_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Memo over `app_key_provider`.
+///
+/// Needed because the provider is one keychain read per key, and that call can block *indefinitely*
+/// on a macOS SecurityAgent prompt — see `MASTER_KEY_WAIT`. Uncached, a gateway with N app keys
+/// takes N blocking calls per request, so one stale keychain ACL stops the whole HTTP surface.
+///
+/// Keyed on the **set of active ids** rather than on time alone: that set is read fresh from
+/// SQLite each request (one indexed scan, no keychain), so create and revoke invalidate the memo
+/// immediately. Keying on a bare TTL instead would have quietly broken revocation, which today
+/// takes effect on the very next request.
+struct AppKeyCache {
+    /// Active ids as of `keys`. `None` until first filled.
+    ids: Option<Vec<String>>,
+    keys: Vec<AppKey>,
+    at: Option<Instant>,
+    ttl: Duration,
+}
+
+impl Default for AppKeyCache {
+    fn default() -> Self {
+        Self { ids: None, keys: Vec::new(), at: None, ttl: APP_KEY_CACHE_TTL }
+    }
+}
+
+impl AppKeyCache {
+    /// `active` is the freshly-read id set, or `None` when there is no store to ask (a harness).
+    fn fresh(&self, active: &Option<Vec<String>>) -> bool {
+        let Some(at) = self.at else {
+            return false;
+        };
+        if at.elapsed() >= self.ttl {
+            return false;
+        }
+        match (active, &self.ids) {
+            // The set is the authority: unchanged ids mean unchanged secrets behind them.
+            (Some(a), Some(c)) => a == c,
+            // No store to consult (a harness), or nothing memoised yet. An unchecked memo would
+            // let a revoked key keep authenticating for the whole TTL — see
+            // `r4_revoked_app_key_rejected_immediately` — so never cache blind.
+            _ => false,
+        }
+    }
 }
 
 /// R4: month-to-date spend vs. the configured cap, in micro-USD — `(spent, cap)`, where
@@ -449,6 +518,9 @@ pub struct GatewayCore {
     /// R4: optional per-app key secrets. `None` = master key only (all existing tests).
     /// Behind a Mutex so it can be swapped after create/revoke without rebuilding the core.
     app_key_provider: Mutex<Option<AppKeyProvider>>,
+    /// Memo over `app_key_provider` — see `AppKeyCache`. Without it, resolving a presented key
+    /// back to its id would cost a keychain read per key *per request*.
+    app_key_cache: Mutex<AppKeyCache>,
     /// R4: optional monthly spend gate. `None` = uncapped (all existing tests).
     spend_provider: Mutex<Option<SpendProvider>>,
     /// R1: window hidden (background mode). Loosens the heartbeat bound — see
@@ -468,6 +540,17 @@ pub struct GatewayCore {
     /// Workspace root for local tool execution (write_file, mkdir, run_command).
     /// Set via `gateway_set_workspace_root` Tauri command before first tool use.
     workspace_root: Mutex<Option<std::path::PathBuf>>,
+    /// The store, so the memory/context layer can be reached from the request path.
+    ///
+    /// `Option` and `None` by default for the same reason `app_key_provider` is: every existing test
+    /// builds a core with `new()`, and none of them have a store. It is attached in production by
+    /// `with_store`. Nothing on the request path touches it until the memory toggle is on.
+    store: Option<Arc<crate::store::Store>>,
+    /// Host-side kill switch for the memory/context layer. **Off by default** — see
+    /// `GATEWAY_MEMORY_LAYER.md` §0: injecting memory bills tokens on every request from every
+    /// client and is invisible at a layer with no review step, which is exactly why skills were kept
+    /// frontend-only. Off means `inject_context` strips `metadata.aip` and does nothing else.
+    memory_enabled: AtomicBool,
     /// Why the worker page failed to start, if it did. It runs in a window nobody can see, so
     /// without a channel back to the host its failures were unobservable.
     worker_error: Mutex<Option<String>>,
@@ -478,7 +561,47 @@ pub struct GatewayCore {
     last_warm: Mutex<Option<Instant>>,
     /// Bound on the worker's first response to a request; see `FIRST_MSG_TIMEOUT`.
     first_msg_timeout: Mutex<Duration>,
+    /// §5.5: composed memory blocks frozen per `(scope, session)`, so the bytes at system position 0
+    /// stop changing between requests and the provider's prefix cache can actually hit. See
+    /// `FrozenMemory`.
+    memory_freeze: Mutex<HashMap<String, FrozenMemory>>,
+    /// How long a frozen block is served before recall runs again. A field, not a constant, for the
+    /// same reason `first_msg_timeout` is one: ten minutes is not something a test can wait for.
+    memory_freeze_ttl: Mutex<Duration>,
 }
+
+/// §5.5: a composed memory block held still across requests.
+///
+/// Coding agents are the one workload deliberately built around provider prompt caching, and the
+/// memory block sits at system position 0 — so *any* change to its bytes invalidates the entire
+/// cached prefix and every request pays full input price plus the cache-write premium. Freezing the
+/// bytes is worth more than the freshness lost inside the TTL.
+#[derive(Debug, Clone)]
+pub struct FrozenMemory {
+    /// The `<memory>…</memory>` block, byte for byte. Live context is deliberately **not** part of
+    /// it: it carries the latest turns, so freezing it would break the thing Phase 3 exists for. It
+    /// is concatenated *after* this block, so the stable prefix still covers everything up to it.
+    pub block: String,
+    /// Atoms in the block, for the `AIP-Memory` header.
+    pub items: usize,
+    /// Cost at freeze time. A later request with a smaller budget must not be handed a block that
+    /// was composed for a roomier one.
+    pub tokens: usize,
+    /// Whether recall found anything at all — kept separately from `items` because "found five, none
+    /// of them fit" is `BelowFloor`, not `NoCandidates`, and the two send the operator to different
+    /// fixes.
+    pub had_candidates: bool,
+    frozen_at: Instant,
+}
+
+/// §5.5: how long a frozen block is served. The design suggests ten minutes. A long TTL costs
+/// freshness (a newly distilled atom waits); a short one costs a cold prefix cache, which is the
+/// only reason this exists.
+pub const MEMORY_FREEZE_TTL: Duration = Duration::from_secs(600);
+
+/// Ceiling on frozen blocks. Sessions come and go, so without a cap a long-lived gateway
+/// accumulates one entry per session for ever.
+const MAX_FROZEN_BLOCKS: usize = 256;
 
 /// Minimum gap between re-warms from the request path.
 ///
@@ -524,6 +647,7 @@ impl GatewayCore {
             bridge,
             master_key: MasterKeyCache::new(key_provider, key_wait),
             app_key_provider: Mutex::new(None),
+            app_key_cache: Mutex::new(AppKeyCache::default()),
             spend_provider: Mutex::new(None),
             hidden: AtomicBool::new(false),
             running: AtomicBool::new(false),
@@ -538,10 +662,14 @@ impl GatewayCore {
             // pass-through of a client's own tools keep working unchanged.
             tools_mutation_enabled: AtomicBool::new(false),
             workspace_root: Mutex::new(default_workspace_root()),
+            store: None,
+            memory_enabled: AtomicBool::new(false),
             worker_error: Mutex::new(None),
             warm: Mutex::new(None),
             last_warm: Mutex::new(None),
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
+            memory_freeze: Mutex::new(HashMap::new()),
+            memory_freeze_ttl: Mutex::new(MEMORY_FREEZE_TTL),
         }
     }
 
@@ -600,6 +728,162 @@ impl GatewayCore {
     pub fn with_app_keys(mut self, provider: AppKeyProvider) -> Self {
         self.app_key_provider = Mutex::new(Some(provider));
         self
+    }
+
+    /// R4: the active per-app keys, memoised — see `AppKeyCache`.
+    ///
+    /// Every request-path caller must come through here rather than through the provider directly.
+    /// Returns empty when no provider is attached, so the master-key-only path costs nothing.
+    pub fn app_keys(&self) -> Vec<AppKey> {
+        // Clone the Arc out of the lock before calling it — never hold a mutex across a
+        // keychain read (which can block on a macOS security prompt).
+        let Some(provider) = self.app_key_provider.lock().ok().and_then(|g| g.clone()) else {
+            return Vec::new();
+        };
+        // Cheap and authoritative: one indexed SQLite scan, no keychain.
+        let active = self
+            .store
+            .as_ref()
+            .and_then(|s| crate::persist::active_gateway_key_ids(s).ok());
+        if let Ok(cache) = self.app_key_cache.lock() {
+            if cache.fresh(&active) {
+                return cache.keys.clone();
+            }
+        }
+        let keys = provider();
+        if let Ok(mut cache) = self.app_key_cache.lock() {
+            cache.ids = active.or_else(|| Some(keys.iter().map(|k| k.id.clone()).collect()));
+            cache.keys = keys.clone();
+            cache.at = Some(Instant::now());
+        }
+        keys
+    }
+
+    /// §4a: the id of the per-app key presenting this request, if any.
+    ///
+    /// Constant-time over every candidate, and deliberately **without an early break**: `find`
+    /// would stop at the first match and turn the order of the key list into a timing oracle.
+    /// Costs nothing when no provider is attached, and is never called with memory off.
+    pub fn app_key_for(&self, presented: &str) -> Option<String> {
+        if presented.is_empty() {
+            return None;
+        }
+        let mut hit = None;
+        for k in self.app_keys() {
+            if constant_time_eq(presented, &k.secret) {
+                hit = Some(k.id.clone());
+            }
+        }
+        hit
+    }
+
+    /// Drop the memoised app-key map. Test-only: production never needs it, because the active-id
+    /// check already invalidates on create and revoke.
+    #[cfg(test)]
+    pub fn clear_app_key_cache(&self) {
+        if let Ok(mut c) = self.app_key_cache.lock() {
+            *c = AppKeyCache::default();
+        }
+    }
+
+    /// Shorten the app-key cache TTL. Test-only, for the same reason as `set_memory_freeze_ttl`.
+    #[cfg(test)]
+    pub fn set_app_key_cache_ttl(&self, d: Duration) {
+        if let Ok(mut c) = self.app_key_cache.lock() {
+            c.ttl = d;
+        }
+    }
+
+    /// Attach the store so the request path can reach the memory/context layer. Builder, for the
+    /// same reason as `with_app_keys`: `new()` must keep working without one.
+    pub fn with_store(mut self, store: Arc<crate::store::Store>) -> Self {
+        self.store = Some(store);
+        self
+    }
+
+    /// The store, when one was attached. `None` in tests and whenever the gateway was built before
+    /// the store existed — in which case the memory layer degrades to "no memory", never an error.
+    #[allow(dead_code)] // Phase 2: the recall path reads through this.
+    pub fn store(&self) -> Option<&Arc<crate::store::Store>> {
+        self.store.as_ref()
+    }
+
+    /// Whether the memory/context layer may recall and inject. Off by default; see the field.
+    pub fn memory_enabled(&self) -> bool {
+        self.memory_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Flip the host-side memory toggle. Takes effect on the next request.
+    ///
+    /// The frozen blocks are dropped with it: a block frozen before the operator switched memory off
+    /// was composed under a decision that has since changed, and serving it on the way back on would
+    /// make the toggle feel like it had not worked.
+    pub fn set_memory_enabled(&self, enabled: bool) {
+        self.memory_enabled.store(enabled, Ordering::Relaxed);
+        self.clear_frozen_memory();
+    }
+
+    /// §5.5: the frozen memory block for a `(scope, session)`, when one is still fresh and still
+    /// fits `budget`.
+    ///
+    /// `None` means the caller has to recall, rank, trim and compose for itself. A block that no
+    /// longer fits is treated the same way — re-composing is one cache miss, whereas shipping a
+    /// block too large for the request is a correctness failure.
+    pub fn frozen_memory(&self, key: &str, budget: usize) -> Option<FrozenMemory> {
+        let ttl = self.memory_freeze_ttl();
+        let mut map = self.memory_freeze.lock().ok()?;
+        let entry = map.get(key)?;
+        if entry.frozen_at.elapsed() >= ttl {
+            map.remove(key);
+            return None;
+        }
+        (entry.tokens <= budget).then(|| entry.clone())
+    }
+
+    /// §5.5: hold a composed block still for the next request in this `(scope, session)`.
+    pub fn freeze_memory(
+        &self,
+        key: String,
+        block: String,
+        items: usize,
+        tokens: usize,
+        had_candidates: bool,
+    ) {
+        let Ok(mut map) = self.memory_freeze.lock() else {
+            return;
+        };
+        // Swept on the way in rather than by a timer: there is no background task, and a request is
+        // the only moment this map is ever touched.
+        let ttl = self.memory_freeze_ttl();
+        map.retain(|_, v| v.frozen_at.elapsed() < ttl);
+        if map.len() >= MAX_FROZEN_BLOCKS && !map.contains_key(&key) {
+            // Oldest out. The sweep already removed everything expired, so this only ever fires on a
+            // genuinely busy gateway, and losing the oldest block costs one cache miss.
+            if let Some(oldest) = map.iter().min_by_key(|(_, v)| v.frozen_at).map(|(k, _)| k.clone())
+            {
+                map.remove(&oldest);
+            }
+        }
+        map.insert(key, FrozenMemory { block, items, tokens, had_candidates, frozen_at: Instant::now() });
+    }
+
+    /// Drop every frozen block. Used by the memory toggle and by tests.
+    pub fn clear_frozen_memory(&self) {
+        if let Ok(mut m) = self.memory_freeze.lock() {
+            m.clear();
+        }
+    }
+
+    /// Shorten the freeze TTL. Test-only for the same reason `set_first_msg_timeout` is.
+    #[cfg(test)]
+    pub fn set_memory_freeze_ttl(&self, d: Duration) {
+        if let Ok(mut g) = self.memory_freeze_ttl.lock() {
+            *g = d;
+        }
+    }
+
+    pub fn memory_freeze_ttl(&self) -> Duration {
+        self.memory_freeze_ttl.lock().map(|g| *g).unwrap_or(MEMORY_FREEZE_TTL)
     }
 
     /// R4: attach the monthly spend gate. Builder, like `with_app_keys`, so `new()` keeps the
@@ -936,6 +1220,21 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
 
 // ---------- auth (invariants 10, 11, 15) ----------
 
+/// The credential a client presented, whichever of the three dialects it used. Shared by auth and
+/// by the memory path so the two can never disagree about who is asking — if a fourth header is
+/// ever accepted, one edit covers both.
+pub(crate) fn presented_key(headers: &HeaderMap) -> &str {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        // Anthropic clients (Claude Code, anthropic-sdk) send the key in x-api-key;
+        // Gemini clients use x-goog-api-key (or ?key=, handled in the Gemini handler).
+        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
+        .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
+        .unwrap_or("")
+}
+
 fn constant_time_eq(a: &str, b: &str) -> bool {
     let (a, b) = (a.as_bytes(), b.as_bytes());
     let mut diff = (a.len() ^ b.len()) as u8;
@@ -1012,27 +1311,15 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
             });
         }
     };
-    let presented = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        // Anthropic clients (Claude Code, anthropic-sdk) send the key in x-api-key;
-        // Gemini clients use x-goog-api-key (or ?key=, handled in the Gemini handler).
-        .or_else(|| headers.get("x-api-key").and_then(|v| v.to_str().ok()))
-        .or_else(|| headers.get("x-goog-api-key").and_then(|v| v.to_str().ok()))
-        .unwrap_or("");
+    let presented = presented_key(headers);
     let mut matched = constant_time_eq(presented, &stored);
     if !matched {
         // R4: per-app key. Every comparison is constant-time, and we deliberately do NOT break
         // early on a match that is followed by more keys (no length/first-byte oracle).
-        // Clone the Arc out of the lock before calling it — never hold a mutex across a
-        // keychain read (which can block on a macOS security prompt).
-        let app_provider = core.app_key_provider.lock().ok().and_then(|g| g.clone());
-        if let Some(provider) = app_provider {
-            for secret in provider() {
-                if constant_time_eq(presented, &secret) {
-                    matched = true;
-                }
+        // `app_keys` memoises the keychain reads, so this is not N of them per request.
+        for k in core.app_keys() {
+            if constant_time_eq(presented, &k.secret) {
+                matched = true;
             }
         }
     }
@@ -1227,6 +1514,14 @@ mod gemini;
 mod handlers;
 #[path = "gateway_responses.rs"]
 mod responses;
+#[path = "context_scope.rs"]
+pub mod context_scope;
+#[path = "session_context.rs"]
+pub mod session_context;
+#[path = "principal.rs"]
+pub mod principal;
+#[path = "model_context.rs"]
+pub mod model_context;
 
 use anthropic::messages_h;
 use gemini::gemini_h;

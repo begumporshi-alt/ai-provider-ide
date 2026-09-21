@@ -15,6 +15,9 @@ use crate::gateway::{
     anthropic_error, anthropic_error_kind, check_gateway_key, clean_assistant_text, err,
     forwarded_headers, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 
 /// Anthropic Messages ingress (2026-09-16 amendment, DECISIONS.md): Claude Code and
 /// anthropic-sdk clients can point at this IDE. The request is translated to the router's
@@ -184,11 +187,19 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     let model = chat.get("model").and_then(Value::as_str).unwrap_or("").to_string();
     tracing::info!(request_id = id, kind = "anthropic", model = %model, body = %chat.to_string().chars().take(500).collect::<String>(), "dispatching anthropic messages request");
     let fwd = forwarded_headers(&headers);
+    // `Some(&req)`: translation rebuilds the body and drops unknown fields, so the `metadata.aip`
+    // fallback has to be read from what the client actually sent.
+    let outcome = inject_context(&core, &headers, Some(&req), &mut chat);
+    // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
+    let prep = prepare_capture(&core, &headers, &chat, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
 
     if wants_stream {
         let mid = msg_id.clone();
         let stream_body = async_stream::stream! {
+            // Moved in: the stream must be 'static, so it cannot borrow the request or headers.
+            let prep = prep;
+            let mut streamed = String::new();
             // Anthropic SSE: `event: <name>` + `data: <json>` — emit the full lifecycle.
             let start = json!({ "type": "message_start", "message": { "id": mid, "type": "message", "role": "assistant",
                 "content": [], "model": model, "stop_reason": null, "usage": { "input_tokens": 0, "output_tokens": 0 } } });
@@ -200,12 +211,18 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
+                        streamed.push_str(&t);
                         tracing::info!(request_id = id, delta_len = t.len(), "anthropic stream delta received");
                         let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
-                    BridgeMsg::Done => break,
+                    BridgeMsg::Done => {
+                        if let Some(p) = &prep {
+                            let _ = finish_capture(p, &streamed);
+                        }
+                        break;
+                    }
                     BridgeMsg::Error { status, message } => {
                         // The SSE response is already committed as 200, so the HTTP status can no
                         // longer carry the outcome — the error type is the only signal the client
@@ -278,9 +295,11 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             }
             drop(slot);
         };
-        return Sse::new(stream_body)
+        let mut r = Sse::new(stream_body)
             .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
             .into_response();
+        apply_memory_headers(&mut r, &outcome);
+        return r;
     }
 
     let mut full = String::new();
@@ -297,6 +316,9 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             BridgeMsg::Result(_) => {}
             BridgeMsg::Done => {
                 tracing::info!(request_id = id, full_len = full.len(), "anthropic non-stream done");
+                if let Some(p) = &prep {
+                    let _ = finish_capture(p, &full);
+                }
                 break;
             }
             BridgeMsg::Error { status, message } => {
@@ -332,7 +354,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
         }
     }
     drop(slot);
-    match err_info {
+    let mut r = match err_info {
         Some((status, message)) => {
             let code = worker_status(status);
             err(code, anthropic_error(&message, anthropic_error_kind(code)))
@@ -362,5 +384,7 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
             )
                 .into_response()
         }
-    }
+    };
+    apply_memory_headers(&mut r, &outcome);
+    r
 }

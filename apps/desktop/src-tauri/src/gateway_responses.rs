@@ -15,6 +15,9 @@ use crate::gateway::{
     check_gateway_key, clean_assistant_text, err, forwarded_headers, map_generic_to_status,
     peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 
 /// OpenAI Responses API ingress (v1.1, 2026-09-16): Codex-style clients. Edge translation
 /// to the normalized chat call; the router core stays single-surface.
@@ -128,6 +131,9 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     let id = slot.id;
     let resp_id = format!("resp_gw_{id}");
     let fwd = forwarded_headers(&headers);
+    let outcome = inject_context(&core, &headers, Some(&req), &mut chat);
+    // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
+    let prep = prepare_capture(&core, &headers, &chat, id);
     core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: fwd.clone() });
     tracing::info!(request_id = id, kind = "responses", model = %chat.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching responses request");
 
@@ -135,6 +141,8 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         let rid = resp_id.clone();
         let stream_tools = tools.clone();
         let stream_body = async_stream::stream! {
+            // Moved in: the stream must be 'static, so it cannot borrow the request or headers.
+            let prep = prep;
             let ev = |name: &str, payload: Value| Ok::<Event, std::convert::Infallible>(
                 Event::default().event(name).data(payload.to_string()),
             );
@@ -155,7 +163,13 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                             "output_index": 0, "content_index": 0, "delta": t }));
                     }
                     BridgeMsg::Result(_) => {}
-                    BridgeMsg::Done => break,
+                    BridgeMsg::Done => {
+                        // `text` is the accumulated assistant output; this is the stream's Done.
+                        if let Some(p) = &prep {
+                            let _ = finish_capture(p, &text);
+                        }
+                        break;
+                    }
                     BridgeMsg::Error { status, message } => {
                         // The SSE stream is already committed as 200, so the failure has to be
                         // described in the event payload. Emitting only a message left the client
@@ -223,7 +237,9 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
             }
             drop(slot);
         };
-        return Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        let mut r = Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        apply_memory_headers(&mut r, &outcome);
+        return r;
     }
 
     // Non-streaming path.
@@ -235,7 +251,12 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
-            BridgeMsg::Done => break,
+            BridgeMsg::Done => {
+                if let Some(p) = &prep {
+                    let _ = finish_capture(p, &full);
+                }
+                break;
+            }
             BridgeMsg::Error { status, message } => {
                 err_info = Some((status, message));
                 break;
@@ -262,7 +283,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         }
     }
     drop(slot);
-    match err_info {
+    let mut r = match err_info {
         Some((status, message)) => {
             let code = worker_status(status);
             let (ty, kind) = responses_error_kind(code);
@@ -283,5 +304,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
             });
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body.to_string()).into_response()
         }
-    }
+    };
+    apply_memory_headers(&mut r, &outcome);
+    r
 }

@@ -2,7 +2,9 @@
  * AI-Provider Router — app root. Bootstraps the core from the host, then routes screens.
  */
 import { useEffect, useState } from "react";
-import { bootstrap } from "./store";
+import { bootstrap, systemAiModel } from "./store";
+import { startCaptureDrain, stopCaptureDrain } from "./lib/memory/drain";
+import { startRetention, stopRetention } from "./lib/memory/retention";
 import { useUi } from "./ui-state";
 import { Shell } from "./components/Shell";
 import { ProvidersScreen } from "./screens/Providers";
@@ -33,6 +35,24 @@ export default function App() {
       (e: unknown) => setBootError(String(e)),
     );
   }, []);
+
+  // Capture-queue drain (§3.3). Started here rather than in the Assistant because the queue is
+  // filled by gateway traffic — agent IDEs the user points at the router — which never touches this
+  // app's own chat at all. A screen-scoped drain would stop learning the moment Memory was not the
+  // open screen. Runs on a slow interval and is stopped with the app, so there is no orphan timer.
+  useEffect(() => {
+    if (!ready) return;
+    startCaptureDrain(systemAiModel);
+    return stopCaptureDrain;
+  }, [ready]);
+
+  // Retention (§6.2). Same reasoning as the drain, and the same scope: both tables are filled by
+  // gateway traffic, so a screen-scoped scheduler would stop pruning whenever Memory was not open.
+  useEffect(() => {
+    if (!ready) return;
+    startRetention();
+    return stopRetention;
+  }, [ready]);
 
   if (bootError) {
     return (

@@ -103,6 +103,12 @@ const EDGE_KINDS = [
 const RUN_STATUSES = ["running", "ok", "error", "stopped"];
 /** memory.rs accepts exactly these four layers. */
 const MEMORY_LAYERS = ["L0", "L1", "L2", "L3"];
+
+/**
+ * Every memory starts capture-only. Mirrors the Rust host, where `scope_global = 0` and the
+ * project/agent columns are NULL until something explicitly binds it.
+ */
+const DEFAULT_SCOPE = { user: "", project: null, agent: null, global: false };
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
 const MAX_WEIGHT = 50;
@@ -1100,12 +1106,18 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         seen.session_id = (args.session_id as string | null) ?? seen.session_id;
         seen.subject = (args.subject as string | null) ?? seen.subject;
         if (args.pinned) seen.pinned = 1;
+        // Older rows predating the §6.4 migration arrived without `scope` or `superseded_at`; fill
+        // them in on touch so the Memory screen's `ScopeSelect` doesn't read `.global` of undefined.
+        if (!seen.scope) seen.scope = { ...DEFAULT_SCOPE };
+        if (seen.superseded_at === undefined) seen.superseded_at = null;
         return { ...seen };
       }
       const row: Row = {
         id: `m-${layer}-${memories.length + 1}-${now}`, layer, text,
         session_id: args.session_id ?? null, subject: args.subject ?? null,
         created_at: now, updated_at: now, pinned: args.pinned ? 1 : 0,
+        scope: { ...DEFAULT_SCOPE },
+        superseded_at: null,
       };
       memories.push(row);
       return { ...row };
@@ -1130,6 +1142,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
             id: `m-${it.layer}-${memories.length + 1}-${now}`, layer: it.layer, text,
             session_id: it.session_id ?? null, subject: it.subject ?? null,
             created_at: now, updated_at: now, pinned: it.pinned ? 1 : 0,
+            scope: { ...DEFAULT_SCOPE },
+            superseded_at: null,
           });
         }
         n += 1;
@@ -1225,8 +1239,79 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "memory_clear":
       memories.length = 0;
       return null;
+    case "memory_assign_scope": {
+      const row = memories.find((m) => m.id === args.id);
+      if (!row) return false;
+      const s = (args.scope ?? {}) as { kind?: string; project?: string | null; agent?: string | null };
+      if (s.kind === "global") {
+        row.scope = { user: row.scope?.user ?? "", project: null, agent: null, global: true };
+      } else if (s.kind === "project") {
+        row.scope = { user: row.scope?.user ?? "", project: s.project ?? null, agent: s.agent ?? null, global: false };
+      } else {
+        row.scope = { user: row.scope?.user ?? "", project: null, agent: null, global: false };
+      }
+      row.updated_at = Date.now();
+      return true;
+    }
+    case "memory_supersede":
+      // Shim never produces conflicts itself; mark the older row superseded so the UI can demo
+      // the §6.4 conflict path. The Rust host refuses to supersede pinned/L3 rows; mirror that.
+      {
+        const old = memories.find((m) => m.id === args.old);
+        if (!old) return false;
+        if (old.pinned) throw new Error("this memory is pinned — unpin it first");
+        if (old.layer === "L3") throw new Error("this is a core fact (L3) — replaced deliberately, never by a newer atom");
+        old.superseded_at = Date.now();
+        return true;
+      }
+    case "memory_unsupersede": {
+      const row = memories.find((m) => m.id === args.id);
+      if (!row) return false;
+      row.superseded_at = null;
+      return true;
+    }
+    case "memory_conflicts":
+      // No contradictions in the shim.
+      return [];
+    case "memory_principal_list":
+      return [];
+    case "model_context_count":
+      return 0;
+    case "capture_queue_status":
+      return { queued: 0, processing: 0, done: 0, failed: 0, outstanding: 0 };
+    case "capture_purge_finished":
+      return 0;
+    case "gateway_memory_enabled":
+      return false;
+    case "gateway_set_memory_enabled":
+      return Boolean(args.enabled);
+    case "gateway_prune_memories":
+      return { l0_expired: 0, l0_ring: 0, decayed: 0 };
+    case "gateway_prune_live_context":
+      return { turns_by_count: 0, turns_by_age: 0, sessions_reaped: 0 };
+    case "crash_count":
+      return 0;
+    case "crash_list":
+      return [];
+    case "crash_read":
+      return null;
+    case "crash_clear":
+      return Boolean(args?.id);
+    case "crash_clear_all":
+      return 0;
+    case "gateway_project_key":
+      // The shim has no workspace root; the Memory screen treats `null` as "no project scoping
+      // today" and renders atoms un-scoped. Without this case the screen's main `Promise.all`
+      // rejects, the `.catch` swallows it, and every row stays hidden — silently breaking the
+      // memory browser tests. Mirrors `gateway_cmds::gateway_project_key` returning `None`.
+      return null;
     case "memory_stats": {
-      const s = { l0: 0, l1: 0, l2: 0, l3: 0, total: memories.length, bytes: 0 };
+      const s = {
+        l0: 0, l1: 0, l2: 0, l3: 0, total: memories.length, bytes: 0,
+        // The Rust host counts rows where `superseded_at IS NULL`; the shim never supersedes
+        // anything, so every row is injectable.
+        injectable: memories.length,
+      };
       for (const m of memories) {
         s.bytes += String(m.text).length;
         if (m.layer === "L0") s.l0 += 1;

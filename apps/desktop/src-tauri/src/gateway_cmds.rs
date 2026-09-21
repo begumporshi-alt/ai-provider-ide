@@ -174,7 +174,11 @@ pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {
             let store = store.inner().clone();
             Arc::new(
                 core.with_app_keys(gateway::vault_app_key_provider(store.clone()))
-                    .with_spend(gateway::vault_spend_provider(store)),
+                    .with_spend(gateway::vault_spend_provider(store.clone()))
+                    // Memory/context layer: the request path needs the store to reach the FTS5
+                    // recall index. `None` when no store is managed (a harness), which degrades the
+                    // layer to "no memory" rather than panicking — same rule as the two above.
+                    .with_store(store),
             )
         }
         None => Arc::new(core),
@@ -575,6 +579,40 @@ pub fn gateway_get_workspace_root(
     state: State<'_, Arc<GatewayState>>,
 ) -> Result<Option<String>, String> {
     Ok(state.core.workspace_root().map(|p| p.to_string_lossy().to_string()))
+}
+
+/// The project scope the gateway will resolve for an incoming request: a hash of the workspace
+/// root, not the path itself.
+///
+/// The Memory screen needs this to scope a memory to "this project" — the hash lives on the host
+/// and duplicating FNV-1a in TypeScript would be a second implementation of a value that has to
+/// match exactly, or a memory scoped from the UI would never be visible to the request path.
+#[tauri::command]
+pub fn gateway_project_key(state: State<'_, Arc<GatewayState>>) -> Result<Option<String>, String> {
+    Ok(state
+        .core
+        .workspace_root()
+        .and_then(|p| crate::gateway::context_scope::project_key_from_root(&p.to_string_lossy())))
+}
+
+/// The memory/context layer's master switch.
+///
+/// Off by default. With it off the gateway performs **no memory reads and no memory writes** — that
+/// is the ship-blocking acceptance criterion in §9, so the toggle is not a cosmetic one: it is the
+/// thing that makes the layer safe to ship behind. The UI turning it on is an explicit act, and the
+/// request path consults it on every request rather than caching it at startup.
+#[tauri::command]
+pub fn gateway_memory_enabled(state: State<'_, Arc<GatewayState>>) -> Result<bool, String> {
+    Ok(state.core.memory_enabled())
+}
+
+#[tauri::command]
+pub fn gateway_set_memory_enabled(
+    state: State<'_, Arc<GatewayState>>,
+    enabled: bool,
+) -> Result<bool, String> {
+    state.core.set_memory_enabled(enabled);
+    Ok(state.core.memory_enabled())
 }
 
 /// One-line digest of a tool call's arguments for the audit log.

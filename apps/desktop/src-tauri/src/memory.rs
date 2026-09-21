@@ -19,6 +19,7 @@
  * whole feature costs one migration and no new dependencies.
  */
 use rusqlite::params;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::store::Store;
@@ -69,9 +70,50 @@ pub struct Memory {
     pub created_at: i64,
     pub updated_at: i64,
     pub pinned: bool,
+    /// Where this memory may be injected. Every row starts `Unscoped`, which is **capture-only and
+    /// never injected** — see `ScopeAssignment`.
+    #[serde(default)]
+    pub scope: MemoryScope,
     /// BM25 score, populated by `recall` only. More negative is a better match.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub score: Option<f64>,
+    /// §6.4.3: when this row was superseded by a newer one, or `NULL` while it is live.
+    ///
+    /// A superseded row is **kept, not deleted** — a reversal is recoverable and the Context graph's
+    /// edges stay valid — but it drops out of recall immediately. Only `supersede` sets it, and
+    /// only `unsupersede` clears it; pruning never touches it.
+    #[serde(default)]
+    pub superseded_at: Option<i64>,
+}
+
+/// The scope a memory is bound to. Mirrors `context_scope::Scope`, minus `session`: a session is a
+/// correlation key, not a boundary, so it never gates injection.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MemoryScope {
+    pub user: String,
+    pub project: Option<String>,
+    pub agent: Option<String>,
+    /// Set on purpose, never by default. `true` makes the row visible to every scope.
+    pub global: bool,
+}
+
+// Whether a row is injectable is decided by one SQL predicate —
+// `scope_global = 1 OR scope_project IS NOT NULL` — shared by `recall_scoped` and
+// `MemoryStats::injectable`. Deliberately not duplicated as a Rust method: a second source of
+// truth for "may this be injected" is exactly the kind of drift this design is guarding against.
+
+/// How a memory gets bound. There is deliberately no variant that means "global by omission" —
+/// three independent reviewers flagged nullable-means-global as a contamination engine, because the
+/// header-less IDE is the common case and would otherwise degrade to global.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopeAssignment {
+    /// Injectable inside one project. `agent: None` means project-wide; `Some` narrows it to that
+    /// agent only.
+    Project { project: String, agent: Option<String> },
+    /// Injectable everywhere. A deliberate act, not a default.
+    Global,
+    /// Not injectable anywhere. Capture-only — the state every row is born in.
+    Unscoped,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -92,6 +134,12 @@ pub struct MemoryStats {
     pub l3: i64,
     pub total: i64,
     pub bytes: i64,
+    /// How many rows can actually be injected — bound to a project, or explicitly global.
+    ///
+    /// Everything else is capture-only. This is the number that answers "why didn't the model know
+    /// anything": if it is 0, the read path is correctly returning nothing because there is nothing
+    /// scoped, not because recall is broken.
+    pub injectable: i64,
 }
 
 fn now_ms() -> i64 {
@@ -180,6 +228,25 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 ],
             )
             .map_err(|e| e.to_string())?;
+            // Re-recording refreshes text and timestamp but deliberately leaves scope alone — an
+            // operator's decision about where a memory may be injected must survive a re-distill.
+            // Read it back rather than assuming the default, or the review surface would show a
+            // scoped row as unscoped.
+            let scope = tx
+                .query_row(
+                    "SELECT scope_user, scope_project, scope_agent, scope_global
+                     FROM memories WHERE id = ?1",
+                    params![id],
+                    |r| {
+                        Ok(MemoryScope {
+                            user: r.get(0)?,
+                            project: r.get(1)?,
+                            agent: r.get(2)?,
+                            global: r.get::<_, i64>(3)? != 0,
+                        })
+                    },
+                )
+                .map_err(|e| e.to_string())?;
             Memory {
                 id,
                 layer: input.layer.clone(),
@@ -189,7 +256,9 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 created_at,
                 updated_at: now,
                 pinned: keep_pinned,
+                scope,
                 score: None,
+                superseded_at: None,
             }
         }
         None => {
@@ -218,7 +287,11 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 created_at: now,
                 updated_at: now,
                 pinned: input.pinned,
+                // Born unscoped: capture-only, never injected. Scoping is a deliberate act
+                // (`assign_scope`), never a default — see `ScopeAssignment`.
+                scope: MemoryScope { user: "local".into(), project: None, agent: None, global: false },
                 score: None,
+                superseded_at: None,
             }
         }
     };
@@ -302,6 +375,13 @@ fn rerank(rows: &mut Vec<Memory>, now: i64) {
             .cmp(&band(b))
             .then(recency_key(&rows[b], now).cmp(&recency_key(&rows[a], now)))
             .then(layer_rank(&rows[a].layer).cmp(&layer_rank(&rows[b].layer)))
+            // §5.5: the order ends on the row id, never on however SQLite happened to return the
+            // rows. All three keys above can tie — same band, same quantised recency, same layer —
+            // and when they do a stable sort silently defers to the query's own row order, which is
+            // not specified and can change with the query plan. The composed block then differs
+            // between two identical requests, which invalidates the provider's cached prefix on
+            // every call. See `GATEWAY_MEMORY_LAYER.md` §5.5.
+            .then(rows[a].id.cmp(&rows[b].id))
     });
 
     let taken: Vec<Memory> = order.into_iter().map(|i| rows[i].clone()).collect();
@@ -320,6 +400,42 @@ pub fn recall(
     limit: usize,
     layers: Option<&[String]>,
 ) -> Result<Vec<Memory>, String> {
+    recall_inner(store, query, limit, layers, None)
+}
+
+/// Which memories may be recalled for a request. Mirrors `context_scope::Scope`.
+///
+/// **Absence is not global.** Three independent reviewers of the gateway memory design flagged
+/// nullable-means-global as a contamination engine: the header-less IDE is the common case, so a
+/// missing project would otherwise degrade to "global" and leak one repo's context into another.
+/// A row is reachable only through an explicit project match or an explicit `scope_global` mark —
+/// and when the project cannot be resolved at all, only pinned global rows survive.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RecallScope {
+    pub user: Option<String>,
+    pub project: Option<String>,
+    pub agent: Option<String>,
+}
+
+/// BM25 recall restricted to a scope. The gateway request path uses this; the Assistant's Memory
+/// screen keeps using the unscoped `recall`, which sees everything.
+pub fn recall_scoped(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    layers: Option<&[String]>,
+    scope: &RecallScope,
+) -> Result<Vec<Memory>, String> {
+    recall_inner(store, query, limit, layers, Some(scope))
+}
+
+fn recall_inner(
+    store: &Store,
+    query: &str,
+    limit: usize,
+    layers: Option<&[String]>,
+    scope: Option<&RecallScope>,
+) -> Result<Vec<Memory>, String> {
     let Some(expr) = match_expr(query) else {
         return Ok(Vec::new());
     };
@@ -335,6 +451,44 @@ pub fn recall(
         None => LAYERS.to_vec(),
     };
 
+    // Scope predicates are appended after the layer placeholders, so their indices continue from
+    // however many layers the caller asked for.
+    let mut next_param = 3 + wanted.len();
+    let mut scope_sql = String::new();
+    let mut scope_args: Vec<String> = Vec::new();
+    if let Some(sc) = scope {
+        if let Some(u) = &sc.user {
+            scope_sql.push_str(&format!(" AND m.scope_user = ?{next_param}"));
+            scope_args.push(u.clone());
+            next_param += 1;
+        }
+        match &sc.project {
+            Some(p) => {
+                // An agent-scoped row also matches when the agent is NULL (a project-wide fact),
+                // and an explicitly global row always matches.
+                scope_sql.push_str(&format!(
+                    " AND (m.scope_global = 1 OR (m.scope_project = ?{next_param}"
+                ));
+                scope_args.push(p.clone());
+                next_param += 1;
+                if let Some(a) = &sc.agent {
+                    scope_sql.push_str(&format!(
+                        " AND (m.scope_agent IS NULL OR m.scope_agent = ?{next_param}))"
+                    ));
+                    scope_args.push(a.clone());
+                    next_param += 1;
+                } else {
+                    scope_sql.push(')');
+                }
+                scope_sql.push(')');
+            }
+            // Unresolvable project: pinned global rows only. A client that cannot identify itself
+            // gets its hard constraints and nothing else.
+            None => scope_sql.push_str(" AND m.scope_global = 1 AND m.pinned = 1"),
+        }
+        let _ = next_param;
+    }
+
     let placeholders: Vec<String> = (1..=wanted.len()).map(|i| format!("?{}", i + 2)).collect();
     // Fetch a wider shortlist than we intend to return: recency can only reorder what it is
     // shown, so pulling exactly `limit` would let the band logic reorder a set that was already
@@ -342,11 +496,20 @@ pub fn recall(
     let fetch = limit.saturating_mul(CANDIDATE_FACTOR).max(limit);
     let sql = format!(
         "SELECT m.id, m.layer, m.text, m.session_id, m.subject, m.created_at, m.updated_at, m.pinned,
+                m.scope_user, m.scope_project, m.scope_agent, m.scope_global,
                 bm25(memories_fts) AS score
          FROM memories_fts
          JOIN memories m ON m.rowid = memories_fts.rowid
-         WHERE memories_fts MATCH ?1 AND m.layer IN ({})
-         ORDER BY score, CASE m.layer WHEN 'L3' THEN 0 WHEN 'L2' THEN 1 WHEN 'L1' THEN 2 ELSE 3 END
+         WHERE memories_fts MATCH ?1 AND m.layer IN ({}){scope_sql}
+           -- §6.4.3: a superseded row is out of the live set the moment it is superseded. It is
+           -- kept for audit and for a reversal, but injecting it would put a fact the operator has
+           -- already replaced back into every prompt.
+           AND m.superseded_at IS NULL
+         -- §5.5: `m.id` is the last key for the same reason it is the last key in `rerank`, and
+         -- matters more here — LIMIT truncates the shortlist, so without it *which* rows survive
+         -- to be ranked at all would depend on the query plan.
+         ORDER BY score, CASE m.layer WHEN 'L3' THEN 0 WHEN 'L2' THEN 1 WHEN 'L1' THEN 2 ELSE 3 END,
+                  m.id
          LIMIT ?2",
         placeholders.join(",")
     );
@@ -357,6 +520,9 @@ pub fn recall(
     p.push(Box::new(fetch as i64));
     for l in &wanted {
         p.push(Box::new(l.to_string()));
+    }
+    for a in &scope_args {
+        p.push(Box::new(a.clone()));
     }
     let mut rows = stmt
         .query_map(rusqlite::params_from_iter(p.iter().map(|b| b.as_ref())), |r| {
@@ -369,7 +535,14 @@ pub fn recall(
                 created_at: r.get(5)?,
                 updated_at: r.get(6)?,
                 pinned: r.get::<_, i64>(7)? != 0,
-                score: Some(r.get(8)?),
+                scope: MemoryScope {
+                    user: r.get(8)?,
+                    project: r.get(9)?,
+                    agent: r.get(10)?,
+                    global: r.get::<_, i64>(11)? != 0,
+                },
+                score: Some(r.get(12)?),
+                superseded_at: None, // the WHERE clause already excluded them
             })
         })
         .map_err(|e| e.to_string())?
@@ -394,14 +567,16 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let (sql, args): (String, Vec<String>) = match layer {
         Some(l) => (
-            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned
+            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at
              FROM memories WHERE layer = ?1
              ORDER BY pinned DESC, updated_at DESC LIMIT ?2"
                 .into(),
             vec![l.to_string(), limit.to_string()],
         ),
         None => (
-            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned
+            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at
              FROM memories
              ORDER BY pinned DESC, updated_at DESC LIMIT ?1"
                 .into(),
@@ -420,7 +595,14 @@ pub fn list(store: &Store, layer: Option<&str>, limit: usize) -> Result<Vec<Memo
                 created_at: r.get(5)?,
                 updated_at: r.get(6)?,
                 pinned: r.get::<_, i64>(7)? != 0,
+                scope: MemoryScope {
+                    user: r.get(8)?,
+                    project: r.get(9)?,
+                    agent: r.get(10)?,
+                    global: r.get::<_, i64>(11)? != 0,
+                },
                 score: None,
+                superseded_at: r.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -438,12 +620,121 @@ pub fn forget(store: &Store, id: &str) -> Result<bool, String> {
     Ok(n > 0)
 }
 
+// ---------- §6.2 retention ----------
+
+/// L0 is verbatim conversation. Keeping it for ever is a size problem and a privacy one.
+pub const L0_TTL_DAYS: i64 = 30;
+
+/// Ring cap on L0 rows **per session**. The newest 200 turns survive; a single long conversation
+/// cannot crowd out every other one.
+pub const L0_RING_PER_SESSION: usize = 200;
+
+/// Recency below which an L1/L2 atom is pruned. With the 30-day half-life this is ~4.3 half-lives:
+/// an atom has to go roughly four months without being re-confirmed before it is dropped.
+pub const PRUNE_FLOOR: f64 = 0.05;
+
+/// Age in ms at which `recency()` has decayed to `PRUNE_FLOOR`. Derived from the two constants
+/// rather than written down, so moving the half-life moves the cutoff with it.
+fn prune_cutoff_ms() -> i64 {
+    let half_lives = (1.0f64 / PRUNE_FLOOR).log2();
+    (half_lives * RECENCY_HALF_LIFE_DAYS * 86_400_000.0) as i64
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct MemoryPruneStats {
+    /// L0 rows past `L0_TTL_DAYS`.
+    pub l0_expired: usize,
+    /// L0 rows dropped by the per-session ring.
+    pub l0_ring: usize,
+    /// L1/L2 atoms whose recency had decayed below `PRUNE_FLOOR`.
+    pub decayed: usize,
+}
+
+/// §6.2 retention for the `memories` table. Called on idle, never from the request path.
+///
+/// Two absolute exemptions, because both survive on the operator's say-so rather than on recency:
+/// **pinned** and **L3**. Everything else is data this layer produced by itself and can unproduce —
+/// an atom nobody has re-confirmed in four months is not a fact, it is a guess with a timestamp.
+///
+/// `DELETE` is safe against the FTS index: `memories_ad` fires per row.
+pub fn prune(store: &Store) -> Result<MemoryPruneStats, String> {
+    let mut stats = MemoryPruneStats::default();
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let now = now_ms();
+
+    stats.l0_expired = conn
+        .execute(
+            "DELETE FROM memories WHERE layer = 'L0' AND pinned = 0 AND updated_at < ?1",
+            params![now - L0_TTL_DAYS * 86_400_000],
+        )
+        .map_err(|e| e.to_string())?;
+
+    // Newest N per session survive. A window function is the only readable way to express "per
+    // session" — the correlated-subquery form is quadratic over every L0 row in the table.
+    stats.l0_ring = conn
+        .execute(
+            "DELETE FROM memories
+              WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
+                AND rowid NOT IN (
+                  SELECT rowid FROM (
+                    SELECT rowid, ROW_NUMBER() OVER (
+                      PARTITION BY session_id ORDER BY updated_at DESC, id
+                    ) AS rn
+                    FROM memories WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
+                  ) WHERE rn <= ?1
+                )",
+            params![L0_RING_PER_SESSION as i64],
+        )
+        .map_err(|e| e.to_string())?;
+
+    stats.decayed = conn
+        .execute(
+            "DELETE FROM memories WHERE layer IN ('L1','L2') AND pinned = 0 AND updated_at < ?1",
+            params![now - prune_cutoff_ms()],
+        )
+        .map_err(|e| e.to_string())?;
+
+    Ok(stats)
+}
+
 pub fn set_pinned(store: &Store, id: &str, pinned: bool) -> Result<bool, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let n = conn
         .execute(
             "UPDATE memories SET pinned = ?1, updated_at = ?2 WHERE id = ?3",
             params![pinned as i64, now_ms(), id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// Bind a memory to a scope. **This is the only way a row becomes injectable.**
+///
+/// Returns false when there is no such memory. Every assignment writes all three columns, so a row
+/// can never keep a stale binding from the state it is leaving: promoting `Project` → `Global` or
+/// demoting it to `Unscoped` both clear `scope_project` / `scope_agent`.
+///
+/// `scope_user` is not assignable — this is a single-user desktop app and every row is `local`.
+pub fn assign_scope(store: &Store, id: &str, a: ScopeAssignment) -> Result<bool, String> {
+    let (project, agent, global): (Option<String>, Option<String>, i64) = match a {
+        ScopeAssignment::Project { project, agent } => {
+            let project = project.trim();
+            if project.is_empty() {
+                return Err("project scope is empty".into());
+            }
+            let agent = agent.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+            (Some(project.to_string()), agent, 0)
+        }
+        ScopeAssignment::Global => (None, None, 1),
+        ScopeAssignment::Unscoped => (None, None, 0),
+    };
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let n = conn
+        .execute(
+            "UPDATE memories SET scope_project = ?1, scope_agent = ?2, scope_global = ?3,
+                    updated_at = ?4
+             WHERE id = ?5",
+            params![project, agent, global, now_ms(), id],
         )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
@@ -481,8 +772,10 @@ pub fn session_atoms(
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned
-             FROM memories WHERE session_id = ?1 AND layer = ?2
+            "SELECT id, layer, text, session_id, subject, created_at, updated_at, pinned,
+                    scope_user, scope_project, scope_agent, scope_global, superseded_at
+             FROM memories
+             WHERE session_id = ?1 AND layer = ?2 AND superseded_at IS NULL
              ORDER BY created_at ASC LIMIT ?3",
         )
         .map_err(|e| e.to_string())?;
@@ -497,7 +790,14 @@ pub fn session_atoms(
                 created_at: r.get(5)?,
                 updated_at: r.get(6)?,
                 pinned: r.get::<_, i64>(7)? != 0,
+                scope: MemoryScope {
+                    user: r.get(8)?,
+                    project: r.get(9)?,
+                    agent: r.get(10)?,
+                    global: r.get::<_, i64>(11)? != 0,
+                },
                 score: None,
+                superseded_at: r.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -532,7 +832,160 @@ pub fn stats(store: &Store) -> Result<MemoryStats, String> {
             _ => {}
         }
     }
+    drop(stmt);
+    // Same predicate `recall_scoped` gates on, so the count and the recall path can never disagree.
+    // §6.4.3: a superseded row is scoped but no longer reachable, so counting it would report rows
+    // as injectable that recall will never return.
+    s.injectable = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memories
+              WHERE superseded_at IS NULL
+                AND (scope_global = 1 OR scope_project IS NOT NULL)",
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .map_err(|e| e.to_string())?;
     Ok(s)
+}
+
+// ---------- §6.4 conflict resolution ----------
+
+/// §6.4.5: one thing a human has to decide. Deliberately narrow — see `conflicts`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Conflict {
+    /// The row that survives on the operator's say-so rather than on recency: pinned, or L3.
+    pub held: Memory,
+    /// A newer live row on the same subject, in the same project, saying something different.
+    pub newer: Memory,
+}
+
+/// Read one `Memory` starting at column `off`, so a join can carry two of them in one row.
+fn row_at(r: &rusqlite::Row<'_>, off: usize) -> rusqlite::Result<Memory> {
+    Ok(Memory {
+        id: r.get(off)?,
+        layer: r.get(off + 1)?,
+        text: r.get(off + 2)?,
+        session_id: r.get(off + 3)?,
+        subject: r.get(off + 4)?,
+        created_at: r.get(off + 5)?,
+        updated_at: r.get(off + 6)?,
+        pinned: r.get::<_, i64>(off + 7)? != 0,
+        scope: MemoryScope {
+            user: r.get(off + 8)?,
+            project: r.get(off + 9)?,
+            agent: r.get(off + 10)?,
+            global: r.get::<_, i64>(off + 11)? != 0,
+        },
+        score: None,
+        superseded_at: r.get(off + 12)?,
+    })
+}
+
+/// The 13 `memories` columns `row_at` reads, in order, qualified by an alias so a self-join can
+/// carry two memories in one row without ambiguity.
+fn memory_columns(alias: &str) -> String {
+    [
+        "id",
+        "layer",
+        "text",
+        "session_id",
+        "subject",
+        "created_at",
+        "updated_at",
+        "pinned",
+        "scope_user",
+        "scope_project",
+        "scope_agent",
+        "scope_global",
+        "superseded_at",
+    ]
+    .iter()
+    .map(|c| format!("{alias}.{c}"))
+    .collect::<Vec<_>>()
+    .join(", ")
+}
+
+/// §6.4.3: mark `old` as superseded by `new`. The old row is **kept** — a reversal is recoverable
+/// and the Context graph's edges stay valid — but it leaves recall immediately.
+///
+/// `Ok(false)` when there is nothing to do (no such row, already superseded, or the same id).
+/// `Err` when §6.4.5 refuses: a pinned or L3 row is never quietly replaced. That is the case the
+/// Memory screen exists for — the contradiction is surfaced, not resolved.
+pub fn supersede(store: &Store, old: &str, new: &str) -> Result<bool, String> {
+    if old == new {
+        return Ok(false);
+    }
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let held: Option<(i64, String)> = conn
+        .query_row(
+            "SELECT pinned, layer FROM memories WHERE id = ?1 AND superseded_at IS NULL",
+            params![old],
+            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|e| e.to_string())?;
+    let Some((pinned, layer)) = held else {
+        return Ok(false);
+    };
+    if pinned != 0 {
+        return Err("this memory is pinned — unpin it first if the newer one should replace it".into());
+    }
+    if layer == "L3" {
+        return Err("this is a core fact (L3) — it is replaced deliberately, never by a newer atom".into());
+    }
+    let n = conn
+        .execute(
+            "UPDATE memories SET superseded_at = ?1 WHERE id = ?2 AND superseded_at IS NULL",
+            params![now_ms(), old],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// §6.4.3: undo a supersession. The row is already intact — this only makes it reachable again.
+pub fn unsupersede(store: &Store, id: &str) -> Result<bool, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let n = conn
+        .execute(
+            "UPDATE memories SET superseded_at = NULL WHERE id = ?1 AND superseded_at IS NOT NULL",
+            params![id],
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(n > 0)
+}
+
+/// §6.4.5: what a human has to look at. Deliberately **narrow**, because a broad "these two atoms
+/// might disagree" list is noise nobody will read and a model call to detect real contradiction is
+/// exactly the auto-resolution the rule forbids.
+///
+/// The one case worth surfacing is the one §6.4.1 exists to prevent: a pinned or L3 row that still
+/// wins *survival* while a newer, ordinary atom on the same subject says something different. That
+/// is a stale pin quietly poisoning retrieval, and only a person can settle it.
+pub fn conflicts(store: &Store) -> Result<Vec<Conflict>, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let sql = format!(
+        "SELECT {}, {}
+           FROM memories h
+           JOIN memories n
+             ON n.subject IS NOT NULL
+            AND n.subject = h.subject
+            AND n.scope_project IS h.scope_project   -- NULL-safe: same project, or both unscoped
+           WHERE h.superseded_at IS NULL AND n.superseded_at IS NULL
+             AND (h.pinned = 1 OR h.layer = 'L3')
+             AND n.id <> h.id
+             AND n.text <> h.text
+             AND n.updated_at > h.updated_at
+           ORDER BY h.updated_at DESC, n.updated_at DESC",
+        memory_columns("h"),
+        memory_columns("n")
+    );
+    let mut stmt = conn.prepare(&sql).map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map([], |r| Ok(Conflict { held: row_at(r, 0)?, newer: row_at(r, 13)? }))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
 }
 
 /// Ids do not need to be cryptographic — they only need to not collide inside one table.
@@ -561,6 +1014,558 @@ mod memory_tests {
             subject: None,
             pinned: false,
         }
+    }
+
+    /// Insert a memory with explicit scope columns. Goes through SQL rather than `capture` because
+    /// `capture` has no scope parameters yet — that is Phase 4 (the capture path).
+    fn scoped(
+        s: &Store,
+        id: &str,
+        layer: &str,
+        text: &str,
+        project: Option<&str>,
+        agent: Option<&str>,
+        global: i64,
+        pinned: i64,
+    ) {
+        s.conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO memories (id, layer, text, created_at, updated_at, pinned,
+                                       scope_user, scope_project, scope_agent, scope_global)
+                 VALUES (?1,?2,?3,1,1,?4,'local',?5,?6,?7)",
+                rusqlite::params![id, layer, text, pinned, project, agent, global],
+            )
+            .unwrap();
+    }
+
+    fn scope_of(project: Option<&str>, agent: Option<&str>) -> RecallScope {
+        RecallScope {
+            user: Some("local".into()),
+            project: project.map(|p| p.to_string()),
+            agent: agent.map(|a| a.to_string()),
+        }
+    }
+
+    fn to_project(project: &str, agent: Option<&str>) -> ScopeAssignment {
+        ScopeAssignment::Project { project: project.into(), agent: agent.map(|a| a.into()) }
+    }
+
+    /// The rule the whole scoped-recall design rests on: a memory is born capture-only and stays
+    /// invisible to every scope until someone deliberately binds it.
+    #[test]
+    fn a_captured_memory_is_born_unscoped_and_invisible_to_every_scope() {
+        let (s, d) = temp_store("born-unscoped");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assert_eq!(m.scope.project, None, "born with no project binding");
+        assert!(!m.scope.global, "born not global");
+        assert_eq!(stats(&s).unwrap().injectable, 0, "nothing is injectable yet");
+        for p in [Some("alpha"), Some("beta"), None] {
+            assert!(
+                recall_scoped(&s, "Postgres", 10, None, &scope_of(p, None)).unwrap().is_empty(),
+                "an unscoped row is invisible to scope {p:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §5.5.1: the recall order has to be **total**, not merely "sorted by the interesting keys".
+    ///
+    /// Three atoms that tie on every real key — identical text so identical BM25 and identical band,
+    /// the same layer, and the same `updated_at` so the same quantised recency — used to fall
+    /// through to whatever order SQLite returned the rows in, which is not specified and can change
+    /// with the query plan. The composed block would then differ between two identical requests,
+    /// and every difference invalidates the provider's cached prefix.
+    ///
+    /// Inserted out of id order on purpose: an ascending result is a tie-break doing the work, not
+    /// insertion order leaking through. Note that either of the two §5.5 fixes (the `m.id` key in
+    /// the SQL `ORDER BY`, or the one in `rerank`) is sufficient *for this data* — the test pins the
+    /// property, and `rerank_breaks_ties_on_id` below is what isolates `rerank` itself.
+    #[test]
+    fn atoms_that_tie_on_every_real_key_come_back_in_id_order() {
+        let (s, d) = temp_store("tie-order");
+        for id in ["m-3", "m-1", "m-2"] {
+            scoped(&s, id, "L1", "the database is postgres", Some("p1"), None, 0, 0);
+        }
+        let first = recall_scoped(&s, "database", 20, None, &scope_of(Some("p1"), None)).unwrap();
+        let ids: Vec<&str> = first.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-1", "m-2", "m-3"], "ties break on id, never on row order");
+
+        // The property §5.5 actually needs: the same query against the same rows returns the same
+        // order every time.
+        let again = recall_scoped(&s, "database", 20, None, &scope_of(Some("p1"), None)).unwrap();
+        let ids2: Vec<&str> = again.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, ids2, "recall is deterministic, so the composed bytes are too");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------- §6.4 conflict resolution ----------
+
+    /// A superseded atom is out of the live set immediately — injecting it would put a fact the
+    /// operator already replaced back into every prompt.
+    #[test]
+    fn a_superseded_atom_drops_out_of_recall_but_not_out_of_the_table() {
+        let (s, d) = temp_store("supersede");
+        let old = capture(&s, &input("L1", "the database is MySQL")).unwrap();
+        let new = capture(&s, &input("L1", "the database is Postgres")).unwrap();
+        for id in [&old.id, &new.id] {
+            assign_scope(&s, id, to_project("p1", None)).unwrap();
+        }
+        assert!(
+            recall_scoped(&s, "database", 10, None, &scope_of(Some("p1"), None))
+                .unwrap()
+                .iter()
+                .any(|m| m.id == old.id),
+            "both atoms are live to start with"
+        );
+
+        assert!(supersede(&s, &old.id, &new.id).unwrap());
+
+        let got = recall_scoped(&s, "database", 10, None, &scope_of(Some("p1"), None)).unwrap();
+        assert!(!got.iter().any(|m| m.id == old.id), "the superseded atom is gone from recall");
+        assert!(got.iter().any(|m| m.id == new.id), "the replacement is still there");
+        assert!(
+            list(&s, None, 100).unwrap().iter().any(|m| m.id == old.id),
+            "but it is still in the table — retained for audit and for a reversal"
+        );
+
+        // And the reversal is one call, because the row was never deleted.
+        assert!(unsupersede(&s, &old.id).unwrap());
+        assert!(
+            recall_scoped(&s, "database", 10, None, &scope_of(Some("p1"), None))
+                .unwrap()
+                .iter()
+                .any(|m| m.id == old.id),
+            "a supersession is reversible"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §6.4.5: a pinned or L3 row is never quietly replaced. This is the refusal that makes the
+    /// conflict surface meaningful rather than decorative.
+    #[test]
+    fn superseding_a_pinned_or_core_row_is_refused() {
+        let (s, d) = temp_store("supersede-refuse");
+        let pinned = capture(&s, &MemoryInput { pinned: true, ..input("L1", "the db is MySQL") }).unwrap();
+        let core = capture(&s, &input("L3", "the db is MySQL and always was")).unwrap();
+        let new = capture(&s, &input("L1", "the db is Postgres")).unwrap();
+
+        let e = supersede(&s, &pinned.id, &new.id).unwrap_err();
+        assert!(e.contains("pinned"), "a refusal says why: {e}");
+        let e = supersede(&s, &core.id, &new.id).unwrap_err();
+        assert!(e.contains("L3"), "a refusal says why: {e}");
+
+        // Still live, which is the point: a stale pin is surfaced, never silently displaced.
+        let ids: Vec<String> = list(&s, None, 100).unwrap().iter().map(|m| m.id.clone()).collect();
+        assert!(ids.contains(&pinned.id) && ids.contains(&core.id));
+        assert!(!supersede(&s, "no-such-row", &new.id).unwrap(), "a missing row is a no-op, not an error");
+        assert!(!supersede(&s, &new.id, &new.id).unwrap(), "a row cannot supersede itself");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §6.4.5: the one case worth surfacing — a pinned or L3 row still winning *survival* while a
+    /// newer ordinary atom on the same subject says something different.
+    #[test]
+    fn a_pinned_row_with_a_newer_atom_on_the_same_subject_is_a_conflict() {
+        let (s, d) = temp_store("conflict");
+        let mut pinned_input = input("L1", "the database is MySQL");
+        pinned_input.subject = Some("database".into());
+        pinned_input.pinned = true;
+        let held = capture(&s, &pinned_input).unwrap();
+        assign_scope(&s, &held.id, to_project("p1", None)).unwrap();
+
+        // Same subject, newer, different text — and in the same project.
+        let mut newer_input = input("L1", "the database is Postgres now");
+        newer_input.subject = Some("database".into());
+        let newer = capture(&s, &newer_input).unwrap();
+        assign_scope(&s, &newer.id, to_project("p1", None)).unwrap();
+
+        // "Newer" is what the query matches on, and two captures land in the same millisecond more
+        // often than not — which made this test pass alone and fail in the full suite. Force the
+        // ordering rather than relying on the clock.
+        let base = now_ms() - 10_000;
+        let set_ts = |id: &str, ts: i64| {
+            s.conn
+                .lock()
+                .unwrap()
+                .execute("UPDATE memories SET updated_at = ?1 WHERE id = ?2", params![ts, id])
+                .unwrap();
+        };
+        set_ts(&held.id, base);
+        set_ts(&newer.id, base + 5_000);
+
+        let cs = conflicts(&s).unwrap();
+        assert_eq!(cs.len(), 1, "{cs:?}");
+        assert_eq!(cs[0].held.id, held.id);
+        assert_eq!(cs[0].newer.id, newer.id);
+
+        // A different project is not a conflict — the two never meet in a prompt.
+        let mut other = input("L1", "the database is SQLite over here");
+        other.subject = Some("database".into());
+        let far = capture(&s, &other).unwrap();
+        assign_scope(&s, &far.id, to_project("p2", None)).unwrap();
+        assert_eq!(conflicts(&s).unwrap().len(), 1, "scope is part of the match");
+
+        // Resolving it by superseding the pinned row is refused, so it stays surfaced.
+        assert!(supersede(&s, &held.id, &newer.id).is_err());
+        assert_eq!(conflicts(&s).unwrap().len(), 1, "a refusal does not hide the conflict");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §6.4.3: `stats` counts what recall can actually return. A superseded row is still scoped, so
+    /// without the predicate the two would disagree — and "3 injectable" over "2 that will ever
+    /// come back" is exactly the kind of drift that makes a stats panel untrustworthy.
+    #[test]
+    fn a_superseded_row_is_not_counted_as_injectable() {
+        let (s, d) = temp_store("supersede-stats");
+        let a = capture(&s, &input("L1", "the database is MySQL")).unwrap();
+        let b = capture(&s, &input("L1", "the database is Postgres")).unwrap();
+        for id in [&a.id, &b.id] {
+            assign_scope(&s, id, to_project("p1", None)).unwrap();
+        }
+        assert_eq!(stats(&s).unwrap().injectable, 2);
+        supersede(&s, &a.id, &b.id).unwrap();
+        assert_eq!(stats(&s).unwrap().injectable, 1, "a superseded row is out of the live set");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // ---------- §6.2 retention ----------
+
+    #[test]
+    fn pruning_drops_l0_past_its_ttl_and_spares_pinned_and_l3() {
+        let (s, d) = temp_store("prune-l0");
+        // `scoped` writes updated_at = 1, i.e. long past every cutoff.
+        scoped(&s, "old-l0", "L0", "an old turn", Some("p1"), None, 0, 0);
+        scoped(&s, "old-l0-pinned", "L0", "an old pinned turn", Some("p1"), None, 0, 1);
+        scoped(&s, "old-l3", "L3", "a core fact", None, None, 1, 0);
+        let st = prune(&s).unwrap();
+        assert_eq!(st.l0_expired, 1, "{st:?}");
+        let ids: Vec<String> = list(&s, None, 100).unwrap().iter().map(|m| m.id.clone()).collect();
+        assert!(!ids.iter().any(|i| i == "old-l0"), "the stale turn went: {ids:?}");
+        assert!(ids.iter().any(|i| i == "old-l0-pinned"), "pinned is exempt: {ids:?}");
+        assert!(ids.iter().any(|i| i == "old-l3"), "L3 is never auto-pruned: {ids:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The ring is per session, not global — otherwise one long conversation would evict every
+    /// other session's turns.
+    #[test]
+    fn the_l0_ring_keeps_only_the_newest_turns_per_session() {
+        let (s, d) = temp_store("prune-ring");
+        let base = now_ms() - 1_000; // recent, so the TTL pass leaves them alone
+        let ins = |id: &str, sess: &str, i: i64| {
+            s.conn
+                .lock()
+                .unwrap()
+                .execute(
+                    "INSERT INTO memories (id, layer, text, session_id, created_at, updated_at, pinned)
+                     VALUES (?1,'L0',?2,?3,?4,?4,0)",
+                    rusqlite::params![id, format!("turn {id}"), sess, base + i],
+                )
+                .unwrap();
+        };
+        for i in 0..205 {
+            ins(&format!("t{i:03}"), "sess", i);
+        }
+        for i in 0..3 {
+            ins(&format!("o{i}"), "other", i);
+        }
+
+        let st = prune(&s).unwrap();
+        assert_eq!(st.l0_ring, 5, "205 - 200, and the other session is untouched: {st:?}");
+
+        let left = list(&s, Some("L0"), 500).unwrap();
+        let sess: Vec<&str> = left
+            .iter()
+            .filter(|m| m.session_id.as_deref() == Some("sess"))
+            .map(|m| m.id.as_str())
+            .collect();
+        assert_eq!(sess.len(), 200, "{sess:?}");
+        assert!(!sess.contains(&"t000"), "the oldest went");
+        assert!(sess.contains(&"t204"), "the newest stayed");
+        assert_eq!(
+            left.iter().filter(|m| m.session_id.as_deref() == Some("other")).count(),
+            3,
+            "the cap is per session"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn pruning_drops_atoms_that_have_decayed_below_the_floor() {
+        let (s, d) = temp_store("prune-decay");
+        scoped(&s, "old-l1", "L1", "an old atom", Some("p1"), None, 0, 0);
+        scoped(&s, "old-l1-pinned", "L1", "an old pinned atom", Some("p1"), None, 0, 1);
+        scoped(&s, "old-l2", "L2", "an old scenario", Some("p1"), None, 0, 0);
+        let fresh = capture(&s, &input("L1", "a fresh atom")).unwrap();
+
+        let st = prune(&s).unwrap();
+        assert_eq!(st.decayed, 2, "L1 and L2, not the pinned one: {st:?}");
+        let ids: Vec<String> = list(&s, None, 100).unwrap().iter().map(|m| m.id.clone()).collect();
+        assert!(ids.contains(&fresh.id), "a fresh atom has not decayed: {ids:?}");
+        assert!(ids.iter().any(|i| i == "old-l1-pinned"), "pinned is exempt: {ids:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A prune is only correct if the FTS index went with it. A row deleted from `memories` but
+    /// still indexed is returned by recall and then read back as nothing — and the next prune's
+    /// `rowid` arithmetic silently drifts.
+    #[test]
+    fn pruned_rows_leave_the_fts_index_too() {
+        let (s, d) = temp_store("prune-fts");
+        scoped(&s, "gone", "L1", "zebrafish database fact", Some("p1"), None, 0, 0);
+        assert_eq!(
+            recall_scoped(&s, "zebrafish", 10, None, &scope_of(Some("p1"), None)).unwrap().len(),
+            1,
+            "seeded and findable"
+        );
+        prune(&s).unwrap();
+        assert!(
+            recall_scoped(&s, "zebrafish", 10, None, &scope_of(Some("p1"), None)).unwrap().is_empty(),
+            "a pruned row is not recallable"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// §5.5.1, isolated: `rerank` sorts rows it is handed in *some* order, and when every real key
+    /// ties the leftover order is whatever SQLite produced. This drives it directly with a shuffled
+    /// input — which is exactly the unpinned situation — so the tie-break is proved without relying
+    /// on what the query happened to return.
+    #[test]
+    fn rerank_breaks_ties_on_id() {
+        let mk = |id: &str| Memory {
+            id: id.into(),
+            layer: "L1".into(),
+            text: "the database is postgres".into(),
+            session_id: None,
+            subject: None,
+            created_at: 1,
+            updated_at: 1,
+            pinned: false,
+            scope: MemoryScope { user: "local".into(), project: Some("p1".into()), agent: None, global: false },
+            score: Some(-1.0),
+            superseded_at: None,
+        };
+        let mut rows = vec![mk("m-3"), mk("m-1"), mk("m-2")];
+        rerank(&mut rows, 1_000_000);
+        let ids: Vec<&str> = rows.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["m-1", "m-2", "m-3"], "a total order, not a partial one");
+    }
+
+    /// The shortlist is truncated by `LIMIT`, so determinism has to hold *before* ranking too —
+    /// which rows survive to be ranked at all would otherwise depend on the query plan. `m.id` is
+    /// the last `ORDER BY` key for exactly this reason.
+    ///
+    /// Honest caveat: verified **not** to fail when that key is removed — this SQLite build returns
+    /// tied rows in a stable order for this query. So this pins the property rather than proving the
+    /// key is load-bearing today; the key is defensive against an unspecified guarantee plus a
+    /// `LIMIT`, both of which are free to change with the planner.
+    #[test]
+    fn a_truncated_shortlist_is_the_same_rows_every_time() {
+        let (s, d) = temp_store("tie-limit");
+        for i in 0..12 {
+            scoped(
+                &s,
+                &format!("m-{i:02}"),
+                "L1",
+                "the database is postgres",
+                Some("p1"),
+                None,
+                0,
+                0,
+            );
+        }
+        // A limit of 3 pulls CANDIDATE_FACTOR * 3 = 12 rows, so this is a real truncation.
+        let ids: Vec<String> = (0..5)
+            .map(|_| {
+                recall_scoped(&s, "database", 3, None, &scope_of(Some("p1"), None))
+                    .unwrap()
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect::<Vec<_>>()
+                    .join(",")
+            })
+            .collect();
+        assert!(ids.windows(2).all(|w| w[0] == w[1]), "every call picks the same rows: {ids:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn assigning_a_project_makes_a_memory_injectable_only_there() {
+        let (s, d) = temp_store("assign-project");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assert!(assign_scope(&s, &m.id, to_project("alpha", None)).unwrap());
+        assert_eq!(stats(&s).unwrap().injectable, 1, "scoping it makes it injectable");
+        assert_eq!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap().len(),
+            1,
+            "visible inside its own project"
+        );
+        assert!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None)).unwrap().is_empty(),
+            "invisible in another project"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_agent_narrowed_memory_is_invisible_to_a_different_agent() {
+        let (s, d) = temp_store("assign-agent");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assign_scope(&s, &m.id, to_project("alpha", Some("cursor"))).unwrap();
+        assert_eq!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), Some("cursor")))
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), Some("aider")))
+                .unwrap()
+                .is_empty(),
+            "an agent-scoped row does not leak to another agent in the same project"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn marking_a_memory_global_makes_it_visible_in_every_project() {
+        let (s, d) = temp_store("assign-global");
+        let m = capture(&s, &input("L3", "prefers terse replies")).unwrap();
+        assert!(assign_scope(&s, &m.id, ScopeAssignment::Global).unwrap());
+        for p in [Some("alpha"), Some("beta")] {
+            assert_eq!(
+                recall_scoped(&s, "terse", 10, None, &scope_of(p, None)).unwrap().len(),
+                1,
+                "global rows are not project-bound"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Demotion has to actually demote: leaving a stale `scope_project` behind would keep the row
+    /// visible after the operator took it out of that project.
+    #[test]
+    fn unscoping_a_memory_hides_it_again() {
+        let (s, d) = temp_store("assign-unscope");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assign_scope(&s, &m.id, to_project("alpha", None)).unwrap();
+        assert_eq!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap().len(),
+            1
+        );
+        assert!(assign_scope(&s, &m.id, ScopeAssignment::Unscoped).unwrap());
+        assert!(
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap().is_empty(),
+            "unscoping clears the project binding rather than leaving it behind"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn promoting_to_global_clears_the_project_binding() {
+        let (s, d) = temp_store("assign-promote");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assign_scope(&s, &m.id, to_project("alpha", None)).unwrap();
+        assign_scope(&s, &m.id, ScopeAssignment::Global).unwrap();
+        let listed = list(&s, None, 10).unwrap();
+        let row = listed.iter().find(|r| r.id == m.id).unwrap();
+        assert!(row.scope.global);
+        assert_eq!(row.scope.project, None, "no stale project survives promotion");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A re-distill refreshes text and timestamp; it must not silently unscope a row the operator
+    /// already placed.
+    #[test]
+    fn re_recording_a_memory_preserves_its_scope() {
+        let (s, d) = temp_store("assign-rerecord");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assign_scope(&s, &m.id, to_project("alpha", None)).unwrap();
+        let again = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assert_eq!(again.scope.project.as_deref(), Some("alpha"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn assigning_scope_to_a_missing_memory_reports_false() {
+        let (s, d) = temp_store("assign-missing");
+        assert!(!assign_scope(&s, "nope", ScopeAssignment::Global).unwrap());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_empty_project_scope_is_refused() {
+        let (s, d) = temp_store("assign-empty");
+        let m = capture(&s, &input("L1", "this repo uses Postgres")).unwrap();
+        assert!(assign_scope(&s, &m.id, to_project("   ", None)).is_err());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_project_scoped_memory_is_invisible_to_another_project() {
+        let (s, d) = temp_store("scope-iso");
+        scoped(&s, "a", "L1", "this repo uses Postgres", Some("alpha"), None, 0, 0);
+        let mine = recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap();
+        assert_eq!(mine.len(), 1, "visible inside its own project");
+        let theirs = recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None)).unwrap();
+        assert!(theirs.is_empty(), "invisible in another project");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_explicitly_global_memory_is_visible_everywhere() {
+        let (s, d) = temp_store("scope-global");
+        scoped(&s, "g", "L3", "prefers terse replies", None, None, 1, 0);
+        for p in [Some("alpha"), Some("beta")] {
+            assert_eq!(
+                recall_scoped(&s, "terse", 10, None, &scope_of(p, None)).unwrap().len(),
+                1,
+                "global rows are not project-bound"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The rule the external review was unanimous about: a missing project is unresolved, and
+    /// unresolved must not silently widen to global.
+    #[test]
+    fn an_unresolved_project_sees_only_pinned_global_rows() {
+        let (s, d) = temp_store("scope-unresolved");
+        scoped(&s, "pinned", "L3", "never run migrations by hand", None, None, 1, 1);
+        scoped(&s, "plain", "L1", "some passing detail", None, None, 1, 0);
+        scoped(&s, "proj", "L1", "alpha uses Postgres", Some("alpha"), None, 0, 0);
+
+        let got = recall_scoped(&s, "migrations detail Postgres", 10, None, &scope_of(None, None)).unwrap();
+        let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["pinned"], "only the pinned global row survives: {ids:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_agent_scoped_row_is_visible_to_that_agent_and_to_project_wide_facts() {
+        let (s, d) = temp_store("scope-agent");
+        scoped(&s, "cursor-only", "L1", "cursor specific fact", Some("alpha"), Some("cursor"), 0, 0);
+        scoped(&s, "any-agent", "L1", "project wide fact", Some("alpha"), None, 0, 0);
+
+        let for_cursor = recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("cursor"))).unwrap();
+        assert_eq!(for_cursor.len(), 2, "both are visible to cursor");
+
+        let for_claude = recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("claude"))).unwrap();
+        let ids: Vec<&str> = for_claude.iter().map(|m| m.id.as_str()).collect();
+        assert_eq!(ids, vec!["any-agent"], "an agent-scoped row is not visible to another agent");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn unscoped_recall_still_sees_everything() {
+        let (s, d) = temp_store("scope-unscoped");
+        scoped(&s, "a", "L1", "alpha uses Postgres", Some("alpha"), None, 0, 0);
+        scoped(&s, "b", "L1", "beta uses Sqlite", Some("beta"), None, 0, 0);
+        // The Assistant's Memory screen must keep working unchanged.
+        assert_eq!(recall(&s, "Postgres Sqlite", 10, None).unwrap().len(), 2);
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
@@ -757,7 +1762,9 @@ mod memory_tests {
             created_at: ts,
             updated_at: ts,
             pinned: false,
+            scope: MemoryScope { user: "local".into(), project: None, agent: None, global: false },
             score: Some(bm25),
+            superseded_at: None,
         }
     }
 

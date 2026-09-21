@@ -264,6 +264,10 @@ export async function bootstrap(): Promise<void> {
     })),
     fetchedByProvider,
   );
+  // Hydration is the common case: a launch that only reads the store never calls refreshCatalog,
+  // so publishing here is what stops the first request of every session planning against the
+  // 8k default.
+  void publishModelContext();
 
   // Adapter registration: builtin profiles win by slug (pinned facts, current template);
   // custom providers use their active manifest row.
@@ -475,6 +479,38 @@ export async function testKey(keyId: string): Promise<PingResult & { verdict: Ke
   return { ...res, verdict };
 }
 
+/**
+ * Publish context windows to the host (§3.4).
+ *
+ * The gateway sizes the injected memory block against the model's window, and Rust cannot see the
+ * catalog — it lives here, with provider selection and key handling. Without this the host plans
+ * every request against a flat 8k default, which starves recall on a 200k model and is generous on
+ * a small one.
+ *
+ * Qualified keys (`slug/nativeId`) because that is what a client sends in `model`; an unqualified
+ * alias simply misses and falls back to the default, which under-injects safely.
+ */
+export async function publishModelContext(): Promise<number> {
+  const rows = catalog
+    .all()
+    .filter((m) => typeof m.contextWindow === "number" && m.contextWindow > 0)
+    .map((m) => {
+      const slug = registry.getProvider(m.providerId)?.slug;
+      return slug
+        ? { model_key: `${slug}/${m.nativeId}`, context_window: m.contextWindow!, chars_per_token: null }
+        : null;
+    })
+    .filter((r): r is { model_key: string; context_window: number; chars_per_token: null } => r !== null);
+  if (rows.length === 0) return 0;
+  // Best-effort: a budget planned against the default is a worse answer, not a failed refresh.
+  return invoke<number>("router_model_context_replace", { rows }).catch(() => 0);
+}
+
+/** How many models the gateway can plan a budget against. Zero means every request uses the default. */
+export async function modelContextCount(): Promise<number> {
+  return invoke<number>("router_model_context_count");
+}
+
 export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
   const n = await catalog.refreshProvider(providerId, signal);
   await invoke("models_cache_replace", {
@@ -492,6 +528,9 @@ export async function refreshCatalog(providerId: string, signal?: AbortSignal): 
   });
   catalog.deriveAutoAliases();
   await persistAliases();
+  // After the catalog changes, not before: the host's window cache is derived from it, and
+  // publishing stale windows would be worse than publishing none.
+  void publishModelContext();
   return n;
 }
 
@@ -704,6 +743,17 @@ export async function agentRunSteps(runId: string): Promise<AgentStep[]> {
 
 export type MemoryLayer = "L0" | "L1" | "L2" | "L3";
 
+/**
+ * Where a memory may be injected. A row with neither a project nor an explicit global mark is
+ * capture-only — it will never be injected into a request, no matter which agent asks.
+ */
+export interface MemoryScope {
+  user: string;
+  project: string | null;
+  agent: string | null;
+  global: boolean;
+}
+
 export interface Memory {
   id: string;
   layer: MemoryLayer;
@@ -713,11 +763,24 @@ export interface Memory {
   created_at: number;
   updated_at: number;
   pinned: boolean;
+  scope: MemoryScope;
   score?: number;
+  /** §6.4.3: when this row was superseded, or null while it is live. Kept, not deleted. */
+  superseded_at: number | null;
+}
+
+/** §6.4.5: one contradiction a human has to settle. */
+export interface MemoryConflict {
+  /** The pinned/L3 row — the one surviving on the operator's say-so, not on recency. */
+  held: Memory;
+  /** A newer live row on the same subject, in the same project, saying something different. */
+  newer: Memory;
 }
 
 export interface MemoryStats {
   l0: number; l1: number; l2: number; l3: number; total: number; bytes: number;
+  /** Rows that can actually be injected. Everything else is capture-only. */
+  injectable: number;
 }
 
 export async function captureMemory(m: {
@@ -752,8 +815,52 @@ export async function forgetMemory(id: string): Promise<boolean> {
   return invoke<boolean>("memory_forget", { id });
 }
 
+/**
+ * §6.4.3: mark `old` as superseded by `new`. The old row is kept for audit and for a reversal, but
+ * it leaves recall immediately.
+ *
+ * Rejects on a pinned or L3 row — §6.4.5 forbids quietly replacing either.
+ */
+export async function supersedeMemory(old: string, newId: string): Promise<boolean> {
+  return invoke<boolean>("memory_supersede", { old, new: newId });
+}
+
+/** §6.4.3: undo a supersession. The row was never deleted, so this makes it reachable again. */
+export async function unsupersedeMemory(id: string): Promise<boolean> {
+  return invoke<boolean>("memory_unsupersede", { id });
+}
+
+/** §6.4.5: what the Memory screen has to put in front of a human. */
+export async function memoryConflicts(): Promise<MemoryConflict[]> {
+  return invoke<MemoryConflict[]>("memory_conflicts");
+}
+
 export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
   return invoke<boolean>("memory_set_pinned", { id, pinned });
+}
+
+/**
+ * The project scope the gateway resolves for an incoming request: a hash of the workspace root.
+ * The Memory screen needs it to bind a memory to "this project" — the value has to match what the
+ * request path computes, so it is fetched from the host rather than recomputed here.
+ */
+export async function gatewayProjectKey(): Promise<string | null> {
+  return invoke<string | null>("gateway_project_key");
+}
+
+/**
+ * Bind a memory to a scope. This is the only way a row becomes injectable — every memory is born
+ * capture-only. `kind` is `project` (optionally narrowed to one agent), `global`, or `unscoped`.
+ */
+export async function assignMemoryScope(
+  id: string,
+  scope: { kind: "project"; project: string; agent?: string | null } | { kind: "global" } | { kind: "unscoped" },
+): Promise<boolean> {
+  const payload =
+    scope.kind === "project"
+      ? { kind: "project", project: scope.project, agent: scope.agent ?? null }
+      : { kind: scope.kind, project: null, agent: null };
+  return invoke<boolean>("memory_assign_scope", { id, scope: payload });
 }
 
 /** Rewrite one memory's text. The layer is left alone — promotion is the caller's call. */
@@ -777,6 +884,135 @@ export async function clearMemories(): Promise<void> {
 
 export async function memoryStats(): Promise<MemoryStats> {
   return invoke<MemoryStats>("memory_stats");
+}
+
+// ---------- capture queue (§3.3) ----------
+
+/** One queued exchange, as the host stored it: already scrubbed, already classified, already scoped. */
+export interface PendingRow {
+  id: number;
+  session_id: string | null;
+  scope_user: string;
+  scope_project: string | null;
+  scope_agent: string | null;
+  /** `fact` | `preference` | `decision` | `instruction` (§3.5.3). */
+  content_class: string;
+  user_text: string;
+  asst_text: string | null;
+  model: string | null;
+  attempts: number;
+}
+
+export interface QueueStatus {
+  queued: number; processing: number; done: number; failed: number; outstanding: number;
+}
+
+/**
+ * Claim a batch for distillation. The rows move to `processing`, so a second drain cannot take
+ * them and a crash mid-batch can be recovered by `captureRequeueStale`.
+ */
+export async function captureClaim(): Promise<PendingRow[]> {
+  return invoke<PendingRow[]>("capture_claim");
+}
+
+/** Mark a row distilled. Returns false when the row was not in `processing`. */
+export async function captureComplete(id: number): Promise<boolean> {
+  return invoke<boolean>("capture_complete", { id });
+}
+
+/**
+ * Give a row back. The host retires it after three attempts rather than retrying forever — a turn
+ * that will not distil is not going to start.
+ */
+export async function captureRelease(id: number): Promise<boolean> {
+  return invoke<boolean>("capture_release", { id });
+}
+
+/** Put back rows whose claim went stale, i.e. the webview died mid-batch. */
+export async function captureRequeueStale(): Promise<number> {
+  return invoke<number>("capture_requeue_stale");
+}
+
+export async function captureQueueStatus(): Promise<QueueStatus> {
+  return invoke<QueueStatus>("capture_queue_status");
+}
+
+/** Drop `done`/`failed` rows past retention. Never touches work in flight. */
+export async function capturePurgeFinished(): Promise<number> {
+  return invoke<number>("capture_purge_finished");
+}
+
+/** §6.2: what a prune of the `memories` table removed. */
+export interface MemoryPruneStats {
+  l0_expired: number;
+  l0_ring: number;
+  decayed: number;
+}
+
+/** §6.2 retention for memories: L0 TTL + per-session ring, L1/L2 decay. Pinned and L3 are exempt. */
+export async function pruneMemories(): Promise<MemoryPruneStats> {
+  return invoke<MemoryPruneStats>("gateway_prune_memories");
+}
+
+/** Live-context retention: turn ring per session, TTL on turns, TTL on idle sessions. */
+export interface LiveContextPruneStats {
+  turns_by_count: number;
+  turns_by_age: number;
+  sessions_reaped: number;
+}
+
+export async function pruneLiveContext(): Promise<LiveContextPruneStats> {
+  return invoke<LiveContextPruneStats>("gateway_prune_live_context");
+}
+
+/**
+ * One client's memory policy (§4a). `enabled: null` means inherit the master switch; an explicit
+ * `true`/`false` overrides it. `last_seen_at` is null for an agent configured before it ever
+ * connected.
+ */
+export interface PrincipalRow {
+  principal: string;
+  enabled: boolean | null;
+  last_seen_at: number | null;
+}
+
+export async function memoryPrincipalList(): Promise<PrincipalRow[]> {
+  return invoke<PrincipalRow[]>("memory_principal_list");
+}
+
+/**
+ * Set one principal's policy, or pass `null` to return it to inheriting.
+ *
+ * The master switch still wins: a principal set to `true` gets nothing while memory is off
+ * globally, which is what keeps "off" a single unambiguous act.
+ */
+export async function setMemoryPrincipal(
+  principal: string,
+  enabled: boolean | null,
+): Promise<boolean> {
+  return invoke<boolean>("memory_principal_set", { policy: { principal, enabled } });
+}
+
+/** The memory/context layer's master switch. Off by default: no reads, no writes. */
+export async function gatewayMemoryEnabled(): Promise<boolean> {
+  return invoke<boolean>("gateway_memory_enabled");
+}
+
+export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean> {
+  return invoke<boolean>("gateway_set_memory_enabled", { enabled });
+}
+
+/**
+ * The qualified id of the configured system model, or null when none is set.
+ *
+ * Distillation needs *some* model and must not silently pick one, so the drain and the chat path
+ * both resolve it here rather than guessing from the catalog.
+ */
+export function systemAiModel(): string | null {
+  const sa = router.settings.systemAi;
+  if (!sa?.model) return null;
+  const slug = registry.getProvider(sa.providerId)?.slug;
+  return slug ? `${slug}/${sa.model}` : null;
 }
 
 // ---------- Phase 6: config export/import + diagnostics (spec req. 14) ----------

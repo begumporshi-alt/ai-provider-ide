@@ -39,7 +39,11 @@ const recordContext = vi.spyOn(store, "recordContext");
 function mem(id: string, layer: Memory["layer"], text: string, pinned = false): Memory {
   return {
     id, layer, text, session_id: "s", subject: null,
-    created_at: 1, updated_at: 1, pinned, score: -1,
+    created_at: 1, updated_at: 1, pinned,
+    // Capture-only by default, matching what the host returns for a freshly captured row.
+    scope: { user: "local", project: null, agent: null, global: false },
+    score: -1,
+    superseded_at: null,
   };
 }
 

@@ -1,4 +1,5 @@
 mod app_nap;
+mod capture;
 mod commands;
 mod context;
 mod crash_report;
