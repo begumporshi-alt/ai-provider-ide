@@ -21,7 +21,7 @@ import {
 } from "@aiprovider/router-core";
 import {
   adapters, addKey, createPendingProvider, deleteProvider, getHttpPort,
-  refreshCatalog, registry, setProviderStatus, router,
+  recordGeneratorAudit, refreshCatalog, registry, setProviderStatus, router,
 } from "../store";
 import { useUi } from "../ui-state";
 import { Button, Field, StatusDot, inputCls, inputStyle } from "../components/atoms";
@@ -228,14 +228,10 @@ export function OnboardingScreen() {
         feedback: note,
         onProgress: (p) => setAiProgress((prev) => [...prev.filter((x) => x.id !== p.id), p]),
         audit: async (e) => {
-          await invoke("generator_audit_record", {
-            e: {
-              modelUsed: e.modelUsed,
-              promptTokens: Math.round(e.promptChars / 4),
-              completionTokens: Math.round(e.completionChars / 4),
-              redactionHash: e.redactionHash,
-            },
-          }).catch(() => undefined);
+          // Through `store.ts`, not a local `invoke`: the wizard and drift repair write the same
+          // trail, and this call site kept its own copy with `.catch(() => undefined)` — so the
+          // wizard's audit failures were the last ones still silent.
+          await recordGeneratorAudit(e);
         },
       });
       setCandidates(ranked);

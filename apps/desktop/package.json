@@ -5,11 +5,13 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "build": "tsc && vite build",
+    "build": "pnpm build:clean && tsc && vite build",
+    "build:clean": "if [ -d dist ]; then mv dist \"/tmp/build-dist-$(date +%s)\"; fi",
     "typecheck": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
     "test": "vitest run",
     "web-test:types": "tsc --noEmit --ignoreConfig --jsx react-jsx --module esnext --moduleResolution bundler --target es2022 --esModuleInterop --skipLibCheck --types node web-test/*.ts",
-    "web-test": "pnpm web-test:types && playwright test --config=playwright.config.ts",
+    "web-test:clean": "if [ -d test-results ]; then mv test-results \"/tmp/web-test-results-$(date +%s)\"; fi",
+    "web-test": "pnpm web-test:clean && pnpm web-test:types && playwright test --config=playwright.config.ts",
     "preview": "vite preview",
     "tauri": "tauri"
   },

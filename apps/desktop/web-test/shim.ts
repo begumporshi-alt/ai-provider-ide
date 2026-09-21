@@ -59,7 +59,25 @@ function persistSettings(): void {
   }
 }
 const ledger: Row[] = [];
-const drift: { providerId: string; triggerJson: string; resolved: string | null }[] = [];
+/**
+ * The drift history. Mirrors `drift_events`.
+ *
+ * `id` and `detectedAt` are here because the reader orders on them (`detected_at DESC, id DESC`), and a
+ * fixture without them could not pin that ordering — nor the tie-break, which is the rule most likely to
+ * be lost. `id` is the insertion index, so it is monotonic the way the host's rowid is.
+ *
+ * Named rather than inlined because `Snapshot` carries the same shape: while this was written out twice,
+ * the persisted-session type kept the old one and `restore` quietly stopped compiling.
+ */
+type DriftRow = {
+  id: number;
+  providerId: string;
+  detectedAt: number;
+  triggerJson: string;
+  resolved: string | null;
+  resolvedAt: number | null;
+};
+const drift: DriftRow[] = [];
 const audits: Row[] = [];
 const sessions: Row[] = [];
 /** secretRef (== key label) -> raw secret. The keychain. Never leaves this module. */
@@ -123,6 +141,31 @@ const appKeys: Row[] = [];
 /** R4 spend cap in micro-USD. `capped` is "at or over the cap", not "a cap is set" — that is what
  * gateway_cmds.rs computes, and the UI colours the number off it. */
 const spendStatus = { monthMicros: 0, capMicros: 0, capped: false };
+/**
+ * What `gateway_log_tail` answers. The host owns `{app_data_dir}/gateway.log`, so a spec cannot
+ * produce the branches that matter — an empty log, a line with no timestamp, a capped line —
+ * without arranging them here.
+ */
+let logLines: { tsMs: number | null; text: string }[] = [];
+/**
+ * Commands that should fail on their next call, mapped to the message to reject with.
+ *
+ * Without this, a UI `catch` branch is unreachable from a spec: every shim case either answers or
+ * throws only because the command is unknown, so "the read failed" and "the read answered with
+ * nothing" render identically — which is exactly the distinction several cards exist to make (the
+ * audit-trail card says so in as many words). One-shot, and cleared on use, so a spec arranges the
+ * precise call it means to fail and a retry is a different call from the one arranged.
+ */
+const failNext = new Map<string, string>();
+/**
+ * How long a `failNext` waits before rejecting, in ms. Absent means immediate.
+ *
+ * An immediate failure is consumed and rejected within a microtask, so it always lands *before* a
+ * later read resolves — which makes it useless for testing supersession: the newer read's success
+ * clears the older one's error whichever way the guard is written, and the guard is never exercised.
+ * A deferred failure is what puts the older rejection *last*, where only the guard can suppress it.
+ */
+const failDelay = new Map<string, number>();
 /** Mirrors the Rust defaults (GatewayCore::new): tools on, gateway-side mutation off (audit H1b). */
 const toolsState = { enabled: true, mutationEnabled: false };
 /**
@@ -248,7 +291,7 @@ interface Snapshot {
   aliases: Row[];
   settings: [string, string][];
   ledger: Row[];
-  drift: { providerId: string; triggerJson: string; resolved: string | null }[];
+  drift: DriftRow[];
   audits: Row[];
   sessions: Row[];
   keychain: [string, string][];
@@ -468,6 +511,24 @@ let eventSeq = 0;
   spendStatus: (next: Partial<typeof spendStatus>): void => {
     Object.assign(spendStatus, next);
   },
+  /**
+   * Replace what `gateway_log_tail` answers. Assigns rather than merges: the log is a sequence, and
+   * merging lines would make "the tail of a three-line log" impossible to arrange.
+   */
+  logLines: (next: { tsMs: number | null; text: string }[]): void => {
+    logLines = next;
+  },
+  /**
+   * Make `cmd` reject on its next call — see `failNext`. The only way a spec can reach a UI `catch`
+   * branch, and therefore the only way to tell "the read failed" from "the read answered empty".
+   *
+   * `afterMs` defers the rejection, so it can be made to land after a later call has resolved. Use it
+   * to test that a superseded read cannot write; an immediate failure always loses that race.
+   */
+  failNext: (cmd: string, message: string, afterMs = 0): void => {
+    failNext.set(cmd, message);
+    if (afterMs > 0) failDelay.set(cmd, afterMs);
+  },
   /** What a gateway tool run answers — see `toolRunResult` above. */
   toolRunResult: (next: Partial<typeof toolRunResult>): void => {
     Object.assign(toolRunResult, next);
@@ -535,6 +596,19 @@ function toRustArgs(args: Record<string, unknown>): Record<string, unknown> {
 }
 
 async function handle(cmd: string, args: Record<string, unknown>): Promise<unknown> {
+  // A one-shot failure a spec arranged. Checked here rather than inside `dispatch` so it also covers
+  // a command the shim has no case for, and so `persist()` is skipped — a rejected call must not
+  // commit anything, the same as the Rust host.
+  const failure = failNext.get(cmd);
+  if (failure !== undefined) {
+    failNext.delete(cmd);
+    const afterMs = failDelay.get(cmd) ?? 0;
+    failDelay.delete(cmd);
+    // Deferred on purpose when asked: see `failDelay`. Awaited *before* the throw so the caller's
+    // rejection lands after any read that resolved in the meantime.
+    if (afterMs > 0) await new Promise((resolve) => setTimeout(resolve, afterMs));
+    throw new Error(failure);
+  }
   const result = await dispatch(cmd, toRustArgs(args));
   persist(); // commit before the webview sees the reply, as the Rust host does
   return result;
@@ -645,16 +719,64 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       ledger.push({ ...(args.e as Row) });
       return null;
     case "drift_event_record":
-      drift.push({ providerId: args.provider_id as string, triggerJson: args.trigger_json as string, resolved: null });
+      drift.push({
+        id: drift.length + 1,
+        providerId: args.provider_id as string,
+        detectedAt: Date.now(),
+        triggerJson: args.trigger_json as string,
+        resolved: null,
+        resolvedAt: null,
+      });
       return null;
     case "drift_event_resolve": {
+      // The host's statement is `WHERE provider_id=?1 AND resolution IS NULL`, so it resolves *every*
+      // open event for that provider, not just the newest. Mirrored deliberately: a fixture that
+      // resolved one row would let a spec pass against behaviour the host does not have.
       const d = drift.find((d) => d.providerId === args.provider_id && !d.resolved);
-      if (d) d.resolved = args.resolution as string;
+      if (d) {
+        d.resolved = args.resolution as string;
+        d.resolvedAt = Date.now();
+      }
       return null;
     }
+    /**
+     * The recorded drift history, newest first. Mirrors the host's two bounds rather than just slicing:
+     * default 50 and ceiling 500 are `drift_events_list`'s, the floor of one is `list_drift_events`'s.
+     * Reversing insertion order is the same order the host's `detected_at DESC, id DESC` produces,
+     * because `id` increases with insertion.
+     */
+    case "drift_events_list": {
+      const asked = args.limit === undefined || args.limit === null ? 50 : Number(args.limit);
+      const limit = Math.min(Math.max(Number.isFinite(asked) ? asked : 50, 1), 500);
+      return [...drift]
+        .sort((a, b) => b.detectedAt - a.detectedAt || b.id - a.id)
+        .slice(0, limit)
+        .map((d) => ({
+          id: d.id,
+          providerId: d.providerId,
+          detectedAt: d.detectedAt,
+          triggerJson: d.triggerJson,
+          resolution: d.resolved,
+          resolvedAt: d.resolvedAt,
+        }));
+    }
     case "generator_audit_record":
-      audits.push({ id: ++auditSeq, ...(args.e as Row) });
+      // `tsMs` last, so it cannot be overridden by the payload — the host stamps `now_ms()` itself and
+      // the write shape deliberately has no timestamp field. Without it the reader has no time to
+      // render and the card would show placeholders for rows that really do have one.
+      audits.push({ id: ++auditSeq, ...(args.e as Row), tsMs: Date.now() });
       return null;
+    /**
+     * The AI generation trail, newest first. Mirrors the host's two bounds rather than just slicing:
+     * default 50 and ceiling 500 are `generator_audit_list`'s, the floor of one is
+     * `list_generator_audit`'s. Reversing insertion order is the same order the host's
+     * `ts DESC, id DESC` produces, because `id` increases with insertion.
+     */
+    case "generator_audit_list": {
+      const asked = args.limit === undefined || args.limit === null ? 50 : Number(args.limit);
+      const limit = Math.min(Math.max(Number.isFinite(asked) ? asked : 50, 1), 500);
+      return [...audits].reverse().slice(0, limit);
+    }
     case "config_import": {
       const raw = args.raw as Row;
       let providersN = 0;
@@ -1201,8 +1323,25 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return { ...row };
     }
     case "memory_capture_batch": {
+      // `toRustArgs` renames only top-level keys, so the caller's spelling survives inside `items`
+      // — and serde matches it against the Rust field names. `MemoryInput` has **no** `rename_all`
+      // and declares `deny_unknown_fields`, so an item must carry `session_id`; a camelCase key is a
+      // hard error in the real host rather than a silent null.
+      //
+      // The key check below exists because this shim is hand-written JS and would otherwise be more
+      // forgiving than the host it stands in for. That leniency is precisely how the original bug
+      // survived: the shim read the camel spelling and agreed silently with the very defect it
+      // existed to catch. Mirroring `deny_unknown_fields` here is what lets the harness see it.
       const items = (args.items as Row[] | undefined) ?? [];
+      const KNOWN_ITEM_KEYS = ["layer", "text", "session_id", "subject", "pinned"];
       for (const it of items) {
+        const unknown = Object.keys(it).filter((k) => !KNOWN_ITEM_KEYS.includes(k));
+        if (unknown.length > 0) {
+          throw new Error(
+            `memory_capture_batch: unknown item key(s) ${unknown.join(", ")} — MemoryInput is ` +
+              `snake_case with deny_unknown_fields, so the real host would reject this payload`,
+          );
+        }
         if (!MEMORY_LAYERS.includes(String(it.layer))) {
           throw new Error(`unknown memory layer '${it.layer}'`);
         }
@@ -1401,6 +1540,27 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return false;
     case "gateway_set_memory_enabled":
       return Boolean(args.enabled);
+    // Deliberately one populated row rather than an empty object: with `{}` a field-name mismatch
+    // between the Rust DTO and the screen would pass the browser sweep unnoticed. The keys mirror
+    // `injection_log::InjectionEvent` under `rename_all = "camelCase"`.
+    case "gateway_injection_stats":
+      return {
+        total: 1,
+        counts: { injected: 1 },
+        recent: [
+          {
+            tsMs: 1758468000000,
+            id: "gw-1",
+            model: "agnes-3.0-flash",
+            scope: "user=local;project=-;agent=-",
+            injected: true,
+            items: 3,
+            context: 1,
+            tokens: 96,
+            reason: "injected",
+          },
+        ],
+      };
     case "gateway_prune_memories":
       return { l0_expired: 0, l0_ring: 0, decayed: 0 };
     case "gateway_prune_live_context":
@@ -1477,6 +1637,17 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return null;
     case "gateway_tool_run":
       return { ...toolRunResult };
+    /**
+     * The tail of the tool audit log. Mirrors the host's two bounds rather than just slicing: a spec
+     * that passes `limit: 0` and gets the host's floor-of-one here but nothing in the app would be
+     * asserting the shim. Default 200 and ceiling 1000 are `gateway_log_tail`'s; the floor of one is
+     * `parse_log_tail`'s.
+     */
+    case "gateway_log_tail": {
+      const asked = args.limit === undefined || args.limit === null ? 200 : Number(args.limit);
+      const limit = Math.min(Math.max(Number.isFinite(asked) ? asked : 200, 1), 1000);
+      return logLines.slice(-limit);
+    }
     case "gateway_usage":
       return null;
     // Reported host-side because the worker window is never visible — without this the only

@@ -158,7 +158,154 @@ function orRouter(): SeedInput {
   };
 }
 
-const SEEDS: Record<string, () => SeedInput> = { systemai: systemAi, "or-router": orRouter };
+/**
+ * A provider whose dialect is genuinely unknown, plus a healthy System AI — the state the
+ * AI-assisted repair path needs and that no single-provider seed can produce.
+ *
+ * Two conditions gate that path, and both are why this is a seed rather than a wizard run:
+ *   - `RepairOrchestrator.plan()` only reaches `generateCandidates` when the free re-fingerprint
+ *     matches no dialect (`repair-orchestrator.ts:60-77`). The oracle fingerprints as
+ *     openai-compat, so it can never take that branch; the exotic (/v2, whose classic paths 404)
+ *     can.
+ *   - `buildRepairPlan` refuses to spend an AI round unless another ENABLED provider exists
+ *     (`store.ts:221`) — the oracle, which is also the provider that serves the call, since the
+ *     drifted one is excluded.
+ *
+ * Reaching the same state through the UI costs the whole Tier-2 story (`ui.spec.ts:87`), which is
+ * precisely the kind of scenario this file exists for.
+ *
+ * The exotic's manifest is a plausible PREVIOUS adapter — OpenAI-compatible paths against an API
+ * that speaks plain newline-delimited text — so the contract checks fail and the repair prompt has
+ * real failing assertions to describe. Its secretRef must differ from the oracle's: the harness
+ * resolves a ref across all keys and pins it to that key's own provider host (`shim.ts:1749`), so a
+ * shared ref would resolve to the wrong provider.
+ */
+function repairAi(): SeedInput {
+  const base = systemAi();
+  const exoticId = "seed-exotic";
+  const staleManifest = BUILTIN_TEMPLATES["openai-compat"](EXOTIC_BASE);
+  return {
+    ...base,
+    providers: [
+      ...(base.providers ?? []),
+      {
+        id: exoticId,
+        slug: "exotic-nd",
+        name: "Exotic ND",
+        type: "builtin",
+        baseUrl: EXOTIC_BASE,
+        status: "enabled",
+        rotationStrategy: "round_robin",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+    keys: [
+      ...(base.keys ?? []),
+      {
+        id: "seed-exotic-key",
+        providerId: exoticId,
+        label: "key-01",
+        secretRef: "key-02",
+        secret: EXOTIC_KEY,
+        secretHint: null,
+        status: "active",
+        priority: 1,
+        cooldownUntil: null,
+        addedAt: now,
+        lastUsedAt: null,
+        lastTestedAt: null,
+      },
+    ],
+    manifests: [
+      ...(base.manifests ?? []),
+      {
+        id: "seed-exotic-manifest",
+        providerId: exoticId,
+        version: 1,
+        origin: "ai-generated",
+        bodyJson: JSON.stringify(staleManifest),
+        contractResultJson: null,
+        createdAt: now,
+        isActive: true,
+      },
+    ],
+  };
+}
+
+/**
+ * A provider stranded in `repairing` — the state the provider card could not tell the truth about.
+ *
+ * Two conditions, both ordinary:
+ *   - `status: "repairing"`, which is what `driftMonitor.onTrigger` leaves behind and which survives
+ *     a restart, because it is persisted on the provider row.
+ *   - an active manifest whose body is not valid JSON. Hydration leaves such a provider
+ *     **unregistered** on purpose (`store.ts:350-357`) — and that comment promises "Phase 5
+ *     drift/repair surfaces it". Nothing did: `adapters.forProvider` throws `no active manifest`,
+ *     it sat *outside* `buildRepairPlan`'s try, and the card then read "Building a repair plan…"
+ *     forever, about work that had stopped.
+ *
+ * `pendingRepairs` is in-memory, so on load there is no entry at all — which is the *other* half of
+ * the same lie: after a restart nothing is building, and the card said it was.
+ *
+ * The slug is deliberately absent from `PROVIDER_PROFILES`, so hydration uses the manifest row
+ * rather than pinning a builtin profile over it.
+ */
+function repairStuck(): SeedInput {
+  const providerId = "seed-stuck";
+  return {
+    providers: [
+      {
+        id: providerId,
+        slug: "stuck-co",
+        name: "Stuck Co",
+        type: "builtin",
+        baseUrl: MOCK_ORIGIN,
+        status: "repairing",
+        rotationStrategy: "round_robin",
+        createdAt: now,
+        updatedAt: now,
+      },
+    ],
+    manifests: [
+      {
+        id: "seed-stuck-manifest",
+        providerId,
+        version: 1,
+        origin: "ai-generated",
+        bodyJson: "{ this body is not json",
+        contractResultJson: null,
+        createdAt: now,
+        isActive: true,
+      },
+    ],
+    keys: [
+      {
+        id: "seed-stuck-key",
+        providerId,
+        label: "key-01",
+        // Present so the failure reached is the manifest one, not "no key to probe with".
+        secretRef: "key-01",
+        secret: ORACLE_KEY,
+        secretHint: null,
+        status: "active",
+        priority: 1,
+        cooldownUntil: null,
+        addedAt: now,
+        lastUsedAt: null,
+        lastTestedAt: null,
+      },
+    ],
+    settings: { router: JSON.stringify({ failoverEnabled: true, systemAi: null }) },
+  };
+}
+
+const SEEDS: Record<string, () => SeedInput> = {
+  systemai: systemAi,
+  "or-router": orRouter,
+  "repair-ai": repairAi,
+  "repair-stuck": repairStuck,
+};
 
 export function seedByName(name: string): SeedInput | null {
   const fn = SEEDS[name.toLowerCase()];

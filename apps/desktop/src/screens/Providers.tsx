@@ -6,18 +6,21 @@
  * Honest interim add-flow (UI_UX_PLAN): the 3 known providers + a custom form with a
  * "the auto-wizard arrives in Phase 3" note — never fake the wizard.
  */
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router-core";
 import {
-  addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, listManifestHistory,
-  pendingRepairs, registry, rollbackManifest, setKeyStatus, setProviderStatus, testKey, refreshCatalog,
+  addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
+  generatorAuditList, listManifestHistory, pendingRepairs, registry, rollbackManifest, setKeyStatus,
+  setProviderStatus, testKey, refreshCatalog,
 } from "../store";
-import type { HostManifestRow } from "../store";
+import type { DriftEventEntry, GeneratorAuditEntry, HostManifestRow } from "../store";
 import { useUi } from "../ui-state";
 import {
   Button, Field, KeyFingerprint, Modal, StatusBadge, StatusDot, healthOf, inputCls, inputStyle,
 } from "../components/atoms";
+import { TrailWriteWarning } from "../components/TrailWriteWarning";
 import { verdictNotice } from "../lib/keys/verdict";
+import { clock, dayKey } from "../lib/memory/timeline";
 
 const KNOWN = Object.keys(PROVIDER_PROFILES); // openrouter | opencode | b.ai
 
@@ -53,6 +56,10 @@ export function ProvidersScreen() {
           {providers.map((p) => {
             const keys = registry.keysOf(p.id);
             const health = healthOf(p);
+            // In-memory and per session, so an absent entry does NOT mean "still building" — after a
+            // restart nothing is building at all. See `buildRepairPlan`: it now registers the entry
+            // before anything can fail, so an entry is the signal that this session started one.
+            const repair = pendingRepairs.get(p.id);
             return (
               <section
                 key={p.id}
@@ -78,10 +85,13 @@ export function ProvidersScreen() {
                     </label>
                     {p.status === "repairing" && (
                       <Button variant="primary" onClick={() => setRepairing(p.id)}>
-                        {pendingRepairs.has(p.id) ? "Review repair…" : "Repair…"}
+                        {repair?.plan ? "Review repair…" : "Repair…"}
                       </Button>
                     )}
-                    {p.status !== "repairing" && p.status !== "draft" && (
+                    {/* Offered for `repairing` too — it is the only way out. `pendingRepairs` is
+                        in-memory, so a provider still `repairing` after a restart has no entry and
+                        no plan, and until now also had no button that could start one. */}
+                    {p.status !== "draft" && (
                       <Button variant="ghost" onClick={() => void buildRepairPlan({
                         providerId: p.id, providerSlug: p.slug,
                         errors: 0, models: [], windowMs: 0, detectedAt: Date.now(),
@@ -96,7 +106,14 @@ export function ProvidersScreen() {
                 </header>
                 {p.status === "repairing" && (
                   <p className="mb-2 text-[12px]" style={{ color: "var(--warn)" }}>
-                    Drift suspected — requests still route here, but failover is covering. {pendingRepairs.has(p.id) ? "A repair plan is ready to review." : "Building a repair plan…"}
+                    Drift suspected — requests still route here, but failover is covering.{" "}
+                    {repair?.plan
+                      ? "A repair plan is ready to review."
+                      : repair?.error
+                        ? `The repair could not be built — ${repair.error}`
+                        : repair
+                          ? "Building a repair plan…"
+                          : "No repair is running in this session — use Check health to rebuild one."}
                   </p>
                 )}
                 <table className="w-full">
@@ -153,6 +170,10 @@ export function ProvidersScreen() {
           })}
         </div>
       )}
+
+      <GenerationAuditCard />
+
+      <DriftHistoryCard />
 
       <NoticeBar />
       {repairing && <RepairModal providerId={repairing} onClose={() => { setRepairing(null); bump(); }} />}
@@ -400,7 +421,15 @@ function RepairModal({ providerId, onClose }: { providerId: string; onClose: () 
                 setBusy(true);
                 const r = await approveRepair(providerId).catch((e) => { setMsg(String((e as Error).message)); return undefined; });
                 setBusy(false);
-                if (r) { setMsg(`Repaired — adapter v${r.version}${r.previous ? ` (previous v${r.previous} kept for rollback)` : ""}`); window.setTimeout(onClose, 1200); }
+                if (r) {
+                  // The repair is live either way; what is in doubt is whether the trail records it.
+                  // Said here because this is the only moment the operator can learn it — the drift
+                  // card below shows the row as still Open, which is also exactly what *declining* a
+                  // repair looks like, so on its own it cannot distinguish the two.
+                  const closed = r.resolveRecorded ? "" : " · its drift event could not be closed";
+                  setMsg(`Repaired — adapter v${r.version}${r.previous ? ` (previous v${r.previous} kept for rollback)` : ""}${closed}`);
+                  window.setTimeout(onClose, 1200);
+                }
               }}>
                 Approve & apply
               </Button>
@@ -439,5 +468,304 @@ function RepairModal({ providerId, onClose }: { providerId: string; onClose: () 
       )}
       {msg && <p className="mt-2 text-[12px]" style={{ color: "var(--success)" }}>{msg}</p>}
     </Modal>
+  );
+}
+/**
+ * The AI generation audit — the trail of adapters the assistant wrote for us.
+ *
+ * Two producers write it: the onboarding wizard's candidate generation, and drift repair. Both are
+ * adapter work, which is why the reader lives on this screen rather than Control → Tools — that tab is
+ * about the gateway's tool registry, and an AI-authored adapter is not a tool. It is a page-level card
+ * rather than a panel inside a provider because the rows carry **no provider id**: the schema has a
+ * `session_id` column but `generator_audit_record`'s INSERT omits it, so there is nothing to filter on
+ * and a per-provider panel would have to invent an attribution the host never recorded.
+ *
+ * Rendered whether or not any provider exists. Hiding a record because the thing it describes was
+ * deleted is the failure this trail exists to prevent — the same "evidence nobody can consult" problem
+ * the gateway log had.
+ *
+ * Read on mount, unlike Control's gateway-log reader, which waits for a disclosure. Control is built as
+ * layer-1 summary plus layer-2 detail, so a card there can be layer 2; this screen is flat, so a card
+ * here is layer 1 by construction, and layer 1 is what has to be visible without a click.
+ */
+function GenerationAuditCard() {
+  const tick = useUi((s) => s.tick);
+  const [rows, setRows] = useState<GeneratorAuditEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  /**
+   * The newest read wins, and a superseded one writes nothing.
+   *
+   * Two reads can be in flight at once — the effect fires on mount and again on every `tick`, and a
+   * Refresh click adds another. Without this, an older read that *rejects* after a newer one has
+   * resolved leaves the error from the failed read sitting next to the rows from the successful one:
+   * a state that never existed, where the card shows a failure notice above fresh data. It was found
+   * by a browser spec failing on exactly that pair.
+   *
+   * Because only the newest read writes, `rows` and `error` always come from the same read — a read
+   * either answers with data and clears the error, or clears the rows and sets one. That invariant is
+   * what lets the empty branch below test `rows` alone.
+   */
+  const gen = useRef(0);
+  const load = useCallback(async () => {
+    const mine = ++gen.current;
+    setLoading(true);
+    try {
+      const next = await generatorAuditList(50);
+      if (mine !== gen.current) return; // superseded — a newer read owns the state now
+      setRows(next);
+      setError(null);
+    } catch (e) {
+      if (mine !== gen.current) return;
+      // Clear rather than keep the previous rows. A stale trail under a failure notice is a claim
+      // about *now*, and this is the one card that must not claim a row is current when the read that
+      // would have shown it is the read that failed.
+      setRows(null);
+      setError(String(e));
+    } finally {
+      // Only the read that still owns the state may clear the spinner; otherwise a superseded read
+      // finishing first would report "not loading" while the newer one is still in flight.
+      if (mine === gen.current) setLoading(false);
+    }
+  }, []);
+
+  /**
+   * Re-read on `tick` as well as on mount.
+   *
+   * This screen is where a row is *created* — approving a repair writes one and bumps the tick. A
+   * mount-only read would leave the operator looking at a trail that does not contain the generation
+   * they just approved, on the very screen they approved it from. Control's gateway-log card does not
+   * need this: it sits behind a disclosure, so opening it is already the request.
+   *
+   * It is not a poll. `tick` moves on user actions alone (`ui-state.ts`), so this costs one indexed
+   * read per action rather than one per interval.
+   */
+  useEffect(() => {
+    void load();
+  }, [load, tick]);
+
+  return (
+    <section
+      className="mt-3 rounded-md border p-3"
+      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-widest" style={{ color: "var(--text-faint)" }}>
+          AI generation audit
+        </span>
+        {rows !== null && rows.length > 0 && (
+          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+            {rows.length} recorded · newest first
+          </span>
+        )}
+        <Button variant="ghost" ariaLabel="Refresh generation audit" onClick={() => void load()} disabled={loading}>
+          {loading ? "Reading…" : "Refresh"}
+        </Button>
+      </div>
+
+      <p className="mb-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        Every adapter the assistant wrote — for the wizard&apos;s candidate generation and for a drift
+        repair. Token counts are <b>estimates</b> (characters ÷ 4), not tokenizer counts. The hash covers
+        the redacted prompt, so the trail is not the leak it exists to catch.
+      </p>
+
+      <TrailWriteWarning trail="generator_audit" />
+
+      {error !== null && (
+        <div
+          className="rounded border px-3 py-2 text-[12px]"
+          style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+        >
+          Could not read the trail: {error}
+        </div>
+      )}
+
+      {/* A loaded-but-empty trail is a fact about this machine, not a failure of the card, so it gets
+          its own sentence. No `error === null` test is needed here: `load` lets only the newest read
+          write, so an empty `rows` and a set `error` cannot coexist — see the invariant on `gen`. */}
+      {rows !== null && rows.length === 0 && (
+        <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+          Nothing recorded yet. Rows appear when the assistant writes an adapter — so an empty trail
+          means it has not, not that this failed to load.
+        </p>
+      )}
+
+      {rows !== null && rows.length > 0 && (
+        <table className="w-full" aria-label="AI generation audit">
+          <thead>
+            <tr className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+              <th className="text-left font-normal">When</th>
+              <th className="text-left font-normal">Model</th>
+              <th className="text-right font-normal">Prompt ≈</th>
+              <th className="text-right font-normal">Reply ≈</th>
+              <th className="text-left font-normal">Redaction</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id} className="border-t text-[12px]" style={{ borderColor: "var(--border)" }}>
+                <td className="mono whitespace-nowrap py-1" title={new Date(r.tsMs).toLocaleString()}>
+                  {dayKey(r.tsMs)} {clock(r.tsMs)}
+                </td>
+                <td className="mono py-1">{r.modelUsed}</td>
+                <td className="mono py-1 text-right">{r.promptTokens}</td>
+                <td className="mono py-1 text-right">{r.completionTokens}</td>
+                <td className="mono py-1" style={{ color: "var(--text-faint)" }}>
+                  {/* Truncated: it is a 64-char digest, and this is a summary rather than a tool for
+                      verifying it. The full value is in the database for anyone who needs to compare. */}
+                  {r.redactionHash.slice(0, 12)}…
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
+  );
+}
+
+/**
+ * A one-line summary of a recorded `DriftEvidence` blob.
+ *
+ * The blob is the host's own JSON, parsed defensively: a malformed or empty `trigger_json` must render as
+ * "no detail recorded" rather than throwing inside a table cell. The row's *existence* is the evidence —
+ * losing it to a parse error would hide the very event this card exists to surface.
+ */
+function driftTriggerSummary(triggerJson: string): string {
+  try {
+    const t = JSON.parse(triggerJson) as { errors?: unknown; models?: unknown; windowMs?: unknown };
+    const errors = typeof t.errors === "number" ? t.errors : null;
+    const models = Array.isArray(t.models) ? t.models.length : null;
+    const mins = typeof t.windowMs === "number" ? Math.round(t.windowMs / 60_000) : null;
+    if (errors === null && models === null && mins === null) return "no detail recorded";
+    const parts: string[] = [];
+    if (errors !== null) parts.push(`${errors} drift-class errors`);
+    if (models !== null) parts.push(`across ${models} models`);
+    if (mins !== null) parts.push(`in ${mins} min`);
+    return parts.join(" ");
+  } catch {
+    return "no detail recorded";
+  }
+}
+
+/**
+ * The recorded drift history — every detection and every repair, read from `drift_events`.
+ *
+ * Why this exists: the table has been written since Phase 5 and read by exactly one thing, the clipboard
+ * diagnostics bundle. So "when did this provider start drifting, and what closed it" had no answer inside
+ * the app — the same gap `gateway.log` and `generator_audit` each had, and the last of the three.
+ *
+ * **Not the same thing as the `RepairModal` above it.** That reads the in-memory `pendingRepairs` map,
+ * which is session-only and describes *pending* plans; this reads what was recorded. A provider repaired
+ * in an earlier session has no entry there and a row here.
+ *
+ * Reads on mount and on `tick`, like the generation card beside it: approving a repair writes a
+ * resolution and bumps the tick, and the row that just changed is the one the operator is looking for.
+ */
+function DriftHistoryCard() {
+  const tick = useUi((s) => s.tick);
+  const [rows, setRows] = useState<DriftEventEntry[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [loading, setLoading] = useState(false);
+
+  // The newest read wins — see the invariant on `GenerationAuditCard`'s counter above.
+  const gen = useRef(0);
+  const load = useCallback(async () => {
+    const mine = ++gen.current;
+    setLoading(true);
+    try {
+      const next = await driftEventsList(50);
+      if (mine !== gen.current) return;
+      setRows(next);
+      setError(null);
+    } catch (e) {
+      if (mine !== gen.current) return;
+      setRows(null);
+      setError(String(e));
+    } finally {
+      if (mine === gen.current) setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void load();
+  }, [load, tick]);
+
+  return (
+    <section
+      className="mt-3 rounded-md border p-3"
+      style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+    >
+      <div className="mb-2 flex items-center gap-2">
+        <span className="text-[11px] font-semibold uppercase tracking-widest" style={{ color: "var(--text-faint)" }}>
+          Drift history
+        </span>
+        {rows !== null && rows.length > 0 && (
+          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+            {rows.length} recorded · newest first
+          </span>
+        )}
+        <Button variant="ghost" ariaLabel="Refresh drift history" onClick={() => void load()} disabled={loading}>
+          {loading ? "Reading…" : "Refresh"}
+        </Button>
+      </div>
+
+      <p className="mb-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        Every time a provider was detected drifting, and every repair that answered it. A row with no
+        resolution is still open — the drift was recorded and nothing has closed it yet.
+      </p>
+
+      <TrailWriteWarning trail="drift" />
+
+      {error !== null && (
+        <div
+          className="rounded border px-3 py-2 text-[12px]"
+          style={{ borderColor: "var(--danger)", color: "var(--danger)" }}
+        >
+          Could not read the drift history: {error}
+        </div>
+      )}
+
+      {/* A loaded-but-empty history is a fact about this install, not a failure of the card. No
+          `error === null` test is needed: `load` lets only the newest read write, so an empty `rows` and
+          a set `error` cannot coexist. */}
+      {rows !== null && rows.length === 0 && (
+        <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+          No drift recorded yet. A row appears when a provider starts failing in a drift-class way — so an
+          empty history means that has not happened, not that this failed to load.
+        </p>
+      )}
+
+      {rows !== null && rows.length > 0 && (
+        <table className="w-full" aria-label="Drift history">
+          <thead>
+            <tr className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+              <th className="text-left font-normal">Detected</th>
+              <th className="text-left font-normal">Provider</th>
+              <th className="text-left font-normal">Trigger</th>
+              <th className="text-left font-normal">Outcome</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.id} className="border-t text-[12px]" style={{ borderColor: "var(--border)" }}>
+                <td className="mono whitespace-nowrap py-1" title={new Date(r.detectedAt).toLocaleString()}>
+                  {dayKey(r.detectedAt)} {clock(r.detectedAt)}
+                </td>
+                {/* The name is resolved for display only; the recorded id is the identity, and it is
+                    what is shown when the provider has since been deleted. */}
+                <td className="mono py-1">{registry.getProvider(r.providerId)?.name ?? r.providerId}</td>
+                <td className="py-1">{driftTriggerSummary(r.triggerJson)}</td>
+                {/* The word carries the state; the colour only reinforces it. */}
+                <td className="py-1" style={{ color: r.resolution ? "var(--success)" : "var(--danger)" }}>
+                  {r.resolution ?? "Open"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
+    </section>
   );
 }

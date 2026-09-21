@@ -10,9 +10,14 @@
  *
  * A run left `running` is shown as running. It is not quietly relabelled as failed: we did not
  * observe a failure, and inventing one would make the dashboard less trustworthy, not more.
+ *
+ * The one case that is not "running" is a run whose *ending* was observed and whose record did not
+ * land. That is not an invented failure — the loop reported a status — so the row shows it, marked,
+ * rather than borrowing the "closed mid-run" explanation for a session that never closed.
  */
 import { useEffect, useMemo, useState } from "react";
 import { Button, EmptyState } from "../components/atoms";
+import { TrailWriteWarning } from "../components/TrailWriteWarning";
 import { useUi } from "../ui-state";
 import {
   agentRunSteps,
@@ -21,6 +26,7 @@ import {
   type AgentStep,
 } from "../store";
 import { liveRunIds, stopRun } from "../lib/agent/orchestrator";
+import { useTrailHealth } from "../lib/trail-health";
 
 const fmtTime = (ts: number) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
 
@@ -39,9 +45,21 @@ function stepMark(kind: string, ok: boolean | null): string {
   return "·";
 }
 
+/**
+ * The status a row should be read as.
+ *
+ * A row whose ending was observed but not written is read as the observed status, not as the stale
+ * `running` the table still holds. The row is wrong about the record; there is no reason for the
+ * dashboard to be wrong with it.
+ */
+function shownStatus(r: AgentRun, unrecorded: Record<string, string>): string {
+  return unrecorded[r.id] ?? r.status;
+}
+
 export function AgentsScreen() {
   const tick = useUi((s) => s.tick);
   const bump = useUi((s) => s.bump);
+  const unrecorded = useTrailHealth((s) => s.unrecordedEnd);
   const [runs, setRuns] = useState<AgentRun[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [steps, setSteps] = useState<AgentStep[]>([]);
@@ -71,10 +89,11 @@ export function AgentsScreen() {
   const counts = useMemo(() => {
     const c = { running: 0, ok: 0, error: 0, stopped: 0 };
     for (const r of runs) {
-      if (r.status in c) c[r.status as keyof typeof c] += 1;
+      const s = shownStatus(r, unrecorded);
+      if (s in c) c[s as keyof typeof c] += 1;
     }
     return c;
-  }, [runs]);
+  }, [runs, unrecorded]);
 
   function doStop(id: string) {
     setStopping(id);
@@ -97,8 +116,17 @@ export function AgentsScreen() {
         </span>
       </div>
 
+      {/*
+        Above the empty-state branch, not inside it and not beside the rows: the worst case is a run
+        whose *start* did not land, and that run appears nowhere in this list — so a warning rendered
+        only alongside rows would go unseen exactly when it is the only thing that mentions the run.
+        Its noun is "write", not "row": what was lost here is a run or a step of one, and the copy
+        must not claim a row went missing when no row ever existed.
+      */}
+      <TrailWriteWarning trail="agent_run" noun="write" nounPlural="writes" />
+
       {runs.length === 0 ? (
-        <EmptyState title="No agent runs yet. Turn on agent mode in the Assistant, set a workspace root, and give it a task — every run is recorded here step by step." />
+        <EmptyState title="No agent runs yet. Turn on agent mode in the Assistant, set a workspace root, and give it a task — runs are recorded here step by step." />
       ) : (
         <div className="flex gap-3">
           <div className="min-w-0 flex-1">
@@ -109,44 +137,60 @@ export function AgentsScreen() {
                   <th className="font-medium">Task</th>
                   <th className="w-40 font-medium">Model</th>
                   <th className="w-16 font-medium">Tools</th>
-                  <th className="w-24 font-medium">Status</th>
+                  <th className="w-32 font-medium">Status</th>
                   <th className="w-20 font-medium" />
                 </tr>
               </thead>
               <tbody>
-                {runs.map((r) => (
-                  <tr
-                    key={r.id}
-                    className="h-[34px] cursor-pointer border-t hover:brightness-110"
-                    style={{ borderColor: "var(--border)", background: selected === r.id ? "var(--surface)" : undefined }}
-                    onClick={() => setSelected(selected === r.id ? null : r.id)}
-                  >
-                    <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>{fmtTime(r.started_at)}</td>
-                    <td className="max-w-[280px] truncate text-[12px]">{r.prompt ?? "—"}</td>
-                    <td className="mono truncate text-[11px]" style={{ color: "var(--text-dim)" }}>{r.model}</td>
-                    <td className="mono text-[12px]">{r.tool_calls}</td>
-                    <td>
-                      <span className="text-[12px]" style={{ color: statusColor(r.status) }}>
-                        {r.status === "running" ? "● running" : r.status}
-                      </span>
-                    </td>
-                    <td>
-                      {r.status === "running" &&
-                        (live.includes(r.id) ? (
-                          <Button onClick={() => doStop(r.id)} disabled={stopping === r.id}>
-                            {stopping === r.id ? "stopping…" : "stop"}
-                          </Button>
-                        ) : (
-                          // Running but not live: this process has no handle on it (a previous
-                          // session was closed mid-run). Offer nothing rather than a stop button
-                          // that cannot work.
-                          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-                            no handle
+                {runs.map((r) => {
+                  const observed = unrecorded[r.id];
+                  return (
+                    <tr
+                      key={r.id}
+                      className="h-[34px] cursor-pointer border-t hover:brightness-110"
+                      style={{ borderColor: "var(--border)", background: selected === r.id ? "var(--surface)" : undefined }}
+                      onClick={() => setSelected(selected === r.id ? null : r.id)}
+                    >
+                      <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>{fmtTime(r.started_at)}</td>
+                      <td className="max-w-[280px] truncate text-[12px]">{r.prompt ?? "—"}</td>
+                      <td className="mono truncate text-[11px]" style={{ color: "var(--text-dim)" }}>{r.model}</td>
+                      <td className="mono text-[12px]">{r.tool_calls}</td>
+                      <td>
+                        {observed ? (
+                          // The status is known; the row just never got it. Marked so it is not read
+                          // as a recorded ending, and not as the "no handle" state below.
+                          <span
+                            className="text-[12px]"
+                            style={{ color: "var(--warn)" }}
+                            title="the run ended and this session saw it, but writing its record failed — this status is from memory, not the table"
+                          >
+                            {observed} ⚠ unrecorded
                           </span>
-                        ))}
-                    </td>
-                  </tr>
-                ))}
+                        ) : (
+                          <span className="text-[12px]" style={{ color: statusColor(r.status) }}>
+                            {r.status === "running" ? "● running" : r.status}
+                          </span>
+                        )}
+                      </td>
+                      <td>
+                        {r.status === "running" &&
+                          !observed &&
+                          (live.includes(r.id) ? (
+                            <Button onClick={() => doStop(r.id)} disabled={stopping === r.id}>
+                              {stopping === r.id ? "stopping…" : "stop"}
+                            </Button>
+                          ) : (
+                            // Running, not live, and no ending observed: this process has no handle
+                            // on it (a previous session was closed mid-run). Offer nothing rather
+                            // than a stop button that cannot work.
+                            <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                              no handle
+                            </span>
+                          ))}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
             {selected && (
@@ -175,7 +219,11 @@ export function AgentsScreen() {
       )}
       <p className="mt-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
         Steps are appended as they happen, so a run you stop is still fully inspectable. A run left
-        <b> running</b> means the app was closed mid-run — it is not marked failed, because no failure was observed.
+        <b> running</b> with <b>no handle</b> means the app was closed mid-run — it is not marked failed,
+        because no failure was observed. A status marked <b>⚠ unrecorded</b> is the other case: the run
+        ended and this session saw it, but writing the record failed, so the table still says running.
+        A run whose <b>start</b> could not be written is absent from this list altogether — the warning
+        above counts it once, however many of its writes failed.
       </p>
     </div>
   );

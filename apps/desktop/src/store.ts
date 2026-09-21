@@ -24,6 +24,7 @@ import {
   type RepairPlan,
 } from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
+import { noteTrailFailure, type TrailId } from "./lib/trail-health";
 import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
 import {
   isConclusive,
@@ -126,6 +127,61 @@ export const router = new ModelRouter(registry, adapters, catalog, ledger);
 
 // ---------- Phase 5: drift detection + repair ----------
 
+/**
+ * Issue a trail write, keeping its failure instead of discarding it.
+ *
+ * Every one of these writes records work that has already happened, so a failure must **not** fail
+ * the work: a repair that applied correctly cannot be reported as failed because its record did not
+ * land, or the operator would be told to retry a repair that is already live. That is why this
+ * returns a boolean rather than throwing, and why the three call sites below still carry on.
+ *
+ * What it adds is the other half — the failure reaches `trail-health`, and the card that claims its
+ * trail is complete renders it. `.catch(() => undefined)` kept the first property and lost the
+ * second, which is how a lost row became indistinguishable from a row that was never written.
+ *
+ * Returns whether the write landed, so a caller that has something specific to say about it can say
+ * it: `approveRepair` is the one that does, because "repaired" beside a row still reading "Open" is
+ * a contradiction the operator can see on one screen.
+ */
+async function writeTrail(trail: TrailId, cmd: string, args: Record<string, unknown>): Promise<boolean> {
+  try {
+    await invoke(cmd, args);
+    return true;
+  } catch (e) {
+    noteTrailFailure(trail, e instanceof Error ? e.message : String(e));
+    return false;
+  }
+}
+
+/**
+ * Record one AI generation in the audit trail.
+ *
+ * **Two** producers write this trail, and they build the same payload from the same shape: the
+ * wizard's candidate generation (`Onboarding.tsx`) and drift repair (`buildRepairPlan` below). Exported
+ * and shared rather than written out twice, so the trail id and the command name live in exactly one
+ * place.
+ *
+ * That is not tidiness. The wizard had its own copy of this call, and when the other trail writes were
+ * routed through `writeTrail` that copy was missed — so the wizard's audit failures stayed **silent**,
+ * on the producer the generation-audit card names first, and the card went on claiming completeness for
+ * it. A duplicated call site is a duplicated place to forget.
+ */
+export async function recordGeneratorAudit(a: {
+  modelUsed: string;
+  promptChars: number;
+  completionChars: number;
+  redactionHash: string;
+}): Promise<boolean> {
+  return writeTrail("generator_audit", "generator_audit_record", {
+    e: {
+      modelUsed: a.modelUsed,
+      promptTokens: Math.round(a.promptChars / 4),
+      completionTokens: Math.round(a.completionChars / 4),
+      redactionHash: a.redactionHash,
+    },
+  });
+}
+
 /** Providers currently in repair flow: id -> evidence + plan (UI subscribes via useUi tick). */
 export const pendingRepairs = new Map<string, { evidence: DriftEvidence; plan?: RepairPlan; error?: string }>();
 
@@ -140,7 +196,7 @@ export const driftMonitor = new DriftMonitor({
       .some((e) => e.status === "ok" && e.requestedModel === requestedModel && e.providerId && e.providerId !== excludeProviderId);
   },
   onTrigger: (e) => {
-    void invoke("drift_event_record", { providerId: e.providerId, triggerJson: JSON.stringify(e) }).catch(() => undefined);
+    void writeTrail("drift", "drift_event_record", { providerId: e.providerId, triggerJson: JSON.stringify(e) });
     // mark repairing (failover keeps serving) and open the plan in the background
     void setProviderStatus(e.providerId, "repairing").catch(() => undefined);
     void buildRepairPlan(e).catch(() => undefined);
@@ -159,13 +215,27 @@ router.onAttempt = (a) => {
 export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPlan | undefined> {
   const provider = registry.getProvider(evidence.providerId);
   if (!provider) return undefined;
-  const { adapter } = await adapters.forProvider(provider.id);
-  const secretRef = registry.keysOf(provider.id)[0]?.secretRef;
-  if (!secretRef) return undefined;
-  const otherHealthy = registry.listProviders().filter((p) => p.id !== provider.id && p.status === "enabled").length;
   const entry = { evidence };
+  // Registered *before* anything that can fail, for two reasons.
+  //
+  // `onTrigger` has already set the provider `repairing` by the time it calls this, and the provider
+  // card renders "Building a repair plan…" for as long as this map holds no entry for it. So a
+  // failure before the entry strands the provider in `repairing` behind a sentence describing work
+  // that stopped — and it is the *same* sentence as the legitimate in-progress case, so waiting is
+  // indistinguishable from broken.
+  //
+  // That is reachable, not theoretical: `adapters.forProvider` throws `no active manifest` for a
+  // provider hydration could not register — which is what a corrupt manifest body leaves behind
+  // (`store.ts:350-357`, whose own comment promises "Phase 5 drift/repair surfaces it"). It sat
+  // outside the `try`, so the throw was swallowed by `onTrigger`'s `.catch(() => undefined)` and
+  // nothing surfaced it. A provider with no key to probe with returned `undefined` the same silent
+  // way, and is now an error too.
   pendingRepairs.set(provider.id, entry);
   try {
+    const { adapter } = await adapters.forProvider(provider.id);
+    const secretRef = registry.keysOf(provider.id)[0]?.secretRef;
+    if (!secretRef) throw new Error(`no key to probe ${provider.name} with`);
+    const otherHealthy = registry.listProviders().filter((p) => p.id !== provider.id && p.status === "enabled").length;
     // free re-checks produce the failing-assertions context for the AI patch prompt
     const { runContractSuite } = await import("@aiprovider/router-core");
     const contract = await runContractSuite(adapter, { secretRef, consent: { text: false, image: false } });
@@ -180,9 +250,7 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
       otherHealthyProviders: otherHealthy,
       failingChecks: contract.checks.filter((c) => !c.pass),
       audit: async (a) => {
-        await invoke("generator_audit_record", {
-          e: { modelUsed: a.modelUsed, promptTokens: Math.round(a.promptChars / 4), completionTokens: Math.round(a.completionChars / 4), redactionHash: a.redactionHash },
-        }).catch(() => undefined);
+        await recordGeneratorAudit(a);
       },
     }).plan();
     pendingRepairs.set(provider.id, { ...entry, plan });
@@ -199,8 +267,19 @@ function routerSettingsLabel(): string {
   return "auto (system)";
 }
 
-/** Human confirms the staged repair: stage new manifest version + activate + hot-swap. */
-export async function approveRepair(providerId: string): Promise<{ version: number; previous: number | null } | undefined> {
+/**
+ * Human confirms the staged repair: stage new manifest version + activate + hot-swap.
+ *
+ * `resolveRecorded` is false when the repair applied but its drift event could not be closed. It is
+ * reported rather than swallowed because the screen shows both halves at once: the modal says
+ * "Repaired" while the drift history, one card below, still reads "Open" in red for that same
+ * provider — and that is also exactly what a *declined* repair looks like, since "Keep current
+ * adapter" never closes the row either. Without this flag the two are indistinguishable, and one of
+ * them is a lost record.
+ */
+export async function approveRepair(
+  providerId: string,
+): Promise<{ version: number; previous: number | null; resolveRecorded: boolean } | undefined> {
   const entry = pendingRepairs.get(providerId);
   const manifest = entry?.plan?.candidate?.manifest ?? entry?.plan?.deterministic;
   if (!manifest || !entry) return undefined;
@@ -217,9 +296,14 @@ export async function approveRepair(providerId: string): Promise<{ version: numb
   adapters.register(providerId, manifest); // hot-swap
   await setProviderStatus(providerId, "enabled");
   await refreshCatalog(providerId).catch(() => undefined);
-  await invoke("drift_event_resolve", { providerId, resolution: `repaired v${version}` }).catch(() => undefined);
+  // Not a bare `await ...catch`: the adapter is already hot-swapped by this point, so a failed close
+  // is a fact to report, not an error to raise.
+  const resolveRecorded = await writeTrail("drift", "drift_event_resolve", {
+    providerId,
+    resolution: `repaired v${version}`,
+  });
   pendingRepairs.delete(providerId);
-  return { version, previous };
+  return { version, previous, resolveRecorded };
 }
 
 export async function rollbackManifest(providerId: string, version: number): Promise<void> {

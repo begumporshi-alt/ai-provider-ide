@@ -143,6 +143,8 @@ test("agents: a seeded run is listed and its steps are inspectable", async ({ pa
   }
 
   // A run left running by another session has no controller here, so no stop button is offered.
-  await expect(page.getByText("no handle")).toBeVisible();
+  // Scoped to the table: the footer names "no handle" too, when it explains what that state means,
+  // so an unscoped `getByText` would pass off the legend.
+  await expect(page.locator("tbody").getByText("no handle")).toBeVisible();
   await expect(page.getByRole("button", { name: "stop" })).toHaveCount(0);
 });
