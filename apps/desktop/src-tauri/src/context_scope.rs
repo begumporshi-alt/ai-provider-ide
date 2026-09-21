@@ -519,8 +519,7 @@ pub fn inject_context_deadline(
     // The app key is only resolved with memory on: off by default has to mean no extra work, and
     // resolving one means reading the app-key map.
     let app_key = if core.memory_enabled() {
-        core.app_key_for(crate::gateway::presented_key(headers))
-            .map(|id| crate::gateway::principal::key_principal(&id))
+        core.key_principal_for(crate::gateway::presented_key(headers))
     } else {
         None
     };
@@ -713,8 +712,7 @@ pub fn prepare_capture(
     // must not have its turns recorded either — otherwise "off" would still mean "quietly learning
     // from you". Read before the struct is built, because `store` moves into it.
     let app_key = if core.memory_enabled() {
-        core.app_key_for(crate::gateway::presented_key(headers))
-            .map(|id| crate::gateway::principal::key_principal(&id))
+        core.key_principal_for(crate::gateway::presented_key(headers))
     } else {
         None
     };
@@ -1646,10 +1644,19 @@ mod context_scope_tests {
             inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app2")]), None, &mut other);
         assert!(out.injected, "{}", out.status_value());
 
-        // And the master key carries no app-key identity, so a policy on a key cannot reach it.
-        let mut master = body();
-        let out = inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-master")]), None, &mut master);
-        assert!(out.injected, "the master key is not an app key: {}", out.status_value());
+        // And a secret we do not recognise names nobody, so no row can reach it and it inherits.
+        // This core's master key is "k", so this bearer is simply unknown — it is *not* the master
+        // key. Calling it "sk-aip-master" here used to imply otherwise, which made the assertion
+        // pass for a reason that had nothing to do with the master key. The master key's own
+        // identity is covered by `the_master_key_is_governable_by_a_policy_on_its_own_name`.
+        let mut unknown = body();
+        let out = inject_context(
+            &core,
+            &hdr(&[("authorization", "Bearer sk-aip-unknown")]),
+            None,
+            &mut unknown,
+        );
+        assert!(out.injected, "an unnameable caller inherits: {}", out.status_value());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1674,6 +1681,73 @@ mod context_scope_tests {
         );
         assert!(!out.injected, "either identity may deny");
         assert_eq!(out.reason, SkipReason::PrincipalOff);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The master key is the caller most operators actually hand out, so it has to be governable.
+    /// Before it had a name, traffic presenting it with no `AIP-Agent` label had no identity at all
+    /// — and absence inherits, so an operator who had disabled every other caller would still have
+    /// been serving memory to it.
+    #[test]
+    fn the_master_key_is_governable_by_a_policy_on_its_own_name() {
+        let (core, store, _reads, dir) = keyed_core("masterkey", &[("ak-1", "sk-aip-app1")]);
+        crate::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
+        let body = || {
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": "what database does this project use"}
+            ]})
+        };
+        // This core's master key is "k" — see `core()`.
+        let master = hdr(&[("authorization", "Bearer k")]);
+
+        let mut before = body();
+        let out = inject_context(&core, &master, None, &mut before);
+        assert!(out.injected, "no row means inherit: {}", out.status_value());
+
+        let mk = crate::gateway::principal::master_principal();
+        assert!(crate::gateway::principal::set(&store, &mk, false).unwrap());
+        let mut denied = body();
+        let out = inject_context(&core, &master, None, &mut denied);
+        assert!(!out.injected, "the master key can be denied");
+        assert_eq!(out.reason, SkipReason::PrincipalOff);
+
+        // One refusal is not a global one: an app key is untouched.
+        let mut app = body();
+        let out =
+            inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app1")]), None, &mut app);
+        assert!(out.injected, "{}", out.status_value());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of "a denied principal is denied": the write path. A caller denied memory
+    /// must not have its turns recorded either — otherwise "off" would still mean quietly learning
+    /// from it, which is the thing the policy exists to prevent.
+    #[test]
+    fn a_denied_master_key_is_denied_on_the_write_path_too() {
+        let (core, store, _reads, dir) = keyed_core("masterwrite", &[("ak-1", "sk-aip-app1")]);
+        crate::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
+        let body = json!({"model": "m", "messages": [
+            {"role": "user", "content": "remember that this project uses Postgres"}
+        ]});
+        let master = hdr(&[("authorization", "Bearer k")]);
+
+        let before = prepare_capture(&core, &master, &body, 1).unwrap();
+        assert!(before.writes_allowed, "no row means inherit");
+
+        let mk = crate::gateway::principal::master_principal();
+        assert!(crate::gateway::principal::set(&store, &mk, false).unwrap());
+        let after = prepare_capture(&core, &master, &body, 2).unwrap();
+        assert!(!after.writes_allowed, "a denied principal must not be learned from");
+
+        // And an app key is untouched.
+        let other = prepare_capture(
+            &core,
+            &hdr(&[("authorization", "Bearer sk-aip-app1")]),
+            &body,
+            3,
+        )
+        .unwrap();
+        assert!(other.writes_allowed, "one refusal is not a global one");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

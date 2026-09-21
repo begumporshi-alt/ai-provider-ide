@@ -678,6 +678,20 @@ see the note below.
 > Resolution is skipped entirely when the master toggle is off, so "off" still costs no keychain
 > read. The scan is constant-time over every candidate with no early break, for the same reason
 > auth's loop has none.
+>
+> **Follow-up, 2026-09-21: the master key gets a name too.** Landing the app-key principal exposed
+> an asymmetry. `key:<id>` covers per-app keys, but the master key resolved to `None` — so traffic
+> presenting it with no `AIP-Agent` label had *no* identity at all, and absence inherits. An
+> operator who had disabled every other caller would still have been serving memory to the master
+> key, with no way to say otherwise. That is backwards: the master key is the one most operators
+> actually hand out.
+>
+> It now resolves to `key:master`, offered by `principal::list` like any app key. Three properties
+> hold. It cannot collide with an app key, because ids are `ak-<hex>` and `master` is not one a
+> client can be issued. It costs nothing, because the master key is already cached — the check is a
+> comparison against a value already in memory, never a keychain read. And denial stays per-caller,
+> not global: a policy on `key:master` leaves every `key:ak-…` untouched, and is enforced on the
+> write path as well as the read one.
 
 **Phase 2 — read path. ✅ Landed 2026-09-21.** Recall + rank + trim + compose, behind the toggle,
 L1/L2/L3 only. Compact response headers (`AIP-Memory` / `AIP-Memory-Scope`). Budget boundary tests.
@@ -745,8 +759,10 @@ injected block on its own say-so.
 Denying a principal denies both directions: it is not injected *and* its turns are not recorded, so
 "off" cannot quietly mean "still learning from you".
 
-Identity is the `AIP-Agent` label; an app-key principal stays deferred (it needs a cached id→secret
-map).
+Identity is two strings, either of which may deny: the `AIP-Agent` label, and the key that
+authenticated the request — `key:<id>` for a per-app key, `key:master` for the master key. (The
+app-key half was deferred from Phase 1 for a cached id→secret map; it landed 2026-09-21, and the
+master key was named the same day for the reason given above.)
 
 **Cut from v1** (two reviewers independently proposed the same list): drop L2 scenarios — nothing in
 the recall path consumes it and it is pure distillation cost; drop the client `AIP-Memory-Budget`

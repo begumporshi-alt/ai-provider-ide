@@ -17,9 +17,10 @@
  * 3. **An explicit row wins over the client's own header.** `AIP-Memory: on` from a principal the
  *    operator has disabled must not switch it back on — the client is not the authority.
  *
- * Identity is the `AIP-Agent` label today. Resolving an app-key principal was deferred from Phase 1
- * (it needs a cached id→secret map), so this module takes the label as a string and does not care
- * where it came from.
+ * Identity is two strings, either of which may deny: the `AIP-Agent` label a client chooses for
+ * itself, and the key that authenticated the request — `key:<id>` for a per-app key, `key:master`
+ * for the master key. This module takes them as strings and does not care where they came from;
+ * resolving them from a presented secret is the gateway's job.
  */
 
 use rusqlite::{params, OptionalExtension};
@@ -60,6 +61,10 @@ pub fn list(store: &Store) -> Result<Vec<PrincipalRow>, String> {
                -- this the feature is unusable: `key:<id>` is not guessable and appears nowhere
                -- else. Revoked keys are excluded — a revoked key authenticates nobody.
                SELECT 'key:' || id FROM gateway_keys WHERE revoked_at IS NULL
+               UNION
+               -- The master key, for the same reason: `key:master` is not guessable either, and
+               -- it is the key most operators actually hand out.
+               SELECT 'key:master'
              ) k
              LEFT JOIN memory_principal_policy pol ON pol.principal = k.principal
              ORDER BY k.principal",
@@ -121,14 +126,29 @@ pub fn key_principal(id: &str) -> String {
     format!("key:{id}")
 }
 
+/// The name an operator writes policy against for the **master key** itself.
+///
+/// The master key is the one most operators actually use, so leaving it unnameable would mean the
+/// busiest caller could never be governed: traffic presenting it with no `AIP-Agent` label would
+/// have no identity at all, and absence inherits — so it would always be allowed whatever else the
+/// operator had decided. Naming it costs nothing and closes that hole.
+///
+/// It sits in the same `key:` namespace as app keys because it *is* a key identity rather than an
+/// agent label, and it cannot collide with one: key ids are `ak-<hex>`, so `master` is not a key id
+/// any client can be issued.
+pub fn master_principal() -> String {
+    key_principal("master")
+}
+
 /// The decision the request path needs: may this principal use memory at all?
 ///
 /// `host_enabled` is the master switch. Everything is refused when it is off, whatever the table
 /// says. A missing store (a harness, or a core built before the store was managed) degrades to the
 /// master switch alone rather than refusing — the policy is a refinement, not a precondition.
 ///
-/// Two identities are offered, not one, and **either can deny**: an `AIP-Agent` label and the
-/// per-app key that authenticated the request. A single "winner" would be a hole either way. Pick
+/// Two identities are offered, not one, and **either can deny**: an `AIP-Agent` label and the key
+/// that authenticated the request — `key:<id>` for a per-app key, `key:master` for the master key.
+/// A single "winner" would be a hole either way. Pick
 /// the label only and a client that presents a denied key still gets memory by sending a label
 /// with no row; pick the key only and a client drops its label to escape a denial on it.
 /// Absence still inherits, so an unlisted second identity adds nothing.
@@ -288,7 +308,11 @@ mod principal_tests {
         // Pre-configured for an agent that has not connected yet.
         assert!(set(&s, "windsurf", false).unwrap());
         let rows = list(&s).unwrap();
-        assert_eq!(rows.len(), 2);
+        // Three, not two: `key:master` is always offered, so an operator can write policy against
+        // the master key without having to guess its name.
+        assert_eq!(rows.len(), 3);
+        let names: Vec<&str> = rows.iter().map(|r| r.principal.as_str()).collect();
+        assert!(names.contains(&master_principal().as_str()), "{names:?}");
         let cursor = rows.iter().find(|r| r.principal == "cursor").unwrap();
         assert_eq!(cursor.enabled, None, "seen in traffic, never configured");
         assert_eq!(cursor.last_seen_at, Some(42));
@@ -321,6 +345,36 @@ mod principal_tests {
         let names: Vec<&str> = rows.iter().map(|r| r.principal.as_str()).collect();
         assert!(names.contains(&"key:ak-1"), "{names:?}");
         assert!(!names.contains(&"key:ak-2"), "a revoked key authenticates nobody: {names:?}");
+        // So is the master key, which is the one most operators actually hand out.
+        assert!(names.contains(&master_principal().as_str()), "{names:?}");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The master key is a caller like any other — the busiest one, in fact. Leaving it unnameable
+    /// would mean no row could ever govern it, and absence inherits, so an operator disabling every
+    /// other caller would still be learning from the master key.
+    #[test]
+    fn the_master_key_is_governable_by_a_policy_on_its_own_name() {
+        let (s, d) = temp_store("masterkey");
+        let mk = master_principal();
+        assert_eq!(mk, "key:master");
+        assert!(allows(true, Some(&s), None, Some(&mk)), "no row means inherit");
+
+        assert!(set(&s, &mk, false).unwrap());
+        assert!(!allows(true, Some(&s), None, Some(&mk)), "the master key can be denied");
+        // One refusal is still not a global one.
+        assert!(allows(true, Some(&s), None, Some(&key_principal("ak-1"))));
+        // And an agent label cannot rescue it, any more than it can rescue a denied app key.
+        assert!(!allows(true, Some(&s), Some("cursor"), Some(&mk)));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// `master` is not a key id any client can be issued — ids are `ak-<hex>` — so the master
+    /// principal cannot be forged by, or collide with, a per-app key.
+    #[test]
+    fn the_master_principal_cannot_collide_with_an_app_key() {
+        assert_ne!(key_principal("ak-1"), master_principal());
+        assert_ne!(key_principal(""), master_principal());
+        assert!(master_principal().starts_with("key:"), "a key identity, not an agent label");
     }
 }

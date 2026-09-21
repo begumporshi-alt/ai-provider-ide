@@ -1017,6 +1017,25 @@
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The master key is the caller most operators actually hand out, so it needs a name of its
+    /// own. Resolving it to `None` would leave the busiest caller unnameable — no policy row could
+    /// reach it, and absence inherits, so it would be allowed whatever the operator had decided
+    /// for everyone else.
+    #[test]
+    fn the_master_key_resolves_to_its_own_principal() {
+        let (core, _reads, dir) = key_core("master-principal", &[("ak-1", "sk-aip-app1")]);
+        crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "an ide").unwrap();
+        let mk = super::principal::master_principal();
+
+        assert_eq!(core.key_principal_for("sk-aip-master").as_deref(), Some(mk.as_str()));
+        // An app key still resolves to its own id — the master key does not shadow it.
+        assert_eq!(core.key_principal_for("sk-aip-app1").as_deref(), Some("key:ak-1"));
+        // A secret we do not recognise names nobody, and an absent key is not a lookup at all.
+        assert_eq!(core.key_principal_for("sk-aip-nope"), None);
+        assert_eq!(core.key_principal_for(""), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// R4(a): the backoff window opened by a bad credential must not throttle a caller that
     /// authenticates correctly — otherwise one misconfigured app DoSes the rest for 500ms+
     /// per failure. It must still throttle a *second* bad attempt inside the window.

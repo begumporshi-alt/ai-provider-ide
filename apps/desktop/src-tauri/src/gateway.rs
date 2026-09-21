@@ -777,6 +777,30 @@ impl GatewayCore {
         hit
     }
 
+    /// The principal a presented key is governed by, for the memory policy table (§4a).
+    ///
+    /// `None` means the secret is one we do not recognise: no row can name it, and absence
+    /// inherits. That is deliberate — a caller we cannot identify is not thereby refused, it is
+    /// simply ungoverned, and the master switch still applies.
+    ///
+    /// The master key resolves to `key:master`, **not** to `None`. It is the key most operators
+    /// actually hand out, so leaving it unnameable would mean the busiest caller could never be
+    /// governed: traffic presenting it with no `AIP-Agent` label would have no identity at all and
+    /// would inherit whatever the operator had decided for everyone else. Cost is nil — the master
+    /// key is already cached, so this is a comparison against a value in memory, never a keychain
+    /// read.
+    pub fn key_principal_for(&self, presented: &str) -> Option<String> {
+        if presented.is_empty() {
+            return None;
+        }
+        if let MasterKeyLookup::Ready(k) = self.master_key.get() {
+            if constant_time_eq(presented, &k) {
+                return Some(principal::master_principal());
+            }
+        }
+        self.app_key_for(presented).map(|id| principal::key_principal(&id))
+    }
+
     /// Drop the memoised app-key map. Test-only: production never needs it, because the active-id
     /// check already invalidates on create and revoke.
     #[cfg(test)]
