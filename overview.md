@@ -160,7 +160,19 @@ at the source with `build:clean`, mirroring the project's existing `web-test:cle
 - **The class sweep is closed.** The two-part test selected three surfaces — the trail, the Agents dashboard and
   the repair card — and all three are fixed and covered. A further sweep would be a new survey, not a
   continuation.
-- **Uncommitted work.** The tree is not committed; the last commit is `4b65e5c` on `main`.
+- **Committed, not pushed.** Five commits on `main`, ahead of `origin/main` by 5:
+
+  | Commit | Theme |
+  |---|---|
+  | `b8f169d` | Rust: gateway recording, memory scope, three trail readers |
+  | `8865a2b` | memory capture + gateway policy + the merging settings write |
+  | `8091721` | the Control switchboard; Gateway becomes credentials only |
+  | `0ee6656` | the trail readers' cards and the trail-health channel (all four shapes) |
+  | `0a9edab` | docs, diagrams and project memory |
+
+  `store.ts` was split at **hunk** level, not by file: it carried 7 trail-health hunks and
+  2 memory/gateway hunks, one of them 250 lines, so a file-level split would have dumped the
+  gateway-memory work into a trail commit. All other files went whole.
 - **`MEMORY.md` is under its ceiling**: **7,961 bytes / 38 rules**, 39 bytes of headroom. The shapes were folded
   into the existing rule rather than added as new ones — the file grows only by trade now.
 - The `sandbox-bulk-delete-guard` skill was refined with the three things this session earned: the single-file
