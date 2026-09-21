@@ -801,15 +801,6 @@ impl GatewayCore {
         self.app_key_for(presented).map(|id| principal::key_principal(&id))
     }
 
-    /// Drop the memoised app-key map. Test-only: production never needs it, because the active-id
-    /// check already invalidates on create and revoke.
-    #[cfg(test)]
-    pub fn clear_app_key_cache(&self) {
-        if let Ok(mut c) = self.app_key_cache.lock() {
-            *c = AppKeyCache::default();
-        }
-    }
-
     /// Shorten the app-key cache TTL. Test-only, for the same reason as `set_memory_freeze_ttl`.
     #[cfg(test)]
     pub fn set_app_key_cache_ttl(&self, d: Duration) {

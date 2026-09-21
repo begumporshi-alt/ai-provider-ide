@@ -135,6 +135,9 @@ test("memory: the master switch is live, proving the screen's host load succeede
   await expect(sw).not.toBeChecked();
   // Same batch: the queue resolved too, so it reports a number rather than a dash.
   await expect(page.getByText("0 awaiting distillation")).toBeVisible();
+  // The reset is deliberate, but it has to be said or it reads as a bug — the listener *is*
+  // remembered across restarts, so "I turned it on and it went off again" looks like a fault.
+  await expect(page.getByText(/off again after a restart/)).toBeVisible();
 });
 
 /**

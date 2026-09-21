@@ -848,6 +848,16 @@ the DB unavailable, every request still succeeds.
 
 1. **Default toggle state.** I argue off. The counter-argument is that a feature nobody turns on is
    not a feature. Decide before Phase 1, not after.
+   → **Decided 2026-09-21: off, and not persisted** — every launch starts off, as do the tool
+   switches (`tools_enabled`, `tools_mutation_enabled`), which are in-memory `AtomicBool`s too.
+   Persisting this would make it the only persisted gateway flag, and the one with the largest
+   blast radius: it is the only setting that sends your traffic to a model you did not call.
+   **Noted asymmetry (still open):** the *listener* does persist — `settings_set("gateway",
+   {port, enabled})` and `lib.rs` auto-restores it on launch. So "the gateway came back but memory
+   did not" is a real inconsistency, and the reset is now stated in the UI (`MEMORY_NOTE`) so it
+   reads as intent rather than as a bug. Persisting remains a deliberate choice, not an oversight:
+   if it is done, it should be done like the listener — a settings row, restored at startup, and
+   shown as "restored from your last session" rather than silently on.
 2. **Who pays for distillation.** Every captured turn costs a system-route call. Cap per session or
    per hour, or the memory feature becomes a quiet line item on the bill.
    → **Decided 2026-09-21, per hour, host-wide.** `capture::DISTILL_BUDGET_PER_HOUR` = 60

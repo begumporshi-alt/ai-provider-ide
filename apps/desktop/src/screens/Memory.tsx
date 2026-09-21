@@ -80,7 +80,11 @@ const MEMORY_NOTE =
   "The memory layer is off until you turn it on. With it off the gateway does nothing extra: no context is "
   + "injected into a request and no turn is recorded, so an agent IDE's traffic is handled exactly "
   + "as it was before this feature existed. Turning it on makes the gateway record the tail of each "
-  + "plain-prose request and, off to the side, distil it into the atoms listed below.";
+  + "plain-prose request and, off to the side, distil it into the atoms listed below. "
+  // Stated because it otherwise reads as a bug: the listener comes back after a restart (its port
+  // and on/off are persisted), this does not. Same rule as the tool switches, and for the same
+  // reason — your traffic should not keep being recorded because you enabled it once.
+  + "It is off again after a restart: unlike the gateway itself, this switch is not remembered.";
 
 /**
  * §10(5) — cross-vendor privacy, stated in the UI rather than only in the docs.
