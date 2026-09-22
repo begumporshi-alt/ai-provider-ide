@@ -6,9 +6,13 @@ Answered the question *"what is left to make this a professional product?"* by a
 `3bb7665` (written up as **`docs/PRODUCT_COMPLETION_PLAN.md`**), then — on the four decisions that
 followed — implemented them and shipped.
 
-Eleven commits on `main` (`754a5fc`..`018ca07`). CI run `35732995088` **green**, all 17 steps; every
+Twelve commits on `main` (`754a5fc`..`4e78768`). CI run `35732995088` **green**, all 17 steps; every
 follow-up commit re-ran the same gate green, and the new scheduled audit workflow was verified by
 dispatching it (`35736120680`, green) rather than assumed to fire.
+
+The three Node 20 GitHub Actions were moved onto Node 24 runtimes (`checkout@v7`, `setup-node@v7`,
+`pnpm/action-setup@v6`), each checked against the new `action.yml` before bumping. Verified empirically:
+CI came back **with no annotations block at all** — the deprecation warning is gone.
 
 ## The four decisions, and what each produced
 
@@ -81,10 +85,14 @@ described a mechanism nobody had built — a doc claiming a control stops anyone
   and the patched line (`>=4.1.11`) is a whole major version from latest (`5.0.1`). Fixing it means a
   test-runner migration across three packages and 460 tests. Its own commit, with the full gate — and
   when it lands, the audit level can rise from `high` to `moderate`.
-- **Still open from the plan:** coverage (§4.2), the root docs reorganisation (§5.1 — 25 root `.md`
-  files while `docs/` holds two).
+- **The root docs reorganisation (§5.1) — measured, and the cheap option isn't cheap.** The root holds 25
+  `.md` files, but **54 references** to them live in project memory, cited by bare filename
+  (`GATEWAY_MEMORY_LAYER.md` ×10, `CONTROL_SCREEN_BUILD.md` ×6). Daily logs are append-only, so a move
+  cannot rewrite them. Only 4 of the 19 non-governance files are uncited at all. The cost is not the
+  `git mv`; it is 54 stale pointers in the files that orient the next session.
+- **Also still open:** coverage (§4.2).
 
-## The two things worth carrying forward
+## The three things worth carrying forward
 
 **`vitest` does not typecheck.** Adding a field to `BridgeMsg::Usage` broke **eight** pattern matches
 across four gateway modules, and `cachedTokens` was missing from `LedgerEntry` so `model-router.ts`
@@ -94,3 +102,9 @@ failed to typecheck in three places. 249 green router-core tests said nothing ab
 **`git commit` with no pathspec commits everything staged.** A `git rm` from earlier had staged four
 deletions, so the first attempt at the licence commit silently carried them. Caught by reading
 `git show --stat` per commit; fixed by resetting and re-committing with explicit paths per batch.
+
+**An absence claim is worthless until you have checked the search reached the directory.** Search tools
+skip dot-directories, so three separate scans this session reported "no references" while never looking
+inside `.github/` or `.workbuddy-ai/` — the directories that actually held them. One produced a confident
+recommendation to move 6 files that turned out to have 14 references, and had to be retracted. For
+anything hidden, read the file or `cat <dir>/* | grep`; do not trust a tool-level search to have looked.

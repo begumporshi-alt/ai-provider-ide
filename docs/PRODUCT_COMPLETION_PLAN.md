@@ -271,16 +271,30 @@ Only one env var is read: `GW_LOG` (`lib.rs:157`). The frontend reads no `import
 
 ## 5. Documentation hygiene
 
-### 5.1 Twenty-one root-level `.md` files, and `docs/` holds one
+### 5.1 Twenty-five root-level `.md` files, and `docs/` holds two
 
 Root currently mixes permanent docs (`README.md`, `ARCHITECTURE.md`, `DECISIONS.md`, `MASTER_PROMPT.md`) with
 dated audit artefacts (`AUDIT_REPORT.md`, `ARCHITECTURE_AUDIT.md`, `AUDIT_TRAIL_READER_2026-09-21.md`,
 `CONTROL_*_2026-09-21.md`, `SECURITY_AUDIT_2026-09-20.md`, `TOOL_CALL_DIAGNOSIS_2026-09-20.md`, …) and plan
 files (`COUNT_TOKENS_PLAN.md`, `STAGE2_RETRY_AFTER_PLAN.md`, `UI_UX_PLAN.md`).
 
-**Action:** the root should hold `README`, `LICENSE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` — and nothing
-else. Move history to `docs/history/`, plans to `docs/plans/`, and add `docs/README.md` as an index. This is
-mechanical and reversible, and it is the single change that most affects how the repo reads to a stranger.
+**Measured 2026-09-22, and it is not as free as "mechanical and reversible" suggests.** The root holds
+**25** `.md` files, and **54 references** to them live in `.workbuddy-ai/memory/` — `GATEWAY_MEMORY_LAYER.md`
+is cited 10 times, `CONTROL_SCREEN_BUILD.md` 6, `ARCHITECTURE.md` and `DECISIONS.md` 5 each, spread across
+`MEMORY.md`, `REFERENCE.md` and the dated logs. They are cited **by bare filename**, and the daily logs are
+append-only by policy, so a move cannot come back and rewrite them.
+
+Only **4 of the 19** non-governance files are uncited at all: `AUDIT_REPORT.md`, `UI_UX_PLAN.md`, and the two
+`CONTROL_*_2026-09-21.md` records.
+
+So the cost is not the `git mv`; it is 54 stale pointers in the very files that orient the next session.
+Three honest options: leave the root alone; move everything and budget for a permanent mapping note in
+`MEMORY.md`; or move only the four uncited files, which barely changes how the root reads.
+
+Worth recording how the first pass got this wrong. The scan that produced "only 2 references" ran through a
+tool that **skips hidden directories**, so it never looked inside `.workbuddy-ai/` at all — the same trap as
+searching for `audit-level=high` and missing `.github/`. An absence claim is worthless until you have checked
+that the search reached the directory.
 
 ### 5.2 `README.md:90` still hardcodes the port
 
@@ -371,7 +385,7 @@ other people**; and **build** the measurement.
 | 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=high` in `ci.yml` and the local mirror; weekly `audit.yml` adds the RustSec pass |
 | 4.1 | Linter and formatter | **Deliberately not added** — see below |
 | 4.2 | Coverage | **Still open** |
-| 5.1 | Docs reorganisation | **Still open** — the root docs are untouched |
+| 5.1 | Docs reorganisation | **Still open, and measured** — 54 references in `.workbuddy-ai/memory/` are cited by bare filename; see §5.1 |
 | 5.2 | README port hardcode | **Done** |
 | 5.3 | Junk directories | **Partly** — `ai/` and `provider/` removed; `IDE/` left alone, see below |
 | 6.4 | `cache_control` measurement | **Done** — migration 0015 plus 8 tests |
