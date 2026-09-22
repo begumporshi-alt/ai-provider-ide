@@ -165,6 +165,26 @@ No `pnpm audit` or `cargo audit` anywhere in CI or `scripts/`. The dependency su
 
 **Action:** add a PR-time audit plus a scheduled job.
 
+**Measured 2026-09-22, and the naive version of this gate cannot pass.** `pnpm audit` reports **2 moderate**
+advisories with a single root cause — `vitest` (`>=2.1.0 <4.1.11`, GHSA-82fw-gwwq-j7x9, a path traversal in
+`@vitest/mocker`). All three packages that declare it are inside that range: `apps/desktop` pins `^3.2.7`,
+`router-core` and `adapter-spec` pin `^3.1.0`. So `--audit-level=moderate` fails today, and `--audit-level=high`
+**exits 0 today** — that is the version that can be added without breaking CI:
+
+```
+pnpm audit --audit-level=high      # exit 0 measured at 33c522f
+```
+
+Two things make the Rust half cheap and worth pairing with it: `apps/desktop/src-tauri/Cargo.lock` **is
+tracked** (no `.gitignore` rule for it), so a RustSec audit is reproducible rather than resolving fresh each
+run. `rustsec/audit-check` avoids the multi-minute `cargo install cargo-audit` compile.
+
+**The vitest bump is its own decision, not part of the gate.** The advisory is a devDependency that never
+enters the bundle, and exploiting it requires running a hostile test — which is not this repo's threat model.
+The patched line is `>=4.1.11` while latest is `5.0.1`, so fixing it means a **major** test-runner migration
+across all three packages and 442 TypeScript tests. Worth doing deliberately, with the full gate, not folded
+into a security-gate commit.
+
 ### 3.3 What is already good — and one thing that only *looks* broken
 
 - **CSP** is set (`tauri.conf.json:21`) and is not vacuous.
