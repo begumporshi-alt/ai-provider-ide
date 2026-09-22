@@ -114,7 +114,10 @@ Model Router, and the Router talks to providers.**
     resolution, and sandboxed code-adapter fallback: see [ARCHITECTURE.md](ARCHITECTURE.md) §2.
 13. **[USER-DIRECTIVE] Local Gateway — one endpoint + one master key for every app:** the IDE
     exposes the whole Model Router as an **OpenAI-compatible local endpoint**
-    (`http://127.0.0.1:8787/v1` — `/v1/chat/completions`, `/v1/models`, `/v1/images/generations`).
+    (`http://127.0.0.1:<port>/v1` — `/v1/chat/completions`, `/v1/models`, `/v1/images/generations`).
+    **The port is configurable, not fixed** — set in Control → Local Gateway. The compiled default is
+    `8787`, but AI Hub v2 also claims 8787 and slides up when it loses, so this machine runs `8800`.
+    Never quote a port as a fact; read `settings.gateway.port`.
     On first enable the IDE **generates a master key** (crypto-random, `sk-aip-…`, stored in
     the OS keychain, shown once, rotatable — rotation kills the old key instantly — and
     revocable). External apps (Cursor, scripts, chat UIs) paste the endpoint URL + master key
@@ -145,7 +148,7 @@ Model Router, and the Router talks to providers.**
    adapter manifest, and run contract tests → review a summary (manifest, test results,
    estimated validation cost) → confirm to enable.
 7. **Local Gateway settings** **[USER-DIRECTIVE]** — enable the gateway, pick the port, see
-   and copy the endpoint URL (`http://127.0.0.1:8787/v1`), generate / rotate / revoke the
+   and copy the endpoint URL (`http://127.0.0.1:<port>/v1`, the configured port), generate / rotate / revoke the
    master key (shown once), test the connection, and copy paste-ready presets for common
    apps (Cursor, Continue, openai-python `base_url`).
 
@@ -185,7 +188,7 @@ Model Router, and the Router talks to providers.**
    OpenAI-compatible provider through the wizard (probe → fingerprint → template → contract
    tests → confirm) and complete a Playground request — no code, no app update.
 8. **Gateway:** `curl` with the master key streams a completion through
-   `http://127.0.0.1:8787/v1`; a wrong key returns 401; rotating the master key kills the old
+   `http://127.0.0.1:<port>/v1`; a wrong key returns 401; rotating the master key kills the old
    key immediately.
 9. **Self-healing:** when a mock provider changes its response shape, the drift is detected,
    a manifest patch is generated and confirmed, and rollback to the previous version works.

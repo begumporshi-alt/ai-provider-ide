@@ -656,7 +656,9 @@ v2.
 
 **Open assumption (unchanged, now load-bearing for two features):** that macOS keeps a hidden
 webview running JS. One check covers both this and background mode: start the gateway, close
-the window, `curl http://127.0.0.1:8787/v1/models`.
+the window, `curl http://127.0.0.1:<port>/v1/models`. (`8787` was the port when this was written. The
+router moved to **`8800`** on 2026-09-21 because AI Hub v2 also claims 8787 — read
+`settings.gateway.port`, do not assume.)
 
 ---
 

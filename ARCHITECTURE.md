@@ -33,8 +33,11 @@ manifests in the middle (data interpreted by a single runtime interpreter), and 
 generated code adapters only as a last resort.
 
 A **Local Gateway** completes the picture: a Rust HTTP server inside the app exposes the whole
-router as one OpenAI-compatible endpoint (`http://127.0.0.1:8787/v1`) guarded by a
-**locally generated master key**. Any third-party app — Cursor, scripts, chat UIs — can use
+router as one OpenAI-compatible endpoint (`http://127.0.0.1:<port>/v1`) guarded by a
+**locally generated master key**. The port is **configurable** (Control → Local Gateway), not a
+constant: the compiled default is `8787`, but AI Hub v2 also claims 8787 and slides up when it loses,
+so this machine runs **`8800`**. Read it from `settings.gateway.port` rather than assuming either.
+Any third-party app — Cursor, scripts, chat UIs — can use
 every configured provider through that single URL and single credential, with the same key
 rotation and failover as the IDE's own UI ("custom AI to 3rd party").
 
@@ -423,7 +426,7 @@ usage-ledger.append({ modality: "image", … })
 
 ```
 Any app (Cursor · VS Code ext · scripts · chat UI)
-  │  POST http://127.0.0.1:8787/v1/chat/completions
+  │  POST http://127.0.0.1:<port>/v1/chat/completions
   │  Authorization: Bearer sk-aip-…            (the master key)
   ▼
 local-gateway (Rust, axum)
@@ -445,7 +448,8 @@ never written to the DB or logs. Rotate = generate a new key (old one dies insta
 revoke = disable the gateway. Reveal is one-shot, like provider keys.
 
 **Endpoint URL setup.** Gateway Settings: enable toggle, port picker (default 8787), the full
-endpoint URL shown for copying (`http://127.0.0.1:8787/v1`), a "test connection" button, and
+endpoint URL shown for copying (`http://127.0.0.1:<port>/v1`, the configured port — not a fixed one),
+a "test connection" button, and
 copy-paste presets for common tools (Cursor, Continue, openai-python base_url override). Binds
 `127.0.0.1` only by default; LAN sharing is a separate explicit opt-in with a warning.
 
