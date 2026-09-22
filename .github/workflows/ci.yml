@@ -9,9 +9,15 @@ jobs:
   checks:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
-      - uses: pnpm/action-setup@v4
-      - uses: actions/setup-node@v4
+      # v4 of these three target Node 20, which GitHub deprecated in 2025; they now run on Node 24
+      # and emit a warning on every job. checkout v7, setup-node v7 and pnpm/action-setup v6 all
+      # declare `runs.using: node24`. Both inputs relied on here were checked against the new
+      # `action.yml` before bumping: setup-node still has `node-version` and `cache`, and
+      # pnpm/action-setup still defaults `package_json_file` to `package.json`, which is how it
+      # reads `packageManager: pnpm@10.12.4`.
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+      - uses: actions/setup-node@v7
         with:
           node-version: 22
           cache: pnpm
