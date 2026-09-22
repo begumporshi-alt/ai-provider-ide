@@ -125,7 +125,12 @@ test("history: turns keep their order when every node shares one timestamp", asy
   await seedSession(page, "s-c", 1_700_000_000_000, { scramble: true });
   await page.getByRole("button", { name: "History", exact: true }).click();
 
-  await expect(page.getByText("what is in this folder").first()).toBeVisible({ timeout: 15_000 });
+  // Wait on the *timeline*, not on a page-wide text match. The rail renders the same preview
+  // text and comes first in document order, so `getByText(...).first()` is satisfied as soon as
+  // the session list loads — before the timeline fetch has even started. The read below is a
+  // single `evaluate` and does not retry, so it would sample an empty list. `toHaveCount`
+  // retries, and the entries render in one commit, so once all four exist the order is final.
+  await expect(page.locator("[data-kind]")).toHaveCount(4, { timeout: 15_000 });
   // `data-kind` is in document order, so this is the rendered order of the run. `.tool` is
   // prefixed with the call name to prove the two calls did not swap places.
   const order = await page.evaluate(() =>
