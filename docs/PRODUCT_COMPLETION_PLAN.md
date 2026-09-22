@@ -175,6 +175,10 @@ advisories with a single root cause — `vitest` (`>=2.1.0 <4.1.11`, GHSA-82fw-g
 pnpm audit --audit-level=high      # exit 0 measured at 33c522f
 ```
 
+> **Superseded 2026-09-22.** Both levels moved the same day: the vitest bump cleared both advisories, so
+> `--audit-level` is now `moderate` in every mirror. The `high` line above is the measurement that justified
+> the *first* version of this gate, kept as a dated record — it is not the current setting.
+
 Two things make the Rust half cheap and worth pairing with it: `apps/desktop/src-tauri/Cargo.lock` **is
 tracked** (no `.gitignore` rule for it), so a RustSec audit is reproducible rather than resolving fresh each
 run. `rustsec/audit-check` avoids the multi-minute `cargo install cargo-audit` compile.
@@ -185,13 +189,31 @@ The patched line is `>=4.1.11` while latest is `5.0.1`, so fixing it means a **m
 across all three packages and 460 TypeScript tests. Worth doing deliberately, with the full gate, not folded
 into a security-gate commit.
 
-**Implemented.** `pnpm audit --audit-level=high` runs in `ci.yml` and in `scripts/ci-local.sh`, and
+> **Done the same day, 2026-09-22 — and the paragraph above overestimates the cost.** The bump landed as
+> `^4.1.11` in all three manifests with **zero test changes**: every vitest config used only long-stable options
+> (`include`, `environment`, `testTimeout`, `hookTimeout`, `bail`), so all 460 tests passed on 4.1.11 as written.
+> "A whole major version away" was true of the version number and wrong about the work. One real cost did
+> surface, and it was nowhere near the tests — see the last paragraph of this section.
+
+**Implemented.** `pnpm audit --audit-level=moderate` runs in `ci.yml` and in `scripts/ci-local.sh`, and
 `.github/workflows/audit.yml` re-runs it weekly on `ubuntu-latest` alongside `rustsec/audit-check`
 against the Tauri host. Two details worth recording: the RustSec action needs
 `working-directory: apps/desktop/src-tauri` because the lockfile is not at the repo root — without it the
 action looks for `./Cargo.lock`, finds nothing, and reports a clean audit it never ran. And on a cron
 trigger the action **files an issue** per advisory rather than failing the run, which is why `audit.yml`
 requests `issues: write`; on push it fails instead.
+
+**The real cost of the vitest bump was not in the tests — it was in the type system.** After the bump,
+`pnpm typecheck` failed with `TS2591: Cannot find name 'node:child_process'` in
+`apps/desktop/e2e/mock-servers.ts` and `src/lib/tools/agentLoop.test.ts`. `@types/node@26.6.0` was declared,
+in the lockfile, on disk (89 `.d.ts` files) and correctly symlinked, and it was still not being seen. The
+decisive measurement: `tsc --listFilesOnly` enumerated **409 files including 83 `@types/node` files** before
+the bump and **238 files including zero** after it. Reverting everything and reinstalling made typecheck pass
+again, which pinned the cause to the dependency graph rather than to the source. tsc discovers `@types/*` by
+enumerating the installed tree at runtime when `types`/`typeRoots` are unset, so which globals exist had
+silently become a property of how pnpm happened to lay the tree out. The fix is one line — `"types": ["node"]`
+in `apps/desktop/tsconfig.json` — and the lesson generalises: **an implicit default is a dependency on the
+install, not on the code.**
 
 That scheduled job is not redundant with the `ci.yml` step. The `ci.yml` step only fires when something
 is pushed, so it cannot see an advisory published against code that has not changed — the one case where
@@ -252,10 +274,12 @@ is not this repo's leak, but it is inherited by every shell this project spawns.
 
 ## 4. Quality gates that do not exist
 
-### 4.1 No linter or formatter anywhere
+### 4.1 No formatter and no ESLint — the linter half is resolved
 
 No `eslint.config.*`, no `.eslintrc*`, no `.prettierrc*`, no `rustfmt.toml`, no `clippy.toml`, no
 `.editorconfig` — and `grep -rn '"eslint"\|"prettier"'` across all `package.json` files returns nothing.
+**All six are still true, `clippy.toml` included:** clippy became a gate on 2026-09-22 running its default
+lint set with `-D warnings`, and it needed no config file to do that.
 
 That is a deliberate-looking omission, but it should be a **decision**, not an accident. The cheapest high-value
 half:
@@ -268,11 +292,54 @@ cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings
 Both are near-free in CI and catch a class of Rust defect the test suite cannot. ESLint on the TS side is a
 larger conversation — worth having explicitly.
 
+> **Resolved in part, 2026-09-22 (later the same day).** The clippy half landed, and the prediction above was
+> right about the class of defect: clearing 64 warnings surfaced **two dead branches** (`if_same_then_else`)
+> that no test could see — one in crash reporting, one in the Gemini dialect adapter, on a code path no test
+> reached at all. The gate is now `cargo clippy --all-targets -- -D warnings`, in both mirrors.
+>
+> What did *not* survive is the "25 warnings" framing further down. `cargo clippy --fix` applied 15 of the 25
+> lib warnings and 10 of the test ones mechanically; only two needed judgement. The obstacle was never the
+> count — it was that no test could tell a correct fix from a plausible-looking wrong one. See
+> [`dev-book/09-status.md`](dev-book/09-status.md). `cargo fmt --check` and ESLint remain open, and the
+> rustfmt reasoning below still holds unchanged.
+
 ### 4.2 No coverage measurement
 
 `coverage/` is gitignored (`.gitignore:5`) but nothing produces it. Four suites exist — router-core,
 adapter-spec, desktop vitest, and the Playwright harness — with no aggregate number. Coverage is a weak signal,
 but *no* number means you cannot answer "did this change make things worse".
+
+**Implemented 2026-09-22.** `@vitest/coverage-v8` (pinned to the vitest line) is configured in all three
+vitest configs, each package gained `test:coverage`, and the root gained `pnpm test:coverage` — which runs the
+three suites and then `scripts/coverage-summary.mjs` to print one weighted figure.
+
+**Measured, not estimated:**
+
+| Package | Statements | Branches | Functions | Lines |
+|---|---|---|---|---|
+| `adapter-spec` | 100.0% (20/20) | 100.0% (15/15) | 100.0% (2/2) | 100.0% (20/20) |
+| `router-core` | 81.3% (1659/2041) | 72.2% (1221/1690) | 81.9% (272/332) | 85.9% (1478/1720) |
+| `desktop` (vitest only) | 21.1% (718/3410) | 14.0% (362/2577) | 14.5% (149/1028) | 21.6% (646/2985) |
+| **COMBINED** | **43.8%** (2397/5471) | **37.3%** (1598/4282) | **31.1%** (423/1362) | **45.4%** (2144/4725) |
+
+**Read the `desktop` row carefully, because it is the one most likely to be misread.** `apps/desktop/src` is
+mostly React screens, and the screens are covered by the **Playwright** suite, not by vitest — vitest only has
+unit tests for `src/lib/**` and `gateway-bridge`. So 21% is an honest measure of *what vitest covers in this
+package* and a misleading measure of *how tested the desktop app is*. The aggregate inherits that skew: 3410 of
+the 5471 measured statements are desktop `src`. It is still the right number for the question this plan asked —
+a change that drops it is a change that removed tests — but it is not a quality score.
+
+**It is deliberately not a gate step, and that is the substantive decision here.** Coverage is a weak signal,
+and a threshold has a specific failure mode: it fails an unrelated refactor, the cheapest way out is to lower
+the threshold, and the number stops being read. The gate already holds the line that matters — 460 unit, 98
+browser and 473 Rust tests, all of which must *pass*. Coverage answers a different question, and a question is
+not a threshold.
+
+**Two mechanics worth recording.** The combination is **weighted** — counts are summed and the percentage
+recomputed, never the three `pct` values averaged, which would weight a 300-line package the same as a
+6,000-line one. And a missing report is a hard error, never a zero: summing two of three and printing a
+confident percentage is the exact failure this script exists to prevent, and it was verified by running it
+before any report existed (exit 1, no table).
 
 ### 4.3 No `.env.example` — low priority
 
@@ -370,10 +437,11 @@ single-source; the `pnpm build` step in `ci.yml`; delete the three junk director
 **Phase B — "this is distributable" (~a day).** `release.yml` + `tauri-action`; decide the updater (§1.4);
 narrow `bundle.targets` or state the macOS-only support; `SECURITY.md`.
 
-**Phase C — "this is maintainable" (~a day).** `cargo fmt --check` + `cargo clippy -D warnings` in CI;
-dependency audit job; the `docs/` reorganisation; `CONTRIBUTING.md`.
+**Phase C — "this is maintainable" (~a day).** `cargo fmt --check` + `cargo clippy -D warnings` in CI
+(clippy landed 2026-09-22 — see §4.1); dependency audit job; the `docs/` reorganisation; `CONTRIBUTING.md`.
 
-**Phase D — optional.** ESLint; coverage measurement; the `cache_control` migration; `thinking` blocks.
+**Phase D — optional.** ESLint; the `cache_control` migration; `thinking` blocks. *(Coverage measurement left
+this list on 2026-09-22 — see §4.2.)*
 
 ---
 
@@ -405,9 +473,9 @@ other people**; and **build** the measurement.
 | 2.2 | `CHANGELOG.md` | **Done** |
 | 2.3 | `bundle.targets` | **Done** — narrowed to `app` + `dmg` |
 | 3.1 | `SECURITY.md` | **Done** |
-| 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=high` in `ci.yml` and the local mirror; weekly `audit.yml` adds the RustSec pass |
-| 4.1 | Linter and formatter | **Deliberately not added** — see below |
-| 4.2 | Coverage | **Still open** |
+| 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=moderate` in `ci.yml` and the local mirror (raised from `high` on 2026-09-22, once the vitest bump cleared GHSA-82fw-gwwq-j7x9); weekly `audit.yml` adds the RustSec pass |
+| 4.1 | Linter and formatter | **Half done** — `cargo clippy --all-targets -- -D warnings` is a gate in both mirrors as of 2026-09-22; `cargo fmt --check` and ESLint deliberately not added, see below |
+| 4.2 | Coverage | **Done** — `pnpm test:coverage` under `@vitest/coverage-v8`, one weighted aggregate (43.8% statements / 37.3% branches / 31.1% functions / 45.4% lines). Deliberately a report, **not** a gate step — see §4.2 |
 | 5.1 | Docs reorganisation | **Done** — 19 files moved to `docs/`; root holds 6; 17 links verified, 0 broken; mapping note added to `MEMORY.md` |
 | 5.2 | README port hardcode | **Done** |
 | 5.3 | Junk directories | **Partly** — `ai/` and `provider/` removed; `IDE/` left alone, see below |
@@ -415,17 +483,21 @@ other people**; and **build** the measurement.
 
 ### Two items deliberately left, with the reason
 
-**The `cargo fmt --check` / `cargo clippy -D warnings` gate was not added.** Measured rather than
-assumed: `cargo fmt --check` fails across the existing Rust sources, and `cargo clippy` reports **25
-warnings** at `HEAD`. Adding either as a gate would have broken CI on the first push, which is worse
-than having no gate at all.
-
-Adopting rustfmt is therefore a real decision, not a free win. It rewrites most of
+**The `cargo fmt --check` gate was not added.** Measured rather than assumed: it fails across the existing
+Rust sources, so adding it as a gate would have broken CI on the first push — worse than having no gate at
+all. Adopting rustfmt is therefore a real decision, not a free win. It rewrites most of
 `apps/desktop/src-tauri/src/`, which destroys `git blame` across the entire host for a change with no
 behavioural content. That is worth doing deliberately, as its own commit, when the blame cost is
-acceptable — not smuggled into a release-preparation batch. The same applies to the 25 clippy
-warnings: several (`too many arguments (8/7)`, three `very complex type`) need judgement rather than
-a mechanical fix.
+acceptable — not smuggled into a release-preparation batch.
+
+> **The clippy half of this item closed later the same day (2026-09-22).** The "25 warnings" framing above
+> did not survive contact: `cargo clippy --fix` applied 15 of the 25 lib warnings and 10 of the test ones
+> mechanically, and only **two** needed judgement — both real defects rather than style. They were
+> `if_same_then_else` dead branches in `crash_report.rs` and `gateway_gemini.rs`, and the second sat on a
+> code path **no test reached at all**. The count was never the obstacle; the obstacle was that no test
+> could distinguish a correct fix from a plausible-looking wrong one. The gate is now
+> `cargo clippy --all-targets -- -D warnings`, in both mirrors — see
+> [`dev-book/09-status.md`](dev-book/09-status.md).
 
 **`IDE/` was not removed.** It is not empty — it contains `IDE/.workbuddy-ai/memory/`, an empty
 directory skeleton left by a session that ran with the wrong working directory. No files are at risk,

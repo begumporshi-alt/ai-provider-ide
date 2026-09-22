@@ -1,7 +1,7 @@
 # AUDIT REPORT — AI-Provider Router
 
 > **Audited:** [MASTER_PROMPT.md](MASTER_PROMPT.md) (spec/prompt) · [ARCHITECTURE.md](ARCHITECTURE.md)
-> (architecture + implementation plan) · [diagrams/](diagrams/) (3 diagram sources)
+> (architecture + implementation plan) · [diagrams/](../diagrams/) (3 diagram sources)
 > **Method:** two independent read-only audit passes — (1) architecture/blueprint/plan/security audit,
 > (2) storage-schema design audit — synthesized below. No code exists yet; the documents are the
 > entire project.

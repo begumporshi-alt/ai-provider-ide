@@ -18,8 +18,10 @@ tools for `codesign`.
 pnpm ci:local
 ```
 
-This is the same set of steps, in the same order, as `.github/workflows/ci.yml`. Run it before
-opening a pull request. Two things about it are worth knowing:
+This runs the same steps as `.github/workflows/ci.yml`, **in the same order**. The two mirrors were one step
+out of order until 2026-09-22 (the dependency audit ran second in CI and seventh locally), which is drift
+register D5; that is fixed and the step table in `docs/dev-book/05-workflow.md` is the owner of the order. Run
+it before opening a pull request. Two things about it are worth knowing:
 
 - **It needs cargo on `PATH`.** Without it the gate reports `FAILED (1): Rust (cargo missing)`
   even when everything else passed, which reads like a Rust failure and is not one. Use
@@ -46,16 +48,31 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 | `pnpm key-leak-grep` | No real credential in the tree. This repository is public |
 | `pnpm check-ts-version` | One TypeScript version across the workspace |
 | `pnpm check-version-sync` | One product version across every manifest |
-| `pnpm audit --audit-level=high` | No high-or-critical advisory in the JS dependency tree |
+| `pnpm check-doc-links` | Every relative link **and image** in every markdown file resolves, including non-`.md` targets and bare directories. Added after D9 |
+| `pnpm audit --audit-level=moderate` | No moderate-or-worse advisory in the JS dependency tree. Raised from `high` on 2026-09-22, once the `vitest` bump cleared the two advisories that had made `moderate` unsatisfiable |
 | `cargo check` / `cargo test` | The host |
+| `cargo clippy --all-targets -- -D warnings` | No lint warning anywhere in the host, test targets included. Adopted 2026-09-22 — 64 warnings had been hiding two real dead branches |
 | Playwright | The live UI harness (wizard, Tier-2 review, egress image) |
 
-**Two steps people expect to find here are deliberately absent:** `cargo fmt --check` and
-`cargo clippy -- -D warnings`. Both were measured before being adopted, and both fail at `HEAD` — fmt
-across the existing Rust sources, clippy with 25 warnings. Adding either would break CI on the first
-push, which is worse than having no gate. Adopting them is a deliberate change that belongs in its own
-commit: rustfmt rewrites most of `apps/desktop/src-tauri/src/` and destroys `git blame` across the host
-for zero behavioural change. See `docs/PRODUCT_COMPLETION_PLAN.md` §4.1.
+**One step people expect to find here is deliberately absent:** `cargo fmt --check`. It fails at `HEAD`
+across the existing Rust sources, so adding it would break CI on the first push, which is worse than
+having no gate. Adopting it is a deliberate change that belongs in its own commit: rustfmt rewrites most
+of `apps/desktop/src-tauri/src/` and destroys `git blame` across the host for zero behavioural change.
+See `docs/PRODUCT_COMPLETION_PLAN.md` §4.1.
+
+**Clippy sat in that same paragraph until 2026-09-22, and the measurement no longer supported it.** The
+"25 warnings" figure was accurate and misleading at once: `cargo clippy --fix` applied 15 of them
+automatically, and only two carried any signal — both `if_same_then_else`, a branch whose two arms were
+identical. One sat in crash reporting; the other in the Gemini dialect adapter, on a code path no test
+reached at all. So the real obstacle was never the warning count. It was that no test could tell a
+correct fix from a plausible-looking wrong one, and writing that test had to come first.
+
+**Coverage is measured but deliberately not enforced.** `pnpm test:coverage` runs all three vitest suites
+under `@vitest/coverage-v8` and prints one weighted figure — 43.8% statements, 37.3% branches, 31.1%
+functions, 45.4% lines, measured 2026-09-22. It is not a step in the table above, and that is a decision
+rather than an omission: a coverage threshold fails an unrelated refactor, the cheapest way out is to lower
+the threshold, and the number stops being read. Every test the gate does run must still *pass*. See
+`docs/PRODUCT_COMPLETION_PLAN.md` §4.2.
 
 **A weekly job covers what a push-triggered gate cannot.** `.github/workflows/audit.yml` runs both
 audits on `ubuntu-latest` every Monday, because an advisory can be published against code that has not

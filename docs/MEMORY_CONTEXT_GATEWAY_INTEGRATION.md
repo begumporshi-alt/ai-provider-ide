@@ -13,8 +13,8 @@ Where this doc and the code disagree, the code wins — cite the line.
 
 | Diagram | File |
 |---------|------|
-| Read path — auth → context + memory → upstream → response | [`diagrams/memory-context-gateway-read-path.svg`](diagrams/memory-context-gateway-read-path.svg) |
-| Write path — capture → queue → drain → L0–L3 lifecycle | [`diagrams/memory-context-gateway-write-path.svg`](diagrams/memory-context-gateway-write-path.svg) |
+| Read path — auth → context + memory → upstream → response | [`diagrams/memory-context-gateway-read-path.svg`](../diagrams/memory-context-gateway-read-path.svg) |
+| Write path — capture → queue → drain → L0–L3 lifecycle | [`diagrams/memory-context-gateway-write-path.svg`](../diagrams/memory-context-gateway-write-path.svg) |
 
 ---
 
@@ -31,7 +31,7 @@ back on two headers. Memory and context never share a store; they share exactly 
 
 ## 1. Request pipeline — the exact order
 
-![Gateway request pipeline: auth, context and memory](diagrams/memory-context-gateway-read-path.svg)
+![Gateway request pipeline: auth, context and memory](../diagrams/memory-context-gateway-read-path.svg)
 
 The axum router (`gateway.rs:1616-1622`) has five ingress handlers. The OpenAI one is representative
 (`gateway_handlers.rs:22`); the Anthropic, Responses, and Gemini handlers are structurally identical.
@@ -202,7 +202,7 @@ per-scope. The frontend's layered recall makes the same choice for the same reas
 
 ## 5. Write path — capture → queue → drain → distillation
 
-![Memory write path: capture, queue, distillation, layers](diagrams/memory-context-gateway-write-path.svg)
+![Memory write path: capture, queue, distillation, layers](../diagrams/memory-context-gateway-write-path.svg)
 
 The write path is **off the request path by construction**. A slow, misconfigured, or offline model
 delays learning; it never delays a response.

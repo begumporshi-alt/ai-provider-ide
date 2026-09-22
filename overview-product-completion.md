@@ -45,8 +45,13 @@ CI came back **with no annotations block at all** — the deprecation warning is
 ## Follow-up batch — dependency auditing (§3.2), shipped
 
 The plan recommended "add a PR-time audit" without evidence one could pass. Measured first: `pnpm audit`
-reports 2 moderate advisories sharing one root cause, so `--audit-level=moderate` fails today and
-`--audit-level=high` exits 0. `high` is what shipped, and it still catches the class that matters.
+reported 2 moderate advisories sharing one root cause, so `--audit-level=moderate` failed at that moment and
+`--audit-level=high` exited 0. `high` is what shipped first, and it still catches the class that matters.
+
+**Superseded later the same day.** The shared root cause was the `vitest` devDependency, and bumping it
+(`^3.2.7` / `^3.1.0` → `^4.1.11`) cleared both advisories with no test changes — all 460 tests passed on 4.1.11
+as written. `--audit-level` is now `moderate` in both mirrors. The paragraph above is a dated measurement of
+the first version that shipped, not the current setting.
 
 Two things a push-triggered gate structurally *cannot* do, so `.github/workflows/audit.yml` does them:
 
@@ -67,9 +72,11 @@ against the same crate later.
 and reports a clean audit it never ran — a green result from a check that did nothing at all.
 
 **A document asserting a gate that did not exist was found and corrected.** `CONTRIBUTING.md`'s CI table
-listed `cargo fmt --check` and `cargo clippy -- -D warnings` as enforced steps. Neither is in `ci.yml`;
-both were measured and deliberately withheld. That is the same defect class as the updater docs that
-described a mechanism nobody had built — a doc claiming a control stops anyone looking for it.
+listed `cargo fmt --check` and `cargo clippy -- -D warnings` as enforced steps. Neither was in `ci.yml`;
+both were measured and deliberately withheld at the time. That is the same defect class as the updater docs
+that described a mechanism nobody had built — a doc claiming a control stops anyone looking for it. (The
+clippy half later became real, hours after this was written: it is now a gate in both mirrors, so
+`CONTRIBUTING.md`'s row is accurate on its own terms.)
 
 ## Also done: the root docs reorganisation (§5.1)
 
@@ -93,14 +100,25 @@ markdown links across 36 files, 0 broken**, and exactly one reference needed edi
   gate that fails on the first push is worse than no gate. Adopting rustfmt rewrites most of
   `src-tauri/src/` and destroys `git blame` across the whole host for a change with no behavioural
   content — a deliberate decision, not a free win.
+  **Superseded for clippy later the same day.** `cargo clippy --all-targets -- -D warnings` is now a gate in
+  both mirrors. `--fix` applied 25 of the warnings mechanically; the two that needed judgement were both
+  real `if_same_then_else` dead branches, one of them on a path no test reached. Only rustfmt remains
+  withheld.
 - **`IDE/`.** Not empty: it holds an empty `.workbuddy-ai/memory/` skeleton from a session that ran
   with the wrong working directory. Left for a human, since this project treats `.workbuddy-ai` as
   data rather than cache. (`ai/` and `provider/` were genuinely empty and went.)
-- **The `vitest` bump.** The two moderate advisories are a devDependency that never enters the bundle,
-  and the patched line (`>=4.1.11`) is a whole major version from latest (`5.0.1`). Fixing it means a
-  test-runner migration across three packages and 460 tests. Its own commit, with the full gate — and
-  when it lands, the audit level can rise from `high` to `moderate`.
-- **Coverage (§4.2).** The only plan item still untouched.
+- **The `vitest` bump — landed 2026-09-22, and cheaper than this bullet predicted.** The two moderate
+  advisories were a devDependency that never enters the bundle, and the patched line (`>=4.1.11`) is a whole
+  major version from latest (`5.0.1`). "A whole major version" was true of the number and wrong about the
+  work: **no test changed.** The configs used only long-stable options, so all 460 tests passed on 4.1.11 as
+  written, and the audit level rose from `high` to `moderate` as a result. The one real cost was a typecheck
+  failure with nothing to do with vitest — see `docs/PRODUCT_COMPLETION_PLAN.md` §3.2.
+- **Coverage (§4.2) — landed 2026-09-22.** This was the last untouched plan item. `pnpm test:coverage` now
+  runs all three vitest suites under `@vitest/coverage-v8` and prints one weighted figure: **43.8% statements**,
+  37.3% branches, 31.1% functions, 45.4% lines. Deliberately a **report, not a gate** — a threshold fails
+  unrelated refactors and the cheapest fix is to lower it, after which nobody reads it. The `desktop` row is
+  the one to read carefully: 21% there measures what *vitest* covers in that package, not how tested the app
+  is, because the screens are the Playwright suite's job.
 
 ## The three things worth carrying forward
 

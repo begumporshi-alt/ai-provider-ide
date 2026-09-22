@@ -5,12 +5,17 @@
 > directive: *the IDE can automatically add and set up any new AI provider; an AI model is
 > required inside the IDE so it can self-construct if needed.*
 >
-> Status: greenfield, pre-scaffold · Pattern: layered modular monolith + hexagonal router core
-> + registry/plugin adapter subsystem · Stack: Tauri 2 + React + TypeScript + Rust host
+> Status: **shipped** — v1.0.0 on macOS, 15 migrations, release workflow green. Pattern: layered modular
+> monolith + hexagonal router core + registry/plugin adapter subsystem · Stack: Tauri 2 + React +
+> TypeScript + Rust host
 >
-> **Visual diagrams:** [diagrams/architecture.html](diagrams/architecture.html) (system overview —
-> layers, router, gateway, key-blind egress) · [diagrams/self-construction.html](diagrams/self-construction.html)
-> (auto-onboarding pipeline for any new provider) · [diagrams/gateway.html](diagrams/gateway.html)
+> **This is a spec document, and parts of it describe the plan rather than the built app.** The rules,
+> interfaces and current state live in [`dev-book/`](dev-book/README.md); known disagreements between this
+> file and the code are tracked in [`dev-book/07-drift-register.md`](dev-book/07-drift-register.md).
+>
+> **Visual diagrams:** [diagrams/architecture.html](../diagrams/architecture.html) (system overview —
+> layers, router, gateway, key-blind egress) · [diagrams/self-construction.html](../diagrams/self-construction.html)
+> (auto-onboarding pipeline for any new provider) · [diagrams/gateway.html](../diagrams/gateway.html)
 > (master key generation + endpoint URL setup flow)
 
 ---
@@ -122,8 +127,29 @@ allowlisting, secret scrubbing).
 | `contract-suite` | L1 | Conformance tests: `pingKey`, `listModels`, minimal text/image gen |
 | `egress-gateway` (Rust) | L0 | ALL outbound HTTP: credential injection, host allowlist, SSE→channel streaming |
 | `local-gateway` (Rust) | L0 | OpenAI-compatible local endpoint: master-key auth, request → router bridge, SSE streaming out |
-| `keychain-vault` (Rust) | L0 | OS keychain CRUD via `keyring` v3; one-shot reveal; stores the master key |
+| `keychain-vault` (Rust) | L0 | OS keychain CRUD via `keyring` v2; one-shot reveal; stores the master key |
 | `sql-store` (Rust) | L0 | SQLite access + migrations |
+
+**The L4 screen rows above are the spec-era map, not the shipped set.** The app ships **13** screens —
+`ScreenId` in `apps/desktop/src/ui-state.ts`, one file each in `apps/desktop/src/screens/`. Seven of them
+post-date this map, and one of those seven is a rename rather than an addition:
+
+| Module | Layer | Purpose | Relation to the map |
+|---|---|---|---|
+| `screen-activity` | L4 | The request ledger: dense table of recent requests, source attribution, failures and fallbacks | **Replaces** `screen-usage` — there is no `Usage.tsx` |
+| `screen-context` | L4 | Context assembly, and the memory the gateway actually injects | New |
+| `screen-history` | L4 | Past conversations and turns | New |
+| `screen-skills` | L4 | Skill bodies — SQLite-backed and frontend-only; the gateway is a blind proxy for `system` | New |
+| `screen-agents` | L4 | Agent definitions and the sandboxed tool loop | New |
+| `screen-memory` | L4 | Memory atoms, scopes, layers and supersession | New |
+| `screen-control` | L4 | Cross-cutting switches and the audit trails | New |
+
+Twelve of the thirteen appear in the sidebar (`NAV` in `apps/desktop/src/components/Shell.tsx`);
+`screen-onboarding` is launched as a wizard rather than listed.
+
+**This is an addition, not a rewrite.** The table above records what was *planned*; this one records what
+*shipped*, and the difference between the two is the part worth keeping. Registered as
+[`dev-book/07-drift-register.md`](dev-book/07-drift-register.md) D6.
 
 ### 1.3 Connectivity graph
 
@@ -491,9 +517,13 @@ specified, not left implicit (audit H1):
 - **Concurrency:** max concurrent routed requests (default 8) with a bounded queue (default 32);
   overflow answers `429` + `Retry-After`. Excess load degrades gracefully instead of stalling
   the webview.
-- **Window policy (v1):** single-window app. The gateway serves while the app runs; closing the
-  window stops the gateway, and the Gateway settings screen says so plainly. A headless
-  service/menu-bar mode is an explicit **v1 non-goal** (extension point noted in §7).
+- **Window policy (v1):** single-window app with a tray. The gateway serves while the *process*
+  runs. Closing the window **hides** it rather than quitting: `RunEvent::WindowEvent` calls
+  `prevent_close()` then `hide()` while `settings.background.hideOnClose` is true, which it is by
+  default (`lib.rs`), so the gateway keeps serving with nothing on screen and the tray — or a Dock
+  click — brings the UI back. Turning that preference off restores close-to-quit. Quitting the app
+  stops the gateway either way. A headless service/menu-bar mode is an explicit **v1 non-goal**
+  (extension point noted in §7).
 - **Entry gate:** Phase 2b starts only after an end-to-end **SSE-through-IPC spike** proves a
   streamed completion round-trips through the bridge under load (including a mid-stream
   disconnect).
@@ -515,7 +545,8 @@ execution-engine implement a per-phase budget:
 
 Retries vs. rotation: each attempt on the plan (next key or next provider) IS the retry — there
 is no separate hidden retry loop. Per-app gateway keys (traffic attribution, revoking one
-abusive app) are a **stated v1 limitation** — one master key for now.
+abusive app) **shipped in 1.0.0** — a client can be revoked without rotating the master key. Per-app
+*budgets* remain open: the spend cap is global and monthly, not per key.
 
 ---
 
@@ -699,7 +730,7 @@ from the newest good backup. A user-initiated **config export** (JSON: providers
 aliases, settings, `secret_ref`s — never keychain values) provides a portable,
 human-inspectable disaster-recovery path.
 
-**OS keychain** (Rust `keyring` v3, service `ai-provider-router`, accounts `key:<keyId>` for
+**OS keychain** (Rust `keyring` v2, service `ai-provider-router`, accounts `key:<keyId>` for
 provider keys and `masterkey` for the Local Gateway master key): the only home of raw secrets.
 Linux requires Secret Service (gnome-keyring/KWallet) — surfaced as a
 first-run check; macOS Keychain and Windows Credential Manager work out of the box.
@@ -809,8 +840,7 @@ deleting a provider cascades keys/manifests/catalog rows (ledger history is pres
 no FKs by design); Assistant conversations persist per session only (v1); models-cache TTL
 24 h with manual refresh and stale-fallback; the app is single-window (a second window would
 instantiate a second router core — rejected); i18n and a11y beyond platform defaults are
-declared **non-goals for v1**; a single master key (no per-app keys) is a **stated v1
-limitation**.
+declared **non-goals for v1**; per-app gateway keys ship (§3.6), while per-app budgets do not.
 
 ---
 
@@ -846,8 +876,8 @@ Risks added from the 2026-09-15 audit, each now carried by a design section:
   handling) — mitigated by the explicit compatibility contract (§3.4: unsupported fields error
   loudly, never silently). **Major.**
 - **Runaway spend via gateway consumers** — per-provider concurrency caps (§3.6) bound it; the
-  usage ledger with `source` attribution makes it visible; per-app keys + budgets are the
-  follow-up. **Medium.**
+  usage ledger with `source` attribution makes it visible; per-app **budgets** are the follow-up
+  (per-app keys shipped — see §3.6). **Medium.**
 - **Model-ID collision in the merged catalog** — resolved by qualified IDs + alias priority
   (§3.4). **Designed against.**
 - **`quickjs-emscripten` maintenance/escape surface** — Tier 2 is last-resort and Phase 6;
@@ -868,7 +898,7 @@ Risks added from the 2026-09-15 audit, each now carried by a design section:
   gateway bridge contract (§3.5), webview hardening setup (invariants 12–14)
 
 **Phase 1 — Host infrastructure + router core (L)**
-- `keychain-vault` (keyring v3) + `egress-gateway` (reqwest, credential injection, allowlist, channel streaming)
+- `keychain-vault` (keyring v2) + `egress-gateway` (reqwest, credential injection, allowlist, channel streaming)
 - Domain types, ports (`HttpPort`, `KeyVaultPort`, `StorePort`), SQLite **schema v1.1 + the
   single migration runner + WAL/backup/pragma init** (§4)
 - Manifest schema v1.1 + `manifest-interpreter` + `openai-compat`/`anthropic-compat` templates + contract suite (vs mock server)

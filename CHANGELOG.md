@@ -28,15 +28,31 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 - `pnpm check-version-sync` — asserts the root `package.json`, both workspace packages,
   `apps/desktop/package.json`, `Cargo.toml` and `tauri.conf.json` all agree on one version.
 
-- **Dependency auditing.** `pnpm audit --audit-level=high` now runs in `ci.yml` and in the local
+- **Coverage measurement.** `pnpm test:coverage` runs all three vitest suites under
+  `@vitest/coverage-v8` and prints one weighted figure across the workspace: **43.8% statements,
+  37.3% branches, 31.1% functions, 45.4% lines**. Previously `coverage/` was gitignored and nothing
+  produced it, so "did this change make things worse" had no answer at all.
+
+  It is a **report, not a gate**. A coverage threshold fails unrelated refactors, and the cheapest way
+  out of that failure is to lower the threshold — after which nobody reads the number. The gate keeps
+  holding the line that matters: all 460 unit, 98 browser and 473 Rust tests must pass.
+
+  Two mechanics worth knowing. The aggregate is **weighted** — counts are summed and the percentage
+  recomputed, never the three `pct` values averaged, which would weight a 300-line package the same as
+  a 6,000-line one. And a missing report is a hard error rather than a zero, because summing two of
+  three and printing a confident percentage is the failure mode that matters most here.
+
+- **Dependency auditing.** `pnpm audit --audit-level=moderate` now runs in `ci.yml` and in the local
   mirror, and a weekly `.github/workflows/audit.yml` re-runs it alongside a RustSec audit of the
   Tauri host on `ubuntu-latest`.
 
-  The level is `high`, not `moderate`, and that is a measurement rather than a preference: the two
-  moderate advisories share a single root cause — a `vitest` devDependency whose patched line
-  (`>=4.1.11`) is a whole major version away — so `moderate` cannot pass without a test-runner
-  migration first. The scheduled job exists because an advisory can be published against code that
-  has not changed, and a push-triggered gate never fires for that.
+  The level started at `high` earlier the same day, and that was a measurement rather than a
+  preference: two moderate advisories shared a single root cause — a `vitest` devDependency whose
+  patched line (`>=4.1.11`) was a whole major version away — so `moderate` could not pass without a
+  test-runner migration first. That migration landed the same day (see `### Changed`), so the level
+  was raised to `moderate` and both mirrors re-verified. The scheduled job exists because an
+  advisory can be published against code that has not changed, and a push-triggered gate never
+  fires for that.
 
 ### Fixed
 
@@ -56,6 +72,18 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   bundle — the local gate (`pnpm ci:local`) was the stricter of the two.
 - CI now runs `pnpm check-version-sync`, which fails when any manifest disagrees with
   `tauri.conf.json` about the product version.
+- **`vitest` 3.2.7 → 4.1.11 across all three packages**, clearing GHSA-82fw-gwwq-j7x9 (a path
+  traversal in `@vitest/mocker`, vulnerable `>=2.1.0 <4.1.11`). **No test changed**: every vitest
+  config used only long-stable options, so all 460 tests passed on 4.1.11 as written.
+
+  The one real cost had nothing to do with vitest. `pnpm typecheck` then failed with
+  `TS2591: Cannot find name 'node:child_process'` in `e2e/mock-servers.ts` and
+  `src/lib/tools/agentLoop.test.ts`, while `@types/node@26.6.0` sat in the tree complete (89 `.d.ts`)
+  and correctly symlinked. `tsc --listFilesOnly` enumerated **409 files including 83 `@types/node`
+  files** before the bump and **238 including zero** after, so the reshaped dependency graph had
+  stopped `@types/node` being auto-included at all. `apps/desktop/tsconfig.json` now states
+  `"types": ["node"]` rather than inferring it: an implicit default is a dependency on the install,
+  not on the code.
 
 ### Removed
 

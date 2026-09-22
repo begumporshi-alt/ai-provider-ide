@@ -62,7 +62,7 @@ Both were written into `CONTROL_SWITCHBOARD_DESIGN.md` §5.1 rather than quietly
 | Browser (playwright) | **98 passed** over **87 declarations** (72 → 73 → 78 → 84 → 91 → 95 → 96 → 97 → 98). Retargeted for the Control move, then added across the three trail readers (§4a.1–4a.3), the trail-health channel (§4a.4), the lost ending (§4a.5), the run that is never listed (§4a.7) and the stranded repair (§4a.8) |
 | `tsc --noEmit --noUnusedLocals --noUnusedParameters` | clean |
 | `web-test:types` | clean |
-| `pnpm ci:local` | **ALL GREEN**, all nine steps (the `Build` step needed `build:clean` — §4a.6) |
+| `pnpm ci:local` | **ALL GREEN**, all nine steps as the gate then stood (the `Build` step needed `build:clean` — §4a.6; the gate has grown since — see [dev-book/05](dev-book/05-workflow.md)) |
 
 Two browser tests carry the weight:
 

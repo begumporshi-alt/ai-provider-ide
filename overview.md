@@ -106,7 +106,7 @@ what was missing. A provider stuck in `repairing` was unrecoverable through the 
 | `web-test/context-skills-agents.spec.ts` | a `no handle` assertion scoped to `tbody` |
 | `apps/desktop/package.json` | `build:clean`, composed into `build` |
 
-## Verification — `pnpm ci:local` **ALL GREEN**, all nine steps
+## Verification — `pnpm ci:local` **ALL GREEN**, all nine steps *(the gate stood at nine then; it has grown since — see [docs/dev-book/05-workflow.md](docs/dev-book/05-workflow.md))*
 
 | Layer | Result |
 |---|---|
