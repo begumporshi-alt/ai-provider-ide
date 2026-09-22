@@ -28,6 +28,7 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Governance | Apache-2.0, changelog, security policy, release workflow, weekly audit | `LICENSE`, `.github/workflows/` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
+| Rust formatting | `cargo fmt --check` is clean under `apps/desktop/src-tauri/rustfmt.toml` | 354 hunks rewritten once on 2026-09-22, then converged to 0. A stock config would have rewritten 638 |
 | Tests | **433** TS unit (18 adapter-spec · 249 router-core · 166 desktop) · **27** end-to-end · **98** browser · **473** Rust | all four re-measured 2026-09-22; the `~425` / `87` this row used to carry were stale |
 | Coverage | **43.8%** statements · 37.3% branches · 31.1% functions · 45.4% lines, weighted across the three packages | `pnpm test:coverage`; a report, **not** a gate step — [`../PRODUCT_COMPLETION_PLAN.md`](../PRODUCT_COMPLETION_PLAN.md) §4.2 |
 
@@ -37,11 +38,17 @@ Real absences, with the reason each one is absent.
 
 | Gap | Why it is not closed |
 |---|---|
-| **No formatter gate** | `cargo fmt --check` still fails across the existing Rust sources. Adopting rustfmt rewrites most of the host and destroys `git blame` for zero behavioural change, so it stays deferred to its own commit. **Clippy is now a gate** — see "Working and verified" |
 | **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
 | **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not |
 
-**Two rows left this table on 2026-09-22.**
+**Three rows left this table on 2026-09-22.**
+
+**"No formatter gate"** — `cargo fmt --check` now runs in both mirrors, first in the Rust block. It failed on
+adoption for a measurable reason rather than a stylistic one: the host is written in a compact "one line if it
+fits" style — `Self { start: Instant::now(), budget, missed_at: None }` — which a stock rustfmt config explodes
+one item per line. Adding `use_small_heuristics = "Max"` cut the churn from **638 hunks / 42.2% of the host to
+354 / 30.1%**, and that is what made the blame cost payable. The reasoning lives in
+`apps/desktop/src-tauri/rustfmt.toml` rather than in a commit message nobody will read again.
 
 **"No coverage measurement"** — `pnpm test:coverage` now prints one weighted figure across the three packages
 (43.8% statements). Note that this closed as a *measurement*, not as enforcement: it is deliberately not a gate
@@ -59,8 +66,11 @@ and nothing was weakened to get there.
 |---|---|
 | **`thinking` blocks** | Not started. Quality-only, and last by design |
 | **`previous_response_id`** | Closed as not applicable — Codex points at a different gateway, and sets `wire_api = "responses"` with `disable_response_storage = true` |
-| **rustfmt adoption** | Deferred to its own commit, so the blame cost is paid on purpose rather than smuggled into a release batch. Clippy shared this row until 2026-09-22 and has left it — it is now a gate, see "Working and verified" |
-| **`IDE/`** | Left in place for a human — it holds an empty `.workbuddy-ai/memory/` skeleton from a session that ran with the wrong working directory, and this project treats that directory as data rather than cache |
+
+**Two rows left this table on 2026-09-22.** **rustfmt adoption** moved to "Working and verified" — it is now a
+gate. **`IDE/`** was removed: a file count showed it held none at all, only an empty `IDE/.workbuddy-ai/memory/`
+skeleton from a session that ran with the wrong working directory, so `rmdir` closed it with nothing at risk.
+The hesitation on that row was about the directory's *name*, and the measurement retired it.
 
 ## Needs improvement
 

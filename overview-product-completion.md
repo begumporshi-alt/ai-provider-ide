@@ -74,9 +74,9 @@ and reports a clean audit it never ran — a green result from a check that did 
 **A document asserting a gate that did not exist was found and corrected.** `CONTRIBUTING.md`'s CI table
 listed `cargo fmt --check` and `cargo clippy -- -D warnings` as enforced steps. Neither was in `ci.yml`;
 both were measured and deliberately withheld at the time. That is the same defect class as the updater docs
-that described a mechanism nobody had built — a doc claiming a control stops anyone looking for it. (The
-clippy half later became real, hours after this was written: it is now a gate in both mirrors, so
-`CONTRIBUTING.md`'s row is accurate on its own terms.)
+that described a mechanism nobody had built — a doc claiming a control stops anyone looking for it. (Both
+halves later became real, within hours of this being written, so the table's rows are accurate now on their
+own terms rather than because the doc was right early.)
 
 ## Also done: the root docs reorganisation (§5.1)
 
@@ -93,20 +93,25 @@ works if they all land in the same directory — they did. Scanned afterwards ra
 markdown links across 36 files, 0 broken**, and exactly one reference needed editing. Every rename is
 `R100`, so each file keeps its full history.
 
-## Deliberately left, with the reason
+## Deliberately left at the time — and what each one turned into
 
-- **`cargo fmt --check` and `cargo clippy -D warnings`.** Measured before adding, rather than assumed:
-  `cargo fmt --check` fails across the existing Rust sources and clippy reports **25 warnings**. A
-  gate that fails on the first push is worse than no gate. Adopting rustfmt rewrites most of
-  `src-tauri/src/` and destroys `git blame` across the whole host for a change with no behavioural
-  content — a deliberate decision, not a free win.
-  **Superseded for clippy later the same day.** `cargo clippy --all-targets -- -D warnings` is now a gate in
-  both mirrors. `--fix` applied 25 of the warnings mechanically; the two that needed judgement were both
-  real `if_same_then_else` dead branches, one of them on a path no test reached. Only rustfmt remains
-  withheld.
-- **`IDE/`.** Not empty: it holds an empty `.workbuddy-ai/memory/` skeleton from a session that ran
-  with the wrong working directory. Left for a human, since this project treats `.workbuddy-ai` as
-  data rather than cache. (`ai/` and `provider/` were genuinely empty and went.)
+- **`cargo fmt --check` and `cargo clippy -D warnings` — both closed 2026-09-22.** Measured before adding,
+  rather than assumed: `cargo fmt --check` fails across the existing Rust sources and clippy reports **25
+  warnings** on the lib, 64 with `--all-targets`. A gate that fails on the first push is worse than no gate,
+  so neither went in on that measurement alone.
+  **Clippy closed first.** `--fix` applied 25 of the warnings mechanically; the two that needed judgement
+  were both real `if_same_then_else` dead branches, one of them on a path no test reached at all.
+  **Rustfmt closed the same day, and the objection turned out to be configurable.** It was never rustfmt —
+  it was the *stock* config, which rewrites most of the host because this code is written in a compact "one
+  line if it fits" style. Stock: **638 hunks / 42.2% of the host**. With `use_small_heuristics = "Max"`:
+  **354 hunks / 30.1%**. That single setting is now in `apps/desktop/src-tauri/rustfmt.toml`, and both
+  mirrors run `cargo fmt --check`.
+- **`IDE/` — removed 2026-09-22.** The hesitation was sound: it is named `.workbuddy-ai`, which this project
+  treats as data rather than cache, so it was left for a human rather than deleted on a guess. A file count
+  settled it — `IDE/` held **no files at all**, only an empty `.workbuddy-ai/memory/` skeleton from a session
+  that ran with the wrong working directory. `rmdir` closed it, and `rmdir` refuses a non-empty directory, so
+  the property that mattered was enforced by the tool rather than by confidence. (`ai/` and `provider/` were
+  genuinely empty and went earlier.)
 - **The `vitest` bump — landed 2026-09-22, and cheaper than this bullet predicted.** The two moderate
   advisories were a devDependency that never enters the bundle, and the patched line (`>=4.1.11`) is a whole
   major version from latest (`5.0.1`). "A whole major version" was true of the number and wrong about the

@@ -52,15 +52,18 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 | `pnpm audit --audit-level=moderate` | No moderate-or-worse advisory in the JS dependency tree. Raised from `high` on 2026-09-22, once the `vitest` bump cleared the two advisories that had made `moderate` unsatisfiable |
 | `cargo check` / `cargo test` | The host |
 | `cargo clippy --all-targets -- -D warnings` | No lint warning anywhere in the host, test targets included. Adopted 2026-09-22 — 64 warnings had been hiding two real dead branches |
+| `cargo fmt --check` | The Rust host is formatted, under `apps/desktop/src-tauri/rustfmt.toml`. Adopted 2026-09-22 — a stock config would have rewritten 42.2% of the host, this one 30.1% |
 | Playwright | The live UI harness (wizard, Tier-2 review, egress image) |
 
-**One step people expect to find here is deliberately absent:** `cargo fmt --check`. It fails at `HEAD`
-across the existing Rust sources, so adding it would break CI on the first push, which is worse than
-having no gate. Adopting it is a deliberate change that belongs in its own commit: rustfmt rewrites most
-of `apps/desktop/src-tauri/src/` and destroys `git blame` across the host for zero behavioural change.
-See `docs/PRODUCT_COMPLETION_PLAN.md` §4.1.
+**No step is deliberately absent on the Rust side any more.** `cargo fmt --check` was the last one, and it
+joined the table on 2026-09-22. It had been held back because a stock config rewrites most of the host and
+destroys `git blame` for no behavioural change — true, and the reason `apps/desktop/src-tauri/rustfmt.toml`
+exists. `use_small_heuristics = "Max"` keeps the compact "one line if it fits" style the code already uses,
+cutting the rewrite from 42.2% of the host to 30.1%, and that is what made the cost payable. **ESLint is the
+one thing still missing**, and it is missing because it is not installed in any of the four manifests — that is
+new work rather than a rejected gate.
 
-**Clippy sat in that same paragraph until 2026-09-22, and the measurement no longer supported it.** The
+**Clippy sat in that absent-step paragraph until 2026-09-22, and the measurement did not support it.** The
 "25 warnings" figure was accurate and misleading at once: `cargo clippy --fix` applied 15 of them
 automatically, and only two carried any signal — both `if_same_then_else`, a branch whose two arms were
 identical. One sat in crash reporting; the other in the Gemini dialect adapter, on a code path no test

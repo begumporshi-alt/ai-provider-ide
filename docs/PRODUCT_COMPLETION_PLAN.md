@@ -274,7 +274,7 @@ is not this repo's leak, but it is inherited by every shell this project spawns.
 
 ## 4. Quality gates that do not exist
 
-### 4.1 No formatter and no ESLint — the linter half is resolved
+### 4.1 No formatter and no ESLint — both Rust halves are resolved
 
 No `eslint.config.*`, no `.eslintrc*`, no `.prettierrc*`, no `rustfmt.toml`, no `clippy.toml`, no
 `.editorconfig` — and `grep -rn '"eslint"\|"prettier"'` across all `package.json` files returns nothing.
@@ -300,8 +300,13 @@ larger conversation — worth having explicitly.
 > What did *not* survive is the "25 warnings" framing further down. `cargo clippy --fix` applied 15 of the 25
 > lib warnings and 10 of the test ones mechanically; only two needed judgement. The obstacle was never the
 > count — it was that no test could tell a correct fix from a plausible-looking wrong one. See
-> [`dev-book/09-status.md`](dev-book/09-status.md). `cargo fmt --check` and ESLint remain open, and the
-> rustfmt reasoning below still holds unchanged.
+> [`dev-book/09-status.md`](dev-book/09-status.md).
+>
+> **The `cargo fmt --check` half landed the same day as well, so this item is closed rather than half
+> closed.** The paragraph above calls the step "near-free in CI", which was true of the *step* and false of
+> the *adoption*: the step is one line, but running it once rewrites 42.2% of the host under a stock config.
+> `use_small_heuristics = "Max"` cuts that to 30.1%, and that is what made it payable. **ESLint is the only
+> remaining half**, and it is open because it is not installed anywhere rather than because it was rejected.
 
 ### 4.2 No coverage measurement
 
@@ -400,7 +405,12 @@ Gateway" pointer that already follows it.
 result of a `mkdir ai provider IDE` run from inside that directory. They are untracked, so `git status` is
 clean and nothing will ever flag them.
 
-**Action:** remove them.
+**Action: remove them — done 2026-09-22.** `ai/` and `provider/` went first. `IDE/` was held back because it
+is named `.workbuddy-ai` inside, which this project treats as data rather than cache, so removing it on a guess
+was not acceptable. A file count retired the hesitation: `IDE/` contained **no files at all**, only an empty
+`IDE/.workbuddy-ai/memory/` skeleton from a session that ran with the wrong working directory. `rmdir` closed
+it, and `rmdir` refuses a non-empty directory — so the property that mattered was enforced by the tool rather
+than by the operator's confidence.
 
 ### 5.4 A plan whose evidence is gone
 
@@ -474,21 +484,23 @@ other people**; and **build** the measurement.
 | 2.3 | `bundle.targets` | **Done** — narrowed to `app` + `dmg` |
 | 3.1 | `SECURITY.md` | **Done** |
 | 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=moderate` in `ci.yml` and the local mirror (raised from `high` on 2026-09-22, once the vitest bump cleared GHSA-82fw-gwwq-j7x9); weekly `audit.yml` adds the RustSec pass |
-| 4.1 | Linter and formatter | **Half done** — `cargo clippy --all-targets -- -D warnings` is a gate in both mirrors as of 2026-09-22; `cargo fmt --check` and ESLint deliberately not added, see below |
+| 4.1 | Linter and formatter | **Done** — `cargo clippy --all-targets -- -D warnings` **and** `cargo fmt --check` are gate steps in both mirrors as of 2026-09-22; ESLint deliberately not added, see below |
 | 4.2 | Coverage | **Done** — `pnpm test:coverage` under `@vitest/coverage-v8`, one weighted aggregate (43.8% statements / 37.3% branches / 31.1% functions / 45.4% lines). Deliberately a report, **not** a gate step — see §4.2 |
 | 5.1 | Docs reorganisation | **Done** — 19 files moved to `docs/`; root holds 6; 17 links verified, 0 broken; mapping note added to `MEMORY.md` |
 | 5.2 | README port hardcode | **Done** |
-| 5.3 | Junk directories | **Partly** — `ai/` and `provider/` removed; `IDE/` left alone, see below |
+| 5.3 | Junk directories | **Done** — `ai/` and `provider/` removed; `IDE/` removed 2026-09-22, see below |
 | 6.4 | `cache_control` measurement | **Done** — migration 0015 plus 8 tests |
 
-### Two items deliberately left, with the reason
+### What this section used to argue, and what measurement changed
 
-**The `cargo fmt --check` gate was not added.** Measured rather than assumed: it fails across the existing
+**`cargo fmt --check` was the item deliberately left. It is now a gate step.** It failed across the existing
 Rust sources, so adding it as a gate would have broken CI on the first push — worse than having no gate at
-all. Adopting rustfmt is therefore a real decision, not a free win. It rewrites most of
-`apps/desktop/src-tauri/src/`, which destroys `git blame` across the entire host for a change with no
-behavioural content. That is worth doing deliberately, as its own commit, when the blame cost is
-acceptable — not smuggled into a release-preparation batch.
+all. That part held. What did not hold was the conclusion that the blame cost was simply unpayable: the
+objection was never rustfmt itself, it was the *stock config*, which rewrites most of the host because this
+code is written in a compact "one line if it fits" style. Measured on the 24,006-line host, stock rustfmt
+rewrites **638 hunks / 42.2% of it**, and `use_small_heuristics = "Max"` rewrites **354 hunks / 30.1%** — a
+config that preserves the style the code already has rather than replacing it. That measurement is the whole
+argument, and it lives in `apps/desktop/src-tauri/rustfmt.toml` so it survives this document.
 
 > **The clippy half of this item closed later the same day (2026-09-22).** The "25 warnings" framing above
 > did not survive contact: `cargo clippy --fix` applied 15 of the 25 lib warnings and 10 of the test ones
@@ -499,10 +511,15 @@ acceptable — not smuggled into a release-preparation batch.
 > `cargo clippy --all-targets -- -D warnings`, in both mirrors — see
 > [`dev-book/09-status.md`](dev-book/09-status.md).
 
-**`IDE/` was not removed.** It is not empty — it contains `IDE/.workbuddy-ai/memory/`, an empty
-directory skeleton left by a session that ran with the wrong working directory. No files are at risk,
-but it is named `.workbuddy-ai`, which this project treats as data rather than cache, so it was left
-for a human to decide rather than deleted on a guess.
+**`IDE/` was removed the same day.** The hesitation was reasonable: it is named `.workbuddy-ai`, which this
+project treats as data rather than cache, so it was left for a human rather than deleted on a guess. A file
+count settled it — `IDE/` held **no files at all**, only an empty `IDE/.workbuddy-ai/memory/` skeleton from a
+session that ran with the wrong working directory. `rmdir` closed it, and `rmdir` refuses a non-empty
+directory, so the removal was safe by construction rather than by inspection.
+
+**ESLint is the one thing still deliberately absent**, and it is a different kind of absence: it is not
+installed in any of the four manifests, so there is no configuration to write and nothing to reconcile. Adding
+it would be new work with a new dependency surface rather than the closing of an existing gap.
 
 ### What the gate caught that the unit tests could not
 

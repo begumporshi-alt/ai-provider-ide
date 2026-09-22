@@ -85,6 +85,15 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   `"types": ["node"]` rather than inferring it: an implicit default is a dependency on the install,
   not on the code.
 
+- **The Rust host is now rustfmt-formatted, and the gate enforces it.** `cargo fmt --check` runs in both
+  mirrors, first in the Rust block. Adoption had been deferred because a stock config rewrites most of
+  the host and destroys `git blame` for no behavioural change — measured on the 24,006-line host, that
+  is **638 hunks / 42.2% of it**. `use_small_heuristics = "Max"`, the single non-default setting in the
+  new `apps/desktop/src-tauri/rustfmt.toml`, cuts that to **354 hunks / 30.1%** by keeping the compact
+  "one line if it fits" style the code already uses — so the rewrite preserves the host's look rather
+  than replacing it. The 24 files, 4,172 insertions and 3,473 deletions it did touch carry no meaning
+  whatsoever, which is exactly why they are their own commit rather than part of a release batch.
+
 ### Removed
 
 - **The auto-updater documentation and scripts.** They described a mechanism that was never

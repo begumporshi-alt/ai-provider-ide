@@ -24,11 +24,12 @@ missing)` even when everything else passed, which reads like a Rust failure and 
 | 6 | Single TypeScript version | 7 | 7 |
 | 7 | One product version | 8 | 8 |
 | 8 | Doc links resolve | 9 | 9 |
-| 9 | Rust check | 10 | 10 |
-| 10 | Rust clippy (`--all-targets -- -D warnings`) | 11 | 11 |
-| 11 | Rust tests | 12 | 12 |
-| 12 | Install Playwright browsers | 13 | 13 |
-| 13 | Live-UI tests | 14 | 14 |
+| 9 | Rust formatting (`--check`) | 10 | 10 |
+| 10 | Rust check | 11 | 11 |
+| 11 | Rust clippy (`--all-targets -- -D warnings`) | 12 | 12 |
+| 12 | Rust tests | 13 | 13 |
+| 13 | Install Playwright browsers | 14 | 14 |
+| 14 | Live-UI tests | 15 | 15 |
 
 **The two mirrors are step-for-step identical, and that is checked rather than asserted.** They were not until
 2026-09-22: the dependency audit ran second in CI and seventh locally, while both `ci-local.sh:2` and
@@ -39,14 +40,19 @@ is the property to re-measure whenever a step is added.
 That difference was harmless in practice — the audit is a read — but it is the class of claim this book exists
 to catch: a mirror that is *almost* faithful is a mirror you stop trusting.
 
-`Rust clippy` is the newest step. `--all-targets` is deliberate: the test code is where a lint earns its keep,
-and the two warnings that motivated the step sat in crash reporting and on a dialect code path no test reached.
-`-D warnings` rather than a tolerated count, because a gate that accepts warnings stops being read once there
-are 25 of them.
+`Rust formatting` is the newest step, and the cheapest: `--check` never writes, and it is a no-op whenever the
+tree is already formatted. It reads `apps/desktop/src-tauri/rustfmt.toml`, whose single non-default setting
+exists to keep the host's existing compact style rather than replace it — stock rustfmt would have rewritten
+42.2% of the host, and this config 30.1%.
+
+`Rust clippy` came just before it. `--all-targets` there is deliberate: the test code is where a lint earns its
+keep, and the two warnings that motivated the step sat in crash reporting and on a dialect code path no test
+reached. `-D warnings` rather than a tolerated count, because a gate that accepts warnings stops being read once
+there are 25 of them.
 
 ## What the gate deliberately does not enforce
 
-Two things, and both are decisions rather than omissions.
+One thing, and it is a decision rather than an omission.
 
 **Coverage.** `pnpm test:coverage` measures all three vitest suites and prints one weighted figure — 43.8%
 statements, 37.3% branches, 31.1% functions, 45.4% lines (2026-09-22). It is not a step in the table above. A
@@ -55,9 +61,9 @@ threshold, and the number stops being read. Every test the gate runs must still 
 different question, and a question is not a threshold. Detail:
 [`../PRODUCT_COMPLETION_PLAN.md`](../PRODUCT_COMPLETION_PLAN.md) §4.2.
 
-**`cargo fmt --check`.** It fails across the existing Rust sources, so adding it would break CI on the first
-push. Adopting rustfmt rewrites most of the host and destroys `git blame` for zero behavioural change, so it
-wants its own commit. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) and [09](09-status.md).
+`cargo fmt --check` sat here until 2026-09-22 and has left — it is step 9 above now. It was the one entry in
+this section that was a *cost* rather than a decision: the objection was `git blame`, and a blame cost is
+answerable by measurement. `rustfmt.toml` carries the measurement.
 
 ## Why the browser step clears vite's dep cache
 
