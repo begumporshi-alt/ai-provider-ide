@@ -97,6 +97,11 @@ step "One product version"    pnpm check-version-sync
 step "Doc links resolve"      pnpm check-doc-links
 
 if command -v cargo >/dev/null 2>&1; then
+  # Formatting first: it is the cheapest check in this block and the only one that is
+  # a no-op whenever the tree is already formatted. `--check` never writes a file.
+  # The config it reads is apps/desktop/src-tauri/rustfmt.toml -- see that file for
+  # why `use_small_heuristics = "Max"` is the one non-default setting.
+  step "Rust fmt"             cargo fmt   --manifest-path "$ROOT/$TAURI_MANIFEST" --check
   step "Rust check"           cargo check --manifest-path "$ROOT/$TAURI_MANIFEST"
   # `--all-targets` and `-D warnings`, matching ci.yml exactly (drift register D5). The test
   # targets matter: the two dead branches this step was added to clear were both invisible to a

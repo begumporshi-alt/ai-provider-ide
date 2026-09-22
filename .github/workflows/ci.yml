@@ -21,12 +21,13 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
-      # `components: clippy` is stated explicitly rather than assumed. The clippy step below cannot
-      # run without it, and relying on this action's default component set to include it would make
-      # the gate's availability depend on an unstated default.
+      # `components: clippy, rustfmt` are stated explicitly rather than assumed. Neither the clippy
+      # step nor the formatting step below can run without its component, and relying on this
+      # action's default set to include them would make the gate's availability depend on an
+      # unstated default.
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy
+          components: clippy, rustfmt
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop/src-tauri
@@ -60,6 +61,13 @@ jobs:
       # as broken images. The same class of bug recurred within the hour. See drift register D9.
       - name: Doc links resolve
         run: pnpm check-doc-links
+      # Formatting first: cheapest check in this block, and a no-op whenever the tree is
+      # already formatted. `--check` never writes a file. The config it reads is
+      # apps/desktop/src-tauri/rustfmt.toml -- see that file for why
+      # `use_small_heuristics = "Max"` is the one non-default setting, and for the measured
+      # reason it is 354 hunks instead of the 638 a stock config would produce.
+      - name: Rust formatting
+        run: cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
       - name: Rust check
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
       # `--all-targets` on purpose: the test code is where a lint earns its keep. Two of the
