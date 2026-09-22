@@ -6,7 +6,8 @@ Answered the question *"what is left to make this a professional product?"* by a
 `3bb7665` (written up as **`docs/PRODUCT_COMPLETION_PLAN.md`**), then — on the four decisions that
 followed — implemented them and shipped.
 
-Seven commits on `main` (`754a5fc`..`e5b3393`). CI run `35732995088` **green**, all 17 steps.
+Nine commits on `main` (`754a5fc`..`faa817d`). CI run `35732995088` **green**, all 17 steps; the two
+documentation follow-ups re-ran the same gate green.
 
 ## The four decisions, and what each produced
 
@@ -46,8 +47,14 @@ Seven commits on `main` (`754a5fc`..`e5b3393`). CI run `35732995088` **green**, 
 - **`IDE/`.** Not empty: it holds an empty `.workbuddy-ai/memory/` skeleton from a session that ran
   with the wrong working directory. Left for a human, since this project treats `.workbuddy-ai` as
   data rather than cache. (`ai/` and `provider/` were genuinely empty and went.)
-- **Still open from the plan:** dependency auditing (§3.2), coverage (§4.2), the root docs
-  reorganisation (§5.1).
+- **Dependency auditing (§3.2) — measured, then left as a one-liner.** The plan had recommended
+  "add a PR-time audit" without evidence one could pass. `pnpm audit` reports **2 moderate** advisories
+  (one root cause: `vitest` `<4.1.11`), so `--audit-level=moderate` fails today and
+  **`--audit-level=high` exits 0** — that is the addable version. The vitest fix needs `>=4.1.11`
+  against a latest of `5.0.1`, i.e. a major test-runner migration across three packages and 460 tests
+  for a devDependency that never enters the bundle. Its own commit, not folded into a gate.
+- **Still open from the plan:** coverage (§4.2), the root docs reorganisation (§5.1 — 21 root `.md`
+  files while `docs/` holds one).
 
 ## The two things worth carrying forward
 

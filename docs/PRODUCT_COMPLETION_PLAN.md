@@ -182,7 +182,7 @@ run. `rustsec/audit-check` avoids the multi-minute `cargo install cargo-audit` c
 **The vitest bump is its own decision, not part of the gate.** The advisory is a devDependency that never
 enters the bundle, and exploiting it requires running a hostile test — which is not this repo's threat model.
 The patched line is `>=4.1.11` while latest is `5.0.1`, so fixing it means a **major** test-runner migration
-across all three packages and 442 TypeScript tests. Worth doing deliberately, with the full gate, not folded
+across all three packages and 460 TypeScript tests. Worth doing deliberately, with the full gate, not folded
 into a security-gate commit.
 
 ### 3.3 What is already good — and one thing that only *looks* broken
