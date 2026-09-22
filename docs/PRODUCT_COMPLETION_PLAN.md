@@ -203,8 +203,20 @@ warnings** — 8 unmaintained (`derivative`, `instant`, `proc-macro-error`, and 
 unsound (`glib 0.18.5`, RUSTSEC-2024-0429, unsound `Iterator`/`DoubleEndedIterator` impls for
 `glib::VariantStrIter`).
 
-Informational warnings do not fail the check, and that is the right default here. `glib` arrives through
-Tauri's Linux/GTK dependency tree, and a lockfile is target-independent while this product ships macOS only.
+Informational warnings do not fail the check, and that is the right default here — and the reason was
+verified rather than assumed. `glib` is **not in the macOS build at all**:
+
+```
+cargo tree --target aarch64-apple-darwin -i glib    # nothing to print
+cargo tree --target x86_64-apple-darwin  -i glib    # nothing to print
+cargo tree --target x86_64-unknown-linux-gnu -i glib
+  glib v0.18.5
+  └── gtk v0.18.2 → … → tauri v2.11.5 → ai-provider-router v1.0.0
+```
+
+The Linux command is the positive control: it proves the query finds `glib` when `glib` is present, so the
+two macOS negatives mean absent rather than mistyped. A lockfile is target-independent, which is why RustSec
+reports a crate this product never compiles.
 The other eight are transitive proc-macro and Unicode-table crates with no advisory against them, only an
 abandonment notice. Worth knowing; not worth a gate, and not worth an `ignore` list that would also hide a
 real advisory filed against the same crate later.
