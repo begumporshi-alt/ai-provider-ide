@@ -76,6 +76,9 @@
   content not index; don't assert collection length.
 - **vitest does not typecheck.** `expect(x).toBe(true, "msg")` is invalid — use `expect(x, "msg").toBe(true)`.
   Run the gate, not just vitest.
+- **`serde_json` writes keys sorted** (`{"index":0,"type":…}`). Assert JSON/SSE by parsing and comparing
+  fields, never by raw substring — a substring test binds to key order and silently tests nothing.
+- Bash `grep` on a redirected file returns empty (shim). Use the Grep tool, or `tail` the file.
 - A cache needs an **authority**, not just a TTL — check mutation sites can reach it.
 - Clamp from numbers/numeric strings only. **Never pre-parse before clamping** — `Number("")` is `0` = *unlimited*
   for the per-provider cap; pass the raw string.
