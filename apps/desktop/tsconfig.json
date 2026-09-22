@@ -18,7 +18,16 @@
     "strict": true,
     "noUnusedLocals": true,
     "noUnusedParameters": true,
-    "noFallthroughCasesInSwitch": true
+    "noFallthroughCasesInSwitch": true,
+
+    /* Stated, not inferred. Without this, tsc discovers `@types/*` by enumerating the installed
+     * tree at runtime, so which globals exist becomes a property of the install rather than of the
+     * source. That broke silently on 2026-09-22: bumping vitest 3.2.7 -> 4.1.11 reshaped the
+     * dependency graph and `@types/node` stopped being auto-included, failing `e2e/mock-servers.ts`
+     * and `agentLoop.test.ts` with TS2591 on `process` and `node:child_process` -- with the package
+     * present, complete (89 .d.ts) and correctly symlinked. Naming it here makes the requirement
+     * explicit and immune to how pnpm happens to lay the tree out. */
+    "types": ["node"]
   },
   "include": ["src", "e2e"],
   "references": [{ "path": "./tsconfig.node.json" }]

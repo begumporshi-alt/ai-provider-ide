@@ -9,13 +9,15 @@
   "scripts": {
     "typecheck": "tsc --noEmit --noUnusedLocals --noUnusedParameters",
     "test": "vitest run",
+    "test:coverage": "vitest run --coverage",
     "build": "tsc --noEmit"
   },
   "dependencies": {
     "zod": "^3.24.0"
   },
   "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.11",
     "typescript": "6.0.3",
-    "vitest": "^3.1.0"
+    "vitest": "^4.1.11"
   }
 }

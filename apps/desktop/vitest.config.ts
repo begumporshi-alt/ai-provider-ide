@@ -16,5 +16,22 @@ export default defineConfig({
     hookTimeout: 30_000,
     // Keep going past a failure so one flaky mock does not hide the rest of the pass.
     bail: false,
+
+    /**
+     * Coverage is a **report, not a gate** — see docs/PRODUCT_COMPLETION_PLAN.md §4.2. There is no
+     * threshold here on purpose: a percentage that fails a build punishes an unrelated refactor and
+     * teaches people to lower the number rather than read it.
+     *
+     * `include` is stated rather than left to the default so the measured surface is explicit:
+     * `src/**` is what this package owns. `exclude` drops the test files, which are not coverage of
+     * the product — vitest excludes them by default, but naming them means a config change cannot
+     * quietly start counting them.
+     */
+    coverage: {
+      provider: "v8",
+      reporter: ["text-summary", "json-summary"],
+      include: ["src/**"],
+      exclude: ["**/*.test.ts", "**/*.test.tsx"],
+    },
   },
 });
