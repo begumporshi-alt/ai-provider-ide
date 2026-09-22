@@ -1,59 +1,61 @@
-# Overview — what remains to ship this as a product (2026-09-22)
+# Overview — product completion, decisions executed (2026-09-22)
 
 ## What was done
 
-Assessed the repo at `3bb7665` against what "a professional, shippable product" requires, and wrote the result
-to **`docs/PRODUCT_COMPLETION_PLAN.md`** (305 lines).
+Answered the question *"what is left to make this a professional product?"* by auditing the repo at
+`3bb7665` (written up as **`docs/PRODUCT_COMPLETION_PLAN.md`**), then — on the four decisions that
+followed — implemented them and shipped.
 
-Every claim in the plan carries a `file:line` or the command that produced it. External claims were checked
-against the Tauri v2 documentation rather than recalled. Nothing was modified except adding that plan.
+Seven commits on `main` (`754a5fc`..`e5b3393`). CI run `35732995088` **green**, all 17 steps.
 
-## The finding, in one line
+## The four decisions, and what each produced
 
-**The engineering is much further along than the packaging.** Four test suites, a real local gate, an audit
-trail and a working gateway — but no licence, no release pipeline, no changelog, no disclosure policy.
-
-## What the evidence showed
-
-| Area | State |
+| Decision | Outcome |
 |---|---|
-| Licence | **None.** Repo is public (`gh repo view` → `visibility: PUBLIC`), `licenseInfo: null` |
-| Release pipeline | **None.** `.github/workflows/` holds only `ci.yml`; it never triggers on tags |
-| CI vs the local gate | **CI is weaker.** `ci.yml` has no `pnpm build`; `ci-local.sh:85` does, and says why at `:83-85` |
-| Auto-updater | **Documented, not implemented — and the docs are wrong for Tauri v2** |
-| Linting | **None anywhere** — no ESLint, Prettier, rustfmt or clippy config |
-| Version | Stated in 4 files; root says `0.0.0`, the other three say `1.0.0`, tag is `v1.0.0` |
-| Governance | No `LICENSE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY.md` |
-| Docs | 21 root-level `.md` files; `docs/` holds one |
+| **Apache-2.0** | `LICENSE` added; GitHub now reports `apache-2.0` (it was `null` on a public repo) |
+| **Delete the updater docs/scripts** | All four v1-era files removed; README states updates are manual |
+| **Yes, this goes to other people** | Made the release pipeline and notarization mandatory rather than optional |
+| **Build the `cached_tokens` measurement** | Migration 0015 adds a **nullable** `ledger.cached_tokens` |
 
-## The three findings worth acting on today
+## What shipped
 
-1. **A public repo with no licence is legally all-rights-reserved** — nobody may fork or contribute. This is a
-   decision, not a code change, and it is the single highest-leverage item.
-2. **`v1.0.0` is a tag with nothing attached.** No release workflow exists, so the app is not downloadable.
-3. **The updater docs describe a mechanism that is not there.** `SIGNING.md:35` claims `tauri.conf.json`
-   "now includes" an `updater` block — it does not, and in Tauri v2 the block belongs under `plugins.updater`.
-   `SIGNING.md:29` exports `TAURI_SIGNING_PUBLIC_KEY`, a variable that does not exist. And
-   `generate-updater-keys.sh:9-14` generates an **RSA** pair via `openssl`, while Tauri verifies with
-   **minisign/ed25519** keys from `tauri signer generate` — those keys cannot verify an update.
+- **Licence and version.** Apache-2.0, and six manifests that had drifted now agree on `1.0.0` —
+  enforced by a new `pnpm check-version-sync` that runs in CI. The root `package.json` and both
+  workspace packages had still said `0.0.0` while the app said `1.0.0`.
+- **Release pipeline.** `.github/workflows/release.yml` builds a universal (Apple Silicon + Intel)
+  macOS bundle on a `v*` tag and attaches it to a **draft** release. Signing and notarization come
+  from repository secrets and never from `tauri.conf.json`, because no other job runs a full
+  `tauri build` — a pinned identity there would be invisible to every check in the repo.
+- **CI parity.** `pnpm build` added to `ci.yml`. The local mirror had always compiled the bundle and
+  CI did not, which made CI the *weaker* gate: a change could be green in CI and broken at release.
+- **Migration 0015.** `ledger.cached_tokens`, **nullable on purpose**: `NULL` means the provider
+  reported no cache block, which is a different finding from reporting zero. Eight tests, and two
+  falsification probes, each reverted after confirming the right assertion failed for the right reason.
+- **Governance.** `SECURITY.md` (scoped around credential handling, gateway auth, egress, local
+  privilege, memory scoping, the tool sandbox), `CONTRIBUTING.md`, `CHANGELOG.md`.
+- **Repo metadata.** Description and 10 topics set; `bundle.targets` narrowed from `"all"` to what is
+  actually built and tested.
 
-A document that describes update signing incorrectly is worse than no document, because it is the artefact a
-future contributor trusts.
+## Deliberately left, with the reason
 
-## Verified, and *not* a bug
+- **`cargo fmt --check` and `cargo clippy -D warnings`.** Measured before adding, rather than assumed:
+  `cargo fmt --check` fails across the existing Rust sources and clippy reports **25 warnings**. A
+  gate that fails on the first push is worse than no gate. Adopting rustfmt rewrites most of
+  `src-tauri/src/` and destroys `git blame` across the whole host for a change with no behavioural
+  content — a deliberate decision, not a free win.
+- **`IDE/`.** Not empty: it holds an empty `.workbuddy-ai/memory/` skeleton from a session that ran
+  with the wrong working directory. Left for a human, since this project treats `.workbuddy-ai` as
+  data rather than cache. (`ai/` and `provider/` were genuinely empty and went.)
+- **Still open from the plan:** dependency auditing (§3.2), coverage (§4.2), the root docs
+  reorganisation (§5.1).
 
-- **`connect-src` omitting `http://127.0.0.1:*` is correct.** There is no `fetch(` in `apps/desktop/src` — the
-  UI reaches the gateway over Tauri IPC, not HTTP. `Gateway.tsx:119` only formats the URL for display.
-- **Least privilege is genuinely tight.** `capabilities/gateway.json` gives the hidden worker window only
-  event listen/unlisten.
+## The two things worth carrying forward
 
-## Open decisions (in the plan, §8)
+**`vitest` does not typecheck.** Adding a field to `BridgeMsg::Usage` broke **eight** pattern matches
+across four gateway modules, and `cachedTokens` was missing from `LedgerEntry` so `model-router.ts`
+failed to typecheck in three places. 249 green router-core tests said nothing about either —
+`pnpm typecheck`, `pnpm build` and `cargo clippy` found both.
 
-1. Licence — MIT vs Apache-2.0 *(Apache-2.0 recommended)*.
-2. Updater — implement properly, or delete the docs/scripts? *(Recommendation: delete now.)*
-3. Audience — does this go to other people? This answer changes the remaining work more than any other.
-4. `cache_control` — build the `cached_tokens` measurement migration, or keep parked?
-
-## Follow-up
-
-No source file was changed, so no test run was needed. The next action is a decision, not a build.
+**`git commit` with no pathspec commits everything staged.** A `git rm` from earlier had staged four
+deletions, so the first attempt at the licence commit silently carried them. Caught by reading
+`git show --stat` per commit; fixed by resetting and re-committing with explicit paths per batch.

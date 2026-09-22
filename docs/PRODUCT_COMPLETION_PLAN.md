@@ -303,3 +303,68 @@ dependency audit job; the `docs/` reorganisation; `CONTRIBUTING.md`.
    Program for notarization), or is it a local/portfolio tool (which makes Phase B optional)? This single answer
    changes the size of the remaining work more than anything else.
 4. **`cache_control`** — build the `cached_tokens` measurement migration now, or keep it parked?
+
+---
+
+## Status — decisions taken 2026-09-22
+
+All four were answered: **Apache-2.0**; **delete** the updater docs and scripts; **yes, this goes to
+other people**; and **build** the measurement.
+
+| § | Item | State |
+|---|---|---|
+| 1.1 | Licence | **Done** — `LICENSE` (Apache-2.0); GitHub reports `apache-2.0`; description and 10 topics set |
+| 1.2 | Release pipeline | **Done** — `.github/workflows/release.yml`, tag-triggered, `tauri-action`, draft release |
+| 1.3 | CI compiles the bundle | **Done** — `pnpm build` added to `ci.yml` *and* the local mirror |
+| 1.4 | Updater docs and scripts | **Done** — all four files deleted; README states updates are manual |
+| 2.1 | Version drift | **Done** — six manifests agree on `1.0.0`, enforced by `pnpm check-version-sync` |
+| 2.2 | `CHANGELOG.md` | **Done** |
+| 2.3 | `bundle.targets` | **Done** — narrowed to `app` + `dmg` |
+| 3.1 | `SECURITY.md` | **Done** |
+| 3.2 | Dependency audit | **Still open** — no `pnpm audit` / `cargo audit` job |
+| 4.1 | Linter and formatter | **Deliberately not added** — see below |
+| 4.2 | Coverage | **Still open** |
+| 5.1 | Docs reorganisation | **Still open** — the root docs are untouched |
+| 5.2 | README port hardcode | **Done** |
+| 5.3 | Junk directories | **Partly** — `ai/` and `provider/` removed; `IDE/` left alone, see below |
+| 6.4 | `cache_control` measurement | **Done** — migration 0015 plus 8 tests |
+
+### Two items deliberately left, with the reason
+
+**The `cargo fmt --check` / `cargo clippy -D warnings` gate was not added.** Measured rather than
+assumed: `cargo fmt --check` fails across the existing Rust sources, and `cargo clippy` reports **25
+warnings** at `HEAD`. Adding either as a gate would have broken CI on the first push, which is worse
+than having no gate at all.
+
+Adopting rustfmt is therefore a real decision, not a free win. It rewrites most of
+`apps/desktop/src-tauri/src/`, which destroys `git blame` across the entire host for a change with no
+behavioural content. That is worth doing deliberately, as its own commit, when the blame cost is
+acceptable — not smuggled into a release-preparation batch. The same applies to the 25 clippy
+warnings: several (`too many arguments (8/7)`, three `very complex type`) need judgement rather than
+a mechanical fix.
+
+**`IDE/` was not removed.** It is not empty — it contains `IDE/.workbuddy-ai/memory/`, an empty
+directory skeleton left by a session that ran with the wrong working directory. No files are at risk,
+but it is named `.workbuddy-ai`, which this project treats as data rather than cache, so it was left
+for a human to decide rather than deleted on a guess.
+
+### What the gate caught that the unit tests could not
+
+Both are the same class of failure, and both were invisible to a green `vitest` run:
+
+1. Adding a field to `BridgeMsg::Usage` broke **eight** pattern matches across four gateway modules.
+2. `cachedTokens` was missing from `LedgerEntry`, so `model-router.ts` failed to typecheck in three
+   places.
+
+`vitest` does not typecheck, so 249 passing router-core tests said nothing about either. They were
+found by `pnpm typecheck`, `pnpm build` and `cargo clippy` — which is the argument for §1.3 in this
+same plan. The fix for (1) was to remove the enum field entirely: the ledger already receives
+`cached_tokens` through the TS router path, so the field was dead weight.
+
+### What the measurement now needs to answer
+
+The column exists; the data does not yet. Before `cache_control` can be decided, the ledger has to
+accumulate `cached_tokens` across real traffic — and the question to ask of it is the one the
+nullability was designed for: **is the column mostly `NULL` (no provider reports caching) or mostly
+`0` (providers report it and we are not using it)?** Only the second justifies reworking request
+bodies.
