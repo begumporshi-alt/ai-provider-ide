@@ -143,24 +143,56 @@ describe("retry-after", () => {
       thrown = e;
     }
     expect(thrown).toBeInstanceOf(AllAttemptsFailedError);
-    expect((thrown as AllAttemptsFailedError).maxRetryAfterMs()).toBe(60_000);
+    expect((thrown as AllAttemptsFailedError).minRetryAfterMs()).toBe(60_000);
   });
 
-  it("takes the longest cooldown across attempts, and zero when none was named", () => {
-    // The max, not the last attempt's value: the client should wait out the window the provider
-    // actually named. The longest is deliberately FIRST, so a `reduce` that keeps the last value
-    // cannot pass. Zero means "no hint" — the bridge then omits the field entirely.
+  it("takes the shortest cooldown across attempts, and zero when none was named", () => {
+    // Shortest, not longest. The planner drops cooled keys (`route-planner.ts`), so the router can
+    // serve the retry as soon as the *first* of these keys frees up — telling the client to wait for
+    // the slowest one makes it idle for no reason.
+    //
+    // The shortest value is deliberately in the MIDDLE: a `reduce` that keeps the first or the last
+    // value gets 45_000 or 60_000 and fails, so this pins the fold direction rather than the input.
     expect(
       new AllAttemptsFailedError("m1", [
         { candidate: candidate("p1", "k1"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 45_000 },
-        { candidate: candidate("p1", "k2"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 12_000 },
-      ]).maxRetryAfterMs(),
-    ).toBe(45_000);
+        { candidate: candidate("p1", "k2"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 30_000 },
+        { candidate: candidate("p1", "k3"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 60_000 },
+      ]).minRetryAfterMs(),
+    ).toBe(30_000);
     expect(
       new AllAttemptsFailedError("m1", [
         { candidate: candidate("p1", "k1"), cls: "RATE_LIMITED", status: 429 },
         { candidate: candidate("p1", "k2"), cls: "RATE_LIMITED", status: 429 },
-      ]).maxRetryAfterMs(),
+      ]).minRetryAfterMs(),
     ).toBe(0);
+  });
+
+  it("ignores a wait that a provider never named, and keeps one it did", () => {
+    // A 503 that carries `Retry-After` leaves its key technically usable — the tracker only cools on
+    // RATE_LIMITED — but the provider still said it was overloaded. Its wait must therefore count:
+    // drop it and the client retries in a second, straight back into the overload.
+    expect(
+      new AllAttemptsFailedError("m1", [
+        { candidate: candidate("p1", "k1"), cls: "SERVER_ERROR", status: 503, retryAfterMs: 30_000 },
+      ]).minRetryAfterMs(),
+    ).toBe(30_000);
+    // An attempt that named nothing contributes nothing, so it can neither raise nor lower the hint.
+    expect(
+      new AllAttemptsFailedError("m1", [
+        { candidate: candidate("p1", "k1"), cls: "NETWORK", status: 0 },
+        { candidate: candidate("p1", "k2"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 20_000 },
+      ]).minRetryAfterMs(),
+    ).toBe(20_000);
+  });
+
+  it("floors a sub-second wait at the tracker's own floor", () => {
+    // A provider naming 400ms still gets a 1000ms cooldown, so the hint must say 1000ms — a `0`
+    // would read to the client as "retry now", which is the window the provider asked us to avoid.
+    expect(
+      new AllAttemptsFailedError("m1", [
+        { candidate: candidate("p1", "k1"), cls: "RATE_LIMITED", status: 429, retryAfterMs: 400 },
+      ]).minRetryAfterMs(),
+    ).toBe(1000);
   });
 });

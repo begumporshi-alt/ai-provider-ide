@@ -393,7 +393,9 @@ async function handle(req: BridgeRequest): Promise<void> {
     if (ac.signal.aborted) return;
     const msg = String((e as Error)?.message ?? e);
     const status = gatewayStatus(e, msg);
-    const retryAfterMs = e instanceof AllAttemptsFailedError ? e.maxRetryAfterMs() : 0;
+    // The shortest cooldown the router is subject to, not the longest: the planner drops cooled
+    // keys, so the earliest a retry can be served is when the first of them frees up.
+    const retryAfterMs = e instanceof AllAttemptsFailedError ? e.minRetryAfterMs() : 0;
     await invoke("gateway_error", {
       requestId: req.requestId,
       status,

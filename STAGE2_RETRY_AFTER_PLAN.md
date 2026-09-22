@@ -1,4 +1,4 @@
-# STAGE 2 PLAN — plumb longest key cooldown into client-facing Retry-After
+# STAGE 2 PLAN — plumb the key cooldown into client-facing Retry-After
 
 Date: 2026-09-22
 Status: **IMPLEMENTED, gated, falsified** — see "What shipped" at the end
@@ -18,19 +18,22 @@ the client always gets `1` regardless of the provider's actual ask. The ZCode bu
 (seven 429s in thirteen seconds) is the symptom: the client honours `1`, retries at ~2 s
 intervals, and gets hit by the provider again.
 
-## What "plumb the longest key cooldown" means
+## What "plumb the key cooldown" means
 
 When the TS core's health tracker reports all-keys-cooled (429 from every key in the plan),
-compute the **longest remaining cooldown** across all keys and carry it through to the
+compute the **shortest remaining cooldown** across all keys and carry it through to the
 Rust handler, which then sets `Retry-After: <seconds>` on the HTTP 429 instead of the
 floor `1`.
+
+Shortest, not longest — see "The min-vs-max question, resolved" at the end. In brief: the route
+planner drops cooled keys, so the router can serve the retry as soon as the *first* key frees up.
 
 Example:
 ```
 Key A cools in 58 s
 Key B cools in 42 s
 Key C cools in 71 s
-→ Gateway returns: Retry-After: 71
+→ Gateway returns: Retry-After: 42
 ```
 
 ## Change set
@@ -158,7 +161,7 @@ each difference is an improvement:
 
 1. **The cooldown comes from the failure, not the health tracker.** The plan proposed
    `router.healthTracker.maxRemainingCooldownMs()`. The implementation adds
-   `AllAttemptsFailedError.maxRetryAfterMs()` instead — the longest `retry-after` the provider
+   `AllAttemptsFailedError.minRetryAfterMs()` instead — the shortest `retry-after` the provider
    named across *this request's* failed attempts. That is the better signal: a global "longest
    remaining cooldown" includes a key cooled by an *earlier* request (say 120 s), so it would
    tell the client to wait 120 s when the key it will actually be routed to is ready in 30 s.
@@ -190,9 +193,9 @@ handlers still destructuring the old two-field variant, 2 × `E0308` from the `C
   `a_sub_second_cooldown_never_reports_zero` (400 ms → 1). With `err_with_cooldown` reverted to
   plain `err`, the three cooldown tests fail with `left: "1"` — the middleware floor — while the
   two floor tests keep passing. So the new tests carry the signal and the old ones do not.
-- Two new TS tests, **falsified first**: changing `maxRetryAfterMs()` to keep the *last* value
-  instead of the max fails with `expected 12000 to be 45000`. The longest value is deliberately
-  first in the chain so that probe is caught.
+- Two new TS tests, **falsified first**: a fold that kept the *last* value instead of the max failed
+  with `expected 12000 to be 45000`. *Superseded* — the fold now takes the **shortest** value, and
+  that probe was replaced; the current falsification is recorded in the section below.
 
 ### Not done, deliberately
 
@@ -201,6 +204,65 @@ handlers still destructuring the old two-field variant, 2 × `E0308` from the `C
   so adding a field name would be a no-op. Verifying the field at the web layer would need an
   invoke-recording facility the shim does not have. The Rust tests cover the behaviour from the
   bridge message through to the HTTP header.
-- **The min-vs-max question is open.** The client is told the *longest* cooldown, but the
-  earliest a retry can succeed is the *shortest*, so max over-waits by design. It is conservative
-  and matches the plan; whether min would serve clients better is a product decision, not a bug.
+- **The min-vs-max question was left open here, and was later resolved.** The fold now takes the
+  *shortest* wait — see the section below, which supersedes this bullet.
+
+---
+
+## The min-vs-max question, resolved (2026-09-22)
+
+Stage 2 shipped `maxRetryAfterMs()` — the *longest* wait any provider named — and flagged the
+inverse as an open product question. It is now settled in favour of the **shortest**, because the
+mechanism turned out to be traceable rather than a matter of taste.
+
+**The evidence.** `route-planner.ts:156` builds every plan by filtering on health:
+
+```ts
+const usable = keys.filter((k) => health.isKeyUsable(k, now));
+```
+
+`isKeyUsable` (`health-tracker.ts:30`) returns false while `h.cooldownUntil > now`. So a cooled key
+is not merely deprioritised — it is **excluded from the plan entirely**, and the plan is rebuilt for
+every request. The router therefore serves the retry at the moment the *first* cooled key frees up.
+Reporting the longest made the client wait for a key the planner would never have chosen.
+
+Worked example — the one in the problem statement, now inverted: with keys cooling in 58 s, 42 s and
+71 s, `Retry-After: 71` forced a 29-second idle that bought nothing. The router was serving on the
+42-second key all along.
+
+**What the fold does now** (`AllAttemptsFailedError.minRetryAfterMs()`):
+
+- takes the **minimum** over attempts, floored at `COOLDOWN_FLOOR_MS` (1000 ms);
+- ignores attempts that named no wait;
+- counts **every** named wait, not only `RATE_LIMITED` ones.
+
+That last point is deliberate and is the one judgement call inside the change. A 503 carrying
+`Retry-After: 30` does *not* cool its key — `recordResult` only cools on `RATE_LIMITED` — so its key
+stays usable and the router would retry it immediately. Filtering the wait out would tell the client
+to retry in a second, straight back into a provider that had just said it was overloaded. The
+provider's advice is worth honouring even where the tracker does not enforce it. A test pins this
+explicitly, so a later "tidy-up" that adds a class filter fails loudly.
+
+**Single source of truth for the floor.** `COOLDOWN_FLOOR_MS` moved out of `recordResult`'s body and
+is now exported from `health-tracker.ts`, used by both the tracker and the fold. Two hardcoded
+`1000`s were free to drift, and the whole point is that the wait the client is *told* matches the
+wait the tracker *enforces*.
+
+### Verification
+
+- `pnpm --filter @aiprovider/router-core test` — **241 passed** (239 before; three tests replaced
+  one, net +2).
+- `pnpm typecheck` — clean across all three workspaces.
+- **Falsified twice, one probe at a time:**
+  - A true "longest" fold (seed `-Infinity`, fold with `Math.max`) fails **exactly one** test —
+    `takes the shortest cooldown across attempts` → `expected 60000 to be 30000`. The shortest value
+    sits in the *middle* of the chain, so a fold that keeps the first or the last value fails too.
+  - Removing the floor fails **exactly one** test — `floors a sub-second wait at the tracker's own
+    floor` → `expected 400 to be 1000`.
+- The Rust tests were **not** touched. The min-vs-max choice lives entirely in the TS fold; the Rust
+  bridge receives a single number, and its four tests still pin the ms→seconds conversion and the
+  never-zero floor.
+- **The first probe lied.** Seeding `+Infinity` and folding with `Math.max` yields `Infinity`, so
+  `Number.isFinite` sent the result to `0` and four tests failed for a reason that had nothing to do
+  with max-vs-min. A probe must be a *working* implementation of the wrong thing, or it proves
+  nothing.

@@ -15,6 +15,17 @@ export interface KeyHealth {
 
 const AUTH_BREAKER_THRESHOLD = 3;
 
+/**
+ * The shortest cooldown a rate-limited key is ever given, in milliseconds. A provider that names a
+ * sub-second `Retry-After` (or none at all) still gets this, so a client is never told to retry
+ * "now" into a window that has not closed.
+ *
+ * Exported because the value the client is *told* must equal the value the tracker *enforces*:
+ * `AllAttemptsFailedError.minRetryAfterMs()` floors with this too, and two hardcoded 1000s would
+ * be free to drift apart.
+ */
+export const COOLDOWN_FLOOR_MS = 1000;
+
 export class HealthTracker {
   private keys = new Map<string, KeyHealth>();
 
@@ -50,7 +61,7 @@ export class HealthTracker {
       return;
     }
     if (cls === "RATE_LIMITED") {
-      h.cooldownUntil = now + Math.max(retryAfterMs ?? 0, 1000);
+      h.cooldownUntil = now + Math.max(retryAfterMs ?? 0, COOLDOWN_FLOOR_MS);
     } else if (cls === "AUTH_FAILED") {
       h.consecutiveAuthFailures++;
       if (h.consecutiveAuthFailures >= AUTH_BREAKER_THRESHOLD) h.breakerOpen = true;

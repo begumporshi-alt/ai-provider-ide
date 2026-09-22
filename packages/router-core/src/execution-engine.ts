@@ -9,7 +9,7 @@ import { ManifestHttpError } from "./manifest-interpreter.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
 import { classify, type ErrorClass } from "./errors.js";
-import type { HealthTracker } from "./health-tracker.js";
+import { COOLDOWN_FLOOR_MS, type HealthTracker } from "./health-tracker.js";
 import type { ProviderLimiter } from "./concurrency.js";
 import type { ToolCall } from "./ports.js";
 
@@ -200,8 +200,29 @@ export class AllAttemptsFailedError extends Error {
     super(`all attempts failed for ${model} [${detail || "empty plan"}]`);
   }
 
-  /** Longest upstream retry-after across all failed attempts, in milliseconds. Zero if none set one. */
-  maxRetryAfterMs(): number {
-    return this.chain.reduce((max, a) => Math.max(max, a.retryAfterMs ?? 0), 0);
+  /**
+   * The shortest wait any attempt named, in milliseconds. Zero when none named one — the caller
+   * then omits the hint entirely and the middleware's floor stands.
+   *
+   * **Shortest, not longest.** The route planner drops keys that are still cooling
+   * (`route-planner.ts`: `keys.filter((k) => health.isKeyUsable(k, now))`), so the earliest the next
+   * request can be served is the moment the *first* of these keys frees up. Reporting the longest
+   * would make the client wait for a key the planner would not have chosen anyway — with keys
+   * cooling in 58 s, 42 s and 71 s, the client can be served at 42 s, not 71 s.
+   *
+   * Every named wait counts, not only `RATE_LIMITED` ones. A 503 that carries `Retry-After: 30`
+   * leaves its key technically usable, so filtering it out would tell the client to retry in a
+   * second — straight back into a provider that just said it was overloaded.
+   *
+   * Floored at `COOLDOWN_FLOOR_MS`, matching the tracker, so a provider naming 400 ms never yields
+   * a hint of `0`, which would read as "retry now".
+   */
+  minRetryAfterMs(): number {
+    let shortest = Number.POSITIVE_INFINITY;
+    for (const a of this.chain) {
+      if (!a.retryAfterMs || a.retryAfterMs <= 0) continue;
+      shortest = Math.min(shortest, Math.max(a.retryAfterMs, COOLDOWN_FLOOR_MS));
+    }
+    return Number.isFinite(shortest) ? shortest : 0;
   }
 }
