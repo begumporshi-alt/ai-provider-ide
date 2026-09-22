@@ -1755,3 +1755,53 @@ the spec failed with `Received: null`, i.e. the camel payload was silently accep
 5. `MemoryInput`'s consumer swallows a capture failure on purpose ("a memory write must never fail a chat")
    but now **logs** it (`engine.ts:113,172,294`). Detection belongs at the boundary, visibility at the
    consumer: without the first the second never fires, and without the second the first is invisible.
+
+## What the gateway does NOT record — and the three backlog answers that follow (2026-09-22)
+
+A five-item backlog was worked through. Two items were already done, one is closed, and two remain —
+but the reusable finding is **where the answers did and did not come from.**
+
+### Nothing records a request path or body
+
+| store | holds | does not hold |
+|---|---|---|
+| `ledger` (1530 rows) | `ts`, `modality`, `source`, `provider_id`, `key_id`, `requested_model`, `model`, `status`, `http_status`, `error_class`, `latency_ms`, `tokens_in/out`, `cost_estimate_micros`, `fallback_chain_json` | the request **path**, the request **body**, the error **message** |
+| `gateway.log` | worker/watchdog heartbeats only (`worker reported in after Nms quiet`, `watchdog: worker beat stale for Nms`) | anything about requests at all |
+
+So **"does client X call endpoint Y?" is unanswerable from this system's own telemetry.** Any future
+question of that shape needs either (a) a different source, or (b) instrumentation first. Do not
+budget a verification step that assumes the data exists — check the store before promising the check.
+
+### `previous_response_id` — CLOSED, and the stated reason was wrong
+
+The backlog said "only affects Codex, and only if it uses server-side continuity — `wire_api="chat"`
+avoids it entirely." **Codex's config uses `wire_api = "responses"`, not `"chat"`.** The conclusion
+survives for a stronger reason, in `~/.codex/config.toml`:
+
+- `disable_response_storage = true` — server-side continuity is switched off, so there is no stored
+  response for a `previous_response_id` to reference; Codex replays the transcript client-side.
+- `base_url = "http://localhost:20128/v1"` — Codex currently points at **OmniRoute on 20128**, not at
+  this gateway at all. So the question is doubly moot until that changes.
+
+**Do not build a response store.** If Codex is ever repointed here, re-read its config first.
+
+### `cache_control` — real cost, but blocked on *measurement*, not effort
+
+The traffic shape confirms the premise (ledger, `source='gateway'`): **`agnes-2.5-flash` — 648 requests,
+35,948,966 input tokens against 213,027 output.** ~55.5K input per request, a 169:1 ratio. That is the
+resent-prefix pattern exactly.
+
+But three things are unknown, and the first is decisive:
+
+1. **The router never reads `prompt_tokens_details.cached_tokens`.** The string appears nowhere in the
+   codebase, and `ledger` has no column for it. So we cannot tell whether the upstream is *already*
+   caching — a rework of the content-block mapping could buy nothing, or buy a lot, and we could not tell.
+2. **No active manifest mentions caching.** `agnes` is `user-edited`, `cline` is `ai-generated`; neither
+   body contains the substring `cache`. Caching support is undeclared, not disproven.
+3. Only two providers exist at all: `agnes` (`apihub.agnes-ai.com/v1`) and `cline` (`api.cline.bot/api/v1`).
+   Neither is Anthropic, whose mechanism `cache_control` is.
+
+**So the order is measure → decide → rework**, not rework → hope. Capturing cached tokens is the
+precondition, and it needs a ledger column, which means a real migration (`MIGRATIONS` + `schema_version`
+bump + count assertion + table-existence list + the rewind test) — not a drive-by edit.
+
