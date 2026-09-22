@@ -69,45 +69,6 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
     }
 }
 
-#[cfg(test)]
-mod tool_conversion_tests {
-    use super::*;
-
-    #[test]
-    fn nested_function_declarations_are_flattened() {
-        let out = tools_to_openai(&json!([{ "functionDeclarations": [
-            { "name": "Bash", "description": "Run it", "parameters": { "type": "object" } },
-            { "name": "Read" }
-        ]}])).unwrap();
-        assert_eq!(out.as_array().unwrap().len(), 2);
-        assert_eq!(out[0]["function"]["name"], "Bash");
-        assert_eq!(out[1]["function"]["name"], "Read");
-        assert_eq!(out[1]["function"]["parameters"]["type"], "object");
-    }
-
-    #[test]
-    fn bare_declarations_are_accepted_too() {
-        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
-        assert_eq!(out[0]["type"], "function");
-    }
-
-    #[test]
-    fn an_empty_tools_array_means_no_tools_at_all() {
-        assert_eq!(tools_to_openai(&json!([])), None);
-    }
-
-    #[test]
-    fn function_calling_config_maps_onto_the_openai_vocabulary() {
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY"}})).unwrap(), json!("required"));
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"NONE"}})).unwrap(), json!("none"));
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"AUTO"}})).unwrap(), json!("auto"));
-        assert_eq!(
-            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["Bash"]}})).unwrap(),
-            json!({ "type": "function", "function": { "name": "Bash" } })
-        );
-    }
-}
-
 /// Gemini error body. `code` and `status` are both derived from the HTTP status so the two cannot
 /// disagree — which they did: the old 429 branch answered `code: 503, status: "INTERNAL"` while
 /// claiming the gateway was "at capacity", so a rate-limited client was told to treat a capacity
@@ -162,13 +123,12 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         Some((m, "streamGenerateContent")) => (m.to_string(), true),
         _ => return gemini_error("bad method suffix — expected :generateContent or :streamGenerateContent", StatusCode::BAD_REQUEST),
     };
-    if streaming {
-        if query.get("alt").map(|v| v.as_str()) != Some("sse") {
+    if streaming
+        && query.get("alt").map(|v| v.as_str()) != Some("sse") {
             // v1: Gemini streaming is served as SSE only (alt=sse); plain JSON-array
             // streaming is not implemented — refuse rather than answer wrongly.
             return gemini_error("streaming requires ?alt=sse", StatusCode::BAD_REQUEST);
         }
-    }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return gemini_error("invalid JSON body", StatusCode::BAD_REQUEST);
     };
@@ -352,7 +312,17 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         }
         None => {
             let (pt, ct) = usage.unwrap_or((0, 0));
-            let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };
+            // Gemini has no distinct tool-call finish reason. Its `FinishReason` enum has no member
+            // for one — a function call is signalled by the presence of `functionCall` parts (built
+            // above), and `finishReason` stays `STOP`.
+            //
+            // Every *other* dialect does distinguish this turn — Anthropic `tool_use` vs `end_turn`,
+            // OpenAI `tool_calls` vs `stop` — so the temptation is to invent a matching literal
+            // here. That would be wrong on the wire. This read
+            // `if has_tool_calls { "STOP" } else { "STOP" }` until 2026-09-22: a dead branch that
+            // implied a distinction the protocol does not make.
+            // Pinned by `gemini_tool_turn_still_reports_stop`.
+            let finish_reason = "STOP";
             let parts = if has_tool_calls && !tool_parts.is_empty() {
                 tool_parts
             } else {
@@ -372,5 +342,44 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     };
     apply_memory_headers(&mut r, &outcome);
     r
+}
+
+#[cfg(test)]
+mod tool_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn nested_function_declarations_are_flattened() {
+        let out = tools_to_openai(&json!([{ "functionDeclarations": [
+            { "name": "Bash", "description": "Run it", "parameters": { "type": "object" } },
+            { "name": "Read" }
+        ]}])).unwrap();
+        assert_eq!(out.as_array().unwrap().len(), 2);
+        assert_eq!(out[0]["function"]["name"], "Bash");
+        assert_eq!(out[1]["function"]["name"], "Read");
+        assert_eq!(out[1]["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn bare_declarations_are_accepted_too() {
+        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
+        assert_eq!(out[0]["type"], "function");
+    }
+
+    #[test]
+    fn an_empty_tools_array_means_no_tools_at_all() {
+        assert_eq!(tools_to_openai(&json!([])), None);
+    }
+
+    #[test]
+    fn function_calling_config_maps_onto_the_openai_vocabulary() {
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY"}})).unwrap(), json!("required"));
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"NONE"}})).unwrap(), json!("none"));
+        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"AUTO"}})).unwrap(), json!("auto"));
+        assert_eq!(
+            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["Bash"]}})).unwrap(),
+            json!({ "type": "function", "function": { "name": "Bash" } })
+        );
+    }
 }
 

@@ -311,7 +311,7 @@ pub fn sessions(store: &Store, limit: usize) -> Result<Vec<HistorySession>, Stri
     // Previews come from the earliest *user* message in each session. One query for all listed
     // sessions rather than a query per row: the index is a list, and N+1 here is the difference
     // between instant and perceptible on a few hundred sessions.
-    let holes = std::iter::repeat("?").take(rows.len()).collect::<Vec<_>>().join(",");
+    let holes = std::iter::repeat_n("?", rows.len()).collect::<Vec<_>>().join(",");
     let mut stmt = conn
         .prepare(&format!(
             "SELECT session_id, label, meta_json FROM context_nodes

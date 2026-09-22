@@ -279,7 +279,7 @@ fn do_read_file(args: &serde_json::Value, root: &Path) -> ToolResult {
             .map_err(|e| format!("cannot read: {e}"))?;
         let mut text = if buf.len() > MAX_READ_BYTES {
             let mut t = String::from_utf8_lossy(&buf[..MAX_READ_BYTES]).into_owned();
-            t.push_str(&format!("\n… truncated at {} bytes", MAX_READ_BYTES));
+            t.push_str(&format!("\n… truncated at {MAX_READ_BYTES} bytes"));
             t
         } else {
             String::from_utf8(buf).map_err(|_| "file is not valid UTF-8 text".to_string())?
@@ -309,7 +309,7 @@ fn do_write_file(args: &serde_json::Value, root: &Path) -> ToolResult {
         let rel = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
         if content.len() > MAX_WRITE_BYTES {
-            return Err(format!("content exceeds the {} byte cap", MAX_WRITE_BYTES));
+            return Err(format!("content exceeds the {MAX_WRITE_BYTES} byte cap"));
         }
         let path = resolve_within(root, &rel, true)?;
         fs::write(&path, content.as_bytes()).map_err(|e| format!("cannot write: {e}"))?;
@@ -546,7 +546,7 @@ fn do_edit_file(args: &serde_json::Value, root: &Path) -> ToolResult {
         }
         let updated = if all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
         if updated.len() > MAX_WRITE_BYTES {
-            return Err(format!("result exceeds the {} byte cap", MAX_WRITE_BYTES));
+            return Err(format!("result exceeds the {MAX_WRITE_BYTES} byte cap"));
         }
         fs::write(&path, updated.as_bytes()).map_err(|e| format!("cannot write: {e}"))?;
         Ok(format!(
@@ -1357,7 +1357,7 @@ mod tests {
         );
         assert!(res.output.contains("capped at"), "the model must be told it saw a prefix");
         assert!(
-            res.output.contains(&format!("{} bytes", MAX_OUTPUT_BYTES)),
+            res.output.contains(&format!("{MAX_OUTPUT_BYTES} bytes")),
             "the byte cap stopped this, not the match cap: {}",
             res.output
         );
@@ -1375,7 +1375,7 @@ mod tests {
         let res = call("search_files", serde_json::json!({ "pattern": "needle" }), &r);
         assert!(res.ok, "{}", res.output);
         assert!(
-            res.output.contains(&format!("{} matches", MAX_SEARCH_MATCHES)),
+            res.output.contains(&format!("{MAX_SEARCH_MATCHES} matches")),
             "the match cap stopped this, not the byte cap: {}",
             res.output
         );

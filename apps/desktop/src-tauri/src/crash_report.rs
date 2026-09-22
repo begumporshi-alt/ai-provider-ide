@@ -70,7 +70,7 @@ pub fn list_crash_reports(app_data_dir: &Path) -> Vec<String> {
         .into_iter()
         .flatten()
         .filter_map(|e| e.ok())
-        .filter(|e| e.path().extension().map_or(false, |ext| ext == "json"))
+        .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|e| {
             e.file_name()
                 .to_string_lossy()
@@ -104,7 +104,7 @@ pub fn clear_all_crash_reports(app_data_dir: &Path) -> usize {
     let mut count = 0;
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
-            if entry.path().extension().map_or(false, |ext| ext == "json") {
+            if entry.path().extension().is_some_and(|ext| ext == "json") {
                 let _ = fs::remove_file(entry.path());
                 count += 1;
             }
@@ -152,11 +152,11 @@ pub fn install_panic_hook(app_data_dir: PathBuf) {
         };
 
         let backtrace = snapshot_backtrace();
-        let location_msg = if backtrace.is_empty() {
-            format!("{msg} — {location}")
-        } else {
-            format!("{msg} — {location}")
-        };
+        // The backtrace travels as its own field of the report (the third argument below), so the
+        // summary does not encode whether one was captured. An earlier version branched on
+        // `backtrace.is_empty()` here and built the *same* string in both arms — a dead branch that
+        // implied a distinction the report does not make. Removed; see `clippy::if_same_then_else`.
+        let location_msg = format!("{msg} — {location}");
 
         let _ = write_crash_report(&app_data_dir, &location_msg, &backtrace);
     }));
@@ -218,8 +218,7 @@ fn millis_to_iso(ms: i64) -> String {
     let day = d + 1;
 
     format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}Z",
-        y, m, day, hours, mins_rem, secs, millis
+        "{y:04}-{m:02}-{day:02}T{hours:02}:{mins_rem:02}:{secs:02}.{millis:03}Z"
     )
 }
 

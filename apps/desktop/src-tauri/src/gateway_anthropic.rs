@@ -248,9 +248,7 @@ fn to_chat_body(req: &Value) -> Option<Value> {
         _ => {}
     }
     // `messages` is still required — an absent array stays a 400 rather than an empty transcript.
-    if req.get("messages").and_then(Value::as_array).is_none() {
-        return None;
-    }
+    req.get("messages").and_then(Value::as_array)?;
     messages.extend(messages_to_openai(req));
     let mut out = json!({
         "model": model,
@@ -307,227 +305,6 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
         "any" => Some(json!("required")),
         "none" => Some(json!("none")),
         _ => Some(json!("auto")),
-    }
-}
-
-#[cfg(test)]
-mod tool_conversion_tests {
-    use super::*;
-
-    #[test]
-    fn anthropic_tools_become_openai_functions() {
-        let out = tools_to_openai(&json!([{ "name": "Bash", "description": "Run it",
-                                            "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }]))
-            .unwrap();
-        assert_eq!(out[0]["type"], "function");
-        assert_eq!(out[0]["function"]["name"], "Bash");
-        assert_eq!(out[0]["function"]["parameters"]["properties"]["command"]["type"], "string");
-    }
-
-    #[test]
-    fn a_tool_without_a_schema_still_gets_one() {
-        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
-        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
-        assert!(out[0]["function"].get("description").is_none(), "absent, not null");
-    }
-
-    /// A minimal Anthropic request wrapper, so the transcript cases below read as transcripts.
-    fn transcript(messages: Value) -> Value {
-        json!({ "model": "mock-fast", "messages": messages })
-    }
-
-    #[test]
-    fn an_assistant_tool_use_becomes_openai_tool_calls() {
-        let out = messages_to_openai(&transcript(json!([
-            { "role": "assistant", "content": [
-                { "type": "text", "text": "Let me look" },
-                { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } } ] }
-        ])));
-        assert_eq!(out.len(), 1, "{out:?}");
-        assert_eq!(out[0]["role"], "assistant");
-        assert_eq!(out[0]["content"], "Let me look", "the text must survive alongside the call");
-        assert_eq!(out[0]["tool_calls"][0]["id"], "toolu_1");
-        assert_eq!(out[0]["tool_calls"][0]["type"], "function");
-        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "Bash");
-        // OpenAI carries arguments as a JSON *string*; Anthropic carries an object.
-        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
-    }
-
-    #[test]
-    fn a_tool_result_becomes_its_own_tool_message() {
-        let out = messages_to_openai(&transcript(json!([
-            { "role": "user", "content": [
-                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "3 files" } ] }
-        ])));
-        // One message, not two: emitting an empty user turn as well is what made providers
-        // reject the body outright and left the assistant turn dangling.
-        assert_eq!(out.len(), 1, "no stray empty turn: {out:?}");
-        assert_eq!(out[0]["role"], "tool");
-        assert_eq!(out[0]["tool_call_id"], "toolu_1");
-        assert_eq!(out[0]["content"], "3 files");
-    }
-
-    #[test]
-    fn a_block_shaped_tool_result_keeps_its_text() {
-        let out = messages_to_openai(&transcript(json!([
-            { "role": "user", "content": [
-                { "type": "tool_result", "tool_use_id": "t1",
-                  "content": [{ "type": "text", "text": "line one" }] } ] }
-        ])));
-        assert_eq!(out[0]["content"], "line one", "{out:?}");
-    }
-
-    #[test]
-    fn text_and_a_tool_result_keep_their_order() {
-        let out = messages_to_openai(&transcript(json!([
-            { "role": "user", "content": [
-                { "type": "text", "text": "what came back:" },
-                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "3 files" } ] }
-        ])));
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[0]["role"], "user", "the prose precedes the result: {out:?}");
-        assert_eq!(out[1]["role"], "tool");
-    }
-
-    #[test]
-    fn a_block_array_system_prompt_survives() {
-        // Claude Code always sends the array form, with cache_control markers beside the text.
-        // Reading only `.as_str()` dropped the entire system prompt.
-        let out = to_chat_body(&json!({
-            "model": "mock-fast",
-            "system": [{ "type": "text", "text": "You are helpful", "cache_control": { "type": "ephemeral" } }],
-            "messages": [{ "role": "user", "content": "hi" }]
-        }))
-        .expect("a body");
-        assert_eq!(out["messages"][0]["role"], "system", "{out}");
-        assert_eq!(out["messages"][0]["content"], "You are helpful", "{out}");
-    }
-
-    #[test]
-    fn a_plain_string_transcript_is_untouched() {
-        let out = messages_to_openai(&transcript(json!([
-            { "role": "user", "content": "hi" },
-            { "role": "assistant", "content": "hello" }
-        ])));
-        assert_eq!(
-            out,
-            vec![
-                json!({ "role": "user", "content": "hi" }),
-                json!({ "role": "assistant", "content": "hello" })
-            ]
-        );
-    }
-
-    #[test]
-    fn tool_choice_maps_onto_the_openai_vocabulary() {
-        assert_eq!(tool_choice_to_openai(&json!({"type":"auto"})).unwrap(), json!("auto"));
-        assert_eq!(tool_choice_to_openai(&json!({"type":"any"})).unwrap(), json!("required"));
-        assert_eq!(tool_choice_to_openai(&json!({"type":"none"})).unwrap(), json!("none"));
-        assert_eq!(
-            tool_choice_to_openai(&json!({"type":"tool","name":"Bash"})).unwrap(),
-            json!({ "type": "function", "function": { "name": "Bash" } })
-        );
-    }
-
-    // ── count_text_chars unit tests ─────────────────────────────────────────────
-
-    #[test]
-    fn count_plain_string_message() {
-        let req = json!({
-            "model": "mock",
-            "messages": [{ "role": "user", "content": "hello world" }]
-        });
-        assert_eq!(count_text_chars(&req), 11);
-    }
-
-    #[test]
-    fn count_system_string_plus_message() {
-        let req = json!({
-            "model": "mock",
-            "system": "You are helpful",
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        assert_eq!(count_text_chars(&req), 15 + 2);
-    }
-
-    #[test]
-    fn count_system_array_blocks() {
-        let req = json!({
-            "model": "mock",
-            "system": [
-                { "type": "text", "text": "block one", "cache_control": { "type": "ephemeral" } },
-                { "type": "text", "text": "block two" }
-            ],
-            "messages": []
-        });
-        assert_eq!(count_text_chars(&req), 9 + 9);
-    }
-
-    #[test]
-    fn count_tool_use_block_counts_name_and_input() {
-        let req = json!({
-            "model": "mock",
-            "messages": [{
-                "role": "assistant",
-                "content": [
-                    { "type": "tool_use", "id": "t1", "name": "Bash",
-                      "input": { "command": "ls -la" } }
-                ]
-            }]
-        });
-        // "Bash" = 4, input.to_string() = {"command":"ls -la"} = 20
-        assert_eq!(count_text_chars(&req), 4 + 20);
-    }
-
-    #[test]
-    fn count_image_block_uses_flat_constant() {
-        let req = json!({
-            "model": "mock",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    { "type": "text", "text": "describe" },
-                    { "type": "image", "source": { "type": "base64", "data": "…" } }
-                ]
-            }]
-        });
-        // "describe" = 8, image = IMAGE_TOKENS * 4 = 4096
-        assert_eq!(count_text_chars(&req), 8 + 4096);
-    }
-
-    #[test]
-    fn count_tools_declaration_is_included() {
-        let req = json!({
-            "model": "mock",
-            "tools": [{ "name": "Bash", "description": "Run a shell command" }],
-            "messages": [{ "role": "user", "content": "hi" }]
-        });
-        // "hi" = 2
-        // tools.to_string() = [{"description":"Run a shell command","name":"Bash"}]
-        // (serde_json sorts keys alphabetically; the exact string length is what matters)
-        let tools_chars = json!({ "name": "Bash", "description": "Run a shell command" }).to_string().len();
-        // tools array adds 2 chars for "[", "]"
-        assert_eq!(count_text_chars(&req), 2 + (tools_chars + 2));
-    }
-
-    #[test]
-    fn count_empty_body_is_zero() {
-        let req = json!({ "model": "mock", "messages": [] });
-        assert_eq!(count_text_chars(&req), 0);
-    }
-
-    #[test]
-    fn count_tool_result_block_counts_content() {
-        let req = json!({
-            "model": "mock",
-            "messages": [{
-                "role": "user",
-                "content": [
-                    { "type": "tool_result", "tool_use_id": "t1", "content": "3 files found" }
-                ]
-            }]
-        });
-        assert_eq!(count_text_chars(&req), 13);
     }
 }
 
@@ -796,4 +573,225 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     };
     apply_memory_headers(&mut r, &outcome);
     r
+}
+
+#[cfg(test)]
+mod tool_conversion_tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_tools_become_openai_functions() {
+        let out = tools_to_openai(&json!([{ "name": "Bash", "description": "Run it",
+                                            "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }]))
+            .unwrap();
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "Bash");
+        assert_eq!(out[0]["function"]["parameters"]["properties"]["command"]["type"], "string");
+    }
+
+    #[test]
+    fn a_tool_without_a_schema_still_gets_one() {
+        let out = tools_to_openai(&json!([{ "name": "Bash" }])).unwrap();
+        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
+        assert!(out[0]["function"].get("description").is_none(), "absent, not null");
+    }
+
+    /// A minimal Anthropic request wrapper, so the transcript cases below read as transcripts.
+    fn transcript(messages: Value) -> Value {
+        json!({ "model": "mock-fast", "messages": messages })
+    }
+
+    #[test]
+    fn an_assistant_tool_use_becomes_openai_tool_calls() {
+        let out = messages_to_openai(&transcript(json!([
+            { "role": "assistant", "content": [
+                { "type": "text", "text": "Let me look" },
+                { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } } ] }
+        ])));
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(out[0]["role"], "assistant");
+        assert_eq!(out[0]["content"], "Let me look", "the text must survive alongside the call");
+        assert_eq!(out[0]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(out[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(out[0]["tool_calls"][0]["function"]["name"], "Bash");
+        // OpenAI carries arguments as a JSON *string*; Anthropic carries an object.
+        assert_eq!(out[0]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn a_tool_result_becomes_its_own_tool_message() {
+        let out = messages_to_openai(&transcript(json!([
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "3 files" } ] }
+        ])));
+        // One message, not two: emitting an empty user turn as well is what made providers
+        // reject the body outright and left the assistant turn dangling.
+        assert_eq!(out.len(), 1, "no stray empty turn: {out:?}");
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["tool_call_id"], "toolu_1");
+        assert_eq!(out[0]["content"], "3 files");
+    }
+
+    #[test]
+    fn a_block_shaped_tool_result_keeps_its_text() {
+        let out = messages_to_openai(&transcript(json!([
+            { "role": "user", "content": [
+                { "type": "tool_result", "tool_use_id": "t1",
+                  "content": [{ "type": "text", "text": "line one" }] } ] }
+        ])));
+        assert_eq!(out[0]["content"], "line one", "{out:?}");
+    }
+
+    #[test]
+    fn text_and_a_tool_result_keep_their_order() {
+        let out = messages_to_openai(&transcript(json!([
+            { "role": "user", "content": [
+                { "type": "text", "text": "what came back:" },
+                { "type": "tool_result", "tool_use_id": "toolu_1", "content": "3 files" } ] }
+        ])));
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[0]["role"], "user", "the prose precedes the result: {out:?}");
+        assert_eq!(out[1]["role"], "tool");
+    }
+
+    #[test]
+    fn a_block_array_system_prompt_survives() {
+        // Claude Code always sends the array form, with cache_control markers beside the text.
+        // Reading only `.as_str()` dropped the entire system prompt.
+        let out = to_chat_body(&json!({
+            "model": "mock-fast",
+            "system": [{ "type": "text", "text": "You are helpful", "cache_control": { "type": "ephemeral" } }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        }))
+        .expect("a body");
+        assert_eq!(out["messages"][0]["role"], "system", "{out}");
+        assert_eq!(out["messages"][0]["content"], "You are helpful", "{out}");
+    }
+
+    #[test]
+    fn a_plain_string_transcript_is_untouched() {
+        let out = messages_to_openai(&transcript(json!([
+            { "role": "user", "content": "hi" },
+            { "role": "assistant", "content": "hello" }
+        ])));
+        assert_eq!(
+            out,
+            vec![
+                json!({ "role": "user", "content": "hi" }),
+                json!({ "role": "assistant", "content": "hello" })
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_choice_maps_onto_the_openai_vocabulary() {
+        assert_eq!(tool_choice_to_openai(&json!({"type":"auto"})).unwrap(), json!("auto"));
+        assert_eq!(tool_choice_to_openai(&json!({"type":"any"})).unwrap(), json!("required"));
+        assert_eq!(tool_choice_to_openai(&json!({"type":"none"})).unwrap(), json!("none"));
+        assert_eq!(
+            tool_choice_to_openai(&json!({"type":"tool","name":"Bash"})).unwrap(),
+            json!({ "type": "function", "function": { "name": "Bash" } })
+        );
+    }
+
+    // ── count_text_chars unit tests ─────────────────────────────────────────────
+
+    #[test]
+    fn count_plain_string_message() {
+        let req = json!({
+            "model": "mock",
+            "messages": [{ "role": "user", "content": "hello world" }]
+        });
+        assert_eq!(count_text_chars(&req), 11);
+    }
+
+    #[test]
+    fn count_system_string_plus_message() {
+        let req = json!({
+            "model": "mock",
+            "system": "You are helpful",
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert_eq!(count_text_chars(&req), 15 + 2);
+    }
+
+    #[test]
+    fn count_system_array_blocks() {
+        let req = json!({
+            "model": "mock",
+            "system": [
+                { "type": "text", "text": "block one", "cache_control": { "type": "ephemeral" } },
+                { "type": "text", "text": "block two" }
+            ],
+            "messages": []
+        });
+        assert_eq!(count_text_chars(&req), 9 + 9);
+    }
+
+    #[test]
+    fn count_tool_use_block_counts_name_and_input() {
+        let req = json!({
+            "model": "mock",
+            "messages": [{
+                "role": "assistant",
+                "content": [
+                    { "type": "tool_use", "id": "t1", "name": "Bash",
+                      "input": { "command": "ls -la" } }
+                ]
+            }]
+        });
+        // "Bash" = 4, input.to_string() = {"command":"ls -la"} = 20
+        assert_eq!(count_text_chars(&req), 4 + 20);
+    }
+
+    #[test]
+    fn count_image_block_uses_flat_constant() {
+        let req = json!({
+            "model": "mock",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "text", "text": "describe" },
+                    { "type": "image", "source": { "type": "base64", "data": "…" } }
+                ]
+            }]
+        });
+        // "describe" = 8, image = IMAGE_TOKENS * 4 = 4096
+        assert_eq!(count_text_chars(&req), 8 + 4096);
+    }
+
+    #[test]
+    fn count_tools_declaration_is_included() {
+        let req = json!({
+            "model": "mock",
+            "tools": [{ "name": "Bash", "description": "Run a shell command" }],
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        // "hi" = 2
+        // tools.to_string() = [{"description":"Run a shell command","name":"Bash"}]
+        // (serde_json sorts keys alphabetically; the exact string length is what matters)
+        let tools_chars = json!({ "name": "Bash", "description": "Run a shell command" }).to_string().len();
+        // tools array adds 2 chars for "[", "]"
+        assert_eq!(count_text_chars(&req), 2 + (tools_chars + 2));
+    }
+
+    #[test]
+    fn count_empty_body_is_zero() {
+        let req = json!({ "model": "mock", "messages": [] });
+        assert_eq!(count_text_chars(&req), 0);
+    }
+
+    #[test]
+    fn count_tool_result_block_counts_content() {
+        let req = json!({
+            "model": "mock",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    { "type": "tool_result", "tool_use_id": "t1", "content": "3 files found" }
+                ]
+            }]
+        });
+        assert_eq!(count_text_chars(&req), 13);
+    }
 }

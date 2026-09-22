@@ -1,24 +1,21 @@
-/**
- * Live context — sessions, a bounded ring of turns, and the state an agent pushes.
- *
- * Design: `GATEWAY_MEMORY_LAYER.md` §3.2 (schema) and §5.4 (idempotency). This is **not**
- * `context_nodes`: that table is the Context screen's display graph — closed four-kind node set, no
- * scoping, no retention — and pushing verbatim agent turns into it would destroy both the screen
- * and its `graph(limit)` window.
- *
- * Three rules are encoded here because each is cheap to get wrong later:
- *
- *  - **Only the tail is recorded.** A coding agent replays its entire transcript on every request.
- *    Storing all of it would write fifty rows per turn and fill the ring with duplicates of turns
- *    that were already stored last request.
- *  - **`system` and `tool` turns are never recorded.** `system` is the client's own instructions,
- *    and tool output is the credential-laundering vector §3.5 warns about: it is full of secrets,
- *    and storing it here would broadcast it to whichever vendor serves the next request.
- *  - **A session is a correlation key, not a boundary.** It never gates what may be recalled — see
- *    `Scope::can_read_project_memory`. Recording is gated on the memory toggle, so with memory off
- *    nothing here runs at all.
- */
-
+//! Live context — sessions, a bounded ring of turns, and the state an agent pushes.
+//!
+//! Design: `GATEWAY_MEMORY_LAYER.md` §3.2 (schema) and §5.4 (idempotency). This is **not**
+//! `context_nodes`: that table is the Context screen's display graph — closed four-kind node set, no
+//! scoping, no retention — and pushing verbatim agent turns into it would destroy both the screen
+//! and its `graph(limit)` window.
+//!
+//! Three rules are encoded here because each is cheap to get wrong later:
+//!
+//!  - **Only the tail is recorded.** A coding agent replays its entire transcript on every request.
+//!    Storing all of it would write fifty rows per turn and fill the ring with duplicates of turns
+//!    that were already stored last request.
+//!  - **`system` and `tool` turns are never recorded.** `system` is the client's own instructions,
+//!    and tool output is the credential-laundering vector §3.5 warns about: it is full of secrets,
+//!    and storing it here would broadcast it to whichever vendor serves the next request.
+//!  - **A session is a correlation key, not a boundary.** It never gates what may be recalled — see
+//!    `Scope::can_read_project_memory`. Recording is gated on the memory toggle, so with memory off
+//!    nothing here runs at all.
 use rusqlite::params;
 use serde_json::Value;
 
@@ -318,11 +315,10 @@ pub struct PruneStats {
 /// to the hottest code in the app.
 pub fn prune(store: &Store) -> Result<PruneStats, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    let mut stats = PruneStats::default();
 
     // Keep the newest MAX_TURNS_PER_SESSION per session. `seq` is monotonic, so "keep the rows
     // whose seq is above the nth largest" is the ring without a per-session loop.
-    stats.turns_by_count = conn
+    let turns_by_count = conn
         .execute(
             "DELETE FROM session_turns WHERE id IN (
                SELECT t.id FROM session_turns t
@@ -334,14 +330,14 @@ pub fn prune(store: &Store) -> Result<PruneStats, String> {
         .map_err(|e| e.to_string())?;
 
     let turn_cutoff = now_ms() - TURN_TTL_DAYS * 86_400_000;
-    stats.turns_by_age = conn
+    let turns_by_age = conn
         .execute("DELETE FROM session_turns WHERE ts < ?1", params![turn_cutoff])
         .map_err(|e| e.to_string())?;
 
     // Sessions are reaped only after their turns are gone, so the FK never fires: a session with
     // no turns has nothing left to contribute to live context.
     let session_cutoff = now_ms() - SESSION_TTL_DAYS * 86_400_000;
-    stats.sessions_reaped = conn
+    let sessions_reaped = conn
         .execute(
             "DELETE FROM router_sessions
              WHERE last_seen_at < ?1
@@ -350,7 +346,10 @@ pub fn prune(store: &Store) -> Result<PruneStats, String> {
         )
         .map_err(|e| e.to_string())?;
 
-    Ok(stats)
+    // One literal rather than `default()` plus three field writes: the three counts come from
+    // three separate statements, so a partial write is impossible to express here and the
+    // literal makes that explicit (clippy::field_reassign_with_default).
+    Ok(PruneStats { turns_by_count, turns_by_age, sessions_reaped })
 }
 
 #[cfg(test)]
@@ -501,7 +500,7 @@ mod session_context_tests {
         }
         assert_eq!(recent_turns(&s, "s1", 1000).unwrap().len(), MAX_TURNS_PER_SESSION + 25);
         let stats = prune(&s).unwrap();
-        assert!(stats.turns_by_count >= 25, "ring trimmed to {MAX_TURNS_PER_SESSION}: {:?}", stats);
+        assert!(stats.turns_by_count >= 25, "ring trimmed to {MAX_TURNS_PER_SESSION}: {stats:?}");
         assert_eq!(recent_turns(&s, "s1", 1000).unwrap().len(), MAX_TURNS_PER_SESSION);
         // The newest survived; the oldest did not.
         let kept: Vec<String> = recent_turns(&s, "s1", 1000).unwrap().iter().map(|t| t.text.clone()).collect();
@@ -524,7 +523,7 @@ mod session_context_tests {
             conn.execute("UPDATE router_sessions SET last_seen_at = 1", []).unwrap();
         }
         let stats = prune(&s).unwrap();
-        assert_eq!(stats.sessions_reaped, 1, "only the empty one goes: {:?}", stats);
+        assert_eq!(stats.sessions_reaped, 1, "only the empty one goes: {stats:?}");
         let conn = s.conn.lock().unwrap();
         let n: i64 = conn
             .query_row("SELECT COUNT(*) FROM router_sessions WHERE id='busy'", [], |r| r.get(0))

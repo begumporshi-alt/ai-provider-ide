@@ -1074,10 +1074,11 @@ impl GatewayCore {
     /// starts now rather than part-way through — otherwise a window hidden immediately after
     /// the last beat would trip the short bound before the renderer's next throttled tick.
     pub fn set_hidden(&self, hidden: bool) {
-        if self.hidden.swap(hidden, Ordering::Relaxed) != hidden {
-            if hidden {
-                self.heartbeat();
-            }
+        // Collapsed from a nested `if` (clippy::collapsible_if). The collapse is safe *because*
+        // `swap` is the left operand of `&&`, so it still runs on every call — the store is the
+        // point of this function and must not become conditional on `hidden`.
+        if self.hidden.swap(hidden, Ordering::Relaxed) != hidden && hidden {
+            self.heartbeat();
         }
     }
 
@@ -1582,7 +1583,7 @@ fn err_ra(status: StatusCode, retry: impl Into<String>, body: Value) -> Response
 /// the worker reported no cooldown — the caller then leaves the header off, and the
 /// `ensure_retry_after` middleware supplies its own 1s floor.
 pub(crate) fn cooldown_secs(retry_after_ms: Option<u64>) -> Option<String> {
-    retry_after_ms.filter(|&ms| ms > 0).map(|ms| ((ms + 999) / 1000).max(1).to_string())
+    retry_after_ms.filter(|&ms| ms > 0).map(|ms| ms.div_ceil(1000).max(1).to_string())
 }
 
 /// Error response for a failed worker request, honouring the provider's own cooldown.

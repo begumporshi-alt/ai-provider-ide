@@ -4,6 +4,12 @@
     use super::*;
     use futures_util::StreamExt as _;
 
+    /// One outbound bridge request as the worker saw it: kind, body, headers.
+    ///
+    /// Factored out of `SynthBridge::sent` — inline, it is a tuple nested two generics deep and no
+    /// reader parses it at the field (clippy::type_complexity).
+    type SentRequest = (String, Value, HashMap<String, String>);
+
     /// Synthetic bridge = the §3.5 entry-gate spike: answers chat with deltas + Done,
     /// models/image with JSON, records cancels. Holds a back-pointer to the core so it can
     /// reply.
@@ -28,7 +34,7 @@
         /// Everything handed to the worker, verbatim. Phase 6 needs to see what actually leaves
         /// for the provider — asserting on the *ingress* body would prove nothing, because every
         /// dialect is translated twice and either hop can drop the injected block.
-        sent: Mutex<Vec<(String, Value, HashMap<String, String>)>>,
+        sent: Mutex<Vec<SentRequest>>,
     }
 
     impl SynthBridge {
@@ -691,6 +697,62 @@
             .await
             .unwrap();
         assert_eq!(res.status(), 401);
+    }
+
+    // ---------- Gemini: a tool turn still reports finishReason "STOP" (2026-09-22) ----------
+    //
+    // Every other dialect distinguishes the tool-call turn in its finish reason: Anthropic sends
+    // `tool_use` vs `end_turn` (`gateway_anthropic.rs:700`), OpenAI sends `tool_calls` vs `stop`
+    // (`gateway_handlers.rs:231`). **Gemini does not.** Its `FinishReason` enum has no tool-call
+    // member, and a function call is signalled by the presence of `functionCall` parts instead —
+    // so `finishReason` stays `STOP`.
+    //
+    // This test exists because `gateway_gemini.rs` read
+    // `let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };` — a dead branch that
+    // implied a distinction the protocol does not make. The branch is gone.
+    //
+    // It is a *value* pin, not a structural one: both arms produced `STOP`, so this test would have
+    // passed against the dead branch too. What it actually prevents is the tempting repair — a
+    // future "fix" that invents a second literal (say `FUNCTION_CALL`) because the guard looks like
+    // it should do something. That repair would pass the entire rest of the suite and be wrong on
+    // the wire; before this test, **no Gemini test reached the tool-call path at all** (the only
+    // `finishReason` assertion used a plain "hi" prompt with no tools).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn gemini_tool_turn_still_reports_stop() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.answer_with_tool_calls(true);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "contents": [{ "role": "user", "parts": [{ "text": "write a file" }] }],
+                "tools": [{ "functionDeclarations": [{ "name": "write_file", "description": "w" }] }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        let parts = body["candidates"][0]["content"]["parts"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no parts array: {body}"));
+        // Prove the tool path was actually taken. Without this the test could pass while asserting
+        // nothing — a text reply also carries a `parts` array.
+        assert_eq!(
+            parts[0]["functionCall"]["name"], "write_file",
+            "tool path not reached, so this test pins nothing: {body}"
+        );
+        assert!(
+            parts.iter().all(|p| p.get("functionCall").is_some()),
+            "a tool turn must carry functionCall parts, not text: {body}"
+        );
+        assert_eq!(
+            body["candidates"][0]["finishReason"], "STOP",
+            "Gemini has no distinct tool-call finish reason — see the comment above"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2691,7 +2753,7 @@
     fn injected_system_text(sent: &(String, Value, HashMap<String, String>)) -> String {
         let ms = sent.1.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
         let first = ms.first().cloned().unwrap_or_else(|| json!({}));
-        assert_eq!(first["role"], "system", "the block must be prepended: {:?}", ms);
+        assert_eq!(first["role"], "system", "the block must be prepended: {ms:?}");
         first["content"].as_str().unwrap_or("").to_string()
     }
 

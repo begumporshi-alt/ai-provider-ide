@@ -1,24 +1,21 @@
-/**
- * Per-model context-window cache (design §3.4).
- *
- * The gateway sizes the injected block against the model's window, and Rust cannot see the TS
- * catalog — the catalog lives in the webview, where provider selection, key handling and fallback
- * already are. Duplicating that here would mean a second provider stack in Rust just to read one
- * number. So the webview publishes the numbers it already has and the host reads them.
- *
- * Two properties that matter more than freshness:
- *
- * - **Absence degrades to the conservative default, never to zero and never to a guess at the top
- *   end.** An unknown model gets `DEFAULT_WINDOW_TOKENS`, which under-injects. Being wrong low costs
- *   a slightly less useful answer; being wrong high overflows the window and fails the request.
- * - **A stale row is better than no row.** The catalog is refetched roughly daily; a window does not
- *   change meaningfully in between, so an old value is still far better than 8192 for a 200k model.
- *
- * An alias that arrives unqualified (a bare `gpt-4o` with no provider prefix) will not match a
- * qualified key and falls back to the default. That is the correct direction to fail, and resolving
- * aliases here would mean duplicating the alias table's precedence rules in Rust.
- */
-
+//! Per-model context-window cache (design §3.4).
+//!
+//! The gateway sizes the injected block against the model's window, and Rust cannot see the TS
+//! catalog — the catalog lives in the webview, where provider selection, key handling and fallback
+//! already are. Duplicating that here would mean a second provider stack in Rust just to read one
+//! number. So the webview publishes the numbers it already has and the host reads them.
+//!
+//! Two properties that matter more than freshness:
+//!
+//! - **Absence degrades to the conservative default, never to zero and never to a guess at the top
+//!   end.** An unknown model gets `DEFAULT_WINDOW_TOKENS`, which under-injects. Being wrong low costs
+//!   a slightly less useful answer; being wrong high overflows the window and fails the request.
+//! - **A stale row is better than no row.** The catalog is refetched roughly daily; a window does not
+//!   change meaningfully in between, so an old value is still far better than 8192 for a 200k model.
+//!
+//! An alias that arrives unqualified (a bare `gpt-4o` with no provider prefix) will not match a
+//! qualified key and falls back to the default. That is the correct direction to fail, and resolving
+//! aliases here would mean duplicating the alias table's precedence rules in Rust.
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 

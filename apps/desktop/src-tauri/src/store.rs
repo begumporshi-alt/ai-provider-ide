@@ -315,9 +315,15 @@ END;
 ///
 /// Ordered *after* every entry in `MIGRATIONS`, so a step here takes the version
 /// `MIGRATIONS.len() + idx + 1`. Keeping the two lists separate rather than interleaved means the
+/// A data migration: the name it is keyed by, and the function that applies it.
+///
+/// Factored out of `DATA_MIGRATIONS` — inline, this is a three-deep generic that no reader parses
+/// at a glance (clippy::type_complexity).
+type DataMigration = (&'static str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>);
+
 /// SQL list stays a literal list of schemas; the numbering is the only coupling, and it is
 /// asserted by `migrations_apply_once_and_are_idempotent`.
-const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Result<()>)] = &[
+const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0007_stable_memory_node_ids", backfill_stable_memory_node_ids),
     ("0008_ledger_error_class", backfill_ledger_error_class),
     ("0009_memory_scope", backfill_memory_scope),

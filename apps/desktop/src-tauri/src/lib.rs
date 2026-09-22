@@ -80,7 +80,7 @@ fn persisted_gateway_port(store: &store::Store) -> Option<u16> {
         .query_row("SELECT value_json FROM settings WHERE key = 'gateway'", [], |r| r.get(0))
         .ok()?;
     let parsed: serde_json::Value = serde_json::from_str(&value).ok()?;
-    if parsed.get("enabled")?.as_bool()? != true {
+    if !(parsed.get("enabled")?.as_bool()?) {
         return None;
     }
     Some(parsed.get("port")?.as_u64()? as u16)
@@ -126,8 +126,24 @@ fn show_window(app: &tauri::AppHandle) {
     // bearing on whether the worker renderer is throttled.
 }
 
-/// R1: read the persisted preference. Default ON — background mode is the whole point of
-/// shipping this, and a user who wants close-to-quit can turn it off in the Gateway screen.
+/// The decision `hide_on_close` makes, split from the `AppHandle` so it can be tested without a
+/// Tauri app — the house pattern for anything a command or hook wraps.
+///
+/// **The default is ON.** Background mode is the whole point of shipping this, and a user who
+/// wants close-to-quit can turn it off in the Gateway screen. Every unusable input (no row,
+/// unparseable JSON, key absent, key not a bool) also resolves to ON, and that is deliberate: a
+/// gateway that quietly stops serving because a settings row was malformed is a worse failure
+/// than one that keeps running.
+///
+/// Pinned by `hide_on_close_defaults_on_and_only_an_explicit_false_turns_it_off`.
+fn hide_on_close_from(raw: Option<&str>) -> bool {
+    match raw.and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) {
+        Some(v) => v.get("hideOnClose").and_then(|b| b.as_bool()).unwrap_or(true),
+        None => true,
+    }
+}
+
+/// R1: read the persisted preference, then apply `hide_on_close_from`.
 fn hide_on_close(app: &tauri::AppHandle) -> bool {
     use tauri::Manager as _;
     let Some(store) = app.try_state::<std::sync::Arc<store::Store>>() else {
@@ -141,10 +157,7 @@ fn hide_on_close(app: &tauri::AppHandle) -> bool {
             conn.query_row("SELECT value_json FROM settings WHERE key='background'", [], |r| r.get(0))
                 .ok()
         });
-    match raw.as_deref().and_then(|v| serde_json::from_str::<serde_json::Value>(v).ok()) {
-        Some(v) => v.get("hideOnClose").and_then(|b| b.as_bool()).unwrap_or(true),
-        None => true,
-    }
+    hide_on_close_from(raw.as_deref())
 }
 
 
@@ -279,4 +292,38 @@ pub fn run() {
             tauri::RunEvent::Reopen { .. } => show_window(app),
             _ => {}
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::hide_on_close_from;
+
+    /// D10. `hide_on_close` decides whether the gateway keeps serving after the window closes —
+    /// the headline feature of R1 — and until 2026-09-22 nothing tested it: the symbol appeared
+    /// in exactly two places, its definition and its call site. The `AppHandle` half is a
+    /// settings read; this half is the decision, and it is the half that carries the default.
+    ///
+    /// Falsified before it was trusted: flipping the `None` arm to `false` fails the first case.
+    #[test]
+    fn hide_on_close_defaults_on_and_only_an_explicit_false_turns_it_off() {
+        // Nothing stored, or the store is unreachable. ON.
+        assert!(hide_on_close_from(None));
+
+        // The one input that turns it off, plus its explicit counterpart.
+        assert!(!hide_on_close_from(Some(r#"{"hideOnClose":false}"#)));
+        assert!(hide_on_close_from(Some(r#"{"hideOnClose":true}"#)));
+
+        // Present but unusable. Every one of these must fall back to ON — quietly stopping the
+        // gateway because a settings row was malformed is the worse failure.
+        assert!(hide_on_close_from(Some("{}")), "key absent");
+        assert!(hide_on_close_from(Some(r#"{"hideOnClose":null}"#)), "explicit null");
+        assert!(hide_on_close_from(Some(r#"{"hideOnClose":"false"}"#)), "string, not bool");
+        assert!(hide_on_close_from(Some(r#"{"hideOnClose":0}"#)), "number, not bool");
+        assert!(hide_on_close_from(Some("not json")), "unparseable");
+        assert!(hide_on_close_from(Some("null")), "JSON null");
+        assert!(hide_on_close_from(Some("")), "empty string");
+
+        // A sibling key must not be mistaken for the preference.
+        assert!(hide_on_close_from(Some(r#"{"other":false}"#)), "unrelated key");
+    }
 }

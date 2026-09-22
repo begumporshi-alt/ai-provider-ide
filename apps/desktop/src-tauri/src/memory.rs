@@ -1041,6 +1041,11 @@ mod memory_tests {
 
     /// Insert a memory with explicit scope columns. Goes through SQL rather than `capture` because
     /// `capture` has no scope parameters yet — that is Phase 4 (the capture path).
+    ///
+    /// Eight positional arguments, one per column under test. Bundling them into a struct would
+    /// push the names out to every call site to save nothing here — this helper exists precisely to
+    /// spell a column set out once.
+    #[allow(clippy::too_many_arguments)]
     fn scoped(
         s: &Store,
         id: &str,

@@ -1,24 +1,21 @@
-/**
- * Async capture queue — the write path of the memory layer.
- *
- * Design: `GATEWAY_MEMORY_LAYER.md` §3.3 (schema) and §3.5 (what may be captured). Every §3.5 rule
- * is enforced **here, at enqueue**, and nowhere else. That placement is the whole point: the review
- * found that the capture path is a credential-laundering pipeline and a persistent instruction
- * channel, and that scrubbing at injection time is too late — the liability is the stored row.
- *
- * The six rules, and where each is enforced:
- *
- * 1. Never distil tool output → `involves_tools` + `Enqueue::Skipped(SkipCapture::ToolTurn)`.
- * 2. Secret scrubbing at enqueue → `scrub`, applied to both texts before the INSERT.
- * 3. Typed atoms → `classify` writes an immutable `content_class` on the row.
- * 4. Immutable scope binding → scope columns are written once and never updated.
- * 5. Idempotent distillation → `request_id` is UNIQUE; a replay is reported, not duplicated.
- * 6. Internal principal excluded → `Principal::Internal` never reaches the queue.
- *
- * No model call happens in this module. Enqueue is a single INSERT on a thread that has already
- * decided the response, so a slow or broken capture can never slow a request.
- */
-
+//! Async capture queue — the write path of the memory layer.
+//!
+//! Design: `GATEWAY_MEMORY_LAYER.md` §3.3 (schema) and §3.5 (what may be captured). Every §3.5 rule
+//! is enforced **here, at enqueue**, and nowhere else. That placement is the whole point: the review
+//! found that the capture path is a credential-laundering pipeline and a persistent instruction
+//! channel, and that scrubbing at injection time is too late — the liability is the stored row.
+//!
+//! The six rules, and where each is enforced:
+//!
+//! 1. Never distil tool output → `involves_tools` + `Enqueue::Skipped(SkipCapture::ToolTurn)`.
+//! 2. Secret scrubbing at enqueue → `scrub`, applied to both texts before the INSERT.
+//! 3. Typed atoms → `classify` writes an immutable `content_class` on the row.
+//! 4. Immutable scope binding → scope columns are written once and never updated.
+//! 5. Idempotent distillation → `request_id` is UNIQUE; a replay is reported, not duplicated.
+//! 6. Internal principal excluded → `Principal::Internal` never reaches the queue.
+//!
+//! No model call happens in this module. Enqueue is a single INSERT on a thread that has already
+//! decided the response, so a slow or broken capture can never slow a request.
 use rusqlite::params;
 use serde::Serialize;
 use serde_json::Value;
@@ -311,7 +308,7 @@ pub fn scrub(text: &str) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut value_budget = 0usize;
     for token in text.split_whitespace() {
-        let trimmed = token.trim_end_matches(|c: char| matches!(c, ',' | ';'));
+        let trimmed = token.trim_end_matches([',', ';']);
         if let Some(key) = trimmed.strip_suffix(':').or_else(|| trimmed.strip_suffix('=')) {
             if is_secret_key(key) {
                 out.push(REDACTED.to_string());

@@ -1,28 +1,25 @@
-/**
- * Per-principal memory policy (§4a).
- *
- * The master switch answers "does this machine learn at all". It cannot answer the question an
- * operator actually has: *which* client gets to benefit. Pointing two IDEs at one gateway is the
- * normal case, and one of them may be a tool the operator does not want reading a project's memory
- * — or writing its turns into it.
- *
- * Precedence, in order, and the ordering is the whole design:
- *
- * 1. **Master switch off → nothing happens**, for every principal. This is the ship-blocking
- *    acceptance criterion and no per-principal row can override it.
- * 2. **No row → inherit.** An unlisted principal is treated as allowed *when the master switch is
- *    on*. A default-deny table would need a row for every IDE that has ever connected before memory
- *    worked for anyone, which is the same absence-as-a-decision trap the scope columns were built
- *    to avoid: silence would mean "no", and silence is what you get by default.
- * 3. **An explicit row wins over the client's own header.** `AIP-Memory: on` from a principal the
- *    operator has disabled must not switch it back on — the client is not the authority.
- *
- * Identity is two strings, either of which may deny: the `AIP-Agent` label a client chooses for
- * itself, and the key that authenticated the request — `key:<id>` for a per-app key, `key:master`
- * for the master key. This module takes them as strings and does not care where they came from;
- * resolving them from a presented secret is the gateway's job.
- */
-
+//! Per-principal memory policy (§4a).
+//!
+//! The master switch answers "does this machine learn at all". It cannot answer the question an
+//! operator actually has: *which* client gets to benefit. Pointing two IDEs at one gateway is the
+//! normal case, and one of them may be a tool the operator does not want reading a project's memory
+//! — or writing its turns into it.
+//!
+//! Precedence, in order, and the ordering is the whole design:
+//!
+//! 1. **Master switch off → nothing happens**, for every principal. This is the ship-blocking
+//!    acceptance criterion and no per-principal row can override it.
+//! 2. **No row → inherit.** An unlisted principal is treated as allowed *when the master switch is
+//!    on*. A default-deny table would need a row for every IDE that has ever connected before memory
+//!    worked for anyone, which is the same absence-as-a-decision trap the scope columns were built
+//!    to avoid: silence would mean "no", and silence is what you get by default.
+//! 3. **An explicit row wins over the client's own header.** `AIP-Memory: on` from a principal the
+//!    operator has disabled must not switch it back on — the client is not the authority.
+//!
+//! Identity is two strings, either of which may deny: the `AIP-Agent` label a client chooses for
+//! itself, and the key that authenticated the request — `key:<id>` for a per-app key, `key:master`
+//! for the master key. This module takes them as strings and does not care where they came from;
+//! resolving them from a presented secret is the gateway's job.
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 

@@ -215,88 +215,6 @@ fn strip_tool_fields(body: &mut Value, enabled: bool) {
     }
 }
 
-#[cfg(test)]
-mod tool_conversion_tests {
-    use super::*;
-
-    fn req_with(input: Value) -> Value {
-        json!({ "model": "mock-fast", "input": input })
-    }
-
-    #[test]
-    fn a_function_call_becomes_openai_tool_calls() {
-        let out = items_to_openai(&req_with(json!([
-            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "fix it" }] },
-            { "type": "function_call", "call_id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" }
-        ])));
-        assert_eq!(out.len(), 2, "{out:?}");
-        assert_eq!(out[1]["role"], "assistant");
-        assert_eq!(out[1]["tool_calls"][0]["id"], "call_1");
-        assert_eq!(out[1]["tool_calls"][0]["type"], "function");
-        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "Bash");
-        assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
-    }
-
-    #[test]
-    fn a_function_call_output_becomes_a_tool_message() {
-        let out = items_to_openai(&req_with(json!([
-            { "type": "function_call_output", "call_id": "call_1", "output": "3 files" }
-        ])));
-        assert_eq!(out.len(), 1, "no stray empty turn: {out:?}");
-        assert_eq!(out[0]["role"], "tool");
-        assert_eq!(out[0]["tool_call_id"], "call_1");
-        assert_eq!(out[0]["content"], "3 files");
-    }
-
-    #[test]
-    fn a_reasoning_item_is_dropped_not_turned_into_an_empty_turn() {
-        // A reasoning item has neither role nor content, so the old code turned it into
-        // `{"role":"user","content":""}` — a turn the client never sent.
-        let out = items_to_openai(&req_with(json!([
-            { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "thinking" }] }
-        ])));
-        assert!(out.is_empty(), "a reasoning item is not a turn: {out:?}");
-    }
-
-    #[test]
-    fn a_flat_responses_tool_becomes_a_nested_openai_function() {
-        let out = to_chat_body_responses(&json!({
-            "model": "mock-fast",
-            "input": "hi",
-            "tools": [{ "type": "function", "name": "Bash", "description": "Run it",
-                        "parameters": { "type": "object", "properties": { "command": { "type": "string" } } },
-                        "strict": null }]
-        }))
-        .expect("a body");
-        // Nested under `function`, not flat: a chat-completions provider rejects the flat shape.
-        assert_eq!(out["tools"][0]["type"], "function");
-        assert_eq!(out["tools"][0]["function"]["name"], "Bash");
-        assert!(
-            out["tools"][0].get("name").is_none(),
-            "the flat name must not survive: {out}"
-        );
-        assert_eq!(
-            out["tools"][0]["function"]["parameters"]["properties"]["command"]["type"],
-            "string"
-        );
-    }
-
-    #[test]
-    fn a_plain_message_transcript_is_untouched() {
-        let out = items_to_openai(&req_with(json!([
-            { "type": "message", "role": "user", "content": "hi" },
-            { "type": "message", "role": "assistant", "content": "hello" }
-        ])));
-        assert_eq!(
-            out,
-            vec![
-                json!({ "role": "user", "content": "hi" }),
-                json!({ "role": "assistant", "content": "hello" })
-            ]
-        );
-    }
-}
-
 pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
@@ -425,7 +343,7 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                 let resolved_tool_choice = stream_tools
                     .as_ref()
                     .map(|_| json!("auto"))
-                    .or(tool_choice.as_ref().map(|tc| tc.clone()))
+                    .or(tool_choice.clone())
                     .unwrap_or(json!("auto"));
                 yield ev("response.completed", json!({ "type": "response.completed",
                     "response": { "id": rid, "object": "response", "status": "completed",
@@ -509,4 +427,86 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     };
     apply_memory_headers(&mut r, &outcome);
     r
+}
+
+#[cfg(test)]
+mod tool_conversion_tests {
+    use super::*;
+
+    fn req_with(input: Value) -> Value {
+        json!({ "model": "mock-fast", "input": input })
+    }
+
+    #[test]
+    fn a_function_call_becomes_openai_tool_calls() {
+        let out = items_to_openai(&req_with(json!([
+            { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "fix it" }] },
+            { "type": "function_call", "call_id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" }
+        ])));
+        assert_eq!(out.len(), 2, "{out:?}");
+        assert_eq!(out[1]["role"], "assistant");
+        assert_eq!(out[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(out[1]["tool_calls"][0]["type"], "function");
+        assert_eq!(out[1]["tool_calls"][0]["function"]["name"], "Bash");
+        assert_eq!(out[1]["tool_calls"][0]["function"]["arguments"], "{\"command\":\"ls\"}");
+    }
+
+    #[test]
+    fn a_function_call_output_becomes_a_tool_message() {
+        let out = items_to_openai(&req_with(json!([
+            { "type": "function_call_output", "call_id": "call_1", "output": "3 files" }
+        ])));
+        assert_eq!(out.len(), 1, "no stray empty turn: {out:?}");
+        assert_eq!(out[0]["role"], "tool");
+        assert_eq!(out[0]["tool_call_id"], "call_1");
+        assert_eq!(out[0]["content"], "3 files");
+    }
+
+    #[test]
+    fn a_reasoning_item_is_dropped_not_turned_into_an_empty_turn() {
+        // A reasoning item has neither role nor content, so the old code turned it into
+        // `{"role":"user","content":""}` — a turn the client never sent.
+        let out = items_to_openai(&req_with(json!([
+            { "type": "reasoning", "summary": [{ "type": "summary_text", "text": "thinking" }] }
+        ])));
+        assert!(out.is_empty(), "a reasoning item is not a turn: {out:?}");
+    }
+
+    #[test]
+    fn a_flat_responses_tool_becomes_a_nested_openai_function() {
+        let out = to_chat_body_responses(&json!({
+            "model": "mock-fast",
+            "input": "hi",
+            "tools": [{ "type": "function", "name": "Bash", "description": "Run it",
+                        "parameters": { "type": "object", "properties": { "command": { "type": "string" } } },
+                        "strict": null }]
+        }))
+        .expect("a body");
+        // Nested under `function`, not flat: a chat-completions provider rejects the flat shape.
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["function"]["name"], "Bash");
+        assert!(
+            out["tools"][0].get("name").is_none(),
+            "the flat name must not survive: {out}"
+        );
+        assert_eq!(
+            out["tools"][0]["function"]["parameters"]["properties"]["command"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn a_plain_message_transcript_is_untouched() {
+        let out = items_to_openai(&req_with(json!([
+            { "type": "message", "role": "user", "content": "hi" },
+            { "type": "message", "role": "assistant", "content": "hello" }
+        ])));
+        assert_eq!(
+            out,
+            vec![
+                json!({ "role": "user", "content": "hi" }),
+                json!({ "role": "assistant", "content": "hello" })
+            ]
+        );
+    }
 }

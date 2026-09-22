@@ -1,28 +1,25 @@
 #![allow(dead_code)]
-/**
- * Gateway memory & context layer — Phase 1 scaffolding.
- *
- * Design: `GATEWAY_MEMORY_LAYER.md` at the repo root. Phases 1 and 2 are landed: `inject_context`
- * is called on every chat-shaped dispatch, where it strips the gateway-invented `metadata.aip`
- * field, resolves a scope, and — when memory is enabled — recalls, ranks, trims and prepends a
- * memory block. It reports what it did (or why it did nothing) on the response as `AIP-Memory` and
- * `AIP-Memory-Scope`. Everything is behind the host toggle, which defaults to off.
- *
- * Two rules from the design are encoded here because they are cheap to get wrong later:
- *
- *  - **`metadata.aip` is stripped, never forwarded.** It exists because most agent IDEs can set a
- *    base URL and a key but not a custom header; a vendor does not know the field and at least one
- *    dialect rejects unknown body fields. Parsing it and leaving it in place is a day-one bug.
- *  - **An unresolved project is not "global".** Three independent reviewers flagged
- *    nullable-means-global as a contamination engine: the header-less IDE is the *common* case, so
- *    the default would degrade to global and leak repo A's context into repo B. `None` means
- *    unresolved, and unresolved means project-scoped memory is never injected.
- *
- * Phase 1 lands the parsers and the dispatch hook but no recall, so a fair amount of the surface
- * below has no caller yet. It is kept because it is the Phase 2 contract, not because it is
- * speculative — `allow(dead_code)` comes off when the pipeline lands.
- */
-
+//! Gateway memory & context layer — Phase 1 scaffolding.
+//!
+//! Design: `GATEWAY_MEMORY_LAYER.md` at the repo root. Phases 1 and 2 are landed: `inject_context`
+//! is called on every chat-shaped dispatch, where it strips the gateway-invented `metadata.aip`
+//! field, resolves a scope, and — when memory is enabled — recalls, ranks, trims and prepends a
+//! memory block. It reports what it did (or why it did nothing) on the response as `AIP-Memory` and
+//! `AIP-Memory-Scope`. Everything is behind the host toggle, which defaults to off.
+//!
+//! Two rules from the design are encoded here because they are cheap to get wrong later:
+//!
+//!  - **`metadata.aip` is stripped, never forwarded.** It exists because most agent IDEs can set a
+//!    base URL and a key but not a custom header; a vendor does not know the field and at least one
+//!    dialect rejects unknown body fields. Parsing it and leaving it in place is a day-one bug.
+//!  - **An unresolved project is not "global".** Three independent reviewers flagged
+//!    nullable-means-global as a contamination engine: the header-less IDE is the *common* case, so
+//!    the default would degrade to global and leak repo A's context into repo B. `None` means
+//!    unresolved, and unresolved means project-scoped memory is never injected.
+//!
+//! Phase 1 lands the parsers and the dispatch hook but no recall, so a fair amount of the surface
+//! below has no caller yet. It is kept because it is the Phase 2 contract, not because it is
+//! speculative — `allow(dead_code)` comes off when the pipeline lands.
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -243,13 +240,12 @@ impl RequestMeta {
 
         let pick = |header_name: &str, key: &str| -> Option<String> {
             header(headers, header_name).or_else(|| {
-                aip.map(|m| {
+                aip.and_then(|m| {
                     m.get(key)
                         .and_then(Value::as_str)
                         .map(|s| s.trim().to_string())
                         .filter(|s| !s.is_empty())
                 })
-                .flatten()
             })
         };
 
@@ -1191,7 +1187,7 @@ mod context_scope_tests {
 
     #[test]
     fn the_composed_block_is_delimited_and_bulleted() {
-        let v = vec![cand("a", "uses Postgres", false)];
+        let v = [cand("a", "uses Postgres", false)];
         let refs: Vec<&Candidate> = v.iter().collect();
         let block = compose_block(&refs);
         assert!(block.starts_with("<memory>\n"));
@@ -1202,7 +1198,7 @@ mod context_scope_tests {
 
     #[test]
     fn an_overlong_memory_is_clipped_not_dropped() {
-        let v = vec![cand("a", &"x".repeat(900), false)];
+        let v = [cand("a", &"x".repeat(900), false)];
         let refs: Vec<&Candidate> = v.iter().collect();
         let block = compose_block(&refs);
         assert!(block.len() < 400, "clipped to MAX_ITEM_CHARS: {}", block.len());
@@ -2116,7 +2112,7 @@ mod context_scope_tests {
         h.insert(HDR_MEMORY, "injected=1".parse().unwrap());
         h.insert(HDR_MEMORY_SCOPE, "user=local".parse().unwrap());
         let fwd = crate::gateway::forwarded_headers(&h);
-        assert!(fwd.get(HDR_MEMORY).is_none());
-        assert!(fwd.get(HDR_MEMORY_SCOPE).is_none());
+        assert!(!fwd.contains_key(HDR_MEMORY));
+        assert!(!fwd.contains_key(HDR_MEMORY_SCOPE));
     }
 }
