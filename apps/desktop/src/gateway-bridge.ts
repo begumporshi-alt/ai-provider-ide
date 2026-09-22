@@ -393,6 +393,12 @@ async function handle(req: BridgeRequest): Promise<void> {
     if (ac.signal.aborted) return;
     const msg = String((e as Error)?.message ?? e);
     const status = gatewayStatus(e, msg);
-    await invoke("gateway_error", { requestId: req.requestId, status, message: msg }).catch(() => undefined);
+    const retryAfterMs = e instanceof AllAttemptsFailedError ? e.maxRetryAfterMs() : 0;
+    await invoke("gateway_error", {
+      requestId: req.requestId,
+      status,
+      message: msg,
+      ...(retryAfterMs > 0 ? { retryAfterMs } : {}),
+    }).catch(() => undefined);
   }
 }

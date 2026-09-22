@@ -119,7 +119,15 @@ export class ExecutionEngine {
               ? "PARSE_ERROR"
               : classify(e.status)
             : "NETWORK";
-          const outcome: AttemptOutcome = { candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 };
+          const outcome: AttemptOutcome = {
+            candidate: c,
+            cls,
+            status: e instanceof ManifestHttpError ? e.status : 0,
+            // What the provider asked us to wait. Without this the cooldown falls through to the
+            // tracker's 1000ms floor, so a key that asked for a minute is retried a second later —
+            // straight back into the window it was told to wait out.
+            retryAfterMs: e instanceof ManifestHttpError ? e.retryAfterMs : undefined,
+          };
           fallbackChain.push(outcome);
           self.health.recordResult(c.key, cls, outcome.retryAfterMs);
           if (args.signal?.aborted) return;
@@ -190,5 +198,10 @@ export class AllAttemptsFailedError extends Error {
   constructor(readonly model: string, readonly chain: AttemptOutcome[]) {
     const detail = chain.map((a) => `${a.candidate.provider.slug}/${a.candidate.key.label}:${a.cls}`).join(" -> ");
     super(`all attempts failed for ${model} [${detail || "empty plan"}]`);
+  }
+
+  /** Longest upstream retry-after across all failed attempts, in milliseconds. Zero if none set one. */
+  maxRetryAfterMs(): number {
+    return this.chain.reduce((max, a) => Math.max(max, a.retryAfterMs ?? 0), 0);
   }
 }

@@ -149,11 +149,47 @@ function renderHeaders(headers: Record<string, string> | undefined, vars: Record
   );
 }
 
+/** Read a header case-insensitively. `HttpPort` returns a plain `Record`, so unlike a real
+ *  `Headers` the lookup is case-sensitive — and providers are not consistent about how they
+ *  capitalise `Retry-After`. */
+function headerValue(headers: Record<string, string> | undefined, name: string): string | undefined {
+  if (!headers) return undefined;
+  const direct = headers[name];
+  if (direct !== undefined) return direct;
+  const want = name.toLowerCase();
+  for (const k of Object.keys(headers)) {
+    if (k.toLowerCase() === want) return headers[k];
+  }
+  return undefined;
+}
+
+/** Parse a `Retry-After` header into a delay in milliseconds.
+ *
+ *  RFC 9110 allows either a delay in seconds or an HTTP-date. Anything unreadable is `undefined`
+ *  so the caller falls back to its own floor: guessing here would produce a cooldown that is
+ *  either uselessly short or absurdly long. */
+export function parseRetryAfter(raw: string | undefined, now = Date.now()): number | undefined {
+  const v = raw?.trim();
+  if (!v) return undefined;
+  const secs = Number(v);
+  if (Number.isFinite(secs) && secs >= 0) return Math.round(secs * 1000);
+  const at = Date.parse(v);
+  if (Number.isNaN(at)) return undefined;
+  return Math.max(0, at - now);
+}
+
+/** The delay a response asks us to wait, in ms, or undefined when it asks for nothing. */
+export function retryAfterFrom(headers: Record<string, string> | undefined, now = Date.now()): number | undefined {
+  return parseRetryAfter(headerValue(headers, "retry-after"), now);
+}
+
 export class ManifestHttpError extends Error {
   constructor(
     readonly status: number,
     readonly body: string,
     readonly kind: "response" | "mid-stream" = "response",
+    /** What the provider asked us to wait before coming back, when it said. */
+    readonly retryAfterMs?: number,
   ) {
     super(`provider HTTP ${status} (${kind}): ${body.slice(0, 400)}`);
   }
@@ -187,7 +223,7 @@ export class ManifestInterpreter implements AdapterInstance {
       secretRef,
       signal,
     });
-    if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text());
+    if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
     const json: unknown = JSON.parse(await res.text());
     const models: ModelEntry[] = [];
     const raws = ep.map.raw ? selectAll(json, ep.map.raw) : [];
@@ -245,7 +281,7 @@ export class ManifestInterpreter implements AdapterInstance {
       secretRef,
       signal,
     });
-    if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text());
+    if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
 
     if (!args.stream || !ep.stream) {
       const json: unknown = JSON.parse(await res.text());
