@@ -21,19 +21,23 @@ jobs:
         with:
           node-version: 22
           cache: pnpm
+      # `components: clippy` is stated explicitly rather than assumed. The clippy step below cannot
+      # run without it, and relying on this action's default component set to include it would make
+      # the gate's availability depend on an unstated default.
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop/src-tauri
       - name: Install JS deps
         run: pnpm install --frozen-lockfile
-      # `--audit-level=high`, not `moderate`. Measured at f5c17c1: `moderate` fails on 2 advisories
-      # whose single root cause is a vitest devDependency, and the patched line is >=4.1.11 against a
-      # latest of 5.0.1 -- so `moderate` cannot be satisfied without a major test-runner migration.
-      # A gate that fails on the first push is worse than no gate. `high` exits 0 today and still
-      # catches the class that matters. Raise it when the vitest bump lands.
-      - name: Dependency audit (high and above)
-        run: pnpm audit --audit-level=high
+      # `--audit-level=moderate`, raised from `high` on 2026-09-22 when the vitest bump landed. The
+      # two advisories that forced `high` shared a single root cause -- GHSA-82fw-gwwq-j7x9, a vitest
+      # devDependency, vulnerable >=2.1.0 <4.1.11 -- and vitest is now ^4.1.11 across all three
+      # manifests, so `moderate` exits 0 and the gate can hold a stricter line.
+      - name: Dependency audit (moderate and above)
+        run: pnpm audit --audit-level=moderate
       - name: Typecheck
         run: pnpm typecheck
       - name: Unit tests
@@ -50,8 +54,26 @@ jobs:
         run: pnpm check-ts-version
       - name: One product version across every manifest
         run: pnpm check-version-sync
+      # Every relative link and image in every markdown file must resolve. Added because a
+      # documentation reorganisation on 2026-09-22 verified only `.md` targets and silently broke
+      # every `.html`, `.svg` and bare-directory link -- including two image embeds that rendered
+      # as broken images. The same class of bug recurred within the hour. See drift register D9.
+      - name: Doc links resolve
+        run: pnpm check-doc-links
       - name: Rust check
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
+      # `--all-targets` on purpose: the test code is where a lint earns its keep. Two of the
+      # warnings this step was introduced to clear were dead branches with identical arms
+      # (`clippy::if_same_then_else`) -- one in crash reporting, one in the Gemini dialect adapter.
+      # Neither was a compile error, neither failed a test, and the Gemini one sat on a code path
+      # no test reached at all. Linting only the lib would have missed half the class.
+      #
+      # `-D warnings`, not a warning count: a gate that tolerates warnings stops being read the
+      # moment there are 25 of them. Reaching zero was mostly `cargo clippy --fix`; the two
+      # remaining judgement calls (a test helper with 8 positional args, three counts from three
+      # statements) carry a local `#[allow]` with its reason written down.
+      - name: Rust clippy (lints must be clean)
+        run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Rust tests (gateway criterion 8, egress invariants, store, persist)
         run: cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Install Playwright browsers

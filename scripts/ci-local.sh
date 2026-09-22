@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Local mirror of .github/workflows/ci.yml.
+# Local mirror of the step set in .github/workflows/ci.yml.
 #
 # Why this exists: CI runs on macos-14, but from ~2026-09-16 to 2026-09-21 it never started a job
 # — every run failed in ~8s with "the job was not started because recent account payments have
@@ -7,7 +7,7 @@
 # public now, so minutes are free and CI runs again: 3-7 minutes, real results. A ~9-second
 # "failure" is that old signature, not a test result.
 #
-# It still earns its place. It runs the same steps in the same order as ci.yml, so it answers
+# It still earns its place. It runs the same step set as ci.yml, so it answers
 # "would CI pass?" in ~3 minutes rather than waiting on a runner queue, and it is the only gate if
 # Actions is unavailable again.
 #
@@ -78,6 +78,12 @@ if [ "$DO_INSTALL" -eq 1 ]; then
 else
   echo "SKIP pnpm install (default; pass --install to run it)"
 fi
+# `--audit-level=moderate`, raised from `high` on 2026-09-22 when the vitest bump landed and cleared
+# GHSA-82fw-gwwq-j7x9 (vulnerable >=2.1.0 <4.1.11; vitest is now ^4.1.11 in all three manifests).
+# See docs/PRODUCT_COMPLETION_PLAN.md §3.2.
+# Second, to mirror ci.yml exactly (drift register D5). A bad advisory should fail the gate in
+# seconds, not after the whole suite has run.
+step "Dependency audit"       pnpm audit --audit-level=moderate
 step "Typecheck"              pnpm typecheck
 step "Unit tests"             pnpm test
 # ci.yml has no build step at all, so nothing in CI would catch a bundle that no
@@ -86,13 +92,16 @@ step "Build"                  pnpm build
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
 step "One product version"    pnpm check-version-sync
-# `--audit-level=high`, not `moderate`: `moderate` fails on 2 vitest devDependency advisories whose
-# patched line (>=4.1.11) is a major version away, so it cannot be satisfied without a test-runner
-# migration. `high` exits 0 today and still catches the class that matters. See docs/PRODUCT_COMPLETION_PLAN.md §3.2.
-step "Dependency audit"       pnpm audit --audit-level=high
+# A relative link or image that does not resolve is invisible until someone clicks it.
+# See docs/dev-book/07-drift-register.md D9.
+step "Doc links resolve"      pnpm check-doc-links
 
 if command -v cargo >/dev/null 2>&1; then
   step "Rust check"           cargo check --manifest-path "$ROOT/$TAURI_MANIFEST"
+  # `--all-targets` and `-D warnings`, matching ci.yml exactly (drift register D5). The test
+  # targets matter: the two dead branches this step was added to clear were both invisible to a
+  # lib-only lint, and one of them sat on a path no test reached.
+  step "Rust clippy"          cargo clippy --manifest-path "$ROOT/$TAURI_MANIFEST" --all-targets -- -D warnings
   step "Rust tests"           cargo test  --manifest-path "$ROOT/$TAURI_MANIFEST"
 else
   echo "SKIP Rust check/tests — cargo not on PATH (export PATH=\"\$HOME/.cargo/bin:\$PATH\")"

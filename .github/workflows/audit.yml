@@ -10,11 +10,11 @@ name: Dependency audit
 # It also runs on a cheap ubuntu runner rather than the 4-minute macOS one, because nothing here
 # needs macOS -- there is no compilation, only a lockfile read.
 #
-# Why `--audit-level=high` and not `moderate`: measured in docs/PRODUCT_COMPLETION_PLAN.md §3.2.
-# The two moderate advisories share one root cause -- a `vitest` devDependency whose patched line
-# (>=4.1.11) is a whole major version away -- so `moderate` cannot be satisfied without a
-# test-runner migration. A gate that fails on the first push is worse than no gate. Raise it to
-# `moderate` when that migration lands.
+# `--audit-level=moderate`, raised from `high` on 2026-09-22. `high` was the level the first version
+# shipped at, because the two moderate advisories shared one root cause -- a `vitest` devDependency
+# whose patched line (>=4.1.11) was a whole major version away -- so `moderate` could not be
+# satisfied without a test-runner migration. That migration landed the same day and cleared both
+# advisories, so this job and the ci.yml step now hold the same, stricter line.
 
 on:
   schedule:
@@ -54,8 +54,8 @@ jobs:
       - name: Install JS deps
         run: pnpm install --frozen-lockfile
 
-      - name: JS dependency audit (high and above)
-        run: pnpm audit --audit-level=high
+      - name: JS dependency audit (moderate and above)
+        run: pnpm audit --audit-level=moderate
 
       # No Rust toolchain step is needed: the action bundles the `cargo-audit` it runs.
       # `working-directory` is required because the lockfile is not at the repo root -- without it
