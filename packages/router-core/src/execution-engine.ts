@@ -11,7 +11,7 @@ import type { Candidate } from "./route-planner.js";
 import { classify, type ErrorClass } from "./errors.js";
 import { COOLDOWN_FLOOR_MS, type HealthTracker } from "./health-tracker.js";
 import type { ProviderLimiter } from "./concurrency.js";
-import type { ToolCall } from "./ports.js";
+import type { ToolCall, UsageTokens } from "./ports.js";
 
 export interface AttemptOutcome {
   candidate: Candidate;
@@ -33,7 +33,7 @@ export interface ExecuteTextArgs {
   /** Real tool calls are reported here, never through `chunks` (see ports.ToolCall). */
   onToolCall?: (call: ToolCall) => void;
   /** Called once with whatever usage the upstream reported; also fills `TextExecution.usage()`. */
-  onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
+  onUsage?: (usage: UsageTokens) => void;
   signal?: AbortSignal;
   maxAttempts?: number;
 }
@@ -43,7 +43,7 @@ export interface TextExecution {
   served: () => Candidate | undefined;
   fallbackChain: () => AttemptOutcome[];
   chunks: AsyncIterable<string>;
-  usage: () => { prompt_tokens?: number; completion_tokens?: number } | undefined;
+  usage: () => Partial<UsageTokens> | undefined;
 }
 
 export const MAX_ATTEMPTS_DEFAULT = 6;
@@ -67,7 +67,7 @@ export class ExecutionEngine {
 
   async executeText(args: ExecuteTextArgs): Promise<TextExecution> {
     const fallbackChain: AttemptOutcome[] = [];
-    const usageBox: { value?: { prompt_tokens?: number; completion_tokens?: number } } = {};
+    const usageBox: { value?: Partial<UsageTokens> } = {};
     let served: Candidate | undefined;
 
     const maxAttempts = args.maxAttempts ?? MAX_ATTEMPTS_DEFAULT;

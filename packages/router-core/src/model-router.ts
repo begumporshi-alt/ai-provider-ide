@@ -347,6 +347,10 @@ export class ModelRouter implements RouterFacade, AiTextPort {
         const served = exec.served();
         const tokensIn = exec.usage()?.prompt_tokens ?? 0;
         const tokensOut = exec.usage()?.completion_tokens ?? 0;
+        // Carried through as-is, `undefined` included. `ledger.cached_tokens` is nullable so that
+        // "the provider reported no cache block" stays distinguishable from "it reported zero" —
+        // which is the whole question migration 0015 exists to answer.
+        const cachedTokens = exec.usage()?.cached_tokens;
         if (!served) {
           // A stream that completes without ever serving is not a success. The engine returns
           // normally in that state only when the caller aborted (plan exhaustion throws
@@ -365,6 +369,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
             latencyMs: Date.now() - t0,
             tokensIn,
             tokensOut,
+            cachedTokens,
             costEstimateMicros: 0,
             fallbackChain: exec.fallbackChain(),
           });
@@ -383,6 +388,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           latencyMs: Date.now() - t0,
           tokensIn,
           tokensOut,
+          cachedTokens,
           // R2: real cost instead of a constant 0. Unknown pricing -> 0 in the ledger column,
           // and the UI renders "—" for it by consulting the catalog (unknown != free).
           costEstimateMicros: estimateCostMicros(
@@ -425,6 +431,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           latencyMs: Date.now() - t0,
           tokensIn: exec.usage()?.prompt_tokens ?? 0,
           tokensOut: exec.usage()?.completion_tokens ?? 0,
+          cachedTokens: exec.usage()?.cached_tokens,
           costEstimateMicros: 0,
           fallbackChain: chain,
         });

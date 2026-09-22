@@ -92,7 +92,28 @@ export interface TextRequest {
    * usage the upstream provider included in the final chunk. Both values may be absent if the
    * provider never emitted a usage block.
    */
-  onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
+  onUsage?: (usage: UsageTokens) => void;
+}
+
+/**
+ * Token counts for one attempt, as the upstream reported them.
+ *
+ * One shared type rather than three inline literals: this shape is *written* by the manifest
+ * interpreter, *carried* by the execution engine and *read* by the ledger. A field added in one
+ * place and not the others is silently dropped — which is precisely how `cached_tokens` went
+ * unrecorded until migration 0015.
+ */
+export interface UsageTokens {
+  prompt_tokens: number;
+  completion_tokens: number;
+  /**
+   * Prompt tokens the upstream served from its own cache.
+   *
+   * `undefined` means the provider reported no cache block at all — **not** that it cached
+   * nothing. The ledger keeps that distinction (`ledger.cached_tokens` is nullable), because the
+   * question this measurement exists to answer is whether caching is available to us at all.
+   */
+  cached_tokens?: number;
 }
 
 export type TextChunk = string;

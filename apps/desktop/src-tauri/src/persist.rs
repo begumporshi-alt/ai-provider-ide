@@ -420,6 +420,13 @@ pub struct LedgerRow {
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub cost_estimate_micros: i64,
+    /// Prompt tokens the upstream served from its own cache, when it reports them.
+    ///
+    /// `None` is the load-bearing value here, not `0`: it means the provider reported no cache
+    /// block at all, which is a different finding from reporting a zero. `ledger.cached_tokens`
+    /// is nullable for the same reason (migration 0015).
+    #[serde(default)]
+    pub cached_tokens: Option<i64>,
     #[serde(default)]
     pub fallback_chain_json: Option<String>,
 }
@@ -428,9 +435,9 @@ pub struct LedgerRow {
 pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
-        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, fallback_chain_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)",
-        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.fallback_chain_json],
+        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
+        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.cached_tokens, e.fallback_chain_json],
     )?;
     Ok(())
 }
@@ -440,7 +447,7 @@ pub fn ledger_recent(store: State<'_, Arc<Store>>, limit: Option<i64>) -> Result
     let limit = limit.unwrap_or(100).clamp(1, 1000);
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, fallback_chain_json
+        "SELECT ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
          FROM ledger ORDER BY ts DESC LIMIT ?1",
     )?;
     let rows = stmt.query_map(params![limit], |r| {
@@ -459,7 +466,8 @@ pub fn ledger_recent(store: State<'_, Arc<Store>>, limit: Option<i64>) -> Result
             tokens_in: r.get(11)?,
             tokens_out: r.get(12)?,
             cost_estimate_micros: r.get(13)?,
-            fallback_chain_json: r.get(14)?,
+            cached_tokens: r.get(14)?,
+            fallback_chain_json: r.get(15)?,
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)

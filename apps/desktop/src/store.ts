@@ -84,6 +84,8 @@ export interface HostLedgerRow {
   requestedModel: string | null; model: string; status: string; httpStatus: number | null;
   errorClass: string | null; latencyMs: number | null; tokensIn: number; tokensOut: number;
   costEstimateMicros: number; fallbackChainJson: string | null;
+  /** Null when the provider reported no cache block — not the same as a reported zero (0015). */
+  cachedTokens: number | null;
 }
 
 // ---------- singletons ----------
@@ -111,6 +113,9 @@ export const ledger = new UsageLedger({
         tokensIn: e.tokensIn,
         tokensOut: e.tokensOut,
         costEstimateMicros: e.costEstimateMicros,
+        // `null` when the provider reported no cache block. The ledger column is nullable so the
+        // measurement can tell "not reported" apart from "reported zero".
+        cachedTokens: e.cachedTokens ?? null,
         fallbackChainJson: e.fallbackChain
           ? JSON.stringify(e.fallbackChain.map((a) => ({
               provider: a.candidate.provider.slug,

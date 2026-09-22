@@ -27,6 +27,15 @@ export interface LedgerEntry {
   tokensIn: number;
   tokensOut: number;
   costEstimateMicros: number;
+  /**
+   * Prompt tokens the upstream served from its own cache, when it reports them.
+   *
+   * Left `undefined` — deliberately **not** defaulted to 0 — when the provider reported no cache
+   * block. `ledger.cached_tokens` is nullable for the same reason: this measurement exists to tell
+   * "this provider does not report caching" apart from "it reported nothing cached", and only the
+   * second is evidence that caching is unavailable to us. (Migration 0015.)
+   */
+  cachedTokens?: number;
   fallbackChain?: AttemptOutcome[];
 }
 

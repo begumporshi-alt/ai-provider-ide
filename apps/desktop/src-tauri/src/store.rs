@@ -326,6 +326,7 @@ const DATA_MIGRATIONS: &[(&str, fn(&rusqlite::Transaction<'_>) -> rusqlite::Resu
     ("0012_principal_policy", backfill_principal_policy),
     ("0013_model_context", backfill_model_context),
     ("0014_superseded_at", backfill_superseded_at),
+    ("0015_ledger_cached_tokens", backfill_ledger_cached_tokens),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -815,6 +816,22 @@ fn backfill_superseded_at(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()
     Ok(())
 }
 
+/// 0015 — prompt caching was a cost question with no evidence behind it. Nothing recorded whether
+/// an upstream served any part of a prompt from its own cache, so "add `cache_control`" could not
+/// be tested in either direction: the ledger showed the *shape* of the problem (agnes-2.5-flash:
+/// 648 requests, ~35.9M input tokens against ~213K output) but never whether the provider had
+/// already been caching and we simply were not asking for it.
+///
+/// **Nullable on purpose.** The column exists to answer *"does this provider report caching at
+/// all?"*, and `NOT NULL DEFAULT 0` would make "never reports it" indistinguishable from "reports
+/// zero" — collapsing the one distinction the measurement exists to draw. `NULL` = not reported.
+fn backfill_ledger_cached_tokens(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "ledger", "cached_tokens")? {
+        tx.execute_batch("ALTER TABLE ledger ADD COLUMN cached_tokens INTEGER;")?;
+    }
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -922,11 +939,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0014 data migrations.
-        assert_eq!(info.schema_version, 14);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0015 data migrations.
+        assert_eq!(info.schema_version, 15);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(14, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(15, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -964,6 +981,49 @@ mod tests {
         conn.execute("DELETE FROM providers WHERE id='p'", []).unwrap();
         let keys: i64 = conn.query_row("SELECT COUNT(*) FROM api_keys", [], |r| r.get(0)).unwrap();
         assert_eq!(keys, 0);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0015 exists to answer one question: **does an upstream report prompt caching at all?**
+    ///
+    /// That question is only answerable if "not reported" and "reported zero" are different
+    /// values, so the column must be nullable and must carry no default. `NOT NULL DEFAULT 0`
+    /// would have made every provider look like a provider that caches nothing — which is the
+    /// finding the measurement was supposed to be able to falsify.
+    #[test]
+    fn ledger_cached_tokens_is_nullable_and_stays_null_when_unreported() {
+        let dir = std::env::temp_dir().join(format!("aip-cached-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+
+        let conn = s.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(ledger)").unwrap();
+        let cols: Vec<(String, i64, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let cached = cols
+            .iter()
+            .find(|(n, _, _)| n == "cached_tokens")
+            .expect("ledger is missing cached_tokens");
+        assert_eq!(cached.1, 0, "cached_tokens must be nullable (notnull=0)");
+        assert!(cached.2.is_none(), "cached_tokens must carry no default, so absence stays NULL");
+
+        // A row that says nothing about caching keeps NULL rather than being coerced to 0.
+        conn.execute(
+            "INSERT INTO ledger (ts, modality, model, status) VALUES (1,'text','gpt-4o','ok')",
+            [],
+        )
+        .unwrap();
+        let v: Option<i64> =
+            conn.query_row("SELECT cached_tokens FROM ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, None, "an unreported cache must stay NULL, not become 0");
+        // `stmt` still borrows `conn`, so it has to be dropped before `conn` can be moved.
+        drop(stmt);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }

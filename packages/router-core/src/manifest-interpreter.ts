@@ -10,7 +10,27 @@ import { selectAll, selectOne } from "./jsonpath.js";
 import { renderTemplate } from "./template.js";
 import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
-import type { ToolCall } from "./ports.js";
+import type { ToolCall, UsageTokens } from "./ports.js";
+
+/**
+ * Cached-prompt tokens from a usage block, in whichever dialect reports them.
+ *
+ * OpenAI-shaped blocks nest it as `prompt_tokens_details.cached_tokens`; Anthropic puts
+ * `cache_read_input_tokens` at the top level. Returns `undefined` when the block carries neither —
+ * and that is the value the ledger needs. "This provider does not report caching" and "this
+ * provider reported zero cached tokens" are different findings, and only the second is evidence
+ * that caching is unavailable to us.
+ */
+function readCachedTokens(u: Record<string, unknown>): number | undefined {
+  const details = u["prompt_tokens_details"];
+  if (details && typeof details === "object") {
+    const c = (details as Record<string, unknown>)["cached_tokens"];
+    if (typeof c === "number") return c;
+  }
+  const anthropic = u["cache_read_input_tokens"];
+  if (typeof anthropic === "number") return anthropic;
+  return undefined;
+}
 
 export interface HttpPortLike {
   request(req: {
@@ -67,7 +87,7 @@ export interface TextArgs {
    * usage the upstream provider included in the final chunk. Both values may be undefined if the
    * provider never emitted a usage block.
    */
-  onUsage?: (usage: { prompt_tokens: number; completion_tokens: number }) => void;
+  onUsage?: (usage: UsageTokens) => void;
 }
 
 /** Streaming reassembly buffer: `arguments` arrives as fragments, one fragment per chunk. */
@@ -294,8 +314,16 @@ export class ManifestInterpreter implements AdapterInstance {
         if (u && typeof u === "object") {
           const pt = u["prompt_tokens"];
           const ct = u["completion_tokens"];
-          if (typeof pt === "number" || typeof ct === "number") {
-            args.onUsage({ prompt_tokens: typeof pt === "number" ? pt : 0, completion_tokens: typeof ct === "number" ? ct : 0 });
+          const cc = readCachedTokens(u);
+          // `cc !== undefined` is part of the guard, not an afterthought: a provider that reports
+          // ONLY cache fields still has something to record, and dropping the whole callback for
+          // want of a `prompt_tokens` would lose the one number this path exists to capture.
+          if (typeof pt === "number" || typeof ct === "number" || cc !== undefined) {
+            args.onUsage({
+              prompt_tokens: typeof pt === "number" ? pt : 0,
+              completion_tokens: typeof ct === "number" ? ct : 0,
+              cached_tokens: cc,
+            });
           }
         }
       }
@@ -308,7 +336,7 @@ export class ManifestInterpreter implements AdapterInstance {
     const wantToolCalls = Boolean(args.onToolCall && (ep.stream.chunkMap.toolCalls || tcs));
     // Last-seen usage block from the stream. Set by the Rust-side parser or by the provider's
     // own usage chunk (e.g. OpenAI puts it on the final choice; Anthropic puts it on message_delta).
-    let lastUsage: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+    let lastUsage: Partial<UsageTokens> | undefined;
 
     // SSE path: `data: {...}` lines through chunkMap / errorMap / finish (§2.6 v1.1).
     // try/finally so the reassembled tool calls are reported on EVERY exit path, including
@@ -363,8 +391,17 @@ export class ManifestInterpreter implements AdapterInstance {
           if (chunkUsage && typeof chunkUsage === "object") {
             const pt = chunkUsage["prompt_tokens"];
             const ct = chunkUsage["completion_tokens"];
-            if (typeof pt === "number" || typeof ct === "number") {
-              lastUsage = { ...(lastUsage ?? {}), prompt_tokens: typeof pt === "number" ? pt : lastUsage?.prompt_tokens, completion_tokens: typeof ct === "number" ? ct : lastUsage?.completion_tokens };
+            const cc = readCachedTokens(chunkUsage);
+            if (typeof pt === "number" || typeof ct === "number" || cc !== undefined) {
+              lastUsage = {
+                ...(lastUsage ?? {}),
+                prompt_tokens: typeof pt === "number" ? pt : lastUsage?.prompt_tokens,
+                completion_tokens: typeof ct === "number" ? ct : lastUsage?.completion_tokens,
+                // Only overwrite when this chunk actually carried a cache block. A later chunk
+                // that omits it must not erase what an earlier one reported — Anthropic, for
+                // instance, puts usage on `message_delta`, not on every chunk.
+                cached_tokens: cc !== undefined ? cc : lastUsage?.cached_tokens,
+              };
             }
           }
         }
@@ -391,7 +428,11 @@ export class ManifestInterpreter implements AdapterInstance {
       }
       // Forward final usage block to the caller (may be undefined if provider omitted it).
       if (args.onUsage && lastUsage && !signal?.aborted) {
-        args.onUsage({ prompt_tokens: lastUsage.prompt_tokens ?? 0, completion_tokens: lastUsage.completion_tokens ?? 0 });
+        args.onUsage({
+          prompt_tokens: lastUsage.prompt_tokens ?? 0,
+          completion_tokens: lastUsage.completion_tokens ?? 0,
+          cached_tokens: lastUsage.cached_tokens,
+        });
       }
     }
   }
