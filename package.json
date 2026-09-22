@@ -1,13 +1,15 @@
 {
   "name": "ai-provider-router",
   "private": true,
-  "version": "0.0.0",
+  "version": "1.0.0",
+  "license": "Apache-2.0",
   "packageManager": "pnpm@10.12.4",
   "scripts": {
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
     "key-leak-grep": "bash scripts/key-leak-grep.sh",
     "check-ts-version": "bash scripts/check-ts-version.sh",
+    "check-version-sync": "bash scripts/check-version-sync.sh",
     "ci:local": "bash scripts/ci-local.sh",
     "dev": "pnpm --filter ai-provider-router-desktop tauri dev",
     "build": "pnpm -r build"
