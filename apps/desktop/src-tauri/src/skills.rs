@@ -134,11 +134,9 @@ pub fn list(store: &Store) -> Result<Vec<Skill>, String> {
 fn seed_once(store: &Store) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let already: bool = conn
-        .query_row(
-            "SELECT value_json FROM settings WHERE key = 'skills_seeded'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
+        .query_row("SELECT value_json FROM settings WHERE key = 'skills_seeded'", [], |r| {
+            r.get::<_, String>(0)
+        })
         .map(|v| v == "1")
         .unwrap_or(false);
     if already {
@@ -280,11 +278,8 @@ pub struct ParsedSkill {
 /// Slug from a name: lowercase, alphanumeric and dashes only. Empty input yields a generated
 /// slug rather than an empty one, because the slug is the skill's identity.
 pub fn slugify(name: &str) -> String {
-    let s: String = name
-        .to_lowercase()
-        .chars()
-        .map(|c| if c.is_alphanumeric() { c } else { '-' })
-        .collect();
+    let s: String =
+        name.to_lowercase().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
     let s = s.trim_matches('-').to_string();
     let collapsed: String = {
         let mut out = String::new();
@@ -358,7 +353,8 @@ mod skill_tests {
     #[test]
     fn installing_and_revoking_a_user_skill() {
         let (s, d) = temp_store("user");
-        install(&s, "mine".into(), "Mine".into(), "does a thing".into(), "step one".into()).unwrap();
+        install(&s, "mine".into(), "Mine".into(), "does a thing".into(), "step one".into())
+            .unwrap();
         assert!(list(&s).unwrap().iter().any(|k| k.slug == "mine"));
         uninstall(&s, "mine").unwrap();
         assert!(!list(&s).unwrap().iter().any(|k| k.slug == "mine"));

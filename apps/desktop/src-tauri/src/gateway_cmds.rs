@@ -81,11 +81,8 @@ struct EventBridge {
 
 impl Bridge for EventBridge {
     fn dispatch(&self, req: BridgeRequest) {
-        let _ = self.app.emit_to(
-            EventTarget::webview_window(GATEWAY_WINDOW),
-            "gateway-request",
-            &req,
-        );
+        let _ =
+            self.app.emit_to(EventTarget::webview_window(GATEWAY_WINDOW), "gateway-request", &req);
     }
     fn cancel(&self, request_id: u64) {
         let _ = self.app.emit_to(
@@ -160,11 +157,9 @@ pub fn build_core(app: &AppHandle) -> Arc<GatewayCore> {
     // The request path can re-warm the worker window itself, so a lapsed heartbeat becomes a
     // short wait rather than a 503. (The watchdog does the same, but once a minute at most.)
     let warm_app = app.clone();
-    let core = GatewayCore::new(
-        Arc::new(EventBridge { app: app.clone() }),
-        gateway::vault_key_provider(),
-    )
-    .with_warm(Arc::new(move || warm_bridge_window(&warm_app)));
+    let core =
+        GatewayCore::new(Arc::new(EventBridge { app: app.clone() }), gateway::vault_key_provider())
+            .with_warm(Arc::new(move || warm_bridge_window(&warm_app)));
     // R4: per-app keys + monthly spend cap, both store-backed. `try_state` because setup order
     // is not guaranteed for every caller (a harness may build a core with no Store managed);
     // in that case the gateway degrades to master-key-only and uncapped rather than panicking.
@@ -277,10 +272,7 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     warm_bridge_window(&app);
     let t_bind = std::time::Instant::now();
     let handle = gateway::spawn(state.core.clone(), port.unwrap_or(gateway::DEFAULT_PORT)).await?;
-    log_to_file(
-        &app,
-        &format!("enable: listener bound in {}ms", t_bind.elapsed().as_millis()),
-    );
+    log_to_file(&app, &format!("enable: listener bound in {}ms", t_bind.elapsed().as_millis()));
     state.core.set_running(true);
     let bound = handle.addr.port();
     *state.server.lock().unwrap() = Some(handle);
@@ -332,7 +324,10 @@ fn sync_workbuddy_with_retry(app: &AppHandle, store: &Arc<Store>) {
             Ok(r) => {
                 log_to_file(
                     app,
-                    &format!("workbuddy sync: {} published, {} stale removed", r.updated, r.removed),
+                    &format!(
+                        "workbuddy sync: {} published, {} stale removed",
+                        r.updated, r.removed
+                    ),
                 );
                 return;
             }
@@ -472,7 +467,9 @@ pub fn gateway_app_key_create(
 }
 
 #[tauri::command]
-pub fn gateway_app_keys(store: State<'_, Arc<Store>>) -> Result<Vec<crate::persist::GatewayKeyRow>, String> {
+pub fn gateway_app_keys(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<crate::persist::GatewayKeyRow>, String> {
     crate::persist::gateway_keys_list(&store).map_err(|e| e.to_string())
 }
 
@@ -491,9 +488,7 @@ pub fn gateway_app_key_delete(store: State<'_, Arc<Store>>, id: String) -> Resul
 /// Short random id — not security-sensitive (the secret is the key), just collision-resistant.
 fn uuid_like() -> String {
     use rand::Rng as _;
-    (0..16)
-        .map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16)))
-        .collect()
+    (0..16).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect()
 }
 
 // ---------- audit R4: monthly spend cap ----------
@@ -627,7 +622,9 @@ pub fn gateway_set_memory_enabled(
 /// memory path is built never to block a request, so its telemetry must not touch SQLite either.
 /// See `injection_log`.
 #[tauri::command]
-pub fn gateway_injection_stats(state: State<'_, Arc<GatewayState>>) -> Result<InjectionStats, String> {
+pub fn gateway_injection_stats(
+    state: State<'_, Arc<GatewayState>>,
+) -> Result<InjectionStats, String> {
     Ok(state.core.injection_stats())
 }
 
@@ -755,10 +752,9 @@ pub(crate) fn run_gateway_tool(
     tool_name: String,
     arguments: serde_json::Value,
 ) -> Result<crate::tools::ToolResult, String> {
-    let root = state
-        .core
-        .workspace_root()
-        .ok_or_else(|| "workspace root not set — call gateway_set_workspace_root first".to_string())?;
+    let root = state.core.workspace_root().ok_or_else(|| {
+        "workspace root not set — call gateway_set_workspace_root first".to_string()
+    })?;
 
     // Audit H1b: the Assistant asks before every call; the gateway cannot — there is no UI on
     // that path. So mutation is gated here, host-side, where no caller can talk past it.
@@ -815,11 +811,7 @@ pub(crate) fn run_gateway_tool(
         root.display(),
         result.ok,
         result.output.len(),
-        result
-            .error
-            .as_deref()
-            .map(|e| truncate_chars(e, 200))
-            .unwrap_or_else(|| "-".to_string())
+        result.error.as_deref().map(|e| truncate_chars(e, 200)).unwrap_or_else(|| "-".to_string())
     ));
     Ok(result)
 }
@@ -840,7 +832,10 @@ pub fn gateway_tool_run(
 
 /// Webview liveness heartbeat (2s cadence from bridge.ts): proves the router core answers.
 #[tauri::command]
-pub fn gateway_heartbeat(app: AppHandle, state: State<'_, Arc<GatewayState>>) -> Result<(), String> {
+pub fn gateway_heartbeat(
+    app: AppHandle,
+    state: State<'_, Arc<GatewayState>>,
+) -> Result<(), String> {
     // Logged only after a gap, so steady-state beats (every ~2s) stay quiet while the two
     // interesting cases are recorded: the worker coming up for the first time, and it
     // recovering after the OS or an error had stopped it.
@@ -869,10 +864,8 @@ pub(crate) fn log_to_file(app: &AppHandle, line: &str) {
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }
-    let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(dir.join("gateway.log"))
+    let Ok(mut f) =
+        std::fs::OpenOptions::new().create(true).append(true).open(dir.join("gateway.log"))
     else {
         return;
     };
@@ -908,7 +901,11 @@ pub struct GatewayLogLine {
 /// unbounded read this exists to avoid. When the whole file fit in the window, the first line is
 /// complete and must survive — dropping it there would silently eat the oldest line on every short
 /// log, which is the bug this flag exists to prevent.
-pub(crate) fn parse_log_tail(text: &str, limit: usize, truncated_head: bool) -> Vec<GatewayLogLine> {
+pub(crate) fn parse_log_tail(
+    text: &str,
+    limit: usize,
+    truncated_head: bool,
+) -> Vec<GatewayLogLine> {
     // The floor lives here, not in `gateway_log_tail`, because this is the function the floor is a
     // property *of* — and the command cannot be unit-tested without an `AppHandle`, so a floor
     // enforced only there would be an untested rule. The ceiling stays in the command: it is a
@@ -950,7 +947,10 @@ pub(crate) fn parse_log_tail(text: &str, limit: usize, truncated_head: bool) -> 
 ///
 /// Bounded at both ends: at most `limit` lines (capped), read from the last `LOG_TAIL_BYTES`.
 #[tauri::command]
-pub fn gateway_log_tail(app: AppHandle, limit: Option<usize>) -> Result<Vec<GatewayLogLine>, String> {
+pub fn gateway_log_tail(
+    app: AppHandle,
+    limit: Option<usize>,
+) -> Result<Vec<GatewayLogLine>, String> {
     use std::io::{Read as _, Seek as _};
     use tauri::Manager as _;
 
@@ -971,8 +971,7 @@ pub fn gateway_log_tail(app: AppHandle, limit: Option<usize>) -> Result<Vec<Gate
     let len = f.metadata().map_err(|e| e.to_string())?.len();
     let truncated_head = len > LOG_TAIL_BYTES;
     if truncated_head {
-        f.seek(std::io::SeekFrom::Start(len - LOG_TAIL_BYTES))
-            .map_err(|e| e.to_string())?;
+        f.seek(std::io::SeekFrom::Start(len - LOG_TAIL_BYTES)).map_err(|e| e.to_string())?;
     }
     let mut buf = Vec::new();
     f.read_to_end(&mut buf).map_err(|e| e.to_string())?;
@@ -1032,7 +1031,11 @@ pub fn gateway_usage(
 /// Errors when nobody is listening any more. That is the bridge's only backpressure signal,
 /// and it is what stops a runaway tool loop: the bridge aborts on a failed chunk, so a request
 /// whose client has gone cannot keep buying upstream tokens.
-pub fn gateway_chunk(state: State<'_, Arc<GatewayState>>, request_id: u64, text: String) -> Result<(), String> {
+pub fn gateway_chunk(
+    state: State<'_, Arc<GatewayState>>,
+    request_id: u64,
+    text: String,
+) -> Result<(), String> {
     if state.core.reply(request_id, BridgeMsg::Delta(text)) {
         Ok(())
     } else {
@@ -1144,17 +1147,12 @@ mod log_tail_tests {
     #[test]
     fn a_line_without_a_timestamp_is_kept() {
         let got = parse_log_tail("1 first\nno stamp here\n3 a stamped line\n", 10, false);
-        let untimed = got
-            .iter()
-            .find(|l| l.text == "no stamp here")
-            .expect("the untimed line survives");
+        let untimed =
+            got.iter().find(|l| l.text == "no stamp here").expect("the untimed line survives");
         assert_eq!(untimed.ts_ms, None);
         // And a stamped neighbour is still stamped, so "no timestamp" is this line's property
         // rather than the parser having given up on stamps altogether.
-        assert_eq!(
-            got.iter().find(|l| l.text == "a stamped line").unwrap().ts_ms,
-            Some(3_000)
-        );
+        assert_eq!(got.iter().find(|l| l.text == "a stamped line").unwrap().ts_ms, Some(3_000));
     }
 
     /// A model controls part of what reaches the log, so one line must not grow without bound —
@@ -1164,16 +1162,9 @@ mod log_tail_tests {
     #[test]
     fn a_very_long_line_is_capped_on_a_char_boundary() {
         let got = parse_log_tail(&format!("1 short\n2 {}", "é".repeat(2_000)), 10, false);
-        let long = got
-            .iter()
-            .find(|l| l.text.starts_with('é'))
-            .expect("the long line survives");
+        let long = got.iter().find(|l| l.text.starts_with('é')).expect("the long line survives");
         assert_eq!(long.ts_ms, Some(2_000));
-        assert!(
-            long.text.chars().count() < 600,
-            "capped, got {}",
-            long.text.chars().count()
-        );
+        assert!(long.text.chars().count() < 600, "capped, got {}", long.text.chars().count());
         assert!(long.text.starts_with('é'), "the cut is on a char boundary");
     }
 
@@ -1203,9 +1194,7 @@ mod sync_retry_tests {
     fn only_the_missing_key_error_is_worth_waiting_for() {
         assert!(is_key_not_ready(crate::workbuddy::NO_KEY_YET));
 
-        assert!(!is_key_not_ready(
-            "cannot read /nope/models.json: No such file or directory"
-        ));
+        assert!(!is_key_not_ready("cannot read /nope/models.json: No such file or directory"));
         // Near-misses must not match — the comparison is exact on purpose.
         assert!(!is_key_not_ready("no gateway key"));
         assert!(!is_key_not_ready(""));
@@ -1322,10 +1311,7 @@ mod tool_audit_tests {
         assert_eq!(node.kind, "skill", "a tool call, not a new node kind");
         assert_eq!(node.source, "gateway", "distinguishable from Assistant activity");
         assert_eq!(node.label, "read_file");
-        assert!(
-            node.session_id.is_none(),
-            "unsessioned — it belongs to the graph, not History"
-        );
+        assert!(node.session_id.is_none(), "unsessioned — it belongs to the graph, not History");
         let meta = node.meta_json.as_deref().unwrap_or("{}");
         assert!(meta.contains("path=a.txt"), "the digest is kept: {meta}");
         assert!(meta.contains("\"out_bytes\":10"), "{meta}");

@@ -89,7 +89,11 @@ pub fn resolve_session(
 ///
 /// `COALESCE` keeps the first non-null binding: a request that arrives before the project is known
 /// must not overwrite a real project with `NULL` later, which would quietly orphan the session.
-pub fn touch_session(store: &Store, session: &str, scope: &crate::gateway::context_scope::Scope) -> Result<(), String> {
+pub fn touch_session(
+    store: &Store,
+    session: &str,
+    scope: &crate::gateway::context_scope::Scope,
+) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let now = now_ms();
     conn.execute(
@@ -146,7 +150,9 @@ pub fn record_turns(store: &Store, session: &str, body: &Value) -> Result<usize,
             .prepare("SELECT seq, role, text FROM session_turns WHERE session_id = ?1 ORDER BY seq DESC LIMIT 2")
             .map_err(|e| e.to_string())?;
         let rows = stmt
-            .query_map(params![session], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+            .query_map(params![session], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+            })
             .map_err(|e| e.to_string())?;
         for r in rows {
             last.push(r.map_err(|e| e.to_string())?);
@@ -154,7 +160,9 @@ pub fn record_turns(store: &Store, session: &str, body: &Value) -> Result<usize,
     }
 
     let next: i64 = conn
-        .query_row("SELECT turn_count FROM router_sessions WHERE id = ?1", params![session], |r| r.get(0))
+        .query_row("SELECT turn_count FROM router_sessions WHERE id = ?1", params![session], |r| {
+            r.get(0)
+        })
         .unwrap_or(0);
 
     let mut written = 0usize;
@@ -238,11 +246,11 @@ pub fn incoming_hashes(body: &Value) -> std::collections::HashSet<String> {
 /// Drop turns the client has already sent itself. This is the whole of §5.4: injection is
 /// wire-only, but a client that replays its transcript plus a router that injects recent turns puts
 /// the tail in the prompt twice.
-pub fn without_duplicates(turns: Vec<Turn>, incoming: &std::collections::HashSet<String>) -> Vec<Turn> {
-    turns
-        .into_iter()
-        .filter(|t| !incoming.contains(&turn_hash(&t.role, &t.text)))
-        .collect()
+pub fn without_duplicates(
+    turns: Vec<Turn>,
+    incoming: &std::collections::HashSet<String>,
+) -> Vec<Turn> {
+    turns.into_iter().filter(|t| !incoming.contains(&turn_hash(&t.role, &t.text))).collect()
 }
 
 /// Live state the agent pushes: open files and an opaque extra object. Both capped.
@@ -253,8 +261,10 @@ pub fn set_state(
     extra: Option<&Value>,
 ) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    let files = open_files
-        .map(|f| serde_json::to_string(&f.iter().take(OPEN_FILES_CAP).collect::<Vec<_>>()).unwrap_or_else(|_| "[]".into()));
+    let files = open_files.map(|f| {
+        serde_json::to_string(&f.iter().take(OPEN_FILES_CAP).collect::<Vec<_>>())
+            .unwrap_or_else(|_| "[]".into())
+    });
     let extra_json = extra.map(|v| v.to_string()).filter(|s| s.len() <= 4000);
     conn.execute(
         "INSERT INTO session_state (session_id, open_files, extra_json, updated_at)
@@ -284,12 +294,7 @@ pub fn get_state(store: &Store, session: &str) -> Result<Option<SessionState>, S
         .query_row(
             "SELECT open_files, updated_at FROM session_state WHERE session_id = ?1",
             params![session],
-            |r| {
-                Ok((
-                    r.get::<_, Option<String>>(0)?,
-                    r.get::<_, i64>(1)?,
-                ))
-            },
+            |r| Ok((r.get::<_, Option<String>>(0)?, r.get::<_, i64>(1)?)),
         )
         .ok();
     let Some((raw, updated_at)) = row else {
@@ -503,7 +508,8 @@ mod session_context_tests {
         assert!(stats.turns_by_count >= 25, "ring trimmed to {MAX_TURNS_PER_SESSION}: {stats:?}");
         assert_eq!(recent_turns(&s, "s1", 1000).unwrap().len(), MAX_TURNS_PER_SESSION);
         // The newest survived; the oldest did not.
-        let kept: Vec<String> = recent_turns(&s, "s1", 1000).unwrap().iter().map(|t| t.text.clone()).collect();
+        let kept: Vec<String> =
+            recent_turns(&s, "s1", 1000).unwrap().iter().map(|t| t.text.clone()).collect();
         assert!(kept.contains(&format!("turn {}", MAX_TURNS_PER_SESSION + 24)));
         assert!(!kept.contains(&"turn 0".to_string()));
         let _ = std::fs::remove_dir_all(&d);
@@ -540,7 +546,9 @@ mod session_context_tests {
         set_state(&s, "s1", Some(&many), None).unwrap();
         let conn = s.conn.lock().unwrap();
         let raw: String = conn
-            .query_row("SELECT open_files FROM session_state WHERE session_id='s1'", [], |r| r.get(0))
+            .query_row("SELECT open_files FROM session_state WHERE session_id='s1'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         let files: Vec<String> = serde_json::from_str(&raw).unwrap();
         assert_eq!(files.len(), OPEN_FILES_CAP, "capped: {}", files.len());

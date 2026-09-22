@@ -17,8 +17,8 @@ use std::path::{Path, PathBuf};
 /// A single crash report entry. Serialized to JSON on disk.
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct CrashReport {
-    pub id: String,          // ISO-8601 timestamp, also the filename stem
-    pub ts: i64,             // unix ms
+    pub id: String, // ISO-8601 timestamp, also the filename stem
+    pub ts: i64,    // unix ms
     pub message: String,
     pub backtrace: String,
     pub os: String,
@@ -35,11 +35,7 @@ pub fn crashes_dir(app_data_dir: &Path) -> PathBuf {
 
 /// Write a crash report to disk. Returns the report id (also the filename stem).
 /// The `message` field stores the human-readable summary; `backtrace` stores the raw trace.
-pub fn write_crash_report(
-    app_data_dir: &Path,
-    message: &str,
-    backtrace: &str,
-) -> String {
+pub fn write_crash_report(app_data_dir: &Path, message: &str, backtrace: &str) -> String {
     let id = precise_now_ms();
     let ts_str = millis_to_iso(id);
     let report = CrashReport {
@@ -72,10 +68,7 @@ pub fn list_crash_reports(app_data_dir: &Path) -> Vec<String> {
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "json"))
         .filter_map(|e| {
-            e.file_name()
-                .to_string_lossy()
-                .strip_suffix(".json")
-                .map(|s| s.to_string())
+            e.file_name().to_string_lossy().strip_suffix(".json").map(|s| s.to_string())
         })
         .collect();
     entries.sort_by(|a, b| b.cmp(a)); // newest first (ISO strings sort correctly)
@@ -217,9 +210,7 @@ fn millis_to_iso(ms: i64) -> String {
     }
     let day = d + 1;
 
-    format!(
-        "{y:04}-{m:02}-{day:02}T{hours:02}:{mins_rem:02}:{secs:02}.{millis:03}Z"
-    )
+    format!("{y:04}-{m:02}-{day:02}T{hours:02}:{mins_rem:02}:{secs:02}.{millis:03}Z")
 }
 
 fn is_leap(year: u32) -> bool {
@@ -227,9 +218,7 @@ fn is_leap(year: u32) -> bool {
 }
 
 fn month_days_array(leap: bool) -> [u32; 12] {
-    [
-        31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31,
-    ]
+    [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────

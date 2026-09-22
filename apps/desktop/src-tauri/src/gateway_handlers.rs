@@ -11,21 +11,28 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 use crate::gateway::{
     check_gateway_key, clean_assistant_text, cooldown_secs, err, err_ra, err_with_cooldown,
     forwarded_headers, openai_error, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest,
     GatewayCore,
 };
-use crate::gateway::context_scope::{
-    apply_memory_headers, finish_capture, inject_context, prepare_capture,
-};
 
-pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+pub(crate) async fn chat_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.openai();
     }
     let Ok(mut req) = serde_json::from_str::<Value>(&body) else {
-        return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error("invalid JSON body", "invalid_request", None),
+        );
     };
     // §3.4 compatibility contract: only reject truly incompatible parameters.
     // Tools/tool_choice/response_format are now forwarded to upstream providers.
@@ -33,12 +40,19 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
         if req.get(unsupported).is_some_and(|v| !v.is_null()) {
             return err(
                 StatusCode::BAD_REQUEST,
-                openai_error(&format!("{unsupported} is not supported yet"), "invalid_request", Some("unsupported_parameter")),
+                openai_error(
+                    &format!("{unsupported} is not supported yet"),
+                    "invalid_request",
+                    Some("unsupported_parameter"),
+                ),
             );
         }
     }
     if req.get("model").and_then(Value::as_str).unwrap_or("").is_empty() {
-        return err(StatusCode::BAD_REQUEST, openai_error("model is required", "invalid_request", None));
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error("model is required", "invalid_request", None),
+        );
     }
     let wants_stream = req.get("stream").and_then(Value::as_bool).unwrap_or(false);
     // Echoed on every response. Clients read `model` back to confirm what actually served them,
@@ -68,7 +82,12 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     // Capture inputs are computed before dispatch: the stream branch builds a `'static` body and so
     // cannot borrow the request.
     let prep = prepare_capture(&core, &headers, &req, id);
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: req.clone(), headers: fwd.clone() });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "chat",
+        body: req.clone(),
+        headers: fwd.clone(),
+    });
     tracing::info!(request_id = id, kind = "chat", model = %req.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching chat request");
 
     if wants_stream {
@@ -218,7 +237,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                 apply_memory_headers(&mut r, &outcome);
                 return r;
             }
-            let mut r = err_with_cooldown(code, retry_after_ms, openai_error(&message, "upstream_error", None));
+            let mut r = err_with_cooldown(
+                code,
+                retry_after_ms,
+                openai_error(&message, "upstream_error", None),
+            );
             apply_memory_headers(&mut r, &outcome);
             r
         }
@@ -258,15 +281,29 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "models", body: json!({}), headers: forwarded_headers(&headers) });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "models",
+        body: json!({}),
+        headers: forwarded_headers(&headers),
+    });
     tracing::info!(request_id = id, kind = "models", "dispatching models request");
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    v.to_string(),
+                )
+                    .into_response()
             }
             BridgeMsg::Error { status, message, retry_after_ms } => {
-                return err_with_cooldown(worker_status(status), retry_after_ms, openai_error(&message, "upstream_error", None))
+                return err_with_cooldown(
+                    worker_status(status),
+                    retry_after_ms,
+                    openai_error(&message, "upstream_error", None),
+                )
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
@@ -274,7 +311,10 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Usage { .. } => {}
         }
     }
-    err(StatusCode::BAD_GATEWAY, openai_error("empty models response from core", "upstream_error", None))
+    err(
+        StatusCode::BAD_GATEWAY,
+        openai_error("empty models response from core", "upstream_error", None),
+    )
 }
 
 /// Catch-all for unknown `/v1/*` and `/v1beta/*` routes — returns a JSON 404 OpenAI-style error
@@ -292,7 +332,6 @@ pub(crate) async fn unknown_route(
     tracing::warn!("unknown gateway route hit");
     err(StatusCode::NOT_FOUND, openai_error("route not found", "not_found", Some("unknown_route")))
 }
-
 
 /// Wrong method on a known route.
 ///
@@ -312,32 +351,56 @@ pub(crate) async fn method_not_allowed(
     )
 }
 
-pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+pub(crate) async fn image_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.openai();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
-        return err(StatusCode::BAD_REQUEST, openai_error("invalid JSON body", "invalid_request", None));
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error("invalid JSON body", "invalid_request", None),
+        );
     };
     if req.get("model").and_then(Value::as_str).unwrap_or("").is_empty()
         || req.get("prompt").and_then(Value::as_str).unwrap_or("").is_empty()
     {
-        return err(StatusCode::BAD_REQUEST, openai_error("model and prompt are required", "invalid_request", None));
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error("model and prompt are required", "invalid_request", None),
+        );
     }
     let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "image", body: req, headers: forwarded_headers(&headers) });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "image",
+        body: req,
+        headers: forwarded_headers(&headers),
+    });
     tracing::info!(request_id = id, kind = "image", "dispatching image request");
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Result(v) => {
-                return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
+                return (
+                    StatusCode::OK,
+                    [(header::CONTENT_TYPE, "application/json")],
+                    v.to_string(),
+                )
+                    .into_response()
             }
             BridgeMsg::Error { status, message, retry_after_ms } => {
-                return err_with_cooldown(worker_status(status), retry_after_ms, openai_error(&message, "upstream_error", None));
+                return err_with_cooldown(
+                    worker_status(status),
+                    retry_after_ms,
+                    openai_error(&message, "upstream_error", None),
+                );
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
@@ -345,6 +408,8 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
             BridgeMsg::Usage { .. } => {}
         }
     }
-    err(StatusCode::BAD_GATEWAY, openai_error("empty image response from core", "upstream_error", None))
+    err(
+        StatusCode::BAD_GATEWAY,
+        openai_error("empty image response from core", "upstream_error", None),
+    )
 }
-

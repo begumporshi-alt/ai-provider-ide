@@ -185,7 +185,10 @@ pub fn classify(text: &str) -> ContentClass {
     {
         return ContentClass::Decision;
     }
-    if ["i prefer", "i like", "prefer ", "i'd rather", "my preference"].iter().any(|p| lower.contains(p)) {
+    if ["i prefer", "i like", "prefer ", "i'd rather", "my preference"]
+        .iter()
+        .any(|p| lower.contains(p))
+    {
         return ContentClass::Preference;
     }
     ContentClass::Fact
@@ -223,24 +226,58 @@ pub fn involves_tools(body: &Value) -> bool {
 /// Prefixes that are credentials by construction. There is no reason to keep a token that starts
 /// with one of these, whatever context it appears in.
 const KNOWN_PREFIXES: &[&str] = &[
-    "sk-ant-", "sk-proj-", "sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_", "github_pat_", "glpat-",
-    "xoxb-", "xoxp-", "xoxa-", "xapp-", "AKIA", "AIza", "dop_v1_", "shpat_", "shpss_", "rpa_",
+    "sk-ant-",
+    "sk-proj-",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "ghr_",
+    "github_pat_",
+    "glpat-",
+    "xoxb-",
+    "xoxp-",
+    "xoxa-",
+    "xapp-",
+    "AKIA",
+    "AIza",
+    "dop_v1_",
+    "shpat_",
+    "shpss_",
+    "rpa_",
 ];
 
 /// Key names whose value is a credential. Deliberately broad — `auth` or `token` in prose is rare,
 /// and over-redacting costs a slightly less useful memory while under-redacting leaks a key to every
 /// vendor that ever serves a request.
 const SECRET_KEYS: &[&str] = &[
-    "api_key", "apikey", "api-key", "access_key", "secret", "client_secret", "password", "passwd",
-    "pwd", "token", "authtoken", "access_token", "refresh_token", "authorization", "auth",
-    "bearer", "private_key", "credential",
+    "api_key",
+    "apikey",
+    "api-key",
+    "access_key",
+    "secret",
+    "client_secret",
+    "password",
+    "passwd",
+    "pwd",
+    "token",
+    "authtoken",
+    "access_token",
+    "refresh_token",
+    "authorization",
+    "auth",
+    "bearer",
+    "private_key",
+    "credential",
 ];
 
 fn is_high_entropy(token: &str) -> bool {
     if token.len() < 32 {
         return false;
     }
-    if !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-')) {
+    if !token.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '/' | '=' | '_' | '-'))
+    {
         return false;
     }
     let mut classes = 0u8;
@@ -275,7 +312,8 @@ fn scrub_token(token: &str) -> String {
         return REDACTED.to_string();
     }
     // Trailing punctuation is not part of the value: `token:"abc",` should still redact.
-    let core = token.trim_matches(|c: char| matches!(c, ',' | ';' | '"' | '\'' | ')' | ']' | '}' | '>'));
+    let core =
+        token.trim_matches(|c: char| matches!(c, ',' | ';' | '"' | '\'' | ')' | ']' | '}' | '>'));
     if KNOWN_PREFIXES.iter().any(|p| core.starts_with(p)) {
         return REDACTED.to_string();
     }
@@ -386,7 +424,8 @@ pub fn enqueue(store: &Store, req: &CaptureRequest<'_>) -> Enqueue {
     // §3.5.2. Both sides, before anything is stored.
     let user_text = scrub(req.user_text);
     let asst_text = req.asst_text.map(scrub).filter(|s| !s.trim().is_empty());
-    let prose_len = user_text.chars().count() + asst_text.as_ref().map(|s| s.chars().count()).unwrap_or(0);
+    let prose_len =
+        user_text.chars().count() + asst_text.as_ref().map(|s| s.chars().count()).unwrap_or(0);
     if prose_len < MIN_PROSE_CHARS {
         return Enqueue::Skipped(SkipCapture::NoProse);
     }
@@ -582,7 +621,12 @@ pub struct QueueStatus {
 pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut out = QueueStatus {
-        queued: 0, processing: 0, done: 0, failed: 0, outstanding: 0, budget_left: 0,
+        queued: 0,
+        processing: 0,
+        done: 0,
+        failed: 0,
+        outstanding: 0,
+        budget_left: 0,
     };
     let mut stmt = conn
         .prepare("SELECT status, COUNT(*) FROM memory_pending GROUP BY status")
@@ -631,7 +675,12 @@ mod capture_tests {
         }
     }
 
-    fn req<'a>(body: &Value, scope: &'a Scope, user: &'a str, asst: Option<&'a str>) -> CaptureRequest<'a> {
+    fn req<'a>(
+        body: &Value,
+        scope: &'a Scope,
+        user: &'a str,
+        asst: Option<&'a str>,
+    ) -> CaptureRequest<'a> {
         CaptureRequest {
             request_id: "gw-1",
             session_id: Some("s1"),
@@ -674,7 +723,8 @@ mod capture_tests {
     fn a_request_that_declared_tools_is_never_captured() {
         let (s, d) = temp_store("tools");
         let sc = scope(Some("p1"), None);
-        let body = json!({"tools": [{"type":"function"}], "messages": [{"role":"user","content":"x"}]});
+        let body =
+            json!({"tools": [{"type":"function"}], "messages": [{"role":"user","content":"x"}]});
         assert_eq!(
             enqueue(&s, &req(&body, &sc, "this is a long enough piece of prose to capture", None)),
             Enqueue::Skipped(SkipCapture::ToolTurn)
@@ -740,13 +790,20 @@ mod capture_tests {
         let (s, d) = temp_store("stored");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let r = req(&body, &sc, "the deploy token is ghp_zzzzzzzzzzzzzzzzzzzzzzzz please remember it", None);
+        let r = req(
+            &body,
+            &sc,
+            "the deploy token is ghp_zzzzzzzzzzzzzzzzzzzzzzzz please remember it",
+            None,
+        );
         let Enqueue::Queued(id) = enqueue(&s, &r) else {
             panic!("expected a queued row");
         };
         let conn = s.conn.lock().unwrap();
         let stored: String = conn
-            .query_row("SELECT user_text FROM memory_pending WHERE id=?1", params![id], |r| r.get(0))
+            .query_row("SELECT user_text FROM memory_pending WHERE id=?1", params![id], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert!(!stored.contains("ghp_"), "the secret never reaches disk: {stored}");
         assert!(stored.contains(REDACTED));
@@ -757,7 +814,10 @@ mod capture_tests {
 
     #[test]
     fn content_is_classified_so_instructions_are_flagged() {
-        assert_eq!(classify("always run the migrations before deploying"), ContentClass::Instruction);
+        assert_eq!(
+            classify("always run the migrations before deploying"),
+            ContentClass::Instruction
+        );
         assert_eq!(classify("never commit the .env file"), ContentClass::Instruction);
         assert_eq!(classify("we decided to use Postgres"), ContentClass::Decision);
         assert_eq!(classify("I prefer terse replies"), ContentClass::Preference);
@@ -771,8 +831,15 @@ mod capture_tests {
         let (s, d) = temp_store("frozen");
         let sc = scope(Some("p-alpha"), Some("cursor"));
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let Enqueue::Queued(id) = enqueue(&s, &req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None))
-        else {
+        let Enqueue::Queued(id) = enqueue(
+            &s,
+            &req(
+                &body,
+                &sc,
+                "a sufficiently long piece of conversational prose to be worth capturing",
+                None,
+            ),
+        ) else {
             panic!("expected a queued row");
         };
         let conn = s.conn.lock().unwrap();
@@ -796,11 +863,17 @@ mod capture_tests {
         let (s, d) = temp_store("idem");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let r = req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None);
+        let r = req(
+            &body,
+            &sc,
+            "a sufficiently long piece of conversational prose to be worth capturing",
+            None,
+        );
         assert!(matches!(enqueue(&s, &r), Enqueue::Queued(_)));
         assert_eq!(enqueue(&s, &r), Enqueue::Skipped(SkipCapture::AlreadyQueued));
         let conn = s.conn.lock().unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM memory_pending", [], |r| r.get(0)).unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_pending", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -812,7 +885,12 @@ mod capture_tests {
         let (s, d) = temp_store("internal");
         let sc = scope(Some("p1"), Some(INTERNAL_AGENT));
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let mut r = req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None);
+        let mut r = req(
+            &body,
+            &sc,
+            "a sufficiently long piece of conversational prose to be worth capturing",
+            None,
+        );
         r.principal = classify_principal(&sc, false);
         assert_eq!(
             enqueue(&s, &r),
@@ -833,7 +911,10 @@ mod capture_tests {
         let (s, d) = temp_store("short");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        assert_eq!(enqueue(&s, &req(&body, &sc, "ok", None)), Enqueue::Skipped(SkipCapture::NoProse));
+        assert_eq!(
+            enqueue(&s, &req(&body, &sc, "ok", None)),
+            Enqueue::Skipped(SkipCapture::NoProse)
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -842,7 +923,12 @@ mod capture_tests {
         let (s, d) = temp_store("off");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let mut r = req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None);
+        let mut r = req(
+            &body,
+            &sc,
+            "a sufficiently long piece of conversational prose to be worth capturing",
+            None,
+        );
         r.writes_allowed = false;
         assert_eq!(enqueue(&s, &r), Enqueue::Skipped(SkipCapture::WritesDisabled));
         let _ = std::fs::remove_dir_all(&d);
@@ -875,7 +961,15 @@ mod capture_tests {
         let (s, d) = temp_store("release");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        enqueue(&s, &req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None));
+        enqueue(
+            &s,
+            &req(
+                &body,
+                &sc,
+                "a sufficiently long piece of conversational prose to be worth capturing",
+                None,
+            ),
+        );
 
         for attempt in 1..=3 {
             let batch = claim(&s).unwrap();
@@ -897,7 +991,15 @@ mod capture_tests {
         let (s, d) = temp_store("stale");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        enqueue(&s, &req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None));
+        enqueue(
+            &s,
+            &req(
+                &body,
+                &sc,
+                "a sufficiently long piece of conversational prose to be worth capturing",
+                None,
+            ),
+        );
         claim(&s).unwrap();
         {
             let conn = s.conn.lock().unwrap();
@@ -1095,7 +1197,12 @@ mod capture_tests {
         let (s, d) = temp_store("purge");
         let sc = scope(Some("p1"), None);
         let body = json!({"messages":[{"role":"user","content":"x"}]});
-        let mut r = req(&body, &sc, "a sufficiently long piece of conversational prose to be worth capturing", None);
+        let mut r = req(
+            &body,
+            &sc,
+            "a sufficiently long piece of conversational prose to be worth capturing",
+            None,
+        );
         assert!(matches!(enqueue(&s, &r), Enqueue::Queued(_)));
         let rid_done = "gw-done";
         r.request_id = rid_done;
@@ -1113,7 +1220,8 @@ mod capture_tests {
         }
         assert_eq!(purge_finished(&s).unwrap(), 1, "only the row past retention");
         let conn = s.conn.lock().unwrap();
-        let n: i64 = conn.query_row("SELECT COUNT(*) FROM memory_pending", [], |r| r.get(0)).unwrap();
+        let n: i64 =
+            conn.query_row("SELECT COUNT(*) FROM memory_pending", [], |r| r.get(0)).unwrap();
         assert_eq!(n, 1);
         drop(conn);
         // A queued row is never purged, however old it is — otherwise a slow drain could delete
@@ -1121,11 +1229,8 @@ mod capture_tests {
         {
             let conn = s.conn.lock().unwrap();
             let old = now_ms() - (RETENTION_DAYS + 1) * 24 * 60 * 60 * 1000;
-            conn.execute(
-                "UPDATE memory_pending SET status='queued', created_at=?1",
-                params![old],
-            )
-            .unwrap();
+            conn.execute("UPDATE memory_pending SET status='queued', created_at=?1", params![old])
+                .unwrap();
         }
         assert_eq!(purge_finished(&s).unwrap(), 0, "a purge must not be able to lose work");
         let _ = std::fs::remove_dir_all(&d);

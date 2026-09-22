@@ -20,9 +20,10 @@ pub enum StoreError {
 }
 
 /// Ordered migrations. Forward-only; never edit an applied migration (§4).
-const MIGRATIONS: &[(&str, &str)] = &[(
-    "0001_schema_v1_1",
-    r#"
+const MIGRATIONS: &[(&str, &str)] = &[
+    (
+        "0001_schema_v1_1",
+        r#"
 CREATE TABLE IF NOT EXISTS schema_version (
   version    INTEGER PRIMARY KEY,
   name       TEXT NOT NULL,
@@ -174,14 +175,14 @@ CREATE TABLE settings (
   value_json TEXT NOT NULL
 );
 "#,
-),
-(
-    // 0002 — audit R4. Per-app gateway keys: one revocable credential per consuming app, so a
-    // leaked or retired client can be cut off WITHOUT rotating the master key (which would
-    // break every other app). Metadata + revocation live here; the secret lives in the OS
-    // keychain under `gwkey:<id>` and is shown once, never persisted.
-    "0002_gateway_keys",
-    r#"
+    ),
+    (
+        // 0002 — audit R4. Per-app gateway keys: one revocable credential per consuming app, so a
+        // leaked or retired client can be cut off WITHOUT rotating the master key (which would
+        // break every other app). Metadata + revocation live here; the secret lives in the OS
+        // keychain under `gwkey:<id>` and is shown once, never persisted.
+        "0002_gateway_keys",
+        r#"
 CREATE TABLE gateway_keys (
   id           TEXT PRIMARY KEY,
   label        TEXT NOT NULL,
@@ -191,10 +192,10 @@ CREATE TABLE gateway_keys (
 );
 CREATE INDEX idx_gateway_keys_active ON gateway_keys(revoked_at);
 "#,
-),
-(
-    "0003_context_graph",
-    r#"
+    ),
+    (
+        "0003_context_graph",
+        r#"
 CREATE TABLE context_nodes (
   id         TEXT PRIMARY KEY,
   kind       TEXT NOT NULL CHECK (kind IN ('artifact','memory','skill','message')),
@@ -223,10 +224,10 @@ CREATE INDEX idx_context_edges_to ON context_edges(to_id);
 -- duplicating, so a repeated relation reads as a stronger one rather than as more clutter.
 CREATE UNIQUE INDEX uq_context_edges ON context_edges(from_id, to_id, kind);
 "#,
-),
-(
-    "0004_skills",
-    r#"
+    ),
+    (
+        "0004_skills",
+        r#"
 CREATE TABLE skills (
   id           TEXT PRIMARY KEY,
   slug         TEXT NOT NULL UNIQUE,
@@ -240,10 +241,10 @@ CREATE TABLE skills (
 );
 CREATE INDEX idx_skills_enabled ON skills(enabled);
 "#,
-),
-(
-    "0005_agent_runs",
-    r#"
+    ),
+    (
+        "0005_agent_runs",
+        r#"
 CREATE TABLE agent_runs (
   id          TEXT PRIMARY KEY,
   session_id  TEXT,
@@ -271,10 +272,10 @@ CREATE TABLE agent_steps (
 CREATE INDEX idx_agent_steps_run ON agent_steps(run_id, seq);
 CREATE UNIQUE INDEX uq_agent_steps_seq ON agent_steps(run_id, seq);
 "#,
-),
-(
-    "0006_memories",
-    r#"
+    ),
+    (
+        "0006_memories",
+        r#"
 CREATE TABLE memories (
   id          TEXT PRIMARY KEY,
   layer       TEXT NOT NULL CHECK (layer IN ('L0','L1','L2','L3')),
@@ -308,7 +309,8 @@ CREATE TRIGGER memories_au AFTER UPDATE ON memories BEGIN
   INSERT INTO memories_fts(rowid, text) VALUES (new.rowid, new.text);
 END;
 "#,
-)];
+    ),
+];
 
 /// Backfills that need real logic — grouping, weight merging, FK-safe re-keying — and so cannot be
 /// expressed as one SQL batch.
@@ -466,9 +468,7 @@ fn backfill_stable_memory_node_ids(tx: &rusqlite::Transaction<'_>) -> rusqlite::
 /// Every memory node whose id is not the stable `memory:<memoryId>` it should be, resolved through
 /// `meta_json`. A node whose memory no longer exists is deliberately *not* returned: there is no
 /// correct stable id to give it, and inventing one would be worse than leaving the row alone.
-fn load_legacy_memory_nodes(
-    tx: &rusqlite::Transaction<'_>,
-) -> rusqlite::Result<Vec<LegacyNode>> {
+fn load_legacy_memory_nodes(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<Vec<LegacyNode>> {
     let mut stmt = tx.prepare(
         "SELECT n.id,
                 'memory:' || json_extract(n.meta_json,'$.memoryId') AS new_id,
@@ -551,8 +551,7 @@ impl Store {
                 Ok(())
             })();
             applied.map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
-            tx.commit()
-                .map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
+            tx.commit().map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
         }
 
         for (name, run) in DATA_MIGRATIONS.iter() {
@@ -569,8 +568,7 @@ impl Store {
                 Ok(())
             })();
             applied.map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
-            tx.commit()
-                .map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
+            tx.commit().map_err(|e| StoreError::Migration(name.to_string(), e.to_string()))?;
         }
         Ok(())
     }
@@ -841,11 +839,13 @@ fn backfill_ledger_cached_tokens(tx: &rusqlite::Transaction<'_>) -> rusqlite::Re
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
-fn table_has_column(tx: &rusqlite::Transaction<'_>, table: &str, column: &str) -> rusqlite::Result<bool> {
+fn table_has_column(
+    tx: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+) -> rusqlite::Result<bool> {
     let mut stmt = tx.prepare(&format!("PRAGMA table_info({table})"))?;
-    let names = stmt
-        .query_map([], |r| r.get::<_, String>(1))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let names = stmt.query_map([], |r| r.get::<_, String>(1))?.collect::<Result<Vec<_>, _>>()?;
     Ok(names.iter().any(|n| n == column))
 }
 
@@ -879,11 +879,9 @@ mod tests {
         )
         .unwrap();
         let (project, global): (Option<String>, i64) = conn
-            .query_row(
-                "SELECT scope_project, scope_global FROM memories WHERE id='m1'",
-                [],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+            .query_row("SELECT scope_project, scope_global FROM memories WHERE id='m1'", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
             .unwrap();
         assert_eq!(project, None, "no project means unresolved, not global");
         assert_eq!(global, 0, "and unresolved is not injectable");
@@ -956,17 +954,38 @@ mod tests {
         // nothing if the FTS index was never created.
         let conn = s.conn.lock().unwrap();
         for table in [
-            "providers", "api_keys", "manifests", "models_cache", "model_aliases",
-            "ledger", "ledger_rollups", "drift_events", "onboarding_sessions",
-            "generator_audit", "settings", "gateway_keys",
-            "context_nodes", "context_edges", "skills",
-            "agent_runs", "agent_steps",
-            "memories", "memories_fts",
-            "router_sessions", "session_turns", "session_state", "memory_pending",
-            "memory_principal_policy", "router_model_context",
+            "providers",
+            "api_keys",
+            "manifests",
+            "models_cache",
+            "model_aliases",
+            "ledger",
+            "ledger_rollups",
+            "drift_events",
+            "onboarding_sessions",
+            "generator_audit",
+            "settings",
+            "gateway_keys",
+            "context_nodes",
+            "context_edges",
+            "skills",
+            "agent_runs",
+            "agent_steps",
+            "memories",
+            "memories_fts",
+            "router_sessions",
+            "session_turns",
+            "session_state",
+            "memory_pending",
+            "memory_principal_policy",
+            "router_model_context",
         ] {
             let n: i64 = conn
-                .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?", [table], |r| r.get(0))
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
+                    [table],
+                    |r| r.get(0),
+                )
                 .unwrap();
             assert_eq!(n, 1, "missing table {table}");
         }
@@ -1290,7 +1309,9 @@ mod tests {
 
         let conn = s.conn.lock().unwrap();
         let n: i64 = conn
-            .query_row("SELECT COUNT(*) FROM context_nodes WHERE id='memory:s-1:7'", [], |r| r.get(0))
+            .query_row("SELECT COUNT(*) FROM context_nodes WHERE id='memory:s-1:7'", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(n, 1, "a recorded migration must not re-run");
         let versions: i64 = conn
@@ -1330,7 +1351,9 @@ mod tests {
                     2,
                     "error",
                     Some("NO_ROUTE"),
-                    Some(r#"[{"provider":"a","key":"k1","cls":"NETWORK"},{"provider":"b","key":"k2","cls":"AUTH_FAILED"}]"#),
+                    Some(
+                        r#"[{"provider":"a","key":"k1","cls":"NETWORK"},{"provider":"b","key":"k2","cls":"AUTH_FAILED"}]"#,
+                    ),
                 ),
                 // Genuinely no route: nothing was attempted, so the column is already right.
                 (3, "error", Some("NO_ROUTE"), Some("[]")),
@@ -1383,9 +1406,8 @@ mod tests {
 
         // `http_status` is NOT invented: the chain never carried it, so it stays NULL. Writing a
         // plausible-looking number here would repeat the very mistake this migration repairs.
-        let hs: Option<i64> = conn
-            .query_row("SELECT http_status FROM ledger WHERE id=1", [], |r| r.get(0))
-            .unwrap();
+        let hs: Option<i64> =
+            conn.query_row("SELECT http_status FROM ledger WHERE id=1", [], |r| r.get(0)).unwrap();
         assert_eq!(hs, None);
         drop(conn);
         let _ = std::fs::remove_dir_all(&dir);

@@ -1,0 +1,18 @@
+# rustfmt configuration for the Tauri host.
+#
+# `use_small_heuristics = "Max"` is the one non-default setting, and it is here to
+# preserve the style the host is already written in rather than to impose a new one.
+# The default (`Default`) derives its width heuristics from `max_width / 2`, which
+# explodes a compact struct literal like
+#     Self { start: Instant::now(), budget, missed_at: None }
+# into one field per line and breaks a short call chain across four.
+#
+# Measured before adopting, on the 24,006-line host: stock rustfmt rewrites
+# 638 hunks / 10,132 lines (42.2% of the host); this setting rewrites 354 hunks /
+# 7,225 lines (30.1%). It was the minimum of every variant tried -- raising
+# `max_width` to 120 on top of it made the churn worse (402 hunks), not better, so
+# the two are not additive.
+#
+# Everything else is rustfmt's default on purpose. A config that enumerates every
+# option drifts from the tool and then has to be maintained.
+use_small_heuristics = "Max"

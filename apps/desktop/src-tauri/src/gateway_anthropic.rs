@@ -11,13 +11,13 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 use crate::gateway::{
     anthropic_error, anthropic_error_kind, check_gateway_key, clean_assistant_text, err,
     err_with_cooldown, forwarded_headers, peer_ip, try_slot, worker_status, BridgeMsg,
     BridgeRequest, GatewayCore,
-};
-use crate::gateway::context_scope::{
-    apply_memory_headers, finish_capture, inject_context, prepare_capture,
 };
 
 /// Anthropic Messages ingress (2026-09-16 amendment, DECISIONS.md): Claude Code and
@@ -148,11 +148,7 @@ pub(crate) async fn count_tokens_h(
     };
     let text_chars = count_text_chars(&req);
     let input_tokens = text_chars / 4;
-    tracing::debug!(
-        chars = text_chars,
-        input_tokens = input_tokens,
-        "count_tokens estimate"
-    );
+    tracing::debug!(chars = text_chars, input_tokens = input_tokens, "count_tokens estimate");
     (StatusCode::OK, axum::Json(json!({ "input_tokens": input_tokens }))).into_response()
 }
 
@@ -292,7 +288,11 @@ fn tools_to_openai(tools: &Value) -> Option<Value> {
             Some(json!({ "type": "function", "function": function }))
         })
         .collect();
-    if out.is_empty() { None } else { Some(Value::Array(out)) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Array(out))
+    }
 }
 
 /// Anthropic `tool_choice` -> OpenAI. `auto|any|none|tool` maps onto `auto|required|none|forced`.
@@ -316,12 +316,19 @@ fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
     }
 }
 
-pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
+pub(crate) async fn messages_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.anthropic();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
-        return err(StatusCode::BAD_REQUEST, anthropic_error("invalid JSON body", "invalid_request_error"));
+        return err(
+            StatusCode::BAD_REQUEST,
+            anthropic_error("invalid JSON body", "invalid_request_error"),
+        );
     };
     let Some(mut chat) = to_chat_body(&req) else {
         return err(
@@ -366,7 +373,12 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     core.record_injection(id, &model, &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "chat",
+        body: chat,
+        headers: fwd.clone(),
+    });
 
     if wants_stream {
         let mid = msg_id.clone();
@@ -496,7 +508,11 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
-                tracing::info!(request_id = id, delta_len = t.len(), "anthropic non-stream delta received");
+                tracing::info!(
+                    request_id = id,
+                    delta_len = t.len(),
+                    "anthropic non-stream delta received"
+                );
                 full.push_str(&t);
             }
             BridgeMsg::Result(_) => {}
@@ -517,8 +533,15 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
-                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let args_raw = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .unwrap_or(&Value::Null);
                         let args: String = if let Some(s) = args_raw.as_str() {
                             s.to_string()
                         } else {
@@ -543,7 +566,11 @@ pub(crate) async fn messages_h(State(core): State<Arc<GatewayCore>>, headers: He
     let mut r = match err_info {
         Some((status, message, retry_after_ms)) => {
             let code = worker_status(status);
-            err_with_cooldown(code, retry_after_ms, anthropic_error(&message, anthropic_error_kind(code)))
+            err_with_cooldown(
+                code,
+                retry_after_ms,
+                anthropic_error(&message, anthropic_error_kind(code)),
+            )
         }
         None => {
             let prompt_tokens = usage.as_ref().map(|(pt, _)| pt).unwrap_or(&0);
@@ -770,7 +797,8 @@ mod tool_conversion_tests {
         // "hi" = 2
         // tools.to_string() = [{"description":"Run a shell command","name":"Bash"}]
         // (serde_json sorts keys alphabetically; the exact string length is what matters)
-        let tools_chars = json!({ "name": "Bash", "description": "Run a shell command" }).to_string().len();
+        let tools_chars =
+            json!({ "name": "Bash", "description": "Run a shell command" }).to_string().len();
         // tools array adds 2 chars for "[", "]"
         assert_eq!(count_text_chars(&req), 2 + (tools_chars + 2));
     }

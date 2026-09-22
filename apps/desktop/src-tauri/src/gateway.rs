@@ -15,9 +15,9 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -195,9 +195,8 @@ impl MasterKeyCache {
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return MasterKeyLookup::Unavailable;
             };
-            let (guard, _) = ready
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(|e| e.into_inner());
+            let (guard, _) =
+                ready.wait_timeout(state, remaining).unwrap_or_else(|e| e.into_inner());
             drop(guard);
         }
     }
@@ -472,7 +471,10 @@ mod assistant_text_tests {
         // content was "<|im_end|>", which an Anthropic client renders as garbage.
         assert_eq!(clean_assistant_text("<|im_end|>"), "");
         assert_eq!(clean_assistant_text("hello<|im_end|>"), "hello");
-        assert_eq!(clean_assistant_text("<|im_start|>assistant\npong<|endoftext|>"), "assistant\npong");
+        assert_eq!(
+            clean_assistant_text("<|im_start|>assistant\npong<|endoftext|>"),
+            "assistant\npong"
+        );
     }
 
     #[test]
@@ -488,7 +490,9 @@ mod tool_call_shape_tests {
 
     #[test]
     fn flat_bridge_calls_become_openai_shaped() {
-        let out = normalize_tool_calls(json!([{ "id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" }]));
+        let out = normalize_tool_calls(
+            json!([{ "id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" }]),
+        );
         assert_eq!(out[0]["index"], 0);
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["id"], "call_1");
@@ -671,7 +675,11 @@ impl GatewayCore {
 
     /// `new` with an explicit key wait, so tests can exercise the bounded path without sitting
     /// through the production timeout.
-    pub fn new_with_key_wait(bridge: Arc<dyn Bridge>, key_provider: KeyProvider, key_wait: Duration) -> Self {
+    pub fn new_with_key_wait(
+        bridge: Arc<dyn Bridge>,
+        key_provider: KeyProvider,
+        key_wait: Duration,
+    ) -> Self {
         Self {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
@@ -777,10 +785,8 @@ impl GatewayCore {
             return Vec::new();
         };
         // Cheap and authoritative: one indexed SQLite scan, no keychain.
-        let active = self
-            .store
-            .as_ref()
-            .and_then(|s| crate::persist::active_gateway_key_ids(s).ok());
+        let active =
+            self.store.as_ref().and_then(|s| crate::persist::active_gateway_key_ids(s).ok());
         if let Ok(cache) = self.app_key_cache.lock() {
             if cache.fresh(&active) {
                 return cache.keys.clone();
@@ -910,12 +916,16 @@ impl GatewayCore {
         if map.len() >= MAX_FROZEN_BLOCKS && !map.contains_key(&key) {
             // Oldest out. The sweep already removed everything expired, so this only ever fires on a
             // genuinely busy gateway, and losing the oldest block costs one cache miss.
-            if let Some(oldest) = map.iter().min_by_key(|(_, v)| v.frozen_at).map(|(k, _)| k.clone())
+            if let Some(oldest) =
+                map.iter().min_by_key(|(_, v)| v.frozen_at).map(|(k, _)| k.clone())
             {
                 map.remove(&oldest);
             }
         }
-        map.insert(key, FrozenMemory { block, items, tokens, had_candidates, frozen_at: Instant::now() });
+        map.insert(
+            key,
+            FrozenMemory { block, items, tokens, had_candidates, frozen_at: Instant::now() },
+        );
     }
 
     /// Drop every frozen block. Used by the memory toggle and by tests.
@@ -950,7 +960,12 @@ impl GatewayCore {
     ///
     /// Cannot fail a request. A poisoned lock is impossible (`panic = "abort"`), so the `unwrap` needs
     /// no handling.
-    pub fn record_injection(&self, id: u64, model: &str, outcome: &context_scope::InjectionOutcome) {
+    pub fn record_injection(
+        &self,
+        id: u64,
+        model: &str,
+        outcome: &context_scope::InjectionOutcome,
+    ) {
         self.injection_log.lock().unwrap().record(InjectionEvent {
             ts_ms: crate::injection_log::now_ms(),
             id: format!("gw-{id}"),
@@ -1295,12 +1310,20 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
         return Err(err_ra(
             StatusCode::SERVICE_UNAVAILABLE,
             "1",
-            openai_error("AI-Provider Router core unavailable — is the app open?", "service_unavailable", None),
+            openai_error(
+                "AI-Provider Router core unavailable — is the app open?",
+                "service_unavailable",
+                None,
+            ),
         ));
     }
     // Admission first: the 41st request is refused outright, before it can occupy a socket.
     let Ok(permit) = core.permits.clone().try_acquire_owned() else {
-        return Err(err_ra(StatusCode::TOO_MANY_REQUESTS, "1", openai_error("router at capacity", "rate_limit", None)));
+        return Err(err_ra(
+            StatusCode::TOO_MANY_REQUESTS,
+            "1",
+            openai_error("router at capacity", "rate_limit", None),
+        ));
     };
     // Then wait for a ROUTING slot. This wait is the §3.5 queue: admitted, not yet dispatched.
     // `Semaphore::acquire_owned` is cancel-safe, and hyper drops this future when the client
@@ -1504,7 +1527,9 @@ pub(crate) struct GateRefusal {
 impl GateRefusal {
     fn frame(self, body: Value) -> Response {
         match self.retry_after {
-            Some(secs) => (self.status, [(header::RETRY_AFTER, secs)], axum::Json(body)).into_response(),
+            Some(secs) => {
+                (self.status, [(header::RETRY_AFTER, secs)], axum::Json(body)).into_response()
+            }
             None => (self.status, axum::Json(body)).into_response(),
         }
     }
@@ -1592,7 +1617,11 @@ pub(crate) fn cooldown_secs(retry_after_ms: Option<u64>) -> Option<String> {
 /// waits the window out. Without this the client gets the middleware's 1s floor and retries
 /// straight back into the window it was told to wait — the shape of the ZCode burst (seven 429s
 /// in thirteen seconds). Every other status is answered exactly as `err` would.
-pub(crate) fn err_with_cooldown(status: StatusCode, retry_after_ms: Option<u64>, body: Value) -> Response {
+pub(crate) fn err_with_cooldown(
+    status: StatusCode,
+    retry_after_ms: Option<u64>,
+    body: Value,
+) -> Response {
     if status == StatusCode::TOO_MANY_REQUESTS {
         if let Some(secs) = cooldown_secs(retry_after_ms) {
             return err_ra(status, secs, body);
@@ -1621,14 +1650,20 @@ fn peer_ip(_headers: &HeaderMap) -> IpAddr {
 /// Extract headers relevant for client detection (User-Agent, X-Client-Name, etc.).
 fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
     let mut out = HashMap::new();
-    for key in ["user-agent", "x-client-name", "x-codex-client", "accept", "x-api-key", "anthropic-version"] {
+    for key in [
+        "user-agent",
+        "x-client-name",
+        "x-codex-client",
+        "accept",
+        "x-api-key",
+        "anthropic-version",
+    ] {
         if let Some(v) = headers.get(key).and_then(|v| v.to_str().ok()) {
             out.insert(key.to_string(), v.to_string());
         }
     }
     out
 }
-
 
 // ---------- ingress dialects ----------
 //
@@ -1639,20 +1674,20 @@ fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
 
 #[path = "gateway_anthropic.rs"]
 mod anthropic;
+#[path = "context_scope.rs"]
+pub mod context_scope;
 #[path = "gateway_gemini.rs"]
 mod gemini;
 #[path = "gateway_handlers.rs"]
 mod handlers;
-#[path = "gateway_responses.rs"]
-mod responses;
-#[path = "context_scope.rs"]
-pub mod context_scope;
-#[path = "session_context.rs"]
-pub mod session_context;
-#[path = "principal.rs"]
-pub mod principal;
 #[path = "model_context.rs"]
 pub mod model_context;
+#[path = "principal.rs"]
+pub mod principal;
+#[path = "gateway_responses.rs"]
+mod responses;
+#[path = "session_context.rs"]
+pub mod session_context;
 
 use anthropic::{count_tokens_h, messages_h};
 use gemini::gemini_h;
@@ -1666,20 +1701,24 @@ mod tests;
 fn map_generic_to_status(r: Response) -> Response {
     let status = r.status();
     let body = openai_error(
-        if status == StatusCode::TOO_MANY_REQUESTS { "router at capacity" } else { "AI-Provider Router core unavailable — is the app open?" },
+        if status == StatusCode::TOO_MANY_REQUESTS {
+            "router at capacity"
+        } else {
+            "AI-Provider Router core unavailable — is the app open?"
+        },
         if status == StatusCode::TOO_MANY_REQUESTS { "rate_limit" } else { "service_unavailable" },
         None,
     );
     (status, axum::Json(body)).into_response()
 }
 
-
 // ---------- master key + server lifecycle ----------
 
 /// A crypto-random gateway credential. 32 hex chars from OsRng (same shape as the master key,
 /// so external apps cannot tell a per-app key from the master one).
 pub fn generate_random_key() -> String {
-    let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
+    let raw: String =
+        (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
     format!("sk-aip-{raw}")
 }
 
@@ -1697,7 +1736,8 @@ pub fn copy_text(text: &str) -> Result<(), String> {
 /// invalidating the cache would leave the OLD key working — silently, with no failing test,
 /// because the write itself succeeds.
 fn generate_master_key() -> Result<String, String> {
-    let raw: String = (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
+    let raw: String =
+        (0..32).map(|_| format!("{:x}", rand::rngs::OsRng.gen_range(0..16))).collect();
     let key = format!("sk-aip-{raw}");
     vault::put(MASTER_ACCOUNT, &key).map_err(|e| e.to_string())?;
     Ok(key)
@@ -1710,7 +1750,8 @@ fn revoke_master_key() -> Result<(), String> {
 
 /// Copy the master key to the clipboard host-side (invariant 14: never crosses the DOM).
 pub fn copy_master_key() -> Result<(), String> {
-    let key = vault::get(MASTER_ACCOUNT).map_err(|e| e.to_string())?.ok_or("no master key exists")?;
+    let key =
+        vault::get(MASTER_ACCOUNT).map_err(|e| e.to_string())?.ok_or("no master key exists")?;
     let mut cb = arboard::Clipboard::new().map_err(|e| e.to_string())?;
     cb.set_text(key).map_err(|e| e.to_string())
 }
@@ -1737,8 +1778,7 @@ async fn ensure_retry_after(req: Request<Body>, next: Next) -> Response {
     if resp.status() == StatusCode::TOO_MANY_REQUESTS
         && !resp.headers().contains_key(header::RETRY_AFTER)
     {
-        resp.headers_mut()
-            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+        resp.headers_mut().insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
     }
     resp
 }

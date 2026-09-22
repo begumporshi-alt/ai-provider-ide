@@ -318,10 +318,8 @@ impl RequestMeta {
                 .filter(|s| !s.is_empty())
         });
 
-        let project = self
-            .project
-            .clone()
-            .or_else(|| workspace_root.and_then(project_key_from_root));
+        let project =
+            self.project.clone().or_else(|| workspace_root.and_then(project_key_from_root));
 
         Scope {
             user: self.user.clone().unwrap_or_else(|| "local".to_string()),
@@ -598,7 +596,8 @@ pub fn inject_context_deadline(
     let memory_budget = ((budget as f64) * MEMORY_SHARE) as usize;
 
     let freeze_key = freeze_key(&scope, &meta, app_key.as_deref());
-    let (memory_block, items, had_candidates) = match core.frozen_memory(&freeze_key, memory_budget) {
+    let (memory_block, items, had_candidates) = match core.frozen_memory(&freeze_key, memory_budget)
+    {
         // §5.5: a hit skips recall entirely, and that is the point rather than an optimisation —
         // the block has to come out byte-identical, and the only way to guarantee that is to not
         // recompute it.
@@ -612,12 +611,16 @@ pub fn inject_context_deadline(
             // L0 is excluded by default: it is verbatim conversation, so injecting it ships one
             // vendor's session to another. Opting in is deliberate and per-scope (design §0.4).
             let layers = [String::from("L1"), String::from("L2"), String::from("L3")];
-            let rows =
-                match crate::memory::recall_scoped(store, &recall_query(body), 20, Some(&layers), &rscope)
-                {
-                    Ok(r) => r,
-                    Err(_) => return skip(SkipReason::NoCandidates),
-                };
+            let rows = match crate::memory::recall_scoped(
+                store,
+                &recall_query(body),
+                20,
+                Some(&layers),
+                &rscope,
+            ) {
+                Ok(r) => r,
+                Err(_) => return skip(SkipReason::NoCandidates),
+            };
 
             let mut candidates: Vec<Candidate> = rows
                 .into_iter()
@@ -674,7 +677,11 @@ pub fn inject_context_deadline(
     if block.is_empty() {
         // Distinguish "there was nothing to inject" from "there was something and it did not fit" —
         // the two send the operator to completely different fixes.
-        return skip(if had_candidates { SkipReason::BelowFloor } else { SkipReason::NoCandidates });
+        return skip(if had_candidates {
+            SkipReason::BelowFloor
+        } else {
+            SkipReason::NoCandidates
+        });
     }
 
     let tokens = estimate_tokens(&block);
@@ -756,7 +763,11 @@ pub fn prepare_capture(
     Some(PreparedCapture {
         store,
         request_id: crate::capture::request_id(request_id),
-        session: crate::gateway::session_context::resolve_session(&meta, &scope, app_key.as_deref()),
+        session: crate::gateway::session_context::resolve_session(
+            &meta,
+            &scope,
+            app_key.as_deref(),
+        ),
         user_text: recall_query(body),
         model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
         principal: crate::capture::classify_principal(&scope, meta.internal),
@@ -1063,7 +1074,8 @@ mod context_scope_tests {
     #[test]
     fn the_body_fallback_is_used_when_no_headers_arrive() {
         let h = HeaderMap::new();
-        let body = json!({"metadata": {"aip": {"project": "ai-provider-router", "agent": "cursor"}}});
+        let body =
+            json!({"metadata": {"aip": {"project": "ai-provider-router", "agent": "cursor"}}});
         let meta = RequestMeta::parse(&h, &body);
         assert_eq!(meta.project.as_deref(), Some("ai-provider-router"));
         assert_eq!(meta.agent.as_deref(), Some("cursor"));
@@ -1081,19 +1093,26 @@ mod context_scope_tests {
     fn an_unrecognised_mode_is_ignored_rather_than_guessed() {
         let h = hdr(&[("aip-memory", "sometimes")]);
         assert_eq!(RequestMeta::parse(&h, &json!({})).mode, None);
-        assert_eq!(RequestMeta::parse(&hdr(&[("aip-memory", "READ")]), &json!({})).mode, Some(MemoryMode::Read));
+        assert_eq!(
+            RequestMeta::parse(&hdr(&[("aip-memory", "READ")]), &json!({})).mode,
+            Some(MemoryMode::Read)
+        );
     }
 
     #[test]
     fn a_client_budget_is_clamped_to_the_gateway_ceiling() {
         let h = hdr(&[("aip-memory-budget", "900000")]);
         assert_eq!(RequestMeta::parse(&h, &json!({})).budget, Some(MAX_BUDGET_TOKENS));
-        assert_eq!(RequestMeta::parse(&hdr(&[("aip-memory-budget", "0")]), &json!({})).budget, None);
+        assert_eq!(
+            RequestMeta::parse(&hdr(&[("aip-memory-budget", "0")]), &json!({})).budget,
+            None
+        );
     }
 
     #[test]
     fn metadata_aip_is_stripped_and_other_metadata_survives() {
-        let mut body = json!({"model": "m", "metadata": {"aip": {"project": "p"}, "trace_id": "t1"}});
+        let mut body =
+            json!({"model": "m", "metadata": {"aip": {"project": "p"}, "trace_id": "t1"}});
         assert!(strip_aip_metadata(&mut body));
         let md = body.get("metadata").unwrap();
         assert!(md.get("aip").is_none(), "the invented field never reaches a vendor");
@@ -1160,7 +1179,8 @@ mod context_scope_tests {
 
     #[test]
     fn pinned_ranks_first_and_the_rest_keep_their_order() {
-        let mut v = vec![cand("a", "first", false), cand("p", "pinned", true), cand("b", "second", false)];
+        let mut v =
+            vec![cand("a", "first", false), cand("p", "pinned", true), cand("b", "second", false)];
         rank(&mut v);
         assert_eq!(v[0].id, "p");
         assert_eq!(v[1].id, "a", "a stable sort preserves recall order for the unpinned");
@@ -1171,7 +1191,10 @@ mod context_scope_tests {
     /// original blanket floor dropped it.
     #[test]
     fn pinned_survives_a_budget_that_fits_nothing_else() {
-        let v = vec![cand("big", &"x".repeat(4000), false), cand("p", "never run migrations by hand", true)];
+        let v = vec![
+            cand("big", &"x".repeat(4000), false),
+            cand("p", "never run migrations by hand", true),
+        ];
         let got = trim(&v, 8);
         let ids: Vec<&str> = got.iter().map(|c| c.id.as_str()).collect();
         assert_eq!(ids, vec!["p"]);
@@ -1179,7 +1202,11 @@ mod context_scope_tests {
 
     #[test]
     fn unpinned_items_stop_at_the_budget() {
-        let v = vec![cand("a", &"x".repeat(70), false), cand("b", &"y".repeat(70), false), cand("c", &"z".repeat(70), false)];
+        let v = vec![
+            cand("a", &"x".repeat(70), false),
+            cand("b", &"y".repeat(70), false),
+            cand("c", &"z".repeat(70), false),
+        ];
         // ~20 tokens each + 8 overhead, so a 40-token budget fits one.
         let got = trim(&v, 40);
         assert_eq!(got.len(), 1, "greedy fill stops rather than overflowing: {}", got.len());
@@ -1221,14 +1248,20 @@ mod context_scope_tests {
         let ms = body["messages"].as_array().unwrap();
         assert_eq!(ms.len(), 2);
         assert_eq!(ms[0]["content"], "<memory>\n- x\n</memory>\n");
-        assert_eq!(ms[1]["content"], "you are helpful", "the client's own system text is untouched");
+        assert_eq!(
+            ms[1]["content"], "you are helpful",
+            "the client's own system text is untouched"
+        );
     }
 
     #[test]
     fn a_declared_max_tokens_reserve_shrinks_the_budget() {
         let tight = json!({"messages": [], "max_tokens": 8000});
         let loose = json!({"messages": [], "max_tokens": 16});
-        assert!(plan_budget(&tight) < plan_budget(&loose), "a big output reservation leaves less room");
+        assert!(
+            plan_budget(&tight) < plan_budget(&loose),
+            "a big output reservation leaves less room"
+        );
     }
 
     #[test]
@@ -1337,7 +1370,10 @@ mod context_scope_tests {
         };
         let v = scope.as_header_value();
         assert!(!v.contains('\r') && !v.contains('\n'));
-        assert!(axum::http::HeaderValue::from_str(&v).is_ok(), "the sanitised value is always legal");
+        assert!(
+            axum::http::HeaderValue::from_str(&v).is_ok(),
+            "the sanitised value is always legal"
+        );
     }
 
     #[test]
@@ -1501,15 +1537,21 @@ mod context_scope_tests {
         // is a separate trailing turn because recall reads the last user turn — padding the question
         // itself would make BM25 search for "word word word" and find nothing.
         let fat = "word ".repeat(6_000);
-        let body = || json!({"model": "openrouter/gpt-4o", "messages": [
-            {"role": "user", "content": fat},
-            {"role": "user", "content": "what database does this project use"}
-        ]});
+        let body = || {
+            json!({"model": "openrouter/gpt-4o", "messages": [
+                {"role": "user", "content": fat},
+                {"role": "user", "content": "what database does this project use"}
+            ]})
+        };
 
         // Before: the host has no window for this model, plans against 8192, and finds no room.
         let mut before = body();
         let out = inject_context(&core, &HeaderMap::new(), None, &mut before);
-        assert!(!out.injected, "with no known window, an 8.6k prompt leaves nothing: {}", out.status_value());
+        assert!(
+            !out.injected,
+            "with no known window, an 8.6k prompt leaves nothing: {}",
+            out.status_value()
+        );
 
         // After: the catalog publishes the real window and the same request gets memory.
         let n = crate::gateway::model_context::upsert(
@@ -1562,9 +1604,11 @@ mod context_scope_tests {
         let core = core().with_store(store.clone());
         core.set_memory_enabled(true);
 
-        let body = || json!({"model": "m", "messages": [
-            {"role": "user", "content": "what database does this project use"}
-        ]});
+        let body = || {
+            json!({"model": "m", "messages": [
+                {"role": "user", "content": "what database does this project use"}
+            ]})
+        };
 
         // Plain `inject_context`: this test is about per-principal policy, not about the clock.
         // `MEMORY_DEADLINE` is widened under `cfg(test)` so the production budget cannot turn this
@@ -1637,13 +1681,11 @@ mod context_scope_tests {
             .iter()
             .map(|(id, sec)| crate::gateway::AppKey { id: (*id).into(), secret: (*sec).into() })
             .collect();
-        let core = core()
-            .with_store(store.clone())
-            .with_app_keys(Arc::new(move || {
-                r.fetch_add(1, Ordering::SeqCst);
-                let active = crate::persist::active_gateway_key_ids(&s2).unwrap_or_default();
-                all.iter().filter(|k| active.contains(&k.id)).cloned().collect()
-            }));
+        let core = core().with_store(store.clone()).with_app_keys(Arc::new(move || {
+            r.fetch_add(1, Ordering::SeqCst);
+            let active = crate::persist::active_gateway_key_ids(&s2).unwrap_or_default();
+            all.iter().filter(|k| active.contains(&k.id)).cloned().collect()
+        }));
         core.set_memory_enabled(true);
         (core, store, reads, dir)
     }
@@ -1686,22 +1728,31 @@ mod context_scope_tests {
 
         // No label, no policy: both identities are absent, so this inherits.
         let mut ok = body();
-        let out = inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app1")]), None, &mut ok);
+        let out =
+            inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app1")]), None, &mut ok);
         assert!(out.injected, "no row means inherit: {}", out.status_value());
 
         // Denied by key — the whole feature. Without the resolved id this client is unnameable.
         let key1 = crate::gateway::principal::key_principal("ak-1");
         assert!(crate::gateway::principal::set(&store, &key1, false).unwrap());
         let mut denied = body();
-        let out =
-            inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app1")]), None, &mut denied);
+        let out = inject_context(
+            &core,
+            &hdr(&[("authorization", "Bearer sk-aip-app1")]),
+            None,
+            &mut denied,
+        );
         assert!(!out.injected);
         assert_eq!(out.reason, SkipReason::PrincipalOff);
 
         // A different key is untouched — one refusal is not a global one.
         let mut other = body();
-        let out =
-            inject_context(&core, &hdr(&[("authorization", "Bearer sk-aip-app2")]), None, &mut other);
+        let out = inject_context(
+            &core,
+            &hdr(&[("authorization", "Bearer sk-aip-app2")]),
+            None,
+            &mut other,
+        );
         assert!(out.injected, "{}", out.status_value());
 
         // And a secret we do not recognise names nobody, so no row can reach it and it inherits.
@@ -1800,13 +1851,9 @@ mod context_scope_tests {
         assert!(!after.writes_allowed, "a denied principal must not be learned from");
 
         // And an app key is untouched.
-        let other = prepare_capture(
-            &core,
-            &hdr(&[("authorization", "Bearer sk-aip-app1")]),
-            &body,
-            3,
-        )
-        .unwrap();
+        let other =
+            prepare_capture(&core, &hdr(&[("authorization", "Bearer sk-aip-app1")]), &body, 3)
+                .unwrap();
         assert!(other.writes_allowed, "one refusal is not a global one");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1826,12 +1873,12 @@ mod context_scope_tests {
     fn live_context_from_a_previous_request_reaches_the_body() {
         let (core, dir) = store_core("carry");
 
-        let mut first = json!({"model": "m", "messages": [{"role": "user", "content": "hello there"}]});
+        let mut first =
+            json!({"model": "m", "messages": [{"role": "user", "content": "hello there"}]});
         let out1 = inject_context(&core, &HeaderMap::new(), None, &mut first);
         assert!(!out1.injected, "the first request has no prior context: {}", out1.status_value());
 
-        let mut second =
-            json!({"model": "m", "messages": [{"role": "user", "content": "now fix the failing test"}]});
+        let mut second = json!({"model": "m", "messages": [{"role": "user", "content": "now fix the failing test"}]});
         let out2 = inject_context(&core, &HeaderMap::new(), None, &mut second);
         assert!(out2.injected, "{}", out2.status_value());
 
@@ -1855,10 +1902,12 @@ mod context_scope_tests {
         let (core, dir) = store_core("files");
         let h = hdr(&[("aip-open-files", "src/main.rs, src/lib.rs")]);
 
-        let mut first = json!({"model": "m", "messages": [{"role": "user", "content": "look at this"}]});
+        let mut first =
+            json!({"model": "m", "messages": [{"role": "user", "content": "look at this"}]});
         inject_context(&core, &h, None, &mut first);
 
-        let mut second = json!({"model": "m", "messages": [{"role": "user", "content": "and now this"}]});
+        let mut second =
+            json!({"model": "m", "messages": [{"role": "user", "content": "and now this"}]});
         let out = inject_context(&core, &HeaderMap::new(), None, &mut second);
         assert!(out.injected, "{}", out.status_value());
         let block = second["messages"][0]["content"].as_str().unwrap();
@@ -1894,7 +1943,8 @@ mod context_scope_tests {
     #[test]
     fn a_request_that_misses_its_deadline_is_dispatched_without_memory_and_writes_nothing() {
         let (core, dir) = store_core("deadline");
-        let body = |text: &str| json!({"model": "m", "messages": [{"role": "user", "content": text}]});
+        let body =
+            |text: &str| json!({"model": "m", "messages": [{"role": "user", "content": text}]});
 
         // Zero budget: the clock is gone before recall can be paid for.
         let mut first = body("hello there");
@@ -1916,7 +1966,12 @@ mod context_scope_tests {
             &mut second,
             Duration::from_secs(30),
         );
-        assert_eq!(out2.context, 0, "the aborted request recorded nothing: {}", out2.status_value());
+        assert_eq!(
+            out2.context,
+            0,
+            "the aborted request recorded nothing: {}",
+            out2.status_value()
+        );
 
         // Control: the same machinery with a real budget both injects and records.
         let mut third = body("and then");

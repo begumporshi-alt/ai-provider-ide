@@ -52,8 +52,19 @@ fn allowed_programs() -> &'static HashSet<&'static str> {
 /// `git` is allowed, but only for subcommands that cannot reach the network. `push`/`pull`/
 /// `fetch`/`clone` are excluded so a model cannot exfiltrate a repo or fetch a payload.
 const GIT_SUBCOMMANDS: &[&str] = &[
-    "status", "diff", "log", "show", "branch", "add", "commit", "init", "rev-parse",
-    "ls-files", "config", "describe", "stash",
+    "status",
+    "diff",
+    "log",
+    "show",
+    "branch",
+    "add",
+    "commit",
+    "init",
+    "rev-parse",
+    "ls-files",
+    "config",
+    "describe",
+    "stash",
 ];
 
 const MAX_COMMAND_MS: u64 = 60_000;
@@ -161,12 +172,15 @@ fn resolve_within(root: &Path, rel: &str, create_parents: bool) -> Result<PathBu
     }
     let rel_path = Path::new(rel);
     if rel_path.is_absolute() {
-        return Err("absolute paths are not allowed — use a path relative to the workspace root".into());
+        return Err(
+            "absolute paths are not allowed — use a path relative to the workspace root".into()
+        );
     }
     if rel_path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err("'..' is not allowed in a path".into());
     }
-    let root_canon = fs::canonicalize(root).map_err(|e| format!("workspace root is not accessible: {e}"))?;
+    let root_canon =
+        fs::canonicalize(root).map_err(|e| format!("workspace root is not accessible: {e}"))?;
     let target = root_canon.join(rel_path);
     // Reads and listings cannot create anything, so a missing path is simply missing. Say so
     // plainly: the reader of this message is a model, and "parent directory is not accessible"
@@ -180,16 +194,19 @@ fn resolve_within(root: &Path, rel: &str, create_parents: bool) -> Result<PathBu
             // Not there yet (typically a write target): canonicalize the parent directory
             // instead. For writes we may create it first; the parent is re-checked against the
             // root afterwards so a symlink in the middle cannot redirect the create outside.
-            let parent = target.parent().ok_or_else(|| "path has no parent directory".to_string())?;
+            let parent =
+                target.parent().ok_or_else(|| "path has no parent directory".to_string())?;
             if create_parents {
-                fs::create_dir_all(parent).map_err(|e| format!("cannot create parent directory: {e}"))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| format!("cannot create parent directory: {e}"))?;
             }
-            let parent_canon =
-                fs::canonicalize(parent).map_err(|e| format!("parent directory is not accessible: {e}"))?;
+            let parent_canon = fs::canonicalize(parent)
+                .map_err(|e| format!("parent directory is not accessible: {e}"))?;
             if !parent_canon.starts_with(&root_canon) {
                 return Err("path resolves outside the workspace root".into());
             }
-            parent_canon.join(target.file_name().ok_or_else(|| "path has no file name".to_string())?)
+            parent_canon
+                .join(target.file_name().ok_or_else(|| "path has no file name".to_string())?)
         }
     };
     if !resolved.starts_with(&root_canon) {
@@ -342,7 +359,11 @@ fn do_list_dir(args: &serde_json::Value, root: &Path) -> ToolResult {
                 let shown = p.strip_prefix(&base).unwrap_or(&p);
                 out.push(format!("{} {}", if is_dir { "dir " } else { "file" }, shown.display()));
             }
-            return Ok(if out.is_empty() { "(empty directory)".to_string() } else { out.join("\n") });
+            return Ok(if out.is_empty() {
+                "(empty directory)".to_string()
+            } else {
+                out.join("\n")
+            });
         }
         let mut entries: Vec<String> = Vec::new();
         for entry in fs::read_dir(&dir).map_err(|e| format!("cannot list: {e}"))? {
@@ -382,12 +403,15 @@ fn do_file_info(args: &serde_json::Value, root: &Path) -> ToolResult {
         // too, so the only difference is that a missing path is a result instead of an error.
         let rel_path = Path::new(&rel);
         if rel_path.is_absolute() {
-            return Err("absolute paths are not allowed — use a path relative to the workspace root".into());
+            return Err(
+                "absolute paths are not allowed — use a path relative to the workspace root".into(),
+            );
         }
         if rel_path.components().any(|c| matches!(c, Component::ParentDir)) {
             return Err("'..' is not allowed in a path".into());
         }
-        let root_canon = fs::canonicalize(root).map_err(|e| format!("workspace root is not accessible: {e}"))?;
+        let root_canon =
+            fs::canonicalize(root).map_err(|e| format!("workspace root is not accessible: {e}"))?;
         let target = root_canon.join(rel_path);
         let resolved = fs::canonicalize(&target).unwrap_or_else(|_| target.clone());
         if !resolved.starts_with(&root_canon) {
@@ -500,9 +524,7 @@ fn do_search_files(args: &serde_json::Value, root: &Path) -> ToolResult {
         if let Some(reason) = capped {
             // Name which bound stopped it: "narrow the pattern" and "narrow the path" are
             // different advice, and a model told the wrong one retries the same search.
-            out.push_str(&format!(
-                "\n… capped at {reason} — narrow the pattern or the path"
-            ));
+            out.push_str(&format!("\n… capped at {reason} — narrow the pattern or the path"));
         }
         Ok(out)
     })() {
@@ -544,7 +566,8 @@ fn do_edit_file(args: &serde_json::Value, root: &Path) -> ToolResult {
                  quote more surrounding lines, or pass replace_all:true to change every one"
             ));
         }
-        let updated = if all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
+        let updated =
+            if all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
         if updated.len() > MAX_WRITE_BYTES {
             return Err(format!("result exceeds the {MAX_WRITE_BYTES} byte cap"));
         }
@@ -632,21 +655,15 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
             .env("LANG", "C.UTF-8");
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("cannot start \"{program}\": {e}"))?;
+        let mut child = cmd.spawn().map_err(|e| format!("cannot start \"{program}\": {e}"))?;
         // `std` has no wait-with-timeout that also captures output, so the child is parked in
         // a worker thread that reads both pipes to EOF and then waits; on timeout the caller
         // kills it through the shared lock. `kill`/`wait` both take `&mut self`, so the child
         // stays behind the lock and is never moved out.
-        let mut stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "stdout was not captured".to_string())?;
-        let mut stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| "stderr was not captured".to_string())?;
+        let mut stdout =
+            child.stdout.take().ok_or_else(|| "stdout was not captured".to_string())?;
+        let mut stderr =
+            child.stderr.take().ok_or_else(|| "stderr was not captured".to_string())?;
         let child = Arc::new(Mutex::new(child));
         let (tx, rx) = mpsc::channel::<std::io::Result<(Vec<u8>, Vec<u8>, i32)>>();
         let killer = child.clone();
@@ -666,19 +683,19 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             }
         });
 
-        let (captured_out, captured_err, code) =
-            match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-                Ok(Ok(triple)) => triple,
-                Ok(Err(e)) => return Err(format!("command failed: {e}")),
-                Err(_) => {
-                    // Timed out: kill, then drain the worker's result so the thread exits.
-                    let _ = child.lock().unwrap().kill();
-                    let _ = rx.recv_timeout(Duration::from_millis(MAX_COMMAND_MS.saturating_add(5_000)));
-                    return Err(format!(
-                        "\"{program}\" timed out after {timeout_ms}ms and was killed"
-                    ));
-                }
-            };
+        let (captured_out, captured_err, code) = match rx
+            .recv_timeout(Duration::from_millis(timeout_ms))
+        {
+            Ok(Ok(triple)) => triple,
+            Ok(Err(e)) => return Err(format!("command failed: {e}")),
+            Err(_) => {
+                // Timed out: kill, then drain the worker's result so the thread exits.
+                let _ = child.lock().unwrap().kill();
+                let _ =
+                    rx.recv_timeout(Duration::from_millis(MAX_COMMAND_MS.saturating_add(5_000)));
+                return Err(format!("\"{program}\" timed out after {timeout_ms}ms and was killed"));
+            }
+        };
 
         let mut text = String::new();
         text.push_str(&truncate(&captured_out, MAX_OUTPUT_BYTES));
@@ -725,7 +742,7 @@ pub(crate) fn validate_root(root: &Path) -> Result<PathBuf, String> {
     // No parent means the filesystem root.
     if canonical.parent().is_none() {
         return Err(
-            "workspace root cannot be the filesystem root — there would be no confinement".into(),
+            "workspace root cannot be the filesystem root — there would be no confinement".into()
         );
     }
     // Compare canonicalized to canonicalized. Several of these are symlinks on macOS —
@@ -821,8 +838,11 @@ mod tests {
 
     fn root() -> PathBuf {
         let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir()
-            .join(format!("aiprovider-tools-test-{}-{}", std::process::id(), seq));
+        let dir = std::env::temp_dir().join(format!(
+            "aiprovider-tools-test-{}-{}",
+            std::process::id(),
+            seq
+        ));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -912,7 +932,8 @@ mod tests {
     #[test]
     fn symlink_escaping_the_root_is_refused() {
         let r = root();
-        let outside = std::env::temp_dir().join(format!("aiprovider-outside-{}", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("aiprovider-outside-{}", std::process::id()));
         fs::write(&outside, "secret").unwrap();
         let link = r.join("escape.txt");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
@@ -925,7 +946,10 @@ mod tests {
     fn write_then_read_round_trips_inside_the_root() {
         let r = root();
         let w = do_write_file(
-            &obj(&[("path", serde_json::json!("skills/demo/SKILL.md")), ("content", serde_json::json!("# demo"))]),
+            &obj(&[
+                ("path", serde_json::json!("skills/demo/SKILL.md")),
+                ("content", serde_json::json!("# demo")),
+            ]),
             &r,
         );
         assert!(w.ok, "{:?}", w.error);
@@ -937,7 +961,13 @@ mod tests {
     #[test]
     fn disallowed_program_never_starts() {
         let r = root();
-        let res = do_run_command(&obj(&[("program", serde_json::json!("rm")), ("args", serde_json::json!(["-rf", "/"]))]), &r);
+        let res = do_run_command(
+            &obj(&[
+                ("program", serde_json::json!("rm")),
+                ("args", serde_json::json!(["-rf", "/"])),
+            ]),
+            &r,
+        );
         assert!(!res.ok);
         assert!(res.error.unwrap().contains("not on the allowlist"));
     }
@@ -948,7 +978,10 @@ mod tests {
         // not as `echo hi` followed by deleting a directory.
         let r = root();
         let res = do_run_command(
-            &obj(&[("program", serde_json::json!("echo")), ("args", serde_json::json!(["hi; echo pwned"]))]),
+            &obj(&[
+                ("program", serde_json::json!("echo")),
+                ("args", serde_json::json!(["hi; echo pwned"])),
+            ]),
             &r,
         );
         assert!(res.ok);
@@ -997,10 +1030,7 @@ mod tests {
         );
         let _ = fs::remove_file(&outside);
 
-        assert!(
-            !res.ok,
-            "run_command must refuse an absolute path outside the root"
-        );
+        assert!(!res.ok, "run_command must refuse an absolute path outside the root");
         assert!(
             !res.output.contains("TOP-SECRET-OUTSIDE"),
             "file contents outside the root leaked: {}",
@@ -1023,8 +1053,10 @@ mod tests {
     #[test]
     fn run_command_refuses_parent_traversal_in_arguments() {
         let dir = root();
-        let res =
-            do_run_command(&serde_json::json!({ "program": "cat", "args": ["../escaped.txt"] }), &dir);
+        let res = do_run_command(
+            &serde_json::json!({ "program": "cat", "args": ["../escaped.txt"] }),
+            &dir,
+        );
         assert!(!res.ok, "'..' in an argument must be refused");
     }
 
@@ -1171,18 +1203,16 @@ mod tests {
     fn search_files_never_leaves_the_root() {
         let r = root();
         // A sibling of the workspace, i.e. outside it. It must not appear in results.
-        let outside = std::env::temp_dir().join(format!("aiprovider-outside-{}.txt", std::process::id()));
+        let outside =
+            std::env::temp_dir().join(format!("aiprovider-outside-{}.txt", std::process::id()));
         fs::write(&outside, "needle outside\n").unwrap();
         let res = call("search_files", serde_json::json!({ "pattern": "needle" }), &r);
         assert!(res.ok);
         assert!(!res.output.contains("outside"), "search escaped the root: {}", res.output);
         let _ = fs::remove_file(&outside);
 
-        let escaped = call(
-            "search_files",
-            serde_json::json!({ "pattern": "needle", "path": "../" }),
-            &r,
-        );
+        let escaped =
+            call("search_files", serde_json::json!({ "pattern": "needle", "path": "../" }), &r);
         assert!(!escaped.ok, "'..' must be refused, not silently honoured");
         assert!(
             escaped.error.unwrap_or_default().contains("not allowed"),
@@ -1212,11 +1242,8 @@ mod tests {
     fn read_file_pages_by_line() {
         let r = root();
         fs::write(r.join("a.txt"), "l1\nl2\nl3\nl4\nl5\n").unwrap();
-        let res = call(
-            "read_file",
-            serde_json::json!({ "path": "a.txt", "offset": 3, "limit": 2 }),
-            &r,
-        );
+        let res =
+            call("read_file", serde_json::json!({ "path": "a.txt", "offset": 3, "limit": 2 }), &r);
         assert!(res.ok, "{:?}", res.error);
         assert!(res.output.starts_with("[lines 3-4 of 5]"), "got: {}", res.output);
         assert!(res.output.contains("l3\nl4"), "got: {}", res.output);
@@ -1233,11 +1260,7 @@ mod tests {
         fs::write(r.join("sub/deep/x.txt"), "x").unwrap();
         let flat = call("list_dir", serde_json::json!({ "path": "." }), &r);
         assert!(flat.ok && !flat.output.contains("deep/x.txt"), "one level only: {}", flat.output);
-        let deep = call(
-            "list_dir",
-            serde_json::json!({ "path": ".", "recursive": true }),
-            &r,
-        );
+        let deep = call("list_dir", serde_json::json!({ "path": ".", "recursive": true }), &r);
         assert!(deep.ok, "{:?}", deep.error);
         assert!(deep.output.contains("dir  sub"), "got: {}", deep.output);
         assert!(deep.output.contains("file sub/deep/x.txt"), "got: {}", deep.output);
@@ -1261,7 +1284,11 @@ mod tests {
     fn edit_file_refuses_an_ambiguous_match() {
         let r = root();
         fs::write(r.join("a.txt"), "same\nsame\n").unwrap();
-        let res = call("edit_file", serde_json::json!({ "path": "a.txt", "old": "same", "new": "x" }), &r);
+        let res = call(
+            "edit_file",
+            serde_json::json!({ "path": "a.txt", "old": "same", "new": "x" }),
+            &r,
+        );
         assert!(!res.ok, "an ambiguous replace must be refused, not guessed");
         let err = res.error.unwrap_or_default();
         assert!(err.contains("occurs 2 times"), "the count belongs in the reason: {err}");
@@ -1290,7 +1317,11 @@ mod tests {
     fn edit_file_says_when_the_snippet_is_absent() {
         let r = root();
         fs::write(r.join("a.txt"), "one\n").unwrap();
-        let res = call("edit_file", serde_json::json!({ "path": "a.txt", "old": "  two", "new": "x" }), &r);
+        let res = call(
+            "edit_file",
+            serde_json::json!({ "path": "a.txt", "old": "  two", "new": "x" }),
+            &r,
+        );
         assert!(!res.ok);
         let err = res.error.unwrap_or_default();
         assert!(err.contains("was not found"), "got: {err}");
@@ -1346,7 +1377,8 @@ mod tests {
         // ~187 of them reach the 64 KB byte cap — well before the 200-match cap. The point of
         // the fixture is that the match cap is NOT what stops this.
         for i in 0..250 {
-            fs::write(r.join(format!("f{i}.txt")), format!("needle {}", "y".repeat(4_000))).unwrap();
+            fs::write(r.join(format!("f{i}.txt")), format!("needle {}", "y".repeat(4_000)))
+                .unwrap();
         }
         let res = call("search_files", serde_json::json!({ "pattern": "needle" }), &r);
         assert!(res.ok, "{}", res.output);

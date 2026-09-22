@@ -13,13 +13,13 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::context;
+use crate::crash_report;
 use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::memory;
 use crate::orchestrator;
 use crate::skills;
 use crate::store::{self, Store};
 use crate::vault;
-use crate::crash_report;
 
 #[derive(Debug, serde::Serialize)]
 pub struct CommandError(pub String);
@@ -41,7 +41,9 @@ impl From<crate::store::StoreError> for CommandError {
             crate::store::StoreError::Io(inner) => {
                 tracing::warn!("store io error (detail withheld from the UI): {inner}");
                 CommandError(match inner.kind() {
-                    std::io::ErrorKind::NotFound => "a required file or folder is missing".to_string(),
+                    std::io::ErrorKind::NotFound => {
+                        "a required file or folder is missing".to_string()
+                    }
                     std::io::ErrorKind::PermissionDenied => "permission was denied".to_string(),
                     std::io::ErrorKind::AlreadyExists => "that already exists".to_string(),
                     _ => "a file operation failed".to_string(),
@@ -87,7 +89,9 @@ fn ui_db_error(e: &rusqlite::Error) -> String {
         rusqlite::Error::SqlInputError { .. } => "an internal query failed".to_string(),
         rusqlite::Error::SqliteFailure(ffi, _) => match ffi.code {
             rusqlite::ErrorCode::CannotOpen => "the database could not be opened".to_string(),
-            rusqlite::ErrorCode::NotADatabase => "the database file is not a valid database".to_string(),
+            rusqlite::ErrorCode::NotADatabase => {
+                "the database file is not a valid database".to_string()
+            }
             rusqlite::ErrorCode::DatabaseBusy => "the database is busy; try again".to_string(),
             rusqlite::ErrorCode::DiskFull => "the disk is full".to_string(),
             rusqlite::ErrorCode::ReadOnly => "the database is read-only".to_string(),
@@ -167,9 +171,7 @@ pub async fn egress_stream(
     req: EgressRequest,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), CommandError> {
-    egress::stream(&state, req, on_event)
-        .await
-        .map_err(Into::into)
+    egress::stream(&state, req, on_event).await.map_err(Into::into)
 }
 
 /// Invariant-3 carve-out: fetch a provider-returned URL (an imageUrl) as base64, scoped to
@@ -194,7 +196,11 @@ pub fn store_info(store: State<'_, Arc<Store>>) -> Result<store::StoreInfo, Comm
 }
 
 #[tauri::command]
-pub fn settings_set(store: State<'_, Arc<Store>>, key: String, value_json: String) -> Result<(), CommandError> {
+pub fn settings_set(
+    store: State<'_, Arc<Store>>,
+    key: String,
+    value_json: String,
+) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO settings (key, value_json) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
@@ -204,7 +210,10 @@ pub fn settings_set(store: State<'_, Arc<Store>>, key: String, value_json: Strin
 }
 
 #[tauri::command]
-pub fn settings_get(store: State<'_, Arc<Store>>, key: String) -> Result<Option<String>, CommandError> {
+pub fn settings_get(
+    store: State<'_, Arc<Store>>,
+    key: String,
+) -> Result<Option<String>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare("SELECT value_json FROM settings WHERE key = ?")?;
     let mut rows = stmt.query_map([key], |r| r.get::<_, String>(0))?;
@@ -216,10 +225,7 @@ pub fn settings_get(store: State<'_, Arc<Store>>, key: String) -> Result<Option<
 
 /// Return the app data directory from the store's DB path (parent of the .db file).
 fn app_data_dir(store: &store::Store) -> std::path::PathBuf {
-    std::path::PathBuf::from(&store.path)
-        .parent()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_default()
+    std::path::PathBuf::from(&store.path).parent().map(|p| p.to_path_buf()).unwrap_or_default()
 }
 
 // ---------- context graph (P4) ----------
@@ -235,7 +241,10 @@ pub fn context_record(
 }
 
 #[tauri::command]
-pub fn context_graph(store: State<'_, Arc<Store>>, limit: usize) -> Result<context::ContextGraph, CommandError> {
+pub fn context_graph(
+    store: State<'_, Arc<Store>>,
+    limit: usize,
+) -> Result<context::ContextGraph, CommandError> {
     context::graph(&store, limit).map_err(CommandError)
 }
 
@@ -245,12 +254,18 @@ pub fn context_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
 }
 
 #[tauri::command]
-pub fn history_sessions(store: State<'_, Arc<Store>>, limit: usize) -> Result<Vec<context::HistorySession>, CommandError> {
+pub fn history_sessions(
+    store: State<'_, Arc<Store>>,
+    limit: usize,
+) -> Result<Vec<context::HistorySession>, CommandError> {
     context::sessions(&store, limit).map_err(CommandError)
 }
 
 #[tauri::command]
-pub fn history_timeline(store: State<'_, Arc<Store>>, session_id: String) -> Result<context::HistoryTimeline, CommandError> {
+pub fn history_timeline(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+) -> Result<context::HistoryTimeline, CommandError> {
     context::timeline(&store, &session_id).map_err(CommandError)
 }
 
@@ -286,7 +301,11 @@ pub fn skills_uninstall(store: State<'_, Arc<Store>>, slug: String) -> Result<()
 }
 
 #[tauri::command]
-pub fn skills_set_enabled(store: State<'_, Arc<Store>>, slug: String, enabled: bool) -> Result<(), CommandError> {
+pub fn skills_set_enabled(
+    store: State<'_, Arc<Store>>,
+    slug: String,
+    enabled: bool,
+) -> Result<(), CommandError> {
     skills::set_enabled(&store, &slug, enabled).map_err(CommandError)
 }
 
@@ -306,7 +325,10 @@ pub fn skills_slugify(name: String) -> String {
 // that dies midway is still inspectable.
 
 #[tauri::command]
-pub fn agent_runs_list(store: State<'_, Arc<Store>>, limit: usize) -> Result<Vec<orchestrator::AgentRun>, CommandError> {
+pub fn agent_runs_list(
+    store: State<'_, Arc<Store>>,
+    limit: usize,
+) -> Result<Vec<orchestrator::AgentRun>, CommandError> {
     orchestrator::runs(&store, limit).map_err(CommandError)
 }
 
@@ -347,7 +369,10 @@ pub fn agent_run_finish(
 }
 
 #[tauri::command]
-pub fn agent_run_steps(store: State<'_, Arc<Store>>, run_id: String) -> Result<Vec<orchestrator::AgentStep>, CommandError> {
+pub fn agent_run_steps(
+    store: State<'_, Arc<Store>>,
+    run_id: String,
+) -> Result<Vec<orchestrator::AgentStep>, CommandError> {
     orchestrator::steps(&store, &run_id).map_err(CommandError)
 }
 
@@ -512,16 +537,15 @@ pub fn memory_supersede(
 
 /// §6.4.3: undo a supersession. The row was never deleted, so this only makes it reachable again.
 #[tauri::command]
-pub fn memory_unsupersede(
-    store: State<'_, Arc<Store>>,
-    id: String,
-) -> Result<bool, CommandError> {
+pub fn memory_unsupersede(store: State<'_, Arc<Store>>, id: String) -> Result<bool, CommandError> {
     memory::unsupersede(&store, &id).map_err(CommandError)
 }
 
 /// §6.4.5: what the Memory screen has to put in front of a human.
 #[tauri::command]
-pub fn memory_conflicts(store: State<'_, Arc<Store>>) -> Result<Vec<memory::Conflict>, CommandError> {
+pub fn memory_conflicts(
+    store: State<'_, Arc<Store>>,
+) -> Result<Vec<memory::Conflict>, CommandError> {
     memory::conflicts(&store).map_err(CommandError)
 }
 
@@ -643,10 +667,7 @@ pub fn crash_read(
 }
 
 #[tauri::command]
-pub fn crash_clear(
-    store: State<'_, Arc<store::Store>>,
-    id: String,
-) -> Result<bool, CommandError> {
+pub fn crash_clear(store: State<'_, Arc<store::Store>>, id: String) -> Result<bool, CommandError> {
     Ok(crash_report::clear_crash_report(&app_data_dir(&store), &id))
 }
 

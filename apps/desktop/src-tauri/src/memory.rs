@@ -242,13 +242,7 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 "UPDATE memories SET updated_at = ?1, pinned = ?2,
                         session_id = COALESCE(?3, session_id), subject = COALESCE(?4, subject)
                  WHERE id = ?5",
-                params![
-                    now,
-                    keep_pinned as i64,
-                    input.session_id,
-                    input.subject,
-                    id
-                ],
+                params![now, keep_pinned as i64, input.session_id, input.subject, id],
             )
             .map_err(|e| e.to_string())?;
             // Re-recording refreshes text and timestamp but deliberately leaves scope alone — an
@@ -312,7 +306,12 @@ pub fn capture(store: &Store, input: &MemoryInput) -> Result<Memory, String> {
                 pinned: input.pinned,
                 // Born unscoped: capture-only, never injected. Scoping is a deliberate act
                 // (`assign_scope`), never a default — see `ScopeAssignment`.
-                scope: MemoryScope { user: "local".into(), project: None, agent: None, global: false },
+                scope: MemoryScope {
+                    user: "local".into(),
+                    project: None,
+                    agent: None,
+                    global: false,
+                },
                 score: None,
                 superseded_at: None,
             }
@@ -838,7 +837,9 @@ pub fn stats(store: &Store) -> Result<MemoryStats, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut s = MemoryStats::default();
     let mut stmt = conn
-        .prepare("SELECT layer, COUNT(*), COALESCE(SUM(LENGTH(text)),0) FROM memories GROUP BY layer")
+        .prepare(
+            "SELECT layer, COUNT(*), COALESCE(SUM(LENGTH(text)),0) FROM memories GROUP BY layer",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?, r.get::<_, i64>(2)?)))
@@ -951,10 +952,14 @@ pub fn supersede(store: &Store, old: &str, new: &str) -> Result<bool, String> {
         return Ok(false);
     };
     if pinned != 0 {
-        return Err("this memory is pinned — unpin it first if the newer one should replace it".into());
+        return Err(
+            "this memory is pinned — unpin it first if the newer one should replace it".into()
+        );
     }
     if layer == "L3" {
-        return Err("this is a core fact (L3) — it is replaced deliberately, never by a newer atom".into());
+        return Err(
+            "this is a core fact (L3) — it is replaced deliberately, never by a newer atom".into(),
+        );
     }
     let n = conn
         .execute(
@@ -1175,7 +1180,8 @@ mod memory_tests {
     #[test]
     fn superseding_a_pinned_or_core_row_is_refused() {
         let (s, d) = temp_store("supersede-refuse");
-        let pinned = capture(&s, &MemoryInput { pinned: true, ..input("L1", "the db is MySQL") }).unwrap();
+        let pinned =
+            capture(&s, &MemoryInput { pinned: true, ..input("L1", "the db is MySQL") }).unwrap();
         let core = capture(&s, &input("L3", "the db is MySQL and always was")).unwrap();
         let new = capture(&s, &input("L1", "the db is Postgres")).unwrap();
 
@@ -1187,7 +1193,10 @@ mod memory_tests {
         // Still live, which is the point: a stale pin is surfaced, never silently displaced.
         let ids: Vec<String> = list(&s, None, 100).unwrap().iter().map(|m| m.id.clone()).collect();
         assert!(ids.contains(&pinned.id) && ids.contains(&core.id));
-        assert!(!supersede(&s, "no-such-row", &new.id).unwrap(), "a missing row is a no-op, not an error");
+        assert!(
+            !supersede(&s, "no-such-row", &new.id).unwrap(),
+            "a missing row is a no-op, not an error"
+        );
         assert!(!supersede(&s, &new.id, &new.id).unwrap(), "a row cannot supersede itself");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1350,7 +1359,9 @@ mod memory_tests {
         );
         prune(&s).unwrap();
         assert!(
-            recall_scoped(&s, "zebrafish", 10, None, &scope_of(Some("p1"), None)).unwrap().is_empty(),
+            recall_scoped(&s, "zebrafish", 10, None, &scope_of(Some("p1"), None))
+                .unwrap()
+                .is_empty(),
             "a pruned row is not recallable"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -1371,7 +1382,12 @@ mod memory_tests {
             created_at: 1,
             updated_at: 1,
             pinned: false,
-            scope: MemoryScope { user: "local".into(), project: Some("p1".into()), agent: None, global: false },
+            scope: MemoryScope {
+                user: "local".into(),
+                project: Some("p1".into()),
+                agent: None,
+                global: false,
+            },
             score: Some(-1.0),
             superseded_at: None,
         };
@@ -1431,7 +1447,9 @@ mod memory_tests {
             "visible inside its own project"
         );
         assert!(
-            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None)).unwrap().is_empty(),
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None))
+                .unwrap()
+                .is_empty(),
             "invisible in another project"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -1485,7 +1503,9 @@ mod memory_tests {
         );
         assert!(assign_scope(&s, &m.id, ScopeAssignment::Unscoped).unwrap());
         assert!(
-            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap().is_empty(),
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None))
+                .unwrap()
+                .is_empty(),
             "unscoping clears the project binding rather than leaving it behind"
         );
         let _ = std::fs::remove_dir_all(&d);
@@ -1537,7 +1557,8 @@ mod memory_tests {
         scoped(&s, "a", "L1", "this repo uses Postgres", Some("alpha"), None, 0, 0);
         let mine = recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("alpha"), None)).unwrap();
         assert_eq!(mine.len(), 1, "visible inside its own project");
-        let theirs = recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None)).unwrap();
+        let theirs =
+            recall_scoped(&s, "Postgres", 10, None, &scope_of(Some("beta"), None)).unwrap();
         assert!(theirs.is_empty(), "invisible in another project");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1565,7 +1586,8 @@ mod memory_tests {
         scoped(&s, "plain", "L1", "some passing detail", None, None, 1, 0);
         scoped(&s, "proj", "L1", "alpha uses Postgres", Some("alpha"), None, 0, 0);
 
-        let got = recall_scoped(&s, "migrations detail Postgres", 10, None, &scope_of(None, None)).unwrap();
+        let got = recall_scoped(&s, "migrations detail Postgres", 10, None, &scope_of(None, None))
+            .unwrap();
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["pinned"], "only the pinned global row survives: {ids:?}");
         let _ = std::fs::remove_dir_all(&d);
@@ -1574,13 +1596,24 @@ mod memory_tests {
     #[test]
     fn an_agent_scoped_row_is_visible_to_that_agent_and_to_project_wide_facts() {
         let (s, d) = temp_store("scope-agent");
-        scoped(&s, "cursor-only", "L1", "cursor specific fact", Some("alpha"), Some("cursor"), 0, 0);
+        scoped(
+            &s,
+            "cursor-only",
+            "L1",
+            "cursor specific fact",
+            Some("alpha"),
+            Some("cursor"),
+            0,
+            0,
+        );
         scoped(&s, "any-agent", "L1", "project wide fact", Some("alpha"), None, 0, 0);
 
-        let for_cursor = recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("cursor"))).unwrap();
+        let for_cursor =
+            recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("cursor"))).unwrap();
         assert_eq!(for_cursor.len(), 2, "both are visible to cursor");
 
-        let for_claude = recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("claude"))).unwrap();
+        let for_claude =
+            recall_scoped(&s, "fact", 10, None, &scope_of(Some("alpha"), Some("claude"))).unwrap();
         let ids: Vec<&str> = for_claude.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(ids, vec!["any-agent"], "an agent-scoped row is not visible to another agent");
         let _ = std::fs::remove_dir_all(&d);
@@ -1900,10 +1933,8 @@ mod memory_tests {
 
     #[test]
     fn at_equal_band_and_recency_the_more_distilled_layer_still_wins() {
-        let mut rows = vec![
-            candidate("L0", "raw", 0, -3.00),
-            candidate("L2", "scenario", 0, -3.05),
-        ];
+        let mut rows =
+            vec![candidate("L0", "raw", 0, -3.00), candidate("L2", "scenario", 0, -3.05)];
         rerank(&mut rows, now_ms());
         assert_eq!(rows[0].text, "scenario", "layer remains the final tiebreak");
     }
@@ -1927,17 +1958,23 @@ mod memory_tests {
     #[test]
     fn recall_still_returns_the_relevant_memory_when_the_others_are_newer() {
         let (s, d) = temp_store("recency-relevance");
-        let wanted = capture(&s, &input("L1", "The workspace root must be set before agent mode runs")).unwrap();
+        let wanted =
+            capture(&s, &input("L1", "The workspace root must be set before agent mode runs"))
+                .unwrap();
         // The distractor has to share a query token, or it is not a candidate at all and the
         // test passes without exercising anything.
-        let noise = capture(&s, &input("L1", "Agent mode is one of the Playground toggles")).unwrap();
+        let noise =
+            capture(&s, &input("L1", "Agent mode is one of the Playground toggles")).unwrap();
         // Make the on-topic memory old and the off-topic one fresh: relevance must still win.
         age(&s, &wanted.id, 365);
         age(&s, &noise.id, 0);
 
         let hits = recall(&s, "workspace root agent mode", 10, None).unwrap();
         assert_eq!(hits.len(), 2, "both must be candidates for this test to mean anything");
-        assert_eq!(hits[0].id, wanted.id, "recency is a tiebreak, not a signal that outranks match");
+        assert_eq!(
+            hits[0].id, wanted.id,
+            "recency is a tiebreak, not a signal that outranks match"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

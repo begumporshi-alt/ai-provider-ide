@@ -11,12 +11,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 use crate::gateway::{
     check_gateway_key, clean_assistant_text, err, err_with_cooldown, forwarded_headers,
     map_generic_to_status, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
-};
-use crate::gateway::context_scope::{
-    apply_memory_headers, finish_capture, inject_context, prepare_capture,
 };
 
 /// OpenAI Responses API ingress (v1.1, 2026-09-16): Codex-style clients. Edge translation
@@ -138,7 +138,11 @@ fn responses_tools_to_openai(tools: &Value) -> Option<Value> {
             Some(json!({ "type": "function", "function": function }))
         })
         .collect();
-    if out.is_empty() { None } else { Some(Value::Array(out)) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Array(out))
+    }
 }
 
 /// Responses `tool_choice` -> OpenAI. A bare string (`auto` / `none` / `required`) means the same
@@ -215,7 +219,12 @@ fn strip_tool_fields(body: &mut Value, enabled: bool) {
     }
 }
 
-pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
+pub(crate) async fn responses_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: String,
+) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         // The Responses API error envelope is the OpenAI one, so this needs no translation.
@@ -226,7 +235,10 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         return err(StatusCode::BAD_REQUEST, responses_error("invalid JSON body", "invalid_json"));
     };
     let Some(mut chat) = to_chat_body_responses(&req) else {
-        return err(StatusCode::BAD_REQUEST, responses_error("model and input are required", "missing_required_parameter"));
+        return err(
+            StatusCode::BAD_REQUEST,
+            responses_error("model and input are required", "missing_required_parameter"),
+        );
     };
     // Forward tools/tool_choice from the original Responses API request to upstream providers.
     let tools: Option<Value> = req.get("tools").cloned();
@@ -253,7 +265,12 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
     core.record_injection(id, chat.get("model").and_then(Value::as_str).unwrap_or(""), &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "responses", body: chat.clone(), headers: fwd.clone() });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "responses",
+        body: chat.clone(),
+        headers: fwd.clone(),
+    });
     tracing::info!(request_id = id, kind = "responses", model = %chat.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching responses request");
 
     if wants_stream {
@@ -357,7 +374,9 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
             }
             drop(slot);
         };
-        let mut r = Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        let mut r = Sse::new(stream_body)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response();
         apply_memory_headers(&mut r, &outcome);
         return r;
     }
@@ -385,8 +404,15 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
-                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let args_raw = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .unwrap_or(&Value::Null);
                         let args: Value = if let Some(s) = args_raw.as_str() {
                             serde_json::from_str(s).unwrap_or(json!(s))
                         } else {
@@ -407,10 +433,16 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
         Some((status, message, retry_after_ms)) => {
             let code = worker_status(status);
             let (ty, kind) = responses_error_kind(code);
-            err_with_cooldown(code, retry_after_ms, json!({ "error": { "message": message, "type": ty, "code": kind } }))
+            err_with_cooldown(
+                code,
+                retry_after_ms,
+                json!({ "error": { "message": message, "type": ty, "code": kind } }),
+            )
         }
         None => {
-            let mut content: Vec<Value> = vec![json!({ "type": "output_text", "text": clean_assistant_text(&full), "annotations": [] })];
+            let mut content: Vec<Value> = vec![
+                json!({ "type": "output_text", "text": clean_assistant_text(&full), "annotations": [] }),
+            ];
             for (call_id, name, args) in &tool_calls {
                 content.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
             }
@@ -422,7 +454,8 @@ pub(crate) async fn responses_h(State(core): State<Arc<GatewayCore>>, headers: H
                 "tools": tools.unwrap_or(json!([])),
                 "tool_choice": tool_choice.unwrap_or(json!("auto"))
             });
-            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body.to_string()).into_response()
+            (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body.to_string())
+                .into_response()
         }
     };
     apply_memory_headers(&mut r, &outcome);
@@ -485,10 +518,7 @@ mod tool_conversion_tests {
         // Nested under `function`, not flat: a chat-completions provider rejects the flat shape.
         assert_eq!(out["tools"][0]["type"], "function");
         assert_eq!(out["tools"][0]["function"]["name"], "Bash");
-        assert!(
-            out["tools"][0].get("name").is_none(),
-            "the flat name must not survive: {out}"
-        );
+        assert!(out["tools"][0].get("name").is_none(), "the flat name must not survive: {out}");
         assert_eq!(
             out["tools"][0]["function"]["parameters"]["properties"]["command"]["type"],
             "string"

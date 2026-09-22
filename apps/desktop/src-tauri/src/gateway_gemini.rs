@@ -13,12 +13,12 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
+use crate::gateway::context_scope::{
+    apply_memory_headers, finish_capture, inject_context, prepare_capture,
+};
 use crate::gateway::{
     check_gateway_key, clean_assistant_text, err_with_cooldown, forwarded_headers, peer_ip,
     try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
-};
-use crate::gateway::context_scope::{
-    apply_memory_headers, finish_capture, inject_context, prepare_capture,
 };
 
 /// One Gemini function declaration -> one OpenAI function declaration.
@@ -48,7 +48,11 @@ fn tools_to_openai(tools: &Value) -> Option<Value> {
             out.push(c);
         }
     }
-    if out.is_empty() { None } else { Some(Value::Array(out)) }
+    if out.is_empty() {
+        None
+    } else {
+        Some(Value::Array(out))
+    }
 }
 
 /// Gemini `functionCallingConfig` -> OpenAI. `AUTO|ANY|NONE` plus an optional forced name.
@@ -91,7 +95,12 @@ fn gemini_error(message: &str, status: StatusCode) -> Response {
 
 /// Gemini generateContent ingress (v1.1, 2026-09-16): `x-goog-api-key` or `?key=`, model
 /// in the path, contents/parts request and candidates response shapes. SSE via ?alt=sse.
-pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, uri: axum::http::Uri, body: String) -> Response {
+pub(crate) async fn gemini_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    uri: axum::http::Uri,
+    body: String,
+) -> Response {
     let query: HashMap<String, String> = uri
         .query()
         .map(|q| {
@@ -116,19 +125,28 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     let path = uri.path().to_string();
     let tail = match path.rsplit("/models/").next() {
         Some(t) => t,
-        None => return gemini_error("bad path — expected /v1beta/models/<model>:generateContent", StatusCode::NOT_FOUND),
+        None => {
+            return gemini_error(
+                "bad path — expected /v1beta/models/<model>:generateContent",
+                StatusCode::NOT_FOUND,
+            )
+        }
     };
     let (model, streaming) = match tail.split_once(':') {
         Some((m, "generateContent")) => (m.to_string(), false),
         Some((m, "streamGenerateContent")) => (m.to_string(), true),
-        _ => return gemini_error("bad method suffix — expected :generateContent or :streamGenerateContent", StatusCode::BAD_REQUEST),
-    };
-    if streaming
-        && query.get("alt").map(|v| v.as_str()) != Some("sse") {
-            // v1: Gemini streaming is served as SSE only (alt=sse); plain JSON-array
-            // streaming is not implemented — refuse rather than answer wrongly.
-            return gemini_error("streaming requires ?alt=sse", StatusCode::BAD_REQUEST);
+        _ => {
+            return gemini_error(
+                "bad method suffix — expected :generateContent or :streamGenerateContent",
+                StatusCode::BAD_REQUEST,
+            )
         }
+    };
+    if streaming && query.get("alt").map(|v| v.as_str()) != Some("sse") {
+        // v1: Gemini streaming is served as SSE only (alt=sse); plain JSON-array
+        // streaming is not implemented — refuse rather than answer wrongly.
+        return gemini_error("streaming requires ?alt=sse", StatusCode::BAD_REQUEST);
+    }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return gemini_error("invalid JSON body", StatusCode::BAD_REQUEST);
     };
@@ -136,7 +154,12 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     if let Some(sys) = req.pointer("/systemInstruction/parts") {
         let text = sys
             .as_array()
-            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .unwrap_or_default();
         if !text.is_empty() {
             messages.push(json!({ "role": "system", "content": text }));
@@ -146,11 +169,20 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
         return gemini_error("contents is required", StatusCode::BAD_REQUEST);
     };
     for c in contents {
-        let role = if c.get("role").and_then(Value::as_str) == Some("model") { "assistant" } else { "user" };
+        let role = if c.get("role").and_then(Value::as_str) == Some("model") {
+            "assistant"
+        } else {
+            "user"
+        };
         let text = c
             .get("parts")
             .and_then(Value::as_array)
-            .map(|ps| ps.iter().filter_map(|p| p.get("text").and_then(Value::as_str)).collect::<Vec<_>>().join(""))
+            .map(|ps| {
+                ps.iter()
+                    .filter_map(|p| p.get("text").and_then(Value::as_str))
+                    .collect::<Vec<_>>()
+                    .join("")
+            })
             .unwrap_or_default();
         messages.push(json!({ "role": role, "content": text }));
     }
@@ -194,7 +226,12 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     core.record_injection(id, chat.get("model").and_then(Value::as_str).unwrap_or(""), &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
-    core.bridge.dispatch(BridgeRequest { request_id: id, kind: "chat", body: chat, headers: fwd.clone() });
+    core.bridge.dispatch(BridgeRequest {
+        request_id: id,
+        kind: "chat",
+        body: chat,
+        headers: fwd.clone(),
+    });
     tracing::info!(request_id = id, kind = "gemini", "dispatching gemini request");
 
     if streaming {
@@ -259,7 +296,9 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
             }
             drop(slot);
         };
-        let mut r = Sse::new(stream_body).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))).into_response();
+        let mut r = Sse::new(stream_body)
+            .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+            .into_response();
         apply_memory_headers(&mut r, &outcome);
         return r;
     }
@@ -288,8 +327,15 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                 if let Some(arr) = calls.as_array() {
                     for tc in arr {
                         let _call_id = tc.get("id").and_then(Value::as_str).unwrap_or("");
-                        let name = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("");
-                        let args_raw = tc.get("function").and_then(|f| f.get("arguments")).unwrap_or(&Value::Null);
+                        let name = tc
+                            .get("function")
+                            .and_then(|f| f.get("name"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        let args_raw = tc
+                            .get("function")
+                            .and_then(|f| f.get("arguments"))
+                            .unwrap_or(&Value::Null);
                         let args: String = if let Some(s) = args_raw.as_str() {
                             s.to_string()
                         } else {
@@ -353,7 +399,8 @@ mod tool_conversion_tests {
         let out = tools_to_openai(&json!([{ "functionDeclarations": [
             { "name": "Bash", "description": "Run it", "parameters": { "type": "object" } },
             { "name": "Read" }
-        ]}])).unwrap();
+        ]}]))
+        .unwrap();
         assert_eq!(out.as_array().unwrap().len(), 2);
         assert_eq!(out[0]["function"]["name"], "Bash");
         assert_eq!(out[1]["function"]["name"], "Read");
@@ -373,13 +420,24 @@ mod tool_conversion_tests {
 
     #[test]
     fn function_calling_config_maps_onto_the_openai_vocabulary() {
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY"}})).unwrap(), json!("required"));
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"NONE"}})).unwrap(), json!("none"));
-        assert_eq!(tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"AUTO"}})).unwrap(), json!("auto"));
         assert_eq!(
-            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["Bash"]}})).unwrap(),
+            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"ANY"}})).unwrap(),
+            json!("required")
+        );
+        assert_eq!(
+            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"NONE"}})).unwrap(),
+            json!("none")
+        );
+        assert_eq!(
+            tool_choice_to_openai(&json!({"functionCallingConfig":{"mode":"AUTO"}})).unwrap(),
+            json!("auto")
+        );
+        assert_eq!(
+            tool_choice_to_openai(
+                &json!({"functionCallingConfig":{"mode":"ANY","allowedFunctionNames":["Bash"]}})
+            )
+            .unwrap(),
             json!({ "type": "function", "function": { "name": "Bash" } })
         );
     }
 }
-

@@ -218,7 +218,10 @@ mod principal_tests {
         assert!(allows(true, Some(&s), Some("claude-code"), None), "no row means inherit");
         assert!(set(&s, "claude-code", false).unwrap());
         assert!(!allows(true, Some(&s), Some("claude-code"), None));
-        assert!(allows(true, Some(&s), Some("cursor"), None), "one refusal is not a global refusal");
+        assert!(
+            allows(true, Some(&s), Some("cursor"), None),
+            "one refusal is not a global refusal"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

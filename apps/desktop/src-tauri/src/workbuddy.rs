@@ -62,7 +62,11 @@ fn is_ours(entry: &Value, our_ids: &[String], our_endpoint: &str) -> bool {
  * The file is accepted as either a bare list or `{"models":[...]}` and is written back in
  * whichever shape it arrived in — we are a guest in someone else's config file.
  */
-pub fn merge(existing: Option<&str>, ours: &[Value], our_endpoint: &str) -> Result<(String, usize, usize), String> {
+pub fn merge(
+    existing: Option<&str>,
+    ours: &[Value],
+    our_endpoint: &str,
+) -> Result<(String, usize, usize), String> {
     let our_ids: Vec<String> = ours
         .iter()
         .filter_map(|e| e.get("id").and_then(Value::as_str).map(str::to_string))
@@ -78,16 +82,15 @@ pub fn merge(existing: Option<&str>, ours: &[Value], our_endpoint: &str) -> Resu
             } else if let Some(arr) = parsed.get("models").and_then(Value::as_array) {
                 (arr.clone(), true)
             } else {
-                return Err("neither a list nor {\"models\":[...]}; refusing to overwrite it".into());
+                return Err(
+                    "neither a list nor {\"models\":[...]}; refusing to overwrite it".into()
+                );
             }
         }
     };
 
-    let kept: Vec<Value> = all
-        .iter()
-        .filter(|e| !is_ours(e, &our_ids, our_endpoint))
-        .cloned()
-        .collect();
+    let kept: Vec<Value> =
+        all.iter().filter(|e| !is_ours(e, &our_ids, our_endpoint)).cloned().collect();
     let removed = all.len() - kept.len();
 
     let mut out = kept;
@@ -160,9 +163,7 @@ fn manifest_forwards_tools(body_json: &str) -> bool {
 /// True when the model's own id says it is not a text model, whatever the catalog claims.
 fn id_marks_non_text(native_id: &str) -> bool {
     let lower = native_id.to_ascii_lowercase();
-    ["-image", "/image", "-video", "/video"]
-        .iter()
-        .any(|m| lower.contains(m))
+    ["-image", "/image", "-video", "/video"].iter().any(|m| lower.contains(m))
 }
 
 fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
@@ -263,7 +264,11 @@ fn seed_from(existing: Option<&str>, our_endpoint: &str) -> Vec<String> {
 
 /// `(models, needs_persisting)` — persisted only when we seeded, so an explicit choice is never
 /// overwritten by a guess.
-fn resolve_models(store: &Store, existing: Option<&str>, our_endpoint: &str) -> (Vec<String>, bool) {
+fn resolve_models(
+    store: &Store,
+    existing: Option<&str>,
+    our_endpoint: &str,
+) -> (Vec<String>, bool) {
     match configured_models(store) {
         Some(list) => (list, false),
         None => (seed_from(existing, our_endpoint), true),
@@ -462,13 +467,16 @@ mod tests {
     use serde_json::json;
 
     fn ours() -> Vec<Value> {
-        vec![json!({"id": "openai/gpt-4o-mini", "url": "http://127.0.0.1:8787/v1/chat/completions"})]
+        vec![
+            json!({"id": "openai/gpt-4o-mini", "url": "http://127.0.0.1:8787/v1/chat/completions"}),
+        ]
     }
 
     #[test]
     fn adds_to_a_bare_list_and_leaves_others_alone() {
         let existing = r#"[{"id":"other","url":"https://api.b.ai/v1/chat/completions"}]"#;
-        let (out, updated, removed) = merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
+        let (out, updated, removed) =
+            merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(updated, 1);
         assert_eq!(removed, 0);
@@ -481,7 +489,8 @@ mod tests {
     #[test]
     fn preserves_the_wrapped_shape() {
         let existing = r#"{"models":[{"id":"other","url":"https://x/v1/chat/completions"}]}"#;
-        let (out, _, _) = merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
+        let (out, _, _) =
+            merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
         let v: Value = serde_json::from_str(&out).unwrap();
         assert!(v.get("models").is_some(), "must write back as {{\"models\":[...]}}");
         assert_eq!(v["models"].as_array().unwrap().len(), 2);
@@ -490,7 +499,8 @@ mod tests {
     #[test]
     fn replaces_our_previous_entry_instead_of_duplicating() {
         let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions","maxInputTokens":1}]"#;
-        let (out, updated, removed) = merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
+        let (out, updated, removed) =
+            merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
         let arr = serde_json::from_str::<Value>(&out).unwrap();
         assert_eq!(arr.as_array().unwrap().len(), 1);
         assert_eq!(updated, 1);
@@ -500,7 +510,8 @@ mod tests {
     #[test]
     fn drops_a_stale_entry_that_points_at_us_but_is_no_longer_published() {
         let existing = r#"[{"id":"old-model","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
-        let (out, _, removed) = merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
+        let (out, _, removed) =
+            merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
         let arr = serde_json::from_str::<Value>(&out).unwrap().as_array().unwrap().clone();
         assert_eq!(removed, 1);
         assert!(arr.iter().all(|e| e["id"] != "old-model"));
@@ -510,7 +521,8 @@ mod tests {
     fn leaves_a_different_local_proxy_alone() {
         // Another gateway on another port is not ours to touch.
         let existing = r#"[{"id":"glm-5.3","url":"http://127.0.0.1:8899/v1/chat/completions"}]"#;
-        let (out, _, removed) = merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
+        let (out, _, removed) =
+            merge(Some(existing), &ours(), "http://127.0.0.1:8787/v1/chat/completions").unwrap();
         let arr = serde_json::from_str::<Value>(&out).unwrap().as_array().unwrap().clone();
         assert_eq!(removed, 0);
         assert_eq!(arr.len(), 2);
@@ -518,8 +530,18 @@ mod tests {
 
     #[test]
     fn refuses_to_overwrite_a_file_it_cannot_parse() {
-        assert!(merge(Some("not json at all"), &ours(), "http://127.0.0.1:8787/v1/chat/completions").is_err());
-        assert!(merge(Some(r#"{"something":"else"}"#), &ours(), "http://127.0.0.1:8787/v1/chat/completions").is_err());
+        assert!(merge(
+            Some("not json at all"),
+            &ours(),
+            "http://127.0.0.1:8787/v1/chat/completions"
+        )
+        .is_err());
+        assert!(merge(
+            Some(r#"{"something":"else"}"#),
+            &ours(),
+            "http://127.0.0.1:8787/v1/chat/completions"
+        )
+        .is_err());
     }
 
     fn tmp_store(tag: &str) -> (crate::store::Store, std::path::PathBuf) {
@@ -534,7 +556,8 @@ mod tests {
     fn seeds_from_an_entry_already_pointing_at_us() {
         let (store, dir) = tmp_store("seed");
         assert_eq!(configured_models(&store), None, "nothing configured yet");
-        let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
+        let existing =
+            r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
         let (got, persist) = resolve_models(&store, Some(existing), EP);
         assert_eq!(got, vec!["openai/gpt-4o-mini".to_string()]);
         assert!(persist, "a seeded list must be remembered");
@@ -554,7 +577,8 @@ mod tests {
             )
             .unwrap();
         }
-        let existing = r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
+        let existing =
+            r#"[{"id":"openai/gpt-4o-mini","url":"http://127.0.0.1:8787/v1/chat/completions"}]"#;
         let (got, persist) = resolve_models(&store, Some(existing), EP);
         assert!(got.is_empty());
         assert!(!persist, "an explicit choice must not be overwritten by a guess");

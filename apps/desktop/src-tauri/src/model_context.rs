@@ -62,9 +62,7 @@ pub fn upsert(store: &Store, entries: &[ModelContextInput]) -> Result<usize, Str
         if key.is_empty() || e.context_window <= 0 || e.context_window > MAX_WINDOW {
             continue;
         }
-        let cpt = e
-            .chars_per_token
-            .filter(|v| v.is_finite() && *v > 0.5 && *v < 20.0);
+        let cpt = e.chars_per_token.filter(|v| v.is_finite() && *v > 0.5 && *v < 20.0);
         let n = conn
             .execute(
                 "INSERT INTO router_model_context (model_key, context_window, chars_per_token, updated_at)
@@ -178,7 +176,8 @@ mod model_context_tests {
     fn an_implausible_window_is_refused_rather_than_stored() {
         let (s, d) = temp_store("absurd");
         assert_eq!(
-            upsert(&s, &[entry("x/huge", 999_999_999), entry("x/neg", -1), entry("x/zero", 0)]).unwrap(),
+            upsert(&s, &[entry("x/huge", 999_999_999), entry("x/neg", -1), entry("x/zero", 0)])
+                .unwrap(),
             0,
             "none of these are believable"
         );
@@ -193,11 +192,14 @@ mod model_context_tests {
     #[test]
     fn a_char_ratio_outside_any_sane_range_is_ignored() {
         let (s, d) = temp_store("cpt");
-        upsert(&s, &[ModelContextInput {
-            model_key: "m/1".into(),
-            context_window: 32_000,
-            chars_per_token: Some(0.0),
-        }])
+        upsert(
+            &s,
+            &[ModelContextInput {
+                model_key: "m/1".into(),
+                context_window: 32_000,
+                chars_per_token: Some(0.0),
+            }],
+        )
         .unwrap();
         let got = lookup(Some(&s), Some("m/1"));
         assert_eq!(got.window, 32_000);

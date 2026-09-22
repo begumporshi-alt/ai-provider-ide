@@ -52,8 +52,15 @@ pub struct ContextGraph {
 
 const NODE_KINDS: [&str; 4] = ["artifact", "memory", "skill", "message"];
 const EDGE_KINDS: [&str; 9] = [
-    "produced", "used", "recalled", "follows", "references",
-    "routes_to", "served_by", "aliases", "backed_by",
+    "produced",
+    "used",
+    "recalled",
+    "follows",
+    "references",
+    "routes_to",
+    "served_by",
+    "aliases",
+    "backed_by",
 ];
 
 fn valid_node_kind(k: &str) -> bool {
@@ -96,11 +103,9 @@ pub fn record(store: &Store, nodes: &[ContextNode], edges: &[ContextEdge]) -> Re
         }
         for e in edges {
             let known = tx
-                .query_row(
-                    "SELECT 1 FROM context_nodes WHERE id = ?1",
-                    params![e.from_id],
-                    |_| Ok(()),
-                )
+                .query_row("SELECT 1 FROM context_nodes WHERE id = ?1", params![e.from_id], |_| {
+                    Ok(())
+                })
                 .is_ok()
                 && tx
                     .query_row(
@@ -140,8 +145,10 @@ pub fn record(store: &Store, nodes: &[ContextNode], edges: &[ContextEdge]) -> Re
 pub fn graph(store: &Store, limit: usize) -> Result<ContextGraph, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
-        .prepare("SELECT id, kind, label, source, session_id, ts, meta_json
-                  FROM context_nodes ORDER BY ts DESC LIMIT ?1")
+        .prepare(
+            "SELECT id, kind, label, source, session_id, ts, meta_json
+                  FROM context_nodes ORDER BY ts DESC LIMIT ?1",
+        )
         .map_err(|e| e.to_string())?;
     let nodes = stmt
         .query_map([limit as i64], |r| {
@@ -160,13 +167,15 @@ pub fn graph(store: &Store, limit: usize) -> Result<ContextGraph, String> {
         .map_err(|e| e.to_string())?;
 
     let mut stmt = conn
-        .prepare("SELECT e.id, e.from_id, e.to_id, e.kind, e.weight, e.ts, e.meta_json
+        .prepare(
+            "SELECT e.id, e.from_id, e.to_id, e.kind, e.weight, e.ts, e.meta_json
                   FROM context_edges e
                   JOIN context_nodes nf ON nf.id = e.from_id
                   JOIN context_nodes nt ON nt.id = e.to_id
                   WHERE nf.id IN (SELECT id FROM context_nodes ORDER BY ts DESC LIMIT ?1)
                     AND nt.id IN (SELECT id FROM context_nodes ORDER BY ts DESC LIMIT ?1)
-                  ORDER BY e.ts DESC LIMIT ?2")
+                  ORDER BY e.ts DESC LIMIT ?2",
+        )
         .map_err(|e| e.to_string())?;
     let edges = stmt
         .query_map(params![limit as i64, (limit * 8) as i64], |r| {
@@ -254,8 +263,7 @@ fn sort_key(id: &str, ts: i64) -> (i64, i64) {
 
 fn meta_text(meta: &Option<String>, key: &str) -> Option<String> {
     let raw = meta.as_deref()?;
-    serde_json::from_str::<serde_json::Value>(raw).ok()?
-        .get(key)?.as_str().map(|s| s.to_string())
+    serde_json::from_str::<serde_json::Value>(raw).ok()?.get(key)?.as_str().map(|s| s.to_string())
 }
 
 /// A session's worth of preview text: the first user message, truncated. Falls back to the
@@ -322,16 +330,9 @@ pub fn sessions(store: &Store, limit: usize) -> Result<Vec<HistorySession>, Stri
     let mut seen = std::collections::HashSet::new();
     let mut models: std::collections::HashMap<String, String> = std::collections::HashMap::new();
     let found = stmt
-        .query_map(
-            rusqlite::params_from_iter(rows.iter().map(|r| r.session_id.clone())),
-            |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, Option<String>>(2)?,
-                ))
-            },
-        )
+        .query_map(rusqlite::params_from_iter(rows.iter().map(|r| r.session_id.clone())), |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, Option<String>>(2)?))
+        })
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -400,7 +401,8 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
     drop(stmt);
     nodes.sort_by_key(|n| sort_key(&n.id, n.ts));
 
-    let by_id: std::collections::HashMap<&str, &Row> = nodes.iter().map(|n| (n.id.as_str(), n)).collect();
+    let by_id: std::collections::HashMap<&str, &Row> =
+        nodes.iter().map(|n| (n.id.as_str(), n)).collect();
 
     let mut stmt = conn
         .prepare(
@@ -421,7 +423,8 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
 
     // message -> skill (used), skill -> artifact (produced), message -> memory (recalled).
     let mut tools_of: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    let mut results_of: std::collections::HashMap<&str, Vec<String>> = std::collections::HashMap::new();
+    let mut results_of: std::collections::HashMap<&str, Vec<String>> =
+        std::collections::HashMap::new();
     let mut recalled: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     for (from, to, kind) in &edges {
         match kind.as_str() {
@@ -514,7 +517,12 @@ mod context_graph_tests {
     #[test]
     fn a_recorded_turn_comes_back_as_nodes_and_edges() {
         let (s, d) = temp_store("roundtrip");
-        record(&s, &[node("m1", "message"), node("a1", "artifact")], &[edge("e1", "m1", "a1", "produced")]).unwrap();
+        record(
+            &s,
+            &[node("m1", "message"), node("a1", "artifact")],
+            &[edge("e1", "m1", "a1", "produced")],
+        )
+        .unwrap();
         let g = graph(&s, 100).unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
@@ -525,7 +533,12 @@ mod context_graph_tests {
     #[test]
     fn a_repeated_relation_strengthens_instead_of_duplicating() {
         let (s, d) = temp_store("weight");
-        record(&s, &[node("m1", "message"), node("s1", "skill")], &[edge("e1", "m1", "s1", "used")]).unwrap();
+        record(
+            &s,
+            &[node("m1", "message"), node("s1", "skill")],
+            &[edge("e1", "m1", "s1", "used")],
+        )
+        .unwrap();
         for i in 0..4 {
             record(&s, &[], &[edge(&format!("e{}", i + 2), "m1", "s1", "used")]).unwrap();
         }
@@ -538,7 +551,8 @@ mod context_graph_tests {
     #[test]
     fn an_edge_to_an_unrecorded_node_is_rejected_not_left_dangling() {
         let (s, d) = temp_store("dangling");
-        let err = record(&s, &[node("m1", "message")], &[edge("e1", "m1", "ghost", "produced")]).unwrap_err();
+        let err = record(&s, &[node("m1", "message")], &[edge("e1", "m1", "ghost", "produced")])
+            .unwrap_err();
         assert!(err.contains("ghost"), "error names the missing node: {err}");
         let g = graph(&s, 100).unwrap();
         assert!(g.edges.is_empty(), "the whole batch is rejected, not half-applied");
@@ -674,7 +688,12 @@ mod context_graph_tests {
     #[test]
     fn clearing_removes_both_tables() {
         let (s, d) = temp_store("clear");
-        record(&s, &[node("m1", "message"), node("m2", "message")], &[edge("e1", "m1", "m2", "follows")]).unwrap();
+        record(
+            &s,
+            &[node("m1", "message"), node("m2", "message")],
+            &[edge("e1", "m1", "m2", "follows")],
+        )
+        .unwrap();
         clear(&s).unwrap();
         let g = graph(&s, 100).unwrap();
         assert!(g.nodes.is_empty() && g.edges.is_empty());

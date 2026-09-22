@@ -120,7 +120,9 @@ pub fn sync_allow_for_provider(
         .ok();
     drop(conn);
     if let Some((base_url, status)) = row {
-        if let Some(host) = reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_lowercase)) {
+        if let Some(host) =
+            reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_lowercase))
+        {
             if matches!(status.as_str(), "pending" | "enabled" | "repairing") {
                 egress.allow.allow(&host);
             } else {
@@ -138,7 +140,9 @@ pub fn recompute_allow(egress: &crate::egress::EgressState, store: &Store) {
     let desired: std::collections::HashSet<String> = {
         let conn = store.conn.lock().unwrap();
         let hosts: Vec<String> = conn
-            .prepare("SELECT base_url FROM providers WHERE status IN ('pending','enabled','repairing')")
+            .prepare(
+                "SELECT base_url FROM providers WHERE status IN ('pending','enabled','repairing')",
+            )
             .map(|mut stmt| {
                 stmt.query_map([], |r| r.get::<_, String>(0))
                     .map(|rows| rows.flatten().collect::<Vec<String>>())
@@ -147,7 +151,9 @@ pub fn recompute_allow(egress: &crate::egress::EgressState, store: &Store) {
             .unwrap_or_default();
         hosts
             .into_iter()
-            .filter_map(|u| reqwest::Url::parse(&u).ok().and_then(|x| x.host_str().map(str::to_lowercase)))
+            .filter_map(|u| {
+                reqwest::Url::parse(&u).ok().and_then(|x| x.host_str().map(str::to_lowercase))
+            })
             .collect()
     }; // conn dropped here before touching the allowlist lock (no deadlock, no borrow)
     let mut cur = egress.allow.0.write().unwrap();
@@ -177,7 +183,10 @@ pub struct ApiKeyRow {
 }
 
 #[tauri::command]
-pub fn api_keys_list(store: State<'_, Arc<Store>>, provider_id: Option<String>) -> Result<Vec<ApiKeyRow>, CommandError> {
+pub fn api_keys_list(
+    store: State<'_, Arc<Store>>,
+    provider_id: Option<String>,
+) -> Result<Vec<ApiKeyRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let sql = "SELECT id, provider_id, label, secret_ref, secret_hint, status, priority, cooldown_until, added_at, last_used_at, last_tested_at FROM api_keys".to_string()
         + if provider_id.is_some() { " WHERE provider_id = ?1" } else { "" };
@@ -269,12 +278,18 @@ pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>
 }
 
 #[tauri::command]
-pub fn manifest_upsert_active(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<(), CommandError> {
+pub fn manifest_upsert_active(
+    store: State<'_, Arc<Store>>,
+    m: ManifestRow,
+) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
     // One transaction: deactivation + activation must be atomic, or a mid-way failure
     // could leave zero active manifests despite uq_manifests_one_active.
     let tx = conn.transaction()?;
-    tx.execute("UPDATE manifests SET is_active = 0 WHERE provider_id = ?1", params![m.provider_id])?;
+    tx.execute(
+        "UPDATE manifests SET is_active = 0 WHERE provider_id = ?1",
+        params![m.provider_id],
+    )?;
     tx.execute(
         "INSERT INTO manifests (id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active)
          VALUES (?1,?2,?3,?4,?5,?6,?7,1)
@@ -310,7 +325,11 @@ pub struct ModelRow {
 }
 
 #[tauri::command]
-pub fn models_cache_replace(store: State<'_, Arc<Store>>, provider_id: String, rows: Vec<ModelRow>) -> Result<(), CommandError> {
+pub fn models_cache_replace(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+    rows: Vec<ModelRow>,
+) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
     replace_models(&mut conn, &provider_id, &rows).map_err(Into::into)
 }
@@ -325,7 +344,11 @@ pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, 
 /// `pricing_json` rides along because the catalog is re-fetched only once per 24h: a launch
 /// that hydrates from this table and finds no price will price every request as unknown,
 /// which zeroes cost and leaves the monthly spend cap unable to fire.
-fn replace_models(conn: &mut rusqlite::Connection, provider_id: &str, rows: &[ModelRow]) -> rusqlite::Result<()> {
+fn replace_models(
+    conn: &mut rusqlite::Connection,
+    provider_id: &str,
+    rows: &[ModelRow],
+) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
     tx.execute("DELETE FROM models_cache WHERE provider_id = ?1", params![provider_id])?;
     for r in rows {
@@ -365,7 +388,10 @@ pub struct AliasRow {
 }
 
 #[tauri::command]
-pub fn aliases_replace(store: State<'_, Arc<Store>>, rows: Vec<AliasRow>) -> Result<(), CommandError> {
+pub fn aliases_replace(
+    store: State<'_, Arc<Store>>,
+    rows: Vec<AliasRow>,
+) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
     // Transaction: a half-applied replace would wipe the failover map (§4).
     let tx = conn.transaction()?;
@@ -443,7 +469,10 @@ pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), C
 }
 
 #[tauri::command]
-pub fn ledger_recent(store: State<'_, Arc<Store>>, limit: Option<i64>) -> Result<Vec<LedgerRow>, CommandError> {
+pub fn ledger_recent(
+    store: State<'_, Arc<Store>>,
+    limit: Option<i64>,
+) -> Result<Vec<LedgerRow>, CommandError> {
     let limit = limit.unwrap_or(100).clamp(1, 1000);
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
@@ -497,10 +526,7 @@ pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandErro
     )?;
     // Raw entries kept 90 days (§4); only after they've been rolled up.
     let cutoff = now_ms() - 90 * 24 * 3600 * 1000;
-    conn.execute(
-        "DELETE FROM ledger WHERE ts < ?1 AND ts < ?2",
-        params![cutoff, month_from],
-    )?;
+    conn.execute("DELETE FROM ledger WHERE ts < ?1 AND ts < ?2", params![cutoff, month_from])?;
     Ok(())
 }
 
@@ -511,16 +537,19 @@ pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandErro
 pub struct OnboardingRow {
     #[serde(default)]
     pub id: Option<i64>,
-    pub input_json: String,               // {name, baseUrl, docsUrl} — NEVER the key (§2.3)
+    pub input_json: String, // {name, baseUrl, docsUrl} — NEVER the key (§2.3)
     #[serde(default)]
-    pub detail_json: Option<String>,      // redacted report + fingerprint + manifest + contract
+    pub detail_json: Option<String>, // redacted report + fingerprint + manifest + contract
     pub state: String,
     #[serde(default)]
     pub outcome: Option<String>,
 }
 
 #[tauri::command]
-pub fn onboarding_save(store: State<'_, Arc<Store>>, row: OnboardingRow) -> Result<i64, CommandError> {
+pub fn onboarding_save(
+    store: State<'_, Arc<Store>>,
+    row: OnboardingRow,
+) -> Result<i64, CommandError> {
     let now = now_ms();
     let conn = store.conn.lock().unwrap();
     match row.id {
@@ -542,7 +571,9 @@ pub fn onboarding_save(store: State<'_, Arc<Store>>, row: OnboardingRow) -> Resu
 }
 
 #[tauri::command]
-pub fn onboarding_latest_active(store: State<'_, Arc<Store>>) -> Result<Option<OnboardingRow>, CommandError> {
+pub fn onboarding_latest_active(
+    store: State<'_, Arc<Store>>,
+) -> Result<Option<OnboardingRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, input_json, COALESCE(probe_report_redacted_json,'null'), state, outcome \
@@ -568,7 +599,10 @@ pub fn onboarding_latest_active(store: State<'_, Arc<Store>>) -> Result<Option<O
 // ---------- generator audit (§2.5) ----------
 
 #[tauri::command]
-pub fn generator_audit_record(store: State<'_, Arc<Store>>, e: GeneratorAuditRow) -> Result<(), CommandError> {
+pub fn generator_audit_record(
+    store: State<'_, Arc<Store>>,
+    e: GeneratorAuditRow,
+) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash) VALUES (?1,?2,?3,?4,?5)",
@@ -653,7 +687,11 @@ pub fn generator_audit_list(
 // ---------- drift events + repair staging (§2.10, Phase 5) ----------
 
 #[tauri::command]
-pub fn drift_event_record(store: State<'_, Arc<Store>>, provider_id: String, trigger_json: String) -> Result<(), CommandError> {
+pub fn drift_event_record(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+    trigger_json: String,
+) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES (?1,?2,?3)",
@@ -663,7 +701,11 @@ pub fn drift_event_record(store: State<'_, Arc<Store>>, provider_id: String, tri
 }
 
 #[tauri::command]
-pub fn drift_event_resolve(store: State<'_, Arc<Store>>, provider_id: String, resolution: String) -> Result<(), CommandError> {
+pub fn drift_event_resolve(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+    resolution: String,
+) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "UPDATE drift_events SET resolution=?2, resolved_at=?3 WHERE provider_id=?1 AND resolution IS NULL",
@@ -741,7 +783,10 @@ pub fn drift_events_list(
 }
 
 #[tauri::command]
-pub fn manifests_history(store: State<'_, Arc<Store>>, provider_id: String) -> Result<Vec<ManifestRow>, CommandError> {
+pub fn manifests_history(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+) -> Result<Vec<ManifestRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active FROM manifests WHERE provider_id = ?1 ORDER BY version DESC",
@@ -765,8 +810,11 @@ pub fn manifests_history(store: State<'_, Arc<Store>>, provider_id: String) -> R
 #[tauri::command]
 pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i64, CommandError> {
     let conn = store.conn.lock().unwrap();
-    let next: i64 = conn
-        .query_row("SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id = ?1", params![m.provider_id], |r| r.get(0))?;
+    let next: i64 = conn.query_row(
+        "SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id = ?1",
+        params![m.provider_id],
+        |r| r.get(0),
+    )?;
     conn.execute(
         "INSERT INTO manifests (id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active) VALUES (?1,?2,?3,?4,?5,?6,?7,0)",
         params![m.id, m.provider_id, next, m.origin, m.body_json, m.contract_result_json, m.created_at],
@@ -776,16 +824,29 @@ pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i6
 
 /// Activate a staged manifest; returns the previously-active version for one-click rollback.
 #[tauri::command]
-pub fn manifest_activate(store: State<'_, Arc<Store>>, provider_id: String, version: i64) -> Result<Option<i64>, CommandError> {
+pub fn manifest_activate(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+    version: i64,
+) -> Result<Option<i64>, CommandError> {
     let mut conn = store.conn.lock().unwrap();
     let tx = conn.transaction()?;
     let previous: Option<i64> = tx
-        .query_row("SELECT version FROM manifests WHERE provider_id=?1 AND is_active=1", params![provider_id], |r| r.get(0))
+        .query_row(
+            "SELECT version FROM manifests WHERE provider_id=?1 AND is_active=1",
+            params![provider_id],
+            |r| r.get(0),
+        )
         .ok();
     tx.execute("UPDATE manifests SET is_active=0 WHERE provider_id=?1", params![provider_id])?;
-    let changed = tx.execute("UPDATE manifests SET is_active=1 WHERE provider_id=?1 AND version=?2", params![provider_id, version])?;
+    let changed = tx.execute(
+        "UPDATE manifests SET is_active=1 WHERE provider_id=?1 AND version=?2",
+        params![provider_id, version],
+    )?;
     if changed == 0 {
-        return Err(CommandError(format!("manifest v{version} not found for provider {provider_id}")));
+        return Err(CommandError(format!(
+            "manifest v{version} not found for provider {provider_id}"
+        )));
     }
     tx.commit()?;
     Ok(previous)
@@ -806,9 +867,7 @@ pub fn manifest_activate(store: State<'_, Arc<Store>>, provider_id: String, vers
 pub fn active_gateway_key_ids(store: &Store) -> Result<Vec<String>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare("SELECT id FROM gateway_keys WHERE revoked_at IS NULL")?;
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt.query_map([], |r| r.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
 }
 
@@ -898,12 +957,15 @@ pub fn month_spend_micros(store: &Store) -> i64 {
 /// Spend cap in micro-USD, or 0/None when disabled.
 pub fn spend_cap_micros(store: &Store) -> Option<i64> {
     let conn = store.conn.lock().unwrap();
-    let raw: Option<String> = conn
-        .query_row("SELECT value_json FROM settings WHERE key='spend'", [], |r| r.get(0))
-        .ok();
+    let raw: Option<String> =
+        conn.query_row("SELECT value_json FROM settings WHERE key='spend'", [], |r| r.get(0)).ok();
     let v: serde_json::Value = serde_json::from_str(&raw?).ok()?;
     let cap = v.get("capMicrosPerMonth")?.as_i64()?;
-    if cap <= 0 { None } else { Some(cap) }
+    if cap <= 0 {
+        None
+    } else {
+        Some(cap)
+    }
 }
 
 pub fn spend_cap_set(store: &Store, cap_micros: i64) -> Result<(), CommandError> {
@@ -942,7 +1004,13 @@ mod persist_tests {
         }
         let next = {
             let conn = store.conn.lock().unwrap();
-            let n: i64 = conn.query_row("SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id='p'", [], |r| r.get(0)).unwrap();
+            let n: i64 = conn
+                .query_row(
+                    "SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id='p'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
             conn.execute(
                 "INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m2','p',?1,'ai-patched','{}',1,0)",
                 rusqlite::params![n],
@@ -954,18 +1022,32 @@ mod persist_tests {
         {
             let mut conn = store.conn.lock().unwrap();
             let tx = conn.transaction().unwrap();
-            let prev: Option<i64> = tx.query_row("SELECT version FROM manifests WHERE provider_id='p' AND is_active=1", [], |r| r.get(0)).ok();
+            let prev: Option<i64> = tx
+                .query_row(
+                    "SELECT version FROM manifests WHERE provider_id='p' AND is_active=1",
+                    [],
+                    |r| r.get(0),
+                )
+                .ok();
             assert_eq!(prev, Some(1));
             tx.execute("UPDATE manifests SET is_active=0 WHERE provider_id='p'", []).unwrap();
-            tx.execute("UPDATE manifests SET is_active=1 WHERE provider_id='p' AND version=2", []).unwrap();
+            tx.execute("UPDATE manifests SET is_active=1 WHERE provider_id='p' AND version=2", [])
+                .unwrap();
             tx.commit().unwrap();
         }
         // exactly one active, and rollback target exists
         let conn = store.conn.lock().unwrap();
-        let active: Vec<i64> = conn.prepare("SELECT version FROM manifests WHERE is_active=1").unwrap()
-            .query_map([], |r| r.get(0)).unwrap().flatten().collect();
+        let active: Vec<i64> = conn
+            .prepare("SELECT version FROM manifests WHERE is_active=1")
+            .unwrap()
+            .query_map([], |r| r.get(0))
+            .unwrap()
+            .flatten()
+            .collect();
         assert_eq!(active, vec![2]);
-        let hist: i64 = conn.query_row("SELECT COUNT(*) FROM manifests WHERE provider_id='p'", [], |r| r.get(0)).unwrap();
+        let hist: i64 = conn
+            .query_row("SELECT COUNT(*) FROM manifests WHERE provider_id='p'", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(hist, 2);
         // uq_manifests_one_active prevents two actives
         let dup = conn.execute("INSERT INTO manifests (id,provider_id,version,origin,body_json,created_at,is_active) VALUES ('m3','p',3,'ai-patched','{}',1,1)", []);
@@ -1009,7 +1091,10 @@ mod persist_tests {
 
             // The priced row comes back priced — this is what the ledger reads after a restart.
             let priced = back.iter().find(|r| r.native_id == "openai/gpt-4o-mini").unwrap();
-            assert_eq!(priced.pricing_json.as_deref(), Some(r#"{"prompt":150000,"completion":600000}"#));
+            assert_eq!(
+                priced.pricing_json.as_deref(),
+                Some(r#"{"prompt":150000,"completion":600000}"#)
+            );
 
             // An unpriced row stays NULL. Writing 0 here would make "unknown" read as "free".
             let unpriced = back.iter().find(|r| r.native_id == "some/free-model").unwrap();
@@ -1030,7 +1115,10 @@ mod persist_tests {
             let back = list_models(&conn).unwrap();
             assert_eq!(back.len(), 1);
             assert_eq!(back[0].pricing_json, None);
-            assert_eq!(back[0].capabilities_json, None, "a refresh with no capability data must clear it, not leave a stale claim");
+            assert_eq!(
+                back[0].capabilities_json, None,
+                "a refresh with no capability data must clear it, not leave a stale claim"
+            );
             assert_eq!(back[0].fetched_at, 2);
         }
         let _ = std::fs::remove_dir_all(&dir);
@@ -1047,15 +1135,27 @@ mod persist_tests {
             ).unwrap();
             conn.execute("INSERT INTO drift_events (provider_id, detected_at, trigger_json) VALUES ('p',1,'{\"errors\":5}')", []).unwrap();
         }
-        let open: i64 = store.conn.lock().unwrap()
-            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| r.get(0)).unwrap();
+        let open: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(open, 1);
         {
             let conn = store.conn.lock().unwrap();
             conn.execute("UPDATE drift_events SET resolution='repaired', resolved_at=2 WHERE provider_id='p' AND resolution IS NULL", []).unwrap();
         }
-        let open2: i64 = store.conn.lock().unwrap()
-            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| r.get(0)).unwrap();
+        let open2: i64 = store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM drift_events WHERE resolution IS NULL", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
         assert_eq!(open2, 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1078,7 +1178,11 @@ mod persist_tests {
                 [],
             ).unwrap();
             conn.execute("INSERT INTO settings (key,value_json) VALUES ('router','{\"failoverEnabled\":true}')", []).unwrap();
-            conn.execute("INSERT INTO settings (key,value_json) VALUES ('gateway','{\"port\":8787}')", []).unwrap();
+            conn.execute(
+                "INSERT INTO settings (key,value_json) VALUES ('gateway','{\"port\":8787}')",
+                [],
+            )
+            .unwrap();
         }
 
         // export: carries the reference, never a secret; gateway setting is machine-local but exported
@@ -1098,17 +1202,24 @@ mod persist_tests {
         let (store2, dir2) = tmp_store("cfg2");
         {
             let mut conn = store2.conn.lock().unwrap();
-            let mut snap2: ImportSnapshot = serde_json::from_value(serde_json::to_value(&snap).unwrap()).unwrap();
+            let mut snap2: ImportSnapshot =
+                serde_json::from_value(serde_json::to_value(&snap).unwrap()).unwrap();
             // force a live status in the source; import must still land as draft
             snap2.providers[0].status = "enabled".into();
             let applied = config_import_checked(&mut conn, &snap2).unwrap();
             assert_eq!(applied.providers, 1);
             assert_eq!(applied.keys, 1);
-            let status: String = conn.query_row("SELECT status FROM providers WHERE id='p'", [], |r| r.get(0)).unwrap();
+            let status: String = conn
+                .query_row("SELECT status FROM providers WHERE id='p'", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(status, "draft", "imported providers must land as draft");
-            let kstatus: String = conn.query_row("SELECT status FROM api_keys WHERE id='k'", [], |r| r.get(0)).unwrap();
+            let kstatus: String = conn
+                .query_row("SELECT status FROM api_keys WHERE id='k'", [], |r| r.get(0))
+                .unwrap();
             assert_eq!(kstatus, "invalid", "imported keys must land as invalid");
-            let gw: Option<String> = conn.query_row("SELECT value_json FROM settings WHERE key='gateway'", [], |r| r.get(0)).ok();
+            let gw: Option<String> = conn
+                .query_row("SELECT value_json FROM settings WHERE key='gateway'", [], |r| r.get(0))
+                .ok();
             assert_eq!(gw, None, "gateway (machine-local) setting must never be imported");
 
             // re-import the same snapshot: idempotent, nothing duplicated
@@ -1126,7 +1237,8 @@ mod persist_tests {
                 Ok(_) => panic!("secret-bearing snapshot must be rejected"),
                 Err(e) => assert!(e.0.contains("raw secret fields"), "got: {}", e.0),
             }
-            let n: i64 = conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get(0)).unwrap();
+            let n: i64 =
+                conn.query_row("SELECT COUNT(*) FROM providers", [], |r| r.get(0)).unwrap();
             assert_eq!(n, 0, "rejected import must apply nothing");
         }
 
@@ -1214,11 +1326,7 @@ mod persist_tests {
                 .unwrap();
             }
         }
-        assert_eq!(
-            month_spend_micros(&store),
-            350,
-            "only the current UTC month counts"
-        );
+        assert_eq!(month_spend_micros(&store), 350, "only the current UTC month counts");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -1289,37 +1397,65 @@ fn config_export_rows(conn: &rusqlite::Connection) -> Result<ExportSnapshot, rus
         let mut stmt = conn.prepare("SELECT id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at FROM providers ORDER BY created_at")?;
         let rows = stmt.query_map([], |r| {
             Ok(ProviderRow {
-                id: r.get(0)?, slug: r.get(1)?, name: r.get(2)?, r#type: r.get(3)?,
-                base_url: r.get(4)?, status: r.get(5)?, rotation_strategy: r.get(6)?,
-                created_at: r.get(7)?, updated_at: r.get(8)?,
+                id: r.get(0)?,
+                slug: r.get(1)?,
+                name: r.get(2)?,
+                r#type: r.get(3)?,
+                base_url: r.get(4)?,
+                status: r.get(5)?,
+                rotation_strategy: r.get(6)?,
+                created_at: r.get(7)?,
+                updated_at: r.get(8)?,
             })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let keys = {
-        let mut stmt = conn.prepare("SELECT id, provider_id, label, secret_ref, secret_hint FROM api_keys")?;
+        let mut stmt =
+            conn.prepare("SELECT id, provider_id, label, secret_ref, secret_hint FROM api_keys")?;
         let rows = stmt.query_map([], |r| {
-            Ok(ExportKey { id: r.get(0)?, provider_id: r.get(1)?, label: r.get(2)?, secret_ref: r.get(3)?, secret_hint: r.get(4)? })
+            Ok(ExportKey {
+                id: r.get(0)?,
+                provider_id: r.get(1)?,
+                label: r.get(2)?,
+                secret_ref: r.get(3)?,
+                secret_hint: r.get(4)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let manifests = {
-        let mut stmt = conn.prepare("SELECT id, provider_id, version, origin, body_json FROM manifests WHERE is_active = 1")?;
+        let mut stmt = conn.prepare(
+            "SELECT id, provider_id, version, origin, body_json FROM manifests WHERE is_active = 1",
+        )?;
         let rows = stmt.query_map([], |r| {
-            Ok(ExportManifest { id: r.get(0)?, provider_id: r.get(1)?, version: r.get(2)?, origin: r.get(3)?, body_json: r.get(4)? })
+            Ok(ExportManifest {
+                id: r.get(0)?,
+                provider_id: r.get(1)?,
+                version: r.get(2)?,
+                origin: r.get(3)?,
+                body_json: r.get(4)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let aliases = {
-        let mut stmt = conn.prepare("SELECT alias, provider_id, native_model_id, priority FROM model_aliases")?;
+        let mut stmt = conn
+            .prepare("SELECT alias, provider_id, native_model_id, priority FROM model_aliases")?;
         let rows = stmt.query_map([], |r| {
-            Ok(AliasRow { alias: r.get(0)?, provider_id: r.get(1)?, native_model_id: r.get(2)?, priority: r.get(3)? })
+            Ok(AliasRow {
+                alias: r.get(0)?,
+                provider_id: r.get(1)?,
+                native_model_id: r.get(2)?,
+                priority: r.get(3)?,
+            })
         })?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     let settings = {
         let mut stmt = conn.prepare("SELECT key, value_json FROM settings")?;
-        let rows = stmt.query_map([], |r| Ok(SettingRow { key: r.get(0)?, value_json: r.get(1)? }))?;
+        let rows =
+            stmt.query_map([], |r| Ok(SettingRow { key: r.get(0)?, value_json: r.get(1)? }))?;
         rows.collect::<Result<Vec<_>, _>>()?
     };
     Ok(ExportSnapshot {
@@ -1373,7 +1509,10 @@ fn find_secret_keys(v: &serde_json::Value, path: String, out: &mut Vec<String>) 
 /// the host-side secret scan sees exactly what arrived — typed structs can't carry a
 /// smuggled `secret` field, so scanning them would be theater.
 #[tauri::command]
-pub fn config_import(store: State<'_, Arc<Store>>, raw: serde_json::Value) -> Result<ImportApplied, CommandError> {
+pub fn config_import(
+    store: State<'_, Arc<Store>>,
+    raw: serde_json::Value,
+) -> Result<ImportApplied, CommandError> {
     let snap = parse_import(raw)?;
     let mut conn = store.conn.lock().unwrap();
     config_import_checked(&mut conn, &snap)
@@ -1391,7 +1530,10 @@ fn parse_import(raw: serde_json::Value) -> Result<ImportSnapshot, CommandError> 
     serde_json::from_value(raw).map_err(|e| CommandError(e.to_string()))
 }
 
-fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot) -> Result<ImportApplied, CommandError> {
+fn config_import_checked(
+    conn: &mut rusqlite::Connection,
+    snap: &ImportSnapshot,
+) -> Result<ImportApplied, CommandError> {
     if snap.format_version != 1 {
         return Err(CommandError(format!("unsupported formatVersion {}", snap.format_version)));
     }
@@ -1399,7 +1541,11 @@ fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot)
     let mut providers = 0usize;
     let mut keys = 0usize;
     for p in &snap.providers {
-        let exists: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1 OR slug=?2", params![p.id, p.slug], |r| r.get(0))?;
+        let exists: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id=?1 OR slug=?2",
+            params![p.id, p.slug],
+            |r| r.get(0),
+        )?;
         if exists > 0 {
             continue;
         }
@@ -1410,12 +1556,17 @@ fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot)
         providers += 1;
     }
     for k in &snap.keys {
-        let exists: i64 = tx.query_row("SELECT COUNT(*) FROM api_keys WHERE id=?1", params![k.id], |r| r.get(0))?;
+        let exists: i64 =
+            tx.query_row("SELECT COUNT(*) FROM api_keys WHERE id=?1", params![k.id], |r| r.get(0))?;
         if exists > 0 {
             continue;
         }
         // Only import keys whose provider exists (skipped or new).
-        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![k.provider_id], |r| r.get(0))?;
+        let has_provider: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id=?1",
+            params![k.provider_id],
+            |r| r.get(0),
+        )?;
         if has_provider == 0 {
             continue;
         }
@@ -1426,7 +1577,11 @@ fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot)
         keys += 1;
     }
     for m in &snap.manifests {
-        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![m.provider_id], |r| r.get(0))?;
+        let has_provider: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id=?1",
+            params![m.provider_id],
+            |r| r.get(0),
+        )?;
         if has_provider == 0 {
             continue;
         }
@@ -1437,7 +1592,11 @@ fn config_import_checked(conn: &mut rusqlite::Connection, snap: &ImportSnapshot)
     }
     for a in &snap.aliases {
         // never overwrite a live alias on this machine; imported providers only
-        let has_provider: i64 = tx.query_row("SELECT COUNT(*) FROM providers WHERE id=?1", params![a.provider_id], |r| r.get(0))?;
+        let has_provider: i64 = tx.query_row(
+            "SELECT COUNT(*) FROM providers WHERE id=?1",
+            params![a.provider_id],
+            |r| r.get(0),
+        )?;
         if has_provider == 0 {
             continue;
         }
@@ -1481,17 +1640,16 @@ fn diagnostics_json(conn: &rusqlite::Connection) -> Result<String, rusqlite::Err
         let mut stmt = conn.prepare(
             "SELECT ts, modality, source, COALESCE(provider_id,''), model, status, COALESCE(error_class,''), COALESCE(latency_ms,0), COALESCE(fallback_chain_json,'[]') FROM ledger ORDER BY ts DESC LIMIT 200",
         )?;
-        let rows = stmt
-            .query_map([], |r| {
-                let chain: String = r.get(8)?;
-                Ok(json!({
-                    "ts": r.get::<_, i64>(0)?, "modality": r.get::<_, String>(1)?,
-                    "source": r.get::<_, String>(2)?, "providerId": r.get::<_, String>(3)?,
-                    "model": r.get::<_, String>(4)?, "status": r.get::<_, String>(5)?,
-                    "errorClass": r.get::<_, String>(6)?, "latencyMs": r.get::<_, i64>(7)?,
-                    "chain": serde_json::from_str::<Value>(&chain).unwrap_or(Value::Null),
-                }))
-            })?;
+        let rows = stmt.query_map([], |r| {
+            let chain: String = r.get(8)?;
+            Ok(json!({
+                "ts": r.get::<_, i64>(0)?, "modality": r.get::<_, String>(1)?,
+                "source": r.get::<_, String>(2)?, "providerId": r.get::<_, String>(3)?,
+                "model": r.get::<_, String>(4)?, "status": r.get::<_, String>(5)?,
+                "errorClass": r.get::<_, String>(6)?, "latencyMs": r.get::<_, i64>(7)?,
+                "chain": serde_json::from_str::<Value>(&chain).unwrap_or(Value::Null),
+            }))
+        })?;
         recent = rows.collect::<Result<Vec<_>, _>>()?;
     }
     let drift: Vec<Value>;

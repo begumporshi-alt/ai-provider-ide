@@ -25,7 +25,9 @@ use tauri::Manager;
 fn initial_allow_hosts(store: &store::Store) -> std::collections::HashSet<String> {
     let conn = store.conn.lock().unwrap();
     let mut hosts = std::collections::HashSet::new();
-    if let Ok(mut stmt) = conn.prepare("SELECT base_url FROM providers WHERE status IN ('pending','enabled','repairing')") {
+    if let Ok(mut stmt) = conn
+        .prepare("SELECT base_url FROM providers WHERE status IN ('pending','enabled','repairing')")
+    {
         if let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0)) {
             for row in rows.flatten() {
                 if let Ok(u) = reqwest::Url::parse(&row) {
@@ -45,7 +47,9 @@ fn initial_allow_hosts(store: &store::Store) -> std::collections::HashSet<String
 fn probe_key_refs(store: &store::Store) {
     let refs: Vec<(String, String)> = {
         let conn = store.conn.lock().unwrap();
-        let Ok(mut stmt) = conn.prepare("SELECT id, secret_ref FROM api_keys WHERE status != 'invalid'") else {
+        let Ok(mut stmt) =
+            conn.prepare("SELECT id, secret_ref FROM api_keys WHERE status != 'invalid'")
+        else {
             return;
         };
         stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
@@ -149,26 +153,19 @@ fn hide_on_close(app: &tauri::AppHandle) -> bool {
     let Some(store) = app.try_state::<std::sync::Arc<store::Store>>() else {
         return true;
     };
-    let raw: Option<String> = store
-        .conn
-        .lock()
-        .ok()
-        .and_then(|conn| {
-            conn.query_row("SELECT value_json FROM settings WHERE key='background'", [], |r| r.get(0))
-                .ok()
-        });
+    let raw: Option<String> = store.conn.lock().ok().and_then(|conn| {
+        conn.query_row("SELECT value_json FROM settings WHERE key='background'", [], |r| r.get(0))
+            .ok()
+    });
     hide_on_close_from(raw.as_deref())
 }
-
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Initialize tracing (stderr JSON on debug, plain text on release)
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
-        .with_env_filter(
-            std::env::var("GW_LOG").unwrap_or_else(|_| "info".to_string()),
-        )
+        .with_env_filter(std::env::var("GW_LOG").unwrap_or_else(|_| "info".to_string()))
         .try_init();
 
     // macOS must not nap this process: the gateway's worker is a hidden webview, and a napped

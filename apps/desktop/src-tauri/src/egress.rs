@@ -39,12 +39,10 @@ pub enum EgressError {
     SecretMissing { ref_: String },
     #[error("secretRef given but no header carries the {{secret}} sentinel — refusing to send unauthenticated")]
     SentinelMissing,
-    #[error("secret_ref {ref_} may only be used against its own provider host {expected} (got {got})")]
-    KeyHostMismatch {
-        ref_: String,
-        expected: String,
-        got: String,
-    },
+    #[error(
+        "secret_ref {ref_} may only be used against its own provider host {expected} (got {got})"
+    )]
+    KeyHostMismatch { ref_: String, expected: String, got: String },
     #[error("http error: {0}")]
     Http(#[from] reqwest::Error),
     #[error("vault error: {0}")]
@@ -90,9 +88,7 @@ pub fn is_local(host: &str) -> bool {
     }
     // Parsed rather than prefix-matched: "127.0.0", "127.0.0.1.5" and "127.evil.example" must
     // all stay remote, and a `strip_prefix("127.")` test gets those wrong in at least one case.
-    host.parse::<std::net::Ipv4Addr>()
-        .map(|ip| ip.octets()[0] == 127)
-        .unwrap_or(false)
+    host.parse::<std::net::Ipv4Addr>().map(|ip| ip.octets()[0] == 127).unwrap_or(false)
 }
 
 #[derive(Debug, Deserialize)]
@@ -157,7 +153,11 @@ pub fn check_url(allow: &AllowList, raw: &str) -> Result<reqwest::Url, EgressErr
 }
 
 /// Enforce `secret_ref -> own provider host` pairing using the DB (the webview is untrusted).
-pub fn check_secret_host(store: &Store, secret_ref: &str, dest_host: &str) -> Result<(), EgressError> {
+pub fn check_secret_host(
+    store: &Store,
+    secret_ref: &str,
+    dest_host: &str,
+) -> Result<(), EgressError> {
     let conn = store.conn.lock().unwrap();
     let base: Option<String> = conn
         .query_row(
@@ -224,10 +224,9 @@ async fn build(
         check_secret_host(&state.store, r, host)?;
     }
     let secret = match &req.secret_ref {
-        Some(r) => Some(
-            vault::get(r)?
-                .ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })?,
-        ),
+        Some(r) => {
+            Some(vault::get(r)?.ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })?)
+        }
         None => None,
     };
     let headers = inject_secret(req.headers.clone(), secret.as_deref())?;
@@ -251,7 +250,10 @@ async fn build(
 }
 
 /// Unary request (model lists, image generations, contract pings).
-pub async fn request(state: &EgressState, req: EgressRequest) -> Result<EgressResponse, EgressError> {
+pub async fn request(
+    state: &EgressState,
+    req: EgressRequest,
+) -> Result<EgressResponse, EgressError> {
     let res = build(state, req).await?.send().await?;
     let status = res.status().as_u16();
     let headers = res
@@ -286,7 +288,10 @@ pub fn image_host_allowed(state: &EgressState, host: &str) -> Result<(), EgressE
 /// scoped to that response, NOT a new allowlist entry. No secret is ever attached — this
 /// path exists for pre-signed CDN URLs, which need none. Every redirect hop re-passes the
 /// same allow/scoped check (see the image_client policy above).
-pub async fn fetch_image(state: &EgressState, req: ImageFetchRequest) -> Result<ImageFetchResponse, EgressError> {
+pub async fn fetch_image(
+    state: &EgressState,
+    req: ImageFetchRequest,
+) -> Result<ImageFetchResponse, EgressError> {
     let url = reqwest::Url::parse(&req.url).map_err(|e| EgressError::BadUrl(e.to_string()))?;
     image_host_allowed(state, url.host_str().unwrap_or(""))?;
     let mut b = state.image_client.get(url);
@@ -336,7 +341,11 @@ pub async fn fetch_image(state: &EgressState, req: ImageFetchRequest) -> Result<
 /// a stream that keeps producing data is never cut off, however long it runs.
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<StreamEvent>) -> Result<(), EgressError> {
+pub async fn stream(
+    state: &EgressState,
+    req: EgressRequest,
+    channel: Channel<StreamEvent>,
+) -> Result<(), EgressError> {
     let b = build(state, req).await?;
     // Bounded the same way as the chunks below: headers are progress too, and a server that
     // completes the handshake and then never answers is indistinguishable from a stall.
@@ -349,16 +358,16 @@ pub async fn stream(state: &EgressState, req: EgressRequest, channel: Channel<St
                 .iter()
                 .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            if channel
-                .send(StreamEvent::Headers { status, headers })
-                .is_err()
-            {
+            if channel.send(StreamEvent::Headers { status, headers }).is_err() {
                 return Ok(()); // consumer gone; provider stream drops => cancelled
             }
             if status >= 400 {
                 let body = res.text().await.unwrap_or_default();
                 let _ = channel.send(StreamEvent::Error {
-                    message: format!("http {status}: {}", body.chars().take(2000).collect::<String>()),
+                    message: format!(
+                        "http {status}: {}",
+                        body.chars().take(2000).collect::<String>()
+                    ),
                 });
                 return Ok(());
             }
@@ -504,7 +513,8 @@ impl EgressState {
 /// Where a URL stops, in practice: the end of a JSON string, an HTML attribute, or prose.
 fn url_token_end(s: &str) -> usize {
     s.find(|c: char| {
-        c.is_whitespace() || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | '\\' | '`')
+        c.is_whitespace()
+            || matches!(c, '"' | '\'' | '<' | '>' | ')' | ']' | '}' | ',' | '\\' | '`')
     })
     .unwrap_or(s.len())
 }
@@ -592,10 +602,10 @@ mod tests {
         for host in [
             "128.0.0.1",
             "126.255.255.255",
-            "127.0.0",           // too few octets
-            "127.0.0.1.5",       // too many
-            "127.evil.example",  // looks local, is not
-            "17.0.0.1",          // prefix of nothing
+            "127.0.0",          // too few octets
+            "127.0.0.1.5",      // too many
+            "127.evil.example", // looks local, is not
+            "17.0.0.1",         // prefix of nothing
         ] {
             assert!(!is_local(host), "{host} is not loopback");
         }
@@ -612,7 +622,8 @@ mod tests {
 
     #[test]
     fn a_url_inside_a_query_string_earns_no_lease_of_its_own() {
-        let hosts = hosts_in_body(r#"{"url":"https://cdn.example/x?next=http://attacker.example"}"#);
+        let hosts =
+            hosts_in_body(r#"{"url":"https://cdn.example/x?next=http://attacker.example"}"#);
         assert!(hosts.contains("cdn.example"));
         assert!(
             !hosts.contains("attacker.example"),
@@ -658,10 +669,7 @@ mod tests {
     fn secret_never_reaches_a_request_without_sentinel() {
         let mut h = std::collections::BTreeMap::new();
         h.insert("Authorization".to_string(), "Bearer wrong".to_string());
-        assert!(matches!(
-            inject_secret(h, Some("sk-x")),
-            Err(EgressError::SentinelMissing)
-        ));
+        assert!(matches!(inject_secret(h, Some("sk-x")), Err(EgressError::SentinelMissing)));
     }
 
     #[test]
@@ -704,7 +712,10 @@ mod image_fetch_tests {
     }
 
     fn state_with(host: &str) -> EgressState {
-        EgressState::new(Arc::new(allow_with(host)), Arc::new(store_with("https://x.test/v1", "key:k1")))
+        EgressState::new(
+            Arc::new(allow_with(host)),
+            Arc::new(store_with("https://x.test/v1", "key:k1")),
+        )
     }
 
     #[test]
@@ -728,9 +739,13 @@ mod image_fetch_tests {
         let state = state_with("cdn.example.com");
         assert!(image_host_allowed(&state, "files.provider-cdn.test").is_err());
         // The provider's response body names that host -> scoped lease opens, nothing persisted.
-        state.record_returned_hosts(r#"{"data":[{"url":"https://files.provider-cdn.test/a.png"}]}"#);
+        state
+            .record_returned_hosts(r#"{"data":[{"url":"https://files.provider-cdn.test/a.png"}]}"#);
         assert!(image_host_allowed(&state, "files.provider-cdn.test").is_ok());
-        assert!(!state.allow.contains("files.provider-cdn.test"), "carve-out must never widen the allowlist");
+        assert!(
+            !state.allow.contains("files.provider-cdn.test"),
+            "carve-out must never widen the allowlist"
+        );
         // A different host still has no lease.
         assert!(image_host_allowed(&state, "other-cdn.test").is_err());
     }
@@ -741,11 +756,10 @@ mod image_fetch_tests {
         state.record_returned_hosts(r#"{"url":"https://files.provider-cdn.test/a.png"}"#);
         assert!(image_host_allowed(&state, "files.provider-cdn.test").is_ok());
         // Push the lease timestamp past its TTL.
-        state
-            .returned_hosts
-            .write()
-            .unwrap()
-            .insert("files.provider-cdn.test".to_string(), Instant::now() - RETURNED_HOST_TTL - Duration::from_secs(1));
+        state.returned_hosts.write().unwrap().insert(
+            "files.provider-cdn.test".to_string(),
+            Instant::now() - RETURNED_HOST_TTL - Duration::from_secs(1),
+        );
         assert!(image_host_allowed(&state, "files.provider-cdn.test").is_err());
     }
 
@@ -798,7 +812,10 @@ mod pairing_tests {
     #[test]
     fn unknown_secret_ref_is_refused() {
         let s = store_with("https://x.test/v1", "key:k1");
-        assert!(matches!(check_secret_host(&s, "key:evil", "x.test"), Err(EgressError::SecretMissing { .. })));
+        assert!(matches!(
+            check_secret_host(&s, "key:evil", "x.test"),
+            Err(EgressError::SecretMissing { .. })
+        ));
         let _ = std::fs::remove_dir_all(&s.path);
     }
 }

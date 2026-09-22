@@ -192,7 +192,15 @@ mod orchestrator_tests {
         let (s, d) = temp_store("record");
         start(&s, "r1".into(), Some("s1".into()), "m".into(), Some("do it".into())).unwrap();
         step(&s, "r1", "tool_call".into(), Some("read_file".into()), None, None).unwrap();
-        step(&s, "r1", "tool_result".into(), Some("read_file".into()), Some("ok".into()), Some(true)).unwrap();
+        step(
+            &s,
+            "r1",
+            "tool_result".into(),
+            Some("read_file".into()),
+            Some("ok".into()),
+            Some(true),
+        )
+        .unwrap();
         // Readable mid-run, before any finish call.
         let all = runs(&s, 10).unwrap();
         assert_eq!(all.len(), 1);
