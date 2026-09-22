@@ -274,6 +274,26 @@ Caveats:
 - `Identifier` changed from `ai_provider_router-15382172ab762b3d` (ad-hoc) to the real bundle id
   `dev.aiprovider.router`. An improvement, but it is a change in app identity.
 
+### Superseded 2026-09-22 — never pin a signing identity in `tauri.conf.json`
+
+The pin described above was correct for this machine and wrong for every other one. A self-signed
+certificate exists in exactly one login keychain, so on any other clone `codesign` fails
+`no identity found` and the build stops. The config no longer names an identity.
+
+- **Default is ad-hoc**, which runs locally — that is the shipped state, and it is deliberate.
+- **`APPLE_SIGNING_IDENTITY` overrides it** for anyone who does have a certificate. Do not re-add a
+  literal `signingIdentity`; a per-machine value does not belong in a committed config.
+- **CI cannot catch this.** `.github/workflows/ci.yml` runs typecheck, unit tests, `cargo check`,
+  `cargo test` and Playwright — it never runs `tauri build`. So a pinned identity goes green on
+  every push and fails the first time a human builds on a different machine. Verify a signing
+  change by *building*, never by pushing.
+
+### `tauri build`: the DMG step always fails here
+
+The final `bundle_dmg.sh` step fails (`hdiutil`). This is expected and not a build failure — the
+`.app` is already complete and installed by that point. Take the `.app`, ignore the DMG error.
+
+
 ## Verifying the *deployed frontend* — three ways to get a false negative (2026-09-21)
 
 Checking that a webview change actually shipped is harder than it looks, and each failure mode looks
@@ -720,8 +740,8 @@ handling, the fix belongs in retry/continuation, not in the error class.
 (`cline/anthropic/claude-sonnet-4.5`), a different provider and an Anthropic-family model — 200
 direct and 200 through the gateway, with two `ok` ledger rows.
 
-## Test counts (measured 2026-09-21)
-router-core **231** · desktop vitest **193** · Rust `cargo test --lib` **433** · adapter-spec **18** ·
+## Test counts (re-measured 2026-09-22)
+router-core **241** · desktop vitest **193** · Rust `cargo test --lib` **470** · adapter-spec **18** ·
 browser **98 passing** (87 declarations; the smoke spec's screen sweep expands one of them to 12, so
 87 − 1 + 12 = 98 — the arithmetic closing is how the declaration count is checked).
 Gate is `pnpm ci:local` (browser included by default). `npx tauri build --bundles app` also
@@ -734,7 +754,8 @@ is not one. Cost two full 4-minute runs on 2026-09-21.
 377 after Phase 5's four prune tests → 381 after §6.4's four conflict tests → 394 after the
 app-key principal's thirteen → 408 → 414 after the injection ring buffer's six →
 **420 after the gateway.log reader's six**, **426 after the `generator_audit` reader's six**, **433 after the
-drift history reader's seven**.
+drift history reader's seven**, **466 after the external-agent ingress + `count_tokens` + Retry-After stage 2**,
+**470 after the cooldown-reporting tests' four**.
 Desktop vitest 163 → 169 (retention) → 170 → 177 (the settings-merge spec's seven) → 181 after the
 trail-writes spec's four → **183 after the generation producer's two** → **186 after the lost-ending specs'
 three** → **190 after the run-omission specs' four** → **193 after the stranded-repair specs' three**.
@@ -769,14 +790,22 @@ at 426 after the `generator_audit` reader.
 ## The local gate: `pnpm ci:local` (`scripts/ci-local.sh`)
 Mirrors `ci.yml` step for step, adds a Node >= 19 preflight, and unsets the proxy vars. Skips
 `pnpm install` by default; `--install` to include it, `--skip-browser` to drop the ~48s Playwright
-run. **Use this, not CI** (see next).
+run. **Use this as the inner loop, not as a substitute for CI** (see next).
 
-## CI is dead for billing reasons, not code (since ~2026-09-16)
-Every run reports `failure` in ~8s with "The job was not started because recent account payments
-have failed or your spending limit needs to be increased". Do not chase it as a regression. Run
-locally instead: `pnpm typecheck` · `pnpm test` (managed Node 22 on PATH) · `pnpm key-leak-grep` ·
-`pnpm check-ts-version` · `cargo check` + `cargo test` under `apps/desktop/src-tauri` ·
-`pnpm --filter ai-provider-router-desktop web-test` (53, `mv test-results /tmp/...` first).
+## CI runs again — the billing block was a *private*-repo artefact (corrected 2026-09-22)
+**This section previously claimed CI was dead. That was wrong, and the way it was wrong cost four
+runs of misdiagnosis.** GitHub Actions bills minutes for *private* repos; the account's block
+applied to private usage only. The repo went public 2026-09-21 ~21:33 UTC and CI resumed with it.
+
+- `gh repo view --json isPrivate,visibility` → `false` / `PUBLIC`.
+- Runs **before** the flip: `failure` in 9–10 s, job never started — that is the old signature.
+- Runs **after**: 3–7 minutes, all 16 steps.
+
+So **a ~9-second failure means billing; a multi-minute failure did real work — read the step.**
+Four consecutive failures after the flip were all one flaky browser test
+(`web-test/history.spec.ts:122`), fixed 2026-09-22. They were only investigated once the billing
+theory was ruled out, which is exactly the cost of leaving a stale cause in memory: a wrong
+explanation does not just fail to help, it actively suppresses the search.
 
 ## Gotchas that each cost real time (distilled 2026-09-20)
 - **Managed Node 22 must be first on PATH** (`~/.workbuddy-ai/binaries/node/versions/22.22.2-2/bin`)

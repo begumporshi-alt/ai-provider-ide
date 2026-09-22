@@ -39,18 +39,17 @@
   `list`. Superseding a pinned or L3 row is refused.
 
 ## Rules that each cost a bug
-- **Reinstalling costs one keychain approval.** *Every* request (even unauthenticated) answers `503 master key
-  unavailable` until approved — the master-key check precedes auth. `pgrep SecurityAgent` is the tell; **401**
-  means healthy. The DMG step of `tauri build` always fails here (hdiutil); the `.app` is complete by then.
-- **Never pin a local signing identity in `tauri.conf.json`.** A self-signed cert exists on one machine only,
-  and `codesign` fails `no identity found` for everyone else. **CI does not run `tauri build`** (only
-  typecheck/test/cargo/Playwright), so it cannot catch this. Default is ad-hoc, which runs locally; override
-  with `APPLE_SIGNING_IDENTITY`.
+- **Reinstalling costs one keychain approval.** Until granted, *every* request — unauthenticated included —
+  answers `503 master key unavailable`: the master-key check precedes auth. **401** means healthy.
+  Depth: REFERENCE.md §Keychain.
+- **Never pin a local signing identity in `tauri.conf.json`** — **CI cannot catch it** (it runs no `tauri build`),
+  so a green push proves nothing here; build to verify. Depth: REFERENCE.md §Code signing.
 - **Nothing is an image model unless a manifest says so.** Needs `endpoints.generateImage` +
   `modalityRules.image` (or `rawMatch`). Measured 455/455 `text`. An id containing "image" means nothing.
 - **`memory_enabled` is in-memory only, off after restart** (`gateway.rs:842`). `Disabled` outranks `WriteOnly`,
   so post-reinstall `aip-memory: write` says `reason=disabled`. Check on the Memory screen, not HTTP.
 - Probe headers are **lowercase** — `h.get("Retry-After")` is always `None`. Dump headers before claiming absence.
+- **A client-facing `Retry-After` is the *shortest* named wait, not the longest** — the planner drops cooled keys.
 - **§3.5 concurrency is two semaphores.** `permits` (8+32) *admits*, `dispatch` (8) *routes*; the wait between is
   the queue.
 - **Three different 429s — read the body.** `RATE_LIMITED` (upstream + key cooldown) vs "too many failed auth
