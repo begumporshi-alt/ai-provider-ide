@@ -11,7 +11,7 @@ import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router-core
 import {
   addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
   generatorAuditList, listManifestHistory, pendingRepairs, registry, rollbackManifest, setKeyStatus,
-  setProviderStatus, testKey, refreshCatalog,
+  setProviderStatus, testKey, refreshCatalog, uniqueSlug,
 } from "../store";
 import type { DriftEventEntry, GeneratorAuditEntry, HostManifestRow } from "../store";
 import { useUi } from "../ui-state";
@@ -237,6 +237,63 @@ function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: ()
 
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
+  const [mode, setMode] = useState<"known" | "manual">("known");
+
+  // Manual mode fields
+  const [manualName, setManualName] = useState("");
+  const [manualUrl, setManualUrl] = useState("");
+  const [manualAuth, setManualAuth] = useState<"bearer" | "x-api-key" | "custom">("bearer");
+  const [manualAuthHeader, setManualAuthHeader] = useState("Authorization");
+  const [manualAuthPrefix, setManualAuthPrefix] = useState("Bearer");
+  const [manualDialect, setManualDialect] = useState("openai-chat-v1");
+
+  function buildManifest(): AdapterManifest {
+    const authHeader = manualAuth === "x-api-key"
+      ? { name: "x-api-key" }
+      : manualAuth === "custom"
+        ? { name: manualAuthHeader, prefix: manualAuthPrefix || undefined }
+        : { name: "Authorization", prefix: "Bearer" };
+
+    return {
+      manifestVersion: 1,
+      kind: "declarative",
+      dialect: manualDialect,
+      provider: { baseUrl: manualUrl.trim(), auth: { headers: [authHeader] } },
+      endpoints: {
+        listModels: { method: "GET", path: "/models", map: { models: "$.data[*].id", raw: "$.data[*]" } },
+        generateText: {
+          method: "POST",
+          path: "/chat/completions",
+          requestTemplate: {
+            model: "{{model}}",
+            messages: "{{messages}}",
+            stream: "{{stream}}",
+            max_tokens: "{{maxTokens?}}",
+            temperature: "{{temperature?}}",
+            tools: "{{tools?}}",
+            tool_choice: "{{toolChoice?}}",
+            response_format: "{{responseFormat?}}",
+          },
+          responseMap: { text: "$.choices[0].message.content", usage: "$.usage" },
+          stream: {
+            protocol: "sse",
+            chunkMap: { delta: "$.choices[0].delta.content" },
+            errorMap: { "$.error": "PASS_THROUGH" },
+            finish: "$.choices[0].finish_reason",
+            requestUsage: true,
+          },
+        },
+      },
+      capabilities: { text: true, image: false },
+      provenance: { origin: "user-edited", generatorModel: null, createdAt: new Date().toISOString() },
+    };
+  }
+
+  const manualValid =
+    mode === "manual" &&
+    manualName.trim().length > 1 &&
+    /^https?:\/\//.test(manualUrl.trim()) &&
+    (manualAuth !== "custom" || (manualAuthHeader.trim().length > 0));
 
   async function addKnown(s: string) {
     setBusy(true);
@@ -257,39 +314,123 @@ function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: ()
     }
   }
 
+  async function addManual() {
+    if (!manualValid) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const manifest = buildManifest();
+      const slug = uniqueSlug(manualName.trim());
+      await addProvider({
+        slug,
+        name: manualName.trim(),
+        type: "manifest",
+        baseUrl: manualUrl.trim(),
+        manifest,
+      });
+      onDone();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <Modal title="Add Provider" onClose={onClose}>
-      <>
-          <div className="mb-3 grid gap-2">
-            {KNOWN.map((s) => (
-              <button
-                key={s}
-                disabled={busy}
-                onClick={() => addKnown(s)}
-                className="flex items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110 disabled:opacity-50"
-                style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-              >
-                <span className="text-[13px] font-medium">
-                  {{ openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s]}
-                </span>
-                <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
-                  {PROVIDER_PROFILES[s]!().provider.baseUrl}
-                </span>
-              </button>
-            ))}
-          </div>
+      <div className="mb-3 flex gap-1 rounded border p-1" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        {(["known", "manual"] as const).map((m) => (
           <button
-            className="flex w-full items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110"
-            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-            onClick={() => {
-              onClose();
-              useUi.getState().go("onboarding");
-            }}
+            key={m}
+            onClick={() => { setMode(m); setError(null); }}
+            className={`flex-1 rounded px-3 py-1 text-[12px] font-medium transition-colors ${
+              mode === m ? "text-white" : "text-inherit"
+            }`}
+            style={mode === m ? { background: "var(--accent)", color: "white" } : {}}
           >
-            <span className="text-[13px] font-medium">Any other provider — guided setup</span>
-            <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>probe → identify → test → enable</span>
+            {m === "known" ? "Quick add" : "Manual"}
           </button>
-      </>
+        ))}
+      </div>
+
+      {mode === "known" ? (
+        <div className="mb-3 grid gap-2">
+          {KNOWN.map((s) => (
+            <button
+              key={s}
+              disabled={busy}
+              onClick={() => addKnown(s)}
+              className="flex items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110 disabled:opacity-50"
+              style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            >
+              <span className="text-[13px] font-medium">
+                {{ openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s]}
+              </span>
+              <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
+                {PROVIDER_PROFILES[s]!().provider.baseUrl}
+              </span>
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="mb-3 space-y-3">
+          <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+            Add any OpenAI- or Anthropic-compatible provider. The adapter manifest is generated automatically.
+          </p>
+          <Field label="Name">
+            <input className={inputCls} style={inputStyle} value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="My Provider" autoFocus />
+          </Field>
+          <Field label="Base URL">
+            <input className={`${inputCls} mono`} style={inputStyle} value={manualUrl} onChange={(e) => setManualUrl(e.target.value)} placeholder="https://api.example.com" />
+          </Field>
+          <Field label="Auth type">
+            <select className={inputCls} style={inputStyle} value={manualAuth} onChange={(e) => setManualAuth(e.target.value as any)}>
+              <option value="bearer">Bearer token (Authorization: Bearer …)</option>
+              <option value="x-api-key">x-api-key header</option>
+              <option value="custom">Custom header</option>
+            </select>
+          </Field>
+          {manualAuth === "custom" && (
+            <>
+              <Field label="Header name">
+                <input className={inputCls} style={inputStyle} value={manualAuthHeader} onChange={(e) => setManualAuthHeader(e.target.value)} placeholder="X-Custom-Auth" />
+              </Field>
+              <Field label="Prefix (optional)">
+                <input className={inputCls} style={inputStyle} value={manualAuthPrefix} onChange={(e) => setManualAuthPrefix(e.target.value)} placeholder="e.g. Token" />
+              </Field>
+            </>
+          )}
+          <Field label="Dialect">
+            <select className={inputCls} style={inputStyle} value={manualDialect} onChange={(e) => setManualDialect(e.target.value)}>
+              <option value="openai-chat-v1">openai-chat-v1</option>
+              <option value="anthropic-messages-v1">anthropic-messages-v1</option>
+            </select>
+          </Field>
+        </div>
+      )}
+
+      {mode === "manual" && (
+        <div className="mt-3">
+          <Button variant="primary" disabled={!manualValid || busy} onClick={addManual}>
+            {busy ? "Adding…" : "Add provider"}
+          </Button>
+        </div>
+      )}
+
+      {mode === "known" && (
+        <button
+          className="mt-2 flex w-full items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110"
+          style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+          onClick={() => {
+            onClose();
+            useUi.getState().go("onboarding");
+          }}
+        >
+          <span className="text-[13px] font-medium">Any other provider — guided setup</span>
+          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>probe → identify → test → enable</span>
+        </button>
+      )}
+
       {error && <p className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
       {busy && <p className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>Registering…</p>}
     </Modal>

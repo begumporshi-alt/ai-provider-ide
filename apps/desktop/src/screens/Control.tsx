@@ -52,6 +52,7 @@ const REASON: Record<string, string> = {
   no_candidates: "Nothing matched this question",
   principal_off: "Off for this app",
   client_off: "The app asked for no memory",
+  write_only: "The app asked to record only, not to be reminded",
   disabled: "Memory is switched off",
   no_project: "Couldn't tell which project this is",
   below_floor: "Found facts, but none fitted the budget",
