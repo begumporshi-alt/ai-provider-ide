@@ -197,6 +197,21 @@ That scheduled job is not redundant with the `ci.yml` step. The `ci.yml` step on
 is pushed, so it cannot see an advisory published against code that has not changed — the one case where
 nobody is looking.
 
+**First run, 2026-09-22** (run `35736120680`, triggered by `workflow_dispatch`): **0 vulnerabilities** across
+607 locked dependencies, against an advisory database of 1261 entries. It also reported **9 informational
+warnings** — 8 unmaintained (`derivative`, `instant`, `proc-macro-error`, and five `unic-*` crates) and 1
+unsound (`glib 0.18.5`, RUSTSEC-2024-0429, unsound `Iterator`/`DoubleEndedIterator` impls for
+`glib::VariantStrIter`).
+
+Informational warnings do not fail the check, and that is the right default here. `glib` arrives through
+Tauri's Linux/GTK dependency tree, and a lockfile is target-independent while this product ships macOS only.
+The other eight are transitive proc-macro and Unicode-table crates with no advisory against them, only an
+abandonment notice. Worth knowing; not worth a gate, and not worth an `ignore` list that would also hide a
+real advisory filed against the same crate later.
+
+The step reporting those warnings is itself the proof that `working-directory` is right. A wrong path finds
+no lockfile and reports a clean audit it never ran — the same failure shape as a spec that asserts nothing.
+
 ### 3.3 What is already good — and one thing that only *looks* broken
 
 - **CSP** is set (`tauri.conf.json:21`) and is not vacuous.
