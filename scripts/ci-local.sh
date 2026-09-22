@@ -1,13 +1,15 @@
 #!/usr/bin/env bash
 # Local mirror of .github/workflows/ci.yml.
 #
-# Why this exists: CI runs on macos-14 and has not started a job since ~2026-09-16, because the
-# account's GitHub Actions billing is blocked (every run is marked failed in ~8s with "the job was
-# not started because recent account payments have failed"). That is an account problem, not a
-# repository one, and nothing in the tree can fix it.
+# Why this exists: CI runs on macos-14, but from ~2026-09-16 to 2026-09-21 it never started a job
+# — every run failed in ~8s with "the job was not started because recent account payments have
+# failed". That was the account's Actions billing, which applies to *private* usage. The repo is
+# public now, so minutes are free and CI runs again: 3-7 minutes, real results. A ~9-second
+# "failure" is that old signature, not a test result.
 #
-# Until it is cleared, this is the gate. It runs the same steps in the same order as ci.yml, so a
-# green run here is what CI would have reported.
+# It still earns its place. It runs the same steps in the same order as ci.yml, so it answers
+# "would CI pass?" in ~3 minutes rather than waiting on a runner queue, and it is the only gate if
+# Actions is unavailable again.
 #
 # Usage:
 #   bash scripts/ci-local.sh                 # the whole gate
