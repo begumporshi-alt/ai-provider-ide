@@ -10,6 +10,8 @@
     "key-leak-grep": "bash scripts/key-leak-grep.sh",
     "check-ts-version": "bash scripts/check-ts-version.sh",
     "check-version-sync": "bash scripts/check-version-sync.sh",
+    "check-doc-links": "node scripts/check-doc-links.mjs",
+    "docs:book": "node scripts/build-dev-book.mjs",
     "ci:local": "bash scripts/ci-local.sh",
     "dev": "pnpm --filter ai-provider-router-desktop tauri dev",
     "build": "pnpm -r build"

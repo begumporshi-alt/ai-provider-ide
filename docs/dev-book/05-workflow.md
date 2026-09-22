@@ -1,0 +1,188 @@
+# 05 — Workflow
+
+## The gate
+
+```bash
+PATH="$HOME/.cargo/bin:$PATH" pnpm ci:local
+```
+
+`scripts/ci-local.sh` mirrors `.github/workflows/ci.yml`. Run it before opening a pull request.
+
+**The `PATH` prefix is not optional.** Without cargo on `PATH` the gate reports `FAILED (1): Rust (cargo
+missing)` even when everything else passed, which reads like a Rust failure and is not one.
+
+### Step order, in both mirrors
+
+| # | Step | `ci.yml` | `ci-local.sh` |
+|---|---|---|---|
+| — | Install JS deps | 1 | 1 (only with `--install`) |
+| 1 | Dependency audit (`--audit-level=moderate`) | 2 | 2 |
+| 2 | Typecheck | 3 | 3 |
+| 3 | Unit tests | 4 | 4 |
+| 4 | Build | 5 | 5 |
+| 5 | Key-leak grep | 6 | 6 |
+| 6 | Single TypeScript version | 7 | 7 |
+| 7 | One product version | 8 | 8 |
+| 8 | Doc links resolve | 9 | 9 |
+| 9 | Rust check | 10 | 10 |
+| 10 | Rust clippy (`--all-targets -- -D warnings`) | 11 | 11 |
+| 11 | Rust tests | 12 | 12 |
+| 12 | Install Playwright browsers | 13 | 13 |
+| 13 | Live-UI tests | 14 | 14 |
+
+**The two mirrors are step-for-step identical, and that is checked rather than asserted.** They were not until
+2026-09-22: the dependency audit ran second in CI and seventh locally, while both `ci-local.sh:2` and
+`CONTRIBUTING.md:21` claimed "the same steps in the same order" — false in exactly that one place. Registered
+as [07](07-drift-register.md) D5 and since fixed. Adding `Rust clippy` kept the count equal on both sides, which
+is the property to re-measure whenever a step is added.
+
+That difference was harmless in practice — the audit is a read — but it is the class of claim this book exists
+to catch: a mirror that is *almost* faithful is a mirror you stop trusting.
+
+`Rust clippy` is the newest step. `--all-targets` is deliberate: the test code is where a lint earns its keep,
+and the two warnings that motivated the step sat in crash reporting and on a dialect code path no test reached.
+`-D warnings` rather than a tolerated count, because a gate that accepts warnings stops being read once there
+are 25 of them.
+
+## What the gate deliberately does not enforce
+
+Two things, and both are decisions rather than omissions.
+
+**Coverage.** `pnpm test:coverage` measures all three vitest suites and prints one weighted figure — 43.8%
+statements, 37.3% branches, 31.1% functions, 45.4% lines (2026-09-22). It is not a step in the table above. A
+coverage threshold fails an unrelated refactor, the cheapest way out of that failure is to lower the
+threshold, and the number stops being read. Every test the gate runs must still *pass*; coverage answers a
+different question, and a question is not a threshold. Detail:
+[`../PRODUCT_COMPLETION_PLAN.md`](../PRODUCT_COMPLETION_PLAN.md) §4.2.
+
+**`cargo fmt --check`.** It fails across the existing Rust sources, so adding it would break CI on the first
+push. Adopting rustfmt rewrites most of the host and destroys `git blame` for zero behavioural change, so it
+wants its own commit. See [`../../CONTRIBUTING.md`](../../CONTRIBUTING.md) and [09](09-status.md).
+
+## Why the browser step clears vite's dep cache
+
+`web-test:clean` moves `node_modules/.vite` aside along with `test-results`. That is not housekeeping for its
+own sake. vite's dev server removes `node_modules/.vite/deps` while loading it
+(`loadCachedDepOptimizationMetadata`), and in a sandboxed environment a bulk-delete guard can refuse that
+removal — vite then exits 1 before it ever serves, and Playwright reports the symptom as a **60-second
+`webServer` timeout** rather than as vite's error.
+
+**The ordering is the easy part to get wrong.** The clean must run *after* `pnpm build`, because `vite build`
+writes the same dependency cache the dev server later tries to remove. That is why it lives in
+`web-test:clean` — the first thing `pnpm web-test` runs — and not somewhere done once by hand before the gate.
+The cost is a cold dependency optimisation, measured at **~300 ms** (vite: `ready in 303 ms`).
+
+`Doc links resolve` is the mechanical answer to the failure D9 records. It resolves every relative link *and
+image* in every markdown file — including non-`.md` targets and bare directories — and fails on a miss. It
+strips fenced blocks and inline code spans first, because several documents *quote* link syntax in order to
+discuss it, and a checker that reports quotations is a checker people learn to ignore.
+
+### Options
+
+| Flag | Effect |
+|---|---|
+| `--skip-browser` | Omit the Playwright harness (~48s saved) |
+| `--install` | Also run `pnpm install --frozen-lockfile` first |
+
+**`--install` is off by default on purpose, and it is destructive here, not merely redundant.** The sandbox
+broker denies pnpm's symlink writes (`ERR_PNPM_CODEBUDDY_BROKER_DENY`, `EEXIST`) and the install fails *half way
+through*, having already unlinked entries — it has left `packages/*/node_modules/typescript` missing, which then
+breaks `pnpm typecheck` with `MODULE_NOT_FOUND`. Run it only when dependencies genuinely changed.
+
+## Fast loops
+
+```bash
+pnpm typecheck                                        # all workspaces
+pnpm test                                             # unit tests
+pnpm --filter ai-provider-router-desktop web-test     # the browser harness
+cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+```
+
+Three environment facts that produce misleading failures if you get them wrong:
+
+- **Use the managed Node 22, and put it first on `PATH`.** Node 18 makes 27 router-core tests fail with
+  `crypto is not defined`, which looks exactly like a regression. The preflight checks the major version because
+  probing for `globalThis.crypto` does not detect Node 18.
+- **`./node_modules/.bin/tsc`, never `npx tsc`.** `npx` may resolve a different compiler than the pinned 6.0.3.
+- **Unset the five proxy variables on any probe *and* on the app.** `HTTP_PROXY HTTPS_PROXY http_proxy
+  https_proxy ALL_PROXY all_proxy` — the sandbox proxy turns every outbound call into `502 upstream connect
+  failed`, which looks like a broken upstream rather than a proxy that should not be there. A *partial* unset is
+  worse: `curl` then returns `000`, which reads like a crash. `ci-local.sh:43` does this for the gate.
+
+**`pnpm build` moves `dist` aside rather than deleting it.** `build:clean` runs first because Vite's
+`emptyOutDir` trips the sandbox bulk-delete guard. That is why a `dist/` directory can appear under `/tmp`.
+
+## The test suites, and what each is for
+
+Four suites, and they fail in different ways on purpose.
+
+| Suite | Covers | Cannot catch |
+|---|---|---|
+| `packages/router-core` + `adapter-spec` + desktop vitest | Routing, adapters, ledger, memory engine, pure logic — with fake ports | Anything requiring the network, the keychain, or a real SQLite file |
+| Rust `cargo test` | Gateway auth and dialects, egress invariants, store and migrations, persistence, tools | UI behaviour |
+| `web-test` (Playwright + a Tauri IPC shim) | Screens against a faked host, 14 spec files | The real Rust host |
+| `e2e` (Playwright, real stack) | Acceptance, onboarding, drift repair, code adapters, 7 spec files | — |
+
+> **`vitest` does not typecheck.** This has bitten twice: adding a field to `BridgeMsg::Usage` broke eight
+> pattern matches across four gateway modules, and a missing `cachedTokens` on `LedgerEntry` broke
+> `model-router.ts` in three places. **249 green router-core tests said nothing about either.** They were found
+> by `pnpm typecheck`, `pnpm build` and `cargo clippy`. Run the gate, not just the unit tests.
+
+## Verification discipline
+
+Three rules, each paid for by a wrong conclusion that had already been written down.
+
+**1. Prove the test fails before trusting it passes.** A spec written *after* a fix only proves the author's
+model of the bug. Flip the code back, watch the specific assertion fail, and check it fails for the *right*
+reason. Falsify one probe at a time — two changes at once and you cannot tell which one mattered.
+
+**2. A negative result needs a positive control.** `cargo tree -i glib` prints nothing on macOS — but "nothing
+to print" is also what you get for a crate that was never a dependency, or for a typo. Running the same query
+against `x86_64-unknown-linux-gnu`, where `glib` *is* present, is what makes the macOS negatives mean *absent*
+rather than *not found*.
+
+**3. An absence claim is worthless until you have checked the search reached the directory.** Search tools skip
+dot-directories, so `.github/` and `.workbuddy-ai/` need `cat <dir>/* | grep` or a read. This produced three
+wrong conclusions in one session, including a confident recommendation that had to be retracted.
+
+**A success message is not evidence.** Verify an edit by reading it back. Long, multi-line anchors have failed
+silently before; prefer short anchors and confirm with a read.
+
+## Releasing
+
+`.github/workflows/release.yml` builds a **universal** (Apple Silicon + Intel) macOS bundle on a `v*` tag and
+attaches it to a **draft** GitHub Release, so artefacts can be checked before anyone downloads them.
+
+**Signing and notarization come entirely from the environment, never from `tauri.conf.json`.** No job outside
+that workflow runs a full `tauri build`, so an identity pinned in the config would be **invisible to every other
+check in this repository** — a green push would prove nothing about signing. Build to verify it.
+
+Repository secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, optionally `APPLE_SIGNING_IDENTITY`, and
+`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` for notarization. Without a certificate the build still
+succeeds, but it is **ad-hoc signed** — fine locally, not fine for a download, because macOS refuses to launch
+an unnotarized app from an unidentified developer.
+
+### The one-time keychain prompt
+
+A notarized release is a **different signing identity** from a local ad-hoc build, and keychain access is bound
+to the identity. So the first launch after switching between them prompts once — and **until the user approves
+it, every request answers `503 master key unavailable`**, including unauthenticated ones, because the master-key
+check precedes auth. `401` is the signal that the gateway is healthy. Worth a line in release notes, because it
+looks like a bug.
+
+### Version
+
+`tauri.conf.json` is authoritative — it is what Tauri stamps onto the bundle. Six manifests are expected to
+agree, and `pnpm check-version-sync` fails the build when one does not.
+
+### There is no auto-updater
+
+Updates are manual. The v1-era updater docs and scripts were deleted in 1.0.0 because they described a
+mechanism nobody had built, and described it wrongly (a v1-shaped config block, a `TAURI_SIGNING_PUBLIC_KEY`
+variable Tauri does not read, and an RSA keypair where Tauri verifies minisign/ed25519). **A document that
+describes update signing incorrectly is worse than no document**, because it is what the next contributor
+trusts.
+
+## Next
+
+[06 Conventions](06-conventions.md) — the rules that keep the codebase consistent.

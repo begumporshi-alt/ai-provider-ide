@@ -133,6 +133,9 @@ Architecture and decisions live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md
 [`docs/DECISIONS.md`](docs/DECISIONS.md). The rest of the design and session records are in `docs/` too —
 the repository root holds only `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` and `LICENSE`.
 
+**Developers: start with the [developer book](docs/dev-book/README.md).** It owns the rules, the interfaces and
+the conventions, and it tracks every known doc-versus-code disagreement.
+
 ## Notes
 
 - The local SQLite database is **gitignored** — a fresh clone starts empty. That is correct, not a bug.
