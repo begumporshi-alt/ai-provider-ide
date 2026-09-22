@@ -1,101 +1,40 @@
 # Project memory — AI-Provider Router IDE
 
-**Rules index, not narrative** — depth lives in `REFERENCE.md`. Injected up to **8,000 chars**; keep it under.
+**Rules index, not narrative** — depth in `REFERENCE.md` (not injected). **Cap 8,000 chars; past that injection truncates mid-rule.**
 
 ## Non-negotiables
-- Verify every edit by reading it back — success messages have lied.
-- Prove a spec fails before trusting it passes; falsify **one** probe at a time.
-- Measure before recording a cause; a timing property needs an observable proxy.
-- Unset all five proxy vars on probe *and* app — else `502 upstream connect failed`; a partial unset gives curl
-  `000`, which reads like a crash.
-- `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH.
-- Gate needs `PATH="$HOME/.cargo/bin:$PATH"` — else `FAILED (1): Rust (cargo missing)` though all else passes.
-- **One edit per file per batch** — the second lands on a stale snapshot and clobbers the first; both report success.
-- Absence claims: use the **Grep tool** (bash `grep` shim unreliable) — **but it skips dot-directories**, so
-  `.github/` and `.workbuddy-ai/` need `cat <dir>/* | grep` or a Read. Three wrong conclusions in one session
-  came from searches that never reached the directory. A hit ≠ completeness — chase the doc comment.
+- A tool result is not evidence. **A `Write` or `Edit` can report success while the file keeps its old bytes *and* mtime** — and `Read` then serves the *unwritten* text, so reading it back agrees with the lie. Verify edits with `stat` mtime + the **Grep tool** (host FS); bash reads the host correctly. Retry until the mtime moves.
+- Falsify **one** probe at a time; measure before recording a cause. **A reason is a claim too** — "cannot be tested" needs the same evidence as "is not tested"; extract the pure part (house pattern) before declaring a default unpinnable.
+- Unset **all six** proxy vars on probe *and* app — else `502`; partial → curl `000` (reads as a crash). **A proxy `502` also satisfies a "status != 000" readiness loop**, so the loop exits instantly and every probe after it measures the proxy. Violated 2026-09-22; the reading looked like a vite response.
+- `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH. Gate needs `PATH="$HOME/.cargo/bin:$PATH"`.
+- **One edit per file per batch** — the 2nd lands on a stale snapshot and clobbers the 1st; both report success.
+- Absence claims: **Grep tool** (bash `grep` shim lies) — **skips dot-dirs** (`.github/`, `.workbuddy-ai/` → `cat <dir>/* | grep`). A hit ≠ completeness. Count via node one-liner (`find … | grep -c` → `0`). **`cargo fmt --check` colours its output even when redirected** — every diff line starts `\e[32m+`, so `^[-+]` counting returns **0** and reads as "no changes"; pass `-- --color=never`. Churn is config-dependent: stock **638 hunks / 42% of the host**, `use_small_heuristics="Max"` **354 / 30%**.
+- **The bulk-delete guard is sandbox-only and camouflaged.** A Playwright `webServer` timeout is a guard symptom: vite removes `node_modules/.vite/deps` at startup, the guard refuses, vite exits 1, and only the 60s timeout surfaces. Clean it in `web-test:clean`, which must run *after* `pnpm build` — the build recreates that cache. `DEBUG=pw:webserver` separates `ECONNREFUSED` (nothing listening) from a non-2xx answer (a different bug).
 
-## Orientation
-- **Docs live in `docs/`** (moved 2026-09-22): `ARCHITECTURE.md`, `DECISIONS.md`, `GATEWAY_MEMORY_LAYER.md`,
-  `CONTROL_SCREEN_BUILD.md`, the dated session records. **Older logs cite them by bare filename** — resolve
-  those under `docs/`. Root keeps only README/CHANGELOG/CONTRIBUTING/SECURITY/LICENSE.
-- Playground = **Assistant** (`screens/Assistant.tsx`). **Skills are frontend-only**: bodies in SQLite `skills`
-  (`store.rs:230`), expanded in `Assistant.tsx` (`:583`, `:702`). Gateway is a blind proxy for `system`.
-- Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db`, `?mode=ro`. Version in
-  `schema_version` (not `PRAGMA user_version`). `settings` = `key`/`value_json`.
-- Tests: core 239 · vitest 193 · Rust `--lib` 470 · browser 98. Gate `pnpm ci:local`. `build:clean` moves `dist`
-  aside — vite `emptyOutDir` trips the bulk-delete guard.
-- Ports: gateway **8800** (`settings.gateway`); AI Hub v2 owns **8787**. `DEFAULT_PORT` (`gateway.rs:33`) is stale.
-  Bundle: `/Applications/AI-Provider Router.app`.
-- Identity is **two** strings, either may deny: `AIP-Agent` label and `key:<id>`. Request paths use
-  `core.app_keys()`, never `AppKeyProvider` (memoised).
+## Where things are
+- Docs in `docs/`; `ARCHITECTURE.md` is a *spec*, not the app. `dev-book/` = rules/contracts + `07-drift-register.md` (10/10 closed). Old logs cite bare filenames → resolve under `docs/`. `pnpm docs:book` → `book.html`; `check-doc-links` is a gate step. Counts + gate steps: `dev-book/09-status.md` / `05-workflow.md`.
+- Playground = **Assistant** (`screens/Assistant.tsx`); skills are frontend-only (SQLite `skills`, `store.rs:230`), gateway blind to them.
+- DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (`?mode=ro`); version in `schema_version`, not `PRAGMA user_version`.
+- Ports: gateway **8800**; AI Hub v2 owns **8787**; `DEFAULT_PORT` stale.
+- Identity = **two** strings, either may deny: `AIP-Agent`, `key:<id>`. Use `core.app_keys()`, never `AppKeyProvider`.
+- **Clippy is a gate** (`--all-targets -- -D warnings`); triage by lint *kind* — count ≠ signal (64 → 2 real). **Snapshot before `--fix`**: it *moves* code.
 
 ## Recall & scope
-- **The two paths differ on exactly one axis: scope.** Gateway = `recall_scoped` + `RecallScope` (excludes
-  `Unscoped`); Assistant = `recall(..., None)`. Live corpus **0 vs 14**. Both want L1/L2/L3; L0 denied on both.
-- Every atom is born unscoped, so gateway recall returns 0 until a human binds it — `capture`'s INSERT
-  (`memory.rs:290`) omits scope columns; `assign_scope` (`:741`) is the only way in. Drain must NOT auto-bind
-  (`drain.test.ts:142`).
-- **Session identity — FIXED 2026-09-22.** `session_context.rs` hashes `principal|user|project|agent` (was
-  `user|project|agent`). Derive a session from identity, never from place. Detail: REFERENCE.md.
-- Operator precedence (master switch → per-principal row) beats the client's `AIP-Memory` header. Denied =
-  denied both ways.
-- `memories.superseded_at` (0014): excluded from `recall_inner`/`session_atoms`/`stats.injectable`, **not**
-  `list`. Superseding a pinned or L3 row is refused.
+- Paths differ on **one axis: scope** — gateway `recall_scoped`+`RecallScope` (excludes `Unscoped`) vs Assistant `recall(..., None)`. Corpus **0 vs 14**; L0 denied both.
+- Atoms are born unscoped → gateway recall 0 until a human binds: `capture` INSERT (`memory.rs:290`) omits scope; `assign_scope` (`:741`) is the only way in. Drain must NOT auto-bind.
+- Session identity **fixed 2026-09-22**: hashes `principal|user|project|agent`. Derive a session from identity, never from place.
+- Master switch → per-principal row beats the client's `AIP-Memory` header. `superseded_at` (0014) hides rows from recall/session/injectable, **not** `list`.
 
-## Rules that each cost a bug
-- **Reinstalling costs one keychain approval.** Until granted, *every* request — unauthenticated included —
-  answers `503 master key unavailable`: the master-key check precedes auth. **401** means healthy.
-  Depth: REFERENCE.md §Keychain.
-- **Never pin a local signing identity in `tauri.conf.json`** — **CI cannot catch it** (it runs no `tauri build`),
-  so a green push proves nothing here; build to verify. Depth: REFERENCE.md §Code signing.
-- **Nothing is an image model unless a manifest says so.** Needs `endpoints.generateImage` +
-  `modalityRules.image` (or `rawMatch`). Measured 455/455 `text`. An id containing "image" means nothing.
-- **`memory_enabled` is in-memory only, off after restart** (`gateway.rs:842`). `Disabled` outranks `WriteOnly`,
-  so post-reinstall `aip-memory: write` says `reason=disabled`. Check on the Memory screen, not HTTP.
-- Probe headers are **lowercase** — `h.get("Retry-After")` is always `None`. Dump headers before claiming absence.
-- **A client-facing `Retry-After` is the *shortest* named wait, not the longest** — the planner drops cooled keys.
-- **§3.5 concurrency is two semaphores.** `permits` (8+32) *admits*, `dispatch` (8) *routes*; the wait between is
-  the queue.
-- **Three different 429s — read the body.** `RATE_LIMITED` (upstream + key cooldown) vs "too many failed auth
-  attempts" (30s backoff) vs "router at capacity".
-- A live capacity probe **cannot** reach the gateway's gate on a real provider (20 concurrent → 4×200, 16×429).
-- Never match nodes on label (80-char truncation); pass the identity a thing already has.
-- A DB-lifetime-unique id must not come from a per-process counter (`next_id` restarts each launch). Ids carry a
-  boot marker.
-- **A `#[tauri::command]` arg and a serde field are different boundaries** — only nested payloads hit serde,
-  which ignores unknown keys. Every nested payload gets `deny_unknown_fields`. `shim.ts:toRustArgs` renames
-  top-level keys only.
-- **Every new `#[tauri::command]` needs a `web-test/shim.ts` case the same day** — the shim throws on unknown
-  commands, screens swallow it, the screen goes blank.
-- **Overlapping reads need a generation counter** — StrictMode double-fires mount effects (vite dev,
-  `main.tsx:7`). Only the newest may write.
-- A tool failure must never reach the model as `""` — guard at bridge *and* consumer. Clear data on failure; a
-  stale value under an error claims *now*.
-- Migration = `MIGRATIONS`/`DATA_MIGRATIONS` + bump `schema_version` + count assertion + table-existence list.
-  Rewind tests delete `WHERE version >= N`.
-- `panic = "abort"` — no poison handling. A debounced save reads state when it **fires**, not when scheduled.
-- Parallel Rust tests: no temp dir by `pid+timestamp` (same-ms → `DatabaseBusy`); use a monotonic `AtomicUsize`.
-- **Two fixes for one property mask each other.** Test the inner function with adversarial input; select by
-  content not index; don't assert collection length.
-- **vitest does not typecheck.** `expect(x).toBe(true, "msg")` is invalid — use `expect(x, "msg").toBe(true)`.
-  Run the gate, not just vitest.
-- **`serde_json` writes keys sorted** (`{"index":0,"type":…}`). Assert JSON/SSE by parsing and comparing
-  fields, never by raw substring — a substring test binds to key order and silently tests nothing.
-- Bash `grep` on a redirected file returns empty (shim). Use the Grep tool, or `tail` the file.
-- A cache needs an **authority**, not just a TTL — check mutation sites can reach it.
-- Clamp from numbers/numeric strings only. **Never pre-parse before clamping** — `Number("")` is `0` = *unlimited*
-  for the per-provider cap; pass the raw string.
-- **`settings_set` is a whole-row UPSERT** (`commands.rs:197`): writing only known keys erases the rest.
-  `patchGatewaySettings` merges and is spec'd against the **stored row**.
-- **A switch rendered in two places drifts** — Control owns cross-cutting ones; move, don't mirror. (Memory
-  master switch stays on Memory by decision.)
-- A switch's accessible name must not change with state — `aria-checked` carries it; give state its own element.
-- `getByText` matching two elements = a **duplicated fact on screen**, not a bad selector. Scope to the container;
-  a readiness wait must match something **only** the awaited view renders, else the wrong copy satisfies it.
-- `__webTest.failNext(cmd, msg, afterMs?)` makes a UI `catch` reachable. **An immediate failure cannot test
-  supersession** — defer with `afterMs`, then outlive it before asserting.
-- A negative assertion on an auto-dismissing surface **can never fail**.
-- **A swallowed write is invisible to every reader.** One `writeTrail` helper, one channel **per trail**; keep
-  the swallow. **Four losses, four shapes** — depth: REFERENCE.md §Trail health.
-- **The repo is PUBLIC** (2026-09-22). `pnpm key-leak-grep` is a gate step; fixtures synthetic only.
+## Rules that cost a bug
+
+**Auth / install** — **Reinstalling costs one keychain approval**; until granted *every* request answers `503 master key unavailable` (that check precedes auth); **401** = healthy. **Never pin a signing identity in `tauri.conf.json`** — CI cannot catch it (no `tauri build`); build to verify. **`memory_enabled` is in-memory only**, off after restart, `Disabled` outranks `WriteOnly` — check the Memory screen, not HTTP.
+
+**Gateway** — Nothing is an image model unless a manifest says so (`endpoints.generateImage` + `modalityRules.image`); measured 455/455 `text`. §3.5 = **two semaphores**: `permits` (8+32) *admits*, `dispatch` (8) *routes*. **Three different 429s — read the body**; a live capacity probe cannot reach the gate. Probe headers are **lowercase** (`h.get("Retry-After")` → `None`) — dump before claiming absence. Client-facing `Retry-After` = the **shortest** named wait. Never match nodes on label (80-char truncation). A DB-lifetime-unique id needs a boot marker — `next_id` restarts each launch.
+
+**Tauri boundary** — A `#[tauri::command]` arg and a serde field are **different boundaries**; only nested payloads hit serde (ignores unknown keys) → give every nested payload `deny_unknown_fields`; `shim.ts:toRustArgs` renames top-level keys only. **Every new command needs a `web-test/shim.ts` case the same day** — the shim throws, screens swallow it, the screen goes blank. A tool failure must never reach the model as `""` — guard at bridge *and* consumer, and clear stale data on failure.
+
+**Data & migrations** — Migration = `MIGRATIONS`/`DATA_MIGRATIONS` + bump `schema_version` + count assertion + table list; rewind tests delete `WHERE version >= N`. **Adding a column proves nothing about the writer** — trace TS router → `store.ts` → command → INSERT (0015: 1530 rows `NULL` ≠ "reported 0"). `panic = "abort"` — no poison handling; a debounced save reads state when it **fires**. **`settings_set` is a whole-row UPSERT** (`commands.rs:197`) — known keys only erases the rest; `patchGatewaySettings` merges. Clamp from numbers/numeric strings only; **never pre-parse** (`Number("")` = `0` = *unlimited*). A cache needs an **authority**, not just a TTL.
+
+**Tests & specs** — **vitest does not typecheck**: `expect(x).toBe(true,"msg")` is invalid → `expect(x,"msg").toBe(true)`; run the gate. `serde_json` sorts keys — assert by parsing, never substring. **Two fixes for one property mask each other** — adversarial input, select by content not index. Parallel Rust tests: no `pid+timestamp` temp dir (same-ms → `DatabaseBusy`); use `AtomicUsize`. `__webTest.failNext(cmd,msg,afterMs?)`: an immediate failure cannot test supersession; a negative assertion on an auto-dismissing surface **can never fail**. **An implicit default is a dependency on the install, not the code**: tsc enumerates the tree at runtime when `types`/`typeRoots` are unset, so the vitest 3.2.7 → 4.1.11 bump dropped `@types/node` silently (`--listFilesOnly`: 409 files/83 `@types` → 238/0) with the package present, complete and symlinked — `apps/desktop/tsconfig.json` now states `"types": ["node"]`. **A `webServer` timeout is not a port problem** — that diagnosis was never established and is superseded by the guard rule above.
+
+**UI** — Overlapping reads need a **generation counter** (StrictMode double-fires mounts, `main.tsx:7`). **A switch in two places drifts** — Control owns cross-cutting ones; move, don't mirror (Memory master switch stays on Memory); accessible name must not change with state (`aria-checked` carries it). `getByText` matching two elements = a **duplicated fact on screen**; a readiness wait must match only the awaited view. **A swallowed write is invisible to every reader** — one `writeTrail` helper, one channel **per trail**. **The repo is PUBLIC** — `pnpm key-leak-grep` is a gate step; fixtures synthetic only.

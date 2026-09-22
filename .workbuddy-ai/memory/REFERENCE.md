@@ -1791,17 +1791,134 @@ The traffic shape confirms the premise (ledger, `source='gateway'`): **`agnes-2.
 35,948,966 input tokens against 213,027 output.** ~55.5K input per request, a 169:1 ratio. That is the
 resent-prefix pattern exactly.
 
-But three things are unknown, and the first is decisive:
+But three things were unknown, and the first was decisive:
 
-1. **The router never reads `prompt_tokens_details.cached_tokens`.** The string appears nowhere in the
-   codebase, and `ledger` has no column for it. So we cannot tell whether the upstream is *already*
-   caching — a rework of the content-block mapping could buy nothing, or buy a lot, and we could not tell.
+1. **~~The router never reads `prompt_tokens_details.cached_tokens`.~~ Corrected 2026-09-22.** That was true
+   when written and is false now — the reader landed the same day. The chain is `manifest-interpreter.ts`
+   (reads `prompt_tokens_details.cached_tokens`, plus Anthropic's cache blocks) → `model-router.ts:353` →
+   `usage-ledger.ts:38` → `store.ts:118` → `persist.rs:440`. And `ledger` **does** have the column: migration
+   0015, nullable, no default, applied to the live DB on 2026-09-22.
 2. **No active manifest mentions caching.** `agnes` is `user-edited`, `cline` is `ai-generated`; neither
    body contains the substring `cache`. Caching support is undeclared, not disproven.
 3. Only two providers exist at all: `agnes` (`apihub.agnes-ai.com/v1`) and `cline` (`api.cline.bot/api/v1`).
    Neither is Anthropic, whose mechanism `cache_control` is.
 
-**So the order is measure → decide → rework**, not rework → hope. Capturing cached tokens is the
-precondition, and it needs a ledger column, which means a real migration (`MIGRATIONS` + `schema_version`
-bump + count assertion + table-existence list + the rewind test) — not a drive-by edit.
+**So the order is measure → decide → rework**, not rework → hope. The precondition is now met — the column
+exists and the writer populates it — so what remains is traffic: the ledger has to accumulate real
+`cached_tokens` values before the question can be answered. As of 2026-09-22 all 1530 rows predate the column
+and read `NULL`, which means "not reported", not "reported zero". **The measurement is now possible; it has not
+yet produced data.** Tracked as dev-book drift register D8, closed 2026-09-22.
+
+## The three different `429`s — read the body (2026-09-22)
+
+A `429` from the gateway is not one condition. Three unrelated mechanisms produce the same status, and the
+body is the only thing that distinguishes them:
+
+| Body says | Mechanism | Layer |
+|---|---|---|
+| `RATE_LIMITED` | The upstream returned `429`, or the chosen key is in cooldown | upstream / key cooldown |
+| "too many failed auth attempts" | Repeated bad auth against the gateway itself | 30-second backoff on the caller |
+| "router at capacity" | Queue full — `permits` (8 in flight + 32 queued) exhausted | the local concurrency gate, §3.5 |
+
+Treating them as one condition sends you to the wrong layer: the first is an upstream problem, the second is
+the caller's own fault, and the third is local saturation.
+
+**A live capacity probe cannot reach the gate on a real provider.** Measured: 20 concurrent requests produced
+4×`200` and 16×`429`, but those 429s came from the *upstream*, not from the router's own queue — so the probe
+never exercised the concurrency gate it was written to test. Reaching the gate needs a provider that does not
+rate-limit, or a stub.
+
+## `memory_enabled` is in-memory only — it is off after every restart (`gateway.rs:842`)
+
+The master switch does not persist. Two consequences that both look like bugs:
+
+1. **After a reinstall or restart, `aip-memory: write` stops working** even though it was on before.
+2. `Disabled` **outranks** `WriteOnly` in the precedence order, so a request carrying `aip-memory: write` is
+   answered `reason=disabled`. The client header does not override a disabled master switch.
+
+**Check the Memory screen, not HTTP**, when diagnosing this. The HTTP surface reports the *effective* decision
+and gives no hint that the switch reset.
+
+## Rust lints — clippy adopted 2026-09-22, and how the triage actually went
+
+`cargo clippy --all-targets -- -D warnings` is now a gate step in both mirrors (14 steps). Reaching zero is
+the whole story, because the warning *count* turned out to be the least informative thing about it.
+
+### The count was 64, and the count was not the signal
+
+Grouped by lint kind (`--message-format=json`, counted per kind — not by reading the summary line):
+
+| count | lint | nature |
+|---|---|---|
+| 13 | `uninlined_format_args` | style |
+| 12 | `empty_line_after_doc_comments` | structural (see below) |
+| 4 | `collapsible_if` | style |
+| 4 | `unnecessary_map_or` | style |
+| 4 | **`if_same_then_else`** | **two real defects** |
+| 2 | **`manual_div_ceil`** | style — *not* the overflow bug it resembles |
+
+`cargo clippy --fix` applied **15 of the 25 lib warnings and 10 of the test ones** on its own. So the "25
+warnings" figure in `09-status.md` was accurate and misleading at once: the obstacle was never the count, it
+was the two entries a mechanical fix would get *wrong*.
+
+### The two real defects, and why `--fix` could not have them
+
+Both were `if_same_then_else` — a branch whose two arms are identical:
+
+1. `crash_report.rs` — `if backtrace.is_empty() { format!("{msg} — {location}") } else { same }`. Dead branch:
+   `write_crash_report` takes the backtrace as its own field, so the summary has no reason to branch on it.
+   Fix: delete the `if`.
+2. `gateway_gemini.rs` — `let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };`.
+
+The Gemini one is instructive. Every *other* dialect distinguishes a tool-call turn:
+
+| dialect | tool calls | otherwise |
+|---|---|---|
+| Anthropic (`gateway_anthropic.rs:700`) | `tool_use` | `end_turn` |
+| OpenAI (`gateway_handlers.rs:231`) | `tool_calls` | `stop` |
+| Gemini | `STOP` | `STOP` |
+
+**The correct fix was to delete the branch, not to give it a second literal.** Gemini's `FinishReason` enum
+has no tool-call member; a function call is signalled by `functionCall` parts and `finishReason` stays `STOP`.
+The defect was a *dead branch implying a distinction the protocol does not make*.
+
+And **the suite could not tell the two fixes apart**: the only Gemini `finishReason` assertion used a plain
+`"hi"` prompt with no tools, so no test reached the tool-call path. A repair that invented `FUNCTION_CALL`
+would have passed everything and been wrong on the wire.
+
+So the test came first — `gemini_tool_turn_still_reports_stop` drives the tool path, asserts the parts are
+`functionCall` (proving the path was reached, so the test pins something), and asserts `finishReason` is still
+`STOP`. Falsified by setting the tempting `"FUNCTION_CALL"` literal: it failed with exactly that mismatch.
+Then the branch was deleted.
+
+### Traps in `cargo clippy --fix`
+
+- **It moves code.** `items_after_test_module` relocated 225 lines inside `gateway_anthropic.rs` —
+  production helpers that sat *after* the test module. The net line delta was −2, so the file was intact, but
+  the diff is 227 lines and unreadable without a baseline.
+- **It can make formatting worse.** The `collapsible_if` fix produced `if cond\n    && hidden {\n        …`.
+  Semantically identical (the atomic `swap` is the left operand of `&&`, so it still always runs) but uglier.
+  Tidied by hand.
+- **So: snapshot the tree before `--fix`, then diff against the snapshot.** Reviewing 674 changed lines is
+  only tractable against a known baseline.
+
+### `manual_div_ceil` was not a bug
+
+`gateway.rs` `cooldown_secs`: `((ms + 999) / 1000).max(1)` → `ms.div_ceil(1000).max(1)`. Overflow would need
+`ms > u64::MAX - 999`, and `ms` is a provider-reported cooldown — so the overflow reading is theoretical.
+Recorded so nobody re-opens it as a correctness issue.
+
+### The judgement calls
+
+- `memory.rs` `scoped(…)` — 8 positional args in a **test helper**, one per column under test. Bundling them
+  would push the names out to every call site to save nothing. Left as `#[allow]` with the reason written down.
+- `session_context.rs` `prune` — **fixed rather than allowed**: `PruneStats::default()` plus three field writes
+  became local bindings and one literal. Three counts from three statements cannot be partially written, and
+  the literal says so.
+
+### `empty_line_after_doc_comments` — clippy's suggestion was not the repo's convention
+
+Clippy suggests `/*!` for a detached doc block. The crate has **16 files using `//!` and zero using `/*!`**, so
+the consistent fix was `//!`. Six files converted by script; the six other files that open with `/**` were
+correctly *skipped* — their block is attached to the item below, which is a different (and non-broken) shape.
 
