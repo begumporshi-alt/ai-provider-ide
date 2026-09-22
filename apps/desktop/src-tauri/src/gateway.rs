@@ -328,10 +328,12 @@ pub enum BridgeMsg {
     Error {
         status: u16,
         message: String,
-        /// Longest upstream retry-after across all failed key attempts, in milliseconds.
-        /// Zero/None when the worker didn't report one. The HTTP handler converts this to
-        /// the `Retry-After` header (in seconds) so a client that honours it waits long
-        /// enough for at least one key to cool down, instead of retrying every 1 second.
+        /// The **shortest** upstream retry-after across all failed key attempts, in
+        /// milliseconds — not the longest. The route planner *drops* cooled keys rather than
+        /// deprioritising them (`route-planner.ts` filters on `isKeyUsable`), so the earliest a
+        /// retry can be served is when the first cooled key frees, and the honest hint to the
+        /// client is that shortest wait. Zero/None when the worker didn't report one. The HTTP
+        /// handler converts this to the `Retry-After` header (in seconds).
         retry_after_ms: Option<u64>,
     },
 }
