@@ -42,6 +42,10 @@
 - **Reinstalling costs one keychain approval.** *Every* request (even unauthenticated) answers `503 master key
   unavailable` until approved — the master-key check precedes auth. `pgrep SecurityAgent` is the tell; **401**
   means healthy. The DMG step of `tauri build` always fails here (hdiutil); the `.app` is complete by then.
+- **Never pin a local signing identity in `tauri.conf.json`.** A self-signed cert exists on one machine only,
+  and `codesign` fails `no identity found` for everyone else. **CI does not run `tauri build`** (only
+  typecheck/test/cargo/Playwright), so it cannot catch this. Default is ad-hoc, which runs locally; override
+  with `APPLE_SIGNING_IDENTITY`.
 - **Nothing is an image model unless a manifest says so.** Needs `endpoints.generateImage` +
   `modalityRules.image` (or `rawMatch`). Measured 455/455 `text`. An id containing "image" means nothing.
 - **`memory_enabled` is in-memory only, off after restart** (`gateway.rs:842`). `Disabled` outranks `WriteOnly`,
