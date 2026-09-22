@@ -142,10 +142,16 @@ is the regression guard that the fix exists at all).
 
 - `PATH="$HOME/.cargo/bin:$PATH"` prefix on the cargo gate — cargo is not on default PATH here
   (`FAILED (1): Rust (cargo missing)` otherwise).
-- `pnpm ci:local` is the full gate (core 231 · vitest 193 · Rust `--lib` 433 · browser 98).
+- `pnpm ci:local` is the full gate (core 241 · vitest 193 · Rust `--lib` 470 · browser 98).
   For a targeted run: `cargo test -p <desktop crate>` filtered to the new tests, then `cargo test --lib`.
-- Confirm the route is live: with the app running on 8787,
-  `curl -s -X POST http://127.0.0.1:8787/v1/messages/count_tokens -H "Authorization: Bearer <master>" -H "Content-Type: application/json" -d '{"model":"x","messages":[{"role":"user","content":"hello world"}]}'`
+- Confirm the route is live. **Take the port from Control → Local Gateway, not from `DEFAULT_PORT`**:
+  the compiled default is `8787` (`gateway.rs:33`) but it is overridden by `settings.gateway`, which
+  on this machine is `8800` — so a hardcoded `8787` targets whatever else holds that port.
+  ```
+  PORT=$(sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
+    "SELECT json_extract(value_json,'$.port') FROM settings WHERE key='gateway';")
+  curl -s -X POST "http://127.0.0.1:$PORT/v1/messages/count_tokens" -H "Authorization: Bearer <master>" -H "Content-Type: application/json" -d '{"model":"x","messages":[{"role":"user","content":"hello world"}]}'
+  ```
   must return `{"input_tokens": N}`, not 404.
 
 ## Effort
