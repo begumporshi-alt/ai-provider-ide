@@ -325,7 +325,15 @@ pub enum BridgeMsg {
         completion_tokens: u64,
     },
     Done,
-    Error { status: u16, message: String },
+    Error {
+        status: u16,
+        message: String,
+        /// Longest upstream retry-after across all failed key attempts, in milliseconds.
+        /// Zero/None when the worker didn't report one. The HTTP handler converts this to
+        /// the `Retry-After` header (in seconds) so a client that honours it waits long
+        /// enough for at least one key to cool down, instead of retrying every 1 second.
+        retry_after_ms: Option<u64>,
+    },
 }
 
 /**
@@ -1219,6 +1227,8 @@ impl Slot {
                         "the router worker produced no response within {}ms — the request was abandoned; retry",
                         bound.as_millis()
                     ),
+                    // No upstream was contacted, so there is no real cooldown to report.
+                    retry_after_ms: None,
                 })
             }
         }
@@ -1558,8 +1568,34 @@ pub(crate) fn anthropic_error_kind(status: StatusCode) -> &'static str {
     }
 }
 
-fn err_ra(status: StatusCode, retry: &'static str, body: Value) -> Response {
-    (status, [(header::RETRY_AFTER, retry)], axum::Json(body)).into_response()
+/// An error response carrying a `Retry-After` header. `retry` accepts anything that becomes a
+/// `String`, so a literal (`"1"`) and a computed cooldown both work at the call site.
+fn err_ra(status: StatusCode, retry: impl Into<String>, body: Value) -> Response {
+    (status, [(header::RETRY_AFTER, retry.into())], axum::Json(body)).into_response()
+}
+
+/// Whole seconds for a `Retry-After` header, from a worker-reported cooldown in milliseconds.
+///
+/// Rounds up, and never returns `0`: a sub-second cooldown still reads as "wait 1s". `None` when
+/// the worker reported no cooldown — the caller then leaves the header off, and the
+/// `ensure_retry_after` middleware supplies its own 1s floor.
+pub(crate) fn cooldown_secs(retry_after_ms: Option<u64>) -> Option<String> {
+    retry_after_ms.filter(|&ms| ms > 0).map(|ms| ((ms + 999) / 1000).max(1).to_string())
+}
+
+/// Error response for a failed worker request, honouring the provider's own cooldown.
+///
+/// A 429 carrying the cooldown the provider asked for sets `Retry-After` to it, so the client
+/// waits the window out. Without this the client gets the middleware's 1s floor and retries
+/// straight back into the window it was told to wait — the shape of the ZCode burst (seven 429s
+/// in thirteen seconds). Every other status is answered exactly as `err` would.
+pub(crate) fn err_with_cooldown(status: StatusCode, retry_after_ms: Option<u64>, body: Value) -> Response {
+    if status == StatusCode::TOO_MANY_REQUESTS {
+        if let Some(secs) = cooldown_secs(retry_after_ms) {
+            return err_ra(status, secs, body);
+        }
+    }
+    err(status, body)
 }
 
 /// The peer identity the auth backoff is bucketed by.
@@ -1615,7 +1651,7 @@ pub mod principal;
 #[path = "model_context.rs"]
 pub mod model_context;
 
-use anthropic::messages_h;
+use anthropic::{count_tokens_h, messages_h};
 use gemini::gemini_h;
 use handlers::{chat_h, image_h, method_not_allowed, models_h, unknown_route};
 use responses::responses_h;
@@ -1718,6 +1754,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/chat/completions", post(chat_h))
         .route("/v1/images/generations", post(image_h))
         .route("/v1/messages", post(messages_h))
+        .route("/v1/messages/count_tokens", post(count_tokens_h))
         .route("/v1/responses", post(responses_h))
         .route("/v1beta/models/{*tail}", post(gemini_h))
         // Both refusals authenticate first, for the same reason `unknown_route` does: an

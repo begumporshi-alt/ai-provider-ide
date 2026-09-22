@@ -22,6 +22,9 @@
         /// Lets a test drive the worker's own status decision into the edge — which is exactly
         /// where that decision used to be discarded.
         fail_status: AtomicUsize,
+        /// Cooldown carried by that failure, in ms — standing in for the provider's own
+        /// `Retry-After`. Zero means the worker reported none.
+        fail_retry_after: AtomicUsize,
         /// Everything handed to the worker, verbatim. Phase 6 needs to see what actually leaves
         /// for the provider — asserting on the *ingress* body would prove nothing, because every
         /// dialect is translated twice and either hop can drop the injected block.
@@ -38,6 +41,7 @@
                 empty_delta: AtomicBool::new(false),
                 silent: AtomicBool::new(false),
                 fail_status: AtomicUsize::new(0),
+                fail_retry_after: AtomicUsize::new(0),
                 sent: Mutex::new(Vec::new()),
             }
         }
@@ -67,6 +71,12 @@
         fn fail_with(&self, status: u16) {
             self.fail_status.store(status as usize, Ordering::Relaxed);
         }
+        /// Same, but the failure also carries the provider's own cooldown — the value that has
+        /// to reach the client as `Retry-After` instead of the middleware's 1s floor.
+        fn fail_with_cooldown(&self, status: u16, retry_after_ms: u64) {
+            self.fail_status.store(status as usize, Ordering::Relaxed);
+            self.fail_retry_after.store(retry_after_ms as usize, Ordering::Relaxed);
+        }
     }
 
     impl Bridge for SynthBridge {
@@ -84,6 +94,7 @@
             let with_tools = self.tool_calls.load(Ordering::Relaxed);
             let with_empty = self.empty_delta.load(Ordering::Relaxed);
             let fail = self.fail_status.load(Ordering::Relaxed);
+            let fail_retry_after = self.fail_retry_after.load(Ordering::Relaxed);
             std::thread::spawn(move || {
                 if slow > 0 {
                     std::thread::sleep(Duration::from_millis(slow as u64 * 20));
@@ -92,7 +103,11 @@
                     // The worker decided this status. Everything downstream must respect it.
                     core.reply(
                         req.request_id,
-                        BridgeMsg::Error { status: fail as u16, message: "upstream refused the request".into() },
+                        BridgeMsg::Error {
+                            status: fail as u16,
+                            message: "upstream refused the request".into(),
+                            retry_after_ms: (fail_retry_after > 0).then_some(fail_retry_after as u64),
+                        },
                     );
                     return;
                 }
@@ -351,6 +366,65 @@
         }
         // synth bridge streams "Hel" + "lo" as separate deltas
         assert!(acc.contains("Hel"), "delta text missing");
+    }
+
+    /// count_tokens returns 200 with input_tokens before any bridge is consulted — no upstream.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn count_tokens_returns_estimate() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages/count_tokens", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": "any",
+                "messages": [{ "role": "user", "content": "hello world" }]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["input_tokens"], 2, "11 chars / 4 = 2");
+    }
+
+    /// No auth header → 401, same as any other gateway route (invariant 10: auth before work).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn count_tokens_unauthenticated_is_401() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages/count_tokens", s.base))
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "any", "messages": [] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 401);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "authentication_error");
+    }
+
+    /// Malformed JSON body → 400 invalid_request_error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn count_tokens_invalid_json_is_400() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages/count_tokens", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .body("not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 400);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["type"], "invalid_request_error");
     }
 
     /// Gateway mode holds text back until the model settles, so it probes liveness between
@@ -1272,6 +1346,152 @@
         assert_eq!(body["choices"][0]["message"]["role"], "assistant");
     }
 
+    // ---------- Anthropic streaming: a tool turn must still terminate (2026-09-22) ----------
+    //
+    // Claude Code reads `stop_reason: "tool_use"` on `message_delta` to decide whether to run
+    // tools, and waits for `message_stop` before it considers the turn over. The stream used to
+    // skip both whenever tool calls were present, so the very turn that needed a round-trip was
+    // the one that never announced it — the agent loop stopped after a single step.
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_stream_tool_turn_stops_with_tool_use() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.answer_with_tool_calls(true);
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64, "stream": true,
+                "tools": [{ "name": "Bash", "description": "Run it",
+                            "input_schema": { "type": "object", "properties": {} } }],
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        assert_eq!(res.headers()["content-type"], "text/event-stream");
+        let mut stream = res.bytes_stream();
+        let mut acc = String::new();
+        while let Some(chunk) = stream.next().await {
+            acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        }
+        // Parse the SSE payloads instead of substring-matching them: `serde_json` emits object
+        // keys in sorted order, so a raw-string assertion binds the test to key ordering
+        // rather than to what the events mean.
+        let events: Vec<Value> = acc
+            .lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter_map(|d| serde_json::from_str::<Value>(d).ok())
+            .collect();
+        assert!(
+            events.iter().any(|e| e["content_block"]["type"] == "tool_use"),
+            "the call must reach the client: {acc}"
+        );
+        // The text block opened at index 0 must be closed, or the client's parser waits for a
+        // stop that never arrives.
+        assert!(
+            events.iter().any(|e| e["type"] == "content_block_stop" && e["index"] == 0),
+            "the text block must be closed: {acc}"
+        );
+        assert!(
+            events.iter().any(|e| e["delta"]["stop_reason"] == "tool_use"),
+            "the client needs this to know a round-trip is required: {acc}"
+        );
+        assert!(
+            events.iter().any(|e| e["type"] == "message_stop"),
+            "the turn must be terminated: {acc}"
+        );
+    }
+
+    /// Asserts on the body handed to the worker, not on the ingress body: every dialect is
+    /// translated twice, and a block can be dropped at either hop.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_tool_transcript_reaches_the_worker_intact() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": "mock-fast", "max_tokens": 64,
+                "tools": [{ "name": "Bash", "description": "Run it",
+                            "input_schema": { "type": "object", "properties": { "command": { "type": "string" } } } }],
+                "messages": [
+                    { "role": "user", "content": [{ "type": "text", "text": "fix the test" }] },
+                    { "role": "assistant", "content": [
+                        { "type": "text", "text": "Let me look" },
+                        { "type": "tool_use", "id": "toolu_1", "name": "Bash", "input": { "command": "ls" } } ] },
+                    { "role": "user", "content": [
+                        { "type": "tool_result", "tool_use_id": "toolu_1", "content": "3 files" } ] }
+                ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        let msgs = sent.1["messages"].as_array().expect("messages").clone();
+        assert_eq!(msgs.len(), 3, "one message per turn: {msgs:?}");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "toolu_1");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "Bash");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "toolu_1");
+        assert_eq!(msgs[2]["content"], "3 files", "the result must reach the model: {msgs:?}");
+        // The empty user turn this used to emit is what made providers reject the body outright.
+        assert!(
+            !msgs.iter().any(|m| m["role"] == "user" && m["content"] == ""),
+            "no empty user turn: {msgs:?}"
+        );
+    }
+
+    /// The Responses counterpart of the Anthropic case: what reaches the worker, not the ingress
+    /// body. Also pins the tool shape, which is the half of this dialect that is only visible
+    /// after translation.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn responses_tool_transcript_reaches_the_worker_intact() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/responses", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({
+                "model": "mock-fast",
+                "tools": [{ "type": "function", "name": "Bash", "description": "Run it",
+                            "parameters": { "type": "object", "properties": { "command": { "type": "string" } } } }],
+                "input": [
+                    { "type": "message", "role": "user", "content": [{ "type": "input_text", "text": "fix it" }] },
+                    { "type": "function_call", "call_id": "call_1", "name": "Bash", "arguments": "{\"command\":\"ls\"}" },
+                    { "type": "function_call_output", "call_id": "call_1", "output": "3 files" }
+                ] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 200);
+        let sent = s.bridge.sent(0).expect("a dispatch");
+        let msgs = sent.1["messages"].as_array().expect("messages").clone();
+        assert_eq!(msgs.len(), 3, "one message per item-turn: {msgs:?}");
+        assert_eq!(msgs[1]["role"], "assistant");
+        assert_eq!(msgs[1]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(msgs[1]["tool_calls"][0]["function"]["name"], "Bash");
+        assert_eq!(msgs[2]["role"], "tool");
+        assert_eq!(msgs[2]["tool_call_id"], "call_1");
+        assert_eq!(msgs[2]["content"], "3 files", "the result must reach the model: {msgs:?}");
+        // The FLAT Responses tool shape must not reach a chat-completions provider.
+        assert_eq!(sent.1["tools"][0]["function"]["name"], "Bash", "{:?}", sent.1["tools"]);
+        assert!(
+            sent.1["tools"][0].get("name").is_none(),
+            "flat shape must not survive: {:?}",
+            sent.1["tools"]
+        );
+    }
+
     /// The bridge's only backpressure signal. Without it, a request whose client has gone
     /// keeps streaming — and in a tool loop, keeps buying tokens — forever.
     #[test]
@@ -1816,6 +2036,93 @@
             res.headers()["retry-after"], "1",
             "a rate limit with no retry hint reads as \"retry now\""
         );
+    }
+
+    /// The provider's own cooldown must reach the client, not the middleware's 1s floor. Stage 1
+    /// taught the health tracker to honour it internally; stage 2 carries it to the wire. 71s is
+    /// deliberately not round, so a hardcoded `1` cannot pass.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upstream_429_reports_the_providers_own_cooldown() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with_cooldown(429, 71_000);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        assert_eq!(
+            res.headers()["retry-after"], "71",
+            "the client must be told the provider's window, not the 1s floor"
+        );
+    }
+
+    /// The cooldown belongs to the failure, not to one dialect. Anthropic is the dialect ZCode
+    /// speaks, and its 429 burst is what motivated this change in the first place.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upstream_429_reports_the_cooldown_to_an_anthropic_client() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with_cooldown(429, 30_000);
+        let res = s
+            .client
+            .post(format!("{}/v1/messages", s.base))
+            .header("x-api-key", "sk-aip-test")
+            .header("anthropic-version", "2023-06-01")
+            .header("content-type", "application/json")
+            .json(&json!({ "model": "mock-fast", "max_tokens": 64,
+                "messages": [{ "role": "user", "content": "hi" }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        assert_eq!(
+            res.headers()["retry-after"], "30",
+            "the Anthropic ingress must carry the cooldown too"
+        );
+    }
+
+    /// Gemini builds its own error envelope rather than going through `openai_error`; the header
+    /// has to survive that difference.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upstream_429_reports_the_cooldown_to_a_gemini_client() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with_cooldown(429, 45_000);
+        let res = s
+            .client
+            .post(format!("{}/v1beta/models/mock-fast:generateContent", s.base))
+            .header("x-goog-api-key", "sk-aip-test")
+            .header("content-type", "application/json")
+            .json(&json!({ "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }] }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        assert_eq!(res.headers()["retry-after"], "45");
+    }
+
+    /// A cooldown under a second must still read as 1, never 0 — a client that sees
+    /// `Retry-After: 0` treats it as "retry now", which is the defect this change removes.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_sub_second_cooldown_never_reports_zero() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with_cooldown(429, 400);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        assert_eq!(res.headers()["retry-after"], "1", "a sub-second cooldown floors at 1s");
     }
 
     /// axum's default 405 has an empty body — the one refusal a JSON-parsing client cannot read.

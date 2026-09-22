@@ -14,8 +14,8 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, clean_assistant_text, forwarded_headers, peer_ip, try_slot, worker_status,
-    BridgeMsg, BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, err_with_cooldown, forwarded_headers, peer_ip,
+    try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };
 use crate::gateway::context_scope::{
     apply_memory_headers, finish_capture, inject_context, prepare_capture,
@@ -260,8 +260,9 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
                         break;
                     }
-                    BridgeMsg::Error { status, message } => {
+                    BridgeMsg::Error { status, message, .. } => {
                         // SSE is already committed as 200, so the payload is the only channel left.
+                        // A `Retry-After` header is no longer possible on this response.
                         let e = gemini_error_body(&message, worker_status(status));
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(e.to_string()));
                         break;
@@ -305,7 +306,7 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
 
     let mut full = String::new();
     let mut usage: Option<(u64, u64)> = None;
-    let mut err_info: Option<(u16, String)> = None;
+    let mut err_info: Option<(u16, String, Option<u64>)> = None;
     let mut has_tool_calls = false;
     let mut tool_parts: Vec<Value> = Vec::new();
     while let Some(msg) = slot.recv().await {
@@ -318,8 +319,8 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
                 }
                 break;
             }
-            BridgeMsg::Error { status, message } => {
-                err_info = Some((status, message));
+            BridgeMsg::Error { status, message, retry_after_ms } => {
+                err_info = Some((status, message, retry_after_ms));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
@@ -345,7 +346,10 @@ pub(crate) async fn gemini_h(State(core): State<Arc<GatewayCore>>, headers: Head
     }
     drop(slot);
     let mut r = match err_info {
-        Some((status, message)) => gemini_error(&message, worker_status(status)),
+        Some((status, message, retry_after_ms)) => {
+            let code = worker_status(status);
+            err_with_cooldown(code, retry_after_ms, gemini_error_body(&message, code))
+        }
         None => {
             let (pt, ct) = usage.unwrap_or((0, 0));
             let finish_reason = if has_tool_calls { "STOP" } else { "STOP" };

@@ -1063,8 +1063,9 @@ pub fn gateway_error(
     request_id: u64,
     status: u16,
     message: String,
+    retry_after_ms: Option<u64>,
 ) -> Result<(), String> {
-    state.core.reply(request_id, BridgeMsg::Error { status, message });
+    state.core.reply(request_id, BridgeMsg::Error { status, message, retry_after_ms });
     Ok(())
 }
 

@@ -12,8 +12,9 @@ use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
 use crate::gateway::{
-    check_gateway_key, clean_assistant_text, err, err_ra, forwarded_headers, openai_error, peer_ip,
-    try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
+    check_gateway_key, clean_assistant_text, cooldown_secs, err, err_ra, err_with_cooldown,
+    forwarded_headers, openai_error, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest,
+    GatewayCore,
 };
 use crate::gateway::context_scope::{
     apply_memory_headers, finish_capture, inject_context, prepare_capture,
@@ -129,10 +130,11 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
                         break;
                     }
-                    BridgeMsg::Error { status, message } => {
+                    BridgeMsg::Error { status, message, .. } => {
                         // SSE is already committed as 200, so the payload is the only channel left.
                         // The non-stream path puts the status on the wire; here it has to be in the
                         // body, or a client cannot tell a bad request from a broken gateway.
+                        // Retry-After cannot be set on a committed SSE response.
                         let code = worker_status(status);
                         let mut body = openai_error(&message, "upstream_error", None);
                         body["error"]["status"] = json!(code.as_u16());
@@ -174,7 +176,7 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     let mut full = String::new();
     let mut tool_calls_json: Option<String> = None;
     let mut usage: Option<(u64, u64)> = None;
-    let mut err_info: Option<(u16, String)> = None;
+    let mut err_info: Option<(u16, String, Option<u64>)> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
@@ -185,8 +187,8 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
                 }
                 break;
             }
-            BridgeMsg::Error { status, message } => {
-                err_info = Some((status, message));
+            BridgeMsg::Error { status, message, retry_after_ms } => {
+                err_info = Some((status, message, retry_after_ms));
                 break;
             }
             BridgeMsg::ToolCalls(calls) => {
@@ -201,16 +203,22 @@ pub(crate) async fn chat_h(State(core): State<Arc<GatewayCore>>, headers: Header
     }
     drop(slot);
     match err_info {
-        Some((status, message)) => {
+        Some((status, message, retry_after_ms)) => {
             let code = worker_status(status);
             // Not upstream: the worker never answered. Say so, and tell the client it is
             // worth retrying — a retry re-enters `try_slot`, which re-warms the window.
+            // A 503 is not a 429, so `ensure_retry_after` would not add a header here: set it
+            // explicitly, using the provider's cooldown when the worker reported one.
             if code == StatusCode::SERVICE_UNAVAILABLE {
-                let mut r = err_ra(code, "1", openai_error(&message, "service_unavailable", None));
+                let mut r = err_ra(
+                    code,
+                    cooldown_secs(retry_after_ms).unwrap_or_else(|| "1".to_string()),
+                    openai_error(&message, "service_unavailable", None),
+                );
                 apply_memory_headers(&mut r, &outcome);
                 return r;
             }
-            let mut r = err(code, openai_error(&message, "upstream_error", None));
+            let mut r = err_with_cooldown(code, retry_after_ms, openai_error(&message, "upstream_error", None));
             apply_memory_headers(&mut r, &outcome);
             r
         }
@@ -257,8 +265,8 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Result(v) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
             }
-            BridgeMsg::Error { status, message } => {
-                return err(worker_status(status), openai_error(&message, "upstream_error", None))
+            BridgeMsg::Error { status, message, retry_after_ms } => {
+                return err_with_cooldown(worker_status(status), retry_after_ms, openai_error(&message, "upstream_error", None))
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
@@ -328,8 +336,8 @@ pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: Heade
             BridgeMsg::Result(v) => {
                 return (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], v.to_string()).into_response()
             }
-            BridgeMsg::Error { status, message } => {
-                return err(worker_status(status), openai_error(&message, "upstream_error", None));
+            BridgeMsg::Error { status, message, retry_after_ms } => {
+                return err_with_cooldown(worker_status(status), retry_after_ms, openai_error(&message, "upstream_error", None));
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
