@@ -18,7 +18,7 @@
   (`store.rs:230`), expanded in `Assistant.tsx` (`:583`, `:702`). Gateway is a blind proxy for `system`.
 - Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db`, `?mode=ro`. Version in
   `schema_version` (not `PRAGMA user_version`). `settings` = `key`/`value_json`.
-- Tests: core 231 · vitest 193 · Rust `--lib` 433 · browser 98. Gate `pnpm ci:local`. `build:clean` moves `dist`
+- Tests: core 239 · vitest 193 · Rust `--lib` 470 · browser 98. Gate `pnpm ci:local`. `build:clean` moves `dist`
   aside — vite `emptyOutDir` trips the bulk-delete guard.
 - Ports: gateway **8800** (`settings.gateway`); AI Hub v2 owns **8787**. `DEFAULT_PORT` (`gateway.rs:33`) is stale.
   Bundle: `/Applications/AI-Provider Router.app`.
@@ -87,7 +87,8 @@
 - **A switch rendered in two places drifts** — Control owns cross-cutting ones; move, don't mirror. (Memory
   master switch stays on Memory by decision.)
 - A switch's accessible name must not change with state — `aria-checked` carries it; give state its own element.
-- `getByText` matching two elements = a **duplicated fact on screen**, not a bad selector. Scope to the container.
+- `getByText` matching two elements = a **duplicated fact on screen**, not a bad selector. Scope to the container;
+  a readiness wait must match something **only** the awaited view renders, else the wrong copy satisfies it.
 - `__webTest.failNext(cmd, msg, afterMs?)` makes a UI `catch` reachable. **An immediate failure cannot test
   supersession** — defer with `afterMs`, then outlive it before asserting.
 - A negative assertion on an auto-dismissing surface **can never fail**.
