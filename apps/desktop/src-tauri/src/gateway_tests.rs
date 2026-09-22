@@ -46,6 +46,11 @@
         fn sent(&self, n: usize) -> Option<(String, Value, HashMap<String, String>)> {
             self.sent.lock().unwrap().get(n).cloned()
         }
+        /// How many requests have been handed to the worker — i.e. actually routed, which is the
+        /// number §3.5 caps at 8. Counting admissions instead would prove nothing.
+        fn dispatched(&self) -> usize {
+            self.sent.lock().unwrap().len()
+        }
         fn attach(&self, core: &Arc<GatewayCore>) {
             *self.core.lock().unwrap() = Some(core.clone());
         }
@@ -1790,6 +1795,67 @@
         assert_eq!(body["error"]["status"], "RESOURCE_EXHAUSTED");
     }
 
+    /// Live 2026-09-22: capacity and spend refusals set `Retry-After`, the upstream 429 path did
+    /// not. A client honouring the header therefore retried a provider rate limit immediately.
+    /// Enforced by one middleware over every dialect, so no dialect can drift from the others.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_upstream_429_carries_retry_after() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.fail_with(429);
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429);
+        assert_eq!(
+            res.headers()["retry-after"], "1",
+            "a rate limit with no retry hint reads as \"retry now\""
+        );
+    }
+
+    /// axum's default 405 has an empty body — the one refusal a JSON-parsing client cannot read.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_method_answers_a_json_405() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .get(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 405);
+        let body: Value = res.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_method");
+    }
+
+    /// Answering 404 to a caller that presented no credential made the route table an oracle:
+    /// 404-vs-401 told an anonymous caller a real route from a typo (invariant 10).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unknown_route_without_a_key_is_401_not_404() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let res = s
+            .client
+            .post(format!("{}/v1/unknown/path", s.base))
+            .header("content-type", "application/json")
+            .body(r#"{"model":"gpt-4"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            res.status(),
+            401,
+            "a 404 for an unauthenticated caller is a route-existence oracle"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_worker_400_reaches_an_image_client_as_400() {
         // The image handler carried its own narrower whitelist — `404` else `502` — so a schema
@@ -1932,6 +1998,77 @@
             body["error"]["type"], "rate_limit_error",
             "429 must not be reported as an overload — the two have different retry semantics"
         );
+    }
+
+    /// §3.5 says "max concurrent routed requests (default 8) with a bounded queue (default 32)".
+    /// Nothing asserted either number: the pool was one flat semaphore of 40 that dispatched as
+    /// soon as it admitted, so 40 upstream calls could go out together. That is also the likely
+    /// reason a live capacity probe rate-limits the provider before it ever reaches this gate.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn no_more_than_eight_requests_are_dispatched_at_once() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        s.bridge.slow.store(50, Ordering::Relaxed); // ~1s per reply
+        let mut inflight = Vec::new();
+        for _ in 0..20 {
+            let c = s.client.clone();
+            let base = s.base.clone();
+            inflight.push(tokio::spawn(async move {
+                c.post(format!("{base}/v1/chat/completions"))
+                    .header("authorization", "Bearer sk-aip-test")
+                    .json(&chat_body(false))
+                    .send()
+                    .await
+                    .unwrap()
+                    .status()
+            }));
+        }
+        // While the first batch is still being answered, the worker must have been handed eight
+        // requests and no more — the rest are admitted and waiting, not routed.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let seen = s.bridge.dispatched();
+        assert!(
+            seen <= MAX_CONCURRENT,
+            "dispatch must be capped at {MAX_CONCURRENT}, but the worker was handed {seen}"
+        );
+        assert_eq!(seen, MAX_CONCURRENT, "the cap should be saturated, not idle");
+
+        for h in inflight {
+            assert_eq!(h.await.unwrap(), 200, "a queued request still completes");
+        }
+        assert_eq!(s.bridge.dispatched(), 20, "queueing delays requests, it drops none");
+    }
+
+    /// The other number: 8 dispatched + 32 waiting = 40 admitted. The 41st is refused outright.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn admission_refuses_the_forty_first_request() {
+        let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+        let s = start(key).await;
+        let mut held = Vec::new();
+        for _ in 0..(MAX_CONCURRENT + MAX_QUEUED) {
+            held.push(
+                s.core
+                    .permits
+                    .clone()
+                    .try_acquire_owned()
+                    .expect("a fresh pool admits 40"),
+            );
+        }
+        assert!(
+            s.core.permits.clone().try_acquire_owned().is_err(),
+            "the pool must be full at 8 + 32"
+        );
+        let res = s
+            .client
+            .post(format!("{}/v1/chat/completions", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&chat_body(false))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(res.status(), 429, "over the admission ceiling is a capacity refusal");
+        assert_eq!(res.headers()["retry-after"], "1");
+        drop(held);
     }
 
     // A streamed response is committed as 200 before the worker answers, so once the worker fails

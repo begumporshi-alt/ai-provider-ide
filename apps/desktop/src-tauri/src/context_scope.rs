@@ -385,6 +385,11 @@ pub enum SkipReason {
     /// §4a: the master switch is on, but this principal is not allowed to use memory.
     PrincipalOff,
     ClientOff,
+    /// The caller asked for the write half only (`aip-memory: write`), so there was nothing to
+    /// recall. Distinct from `ClientOff`, which means the caller opted out of memory entirely —
+    /// collapsing the two made an operator hunt for a client that had disabled memory when in fact
+    /// one had merely declined to be read back to.
+    WriteOnly,
     NoProject,
     NoCandidates,
     BelowFloor,
@@ -398,6 +403,7 @@ impl SkipReason {
             Self::Disabled => "disabled",
             Self::PrincipalOff => "principal_off",
             Self::ClientOff => "client_off",
+            Self::WriteOnly => "write_only",
             Self::NoProject => "no_project",
             Self::NoCandidates => "no_candidates",
             Self::BelowFloor => "below_floor",
@@ -560,6 +566,8 @@ pub fn inject_context_deadline(
             SkipReason::Disabled
         } else if !operator_allows {
             SkipReason::PrincipalOff
+        } else if matches!(meta.mode, Some(MemoryMode::Write)) {
+            SkipReason::WriteOnly
         } else {
             SkipReason::ClientOff
         });
@@ -593,7 +601,7 @@ pub fn inject_context_deadline(
     let budget = meta.budget.unwrap_or(planned).min(MAX_BUDGET_TOKENS);
     let memory_budget = ((budget as f64) * MEMORY_SHARE) as usize;
 
-    let freeze_key = freeze_key(&scope, &meta);
+    let freeze_key = freeze_key(&scope, &meta, app_key.as_deref());
     let (memory_block, items, had_candidates) = match core.frozen_memory(&freeze_key, memory_budget) {
         // §5.5: a hit skips recall entirely, and that is the point rather than an optimisation —
         // the block has to come out byte-identical, and the only way to guarantee that is to not
@@ -650,7 +658,14 @@ pub fn inject_context_deadline(
     if !deadline.check("context") {
         return miss(&deadline);
     }
-    let (context_block, context_items) = live_context(store, &meta, &scope, body, budget.saturating_sub(estimate_tokens(&memory_block)));
+    let (context_block, context_items) = live_context(
+        store,
+        &meta,
+        &scope,
+        body,
+        budget.saturating_sub(estimate_tokens(&memory_block)),
+        app_key.as_deref(),
+    );
 
     // §5.6, check 3: the last chance to decide, before the client's body is mutated. A block that
     // took too long to build is not worth shipping — the request goes out as it arrived.
@@ -688,11 +703,14 @@ pub fn inject_context_deadline(
 /// invalidates the provider's cached prefix on every call — the failure §5.5 exists to prevent.
 /// The cost is staleness inside the TTL: a session that changes topic keeps the earlier block until
 /// it expires.
-fn freeze_key(scope: &Scope, meta: &RequestMeta) -> String {
+///
+/// The principal is part of the session half of this key, so two callers cannot share a frozen
+/// block any more than they can share a session.
+fn freeze_key(scope: &Scope, meta: &RequestMeta, principal: Option<&str>) -> String {
     format!(
         "{}|{}",
         scope.as_header_value(),
-        crate::gateway::session_context::resolve_session(meta, scope)
+        crate::gateway::session_context::resolve_session(meta, scope, principal)
     )
 }
 
@@ -742,7 +760,7 @@ pub fn prepare_capture(
     Some(PreparedCapture {
         store,
         request_id: crate::capture::request_id(request_id),
-        session: crate::gateway::session_context::resolve_session(&meta, &scope),
+        session: crate::gateway::session_context::resolve_session(&meta, &scope, app_key.as_deref()),
         user_text: recall_query(body),
         model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
         principal: crate::capture::classify_principal(&scope, meta.internal),
@@ -784,8 +802,9 @@ fn live_context(
     scope: &Scope,
     body: &Value,
     budget: usize,
+    principal: Option<&str>,
 ) -> (String, usize) {
-    let sess = crate::gateway::session_context::resolve_session(meta, scope);
+    let sess = crate::gateway::session_context::resolve_session(meta, scope, principal);
     if crate::gateway::session_context::touch_session(store, &sess, scope).is_err() {
         return (String::new(), 0);
     }
@@ -1229,6 +1248,31 @@ mod context_scope_tests {
         assert!(MemoryMode::Read.allows_read() && !MemoryMode::Read.allows_write());
         assert!(!MemoryMode::Write.allows_read() && MemoryMode::Write.allows_write());
         assert!(!MemoryMode::Off.allows_read() && !MemoryMode::Off.allows_write());
+    }
+
+    /// `write` asks for the capture half only, so there is nothing to read back. It used to be
+    /// reported as `client_off`, which reads as "this app turned memory off" — measured live, that
+    /// sent an operator hunting for a client that had opted out when one had merely declined recall.
+    #[test]
+    fn write_only_is_reported_as_such_not_as_the_client_opting_out() {
+        let core = core();
+        core.set_memory_enabled(true);
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = inject_context(&core, &hdr(&[("aip-memory", "write")]), None, &mut body);
+        assert!(!out.injected, "capture-only injects nothing");
+        assert_eq!(out.reason, SkipReason::WriteOnly);
+        assert_eq!(out.status_value(), "injected=0;reason=write_only");
+    }
+
+    /// The distinction the new reason exists for: a real opt-out is still `client_off`.
+    #[test]
+    fn an_explicit_opt_out_is_still_reported_as_client_off() {
+        let core = core();
+        core.set_memory_enabled(true);
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        let out = inject_context(&core, &hdr(&[("aip-memory", "off")]), None, &mut body);
+        assert_eq!(out.reason, SkipReason::ClientOff, "opting out is not the same as capture-only");
+        assert_eq!(out.status_value(), "injected=0;reason=client_off");
     }
 
     // ---------- response contract ----------

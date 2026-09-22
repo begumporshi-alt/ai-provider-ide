@@ -116,7 +116,12 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     const plan = this.plan(req.model, "image");
     if (!plan.length) {
       await this.recordNoRoute(req.model, "image", opts?.source ?? "ui", t0);
-      throw new Error(`no route for image model "${req.model}"`);
+      // The bare "no route for image model" blamed the model id. Measured live 2026-09-22: the
+      // gateway advertised 15 image-named models and 404'd every one, because the catalog tagged
+      // zero of them as image — no configured provider declared an image capability, so the id
+      // was never the problem. Say which of the three it actually is. "no route" is kept in the
+      // text because `gatewayStatus` maps that phrase to 404.
+      throw new Error(`no route for image model "${req.model}" (${this.whyNoImage(req.model)})`);
     }
     const res = await this.engine.executeImage({ plan, prompt: req.prompt, model: req.model, signal: opts?.signal });
     await this.ledger.append({
@@ -136,6 +141,27 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     });
     this.advanceCursor(res.candidate.provider.id);
     return { url: res.url, base64: res.base64 };
+  }
+
+  /**
+   * Why an image request planned to nothing, in the caller's terms.
+   *
+   * Three different failures used to produce one message that named the model, so the caller
+   * went and checked the model id. Only the middle case is actually about the id.
+   */
+  private whyNoImage(requested: string): string {
+    if (!this.catalog.forModality("image").length) {
+      // Nothing in the catalog is an image model at all — a provider that advertises image ids
+      // but declares no `modalityRules.image` tags every one of them text. Blaming the model
+      // sends the caller to fix a string that is already correct.
+      return "no enabled provider is configured for image generation";
+    }
+    // The request may be qualified (`slug/native`), which is how `/v1/models` prints ids.
+    const known = this.catalog
+      .all()
+      .some((m) => m.nativeId === requested || requested.endsWith(`/${m.nativeId}`));
+    if (!known) return "no enabled provider carries it";
+    return "it is not tagged as an image model in the catalog";
   }
 
   async listModels(modality?: Modality): Promise<ModelInfo[]> {

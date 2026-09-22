@@ -201,6 +201,42 @@ describe("acceptance 4 — text + image end-to-end (core level)", () => {
   });
 });
 
+// Three different failures used to produce one message that named the model, so every caller
+// went and checked the model id. Measured live 2026-09-22: the gateway advertised 15
+// image-named models and 404'd all of them, and the id was correct in every case.
+describe("image: the no-route error names the cause, not the model", () => {
+  it("no image model in the catalog at all -> the provider is not configured for images", async () => {
+    const s = makeSetup();
+    // A provider whose manifest declares no `modalityRules.image` tags every model text, even
+    // the ones it advertises as image-capable. That was the live state of both providers.
+    s.catalog.hydrate(
+      [{ providerId: "pA", nativeId: "agnes-image-2.5-flash", modality: "text", fetchedAt: Date.now() }],
+      {},
+    );
+    await expect(
+      s.router.generateImage({ model: "openrouter/agnes-image-2.5-flash", prompt: "cat" }),
+    ).rejects.toThrow(/no enabled provider is configured for image generation/);
+  });
+
+  it("an id nothing carries -> the id really is the problem", async () => {
+    const s = makeSetup();
+    await addKeys(s, "pA", 1);
+    await s.catalog.refreshProvider("pA"); // dall-e-3 image, gpt-4o text
+    await expect(
+      s.router.generateImage({ model: "openrouter/nope", prompt: "cat" }),
+    ).rejects.toThrow(/no enabled provider carries it/);
+  });
+
+  it("a known model that is tagged text -> the catalog says it is not an image model", async () => {
+    const s = makeSetup();
+    await addKeys(s, "pA", 1);
+    await s.catalog.refreshProvider("pA");
+    await expect(
+      s.router.generateImage({ model: "openrouter/gpt-4o", prompt: "cat" }),
+    ).rejects.toThrow(/not tagged as an image model/);
+  });
+});
+
 describe("cancellation (spec req. 9)", () => {
   it("abort mid-stream stops consumption promptly", async () => {
     const lines = ["a", "b", "c", "d", "e"].map((t) => `data: ${JSON.stringify({ choices: [{ delta: { content: t } }] })}`);

@@ -58,15 +58,29 @@ pub struct Turn {
 
 /// Resolve the session a request belongs to.
 ///
-/// An explicit `AIP-Session` wins. Absent it, the id is **derived** from the scope rather than
-/// randomised: most agents cannot set headers, so a fresh random id per request would give every
-/// request its own session and live context would never accumulate.
-pub fn resolve_session(meta: &crate::gateway::context_scope::RequestMeta, scope: &crate::gateway::context_scope::Scope) -> String {
+/// An explicit `AIP-Session` wins. Absent it, the id is **derived** from the principal and the scope
+/// rather than randomised: most agents cannot set headers, so a fresh random id per request would
+/// give every request its own session and live context would never accumulate.
+///
+/// `principal` is in the key because without it the key says only *where* a request came from and
+/// not *who* sent it. Measured against the live gateway (2026-09-22): the master key and a per-app
+/// key, both resolving to `local|<project>|-`, produced the **same** session id, so turns recorded
+/// for one caller were injected into the other's prompt. Scope alone is not an identity.
+///
+/// `None` renders as `-`, the same convention as the other unresolved dimensions, and is what a
+/// request gets when memory is off — sessions are unused then, so this is inert rather than a
+/// second namespace that shifts with the toggle.
+pub fn resolve_session(
+    meta: &crate::gateway::context_scope::RequestMeta,
+    scope: &crate::gateway::context_scope::Scope,
+    principal: Option<&str>,
+) -> String {
     if let Some(s) = &meta.session {
         return s.clone();
     }
     let key = format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
+        principal.unwrap_or("-"),
         scope.user,
         scope.project.as_deref().unwrap_or("-"),
         scope.agent.as_deref().unwrap_or("-"),
@@ -371,7 +385,8 @@ mod session_context_tests {
     #[test]
     fn an_explicit_session_id_wins_over_derivation() {
         let meta = RequestMeta { session: Some("mine".into()), ..Default::default() };
-        assert_eq!(resolve_session(&meta, &scope(Some("p1"), Some("cursor"))), "mine");
+        let s = resolve_session(&meta, &scope(Some("p1"), Some("cursor")), Some("key:master"));
+        assert_eq!(s, "mine");
     }
 
     /// Most agents cannot set headers, so a random id would give every request its own session and
@@ -379,11 +394,29 @@ mod session_context_tests {
     #[test]
     fn a_derived_session_is_stable_across_requests() {
         let meta = RequestMeta::default();
-        let a = resolve_session(&meta, &scope(Some("p1"), Some("cursor")));
-        let b = resolve_session(&meta, &scope(Some("p1"), Some("cursor")));
-        let c = resolve_session(&meta, &scope(Some("p2"), Some("cursor")));
+        let a = resolve_session(&meta, &scope(Some("p1"), Some("cursor")), Some("key:master"));
+        let b = resolve_session(&meta, &scope(Some("p1"), Some("cursor")), Some("key:master"));
+        let c = resolve_session(&meta, &scope(Some("p2"), Some("cursor")), Some("key:master"));
         assert_eq!(a, b, "the same scope always yields the same session");
         assert_ne!(a, c, "a different project is a different session");
+    }
+
+    /// The defect this fixes, measured live on 2026-09-22: the master key and a per-app key resolve
+    /// to the same scope, so with the principal absent from the key they derived the same session
+    /// and turns recorded for one caller were injected into the other's prompt. Scope alone is
+    /// where a request came from, not who sent it.
+    #[test]
+    fn two_principals_in_the_same_scope_do_not_share_a_session() {
+        let meta = RequestMeta::default();
+        let sc = scope(Some("p1"), None);
+        let master = resolve_session(&meta, &sc, Some("key:master"));
+        let app = resolve_session(&meta, &sc, Some("key:ak-fc85350a2fb1dc67"));
+        let unnamed = resolve_session(&meta, &sc, None);
+        assert_ne!(master, app, "a per-app key is not the master key's session");
+        assert_ne!(master, unnamed, "an unidentified caller is not the master key's session");
+        assert_ne!(app, unnamed);
+        // Stability is untouched: the same principal and scope still derive one id.
+        assert_eq!(master, resolve_session(&meta, &sc, Some("key:master")));
     }
 
     #[test]

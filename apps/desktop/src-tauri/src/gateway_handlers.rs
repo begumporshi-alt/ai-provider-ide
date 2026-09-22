@@ -271,11 +271,38 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
 
 /// Catch-all for unknown `/v1/*` and `/v1beta/*` routes — returns a JSON 404 OpenAI-style error
 /// instead of falling through to the Tauri webview HTML 404 page.
-pub(crate) async fn unknown_route() -> Response {
+pub(crate) async fn unknown_route(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+) -> Response {
+    // Invariant 10: authenticate before any routing work. Answering 404 to a caller that never
+    // presented a credential makes the route table an oracle — 404-vs-401 separated a real route
+    // from a typo with no key at all, which is exactly what the invariant exists to prevent.
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        return r.openai();
+    }
     tracing::warn!("unknown gateway route hit");
     err(StatusCode::NOT_FOUND, openai_error("route not found", "not_found", Some("unknown_route")))
 }
 
+
+/// Wrong method on a known route.
+///
+/// axum's default is a bare 405 with an empty body, which is the one refusal here a client parsing
+/// JSON cannot read. It authenticates first for the same reason `unknown_route` does: a 405 is
+/// itself a statement that the route exists.
+pub(crate) async fn method_not_allowed(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        return r.openai();
+    }
+    err(
+        StatusCode::METHOD_NOT_ALLOWED,
+        openai_error("method not allowed", "invalid_request", Some("unsupported_method")),
+    )
+}
 
 pub(crate) async fn image_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap, body: String) -> Response {
     if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {

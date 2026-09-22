@@ -21,7 +21,9 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
-use axum::http::{header, HeaderMap, StatusCode};
+use axum::body::Body;
+use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use rand::Rng as _;
@@ -33,7 +35,12 @@ use crate::vault;
 
 pub const DEFAULT_PORT: u16 = 8787;
 pub const MASTER_ACCOUNT: &str = "masterkey";
-const MAX_TOTAL: usize = 8 + 32; // §3.5: 8 concurrent, queue of 32
+/// §3.5 concurrency: at most this many requests are *routed* (dispatched to the core) at once.
+pub const MAX_CONCURRENT: usize = 8;
+/// §3.5 bounded queue: this many further requests are admitted and wait for a routing slot.
+pub const MAX_QUEUED: usize = 32;
+/// Admission ceiling. Not a concurrency limit — see `dispatch`.
+const MAX_TOTAL: usize = MAX_CONCURRENT + MAX_QUEUED;
 const HEARTBEAT_STALE_MS: u64 = 6_000;
 /// R1: liveness bound while the window is hidden. A looser bound keeps the gateway serving in
 /// the background; the cost is that a truly dead renderer is detected after 30s instead of 6s
@@ -509,7 +516,12 @@ pub trait Bridge: Send + Sync + 'static {
 pub struct GatewayCore {
     next_id: AtomicU64,
     pending: Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>,
+    /// Admission: how many requests may be in the building at all, dispatched + waiting.
     permits: Arc<Semaphore>,
+    /// Routing: how many may be dispatched to the core at once (§3.5). This is the half the
+    /// single 40-permit pool was missing — acquiring `permits` used to dispatch immediately, so
+    /// 40 upstream calls could go out together.
+    dispatch: Arc<Semaphore>,
     last_heartbeat: Mutex<Instant>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     bridge: Arc<dyn Bridge>,
@@ -654,6 +666,7 @@ impl GatewayCore {
             next_id: AtomicU64::new(1),
             pending: Mutex::new(HashMap::new()),
             permits: Arc::new(Semaphore::new(MAX_TOTAL)),
+            dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT)),
             last_heartbeat: Mutex::new(Instant::now()),
             failures: Mutex::new(HashMap::new()),
             bridge,
@@ -1163,6 +1176,9 @@ pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(30);
 struct Slot {
     core: Arc<GatewayCore>,
     _permit: OwnedSemaphorePermit,
+    /// Held for the same lifetime as the slot, so a request that has been routed keeps its
+    /// routing slot until it finishes — dropping it earlier would let a ninth request dispatch.
+    _dispatch: OwnedSemaphorePermit,
     id: u64,
     rx: mpsc::UnboundedReceiver<BridgeMsg>,
     /// Set once the worker has produced its first message; only that wait is bounded.
@@ -1269,13 +1285,29 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
             openai_error("AI-Provider Router core unavailable — is the app open?", "service_unavailable", None),
         ));
     }
+    // Admission first: the 41st request is refused outright, before it can occupy a socket.
     let Ok(permit) = core.permits.clone().try_acquire_owned() else {
         return Err(err_ra(StatusCode::TOO_MANY_REQUESTS, "1", openai_error("router at capacity", "rate_limit", None)));
+    };
+    // Then wait for a ROUTING slot. This wait is the §3.5 queue: admitted, not yet dispatched.
+    // `Semaphore::acquire_owned` is cancel-safe, and hyper drops this future when the client
+    // disconnects, so a queued request never holds a routing slot for a caller that has gone.
+    let dispatch = match core.dispatch.clone().acquire_owned().await {
+        Ok(d) => d,
+        Err(_) => {
+            // Only reachable if the pool is closed (shutdown). Refuse rather than dispatch
+            // unboundedly — an unbounded dispatch is exactly the defect this gate exists for.
+            return Err(err_ra(
+                StatusCode::TOO_MANY_REQUESTS,
+                "1",
+                openai_error("router at capacity", "rate_limit", None),
+            ));
+        }
     };
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     core.pending.lock().unwrap().insert(id, tx);
-    Ok(Slot { core: core.clone(), _permit: permit, id, rx, started: false })
+    Ok(Slot { core: core.clone(), _permit: permit, _dispatch: dispatch, id, rx, started: false })
 }
 
 // ---------- auth (invariants 10, 11, 15) ----------
@@ -1585,7 +1617,7 @@ pub mod model_context;
 
 use anthropic::messages_h;
 use gemini::gemini_h;
-use handlers::{chat_h, image_h, models_h, unknown_route};
+use handlers::{chat_h, image_h, method_not_allowed, models_h, unknown_route};
 use responses::responses_h;
 
 #[cfg(test)]
@@ -1649,6 +1681,29 @@ pub struct ServerHandle {
     pub addr: SocketAddr,
 }
 
+/// Every 429 this gateway emits carries a `Retry-After`.
+///
+/// Enforced here rather than at the ten places a dialect frames an upstream error: one dialect
+/// that forgot would drift from the others with no failing test. The gap this closes is the
+/// upstream 429 — a provider rate limit reached the client as a bare 429, which reads as "retry
+/// immediately". Capacity and auth-backoff refusals already set their own value, so a value that
+/// is already present is never overwritten.
+///
+/// `1` is a floor, not the provider's real window: the worker reports a status but no retry hint.
+/// It matches the core's own key-cooldown floor (`health-tracker.ts`:
+/// `cooldownUntil = now + max(retryAfterMs ?? 0, 1000)`), so the key is eligible again by the time
+/// a client that honours the header comes back.
+async fn ensure_retry_after(req: Request<Body>, next: Next) -> Response {
+    let mut resp = next.run(req).await;
+    if resp.status() == StatusCode::TOO_MANY_REQUESTS
+        && !resp.headers().contains_key(header::RETRY_AFTER)
+    {
+        resp.headers_mut()
+            .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    }
+    resp
+}
+
 /// Spawn the axum server on 127.0.0.1:port (invariant 11). Bind failure is a loud error
 /// with remediation text (invariant 16).
 pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, String> {
@@ -1665,7 +1720,11 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/messages", post(messages_h))
         .route("/v1/responses", post(responses_h))
         .route("/v1beta/models/{*tail}", post(gemini_h))
+        // Both refusals authenticate first, for the same reason `unknown_route` does: an
+        // unauthenticated 404 or 405 is a statement that the route exists.
+        .method_not_allowed_fallback(method_not_allowed)
         .fallback(unknown_route)
+        .layer(middleware::from_fn(ensure_retry_after))
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {
