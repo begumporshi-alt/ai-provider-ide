@@ -86,6 +86,10 @@ step "Build"                  pnpm build
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
 step "One product version"    pnpm check-version-sync
+# `--audit-level=high`, not `moderate`: `moderate` fails on 2 vitest devDependency advisories whose
+# patched line (>=4.1.11) is a major version away, so it cannot be satisfied without a test-runner
+# migration. `high` exits 0 today and still catches the class that matters. See docs/PRODUCT_COMPLETION_PLAN.md §3.2.
+step "Dependency audit"       pnpm audit --audit-level=high
 
 if command -v cargo >/dev/null 2>&1; then
   step "Rust check"           cargo check --manifest-path "$ROOT/$TAURI_MANIFEST"

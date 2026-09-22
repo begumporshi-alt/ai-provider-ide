@@ -185,6 +185,18 @@ The patched line is `>=4.1.11` while latest is `5.0.1`, so fixing it means a **m
 across all three packages and 460 TypeScript tests. Worth doing deliberately, with the full gate, not folded
 into a security-gate commit.
 
+**Implemented.** `pnpm audit --audit-level=high` runs in `ci.yml` and in `scripts/ci-local.sh`, and
+`.github/workflows/audit.yml` re-runs it weekly on `ubuntu-latest` alongside `rustsec/audit-check`
+against the Tauri host. Two details worth recording: the RustSec action needs
+`working-directory: apps/desktop/src-tauri` because the lockfile is not at the repo root — without it the
+action looks for `./Cargo.lock`, finds nothing, and reports a clean audit it never ran. And on a cron
+trigger the action **files an issue** per advisory rather than failing the run, which is why `audit.yml`
+requests `issues: write`; on push it fails instead.
+
+That scheduled job is not redundant with the `ci.yml` step. The `ci.yml` step only fires when something
+is pushed, so it cannot see an advisory published against code that has not changed — the one case where
+nobody is looking.
+
 ### 3.3 What is already good — and one thing that only *looks* broken
 
 - **CSP** is set (`tauri.conf.json:21`) and is not vacuous.
@@ -341,7 +353,7 @@ other people**; and **build** the measurement.
 | 2.2 | `CHANGELOG.md` | **Done** |
 | 2.3 | `bundle.targets` | **Done** — narrowed to `app` + `dmg` |
 | 3.1 | `SECURITY.md` | **Done** |
-| 3.2 | Dependency audit | **Still open** — no `pnpm audit` / `cargo audit` job |
+| 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=high` in `ci.yml` and the local mirror; weekly `audit.yml` adds the RustSec pass |
 | 4.1 | Linter and formatter | **Deliberately not added** — see below |
 | 4.2 | Coverage | **Still open** |
 | 5.1 | Docs reorganisation | **Still open** — the root docs are untouched |

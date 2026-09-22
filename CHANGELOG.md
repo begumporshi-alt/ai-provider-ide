@@ -28,6 +28,16 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 - `pnpm check-version-sync` — asserts the root `package.json`, both workspace packages,
   `apps/desktop/package.json`, `Cargo.toml` and `tauri.conf.json` all agree on one version.
 
+- **Dependency auditing.** `pnpm audit --audit-level=high` now runs in `ci.yml` and in the local
+  mirror, and a weekly `.github/workflows/audit.yml` re-runs it alongside a RustSec audit of the
+  Tauri host on `ubuntu-latest`.
+
+  The level is `high`, not `moderate`, and that is a measurement rather than a preference: the two
+  moderate advisories share a single root cause — a `vitest` devDependency whose patched line
+  (`>=4.1.11`) is a whole major version away — so `moderate` cannot pass without a test-runner
+  migration first. The scheduled job exists because an advisory can be published against code that
+  has not changed, and a push-triggered gate never fires for that.
+
 ### Fixed
 
 - **A client-facing `Retry-After` is now the shortest wait, not the longest.** The route planner

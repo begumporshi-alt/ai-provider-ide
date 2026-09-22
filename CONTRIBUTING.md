@@ -46,10 +46,21 @@ cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 | `pnpm key-leak-grep` | No real credential in the tree. This repository is public |
 | `pnpm check-ts-version` | One TypeScript version across the workspace |
 | `pnpm check-version-sync` | One product version across every manifest |
+| `pnpm audit --audit-level=high` | No high-or-critical advisory in the JS dependency tree |
 | `cargo check` / `cargo test` | The host |
-| `cargo fmt --check` | Rust formatting |
-| `cargo clippy -- -D warnings` | Rust lints, as errors |
 | Playwright | The live UI harness (wizard, Tier-2 review, egress image) |
+
+**Two steps people expect to find here are deliberately absent:** `cargo fmt --check` and
+`cargo clippy -- -D warnings`. Both were measured before being adopted, and both fail at `HEAD` — fmt
+across the existing Rust sources, clippy with 25 warnings. Adding either would break CI on the first
+push, which is worse than having no gate. Adopting them is a deliberate change that belongs in its own
+commit: rustfmt rewrites most of `apps/desktop/src-tauri/src/` and destroys `git blame` across the host
+for zero behavioural change. See `docs/PRODUCT_COMPLETION_PLAN.md` §4.1.
+
+**A weekly job covers what a push-triggered gate cannot.** `.github/workflows/audit.yml` runs both
+audits on `ubuntu-latest` every Monday, because an advisory can be published against code that has not
+changed — nothing changes, no push happens, so no gate fires. That is also the only place the Rust
+crates are audited.
 
 ## Conventions this codebase actually follows
 

@@ -21,6 +21,13 @@ jobs:
           workspaces: apps/desktop/src-tauri
       - name: Install JS deps
         run: pnpm install --frozen-lockfile
+      # `--audit-level=high`, not `moderate`. Measured at f5c17c1: `moderate` fails on 2 advisories
+      # whose single root cause is a vitest devDependency, and the patched line is >=4.1.11 against a
+      # latest of 5.0.1 -- so `moderate` cannot be satisfied without a major test-runner migration.
+      # A gate that fails on the first push is worse than no gate. `high` exits 0 today and still
+      # catches the class that matters. Raise it when the vitest bump lands.
+      - name: Dependency audit (high and above)
+        run: pnpm audit --audit-level=high
       - name: Typecheck
         run: pnpm typecheck
       - name: Unit tests

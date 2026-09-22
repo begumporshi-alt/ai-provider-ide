@@ -1,0 +1,67 @@
+name: Dependency audit
+
+# Why this is not a step in ci.yml.
+#
+# `pnpm audit` already runs there on every push and PR. What that cannot catch is the case this
+# workflow exists for: an advisory published *later* against a dependency whose code has not
+# changed. Nothing in the repo changes, so no push happens, so no gate fires. Only a clock catches
+# that. The Rust crates were not audited anywhere at all.
+#
+# It also runs on a cheap ubuntu runner rather than the 4-minute macOS one, because nothing here
+# needs macOS -- there is no compilation, only a lockfile read.
+#
+# Why `--audit-level=high` and not `moderate`: measured in docs/PRODUCT_COMPLETION_PLAN.md §3.2.
+# The two moderate advisories share one root cause -- a `vitest` devDependency whose patched line
+# (>=4.1.11) is a whole major version away -- so `moderate` cannot be satisfied without a
+# test-runner migration. A gate that fails on the first push is worse than no gate. Raise it to
+# `moderate` when that migration lands.
+
+on:
+  schedule:
+    # Mondays 06:00 UTC. On a schedule there is no commit to fail, so the RustSec action files one
+    # issue per new advisory instead of marking the run red.
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+  push:
+    # Immediate feedback when a Rust dependency is bumped, rather than waiting up to a week for the
+    # cron. On push the RustSec action fails the run instead of filing an issue -- which is the
+    # behaviour wanted here.
+    paths:
+      - "apps/desktop/src-tauri/Cargo.toml"
+      - "apps/desktop/src-tauri/Cargo.lock"
+
+permissions:
+  contents: read
+  # The RustSec action opens an issue per advisory when triggered by cron...
+  issues: write
+  # ...and attaches a check run in every other case.
+  checks: write
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # `pnpm audit` resolves from the lockfile, but the install is kept so this job matches the
+      # dependency state ci.yml audits rather than an unstated assumption about what audit needs.
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: JS dependency audit (high and above)
+        run: pnpm audit --audit-level=high
+
+      # No Rust toolchain step is needed: the action bundles the `cargo-audit` it runs.
+      # `working-directory` is required because the lockfile is not at the repo root -- without it
+      # the action looks for ./Cargo.lock, finds nothing, and reports a clean audit it never ran.
+      - name: Rust dependency audit (RustSec)
+        uses: rustsec/audit-check@v2.0.0
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          working-directory: apps/desktop/src-tauri
