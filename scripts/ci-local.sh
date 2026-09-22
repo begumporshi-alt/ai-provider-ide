@@ -85,6 +85,7 @@ step "Unit tests"             pnpm test
 step "Build"                  pnpm build
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
+step "One product version"    pnpm check-version-sync
 
 if command -v cargo >/dev/null 2>&1; then
   step "Rust check"           cargo check --manifest-path "$ROOT/$TAURI_MANIFEST"

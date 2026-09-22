@@ -25,10 +25,18 @@ jobs:
         run: pnpm typecheck
       - name: Unit tests
         run: pnpm test
+      # Nothing else in this workflow compiles the production bundle: the Playwright step below
+      # runs against a vite DEV server (playwright.config.ts), so a bundle that no longer builds
+      # stayed green here. scripts/ci-local.sh has always had this step; ci.yml did not, which made
+      # the local mirror stricter than CI.
+      - name: Build (the bundle must compile)
+        run: pnpm build
       - name: Key-leak grep (criterion 5)
         run: pnpm key-leak-grep
       - name: Single TypeScript version (audit R6)
         run: pnpm check-ts-version
+      - name: One product version across every manifest
+        run: pnpm check-version-sync
       - name: Rust check
         run: cargo check --manifest-path apps/desktop/src-tauri/Cargo.toml
       - name: Rust tests (gateway criterion 8, egress invariants, store, persist)
