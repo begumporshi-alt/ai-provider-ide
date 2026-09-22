@@ -1,0 +1,305 @@
+# Product Completion Plan
+
+**Question answered:** what remains to take this from a working prototype to a professional, shippable product.
+
+**Date:** 2026-09-22
+**Assessed tree:** `3bb7665` (clean, `main` == `origin/main`, CI green)
+**Method:** every claim below carries a `file:line` or the command that produced it. External claims are
+checked against the Tauri v2 documentation, not recalled.
+
+---
+
+## 0. The headline
+
+**The engineering is much further along than the packaging.**
+
+The code has four test suites, a real local gate, an audit trail, and a working gateway. What is missing is the
+*product wrapper*: a licence, a release pipeline, a changelog, a disclosure policy, and a tidier docs surface.
+Two facts make this concrete:
+
+- The repo is **public** (`gh repo view` → `visibility: PUBLIC`) and has **no licence**
+  (`licenseInfo: null`; no `LICENSE*` tracked).
+- There is **no automated way to produce a release**. `.github/workflows/` contains exactly one file —
+  `ci.yml`. `v1.0.0` is a tag with nothing attached to it.
+
+Neither is a code problem. Both are the difference between "a repo" and "a product".
+
+---
+
+## 1. Release-blocking
+
+### 1.1 No licence on a public repo
+
+| Evidence | `gh repo view begumporshi-alt/ai-provider-ide` → `"licenseInfo": null`, `"visibility": "PUBLIC"`; `git ls-files \| grep -i license` → nothing |
+|---|---|
+
+A public repository with no licence is legally **all rights reserved**. Nobody may fork it, ship it, or
+contribute to it — the default is not permissive, it is restrictive. `README.md:108` states the repo is public,
+so this is not a theoretical audience.
+
+**Action:** add `LICENSE`; add a `license` field to the root `package.json` and `Cargo.toml`; set the GitHub
+description and topics (both currently empty — `"description": ""`).
+
+> Apache-2.0 is the better default here: it carries an explicit patent grant and a `NOTICE` mechanism, which
+> suits a tool that handles credentials. MIT is simpler if you want maximum permissiveness. Either is fine; the
+> current state is the only wrong answer.
+
+### 1.2 No release pipeline
+
+| Evidence | `find .github -type f` → `ci.yml` only. No tag trigger, no `tauri-action`, no artifact upload. |
+|---|---|
+
+`ci.yml:3-6` triggers on `push: branches: [main]` and `pull_request` — never on tags. So tagging `v1.0.0`
+produces a label, not a download. A user cannot install this.
+
+**Action:** add `.github/workflows/release.yml` triggered on `push: tags: ["v*"]`, building with
+`tauri-apps/tauri-action`, which uploads bundles and can open the GitHub Release.
+
+### 1.3 CI never builds the bundle
+
+| Evidence | `ci.yml` has no `pnpm build` step. `playwright.config.ts` `webServer[1].command` is `pnpm exec vite --port 1430` — a **dev server**, not a built bundle. `scripts/ci-local.sh:83-85` says it outright: *"ci.yml has no build step at all, so nothing in CI would catch a bundle that no longer compiles"*. |
+|---|---|
+
+`ci-local.sh:85` runs `pnpm build`; `ci.yml` does not. **The local mirror is stricter than CI** — which means a
+change can be green in CI and broken at release time. That is the exact failure mode a release pipeline is
+supposed to prevent, and it is currently undetected.
+
+**Action:** add a `Build` step to `ci.yml` between typecheck and the Rust steps, matching `ci-local.sh` order.
+
+### 1.4 The auto-updater is documented but not implemented — and the docs describe a mechanism that is not there
+
+This is the most serious item, because it is a *documented security mechanism* that does not exist.
+
+What is present: `SIGNING.md`, `UPDATER.md`, `generate-updater-keys.sh`, `release-server.sh`.
+What is absent:
+
+| Missing piece | Evidence |
+|---|---|
+| The plugin crate | `Cargo.toml` has no `tauri-plugin-updater` (`grep -n updater Cargo.toml` → none) |
+| The npm package | `apps/desktop/package.json` has no `@tauri-apps/plugin-updater` |
+| The config block | `tauri.conf.json` has no `plugins` key at all |
+| `bundle.createUpdaterArtifacts` | absent from `tauri.conf.json:24-34` |
+| The capability | `capabilities/default.json:6-9` grants only `core:default`, `opener:default` — no `updater:default` |
+| The keypair | no `signing-keys/` directory |
+
+And three of the documents are wrong:
+
+1. **`SIGNING.md:35`** — *"The `tauri.conf.json` now includes:"* followed by a top-level `"updater": { … }`
+   block. It does not include it, and in **Tauri v2 the block belongs under `plugins.updater`**, with
+   `createUpdaterArtifacts` under `bundle` ([v2 updater docs](https://v2.tauri.app/plugin/updater/)). The shape
+   in this file is v1-era.
+2. **`SIGNING.md:29-30`** — instructs `export TAURI_SIGNING_PUBLIC_KEY=…`. That variable **does not exist**.
+   Tauri reads `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`. Following this doc wastes
+   an afternoon.
+3. **`generate-updater-keys.sh:9-14`** — generates an **RSA** pair with `openssl genrsa` + `openssl rsa
+   -pubout`. Tauri's signer produces a **minisign (ed25519)** keypair via `tauri signer generate`, and the
+   verifier accepts that format. **Keys from this script cannot verify an update** — the script is a working
+   implementation of the wrong thing.
+
+The endpoint template is also v1-shaped: `SIGNING.md:42` uses `{target}/{arch}/{version}`; v2 uses
+`{{target}}/{{arch}}/{{current_version}}`.
+
+**Action — one of two, and pick deliberately:**
+
+- **(a) Implement it properly.** `pnpm tauri add updater`; `tauri signer generate`; put the public key under
+  `plugins.updater.pubkey`; set `bundle.createUpdaterArtifacts: true`; add `updater:default` to
+  `capabilities/default.json`; host a real endpoint. Delete `generate-updater-keys.sh` and rewrite both docs.
+- **(b) Delete the claim.** Remove `SIGNING.md`'s updater section, `UPDATER.md`, `generate-updater-keys.sh`,
+  `release-server.sh`, and state in `README.md` that updates are manual.
+
+**My recommendation is (b) now, (a) when you have a distribution audience.** A document that describes update
+signing incorrectly is worse than no document: it is the artefact a future contributor trusts.
+
+---
+
+## 2. Versioning and release hygiene
+
+### 2.1 The version is stated in four places and they disagree
+
+| File | Line | Value |
+|---|---|---|
+| `package.json` (root) | 4 | `0.0.0` |
+| `apps/desktop/package.json` | 4 | `1.0.0` |
+| `apps/desktop/src-tauri/Cargo.toml` | 3 | `1.0.0` |
+| `apps/desktop/src-tauri/tauri.conf.json` | 4 | `1.0.0` |
+
+Git tag: `v1.0.0`.
+
+**`tauri.conf.json` is authoritative for the bundle.** The root `0.0.0` is the visible drift. Action: make one
+the source of truth (tauri.conf.json is the natural one) and either sync or generate the rest, so a release
+cannot ship a bundle whose version disagrees with its tag.
+
+### 2.2 No CHANGELOG
+
+A `v1.0.0` tag exists; a user-facing changelog does not. Twenty-one root docs describe internal plans, none
+describe what changed for a user. Action: add `CHANGELOG.md` (Keep a Changelog shape), seed it from
+`git log --oneline`.
+
+### 2.3 `bundle.targets: "all"` over-promises
+
+`tauri.conf.json:26` is `"all"` — dmg, app, msi, nsis, deb, rpm, AppImage. But `README.md:13-15` says *"Windows
+and Linux are untested"* and CI is `macos-14` only (`ci.yml:10`). Shipping installers you have never run is a
+support burden and an implicit promise.
+
+**Action:** either narrow to `["app", "dmg"]`, or keep `"all"` and say plainly in `README.md` that only the
+macOS artefact is supported. The icons already imply cross-platform intent (`icons/` carries `.ico` and the
+Windows Store logos) — that intent should be a stated decision, not an accident of the bundler default.
+
+---
+
+## 3. Security and disclosure
+
+### 3.1 No SECURITY.md
+
+The product's core promise is *"API keys are stored in the OS keychain and never written to disk"*
+(`README.md:8-9`). There is no channel to report a break of that promise. For a tool whose whole premise is
+credential safety, this is the most conspicuous governance gap after the licence.
+
+**Action:** add `SECURITY.md` — private reporting route, scope (gateway auth and the master-key check, keychain
+handling, the egress allowlist, the memory layer's scoping), and an explicit out-of-scope list.
+
+### 3.2 No dependency-vulnerability scanning
+
+No `pnpm audit` or `cargo audit` anywhere in CI or `scripts/`. The dependency surface is non-trivial
+(`Cargo.toml:20-40` pulls `reqwest`, `rusqlite` with a bundled SQLite, `keyring`, `axum`, `arboard`, …).
+
+**Action:** add a PR-time audit plus a scheduled job.
+
+### 3.3 What is already good — and one thing that only *looks* broken
+
+- **CSP** is set (`tauri.conf.json:21`) and is not vacuous.
+- **`connect-src` does not list `http://127.0.0.1:*`, but that is correct, not a bug.** I checked: there is no
+  `fetch(` in `apps/desktop/src` — the UI reaches the gateway through Tauri IPC, not HTTP. `Gateway.tsx:119`
+  builds an `http://127.0.0.1:${port}` string only to *display* it for copying. Only `img-src` needs the
+  loopback entry, and it has it.
+- **Least privilege is real.** `capabilities/gateway.json:6-9` grants the hidden worker window only
+  `core:event:allow-listen` and `allow-unlisten` — no filesystem, no shell, no opener. The comment at
+  `gateway.json:4` documents why the capability exists at all.
+- **`key-leak-grep` runs in CI** (`ci.yml:28-29`) and `.gitignore:23-27` covers `.env*`, `*.pem`, `*.key`.
+
+### 3.4 A distribution consequence worth stating in the docs
+
+A notarized Developer ID release is a **different signing identity** from a local ad-hoc build. Since keychain
+ACLs are bound to the signing identity, a user moving from a local build to a release will hit the one-time
+approval prompt that `README.md:106-107` already documents — and until they approve it, every request answers
+`503 master key unavailable`. Worth a line in the release notes, because it looks like a bug.
+
+### 3.5 Adjacent, not this repo
+
+`ANTHROPIC_AUTH_TOKEN` sits in `~/.codex/config.toml` under `[shell_environment_policy.set]` (mode `0600`). It
+is not this repo's leak, but it is inherited by every shell this project spawns.
+
+---
+
+## 4. Quality gates that do not exist
+
+### 4.1 No linter or formatter anywhere
+
+No `eslint.config.*`, no `.eslintrc*`, no `.prettierrc*`, no `rustfmt.toml`, no `clippy.toml`, no
+`.editorconfig` — and `grep -rn '"eslint"\|"prettier"'` across all `package.json` files returns nothing.
+
+That is a deliberate-looking omission, but it should be a **decision**, not an accident. The cheapest high-value
+half:
+
+```
+cargo fmt --manifest-path apps/desktop/src-tauri/Cargo.toml --check
+cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml -- -D warnings
+```
+
+Both are near-free in CI and catch a class of Rust defect the test suite cannot. ESLint on the TS side is a
+larger conversation — worth having explicitly.
+
+### 4.2 No coverage measurement
+
+`coverage/` is gitignored (`.gitignore:5`) but nothing produces it. Four suites exist — router-core,
+adapter-spec, desktop vitest, and the Playwright harness — with no aggregate number. Coverage is a weak signal,
+but *no* number means you cannot answer "did this change make things worse".
+
+### 4.3 No `.env.example` — low priority
+
+Only one env var is read: `GW_LOG` (`lib.rs:157`). The frontend reads no `import.meta.env` at all. Documenting
+`GW_LOG` is a nicety, not a gap.
+
+---
+
+## 5. Documentation hygiene
+
+### 5.1 Twenty-one root-level `.md` files, and `docs/` holds one
+
+Root currently mixes permanent docs (`README.md`, `ARCHITECTURE.md`, `DECISIONS.md`, `MASTER_PROMPT.md`) with
+dated audit artefacts (`AUDIT_REPORT.md`, `ARCHITECTURE_AUDIT.md`, `AUDIT_TRAIL_READER_2026-09-21.md`,
+`CONTROL_*_2026-09-21.md`, `SECURITY_AUDIT_2026-09-20.md`, `TOOL_CALL_DIAGNOSIS_2026-09-20.md`, …) and plan
+files (`COUNT_TOKENS_PLAN.md`, `STAGE2_RETRY_AFTER_PLAN.md`, `UI_UX_PLAN.md`).
+
+**Action:** the root should hold `README`, `LICENSE`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` — and nothing
+else. Move history to `docs/history/`, plans to `docs/plans/`, and add `docs/README.md` as an index. This is
+mechanical and reversible, and it is the single change that most affects how the repo reads to a stranger.
+
+### 5.2 `README.md:90` still hardcodes the port
+
+> *"The gateway listens on **port 8800**"*
+
+This is the same class of bug as the 8787 sweep: **8800 is a persisted setting, 8787 is the compiled default**
+(`gateway.rs:33`). A fresh clone is not on 8800. It should read `<port>` with the "check Control → Local
+Gateway" pointer that already follows it.
+
+### 5.3 Three empty junk directories at the repo root
+
+`IDE/`, `ai/`, `provider/` — all empty. Root is named `open ai provider IDE`, so these are almost certainly the
+result of a `mkdir ai provider IDE` run from inside that directory. They are untracked, so `git status` is
+clean and nothing will ever flag them.
+
+**Action:** remove them.
+
+### 5.4 A plan whose evidence is gone
+
+`docs/gateway-flexibility-plan.md:6` cites a shallow clone at `/tmp/OmniRoute`. That reference is
+unreproducible now. Not urgent, but it is the kind of citation that ages into a false claim.
+
+---
+
+## 6. Functional backlog — the five items, restated with current evidence
+
+| # | Item | Status | Evidence |
+|---|---|---|---|
+| 1 | Retry-After plumbing | **DONE** | `e5dcf62`; `minRetryAfterMs()` in `execution-engine.ts`; 3 tests |
+| 2 | `count_tokens` | **DONE** | route at `gateway.rs:1757`, handler `gateway_anthropic.rs:135`, three 200-proving tests |
+| 3 | `previous_response_id` | **CLOSED — not applicable** | Codex points at OmniRoute, not this gateway, and sets `wire_api = "responses"` + `disable_response_storage = true` |
+| 4 | `cache_control` | **BLOCKED on measurement** | see below |
+| 5 | `thinking` blocks | **NOT STARTED** | quality-only, last |
+
+**On `cache_control` specifically.** The feature is real but currently unmeasurable: the signal is
+`prompt_tokens_details.cached_tokens`, which appears **nowhere** in the codebase, and the `ledger` table has no
+column for it. The ledger does show the shape of the problem — `agnes-2.5-flash` has 648 requests, ~35.9M input
+tokens against ~213K output, roughly 55.5K input per request — so caching would pay. But no active manifest
+mentions caching either. The order is **measure → decide → rework**, and measuring needs a real migration.
+This is parked pending your call (see §8).
+
+---
+
+## 7. Suggested order
+
+**Phase A — "this is a product" (~half a day).** Licence + repo metadata; `CHANGELOG.md`; version
+single-source; the `pnpm build` step in `ci.yml`; delete the three junk directories; fix `README.md:90`.
+*Nothing here is architectural, and together they change what the repo is.*
+
+**Phase B — "this is distributable" (~a day).** `release.yml` + `tauri-action`; decide the updater (§1.4);
+narrow `bundle.targets` or state the macOS-only support; `SECURITY.md`.
+
+**Phase C — "this is maintainable" (~a day).** `cargo fmt --check` + `cargo clippy -D warnings` in CI;
+dependency audit job; the `docs/` reorganisation; `CONTRIBUTING.md`.
+
+**Phase D — optional.** ESLint; coverage measurement; the `cache_control` migration; `thinking` blocks.
+
+---
+
+## 8. Decisions needed from you
+
+1. **Licence** — MIT, Apache-2.0, or something else? *(Apache-2.0 recommended: patent grant, suits a
+   credential-handling tool.)*
+2. **Updater** — implement it properly, or delete the docs and scripts and declare manual updates?
+   *(Recommendation: delete now. A wrong document about update signing is a liability.)*
+3. **Audience** — is this going to other people (which makes Phase B mandatory and implies the Apple Developer
+   Program for notarization), or is it a local/portfolio tool (which makes Phase B optional)? This single answer
+   changes the size of the remaining work more than anything else.
+4. **`cache_control`** — build the `cached_tokens` measurement migration now, or keep it parked?

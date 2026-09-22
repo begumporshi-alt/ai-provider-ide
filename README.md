@@ -68,12 +68,43 @@ skipped unless `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` are set.
 > The `.dmg` step may fail on some machines (`hdiutil`). The signed `.app` is already complete at that point —
 > the DMG failure is cosmetic.
 
+## Releasing
+
+`.github/workflows/release.yml` builds a **universal** (Apple Silicon + Intel) macOS bundle on a `v*`
+tag and attaches it to a **draft** GitHub Release, so the artefacts can be checked before anyone can
+download them.
+
+Signing and notarization come entirely from the environment — never from `tauri.conf.json`, because
+no job outside that workflow runs a full `tauri build`, so an identity pinned in the config would be
+invisible to every other check here. Repository secrets needed:
+
+| Secret | What it is |
+|---|---|
+| `APPLE_CERTIFICATE` | Developer ID Application certificate (`.p12`), base64-encoded |
+| `APPLE_CERTIFICATE_PASSWORD` | The password set when exporting that `.p12` |
+| `APPLE_SIGNING_IDENTITY` | Optional — the certificate's keychain name; derived from the certificate if unset |
+| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | Notarization credentials (`APPLE_PASSWORD` is an app-specific password) |
+
+Without a certificate the build still succeeds, but it is **ad-hoc signed**. That is fine locally and
+not fine for a download: macOS refuses to launch an unnotarized app from an unidentified developer,
+so the user sees "the developer cannot be verified" instead of your app.
+
+**There is no auto-updater — updates are manual.** The user downloads the new release and replaces
+the app. `UPDATER.md`, `SIGNING.md` and the two updater scripts were removed in 1.0.0 because they
+described an updater that was never implemented, and described it wrongly: a top-level `updater`
+config block (Tauri v1's shape, not v2's `plugins.updater`), a `TAURI_SIGNING_PUBLIC_KEY` variable
+Tauri does not read, and an RSA keypair where Tauri verifies minisign/ed25519. See `CHANGELOG.md`.
+
+A notarized release is a **different signing identity** from a locally built app, and keychain access
+is bound to the identity — so the first launch after switching between them prompts once. See
+`SECURITY.md`.
+
 ## Test
 
 ```bash
 pnpm typecheck                 # all workspaces
 pnpm test                      # unit tests
-pnpm ci:local                  # the full gate: leak scan, typecheck, Rust, browser
+pnpm ci:local                  # the full gate: leak scan, version sync, build, Rust, browser
 ```
 
 `pnpm ci:local` needs `PATH="$HOME/.cargo/bin:$PATH"` or it reports a bogus "Rust (cargo missing)" failure.
@@ -87,8 +118,8 @@ pnpm ci:local                  # the full gate: leak scan, typecheck, Rust, brow
    - **Guided setup** — for anything else; it probes the API, identifies the dialect, runs free contract
      checks, and only enables the provider after you approve.
 3. Add a key per provider (**+ Add key**). It goes to the keychain.
-4. Enable the provider. The gateway listens on **port 8800**; check Control → Local Gateway for the current
-   port and the master key.
+4. Enable the provider. The gateway listens on `127.0.0.1` on a **configurable port** — Control → Local
+   Gateway shows the current one along with the master key. A fresh install starts on `8787`.
 
 ## Layout
 
@@ -106,3 +137,12 @@ Architecture and decisions live in `ARCHITECTURE.md` and `DECISIONS.md`.
 - After replacing the installed binary, macOS will prompt once before the app may read its keychain entry.
   Until you approve it, every gateway request returns `503 master key unavailable`.
 - This repository is public. Never commit a real key or token; `pnpm key-leak-grep` runs in CI.
+
+## Contributing
+
+See `CONTRIBUTING.md` for the gate, and for the conventions this codebase follows — each one was paid
+for by a bug. For a vulnerability, do **not** open a public issue; see `SECURITY.md`.
+
+## Licence
+
+Apache License 2.0 — see `LICENSE`.

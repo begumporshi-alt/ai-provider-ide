@@ -1,0 +1,70 @@
+name: Release
+
+# Tags only. ci.yml already runs on every push to main, so triggering a release build on every push
+# would double the work and produce unsigned artefacts nobody asked for.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      # Both targets, because the artefact is built universal — one download that runs on Apple
+      # Silicon and Intel alike.
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      # The same gate CI runs, before anything is built. A release is the worst possible place to
+      # discover that a check was skipped. Browser specs are omitted because this job's purpose is
+      # to produce an artefact, not to re-run the UI suite that `main` already passed.
+      - name: Gate
+        run: bash scripts/ci-local.sh --skip-browser
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Signing and notarization come entirely from the environment. They are deliberately NOT
+          # configured in tauri.conf.json: no job in this repository runs a full `tauri build`
+          # outside this workflow, so a signing identity pinned in the config would be invisible to
+          # every other check — a green push would prove nothing about it.
+          #
+          # Required secrets (see CONTRIBUTING.md):
+          #   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD  — the Developer ID .p12, base64
+          #   APPLE_SIGNING_IDENTITY                         — optional; derived from the cert if unset
+          #   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID        — notarization credentials
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          args: --target universal-apple-darwin
+          tagName: ${{ github.ref_name }}
+          releaseName: "AI-Provider Router ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for what changed in this release."
+          # A draft, so the artefacts can be checked before anyone can download them. An unsigned
+          # or un-notarized macOS build is worse than no build: it fails to launch for the user.
+          releaseDraft: true
+          prerelease: false
