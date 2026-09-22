@@ -11,9 +11,14 @@
 - `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH.
 - Gate needs `PATH="$HOME/.cargo/bin:$PATH"` — else `FAILED (1): Rust (cargo missing)` though all else passes.
 - **One edit per file per batch** — the second lands on a stale snapshot and clobbers the first; both report success.
-- Absence claims: use the **Grep tool** (bash `grep` shim unreliable). A hit ≠ completeness — chase the doc comment.
+- Absence claims: use the **Grep tool** (bash `grep` shim unreliable) — **but it skips dot-directories**, so
+  `.github/` and `.workbuddy-ai/` need `cat <dir>/* | grep` or a Read. Three wrong conclusions in one session
+  came from searches that never reached the directory. A hit ≠ completeness — chase the doc comment.
 
 ## Orientation
+- **Docs live in `docs/`** (moved 2026-09-22): `ARCHITECTURE.md`, `DECISIONS.md`, `GATEWAY_MEMORY_LAYER.md`,
+  `CONTROL_SCREEN_BUILD.md`, the dated session records. **Older logs cite them by bare filename** — resolve
+  those under `docs/`. Root keeps only README/CHANGELOG/CONTRIBUTING/SECURITY/LICENSE.
 - Playground = **Assistant** (`screens/Assistant.tsx`). **Skills are frontend-only**: bodies in SQLite `skills`
   (`store.rs:230`), expanded in `Assistant.tsx` (`:583`, `:702`). Gateway is a blind proxy for `system`.
 - Live DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db`, `?mode=ro`. Version in

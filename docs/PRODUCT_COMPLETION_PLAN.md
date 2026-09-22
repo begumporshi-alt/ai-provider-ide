@@ -283,7 +283,18 @@ Only one env var is read: `GW_LOG` (`lib.rs:157`). The frontend reads no `import
 
 ## 5. Documentation hygiene
 
-### 5.1 Twenty-five root-level `.md` files, and `docs/` holds two
+### 5.1 Twenty-five root-level `.md` files, and `docs/` holds two — **resolved**
+
+**Executed 2026-09-22.** The 19 non-governance files moved to `docs/`, flat, following the precedent already
+set by `docs/gateway-flexibility-plan.md`. The root now holds six: `README`, `CHANGELOG`, `CONTRIBUTING`,
+`SECURITY`, and the two overview artefacts the tooling writes there.
+
+Verified rather than reasoned: **17 Markdown links across 36 files, 0 broken.** These docs cross-link each
+other by bare relative path (`[MASTER_PROMPT.md](MASTER_PROMPT.md)`), and because every one of them moved
+into the *same* directory those links stayed valid. Exactly one reference needed editing — `README.md:132`.
+
+The 54 bare-filename citations in `.workbuddy-ai/memory/` are handled by a **mapping note in `MEMORY.md`**,
+not by rewriting the logs. Daily logs are append-only by policy, so a pointer note is the only honest fix.
 
 Root currently mixes permanent docs (`README.md`, `ARCHITECTURE.md`, `DECISIONS.md`, `MASTER_PROMPT.md`) with
 dated audit artefacts (`AUDIT_REPORT.md`, `ARCHITECTURE_AUDIT.md`, `AUDIT_TRAIL_READER_2026-09-21.md`,
@@ -397,7 +408,7 @@ other people**; and **build** the measurement.
 | 3.2 | Dependency audit | **Done** — `pnpm audit --audit-level=high` in `ci.yml` and the local mirror; weekly `audit.yml` adds the RustSec pass |
 | 4.1 | Linter and formatter | **Deliberately not added** — see below |
 | 4.2 | Coverage | **Still open** |
-| 5.1 | Docs reorganisation | **Still open, and measured** — 54 references in `.workbuddy-ai/memory/` are cited by bare filename; see §5.1 |
+| 5.1 | Docs reorganisation | **Done** — 19 files moved to `docs/`; root holds 6; 17 links verified, 0 broken; mapping note added to `MEMORY.md` |
 | 5.2 | README port hardcode | **Done** |
 | 5.3 | Junk directories | **Partly** — `ai/` and `provider/` removed; `IDE/` left alone, see below |
 | 6.4 | `cache_control` measurement | **Done** — migration 0015 plus 8 tests |

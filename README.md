@@ -129,7 +129,9 @@ packages/router-core/    routing, adapter runtime, model catalog, onboarding orc
 packages/adapter-spec/   the manifest grammar (zod) — the frozen contract
 ```
 
-Architecture and decisions live in `ARCHITECTURE.md` and `DECISIONS.md`.
+Architecture and decisions live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
+[`docs/DECISIONS.md`](docs/DECISIONS.md). The rest of the design and session records are in `docs/` too —
+the repository root holds only `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` and `LICENSE`.
 
 ## Notes
 
