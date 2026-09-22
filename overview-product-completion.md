@@ -6,7 +6,7 @@ Answered the question *"what is left to make this a professional product?"* by a
 `3bb7665` (written up as **`docs/PRODUCT_COMPLETION_PLAN.md`**), then — on the four decisions that
 followed — implemented them and shipped.
 
-Twelve commits on `main` (`754a5fc`..`4e78768`). CI run `35732995088` **green**, all 17 steps; every
+Thirteen commits on `main` (`754a5fc`..`6327ecc`). CI run `35732995088` **green**, all 17 steps; every
 follow-up commit re-ran the same gate green, and the new scheduled audit workflow was verified by
 dispatching it (`35736120680`, green) rather than assumed to fire.
 
@@ -71,6 +71,21 @@ listed `cargo fmt --check` and `cargo clippy -- -D warnings` as enforced steps. 
 both were measured and deliberately withheld. That is the same defect class as the updater docs that
 described a mechanism nobody had built — a doc claiming a control stops anyone looking for it.
 
+## Also done: the root docs reorganisation (§5.1)
+
+The root held 25 `.md` files and now holds six — `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY`, plus the
+two overview artefacts the tooling writes there. The other 19 moved to `docs/`, flat.
+
+**The measurement that mattered.** 54 references to those files live in project memory, cited by bare
+filename (`GATEWAY_MEMORY_LAYER.md` ×10, `CONTROL_SCREEN_BUILD.md` ×6), in daily logs that are **append-only
+by policy** and so cannot be rewritten to match. That cost is paid with a mapping note in `MEMORY.md`, not
+by editing history that should stay as written.
+
+**What made the move safe.** These docs cross-link each other by bare relative path, so moving them only
+works if they all land in the same directory — they did. Scanned afterwards rather than assumed: **17
+markdown links across 36 files, 0 broken**, and exactly one reference needed editing. Every rename is
+`R100`, so each file keeps its full history.
+
 ## Deliberately left, with the reason
 
 - **`cargo fmt --check` and `cargo clippy -D warnings`.** Measured before adding, rather than assumed:
@@ -85,12 +100,7 @@ described a mechanism nobody had built — a doc claiming a control stops anyone
   and the patched line (`>=4.1.11`) is a whole major version from latest (`5.0.1`). Fixing it means a
   test-runner migration across three packages and 460 tests. Its own commit, with the full gate — and
   when it lands, the audit level can rise from `high` to `moderate`.
-- **The root docs reorganisation (§5.1) — measured, and the cheap option isn't cheap.** The root holds 25
-  `.md` files, but **54 references** to them live in project memory, cited by bare filename
-  (`GATEWAY_MEMORY_LAYER.md` ×10, `CONTROL_SCREEN_BUILD.md` ×6). Daily logs are append-only, so a move
-  cannot rewrite them. Only 4 of the 19 non-governance files are uncited at all. The cost is not the
-  `git mv`; it is 54 stale pointers in the files that orient the next session.
-- **Also still open:** coverage (§4.2).
+- **Coverage (§4.2).** The only plan item still untouched.
 
 ## The three things worth carrying forward
 
