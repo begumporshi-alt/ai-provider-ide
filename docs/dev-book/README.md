@@ -36,6 +36,7 @@ image does not resolve, or if two elements claim the same `id` — the two failu
 | Debugging something that "should work" | [03 Contracts](03-contracts.md) → [04 Data model](04-data-model.md) |
 | Wanting the picture rather than the prose | [08 Flows](08-flows.md) → [02 Architecture](02-architecture.md) |
 | Picking up the backlog | [09 Status](09-status.md) → [07 Drift register](07-drift-register.md) |
+| Planning a major architectural change | [10 Headless service](10-headless-service.md) |
 
 ## Chapters
 
@@ -50,6 +51,7 @@ image does not resolve, or if two elements claim the same `id` — the two failu
 | 07 | [Drift register](07-drift-register.md) | Known doc-versus-code disagreements, and the change checklist |
 | 08 | [Flows](08-flows.md) | The request lifecycle and the user journey, with diagrams |
 | 09 | [Status](09-status.md) | Where the work stands: working, gaps, parked, needs improvement |
+| 10 | [Headless service](10-headless-service.md) | Plan for detaching the gateway from the webview process |
 
 ## Single ownership — where truth lives
 

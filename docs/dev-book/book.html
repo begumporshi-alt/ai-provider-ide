@@ -171,11 +171,12 @@ figure.diagram figcaption a{border-bottom:none}
 <a class="nav-item" href="#ch-07" data-target="ch-07"><span class="nav-num">07</span><span class="nav-title">07 — Drift register</span></a>
 <a class="nav-item" href="#ch-08" data-target="ch-08"><span class="nav-num">08</span><span class="nav-title">08 — Flows</span></a>
 <a class="nav-item" href="#ch-09" data-target="ch-09"><span class="nav-num">09</span><span class="nav-title">09 — Status</span></a>
+<a class="nav-item" href="#ch-10" data-target="ch-10"><span class="nav-num">10</span><span class="nav-title">10 — Headless service mode</span></a>
 <a class="nav-item" href="#appendix-diagrams" data-target="appendix-diagrams"><span class="nav-num">A</span><span class="nav-title">Diagram index</span></a>
 </nav>
 <main>
   <p class="generated-note">
-    Generated from <code>docs/dev-book/</code> — 10 chapters.
+    Generated from <code>docs/dev-book/</code> — 11 chapters.
     Edit the markdown, then run <code>pnpm docs:book</code>. Never edit this file.
   </p>
 <section class="chapter" id="ch-00" data-title="The developer book">
@@ -188,9 +189,9 @@ figure.diagram figcaption a{border-bottom:none}
 <pre><code class="language-bash">pnpm docs:book</code></pre>
 <p><code>scripts/build-dev-book.mjs</code> has no dependencies. It <strong>fails the build</strong> if any relative link or image does not resolve, or if two elements claim the same <code>id</code> — the two failure modes that <a href="#ch-07">07</a> D9 records. Edit the markdown, regenerate, and commit both.</p>
 <h2 id="ch-00-how-to-read-it">How to read it</h2>
-<div class="table-wrap"><table><thead><tr><th>If you are</th><th>Read</th></tr></thead><tbody><tr><td>New to the repository</td><td><a href="#ch-01">01 Orientation</a> → <a href="#ch-02">02 Architecture</a> → <a href="#ch-05">05 Workflow</a></td></tr><tr><td>About to change code</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-06">06 Conventions</a> → the checklist in <a href="#ch-07">07</a></td></tr><tr><td>About to cut a release</td><td><a href="#ch-05">05 Workflow</a> § Release, then <a href="#ch-07">07</a></td></tr><tr><td>Debugging something that &quot;should work&quot;</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-04">04 Data model</a></td></tr><tr><td>Wanting the picture rather than the prose</td><td><a href="#ch-08">08 Flows</a> → <a href="#ch-02">02 Architecture</a></td></tr><tr><td>Picking up the backlog</td><td><a href="#ch-09">09 Status</a> → <a href="#ch-07">07 Drift register</a></td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>If you are</th><th>Read</th></tr></thead><tbody><tr><td>New to the repository</td><td><a href="#ch-01">01 Orientation</a> → <a href="#ch-02">02 Architecture</a> → <a href="#ch-05">05 Workflow</a></td></tr><tr><td>About to change code</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-06">06 Conventions</a> → the checklist in <a href="#ch-07">07</a></td></tr><tr><td>About to cut a release</td><td><a href="#ch-05">05 Workflow</a> § Release, then <a href="#ch-07">07</a></td></tr><tr><td>Debugging something that &quot;should work&quot;</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-04">04 Data model</a></td></tr><tr><td>Wanting the picture rather than the prose</td><td><a href="#ch-08">08 Flows</a> → <a href="#ch-02">02 Architecture</a></td></tr><tr><td>Picking up the backlog</td><td><a href="#ch-09">09 Status</a> → <a href="#ch-07">07 Drift register</a></td></tr><tr><td>Planning a major architectural change</td><td><a href="#ch-10">10 Headless service</a></td></tr></tbody></table></div>
 <h2 id="ch-00-chapters">Chapters</h2>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Chapter</th><th>Owns</th></tr></thead><tbody><tr><td>01</td><td><a href="#ch-01">Orientation</a></td><td>What the product is, the repository map, the toolchain, the screen map</td></tr><tr><td>02</td><td><a href="#ch-02">Architecture</a></td><td>The two-runtime split, the layer stack, the one security boundary, self-construction</td></tr><tr><td>03</td><td><a href="#ch-03">Contracts</a></td><td>Invariants, the HTTP surface, the IPC surface, status-code semantics, budgets</td></tr><tr><td>04</td><td><a href="#ch-04">Data model</a></td><td>Schema, migration rules, identifier rules, retention</td></tr><tr><td>05</td><td><a href="#ch-05">Workflow</a></td><td>The gate, the fast loops, the test suites, releasing, verification discipline</td></tr><tr><td>06</td><td><a href="#ch-06">Conventions</a></td><td>Code, test, UI and doc conventions — each with the bug it cost</td></tr><tr><td>07</td><td><a href="#ch-07">Drift register</a></td><td>Known doc-versus-code disagreements, and the change checklist</td></tr><tr><td>08</td><td><a href="#ch-08">Flows</a></td><td>The request lifecycle and the user journey, with diagrams</td></tr><tr><td>09</td><td><a href="#ch-09">Status</a></td><td>Where the work stands: working, gaps, parked, needs improvement</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Chapter</th><th>Owns</th></tr></thead><tbody><tr><td>01</td><td><a href="#ch-01">Orientation</a></td><td>What the product is, the repository map, the toolchain, the screen map</td></tr><tr><td>02</td><td><a href="#ch-02">Architecture</a></td><td>The two-runtime split, the layer stack, the one security boundary, self-construction</td></tr><tr><td>03</td><td><a href="#ch-03">Contracts</a></td><td>Invariants, the HTTP surface, the IPC surface, status-code semantics, budgets</td></tr><tr><td>04</td><td><a href="#ch-04">Data model</a></td><td>Schema, migration rules, identifier rules, retention</td></tr><tr><td>05</td><td><a href="#ch-05">Workflow</a></td><td>The gate, the fast loops, the test suites, releasing, verification discipline</td></tr><tr><td>06</td><td><a href="#ch-06">Conventions</a></td><td>Code, test, UI and doc conventions — each with the bug it cost</td></tr><tr><td>07</td><td><a href="#ch-07">Drift register</a></td><td>Known doc-versus-code disagreements, and the change checklist</td></tr><tr><td>08</td><td><a href="#ch-08">Flows</a></td><td>The request lifecycle and the user journey, with diagrams</td></tr><tr><td>09</td><td><a href="#ch-09">Status</a></td><td>Where the work stands: working, gaps, parked, needs improvement</td></tr><tr><td>10</td><td><a href="#ch-10">Headless service</a></td><td>Plan for detaching the gateway from the webview process</td></tr></tbody></table></div>
 <h2 id="ch-00-single-ownership-where-truth-lives">Single ownership — where truth lives</h2>
 <p>Every fact has exactly one home. If two files state the same fact, one of them is a copy and will rot.</p>
 <div class="table-wrap"><table><thead><tr><th>Subject</th><th>Authoritative source</th></tr></thead><tbody><tr><td>Product overview, install, first run, signing</td><td><code>README.md</code></td></tr><tr><td>What changed, per release</td><td><code>CHANGELOG.md</code></td></tr><tr><td>Build, test, gate, contribution mechanics</td><td><code>CONTRIBUTING.md</code></td></tr><tr><td>Vulnerability reporting and threat scope</td><td><code>SECURITY.md</code></td></tr><tr><td>Design narrative, module map, data flows, acceptance criteria</td><td><code>docs/ARCHITECTURE.md</code></td></tr><tr><td>Why a decision was made, dated</td><td><code>docs/DECISIONS.md</code></td></tr><tr><td>Memory and context subsystem design</td><td><code>docs/GATEWAY_MEMORY_LAYER.md</code></td></tr><tr><td>Control screen design and the audit trails</td><td><code>docs/CONTROL_SCREEN_BUILD.md</code></td></tr><tr><td>Product-completion <strong>audit</strong> and its dated evidence trail</td><td><code>docs/PRODUCT_COMPLETION_PLAN.md</code></td></tr><tr><td>Product-completion <strong>current status</strong> (the live snapshot)</td><td><a href="#ch-09">09 Status</a></td></tr><tr><td>Diagrams and visual assets</td><td><code>diagrams/</code> — at the repository <strong>root</strong>, not under <code>docs/</code></td></tr><tr><td>The rendered single-page book</td><td><code>docs/dev-book/book.html</code> — <strong>generated</strong>, never hand-edited</td></tr><tr><td><strong>Rules, invariants, interfaces, workflow, conventions</strong></td><td><strong>this book</strong></td></tr><tr><td>Working notes discovered while building</td><td><code>.workbuddy-ai/memory/REFERENCE.md</code></td></tr><tr><td>Known doc-versus-code disagreements</td><td><a href="#ch-07">07 Drift register</a></td></tr></tbody></table></div>
@@ -763,6 +764,206 @@ sqlite3 &quot;file:$HOME/Library/Application Support/dev.aiprovider.router/ai-pr
   &quot;SELECT COUNT(*) FROM pragma_table_info('ledger') WHERE name='cached_tokens';&quot;   # expect 1
 cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings  # expect clean</code></pre>
 <p>Counts in this chapter came from the tree, not from other docs — the documented test counts had drifted twice before this page existed. If you re-measure and get a different number, <strong>update the number here rather than assuming the code changed.</strong></p>
+</section>
+<section class="chapter" id="ch-10" data-title="10 — Headless service mode">
+<h1 id="ch-10-10-headless-service-mode">10 — Headless service mode</h1>
+<p><strong>Status:</strong> plan only — no implementation yet.</p>
+<p><strong>Question answered:</strong> what it takes to detach the gateway from the webview process so it survives UI quit, crash, and reload.</p>
+<p><strong>Date:</strong> 2026-09-23 <strong>Assessed tree:</strong> <code>fb38d1e</code> (clean, <code>main</code> == <code>origin/main</code>, CI green) <strong>Method:</strong> every claim below carries a <code>file:line</code> or the command that produced it.</p>
+<p>---</p>
+<h2 id="ch-10-0-the-headline">0. The headline</h2>
+<p><strong>The gateway is already a Rust HTTP server. What makes it dependent on the UI is the router core, which lives in a webview.</strong></p>
+<p>Moving the router core from TypeScript to Rust is the work. Everything else — process management, launchd registration, the UI falling back to HTTP — is wiring around that change.</p>
+<p>---</p>
+<h2 id="ch-10-1-the-problem-restated-with-measurements">1. The problem, restated with measurements</h2>
+<h3 id="ch-10-11-what-already-works-r1-background-mode">1.1 What already works (R1 background mode)</h3>
+<p>Closing the main window hides it instead of quitting (<code>lib.rs:277-284</code>). The gateway worker window stays alive. The heartbeat bound relaxes from 6s to 30s (<code>gateway.rs:65</code>). App Nap is fought with a native heartbeat (<code>app_nap.rs</code>).</p>
+<p><strong>What R1 does NOT fix:</strong></p>
+<div class="table-wrap"><table><thead><tr><th>Failure mode</th><th>Why it happens</th><th>Evidence</th></tr></thead><tbody><tr><td>Renderer crash</td><td>WebView process dies; bridge goes dead</td><td><code>gateway_tests.rs:852-864</code> tests the 503 path</td></tr><tr><td>User quits app</td><td><code>Cmd+Q</code> / Dock quit kills the process</td><td>Background mode only intercepts the close button</td></tr><tr><td>App Nap (deep)</td><td>macOS suspends hidden JS timers beyond the 30s bound</td><td><code>gateway.rs:46-64</code> — 38 lapses measured over 11h</td></tr><tr><td>HMR reload</td><td>Vite hot-reload tears down the worker window</td><td><code>gateway-worker.ts:7-8</code> documents the risk</td></tr></tbody></table></div>
+<h3 id="ch-10-12-the-shared-fate-diagram">1.2 The shared-fate diagram</h3>
+<pre><code>Today:  one OS process
+        ├─ main window      (React UI, user-visible)
+        ├─ gateway worker   (hidden webview, router core in JS)
+        └─ Rust host        (HTTP server, bridges into the webview)
+
+Target: two OS processes
+        ├─ UI app           (React UI, talks HTTP to the service)
+        └─ aiproviderd      (Rust HTTP server + router core, no webview)</code></pre>
+<p>The shared fate is the process boundary. R1 moves the close-button case from &quot;quit&quot; to &quot;hide&quot;. Headless mode moves the process boundary so the gateway is no longer inside the UI process at all.</p>
+<p>---</p>
+<h2 id="ch-10-2-what-stays-what-moves-what-is-new">2. What stays, what moves, what is new</h2>
+<h3 id="ch-10-21-the-component-map">2.1 The component map</h3>
+<div class="table-wrap"><table><thead><tr><th>Component</th><th>Today</th><th>In headless mode</th><th>Effort</th></tr></thead><tbody><tr><td><strong>HTTP server</strong> (<code>gateway.rs</code>)</td><td>Rust — axum on 127.0.0.1</td><td>Same code, same port, same routes</td><td>None</td></tr><tr><td><strong>Auth layer</strong> (<code>gateway.rs:67-200</code>)</td><td>Rust — master-key + app-key check</td><td>Same code</td><td>None</td></tr><tr><td><strong>Keychain vault</strong> (<code>vault.rs</code>)</td><td>Rust — <code>keyring</code> crate</td><td>Same code</td><td>None</td></tr><tr><td><strong>SQLite store</strong> (<code>store.rs</code>, <code>persist.rs</code>)</td><td>Rust — <code>rusqlite</code></td><td>Same code, same DB path</td><td>None</td></tr><tr><td><strong>Egress</strong> (<code>egress.rs</code>)</td><td>Rust — reqwest with credential injection</td><td>Same code</td><td>None</td></tr><tr><td><strong>Model adapters</strong> (<code>gateway_anthropic.rs</code>, <code>gateway_gemini.rs</code>, <code>gateway_responses.rs</code>)</td><td>Rust, but dispatch through bridge</td><td>Call providers directly, no bridge</td><td>Medium — remove bridge indirection</td></tr><tr><td><strong>Execution engine</strong> (<code>execution-engine.ts:228</code>)</td><td>TypeScript — attempt loop, failover, SSE</td><td>Must be ported to Rust</td><td><strong>High</strong> — 228 lines, but the logic is load-bearing</td></tr><tr><td><strong>Route planner</strong> (<code>route-planner.ts:173</code>)</td><td>TypeScript — candidate ordering</td><td>Must be ported to Rust</td><td><strong>High</strong> — 173 lines, heuristic-heavy</td></tr><tr><td><strong>Model router</strong> (<code>model-router.ts:557</code>)</td><td>TypeScript — facade, registry, catalog</td><td>Must be ported to Rust</td><td><strong>High</strong> — 557 lines, the public API</td></tr><tr><td><strong>Context compression</strong> (<code>context-compress.ts:271</code>)</td><td>TypeScript — Tier 1 trim, Tier 2 summary</td><td>Must be ported to Rust</td><td><strong>High</strong> — 271 lines, summarizer needs an AI call</td></tr><tr><td><strong>Adapter runtime</strong> (<code>adapter-runtime.ts:60</code>)</td><td>TypeScript — manifest interpreter + sandbox</td><td>Must be ported to Rust</td><td><strong>High</strong> — 60 lines, but pulls in QuickJS-WASM</td></tr><tr><td><strong>Health tracker</strong> (<code>health-tracker.ts:78</code>)</td><td>TypeScript — cooldowns, circuit breakers</td><td>Must be ported to Rust</td><td>Medium</td></tr><tr><td><strong>Concurrency limiter</strong> (<code>concurrency.ts:91</code>)</td><td>TypeScript — per-provider in-flight caps</td><td>Must be ported to Rust</td><td>Low</td></tr><tr><td><strong>Usage ledger</strong> (<code>usage-ledger.ts:114</code>)</td><td>TypeScript — cost attribution</td><td>Must be ported to Rust</td><td>Medium — already mirrored in <code>persist.rs</code></td></tr><tr><td><strong>Gateway bridge</strong> (<code>gateway_cmds.rs:73-94</code>)</td><td>Rust — Tauri events to webview</td><td><strong>Deleted</strong> — no webview to talk to</td><td>Negative effort</td></tr><tr><td><strong>Gateway worker window</strong> (<code>gateway-worker.ts</code>, <code>gateway.html</code>)</td><td>Hidden webview</td><td><strong>Deleted</strong></td><td>Negative effort</td></tr><tr><td><strong>App Nap suppression</strong> (<code>app_nap.rs</code>)</td><td>Native heartbeat to keep JS alive</td><td><strong>Deleted</strong> — no JS to keep alive</td><td>Negative effort</td></tr><tr><td><strong>Process manager</strong></td><td>None</td><td>New: launchd plist, start/stop/lifecycle</td><td>Medium</td></tr><tr><td><strong>UI → service discovery</strong></td><td>Tauri IPC (<code>invoke</code>)</td><td>New: HTTP client, health probe</td><td>Medium</td></tr></tbody></table></div>
+<h3 id="ch-10-22-the-line-count">2.2 The line count</h3>
+<pre><code>Router-core TypeScript:  5,880 lines across 35 modules
+Rust host today:        25,612 lines across 25 modules
+What must move:         ~2,100 lines (execution, router, planner, compression, health, ledger)
+What can be deleted:    ~300 lines (bridge, worker window, App Nap)
+Net new Rust:           ~2,500 lines (port + process manager + tests)</code></pre>
+<p>The 5,880 figure includes modules that do NOT need to move: <code>builtin-templates.ts</code> (static data), <code>redaction.ts</code> (generator-only), <code>adapter-generator.ts</code> (generator-only), <code>onboarding-orchestrator.ts</code> (UI-only), <code>drift-monitor.ts</code> (UI-only), <code>repair-orchestrator.ts</code> (UI-only). The gateway path touches only a subset.</p>
+<h3 id="ch-10-23-what-does-not-need-to-move">2.3 What does NOT need to move</h3>
+<p>The UI and the generator stay in TypeScript. They become HTTP clients of the service instead of Tauri IPC callers. The only modules they need are:</p>
+<ul><li><code>ports.ts</code> — the interface types (imported by both sides)</li><li><code>domain.ts</code> — shared types</li><li><code>config.ts</code> — settings shape</li></ul>
+<p>These become a <strong>shared contract package</strong> — TypeScript types that describe the HTTP API, consumed by both the service (Rust implements them) and the UI (TypeScript calls them).</p>
+<p>---</p>
+<h2 id="ch-10-3-the-target-architecture">3. The target architecture</h2>
+<h3 id="ch-10-31-process-boundaries">3.1 Process boundaries</h3>
+<pre><code>┌─────────────────────────────────────┐     ┌─────────────────────────────────────┐
+│  UI App (Tauri)                     │     │  aiproviderd (Rust binary)          │
+│  ─────────────                      │     │  ─────────────────────────            │
+│  Main window                        │     │  axum HTTP server (port 8800)       │
+│  React + TypeScript                 │     │  Auth (master key, app keys)        │
+│  └─ Settings, onboarding, screens   │     │  Router core (Rust)                 │
+│                                     │     │  ├─ Route planner                   │
+│  HTTP client (new)                  │     │  ├─ Execution engine                │
+│  └─ GET  /health                    │◄────┼──┤  ├─ Model adapters                │
+│  └─ POST /v1/chat/completions       │◄────┼──┤  ├─ Health tracker                │
+│  └─ POST /v1/images/generations     │◄────┼──┤  ├─ Concurrency limiter           │
+│  └─ GET  /v1/models                 │◄────┼──┤  └─ Context compression           │
+│  └─ ...                             │◄────┼──┘                                   │
+│                                     │     │  SQLite (same DB file)              │
+│  No gateway logic — pure consumer   │     │  Keychain (same OS vault)           │
+└─────────────────────────────────────┘     └─────────────────────────────────────┘</code></pre>
+<h3 id="ch-10-32-the-ui-apps-new-responsibility">3.2 The UI app's new responsibility</h3>
+<p>Today the UI owns the gateway settings (port, background mode, etc.) and pushes them to Rust via <code>invoke</code>. In headless mode the service owns its own settings. The UI is a <strong>viewer and editor</strong>, not an owner.</p>
+<div class="table-wrap"><table><thead><tr><th>Setting</th><th>Today</th><th>Headless</th></tr></thead><tbody><tr><td>Port</td><td>UI sets, Rust reads from SQLite</td><td>Service sets, UI reads from service</td></tr><tr><td>Background mode</td><td>UI toggle → Rust stores</td><td><strong>Deleted</strong> — service is always background</td></tr><tr><td>Gateway enabled</td><td>UI toggle → Rust starts/stops HTTP</td><td>Service always on; UI toggles are client-side only</td></tr><tr><td>Per-app keys</td><td>UI creates, Rust stores</td><td>Same — but created via HTTP, not IPC</td></tr><tr><td>App budgets</td><td>UI sets, Rust enforces</td><td>Same — but set via HTTP, not IPC</td></tr></tbody></table></div>
+<h3 id="ch-10-33-the-service-binary">3.3 The service binary</h3>
+<p>A new crate binary: <code>apps/desktop/src-tauri/src/bin/aiproviderd.rs</code>.</p>
+<p>It is <strong>not</strong> a Tauri app. It is a standard Rust binary that:</p>
+<ol><li>Opens the SQLite database (<code>store.rs</code> already supports this)</li><li>Reads the master key from the keychain (<code>vault.rs</code>)</li><li>Starts the axum HTTP server (<code>gateway.rs</code>)</li><li>Registers with launchd (see §4)</li></ol>
+<p>The binary reuses the <code>ai_provider_router_lib</code> crate for everything except Tauri-specific code. This means splitting the current lib into:</p>
+<ul><li><strong>Core</strong> (HTTP, SQLite, keychain, adapters, store) — usable by both Tauri and the service</li><li><strong>Tauri glue</strong> (commands, events, window management) — Tauri-only</li></ul>
+<p>---</p>
+<h2 id="ch-10-4-process-management-strategy-macos">4. Process management strategy (macOS)</h2>
+<h3 id="ch-10-41-launchd-launchagent">4.1 launchd LaunchAgent</h3>
+<p>The service registers as a user LaunchAgent, which means:</p>
+<ul><li>It starts at user login</li><li>It restarts if it crashes (<code>KeepAlive</code>)</li><li>It runs as the user, not root</li><li>It appears in Activity Monitor as <code>aiproviderd</code></li></ul>
+<p>The plist template:</p>
+<pre><code class="language-xml">&lt;?xml version=&quot;1.0&quot; encoding=&quot;UTF-8&quot;?&gt;
+&lt;!DOCTYPE plist PUBLIC &quot;-//Apple//DTD PLIST 1.0//EN&quot;
+  &quot;http://www.apple.com/DTDs/PropertyList-1.0.dtd&quot;&gt;
+&lt;plist version=&quot;1.0&quot;&gt;
+&lt;dict&gt;
+    &lt;key&gt;Label&lt;/key&gt;
+    &lt;string&gt;dev.aiprovider.routerd&lt;/string&gt;
+    &lt;key&gt;ProgramArguments&lt;/key&gt;
+    &lt;array&gt;
+        &lt;string&gt;/Applications/AI-Provider Router.app/Contents/MacOS/aiproviderd&lt;/string&gt;
+    &lt;/array&gt;
+    &lt;key&gt;RunAtLoad&lt;/key&gt;
+    &lt;true/&gt;
+    &lt;key&gt;KeepAlive&lt;/key&gt;
+    &lt;dict&gt;
+        &lt;key&gt;SuccessfulExit&lt;/key&gt;
+        &lt;false/&gt;
+    &lt;/dict&gt;
+    &lt;key&gt;StandardOutPath&lt;/key&gt;
+    &lt;string&gt;~/Library/Logs/aiproviderd/stdout.log&lt;/string&gt;
+    &lt;key&gt;StandardErrorPath&lt;/key&gt;
+    &lt;string&gt;~/Library/Logs/aiproviderd/stderr.log&lt;/string&gt;
+&lt;/dict&gt;
+&lt;/plist&gt;</code></pre>
+<h3 id="ch-10-42-the-ui-app-as-a-controller-not-an-owner">4.2 The UI app as a controller, not an owner</h3>
+<p>The UI app does not start the service directly (that would create a parent-child relationship, and the UI's death would take the service with it). Instead:</p>
+<ol><li><strong>On first launch:</strong> the UI app checks if the plist is installed. If not, it writes it and tells</li></ol>
+<p>the user to log out and back in (or runs <code>launchctl load</code>).</p>
+<ol><li><strong>On every launch:</strong> the UI app checks <code>GET /health</code> on port 8800. If the service is up, it</li></ol>
+<p>connects. If not, it shows a &quot;Service not running&quot; state with a manual start button.</p>
+<ol><li><strong>The service outlives the UI:</strong> quitting the app leaves the service running. Reopening the app</li></ol>
+<p>reconnects.</p>
+<h3 id="ch-10-43-why-not-a-tauri-sidecar">4.3 Why not a Tauri sidecar</h3>
+<p>Tauri has a sidecar feature for bundling external binaries. A sidecar is launched by the Tauri app and killed when the app quits. That is the opposite of what we want — the service must survive the UI's death.</p>
+<p>So the service is <strong>not</strong> a sidecar. It is an independent binary that happens to be shipped in the same <code>.app</code> bundle.</p>
+<p>---</p>
+<h2 id="ch-10-5-the-http-contract-changes">5. The HTTP contract changes</h2>
+<h3 id="ch-10-51-what-stays-the-same">5.1 What stays the same</h3>
+<p>The external-facing HTTP surface (7 routes, <code>gateway.rs:1755-1761</code>) does not change. External clients — curl, AI Hub, other apps — see the same API.</p>
+<h3 id="ch-10-52-what-the-ui-app-loses">5.2 What the UI app loses</h3>
+<p>Today the UI uses Tauri IPC (<code>invoke</code>) for everything. In headless mode it becomes an HTTP client. This means:</p>
+<ul><li><strong>Latency:</strong> HTTP localhost is ~1-2ms, vs ~0.1ms for IPC. Measurable but not perceptible for UI operations.</li><li><strong>No shared memory:</strong> Large payloads (image generations, long chat histories) cross the HTTP boundary as JSON instead of being passed by reference.</li><li><strong>CORS:</strong> The UI runs on <code>tauri://localhost</code> (or the dev server). The gateway is on <code>http://127.0.0.1:8800</code>. The gateway must add <code>Access-Control-Allow-Origin: tauri://localhost</code> (or <code>*</code> in dev) to its responses, or the UI's <code>fetch()</code> will be blocked.</li></ul>
+<h3 id="ch-10-53-new-internal-routes-for-the-ui">5.3 New internal routes for the UI</h3>
+<p>The UI needs some operations that today go through <code>invoke</code>:</p>
+<div class="table-wrap"><table><thead><tr><th>Today (<code>invoke</code>)</th><th>Headless (HTTP)</th></tr></thead><tbody><tr><td><code>gateway_settings_get</code></td><td><code>GET /admin/settings</code></td></tr><tr><td><code>gateway_settings_set</code></td><td><code>POST /admin/settings</code></td></tr><tr><td><code>gateway_app_keys</code></td><td><code>GET /admin/keys</code></td></tr><tr><td><code>gateway_app_key_create</code></td><td><code>POST /admin/keys</code></td></tr><tr><td><code>gateway_app_key_revoke</code></td><td><code>DELETE /admin/keys/:id</code></td></tr><tr><td><code>gateway_spend_status</code></td><td><code>GET /admin/spend</code></td></tr><tr><td><code>gateway_enable</code> / <code>gateway_disable</code></td><td><strong>Deleted</strong> — service is always on</td></tr><tr><td><code>gateway_worker_error</code></td><td><strong>Deleted</strong> — no worker window</td></tr></tbody></table></div>
+<p>These routes are authenticated with the same master-key mechanism as the external surface. The UI holds the master key in memory (it already does, for the one-shot reveal).</p>
+<p>---</p>
+<h2 id="ch-10-6-data-ownership-and-the-sqlite-database">6. Data ownership and the SQLite database</h2>
+<h3 id="ch-10-61-single-database-two-accessors">6.1 Single database, two accessors</h3>
+<p>Both the service and the UI app open the same SQLite file. SQLite handles concurrency via file locking, so this is safe as long as both use WAL mode (which <code>store.rs</code> already does).</p>
+<div class="table-wrap"><table><thead><tr><th>Data</th><th>Owner</th><th>Access pattern</th></tr></thead><tbody><tr><td><code>api_keys</code> (provider credentials)</td><td>Service (read)</td><td>Service reads for egress; UI never touches</td></tr><tr><td><code>gateway_keys</code> (app keys)</td><td>Service (CRUD)</td><td>Service enforces; UI reads for display</td></tr><tr><td><code>ledger</code> (spend records)</td><td>Service (write)</td><td>Service writes on every request; UI reads for display</td></tr><tr><td><code>settings</code></td><td>Service (write), UI (read/write)</td><td>Both read; UI writes user preferences, service writes gateway config</td></tr><tr><td><code>memory_*</code> tables</td><td>Service (write)</td><td>Service writes captures; UI reads for recall</td></tr></tbody></table></div>
+<h3 id="ch-10-62-the-migration-problem">6.2 The migration problem</h3>
+<p>Today migrations run inside the Tauri app on first launch. In headless mode they run inside the service on first start. The UI app must not run migrations — it would race with the service.</p>
+<p>The service becomes the <strong>schema owner</strong>. The UI app checks <code>PRAGMA schema_version</code> on connect and refuses to start if the service's version is newer than the UI expects.</p>
+<p>---</p>
+<h2 id="ch-10-7-the-phased-implementation">7. The phased implementation</h2>
+<h3 id="ch-10-phase-1-extract-the-core-library-1-2-days">Phase 1 — Extract the core library (1-2 days)</h3>
+<p><strong>Goal:</strong> split the Rust code into &quot;Tauri-dependent&quot; and &quot;Tauri-independent&quot; halves, without changing behaviour.</p>
+<ol><li>Create <code>src/core/</code> for Tauri-independent code: <code>gateway.rs</code>, <code>store.rs</code>, <code>persist.rs</code>, <code>vault.rs</code>, <code>egress.rs</code>, all <code>gateway_*.rs</code> adapters.</li><li>Create <code>src/tauri/</code> for Tauri glue: <code>commands.rs</code>, <code>lib.rs</code> (app setup), <code>gateway_cmds.rs</code> (bridge, worker window).</li><li>Verify: <code>cargo test</code> still passes, <code>cargo clippy</code> still clean.</li><li>Add a new binary target: <code>src/bin/aiproviderd.rs</code> that links only <code>core/</code> and starts the HTTP server.</li></ol>
+<p><strong>What this proves:</strong> the HTTP server can start without Tauri.</p>
+<h3 id="ch-10-phase-2-port-the-execution-engine-3-5-days">Phase 2 — Port the execution engine (3-5 days)</h3>
+<p><strong>Goal:</strong> rewrite <code>execution-engine.ts</code> in Rust.</p>
+<p>This is the highest-risk module. It has:</p>
+<ul><li>Async generator functions (<code>async function* stream()</code>)</li><li>AbortSignal propagation</li><li>Retry logic with Retry-After headers</li><li>Circuit breakers and cooldowns</li><li>SSE chunk parsing and multiplexing</li></ul>
+<p>The Rust equivalent uses <code>tokio::sync::mpsc</code> for streaming, <code>tokio::time::timeout</code> for cancellation, and <code>async-stream</code> for the generator pattern.</p>
+<p><strong>Test strategy:</strong> port the tests first. <code>gateway_tests.rs</code> already has synthetic bridge tests. Replace the synthetic bridge with the real Rust engine and verify the same assertions pass.</p>
+<h3 id="ch-10-phase-3-port-the-model-router-and-route-planner-2-3-days">Phase 3 — Port the model router and route planner (2-3 days)</h3>
+<p><strong>Goal:</strong> rewrite <code>model-router.ts</code> and <code>route-planner.ts</code> in Rust.</p>
+<p>These are less risky than the execution engine — they are synchronous, stateful logic without async streams. The main challenge is the registry and catalog data structures, which today live in JS memory and are hydrated from SQLite.</p>
+<p>In Rust they become structs loaded from <code>store.rs</code> on startup and kept in an <code>Arc&lt;RwLock&lt;_&gt;&gt;</code>.</p>
+<h3 id="ch-10-phase-4-port-context-compression-2-3-days">Phase 4 — Port context compression (2-3 days)</h3>
+<p><strong>Goal:</strong> rewrite <code>context-compress.ts</code> in Rust.</p>
+<p>Tier 1 (trimming turns) is pure logic — port directly.</p>
+<p>Tier 2 (summarization) is harder: it makes an AI call. In Rust this means the compression module calls the execution engine recursively. The <code>skipCompression</code> flag (<code>gateway-bridge.ts:102</code>) prevents infinite recursion — the same flag exists in the Rust port.</p>
+<h3 id="ch-10-phase-5-delete-the-bridge-1-day">Phase 5 — Delete the bridge (1 day)</h3>
+<p><strong>Goal:</strong> remove <code>gateway_cmds.rs</code> bridge code, <code>gateway-worker.ts</code>, <code>gateway.html</code>, and <code>app_nap.rs</code>.</p>
+<p>This is the satisfying phase. The gateway routes directly into the Rust router core. No hidden webview. No Tauri events. No heartbeat.</p>
+<h3 id="ch-10-phase-6-process-manager-and-ui-changes-2-3-days">Phase 6 — Process manager and UI changes (2-3 days)</h3>
+<p><strong>Goal:</strong> launchd plist, service binary bundling, UI HTTP client.</p>
+<ol><li>Write the plist template and the install logic.</li><li>Bundle <code>aiproviderd</code> into the <code>.app</code> (Tauri's <code>bundle.externalBin</code> or manual copy).</li><li>Change the UI from <code>invoke</code> to <code>fetch()</code> for gateway operations.</li><li>Add CORS headers to the gateway for <code>tauri://localhost</code>.</li><li>Update <code>09-status.md</code> and the drift register.</li></ol>
+<p>---</p>
+<h2 id="ch-10-8-risk-register">8. Risk register</h2>
+<div class="table-wrap"><table><thead><tr><th>Risk</th><th>Likelihood</th><th>Impact</th><th>Mitigation</th></tr></thead><tbody><tr><td><strong>Execution engine port introduces bugs</strong></td><td>High</td><td>Critical</td><td>Port tests first; keep JS implementation behind a feature flag; run both in parallel for one release</td></tr><tr><td><strong>Adapter runtime (QuickJS-WASM) is hard to port</strong></td><td>Medium</td><td>High</td><td>Evaluate <code>rquickjs</code> or <code>boa</code> crates; fallback: keep Tier-2 adapters in a sandboxed subprocess</td></tr><tr><td><strong>SQLite concurrent access deadlocks</strong></td><td>Low</td><td>High</td><td>WAL mode is already on; add connection pooling; test with <code>cargo test</code> under <code>tokio::task::spawn</code></td></tr><tr><td><strong> launchd plist gets out of sync with binary path</strong></td><td>Medium</td><td>Medium</td><td>Version the plist; on app update, check path and rewrite if the bundle moved</td></tr><tr><td><strong>UI → service discovery fails on first install</strong></td><td>Medium</td><td>Medium</td><td>Graceful degradation: UI shows &quot;service not running&quot; with manual start instructions</td></tr><tr><td><strong>CORS misconfiguration blocks UI in dev</strong></td><td>High</td><td>Low</td><td>Dev mode allows <code>*</code>; production allows <code>tauri://localhost</code> only</td></tr><tr><td><strong>Bundle size increases</strong></td><td>High</td><td>Low</td><td>Service binary is ~5MB stripped; acceptable</td></tr><tr><td><strong>Migration rollback is hard</strong></td><td>Low</td><td>High</td><td>Keep the Tauri bridge code behind a <code>webview-gateway</code> feature flag for one release</td></tr></tbody></table></div>
+<p>---</p>
+<h2 id="ch-10-9-test-strategy">9. Test strategy</h2>
+<h3 id="ch-10-91-what-must-be-re-tested">9.1 What must be re-tested</h3>
+<p>Every gateway test in <code>gateway_tests.rs</code> (104 tests, measured 2026-09-23) must pass against the Rust-native engine. The synthetic bridge (<code>SynthBridge</code>) is replaced with the real router core.</p>
+<h3 id="ch-10-92-new-tests-needed">9.2 New tests needed</h3>
+<div class="table-wrap"><table><thead><tr><th>Test</th><th>Why</th></tr></thead><tbody><tr><td>Service starts without Tauri</td><td><code>aiproviderd --version</code> exits 0</td></tr><tr><td>Service survives UI process death</td><td>Start service, kill UI, <code>curl /health</code> still 200</td></tr><tr><td>Service restarts on crash</td><td><code>kill -9</code> the service, launchd restarts it within 5s</td></tr><tr><td>UI reconnects after service restart</td><td>Kill service, wait for restart, UI auto-reconnects</td></tr><tr><td>Concurrent SQLite access</td><td>10 parallel requests, no <code>DatabaseBusy</code></td></tr><tr><td>CORS preflight</td><td><code>OPTIONS</code> request from <code>tauri://localhost</code> returns 204</td></tr></tbody></table></div>
+<h3 id="ch-10-93-the-feature-flag-safety-net">9.3 The feature-flag safety net</h3>
+<p>For one release, keep both code paths:</p>
+<pre><code class="language-rust">// In gateway.rs
+#[cfg(feature = &quot;webview-gateway&quot;)]
+fn route_request(req: Request) -&gt; Response {
+    // Today: dispatch to bridge
+}
+
+#[cfg(not(feature = &quot;webview-gateway&quot;))]
+fn route_request(req: Request) -&gt; Response {
+    // New: direct Rust router core
+}</code></pre>
+<p>The Tauri app builds with <code>--features webview-gateway</code> (default). The service binary builds without it. This lets the team roll back by reverting one line in <code>Cargo.toml</code>.</p>
+<p>---</p>
+<h2 id="ch-10-10-decisions-needed">10. Decisions needed</h2>
+<ol><li><strong>Do we port the adapter runtime (QuickJS-WASM) to Rust, or sandbox it in a subprocess?</strong> - Port: single binary, simpler deployment, but <code>rquickjs</code> is immature. - Subprocess: keep JS adapters in a worker, but add IPC overhead. - <em>Recommendation:</em> evaluate <code>rquickjs</code> in a spike (1 day). If it passes the contract suite, port. If not, subprocess.</li></ol>
+<ol><li><strong>Do we keep the Tauri app as a pure HTTP client, or keep a subset of IPC for performance?</strong> - Pure HTTP: simpler, consistent, no special cases. - Hybrid HTTP+IPC: keep IPC for hot paths (settings read), HTTP for gateway operations. - <em>Recommendation:</em> pure HTTP. The latency difference is not perceptible, and hybrid creates two contracts to maintain.</li></ol>
+<ol><li><strong>Do we ship the service as a separate downloadable, or bundle it inside the <code>.app</code>?</strong> - Separate: smaller app bundle, but two downloads to manage. - Bundled: one <code>.app</code>, one update channel, but larger. - <em>Recommendation:</em> bundled. The binary is small (~5MB), and one artefact is simpler for users.</li></ol>
+<ol><li><strong>What is the minimum viable port?</strong> - Full port: everything in Rust, no JS in the gateway path. - Hybrid: keep the router core in JS, but run it in a separate process via <code>deno</code> or <code>node</code>. - <em>Recommendation:</em> full port. A hybrid still has a JS process that can crash, and the whole point is to eliminate the webview as a failure mode.</li></ol>
+<p>---</p>
+<h2 id="ch-10-11-effort-estimate">11. Effort estimate</h2>
+<div class="table-wrap"><table><thead><tr><th>Phase</th><th>Days</th><th>Cumulative</th></tr></thead><tbody><tr><td>1 — Extract core library</td><td>1-2</td><td>2</td></tr><tr><td>2 — Port execution engine</td><td>3-5</td><td>7</td></tr><tr><td>3 — Port router + planner</td><td>2-3</td><td>10</td></tr><tr><td>4 — Port context compression</td><td>2-3</td><td>13</td></tr><tr><td>5 — Delete bridge</td><td>1</td><td>14</td></tr><tr><td>6 — Process manager + UI</td><td>2-3</td><td>17</td></tr><tr><td><strong>Buffer (testing, edge cases)</strong></td><td>3</td><td><strong>20</strong></td></tr></tbody></table></div>
+<p><strong>Total: 3-4 weeks of focused development.</strong></p>
+<p>This is an all-at-once change, not an incremental one. The bridge is the boundary, and the router core is on one side of it. You cannot move it piecemeal — half the engine in Rust and half in JS would need a second bridge between them.</p>
+<p>---</p>
+<h2 id="ch-10-12-what-we-know-we-do-not-know">12. What we know we do not know</h2>
+<ul><li>Whether <code>rquickjs</code> (or <code>boa</code>) can run the existing Tier-2 adapter sandbox. The contract suite is</li></ul>
+<p>the test; until it is run, this is an open question.</p>
+<ul><li>Whether the summarization call in context compression (Tier 2) works correctly when the engine</li></ul>
+<p>calls itself recursively. The <code>skipCompression</code> flag is designed for this, but recursive async calls in Rust are harder to reason about than in JS.</p>
+<ul><li>Whether launchd's <code>KeepAlive</code> behaves correctly when the binary is inside an <code>.app</code> bundle that</li></ul>
+<p>is updated (the path changes). This needs a real update cycle to verify.</p>
+<p>---</p>
+<h2 id="ch-10-13-where-this-plan-lives">13. Where this plan lives</h2>
+<p>This is a plan, not a specification. When implementation starts, each phase gets its own design document in <code>docs/</code> and its own branch. This chapter is updated as decisions are made and assumptions are tested.</p>
+<p><strong>Next action:</strong> answer the four decisions in §10, then begin Phase 1 (extract core library).</p>
 </section>
 <section class="chapter" id="appendix-diagrams" data-title="Appendix — Diagram index">
 <h1>Appendix — Diagram index</h1>
