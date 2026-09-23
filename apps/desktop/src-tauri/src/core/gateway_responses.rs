@@ -11,10 +11,10 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use serde_json::{json, Value};
 
-use crate::gateway::context_scope::{
+use crate::core::gateway::context_scope::{
     apply_memory_headers, finish_capture, inject_context, prepare_capture,
 };
-use crate::gateway::{
+use crate::core::gateway::{
     check_gateway_key, clean_assistant_text, err, err_with_cooldown, forwarded_headers,
     map_generic_to_status, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest, GatewayCore,
 };

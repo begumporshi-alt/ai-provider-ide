@@ -10,9 +10,9 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use crate::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
-use crate::injection_log::InjectionStats;
-use crate::store::Store;
+use crate::core::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
+use crate::core::injection_log::InjectionStats;
+use crate::core::store::Store;
 
 /// R1: label of the dedicated window that hosts the router core for gateway requests. Keeping
 /// the bridge out of the UI window is what stops UI render work — and UI HMR reloads — from
@@ -313,14 +313,14 @@ const SYNC_KEY_POLL: Duration = Duration::from_secs(3);
 /// permissive direction would retry a genuine misconfiguration for the whole wait and then report
 /// it, which is how a real error hides behind a retry loop.
 fn is_key_not_ready(err: &str) -> bool {
-    err == crate::workbuddy::NO_KEY_YET
+    err == crate::tauri::workbuddy::NO_KEY_YET
 }
 
 /// Publish our entries, retrying while the keychain ACL settles.
 fn sync_workbuddy_with_retry(app: &AppHandle, store: &Arc<Store>) {
     let deadline = std::time::Instant::now() + SYNC_KEY_WAIT;
     loop {
-        match crate::workbuddy::sync(store) {
+        match crate::tauri::workbuddy::sync(store) {
             Ok(r) => {
                 log_to_file(
                     app,
@@ -448,10 +448,10 @@ pub fn gateway_app_key_create(
     let id = format!("ak-{}", uuid_like());
     let secret = gateway::generate_random_key();
     let account = format!("{}{}", gateway::APP_KEY_PREFIX, id);
-    crate::vault::put(&account, &secret).map_err(|e| e.to_string())?;
-    if let Err(e) = crate::persist::gateway_key_insert(&store, &id, &label) {
+    crate::core::vault::put(&account, &secret).map_err(|e| e.to_string())?;
+    if let Err(e) = crate::core::persist::gateway_key_insert(&store, &id, &label) {
         // Roll back the keychain entry: a secret with no row is an unrevokable ghost.
-        let _ = crate::vault::delete(&account);
+        let _ = crate::core::vault::delete(&account);
         return Err(e.to_string());
     }
     // No provider refresh needed: the key provider re-reads the active ids per request, so the
@@ -459,8 +459,8 @@ pub fn gateway_app_key_create(
     if let Err(e) = gateway::copy_text(&secret) {
         // The key is the ONLY copy of the secret — if it never reaches the clipboard the user
         // can't use it, so unwind both stores rather than leave a credential nobody holds.
-        let _ = crate::vault::delete(&account);
-        let _ = crate::persist::gateway_key_delete(&store, &id);
+        let _ = crate::core::vault::delete(&account);
+        let _ = crate::core::persist::gateway_key_delete(&store, &id);
         return Err(e);
     }
     Ok(AppKeyCreated { id, label })
@@ -493,8 +493,8 @@ pub struct AppKeyView {
 
 #[tauri::command]
 pub fn gateway_app_keys(store: State<'_, Arc<Store>>) -> Result<Vec<AppKeyView>, String> {
-    let rows = crate::persist::gateway_keys_list(&store).map_err(|e| e.to_string())?;
-    let spend = crate::persist::month_spend_by_app(&store);
+    let rows = crate::core::persist::gateway_keys_list(&store).map_err(|e| e.to_string())?;
+    let spend = crate::core::persist::month_spend_by_app(&store);
     Ok(rows
         .into_iter()
         .map(|k| AppKeyView {
@@ -520,19 +520,19 @@ pub fn gateway_app_key_cap_set(
     id: String,
     cap_micros: i64,
 ) -> Result<(), String> {
-    crate::persist::gateway_key_cap_set(&store, &id, cap_micros).map_err(|e| e.to_string())
+    crate::core::persist::gateway_key_cap_set(&store, &id, cap_micros).map_err(|e| e.to_string())
 }
 
 /// Revoke one app key. Takes effect on the next request — the master key and every other app
 /// key are untouched, which is the whole point (audit R4).
 #[tauri::command]
 pub fn gateway_app_key_revoke(store: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
-    crate::persist::gateway_key_revoke(&store, &id).map_err(|e| e.to_string())
+    crate::core::persist::gateway_key_revoke(&store, &id).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
 pub fn gateway_app_key_delete(store: State<'_, Arc<Store>>, id: String) -> Result<(), String> {
-    crate::persist::gateway_key_delete(&store, &id).map_err(|e| e.to_string())
+    crate::core::persist::gateway_key_delete(&store, &id).map_err(|e| e.to_string())
 }
 
 /// Short random id — not security-sensitive (the secret is the key), just collision-resistant.
@@ -555,15 +555,15 @@ pub struct SpendStatus {
 
 #[tauri::command]
 pub fn gateway_spend_status(store: State<'_, Arc<Store>>) -> Result<SpendStatus, String> {
-    let month = crate::persist::month_spend_micros(&store);
-    let cap = crate::persist::spend_cap_micros(&store).unwrap_or(0);
+    let month = crate::core::persist::month_spend_micros(&store);
+    let cap = crate::core::persist::spend_cap_micros(&store).unwrap_or(0);
     Ok(SpendStatus { month_micros: month, cap_micros: cap, capped: cap > 0 && month >= cap })
 }
 
 /// Set the monthly cap in micro-USD. `0` disables it.
 #[tauri::command]
 pub fn gateway_spend_cap_set(store: State<'_, Arc<Store>>, cap_micros: i64) -> Result<(), String> {
-    crate::persist::spend_cap_set(&store, cap_micros.max(0)).map_err(|e| e.to_string())
+    crate::core::persist::spend_cap_set(&store, cap_micros.max(0)).map_err(|e| e.to_string())
 }
 
 #[tauri::command]
@@ -606,7 +606,7 @@ pub(crate) fn set_gateway_workspace_root(
     // accepting a bad root was never a breach — but `gateway_get_workspace_root` reported it as
     // set, and the refusal then surfaced mid-request as a tool error the model had to interpret.
     // Storing the canonical path also freezes `..` and symlinks: what is set is what is used.
-    let canonical = crate::tools::validate_root(&path)?;
+    let canonical = crate::tauri::tools::validate_root(&path)?;
     state.core.set_workspace_root(canonical);
     Ok(())
 }
@@ -635,10 +635,9 @@ pub fn gateway_get_workspace_root(
 /// match exactly, or a memory scoped from the UI would never be visible to the request path.
 #[tauri::command]
 pub fn gateway_project_key(state: State<'_, Arc<GatewayState>>) -> Result<Option<String>, String> {
-    Ok(state
-        .core
-        .workspace_root()
-        .and_then(|p| crate::gateway::context_scope::project_key_from_root(&p.to_string_lossy())))
+    Ok(state.core.workspace_root().and_then(|p| {
+        crate::core::gateway::context_scope::project_key_from_root(&p.to_string_lossy())
+    }))
 }
 
 /// The memory/context layer's master switch.
@@ -764,7 +763,7 @@ fn record_gateway_tool_call(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0);
-    let node = crate::context::ContextNode {
+    let node = crate::core::context::ContextNode {
         id: format!("gateway:{request_id}:{tool}:{ts}"),
         // `skill` is the kind the Assistant already uses for a tool call, and the closed set of
         // four kinds is deliberate — a tool call is not a fifth kind of thing.
@@ -785,7 +784,7 @@ fn record_gateway_tool_call(
         ),
     };
     std::thread::spawn(move || {
-        let _ = crate::context::record(&store, &[node], &[]);
+        let _ = crate::core::context::record(&store, &[node], &[]);
     });
 }
 
@@ -801,7 +800,7 @@ pub(crate) fn run_gateway_tool(
     request_id: u64,
     tool_name: String,
     arguments: serde_json::Value,
-) -> Result<crate::tools::ToolResult, String> {
+) -> Result<crate::tauri::tools::ToolResult, String> {
     let root = state.core.workspace_root().ok_or_else(|| {
         "workspace root not set — call gateway_set_workspace_root first".to_string()
     })?;
@@ -825,7 +824,7 @@ pub(crate) fn run_gateway_tool(
             "tool req={request_id} tool={tool_name} args={digest} -> REFUSED: {}",
             truncate_chars(&reason, 200)
         ));
-        return Ok(crate::tools::ToolResult {
+        return Ok(crate::tauri::tools::ToolResult {
             ok: false,
             output: String::new(),
             error: Some(reason),
@@ -841,12 +840,12 @@ pub(crate) fn run_gateway_tool(
     // was, and a bounded error.
     let log_name = tool_name.clone();
     let digest = tool_arg_digest(&tool_name, &arguments);
-    let req = crate::tools::ToolRunRequest {
+    let req = crate::tauri::tools::ToolRunRequest {
         name: tool_name,
         arguments,
         root: root.to_string_lossy().to_string(),
     };
-    let result = crate::tools::tool_run(req);
+    let result = crate::tauri::tools::tool_run(req);
     record_gateway_tool_call(
         state.store.clone(),
         request_id,
@@ -875,7 +874,7 @@ pub fn gateway_tool_run(
     request_id: u64,
     tool_name: String,
     arguments: serde_json::Value,
-) -> Result<crate::tools::ToolResult, String> {
+) -> Result<crate::tauri::tools::ToolResult, String> {
     let log = |line: &str| log_to_file(&app, line);
     run_gateway_tool(&state, &log, request_id, tool_name, arguments)
 }
@@ -1058,7 +1057,9 @@ pub fn gateway_tool_calls(
     let v: serde_json::Value = serde_json::from_str(&tool_calls_json).map_err(|e| e.to_string())?;
     // Normalised here, at the single point where tool calls enter the gateway, so every
     // dialect's reader (OpenAI, Anthropic, Responses, Gemini) gets the shape it looks for.
-    state.core.reply(request_id, BridgeMsg::ToolCalls(crate::gateway::normalize_tool_calls(v)));
+    state
+        .core
+        .reply(request_id, BridgeMsg::ToolCalls(crate::core::gateway::normalize_tool_calls(v)));
     Ok(())
 }
 
@@ -1242,7 +1243,7 @@ mod sync_retry_tests {
     /// reads as a hang rather than as a misconfiguration.
     #[test]
     fn only_the_missing_key_error_is_worth_waiting_for() {
-        assert!(is_key_not_ready(crate::workbuddy::NO_KEY_YET));
+        assert!(is_key_not_ready(crate::tauri::workbuddy::NO_KEY_YET));
 
         assert!(!is_key_not_ready("cannot read /nope/models.json: No such file or directory"));
         // Near-misses must not match — the comparison is exact on purpose.
@@ -1322,14 +1323,14 @@ mod tool_audit_tests {
     /// a root the getter reported as set while every call refused it.
     #[test]
     fn a_bad_workspace_root_is_refused_at_set_time() {
-        assert!(crate::tools::validate_root(std::path::Path::new("/")).is_err());
+        assert!(crate::tauri::tools::validate_root(std::path::Path::new("/")).is_err());
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
-            assert!(crate::tools::validate_root(std::path::Path::new(&home)).is_err());
+            assert!(crate::tauri::tools::validate_root(std::path::Path::new(&home)).is_err());
         }
         for d in ["/System", "/usr", "/bin", "/sbin", "/etc", "/private"] {
             assert!(
-                crate::tools::validate_root(std::path::Path::new(d)).is_err(),
+                crate::tauri::tools::validate_root(std::path::Path::new(d)).is_err(),
                 "{d} must be refused"
             );
         }
@@ -1351,7 +1352,7 @@ mod tool_audit_tests {
         // Spawned, so poll — but bound the wait so a regression fails instead of hanging.
         let found = (0..200).find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::context::graph(&store, 100)
+            crate::core::context::graph(&store, 100)
                 .ok()?
                 .nodes
                 .into_iter()
@@ -1375,12 +1376,12 @@ mod tool_audit_tests {
         record_gateway_tool_call(store.clone(), 7, "list_dir", "path=.", true, 3, false);
         for _ in 0..200 {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            if !crate::context::graph(&store, 100).unwrap().nodes.is_empty() {
+            if !crate::core::context::graph(&store, 100).unwrap().nodes.is_empty() {
                 break;
             }
         }
         assert!(
-            crate::context::sessions(&store, 50).unwrap().is_empty(),
+            crate::core::context::sessions(&store, 50).unwrap().is_empty(),
             "no phantom History session"
         );
     }
@@ -1392,7 +1393,7 @@ mod tool_audit_tests {
         record_gateway_tool_call(store.clone(), 9, "run_command", "program=rm", false, 0, true);
         let found = (0..200).find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::context::graph(&store, 100)
+            crate::core::context::graph(&store, 100)
                 .ok()?
                 .nodes
                 .into_iter()

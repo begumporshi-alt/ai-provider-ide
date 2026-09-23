@@ -23,7 +23,7 @@
 use rusqlite::{params, OptionalExtension};
 use serde::Serialize;
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 /// One row of the policy table as the UI wants it: what the operator decided, plus when we last
 /// saw that principal, so a stale entry is distinguishable from a live one.

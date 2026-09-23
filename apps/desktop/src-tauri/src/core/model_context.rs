@@ -19,7 +19,7 @@
 use rusqlite::params;
 use serde::Deserialize;
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 /// Largest window we will believe. A provider that publishes something absurd is more likely to
 /// have a units bug than a ten-million-token model, and believing it would blow the budget — which
@@ -44,8 +44,8 @@ pub struct ModelWindow {
 impl Default for ModelWindow {
     fn default() -> Self {
         Self {
-            window: crate::gateway::context_scope::DEFAULT_WINDOW_TOKENS,
-            chars_per_token: crate::gateway::context_scope::CHARS_PER_TOKEN,
+            window: crate::core::gateway::context_scope::DEFAULT_WINDOW_TOKENS,
+            chars_per_token: crate::core::gateway::context_scope::CHARS_PER_TOKEN,
         }
     }
 }
@@ -98,11 +98,11 @@ pub fn lookup(store: Option<&Store>, model: Option<&str>) -> ModelWindow {
         window: if window > 0 && window <= MAX_WINDOW {
             window as usize
         } else {
-            crate::gateway::context_scope::DEFAULT_WINDOW_TOKENS
+            crate::core::gateway::context_scope::DEFAULT_WINDOW_TOKENS
         },
         chars_per_token: cpt
             .filter(|v| v.is_finite() && *v > 0.5 && *v < 20.0)
-            .unwrap_or(crate::gateway::context_scope::CHARS_PER_TOKEN),
+            .unwrap_or(crate::core::gateway::context_scope::CHARS_PER_TOKEN),
     }
 }
 
@@ -144,7 +144,7 @@ mod model_context_tests {
         // be wrong.
         assert_eq!(
             lookup(Some(&s), Some("nobody/whatever")).window,
-            crate::gateway::context_scope::DEFAULT_WINDOW_TOKENS
+            crate::core::gateway::context_scope::DEFAULT_WINDOW_TOKENS
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -174,7 +174,7 @@ mod model_context_tests {
         assert_eq!(count(&s).unwrap(), 0);
         assert_eq!(
             lookup(Some(&s), Some("x/huge")).window,
-            crate::gateway::context_scope::DEFAULT_WINDOW_TOKENS
+            crate::core::gateway::context_scope::DEFAULT_WINDOW_TOKENS
         );
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -193,7 +193,7 @@ mod model_context_tests {
         .unwrap();
         let got = lookup(Some(&s), Some("m/1"));
         assert_eq!(got.window, 32_000);
-        assert_eq!(got.chars_per_token, crate::gateway::context_scope::CHARS_PER_TOKEN);
+        assert_eq!(got.chars_per_token, crate::core::gateway::context_scope::CHARS_PER_TOKEN);
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -16,7 +16,7 @@
  */
 use serde::{Deserialize, Serialize};
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Skill {

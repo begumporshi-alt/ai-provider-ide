@@ -27,7 +27,7 @@ use axum::http::{HeaderMap, HeaderValue};
 use axum::response::Response;
 use serde_json::{json, Value};
 
-use crate::gateway::GatewayCore;
+use crate::core::gateway::GatewayCore;
 
 /// Ceiling on a client-requested memory budget. The gateway owns the safety budget; a client may
 /// only ask for less, never more.
@@ -116,7 +116,7 @@ const MEMORY_SHARE: f64 = 0.60;
 
 /// Cap on a client-pushed open-files list. Reused from `session_context` rather than redeclared:
 /// a second value for "how many open files is too many" would drift.
-const OPEN_FILES_CAP: usize = crate::gateway::session_context::OPEN_FILES_CAP;
+const OPEN_FILES_CAP: usize = crate::core::gateway::session_context::OPEN_FILES_CAP;
 
 /// Response header carrying the compact injection status: what happened, or why nothing did.
 pub const HDR_MEMORY: &str = "aip-memory";
@@ -536,11 +536,11 @@ pub fn inject_context_deadline(
     // The app key is only resolved with memory on: off by default has to mean no extra work, and
     // resolving one means reading the app-key map.
     let app_key = if core.memory_enabled() {
-        core.key_principal_for(crate::gateway::presented_key(headers))
+        core.key_principal_for(crate::core::gateway::presented_key(headers))
     } else {
         None
     };
-    let operator_allows = crate::gateway::principal::allows(
+    let operator_allows = crate::core::gateway::principal::allows(
         core.memory_enabled(),
         core.store().map(|s| s.as_ref()),
         scope.agent.as_deref(),
@@ -587,7 +587,7 @@ pub fn inject_context_deadline(
     // §3.4: the real window when we know it. Against a 200k model the old flat 8192 made 25% of
     // "what is left" a rounding error; against a small one it was generous. The ceiling below still
     // bounds the block, so a large window cannot over-inject — it only stops starving recall.
-    let mw = crate::gateway::model_context::lookup(
+    let mw = crate::core::gateway::model_context::lookup(
         core.store().map(|s| s.as_ref()),
         body.get("model").and_then(Value::as_str),
     );
@@ -603,7 +603,7 @@ pub fn inject_context_deadline(
         // recompute it.
         Some(f) => (f.block, f.items, f.had_candidates),
         None => {
-            let rscope = crate::memory::RecallScope {
+            let rscope = crate::core::memory::RecallScope {
                 user: Some(scope.user.clone()),
                 project: scope.project.clone(),
                 agent: scope.agent.clone(),
@@ -611,7 +611,7 @@ pub fn inject_context_deadline(
             // L0 is excluded by default: it is verbatim conversation, so injecting it ships one
             // vendor's session to another. Opting in is deliberate and per-scope (design §0.4).
             let layers = [String::from("L1"), String::from("L2"), String::from("L3")];
-            let rows = match crate::memory::recall_scoped(
+            let rows = match crate::core::memory::recall_scoped(
                 store,
                 &recall_query(body),
                 20,
@@ -713,7 +713,7 @@ fn freeze_key(scope: &Scope, meta: &RequestMeta, principal: Option<&str>) -> Str
     format!(
         "{}|{}",
         scope.as_header_value(),
-        crate::gateway::session_context::resolve_session(meta, scope, principal)
+        crate::core::gateway::session_context::resolve_session(meta, scope, principal)
     )
 }
 
@@ -723,13 +723,13 @@ fn freeze_key(scope: &Scope, meta: &RequestMeta, principal: Option<&str>) -> Str
 /// cannot borrow the request body. Preparing first also avoids a second clone of what may be a
 /// large prompt — only this small struct crosses into the stream.
 pub struct PreparedCapture {
-    store: Arc<crate::store::Store>,
+    store: Arc<crate::core::store::Store>,
     request_id: String,
     session: String,
     scope: Scope,
     user_text: String,
     model: String,
-    principal: crate::capture::Principal,
+    principal: crate::core::capture::Principal,
     writes_allowed: bool,
     involves_tools: bool,
 }
@@ -750,11 +750,11 @@ pub fn prepare_capture(
     // must not have its turns recorded either — otherwise "off" would still mean "quietly learning
     // from you". Read before the struct is built, because `store` moves into it.
     let app_key = if core.memory_enabled() {
-        core.key_principal_for(crate::gateway::presented_key(headers))
+        core.key_principal_for(crate::core::gateway::presented_key(headers))
     } else {
         None
     };
-    let operator_allows = crate::gateway::principal::allows(
+    let operator_allows = crate::core::gateway::principal::allows(
         core.memory_enabled(),
         Some(store.as_ref()),
         scope.agent.as_deref(),
@@ -762,18 +762,18 @@ pub fn prepare_capture(
     );
     Some(PreparedCapture {
         store,
-        request_id: crate::capture::request_id(request_id),
-        session: crate::gateway::session_context::resolve_session(
+        request_id: crate::core::capture::request_id(request_id),
+        session: crate::core::gateway::session_context::resolve_session(
             &meta,
             &scope,
             app_key.as_deref(),
         ),
         user_text: recall_query(body),
         model: body.get("model").and_then(Value::as_str).unwrap_or("").to_string(),
-        principal: crate::capture::classify_principal(&scope, meta.internal),
+        principal: crate::core::capture::classify_principal(&scope, meta.internal),
         writes_allowed: meta.mode.map(|m| m.allows_write()).unwrap_or(true) && operator_allows,
         // §3.5.1 is decided against what the client sent, before any text is synthesized.
-        involves_tools: crate::capture::involves_tools(body),
+        involves_tools: crate::core::capture::involves_tools(body),
         scope,
     })
 }
@@ -781,8 +781,8 @@ pub fn prepare_capture(
 /// Offer the finished exchange to the capture queue. Called when the worker signals `Done`.
 ///
 /// Never fails the caller, and no model call happens here — the queue is drained by the webview.
-pub fn finish_capture(prep: &PreparedCapture, asst_text: &str) -> crate::capture::Enqueue {
-    use crate::capture::{enqueue, CaptureRequest};
+pub fn finish_capture(prep: &PreparedCapture, asst_text: &str) -> crate::core::capture::Enqueue {
+    use crate::core::capture::{enqueue, CaptureRequest};
     enqueue(
         &prep.store,
         &CaptureRequest {
@@ -804,40 +804,40 @@ pub fn finish_capture(prep: &PreparedCapture, asst_text: &str) -> crate::capture
 /// Returns `(block, turn_count)`. Recording is best-effort: a failed write costs the next request
 /// some context, not this one its response.
 fn live_context(
-    store: &Arc<crate::store::Store>,
+    store: &Arc<crate::core::store::Store>,
     meta: &RequestMeta,
     scope: &Scope,
     body: &Value,
     budget: usize,
     principal: Option<&str>,
 ) -> (String, usize) {
-    let sess = crate::gateway::session_context::resolve_session(meta, scope, principal);
-    if crate::gateway::session_context::touch_session(store, &sess, scope).is_err() {
+    let sess = crate::core::gateway::session_context::resolve_session(meta, scope, principal);
+    if crate::core::gateway::session_context::touch_session(store, &sess, scope).is_err() {
         return (String::new(), 0);
     }
 
     if meta.mode.map(|m| m.allows_write()).unwrap_or(true) {
-        let _ = crate::gateway::session_context::record_turns(store, &sess, body);
+        let _ = crate::core::gateway::session_context::record_turns(store, &sess, body);
     }
     if let Some(files) = &meta.open_files {
-        let _ = crate::gateway::session_context::set_state(store, &sess, Some(files), None);
+        let _ = crate::core::gateway::session_context::set_state(store, &sess, Some(files), None);
     }
 
     let mut open_files: Vec<String> = Vec::new();
-    if let Ok(Some(st)) = crate::gateway::session_context::get_state(store, &sess) {
+    if let Ok(Some(st)) = crate::core::gateway::session_context::get_state(store, &sess) {
         open_files = st.open_files;
     }
 
-    let Ok(recent) = crate::gateway::session_context::recent_turns(store, &sess, 12) else {
+    let Ok(recent) = crate::core::gateway::session_context::recent_turns(store, &sess, 12) else {
         return (String::new(), 0);
     };
     // §5.4: the client replays its own transcript, so anything it already sent is dropped rather
     // than appearing twice.
-    let incoming = crate::gateway::session_context::incoming_hashes(body);
-    let turns = crate::gateway::session_context::without_duplicates(recent, &incoming);
+    let incoming = crate::core::gateway::session_context::incoming_hashes(body);
+    let turns = crate::core::gateway::session_context::without_duplicates(recent, &incoming);
 
     // Newest first until the budget runs out, then back to chronological for the prompt.
-    let mut chosen: Vec<crate::gateway::session_context::Turn> = Vec::new();
+    let mut chosen: Vec<crate::core::gateway::session_context::Turn> = Vec::new();
     let mut used = if open_files.is_empty() {
         0
     } else {
@@ -992,7 +992,7 @@ pub fn compose_block(items: &[&Candidate]) -> String {
 /// "this is a fact I told you" from "this is what we were just doing".
 pub fn compose_context_block(
     open_files: &[String],
-    turns: &[crate::gateway::session_context::Turn],
+    turns: &[crate::core::gateway::session_context::Turn],
 ) -> String {
     if open_files.is_empty() && turns.is_empty() {
         return String::new();
@@ -1308,8 +1308,8 @@ mod context_scope_tests {
     // ---------- response contract ----------
 
     struct NoopBridge;
-    impl crate::gateway::Bridge for NoopBridge {
-        fn dispatch(&self, _req: crate::gateway::BridgeRequest) {}
+    impl crate::core::gateway::Bridge for NoopBridge {
+        fn dispatch(&self, _req: crate::core::gateway::BridgeRequest) {}
         fn cancel(&self, _request_id: u64) {}
     }
 
@@ -1421,16 +1421,16 @@ mod context_scope_tests {
     fn a_scoped_memory_reaches_the_body_when_the_toggle_is_on() {
         let dir = std::env::temp_dir().join(format!("aip-inject-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = crate::store::Store::open(&dir).unwrap();
+        let store = crate::core::store::Store::open(&dir).unwrap();
 
         // The core resolves `project` from the workspace root, so the row has to be bound to the
         // hash of that same root to be visible.
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
 
-        let m = crate::memory::capture(
+        let m = crate::core::memory::capture(
             &store,
-            &crate::memory::MemoryInput {
+            &crate::core::memory::MemoryInput {
                 layer: "L1".into(),
                 text: "this project uses Postgres for the database".into(),
                 session_id: None,
@@ -1439,10 +1439,10 @@ mod context_scope_tests {
             },
         )
         .unwrap();
-        assert!(crate::memory::assign_scope(
+        assert!(crate::core::memory::assign_scope(
             &store,
             &m.id,
-            crate::memory::ScopeAssignment::Project { project: project.clone(), agent: None },
+            crate::core::memory::ScopeAssignment::Project { project: project.clone(), agent: None },
         )
         .unwrap());
 
@@ -1472,11 +1472,11 @@ mod context_scope_tests {
     fn an_unscoped_memory_is_not_injected_even_with_the_toggle_on() {
         let dir = std::env::temp_dir().join(format!("aip-inject-unscoped-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = crate::store::Store::open(&dir).unwrap();
+        let store = crate::core::store::Store::open(&dir).unwrap();
 
-        crate::memory::capture(
+        crate::core::memory::capture(
             &store,
-            &crate::memory::MemoryInput {
+            &crate::core::memory::MemoryInput {
                 layer: "L1".into(),
                 text: "this project uses Postgres for the database".into(),
                 session_id: None,
@@ -1510,12 +1510,12 @@ mod context_scope_tests {
     fn a_known_window_lets_a_large_prompt_still_carry_memory() {
         let dir = std::env::temp_dir().join(format!("aip-window-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
-        let m = crate::memory::capture(
+        let m = crate::core::memory::capture(
             &store,
-            &crate::memory::MemoryInput {
+            &crate::core::memory::MemoryInput {
                 layer: "L1".into(),
                 text: "this project uses Postgres for the database".into(),
                 session_id: None,
@@ -1524,10 +1524,10 @@ mod context_scope_tests {
             },
         )
         .unwrap();
-        crate::memory::assign_scope(
+        crate::core::memory::assign_scope(
             &store,
             &m.id,
-            crate::memory::ScopeAssignment::Project { project, agent: None },
+            crate::core::memory::ScopeAssignment::Project { project, agent: None },
         )
         .unwrap();
 
@@ -1555,9 +1555,9 @@ mod context_scope_tests {
         );
 
         // After: the catalog publishes the real window and the same request gets memory.
-        let n = crate::gateway::model_context::upsert(
+        let n = crate::core::gateway::model_context::upsert(
             &store,
-            &[crate::gateway::model_context::ModelContextInput {
+            &[crate::core::gateway::model_context::ModelContextInput {
                 model_key: "openrouter/gpt-4o".into(),
                 context_window: 200_000,
                 chars_per_token: None,
@@ -1581,12 +1581,12 @@ mod context_scope_tests {
     fn a_principal_denied_memory_is_refused_even_when_it_asks_for_it() {
         let dir = std::env::temp_dir().join(format!("aip-principal-e2e-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
-        let m = crate::memory::capture(
+        let m = crate::core::memory::capture(
             &store,
-            &crate::memory::MemoryInput {
+            &crate::core::memory::MemoryInput {
                 layer: "L1".into(),
                 text: "this project uses Postgres for the database".into(),
                 session_id: None,
@@ -1595,10 +1595,10 @@ mod context_scope_tests {
             },
         )
         .unwrap();
-        crate::memory::assign_scope(
+        crate::core::memory::assign_scope(
             &store,
             &m.id,
-            crate::memory::ScopeAssignment::Project { project, agent: None },
+            crate::core::memory::ScopeAssignment::Project { project, agent: None },
         )
         .unwrap();
 
@@ -1619,7 +1619,7 @@ mod context_scope_tests {
         let out = inject_context(&core, &hdr(&[("aip-agent", "cursor")]), None, &mut ok);
         assert!(out.injected, "no row means inherit: {}", out.status_value());
 
-        assert!(crate::gateway::principal::set(&store, "cursor", false).unwrap());
+        assert!(crate::core::gateway::principal::set(&store, "cursor", false).unwrap());
 
         // The denied principal is refused, and says why — not "disabled", which would send the
         // operator hunting for a master switch that is on.
@@ -1652,15 +1652,15 @@ mod context_scope_tests {
     fn keyed_core(
         tag: &str,
         keys: &'static [(&'static str, &'static str)],
-    ) -> (GatewayCore, Arc<crate::store::Store>, Arc<AtomicUsize>, std::path::PathBuf) {
+    ) -> (GatewayCore, Arc<crate::core::store::Store>, Arc<AtomicUsize>, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("aip-ctx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
-        let m = crate::memory::capture(
+        let m = crate::core::memory::capture(
             &store,
-            &crate::memory::MemoryInput {
+            &crate::core::memory::MemoryInput {
                 layer: "L1".into(),
                 text: "this project uses Postgres for the database".into(),
                 session_id: None,
@@ -1669,22 +1669,25 @@ mod context_scope_tests {
             },
         )
         .unwrap();
-        crate::memory::assign_scope(
+        crate::core::memory::assign_scope(
             &store,
             &m.id,
-            crate::memory::ScopeAssignment::Project { project, agent: None },
+            crate::core::memory::ScopeAssignment::Project { project, agent: None },
         )
         .unwrap();
 
         let reads = Arc::new(AtomicUsize::new(0));
         let (r, s2) = (reads.clone(), store.clone());
-        let all: Vec<crate::gateway::AppKey> = keys
+        let all: Vec<crate::core::gateway::AppKey> = keys
             .iter()
-            .map(|(id, sec)| crate::gateway::AppKey { id: (*id).into(), secret: (*sec).into() })
+            .map(|(id, sec)| crate::core::gateway::AppKey {
+                id: (*id).into(),
+                secret: (*sec).into(),
+            })
             .collect();
         let core = core().with_store(store.clone()).with_app_keys(Arc::new(move || {
             r.fetch_add(1, Ordering::SeqCst);
-            let active = crate::persist::active_gateway_key_ids(&s2).unwrap_or_default();
+            let active = crate::core::persist::active_gateway_key_ids(&s2).unwrap_or_default();
             all.iter().filter(|k| active.contains(&k.id)).cloned().collect()
         }));
         core.set_memory_enabled(true);
@@ -1719,8 +1722,8 @@ mod context_scope_tests {
     fn a_client_with_only_a_key_is_governed_by_a_policy_on_that_key() {
         let (core, store, _reads, dir) =
             keyed_core("keyonly", &[("ak-1", "sk-aip-app1"), ("ak-2", "sk-aip-app2")]);
-        crate::persist::gateway_key_insert(&store, "ak-1", "an unnamed ide").unwrap();
-        crate::persist::gateway_key_insert(&store, "ak-2", "another ide").unwrap();
+        crate::core::persist::gateway_key_insert(&store, "ak-1", "an unnamed ide").unwrap();
+        crate::core::persist::gateway_key_insert(&store, "ak-2", "another ide").unwrap();
         let body = || {
             json!({"model": "m", "messages": [
                 {"role": "user", "content": "what database does this project use"}
@@ -1734,8 +1737,8 @@ mod context_scope_tests {
         assert!(out.injected, "no row means inherit: {}", out.status_value());
 
         // Denied by key — the whole feature. Without the resolved id this client is unnameable.
-        let key1 = crate::gateway::principal::key_principal("ak-1");
-        assert!(crate::gateway::principal::set(&store, &key1, false).unwrap());
+        let key1 = crate::core::gateway::principal::key_principal("ak-1");
+        assert!(crate::core::gateway::principal::set(&store, &key1, false).unwrap());
         let mut denied = body();
         let out = inject_context(
             &core,
@@ -1778,9 +1781,9 @@ mod context_scope_tests {
     #[test]
     fn an_unlisted_label_does_not_rescue_a_denied_key() {
         let (core, store, _reads, dir) = keyed_core("rescue", &[("ak-1", "sk-aip-app1")]);
-        crate::persist::gateway_key_insert(&store, "ak-1", "cursor").unwrap();
-        let key1 = crate::gateway::principal::key_principal("ak-1");
-        assert!(crate::gateway::principal::set(&store, &key1, false).unwrap());
+        crate::core::persist::gateway_key_insert(&store, "ak-1", "cursor").unwrap();
+        let key1 = crate::core::gateway::principal::key_principal("ak-1");
+        assert!(crate::core::gateway::principal::set(&store, &key1, false).unwrap());
         let mut body = json!({"model": "m", "messages": [
             {"role": "user", "content": "what database does this project use"}
         ]});
@@ -1803,7 +1806,7 @@ mod context_scope_tests {
     #[test]
     fn the_master_key_is_governable_by_a_policy_on_its_own_name() {
         let (core, store, _reads, dir) = keyed_core("masterkey", &[("ak-1", "sk-aip-app1")]);
-        crate::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
+        crate::core::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
         let body = || {
             json!({"model": "m", "messages": [
                 {"role": "user", "content": "what database does this project use"}
@@ -1816,8 +1819,8 @@ mod context_scope_tests {
         let out = inject_context(&core, &master, None, &mut before);
         assert!(out.injected, "no row means inherit: {}", out.status_value());
 
-        let mk = crate::gateway::principal::master_principal();
-        assert!(crate::gateway::principal::set(&store, &mk, false).unwrap());
+        let mk = crate::core::gateway::principal::master_principal();
+        assert!(crate::core::gateway::principal::set(&store, &mk, false).unwrap());
         let mut denied = body();
         let out = inject_context(&core, &master, None, &mut denied);
         assert!(!out.injected, "the master key can be denied");
@@ -1837,7 +1840,7 @@ mod context_scope_tests {
     #[test]
     fn a_denied_master_key_is_denied_on_the_write_path_too() {
         let (core, store, _reads, dir) = keyed_core("masterwrite", &[("ak-1", "sk-aip-app1")]);
-        crate::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
+        crate::core::persist::gateway_key_insert(&store, "ak-1", "an ide").unwrap();
         let body = json!({"model": "m", "messages": [
             {"role": "user", "content": "remember that this project uses Postgres"}
         ]});
@@ -1846,8 +1849,8 @@ mod context_scope_tests {
         let before = prepare_capture(&core, &master, &body, 1).unwrap();
         assert!(before.writes_allowed, "no row means inherit");
 
-        let mk = crate::gateway::principal::master_principal();
-        assert!(crate::gateway::principal::set(&store, &mk, false).unwrap());
+        let mk = crate::core::gateway::principal::master_principal();
+        assert!(crate::core::gateway::principal::set(&store, &mk, false).unwrap());
         let after = prepare_capture(&core, &master, &body, 2).unwrap();
         assert!(!after.writes_allowed, "a denied principal must not be learned from");
 
@@ -1862,7 +1865,7 @@ mod context_scope_tests {
     fn store_core(tag: &str) -> (GatewayCore, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("aip-ctx-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
         let core = core().with_store(store);
         core.set_memory_enabled(true);
         (core, dir)
@@ -2038,13 +2041,13 @@ mod context_scope_tests {
     fn a_frozen_block_is_served_unchanged_until_its_ttl_expires() {
         let dir = std::env::temp_dir().join(format!("aip-freeze-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
         let add = |text: &str, pinned: bool| {
-            let m = crate::memory::capture(
+            let m = crate::core::memory::capture(
                 &store,
-                &crate::memory::MemoryInput {
+                &crate::core::memory::MemoryInput {
                     layer: "L1".into(),
                     text: text.into(),
                     session_id: None,
@@ -2053,10 +2056,13 @@ mod context_scope_tests {
                 },
             )
             .unwrap();
-            crate::memory::assign_scope(
+            crate::core::memory::assign_scope(
                 &store,
                 &m.id,
-                crate::memory::ScopeAssignment::Project { project: project.clone(), agent: None },
+                crate::core::memory::ScopeAssignment::Project {
+                    project: project.clone(),
+                    agent: None,
+                },
             )
             .unwrap();
         };
@@ -2113,14 +2119,14 @@ mod context_scope_tests {
     fn two_identical_requests_compose_the_same_memory_block() {
         let dir = std::env::temp_dir().join(format!("aip-sameblock-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-        let root = crate::gateway::default_workspace_root().unwrap();
+        let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+        let root = crate::core::gateway::default_workspace_root().unwrap();
         let project = project_key_from_root(&root.to_string_lossy()).unwrap();
         // Atoms that tie on every ranking key: identical text, same layer, captured in the same run.
         for _ in 0..3 {
-            let m = crate::memory::capture(
+            let m = crate::core::memory::capture(
                 &store,
-                &crate::memory::MemoryInput {
+                &crate::core::memory::MemoryInput {
                     layer: "L1".into(),
                     text: "the database is postgres".into(),
                     session_id: None,
@@ -2129,10 +2135,13 @@ mod context_scope_tests {
                 },
             )
             .unwrap();
-            crate::memory::assign_scope(
+            crate::core::memory::assign_scope(
                 &store,
                 &m.id,
-                crate::memory::ScopeAssignment::Project { project: project.clone(), agent: None },
+                crate::core::memory::ScopeAssignment::Project {
+                    project: project.clone(),
+                    agent: None,
+                },
             )
             .unwrap();
         }
@@ -2167,7 +2176,7 @@ mod context_scope_tests {
         let mut h = HeaderMap::new();
         h.insert(HDR_MEMORY, "injected=1".parse().unwrap());
         h.insert(HDR_MEMORY_SCOPE, "user=local".parse().unwrap());
-        let fwd = crate::gateway::forwarded_headers(&h);
+        let fwd = crate::core::gateway::forwarded_headers(&h);
         assert!(!fwd.contains_key(HDR_MEMORY));
         assert!(!fwd.contains_key(HDR_MEMORY_SCOPE));
     }

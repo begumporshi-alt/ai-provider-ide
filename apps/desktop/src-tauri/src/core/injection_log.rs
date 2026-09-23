@@ -104,6 +104,14 @@ impl InjectionLog {
     pub fn len(&self) -> usize {
         self.recent.len()
     }
+
+    /// The `is_empty` half of `len`. Test-only for the same reason, and present because a public
+    /// `len` without it is `clippy::len_without_is_empty` — a lint that only started firing when
+    /// `core/` became a public module and this type became reachable from outside the crate.
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.recent.is_empty()
+    }
 }
 
 /// Milliseconds since the epoch, for event timestamps.

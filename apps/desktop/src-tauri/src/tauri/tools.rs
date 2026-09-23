@@ -156,7 +156,7 @@ pub fn tools_check_root(root: String) -> Result<(), String> {
 /// file written through the gateway is readable from the Assistant: one workspace, not two.
 #[tauri::command]
 pub fn tools_default_root() -> Result<String, String> {
-    crate::gateway::default_workspace_root()
+    crate::core::gateway::default_workspace_root()
         .map(|p| p.to_string_lossy().into_owned())
         .ok_or_else(|| "no home directory — set a workspace root".to_string())
 }

@@ -16,7 +16,7 @@
  * user's other providers — is left byte-for-byte alone, and a file we cannot parse is an error,
  * never something to overwrite.
  */
-use crate::store::Store;
+use crate::core::store::Store;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -324,7 +324,7 @@ pub fn sync(store: &Arc<Store>) -> Result<WorkbuddySyncResult, String> {
         None
     } else {
         Some(
-            crate::vault::get(crate::gateway::MASTER_ACCOUNT)
+            crate::core::vault::get(crate::core::gateway::MASTER_ACCOUNT)
                 .ok()
                 .flatten()
                 .ok_or_else(|| NO_KEY_YET.to_string())?,
@@ -544,10 +544,10 @@ mod tests {
         .is_err());
     }
 
-    fn tmp_store(tag: &str) -> (crate::store::Store, std::path::PathBuf) {
+    fn tmp_store(tag: &str) -> (crate::core::store::Store, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!("wb-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
-        (crate::store::Store::open(&dir).unwrap(), dir)
+        (crate::core::store::Store::open(&dir).unwrap(), dir)
     }
 
     const EP: &str = "http://127.0.0.1:8787/v1/chat/completions";

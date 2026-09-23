@@ -20,8 +20,8 @@ use rusqlite::params;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::gateway::context_scope::Scope;
-use crate::store::Store;
+use crate::core::gateway::context_scope::Scope;
+use crate::core::store::Store;
 
 /// Reserved agent label for the router's own distillation traffic. §3.5.6: the drain calls a model
 /// through this very gateway, so each distillation would otherwise be captured as a turn, distilled

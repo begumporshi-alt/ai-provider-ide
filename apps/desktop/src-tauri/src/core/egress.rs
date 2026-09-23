@@ -24,8 +24,8 @@ use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use tauri::ipc::Channel;
 
-use crate::store::Store;
-use crate::vault;
+use crate::core::store::Store;
+use crate::core::vault;
 
 pub const SENTINEL: &str = "{{secret}}";
 
@@ -48,7 +48,7 @@ pub enum EgressError {
     #[error("vault error: {0}")]
     Vault(#[from] vault::VaultError),
     #[error("store error: {0}")]
-    Store(#[from] crate::store::StoreError),
+    Store(#[from] crate::core::store::StoreError),
     #[error("image fetch refused: {0}")]
     ImageFetch(String),
 }

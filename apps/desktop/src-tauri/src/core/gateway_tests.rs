@@ -192,10 +192,10 @@ struct TestServer {
 
 /// A real store on a temp dir, because `GatewayState` now carries one for the context-graph
 /// audit path. Returns the dir so the caller keeps it alive until the test ends.
-fn gateway_test_store(tag: &str) -> (Arc<crate::store::Store>, std::path::PathBuf) {
+fn gateway_test_store(tag: &str) -> (Arc<crate::core::store::Store>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("aip-gw-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    (Arc::new(crate::store::Store::open(&dir).unwrap()), dir)
+    (Arc::new(crate::core::store::Store::open(&dir).unwrap()), dir)
 }
 
 /// Key provider backed by a mutable slot — simulates rotate/revoke without the keychain.
@@ -1187,7 +1187,7 @@ fn key_core(
 ) -> (Arc<GatewayCore>, Arc<AtomicUsize>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("aip-appkey-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let store = Arc::new(crate::store::Store::open(&dir).unwrap());
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
     let reads = Arc::new(AtomicUsize::new(0));
     let (r, s2) = (reads.clone(), store.clone());
     let all: Vec<AppKey> =
@@ -1196,7 +1196,7 @@ fn key_core(
     let core = GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-master".into())))
         .with_app_keys(Arc::new(move || {
             r.fetch_add(1, Ordering::SeqCst);
-            let active = crate::persist::active_gateway_key_ids(&s2).unwrap_or_default();
+            let active = crate::core::persist::active_gateway_key_ids(&s2).unwrap_or_default();
             all.iter().filter(|k| active.contains(&k.id)).cloned().collect()
         }))
         .with_store(store);
@@ -1209,7 +1209,7 @@ fn key_core(
 #[test]
 fn the_app_key_map_is_read_once_not_once_per_request() {
     let (core, reads, dir) = key_core("memo", &[("ak-1", "sk-aip-app1")]);
-    crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
+    crate::core::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
@@ -1224,11 +1224,11 @@ fn the_app_key_map_is_read_once_not_once_per_request() {
 fn revoking_a_key_invalidates_the_memo_on_the_next_request() {
     let (core, reads, dir) = key_core("revoke", &[("ak-1", "sk-aip-app1")]);
     let store = core.store().unwrap();
-    crate::persist::gateway_key_insert(store, "ak-1", "cursor").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-1", "cursor").unwrap();
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 1);
 
-    crate::persist::gateway_key_revoke(store, "ak-1").unwrap();
+    crate::core::persist::gateway_key_revoke(store, "ak-1").unwrap();
     assert!(core.app_keys().is_empty(), "a revoked key must authenticate nobody");
     assert_eq!(reads.load(Ordering::SeqCst), 2, "the memo was not served");
     let _ = std::fs::remove_dir_all(&dir);
@@ -1240,9 +1240,9 @@ fn revoking_a_key_invalidates_the_memo_on_the_next_request() {
 fn creating_a_key_invalidates_the_memo_on_the_next_request() {
     let (core, _reads, dir) = key_core("create", &[("ak-1", "s1"), ("ak-2", "s2")]);
     let store = core.store().unwrap();
-    crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
     assert_eq!(core.app_keys().len(), 1);
-    crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
     assert_eq!(core.app_keys().len(), 2, "a new key authenticates on the very next request");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1252,7 +1252,7 @@ fn creating_a_key_invalidates_the_memo_on_the_next_request() {
 #[test]
 fn the_memo_stops_being_served_once_its_ttl_expires() {
     let (core, reads, dir) = key_core("ttl", &[("ak-1", "sk-aip-app1")]);
-    crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
+    crate::core::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "cursor").unwrap();
     core.set_app_key_cache_ttl(Duration::ZERO);
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
@@ -1285,8 +1285,8 @@ fn without_a_store_nothing_is_cached() {
 fn a_presented_key_resolves_to_its_id_and_a_strange_one_to_nothing() {
     let (core, _reads, dir) = key_core("resolve", &[("ak-1", "s1"), ("ak-2", "s2")]);
     let store = core.store().unwrap();
-    crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
-    crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
     // Deliberately not the first entry: resolution must not depend on position.
     assert_eq!(core.app_key_for("s2").as_deref(), Some("ak-2"));
     assert_eq!(core.app_key_for("s1").as_deref(), Some("ak-1"));
@@ -1303,8 +1303,8 @@ fn a_presented_key_resolves_to_its_id_and_a_strange_one_to_nothing() {
 fn resolving_a_key_scans_every_candidate_rather_than_stopping_at_the_first() {
     let (core, _reads, dir) = key_core("scan", &[("ak-1", "shared"), ("ak-2", "shared")]);
     let store = core.store().unwrap();
-    crate::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
-    crate::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-1", "one").unwrap();
+    crate::core::persist::gateway_key_insert(store, "ak-2", "two").unwrap();
     assert_eq!(core.app_key_for("shared").as_deref(), Some("ak-2"), "the scan runs to the end");
     let _ = std::fs::remove_dir_all(&dir);
 }
@@ -1316,7 +1316,7 @@ fn resolving_a_key_scans_every_candidate_rather_than_stopping_at_the_first() {
 #[test]
 fn the_master_key_resolves_to_its_own_principal() {
     let (core, _reads, dir) = key_core("master-principal", &[("ak-1", "sk-aip-app1")]);
-    crate::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "an ide").unwrap();
+    crate::core::persist::gateway_key_insert(core.store().unwrap(), "ak-1", "an ide").unwrap();
     let mk = super::principal::master_principal();
 
     assert_eq!(core.key_principal_for("sk-aip-master").as_deref(), Some(mk.as_str()));
@@ -1944,7 +1944,7 @@ fn the_refusal_message_tells_the_model_what_to_do() {
 /// outlived the operator's intent, because nothing else will ever tear it down.
 #[test]
 fn a_bound_listener_is_stale_only_when_serving_was_never_asked_for() {
-    use crate::gateway_cmds::GatewayState;
+    use crate::tauri::gateway_cmds::GatewayState;
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
     let (core, _bridge) = test_core(key);
     let (store, _dir) = gateway_test_store("stale-listener");
@@ -2801,7 +2801,9 @@ async fn a_streamed_responses_failure_carries_a_code() {
 /// than its helper. That is the coverage the isolated helper tests could not give: they
 /// proved `record_gateway_tool_call` works, not that the command ever calls it. Deleting the
 /// call site now fails a test.
-fn tool_test_state(tag: &str) -> (Arc<crate::gateway_cmds::GatewayState>, std::path::PathBuf) {
+fn tool_test_state(
+    tag: &str,
+) -> (Arc<crate::tauri::gateway_cmds::GatewayState>, std::path::PathBuf) {
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
     let (core, _bridge) = test_core(key);
     let (store, _sdir) = gateway_test_store(tag);
@@ -2809,7 +2811,14 @@ fn tool_test_state(tag: &str) -> (Arc<crate::gateway_cmds::GatewayState>, std::p
     let _ = std::fs::remove_dir_all(&ws);
     std::fs::create_dir_all(&ws).unwrap();
     core.set_workspace_root(ws.clone());
-    (Arc::new(crate::gateway_cmds::GatewayState { core, server: Mutex::new(None), store }), ws)
+    (
+        Arc::new(crate::tauri::gateway_cmds::GatewayState {
+            core,
+            server: Mutex::new(None),
+            store,
+        }),
+        ws,
+    )
 }
 
 #[test]
@@ -2821,7 +2830,7 @@ fn a_refused_gateway_tool_call_is_gated_logged_and_recorded() {
         let lines = lines.clone();
         move |line: &str| lines.lock().unwrap().push(line.to_string())
     };
-    let res = crate::gateway_cmds::run_gateway_tool(
+    let res = crate::tauri::gateway_cmds::run_gateway_tool(
         &state,
         &sink,
         42,
@@ -2844,7 +2853,7 @@ fn a_refused_gateway_tool_call_is_gated_logged_and_recorded() {
     let node = (0..200)
         .find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::context::graph(&store, 200)
+            crate::core::context::graph(&store, 200)
                 .ok()?
                 .nodes
                 .into_iter()
@@ -2868,7 +2877,7 @@ fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
         let lines = lines.clone();
         move |line: &str| lines.lock().unwrap().push(line.to_string())
     };
-    let res = crate::gateway_cmds::run_gateway_tool(
+    let res = crate::tauri::gateway_cmds::run_gateway_tool(
         &state,
         &sink,
         43,
@@ -2891,7 +2900,7 @@ fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
     let node = (0..200)
         .find_map(|_| {
             std::thread::sleep(std::time::Duration::from_millis(10));
-            crate::context::graph(&store, 200)
+            crate::core::context::graph(&store, 200)
                 .ok()?
                 .nodes
                 .into_iter()
@@ -2908,12 +2917,12 @@ fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
 fn a_bad_workspace_root_is_refused_before_anything_stores_it() {
     let (state, _ws) = tool_test_state("wsroot");
     assert!(
-        crate::gateway_cmds::set_gateway_workspace_root(&state, "/").is_err(),
+        crate::tauri::gateway_cmds::set_gateway_workspace_root(&state, "/").is_err(),
         "the filesystem root is refused"
     );
     let home = std::env::var("HOME").unwrap_or_default();
     assert!(
-        crate::gateway_cmds::set_gateway_workspace_root(&state, &home).is_err(),
+        crate::tauri::gateway_cmds::set_gateway_workspace_root(&state, &home).is_err(),
         "the home directory is refused"
     );
     // A refused root must not replace the good one already set.
@@ -2922,9 +2931,11 @@ fn a_bad_workspace_root_is_refused_before_anything_stores_it() {
     let good = std::env::temp_dir().join(format!("aip-ws-good-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&good);
     std::fs::create_dir_all(&good).unwrap();
-    assert!(
-        crate::gateway_cmds::set_gateway_workspace_root(&state, &good.to_string_lossy()).is_ok()
-    );
+    assert!(crate::tauri::gateway_cmds::set_gateway_workspace_root(
+        &state,
+        &good.to_string_lossy()
+    )
+    .is_ok());
     assert!(state.core.workspace_root().is_some());
 }
 
@@ -2952,14 +2963,14 @@ fn phase6_dir() -> std::path::PathBuf {
 /// memory layer switched on. Returns the temp dir so the caller can clean it up.
 async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
     let dir = phase6_dir();
-    let store = Arc::new(crate::store::Store::open(&dir).unwrap());
-    let project = crate::gateway::context_scope::project_key_from_root(
-        &crate::gateway::default_workspace_root().unwrap().to_string_lossy(),
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+    let project = crate::core::gateway::context_scope::project_key_from_root(
+        &crate::core::gateway::default_workspace_root().unwrap().to_string_lossy(),
     )
     .unwrap();
-    let m = crate::memory::capture(
+    let m = crate::core::memory::capture(
         &store,
-        &crate::memory::MemoryInput {
+        &crate::core::memory::MemoryInput {
             layer: "L1".into(),
             text: MEMORY_TEXT.into(),
             session_id: None,
@@ -2970,10 +2981,10 @@ async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
     .unwrap();
     // Scoped on purpose: an unscoped memory is invisible to every scope, which would make the
     // whole suite pass on "no candidates" instead of proving injection.
-    assert!(crate::memory::assign_scope(
+    assert!(crate::core::memory::assign_scope(
         &store,
         &m.id,
-        crate::memory::ScopeAssignment::Project { project, agent: None },
+        crate::core::memory::ScopeAssignment::Project { project, agent: None },
     )
     .unwrap());
 

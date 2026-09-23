@@ -30,8 +30,8 @@ use rand::Rng as _;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 
-use crate::injection_log::{InjectionEvent, InjectionLog, InjectionStats};
-use crate::vault;
+use crate::core::injection_log::{InjectionEvent, InjectionLog, InjectionStats};
+use crate::core::vault;
 
 pub const DEFAULT_PORT: u16 = 8787;
 pub const MASTER_ACCOUNT: &str = "masterkey";
@@ -214,9 +214,9 @@ pub const APP_KEY_PREFIX: &str = "gwkey:";
 
 /// R4: secrets of every non-revoked per-app key, read from the keychain. Metadata (label,
 /// revocation, last-used) lives in SQLite — see `persist.rs`.
-pub fn vault_app_key_provider(store: Arc<crate::store::Store>) -> AppKeyProvider {
+pub fn vault_app_key_provider(store: Arc<crate::core::store::Store>) -> AppKeyProvider {
     Arc::new(move || {
-        let ids = crate::persist::active_gateway_key_ids(&store).unwrap_or_default();
+        let ids = crate::core::persist::active_gateway_key_ids(&store).unwrap_or_default();
         ids.into_iter()
             .filter_map(|id| {
                 let secret = vault::get(&format!("{APP_KEY_PREFIX}{id}")).ok().flatten()?;
@@ -313,18 +313,18 @@ pub type SpendProvider = Arc<dyn Fn(Option<&str>) -> SpendLimits + Send + Sync +
 ///
 /// The per-app half is only read when there *is* an app, so a master-key request pays for one
 /// query rather than two.
-pub fn vault_spend_provider(store: Arc<crate::store::Store>) -> SpendProvider {
+pub fn vault_spend_provider(store: Arc<crate::core::store::Store>) -> SpendProvider {
     Arc::new(move |app_key_id: Option<&str>| {
         let (app_micros, app_cap_micros) = match app_key_id {
             Some(id) => (
-                Some(crate::persist::app_month_spend_micros(&store, id)),
-                crate::persist::gateway_key_cap(&store, id),
+                Some(crate::core::persist::app_month_spend_micros(&store, id)),
+                crate::core::persist::gateway_key_cap(&store, id),
             ),
             None => (None, None),
         };
         SpendLimits {
-            total_micros: crate::persist::month_spend_micros(&store),
-            total_cap_micros: crate::persist::spend_cap_micros(&store).unwrap_or(0),
+            total_micros: crate::core::persist::month_spend_micros(&store),
+            total_cap_micros: crate::core::persist::spend_cap_micros(&store).unwrap_or(0),
             app_micros,
             app_cap_micros,
         }
@@ -615,7 +615,7 @@ pub struct GatewayCore {
     /// `Option` and `None` by default for the same reason `app_key_provider` is: every existing test
     /// builds a core with `new()`, and none of them have a store. It is attached in production by
     /// `with_store`. Nothing on the request path touches it until the memory toggle is on.
-    store: Option<Arc<crate::store::Store>>,
+    store: Option<Arc<crate::core::store::Store>>,
     /// Host-side kill switch for the memory/context layer. **Off by default** — see
     /// `GATEWAY_MEMORY_LAYER.md` §0: injecting memory bills tokens on every request from every
     /// client and is invisible at a layer with no review step, which is exactly why skills were kept
@@ -829,7 +829,7 @@ impl GatewayCore {
         };
         // Cheap and authoritative: one indexed SQLite scan, no keychain.
         let active =
-            self.store.as_ref().and_then(|s| crate::persist::active_gateway_key_ids(s).ok());
+            self.store.as_ref().and_then(|s| crate::core::persist::active_gateway_key_ids(s).ok());
         if let Ok(cache) = self.app_key_cache.lock() {
             if cache.fresh(&active) {
                 return cache.keys.clone();
@@ -896,7 +896,7 @@ impl GatewayCore {
 
     /// Attach the store so the request path can reach the memory/context layer. Builder, for the
     /// same reason as `with_app_keys`: `new()` must keep working without one.
-    pub fn with_store(mut self, store: Arc<crate::store::Store>) -> Self {
+    pub fn with_store(mut self, store: Arc<crate::core::store::Store>) -> Self {
         self.store = Some(store);
         self
     }
@@ -904,7 +904,7 @@ impl GatewayCore {
     /// The store, when one was attached. `None` in tests and whenever the gateway was built before
     /// the store existed — in which case the memory layer degrades to "no memory", never an error.
     #[allow(dead_code)] // Phase 2: the recall path reads through this.
-    pub fn store(&self) -> Option<&Arc<crate::store::Store>> {
+    pub fn store(&self) -> Option<&Arc<crate::core::store::Store>> {
         self.store.as_ref()
     }
 
@@ -1010,7 +1010,7 @@ impl GatewayCore {
         outcome: &context_scope::InjectionOutcome,
     ) {
         self.injection_log.lock().unwrap().record(InjectionEvent {
-            ts_ms: crate::injection_log::now_ms(),
+            ts_ms: crate::core::injection_log::now_ms(),
             id: format!("gw-{id}"),
             model: model.to_string(),
             scope: outcome.scope.clone(),
@@ -1865,6 +1865,27 @@ pub fn copy_master_key() -> Result<(), String> {
     cb.set_text(key).map_err(|e| e.to_string())
 }
 
+/// The port the gateway should come back up on, or `None` when it was left off.
+///
+/// The gateway is a local endpoint other processes point at — WorkBuddy's custom-provider entry
+/// among them — so "was serving" is a setting, not a session detail. A gateway that needs a click
+/// after every relaunch silently breaks every client configured against it.
+///
+/// Lives in `core/` because two processes now read it: the desktop app restoring its own
+/// gateway, and `aiproviderd` picking a port at boot. One authority — two copies of this query
+/// would drift the moment one of them gained a fallback.
+pub fn persisted_gateway_port(store: &crate::core::store::Store) -> Option<u16> {
+    let conn = store.conn.lock().unwrap();
+    let value: String = conn
+        .query_row("SELECT value_json FROM settings WHERE key = 'gateway'", [], |r| r.get(0))
+        .ok()?;
+    let parsed: serde_json::Value = serde_json::from_str(&value).ok()?;
+    if !(parsed.get("enabled")?.as_bool()?) {
+        return None;
+    }
+    Some(parsed.get("port")?.as_u64()? as u16)
+}
+
 pub struct ServerHandle {
     pub shutdown: oneshot::Sender<()>,
     pub addr: SocketAddr,
@@ -1892,6 +1913,18 @@ async fn ensure_retry_after(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
+/// Liveness probe for the standalone service (`aiproviderd`) and for the UI's service
+/// discovery (dev-book §10 4.2).
+///
+/// Deliberately the one unauthenticated route. Every other route — including the 404 and 405
+/// refusals — authenticates first, because an unauthenticated answer is a statement that the
+/// route exists. This one answers before any key is produced, because a client that does not
+/// yet hold a key must still be able to find the service; and it reports exactly one bit ("a
+/// process is listening"), never the version, the key state, or the route inventory.
+async fn health_h() -> Response {
+    (StatusCode::OK, axum::Json(json!({ "status": "ok" }))).into_response()
+}
+
 /// Spawn the axum server on 127.0.0.1:port (invariant 11). Bind failure is a loud error
 /// with remediation text (invariant 16).
 pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, String> {
@@ -1902,6 +1935,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
     let bound = listener.local_addr().map_err(|e| e.to_string())?;
     *core.port.lock().unwrap() = bound.port();
     let app = axum::Router::new()
+        .route("/health", get(health_h))
         .route("/v1/models", get(models_h))
         .route("/v1/chat/completions", post(chat_h))
         .route("/v1/images/generations", post(image_h))

@@ -19,7 +19,7 @@
 use rusqlite::params;
 use serde_json::Value;
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 /// Ring size per session. Pruned by `prune`, and enforced here as well so a misbehaving caller
 /// cannot grow the table without limit.
@@ -68,8 +68,8 @@ pub struct Turn {
 /// request gets when memory is off — sessions are unused then, so this is inert rather than a
 /// second namespace that shifts with the toggle.
 pub fn resolve_session(
-    meta: &crate::gateway::context_scope::RequestMeta,
-    scope: &crate::gateway::context_scope::Scope,
+    meta: &crate::core::gateway::context_scope::RequestMeta,
+    scope: &crate::core::gateway::context_scope::Scope,
     principal: Option<&str>,
 ) -> String {
     if let Some(s) = &meta.session {
@@ -82,7 +82,7 @@ pub fn resolve_session(
         scope.project.as_deref().unwrap_or("-"),
         scope.agent.as_deref().unwrap_or("-"),
     );
-    format!("s-{:016x}", crate::gateway::context_scope::fnv1a(&key))
+    format!("s-{:016x}", crate::core::gateway::context_scope::fnv1a(&key))
 }
 
 /// Create the session if new, otherwise refresh `last_seen_at`.
@@ -92,7 +92,7 @@ pub fn resolve_session(
 pub fn touch_session(
     store: &Store,
     session: &str,
-    scope: &crate::gateway::context_scope::Scope,
+    scope: &crate::core::gateway::context_scope::Scope,
 ) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let now = now_ms();
@@ -219,7 +219,7 @@ pub fn recent_turns(store: &Store, session: &str, limit: usize) -> Result<Vec<Tu
 /// whitespace must still be recognised as a duplicate.
 pub fn turn_hash(role: &str, text: &str) -> String {
     let normalised: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    format!("{:016x}", crate::gateway::context_scope::fnv1a(&format!("{role}\n{normalised}")))
+    format!("{:016x}", crate::core::gateway::context_scope::fnv1a(&format!("{role}\n{normalised}")))
 }
 
 /// Hashes of the user turns present in an incoming request, so injected turns that duplicate them
@@ -360,7 +360,7 @@ pub fn prune(store: &Store) -> Result<PruneStats, String> {
 #[cfg(test)]
 mod session_context_tests {
     use super::*;
-    use crate::gateway::context_scope::{RequestMeta, Scope};
+    use crate::core::gateway::context_scope::{RequestMeta, Scope};
     use serde_json::json;
 
     fn temp_store(tag: &str) -> (Store, std::path::PathBuf) {

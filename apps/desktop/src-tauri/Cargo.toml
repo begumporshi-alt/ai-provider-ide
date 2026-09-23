@@ -5,6 +5,12 @@ description = "AI Provider Router — a local-first desktop app that turns the u
 authors = ["Tusher Shikder"]
 license = "Apache-2.0"
 edition = "2021"
+# Two binaries now live in this package (`ai-provider-router` from src/main.rs, and
+# `aiproviderd`). Without this, `tauri build` fails with "failed to find main binary" — it picks
+# the package's main binary by name and cannot disambiguate on its own. Measured 2026-09-23:
+# adding the [[bin]] section alone broke the bundle build; `cargo check`, `cargo test`, clippy
+# and `cargo build --bin` all stayed green, so nothing but a real `tauri build` finds this.
+default-run = "ai-provider-router"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -14,6 +20,14 @@ edition = "2021"
 # This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
 name = "ai_provider_router_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# Standalone gateway service — headless mode, dev-book §10. Cargo would discover this from
+# `src/bin/` anyway; it is declared so the target name cannot drift from the docs and so a
+# reader can see there are two binaries without hunting the filesystem.
+# The desktop app's own binary is `src/main.rs`, auto-discovered as `ai-provider-router`.
+[[bin]]
+name = "aiproviderd"
+path = "src/bin/aiproviderd.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }

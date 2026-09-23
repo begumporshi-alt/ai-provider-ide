@@ -13,7 +13,7 @@
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 /// Edge weight ceiling. A relation that recurs reads as *stronger*, not as more edges, so
 /// repeated recording bumps weight. Without a ceiling one hot relation would eventually

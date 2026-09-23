@@ -22,7 +22,7 @@ use rusqlite::params;
 use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
-use crate::store::Store;
+use crate::core::store::Store;
 
 pub const LAYERS: [&str; 4] = ["L0", "L1", "L2", "L3"];
 

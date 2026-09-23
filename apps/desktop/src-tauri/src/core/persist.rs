@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use tauri::State;
 
-use crate::commands::CommandError;
-use crate::store::Store;
+use crate::core::error::CommandError;
+use crate::core::store::Store;
 
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -63,7 +63,7 @@ pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, 
 #[tauri::command]
 pub fn provider_upsert(
     store: State<'_, Arc<Store>>,
-    egress: State<'_, Arc<crate::egress::EgressState>>,
+    egress: State<'_, Arc<crate::core::egress::EgressState>>,
     p: ProviderRow,
 ) -> Result<(), CommandError> {
     {
@@ -82,7 +82,7 @@ pub fn provider_upsert(
 #[tauri::command]
 pub fn provider_delete(
     store: State<'_, Arc<Store>>,
-    egress: State<'_, Arc<crate::egress::EgressState>>,
+    egress: State<'_, Arc<crate::core::egress::EgressState>>,
     id: String,
 ) -> Result<(), CommandError> {
     // §7 hygiene: the SQL cascade removes key ROWS; the keychain entries must go too,
@@ -98,7 +98,7 @@ pub fn provider_delete(
         conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?; // cascades (§7)
     }
     for account in secret_refs {
-        let _ = crate::vault::delete(&account);
+        let _ = crate::core::vault::delete(&account);
     }
     recompute_allow(&egress, &store);
     Ok(())
@@ -107,7 +107,7 @@ pub fn provider_delete(
 /// Recompute the allowlist entry for one provider (host allowed only while its status is
 /// pending/enabled/repairing).
 pub fn sync_allow_for_provider(
-    egress: &crate::egress::EgressState,
+    egress: &crate::core::egress::EgressState,
     store: &Store,
     provider_id: &str,
 ) {
@@ -137,7 +137,7 @@ pub fn sync_allow_for_provider(
 
 /// Full allowlist recompute from current provider rows (authoritative; called after deletes
 /// and status changes so no stale grant survives — invariant 9).
-pub fn recompute_allow(egress: &crate::egress::EgressState, store: &Store) {
+pub fn recompute_allow(egress: &crate::core::egress::EgressState, store: &Store) {
     let desired: std::collections::HashSet<String> = {
         let conn = store.conn.lock().unwrap();
         let hosts: Vec<String> = conn
@@ -236,7 +236,7 @@ pub fn api_key_delete(store: State<'_, Arc<Store>>, id: String) -> Result<(), Co
     conn.execute("DELETE FROM api_keys WHERE id = ?1", params![id])?;
     drop(conn);
     if let Some(account) = secret_ref {
-        let _ = crate::vault::delete(&account);
+        let _ = crate::core::vault::delete(&account);
     }
     Ok(())
 }
@@ -999,7 +999,7 @@ pub fn gateway_key_revoke(store: &Store, id: &str) -> Result<(), CommandError> {
 pub fn gateway_key_delete(store: &Store, id: &str) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute("DELETE FROM gateway_keys WHERE id=?1", params![id])?;
-    crate::vault::delete(&format!("{}{}", crate::gateway::APP_KEY_PREFIX, id)).ok();
+    crate::core::vault::delete(&format!("{}{}", crate::core::gateway::APP_KEY_PREFIX, id)).ok();
     Ok(())
 }
 

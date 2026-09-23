@@ -12,17 +12,15 @@ use serde::Deserialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::context;
-use crate::crash_report;
-use crate::egress::{self, EgressRequest, EgressState, StreamEvent};
-use crate::memory;
-use crate::orchestrator;
-use crate::skills;
-use crate::store::{self, Store};
-use crate::vault;
-
-#[derive(Debug, serde::Serialize)]
-pub struct CommandError(pub String);
+use crate::core::context;
+use crate::core::crash_report;
+use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
+use crate::core::error::CommandError;
+use crate::core::memory;
+use crate::core::orchestrator;
+use crate::core::skills;
+use crate::core::store::{self, Store};
+use crate::core::vault;
 
 impl From<egress::EgressError> for CommandError {
     fn from(e: egress::EgressError) -> Self {
@@ -34,11 +32,11 @@ impl From<vault::VaultError> for CommandError {
         CommandError(e.to_string())
     }
 }
-impl From<crate::store::StoreError> for CommandError {
-    fn from(e: crate::store::StoreError) -> Self {
+impl From<crate::core::store::StoreError> for CommandError {
+    fn from(e: crate::core::store::StoreError) -> Self {
         match e {
-            crate::store::StoreError::Sql(inner) => CommandError(ui_db_error(&inner)),
-            crate::store::StoreError::Io(inner) => {
+            crate::core::store::StoreError::Sql(inner) => CommandError(ui_db_error(&inner)),
+            crate::core::store::StoreError::Io(inner) => {
                 tracing::warn!("store io error (detail withheld from the UI): {inner}");
                 CommandError(match inner.kind() {
                     std::io::ErrorKind::NotFound => {
@@ -51,7 +49,7 @@ impl From<crate::store::StoreError> for CommandError {
             }
             // A migration carries its own id, which is safe and is the one thing the operator
             // needs — the rest of the detail is SQL.
-            crate::store::StoreError::Migration(id, detail) => {
+            crate::core::store::StoreError::Migration(id, detail) => {
                 tracing::warn!("migration {id} failed: {detail}");
                 CommandError(format!("migration {id} failed"))
             }
@@ -102,22 +100,6 @@ fn ui_db_error(e: &rusqlite::Error) -> String {
         },
         rusqlite::Error::QueryReturnedNoRows => "no matching row was found".to_string(),
         _ => "a database error occurred".to_string(),
-    }
-}
-
-/// `CommandError` is serialized to the webview (Tauri requires `Serialize`). It also implements
-/// `Display` so non-command callers — e.g. `gateway_cmds`, which needs a `String` error — can
-/// reuse `persist::*` helpers through the ordinary `?`/`map_err` idiom instead of reaching into
-/// the tuple field. One error type, two surfaces.
-impl std::fmt::Display for CommandError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
-    }
-}
-
-impl From<CommandError> for String {
-    fn from(e: CommandError) -> Self {
-        e.0
     }
 }
 
@@ -502,8 +484,8 @@ pub fn memory_clear(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
 #[tauri::command]
 pub fn gateway_prune_live_context(
     store: State<'_, Arc<Store>>,
-) -> Result<crate::gateway::session_context::PruneStats, CommandError> {
-    crate::gateway::session_context::prune(&store).map_err(CommandError)
+) -> Result<crate::core::gateway::session_context::PruneStats, CommandError> {
+    crate::core::gateway::session_context::prune(&store).map_err(CommandError)
 }
 
 /// §6.2 retention for the `memories` table: L0 TTL and ring, L1/L2 decay. Pinned and L3 are exempt.
@@ -559,35 +541,35 @@ pub fn memory_conflicts(
 #[tauri::command]
 pub fn capture_claim(
     store: State<'_, Arc<Store>>,
-) -> Result<Vec<crate::capture::PendingRow>, CommandError> {
-    crate::capture::claim(&store).map_err(CommandError)
+) -> Result<Vec<crate::core::capture::PendingRow>, CommandError> {
+    crate::core::capture::claim(&store).map_err(CommandError)
 }
 
 #[tauri::command]
 pub fn capture_complete(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, CommandError> {
-    crate::capture::complete(&store, id).map_err(CommandError)
+    crate::core::capture::complete(&store, id).map_err(CommandError)
 }
 
 #[tauri::command]
 pub fn capture_release(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, CommandError> {
-    crate::capture::release(&store, id).map_err(CommandError)
+    crate::core::capture::release(&store, id).map_err(CommandError)
 }
 
 #[tauri::command]
 pub fn capture_requeue_stale(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
-    crate::capture::requeue_stale(&store).map_err(CommandError)
+    crate::core::capture::requeue_stale(&store).map_err(CommandError)
 }
 
 #[tauri::command]
 pub fn capture_queue_status(
     store: State<'_, Arc<Store>>,
-) -> Result<crate::capture::QueueStatus, CommandError> {
-    crate::capture::queue_status(&store).map_err(CommandError)
+) -> Result<crate::core::capture::QueueStatus, CommandError> {
+    crate::core::capture::queue_status(&store).map_err(CommandError)
 }
 
 #[tauri::command]
 pub fn capture_purge_finished(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
-    crate::capture::purge_finished(&store).map_err(CommandError)
+    crate::core::capture::purge_finished(&store).map_err(CommandError)
 }
 
 // ── per-principal memory policy (§4a) ───────────────────────────────────────
@@ -599,8 +581,8 @@ pub fn capture_purge_finished(store: State<'_, Arc<Store>>) -> Result<usize, Com
 #[tauri::command]
 pub fn memory_principal_list(
     store: State<'_, Arc<Store>>,
-) -> Result<Vec<crate::gateway::principal::PrincipalRow>, CommandError> {
-    crate::gateway::principal::list(&store).map_err(CommandError)
+) -> Result<Vec<crate::core::gateway::principal::PrincipalRow>, CommandError> {
+    crate::core::gateway::principal::list(&store).map_err(CommandError)
 }
 
 #[derive(Debug, Deserialize)]
@@ -616,8 +598,8 @@ pub fn memory_principal_set(
     policy: PrincipalPolicyInput,
 ) -> Result<bool, CommandError> {
     match policy.enabled {
-        Some(on) => crate::gateway::principal::set(&store, &policy.principal, on),
-        None => crate::gateway::principal::clear(&store, &policy.principal),
+        Some(on) => crate::core::gateway::principal::set(&store, &policy.principal, on),
+        None => crate::core::gateway::principal::clear(&store, &policy.principal),
     }
     .map_err(CommandError)
 }
@@ -633,9 +615,9 @@ pub fn memory_principal_set(
 #[tauri::command]
 pub fn router_model_context_replace(
     store: State<'_, Arc<Store>>,
-    rows: Vec<crate::gateway::model_context::ModelContextInput>,
+    rows: Vec<crate::core::gateway::model_context::ModelContextInput>,
 ) -> Result<usize, CommandError> {
-    crate::gateway::model_context::upsert(&store, &rows).map_err(CommandError)
+    crate::core::gateway::model_context::upsert(&store, &rows).map_err(CommandError)
 }
 
 /// How many models the gateway can plan a budget against. Shown in the UI because "why is so
@@ -643,7 +625,7 @@ pub fn router_model_context_replace(
 /// against the 8k default.
 #[tauri::command]
 pub fn router_model_context_count(store: State<'_, Arc<Store>>) -> Result<usize, CommandError> {
-    crate::gateway::model_context::count(&store).map_err(CommandError)
+    crate::core::gateway::model_context::count(&store).map_err(CommandError)
 }
 
 // ── crash reporting (L0 — local only, no external telemetry) ─────────────────
@@ -687,21 +669,21 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         store_info,
         settings_set,
         settings_get,
-        crate::persist::providers_list,
-        crate::persist::provider_upsert,
-        crate::persist::provider_delete,
-        crate::persist::api_keys_list,
-        crate::persist::api_key_upsert,
-        crate::persist::api_key_delete,
-        crate::persist::manifests_active,
-        crate::persist::manifest_upsert_active,
-        crate::persist::models_cache_replace,
-        crate::persist::models_cache_list,
-        crate::persist::aliases_replace,
-        crate::persist::aliases_list,
-        crate::persist::ledger_append,
-        crate::persist::ledger_recent,
-        crate::persist::ledger_rollup_run,
+        crate::core::persist::providers_list,
+        crate::core::persist::provider_upsert,
+        crate::core::persist::provider_delete,
+        crate::core::persist::api_keys_list,
+        crate::core::persist::api_key_upsert,
+        crate::core::persist::api_key_delete,
+        crate::core::persist::manifests_active,
+        crate::core::persist::manifest_upsert_active,
+        crate::core::persist::models_cache_replace,
+        crate::core::persist::models_cache_list,
+        crate::core::persist::aliases_replace,
+        crate::core::persist::aliases_list,
+        crate::core::persist::ledger_append,
+        crate::core::persist::ledger_recent,
+        crate::core::persist::ledger_rollup_run,
         context_record,
         context_graph,
         context_clear,
@@ -719,64 +701,64 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         agent_step_append,
         agent_run_finish,
         agent_run_steps,
-        crate::gateway_cmds::gateway_status,
-        crate::gateway_cmds::get_tools_enabled,
-        crate::gateway_cmds::set_tools_enabled,
+        crate::tauri::gateway_cmds::gateway_status,
+        crate::tauri::gateway_cmds::get_tools_enabled,
+        crate::tauri::gateway_cmds::set_tools_enabled,
         // Audit H1b: gateway-side mutation is opt-in.
-        crate::gateway_cmds::get_tools_mutation_enabled,
-        crate::gateway_cmds::set_tools_mutation_enabled,
-        crate::gateway_cmds::gateway_enable,
-        crate::gateway_cmds::gateway_disable,
-        crate::gateway_cmds::gateway_key_generate,
-        crate::gateway_cmds::gateway_key_copy,
-        crate::gateway_cmds::gateway_key_revoke,
+        crate::tauri::gateway_cmds::get_tools_mutation_enabled,
+        crate::tauri::gateway_cmds::set_tools_mutation_enabled,
+        crate::tauri::gateway_cmds::gateway_enable,
+        crate::tauri::gateway_cmds::gateway_disable,
+        crate::tauri::gateway_cmds::gateway_key_generate,
+        crate::tauri::gateway_cmds::gateway_key_copy,
+        crate::tauri::gateway_cmds::gateway_key_revoke,
         // Audit R4: per-app gateway keys + monthly spend cap.
-        crate::gateway_cmds::gateway_app_key_create,
-        crate::gateway_cmds::gateway_app_keys,
-        crate::gateway_cmds::gateway_app_key_revoke,
-        crate::gateway_cmds::gateway_app_key_delete,
+        crate::tauri::gateway_cmds::gateway_app_key_create,
+        crate::tauri::gateway_cmds::gateway_app_keys,
+        crate::tauri::gateway_cmds::gateway_app_key_revoke,
+        crate::tauri::gateway_cmds::gateway_app_key_delete,
         // 0017: the per-app budget. Kept beside the key commands rather than with the global cap,
         // because it is a property of one key — the same ownership rule that put the global cap on
         // Control and the keys on Local Gateway.
-        crate::gateway_cmds::gateway_app_key_cap_set,
-        crate::gateway_cmds::gateway_spend_status,
-        crate::gateway_cmds::gateway_spend_cap_set,
-        crate::gateway_cmds::gateway_heartbeat,
-        crate::gateway_cmds::gateway_worker_error,
-        crate::gateway_cmds::gateway_chunk,
-        crate::gateway_cmds::gateway_result,
-        crate::gateway_cmds::gateway_done,
-        crate::gateway_cmds::gateway_error,
-        crate::gateway_cmds::gateway_tool_calls,
-        crate::gateway_cmds::gateway_usage,
-        crate::gateway_cmds::gateway_set_workspace_root,
-        crate::gateway_cmds::gateway_get_workspace_root,
-        crate::gateway_cmds::gateway_project_key,
-        crate::gateway_cmds::gateway_memory_enabled,
-        crate::gateway_cmds::gateway_set_memory_enabled,
-        crate::gateway_cmds::gateway_injection_stats,
-        crate::gateway_cmds::gateway_log_tail,
-        crate::gateway_cmds::gateway_tool_run,
-        crate::workbuddy::workbuddy_sync,
-        crate::workbuddy::workbuddy_status,
-        crate::workbuddy::workbuddy_set_models,
-        crate::persist::onboarding_save,
-        crate::persist::onboarding_latest_active,
-        crate::persist::generator_audit_record,
-        crate::persist::generator_audit_list,
-        crate::persist::drift_event_record,
-        crate::persist::drift_event_resolve,
-        crate::persist::drift_events_list,
-        crate::persist::manifests_history,
-        crate::persist::manifest_stage,
-        crate::persist::manifest_activate,
-        crate::persist::config_export,
-        crate::persist::config_import,
-        crate::persist::diagnostics_bundle,
-        crate::tools::tools_policy,
-        crate::tools::tools_check_root,
-        crate::tools::tools_default_root,
-        crate::tools::tool_run,
+        crate::tauri::gateway_cmds::gateway_app_key_cap_set,
+        crate::tauri::gateway_cmds::gateway_spend_status,
+        crate::tauri::gateway_cmds::gateway_spend_cap_set,
+        crate::tauri::gateway_cmds::gateway_heartbeat,
+        crate::tauri::gateway_cmds::gateway_worker_error,
+        crate::tauri::gateway_cmds::gateway_chunk,
+        crate::tauri::gateway_cmds::gateway_result,
+        crate::tauri::gateway_cmds::gateway_done,
+        crate::tauri::gateway_cmds::gateway_error,
+        crate::tauri::gateway_cmds::gateway_tool_calls,
+        crate::tauri::gateway_cmds::gateway_usage,
+        crate::tauri::gateway_cmds::gateway_set_workspace_root,
+        crate::tauri::gateway_cmds::gateway_get_workspace_root,
+        crate::tauri::gateway_cmds::gateway_project_key,
+        crate::tauri::gateway_cmds::gateway_memory_enabled,
+        crate::tauri::gateway_cmds::gateway_set_memory_enabled,
+        crate::tauri::gateway_cmds::gateway_injection_stats,
+        crate::tauri::gateway_cmds::gateway_log_tail,
+        crate::tauri::gateway_cmds::gateway_tool_run,
+        crate::tauri::workbuddy::workbuddy_sync,
+        crate::tauri::workbuddy::workbuddy_status,
+        crate::tauri::workbuddy::workbuddy_set_models,
+        crate::core::persist::onboarding_save,
+        crate::core::persist::onboarding_latest_active,
+        crate::core::persist::generator_audit_record,
+        crate::core::persist::generator_audit_list,
+        crate::core::persist::drift_event_record,
+        crate::core::persist::drift_event_resolve,
+        crate::core::persist::drift_events_list,
+        crate::core::persist::manifests_history,
+        crate::core::persist::manifest_stage,
+        crate::core::persist::manifest_activate,
+        crate::core::persist::config_export,
+        crate::core::persist::config_import,
+        crate::core::persist::diagnostics_bundle,
+        crate::tauri::tools::tools_policy,
+        crate::tauri::tools::tools_check_root,
+        crate::tauri::tools::tools_default_root,
+        crate::tauri::tools::tool_run,
         memory_capture,
         memory_capture_batch,
         memory_recall,
@@ -804,11 +786,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         router_model_context_replace,
         router_model_context_count,
         // Crash reporting (local-only, no external telemetry)
-        crate::commands::crash_count,
-        crate::commands::crash_list,
-        crate::commands::crash_read,
-        crate::commands::crash_clear,
-        crate::commands::crash_clear_all,
+        crate::tauri::commands::crash_count,
+        crate::tauri::commands::crash_list,
+        crate::tauri::commands::crash_read,
+        crate::tauri::commands::crash_clear,
+        crate::tauri::commands::crash_clear_all,
     ]
 }
 
@@ -887,7 +869,7 @@ mod ui_error_tests {
 
     #[test]
     fn a_migration_failure_names_the_migration_but_not_the_sql() {
-        let e = crate::store::StoreError::Migration(
+        let e = crate::core::store::StoreError::Migration(
             "0007_ledger_error_class".into(),
             "near \"FROM\": syntax error in UPDATE ledger SET FROM WHERE".into(),
         );
@@ -898,7 +880,7 @@ mod ui_error_tests {
 
     #[test]
     fn an_io_failure_names_only_its_kind() {
-        let e = crate::store::StoreError::Io(std::io::Error::new(
+        let e = crate::core::store::StoreError::Io(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "No such file or directory (os error 2)",
         ));
@@ -912,7 +894,7 @@ mod ui_error_tests {
         // module, not from rusqlite, and they are already written for a person to read. The
         // guard is that this class of message still names what was wrong.
         let dir = temp_dir("handwritten");
-        let s = crate::store::Store::open(&dir).expect("open");
+        let s = crate::core::store::Store::open(&dir).expect("open");
         let node = context::ContextNode {
             id: "n1".into(),
             kind: "vibe".into(),
