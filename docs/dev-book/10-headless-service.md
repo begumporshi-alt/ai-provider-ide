@@ -113,7 +113,7 @@ src/
     └── aiproviderd.rs     # NEW — the standalone service
 ```
 
-**Three things did not go where §7 of the task prompt said they would**, and each was measured rather
+**Four things did not go where §7 of the task prompt said they would**, and each was measured rather
 than assumed:
 
 1. **`persist.rs` and `egress.rs` are in `core/`, not `tauri/`.** They cannot be anywhere else.
@@ -129,9 +129,26 @@ than assumed:
    aiproviderd` compiles Tauri regardless. The service is therefore Tauri-free in **source**, not in
    **dependency** — which is also why the Linux CI job has to install WebKitGTK. Removing those types
    is Phase 2 work.
-3. **One `cfg(test)` edge points backwards.** `gateway_tests.rs` constructs a
-   `gateway_cmds::GatewayState`. Harmless — `cargo build --bin aiproviderd` does not compile tests —
-   but it means "core never names tauri" is true of the build and false of the test build.
+3. **One test-only file points backwards — nine times.** `core/gateway_tests.rs` names
+   `crate::tauri::gateway_cmds::{GatewayState, run_gateway_tool, set_gateway_workspace_root}` in **9
+   references**. It is declared `#[cfg(test)] #[path = "gateway_tests.rs"] mod tests;`
+   (`core/gateway.rs:1806-1808`), so it compiles only under `cfg(test)` and never reaches
+   `cargo build --bin aiproviderd` — "core never names tauri" is therefore true of the build and
+   false of the test build. (An earlier note said "one `cfg(test)` edge"; that counted the *file*,
+   not the references.)
+4. **The service binary is copied into the macOS app bundle, undeclared.** Adding the second `[[bin]]`
+   makes `tauri build` place `aiproviderd` in `Contents/MacOS/` beside the app binary — a separate
+   physical copy (distinct inode), with `bundle.externalBin` unset and nothing in `build.rs` naming
+   it. Measured 2026-09-23 on a `--bundles app` build: the bundle is **15 MB** and holds
+   `Contents/MacOS/{ai-provider-router, aiproviderd}`, where the pre-change bundle installed at
+   `/Applications` held only `ai-provider-router`. Two consequences for Phase 6: **useful** — the
+   service already ships with the app, so no sidecar config is needed; and an **obligation** — a
+   Developer ID release must sign *every* Mach-O in the bundle with the same identity and hardened
+   runtime, and `aiproviderd` is currently only linker-signed (`adhoc`). Not a regression by itself:
+   `codesign --verify --deep --strict` reports "code has no resources but signature indicates they
+   must be present" for the **new** bundle, the **pre-change installed** bundle, and the app binary
+   **alone** — it is a property of Tauri's ad-hoc dev bundle, not of the second binary. (`aiproviderd`
+   on its own verifies: "valid on disk … satisfies its Designated Requirement".)
 
 **One new route: `GET /health`.** The plan (§4.2) and the task prompt (§8.3) both assume it exists; it
 did not. It is the single unauthenticated route and returns `{"status":"ok"}` — nothing else, no
