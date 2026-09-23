@@ -2481,4 +2481,38 @@ The register entry was rewritten to say which half is missing, to cross-referenc
 and to state that it is not a second finding of it. **Read the register and the status table before recording;
 then record the contradiction, not the fact.**
 
+### The same guard has a method-shaped twin — so give a new trait member no default body
+
+Adding a member to a ported seam breaks **every implementor** at compile time: `E0046: not all trait items
+implemented, missing: …`. That error is the deliverable, not damage. So a new member gets **no default body** — a
+default makes the same addition silent for every implementor that does not care, which forfeits the only mechanism
+a trait has for forcing a boundary decision. Measured: adding `generate_text` broke exactly one implementor outside
+the new code (the image double at `engine.rs:1539`), and the fix was a *written answer* to "what does an image-only
+adapter do when asked for text" rather than a runtime surprise in whichever test reached it first.
+
+Two smaller facts from the same increment, both found by the compiler rather than by review:
+
+- **`Result<BoxStream<…>, E>` cannot use `unwrap_err`.** It requires the *Ok* type to be `Debug`, and a
+  `BoxStream` is not — `E0277`, naming the type you are not testing. `match` explicitly, which is also the stronger
+  assertion because it names *which phase* came back.
+- **A test double handed `stream: true` that behaves like the non-stream branch.** A double is an adapter
+  implementation and owes the same contract, including *when* it fires a callback. The first draft fired both
+  callbacks while the future resolved — the source's non-stream branch — and every test passed, because they
+  asserted the values delivered and not the moment. A consumer that read usage without draining would have gone
+  green against the double and failed against every real adapter. Fixed by firing at exhaustion, once, in the
+  source's order, plus a test that asserts the **moment** (empty after the future resolves, populated after the
+  drain). Treat a field on an arguments struct as load-bearing even in a double.
+
+### A pull seam makes cancellation the engine's, not the adapter's
+
+The engine's *other* text path in this crate is push-based (`ReplyHandle` + `mpsc`), so the port had a precedent for
+the wrong shape available. `generate_text` returns
+`BoxFuture<Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>` — **pull**, matching the TypeScript's
+`AsyncGenerator` — because a pull stream is driven by the engine: the engine decides when to stop asking, so
+cancellation is an engine-owned check rather than a flag every adapter must remember to honour. The two-phase
+return is the design: awaiting the future is the **response** phase (a refusal is `Err`, before a byte reaches the
+caller); polling the stream is the **mid-stream** phase (a break is `Err` as an *item*, because the consumer
+already holds text and a clean `Err` would invite the retry that duplicates it). Those are exactly
+`FailureKind::Response` and `FailureKind::MidStream`, and the classification turns on which one was seen.
+
 

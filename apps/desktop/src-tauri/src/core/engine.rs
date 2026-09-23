@@ -1510,8 +1510,9 @@ mod tests {
     // the loop can be driven without a manifest, a sandbox or a socket — which is also what keeps
     // the sandbox decision open (`core::adapter`).
 
-    use crate::core::adapter::{AdapterInstance, ImageReply};
+    use crate::core::adapter::{AdapterInstance, ImageReply, TextArgs};
     use futures_util::future::BoxFuture;
+    use futures_util::stream::BoxStream;
     use std::collections::VecDeque;
     use std::sync::{Arc, Mutex};
 
@@ -1549,6 +1550,21 @@ mod tests {
             let next =
                 self.replies.lock().unwrap().pop_front().unwrap_or(Err(AttemptError::Transport));
             Box::pin(async move { next })
+        }
+
+        /// **This double is the image half's, and it says so rather than pretending.** The text
+        /// half has its own double in `core::adapter`, so a test that reaches here asked a question
+        /// this double was never built to answer. It fails the way an under-scripted image call
+        /// fails — loudly, on the response phase, before any chunk exists — so the mistake surfaces
+        /// as a failed attempt instead of an empty stream that reads like a model saying nothing.
+        fn generate_text<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async { Err(AttemptError::Transport) })
         }
     }
 

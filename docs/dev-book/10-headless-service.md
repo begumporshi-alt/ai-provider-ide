@@ -980,6 +980,86 @@ remains is the streaming shape itself, and one question this increment made visi
 text loop must outlive the call that starts it, so `execute_image`'s `&mut HealthTracker` borrow is not available
 to it, and how the loop owns its mutable state is a design decision rather than a translation.
 
+#### Increment 9 as built — the text half of the adapter seam (2026-09-23)
+
+**The seam is now whole for both members the engine calls.** `adapter-instance.ts` declares seven;
+`execution-engine.ts` calls two — `generateImage` (`:174`) and `generateText` (`:91`). Increment 7 landed the
+image half, this lands the text half, so `AdapterInstance` is complete with respect to its only consumer. The
+other five (`capabilities`, `tagModality`, `listModels`, `pingKey`, `dispose`) stay absent, and their absence is
+now stated once in the module doc instead of being re-derived at each reading.
+
+**What landed.** Three shapes in `core/adapter.rs`: `ToolCall` (`ports.ts:50-57`), `TextArgs<'a>`
+(`manifest-interpreter.ts:70-91`) and `AdapterInstance::generate_text`. Eight tests against one new double.
+`cargo test` **575 → 583/0**: the seven the seam was scoped for, plus one the double's own first draft earned
+(below). That arithmetic is how a trait addition is proven real rather than assumed.
+
+**The one design decision, and it was a decision rather than a translation: pull, not push.** `generate_text`
+returns `BoxFuture<Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>`. The crate's *other* text
+path is push-based — `ReplyHandle` plus an `mpsc` channel (`gateway.rs:566-640`) — so the port had a precedent
+available and did not take it. The reason is cancellation: a pull stream is driven by the engine, so the engine
+decides when to stop asking, which makes cancellation an engine-owned check rather than a flag every adapter must
+remember to honour. The TypeScript is a pull generator for the same reason (`adapter-instance.ts:21`).
+
+**Two phases, and the split is the whole design.** Awaiting the returned future is the *response* phase — a
+refusal is `Err`, before a byte reaches the caller. Polling the stream is the *mid-stream* phase — a break is
+`Err` as an **item**, because by then the consumer already holds text and re-running the attempt would show it the
+text twice. Those are exactly `FailureKind::Response` and `FailureKind::MidStream`, and the engine's
+classification turns on which one it saw: mid-stream → `ParseError` whatever the status; response → the status
+decides. `the_two_phases_stay_separable_when_the_status_is_identical` gives both a `429` and asserts the two
+classes differ, because a seam that collapsed the kinds would make the distinction unrecoverable downstream — and
+`RateLimited` cools a key where `ParseError` does not.
+
+**`TextArgs` keeps its callbacks because the TypeScript puts them there, and the lifetime is the price.**
+`on_tool_call` and `on_usage` are `Option<&'a mut (dyn FnMut(..) + Send)>`, which is what makes `TextArgs<'a>`
+parameterised rather than split into a sibling argument. The faithful shape was worth it: one struct carrying the
+same ten fields as its source is checkable against that source, where two structs require the reader to re-derive
+why the split is where it is. The cost is stated rather than hidden — **`TextArgs` has no derives**, because
+`dyn FnMut` is neither `Debug`, `Clone` nor `Eq`.
+
+**Neither trait method has a default body, and the compiler enforced that here.** Adding `generate_text` broke
+exactly one implementor outside the new code — the image double at `engine.rs:1539` — with `E0046: not all trait
+items implemented, missing: generate_text`. That is the method-shaped analogue of `core/usage.rs`'s exhaustive
+struct literal: adding a member is a compile error at every implementor, which forces a decision about what that
+implementor *means* by it. The decision was written down — the double is the image half's, so it fails loudly on
+the response phase rather than answering an empty stream that reads like a model saying nothing — instead of being
+defaulted away. A default body would have made the same addition silent, which is the whole reason there is none.
+
+**One friction the seam owns, found by the compiler rather than by review.** `Result::unwrap_err` requires the
+*Ok* type to be `Debug`, and a `BoxStream` is not — so `Result<BoxStream<..>, AttemptError>` cannot use
+`unwrap_err`, and every consumer, `execute_text` included, must `match`. The test was rewritten to match
+explicitly, which is also the stronger assertion: it names the phase rather than trusting that whatever came back
+was the error arm.
+
+**The double was wrong first, and no compiler could have caught it.** The first draft fired both callbacks while
+the *future* resolved — the source's **non-stream** branch (`manifest-interpreter.ts:312-329`) — behind a
+`TextArgs` whose `stream` field said `true`. The stream branch fires them in the loop's `finally` (`:424`,
+`:430`), after the last chunk. That is not cosmetic infidelity: a consumer that read usage without draining would
+have gone green against this double and failed against every real adapter, and that consumer is `execute_text` —
+the very next thing to be written. The double now *takes* the callbacks and fires them when the inner stream
+reports exhaustion, exactly once, in the source's order (tool calls before usage), and
+`the_callbacks_fire_when_the_stream_ends_and_not_when_the_future_resolves` asserts the **moment** rather than the
+value: the log is empty once the future resolves and holds both entries after the drain. The lesson is an old one
+in a new shape — a test double is an adapter implementation, so it owes the same contract, and a field it is
+handed is not decoration.
+
+**Eight falsifications.** Six fail a named test — flattening a response-phase refusal into an empty stream,
+hoisting a mid-stream break into the response phase, making the classifier read only the status, flattening an
+unreported cache block to a reported zero, dropping a tool call's `arguments` on the way to its callback, and
+firing the callbacks while the future resolves — and two are rejected by the *compiler*: an implementor missing
+the new member, and the usage callback reverted to a two-field payload. Every restore verified byte-identical to
+the baseline hash. The last one is increment 8's guard re-tested at a new boundary: `on_usage` carrying
+`UsageTokens` rather than a bare pair is load-bearing, and reverting it is unrepresentable rather than merely
+untested.
+
+**What this narrows.** The seam is complete; what remains of Phase 2 is the loop over it — `engine::execute_text`.
+One question is now visible and *not* answered: the text loop must outlive the call that starts it, so
+`execute_image`'s `&mut HealthTracker` borrow (`:559`) is not available to it. Three shapes are open — lend the
+state to the returned stream (`execute_text<'a>(health: &'a mut HealthTracker, ..) -> BoxStream<'a, ..>`, which
+means the caller cannot touch health while draining), own it behind interior mutability, or invert the direction
+and take a sink. The TypeScript answers none of this, because a generator borrows its enclosing scope for free —
+which is exactly the affordance Rust does not have. That makes it a design decision with three named options
+rather than a translation.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
