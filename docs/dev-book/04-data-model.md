@@ -36,7 +36,7 @@ Set on open, and asserted by a test rather than assumed:
 25 tables, plus `sqlite_sequence` and four FTS shadow tables (`memories_fts_data`, `_idx`, `_docsize`,
 `_config`), which is why `sqlite_master` reports 31.
 
-The authoritative list is the array in the `migrations_apply_once_and_are_idempotent` test in `store.rs`. **If
+The authoritative list is the array in the `migrations_apply_once_and_are_idempotent` test in `core/store.rs`. **If
 you add a table, add it there too** — that assertion is what catches a migration that silently did not run.
 
 | Subsystem | Tables |
@@ -75,7 +75,7 @@ A data migration's version is `MIGRATIONS.len() + idx + 1`.
 **The trap:** appending a new SQL migration to `MIGRATIONS` shifts the version number of **every** data
 migration by one. On any database that already applied them, each data migration would then be re-run under a
 number it has already passed — or silently skipped. This is why `0010_live_context` was added as a *data*
-migration rather than appended to `MIGRATIONS`. See the comment at `store.rs:702`.
+migration rather than appended to `MIGRATIONS`. See the comment at `core/store.rs:702`.
 
 Checklist for a migration:
 

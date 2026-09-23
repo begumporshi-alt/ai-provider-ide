@@ -55,7 +55,7 @@ architectural cost, and it is documented rather than hidden:
 
 - The bridge runs in its **own hidden window** (`gateway.html` → `src/gateway-worker.ts`), not in the main app
   window. UI render work and Vite HMR reloads therefore cannot disturb in-flight gateway requests. Rust targets
-  that window explicitly — see `GATEWAY_WINDOW` in `gateway_cmds.rs`.
+  that window explicitly — see `GATEWAY_WINDOW` in `tauri/gateway_cmds.rs`.
 - That window is granted **only** `core:event:allow-listen` and `allow-unlisten` by `capabilities/gateway.json`.
   No filesystem, no shell, no opener.
 - **If the webview is reloading, crashed or closed, the gateway answers `503` + `Retry-After: 1` immediately.**

@@ -13,6 +13,31 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **Headless service, Phase 1 — the gateway no longer has to live inside the desktop app.** The Rust
+  half of the codebase is now split into `src/core/` (no dependency on the Tauri glue) and
+  `src/tauri/` (commands, the worker-window bridge, app setup), and a new binary, `aiproviderd`,
+  starts the HTTP server with no window, no WebView and no Tauri app.
+
+  **What this does and does not do.** It proves the HTTP server starts and binds on its own:
+  `aiproviderd` opens the same SQLite file, reads the master key from the same keychain, binds
+  `127.0.0.1:8800` (persisted setting first), and answers `GET /health` with `200 {"status":"ok"}`.
+  It does **not** serve completions, and is not meant to yet — the router core is still TypeScript
+  running in a hidden webview, so the standalone service has nothing to bridge to and every
+  completion route answers `503` by design. Porting the router core to Rust is Phase 2.
+
+  `GET /health` is the one new route, and the one unauthenticated one: it reports that a process is
+  listening and nothing more, so a client that does not yet hold a key can still find the service.
+  All seven existing routes, and both the 404 and 405 refusals, still authenticate first.
+
+  Three notes on the split, because they are not what the plan predicted: `persist.rs` and
+  `egress.rs` sit in `core/` — not in `tauri/` — because `gateway.rs` calls `persist` in non-test
+  code and `persist` in turn needs `egress` and `CommandError`; `core/` still imports the `tauri`
+  *crate* (`persist.rs` carries 32 `#[tauri::command]` handlers), so the service is Tauri-free in
+  source but not in dependency; and one `cfg(test)` edge in `gateway_tests.rs` still points back at
+  `tauri/`, which affects `cargo test` and not `cargo build --bin aiproviderd`.
+
+  CI gains a `headless-service` job building `aiproviderd` on macOS, Windows and Linux.
+
 - **Per-app budgets.** A per-app gateway key can now carry its own monthly cap, so one runaway
   consumer — an agent loop in a connected IDE — is stopped without touching any other app, and
   without touching the owner's global budget. Until now the only cap was global and monthly: one

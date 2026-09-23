@@ -1,12 +1,14 @@
 # 10 — Headless service mode
 
-**Status:** plan only — no implementation yet.
+**Status:** Phase 1 landed 2026-09-23 — the code is split and `aiproviderd` builds and serves. Phases
+2–6 are still plan only. **Phase 1 does not serve completions**, and is not meant to: see §2.1.1.
 
 **Question answered:** what it takes to detach the gateway from the webview process so it survives UI
 quit, crash, and reload.
 
 **Date:** 2026-09-23
 **Assessed tree:** `fb38d1e` (clean, `main` == `origin/main`, CI green)
+**Phase 1 landed on:** the commit immediately after `f7fdf2c`
 **Method:** every claim below carries a `file:line` or the command that produced it.
 
 ---
@@ -81,6 +83,69 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 | **App Nap suppression** (`app_nap.rs`) | Native heartbeat to keep JS alive | **Deleted** — no JS to keep alive | Negative effort |
 | **Process manager** | None | New: launchd plist, start/stop/lifecycle | Medium |
 | **UI → service discovery** | Tauri IPC (`invoke`) | New: HTTP client, health probe | Medium |
+
+### 2.1.1 The module split as built (Phase 1, 2026-09-23)
+
+`apps/desktop/src-tauri/src/` now has three parts. The rule is **module-level, not crate-level**:
+`core/` may not name `crate::tauri::*`.
+
+```
+src/
+├── lib.rs                 # thin crate root: `pub mod core; pub mod tauri; pub use tauri::app::run;`
+├── main.rs                # Tauri app binary (unchanged)
+├── core/                  # NEW — no dependency on the tauri/ module
+│   ├── gateway.rs         # HTTP server, auth, capacity, the Bridge trait
+│   ├── store.rs           # SQLite + migrations
+│   ├── persist.rs         # store queries + 32 #[tauri::command] handlers
+│   ├── egress.rs          # allowlist + reqwest; stream() takes a tauri::ipc::Channel
+│   ├── error.rs           # NEW — CommandError, extracted from commands.rs
+│   ├── vault.rs  injection_log.rs  capture.rs  context.rs
+│   ├── crash_report.rs  memory.rs  orchestrator.rs  skills.rs
+│   └── gateway_{anthropic,gemini,responses,handlers,tests}.rs
+│       context_scope.rs  model_context.rs  principal.rs  session_context.rs
+│       — all `#[path]` submodules of gateway.rs, so they moved with it
+├── tauri/
+│   ├── app.rs             # was src/lib.rs — setup, tray, RunEvent
+│   ├── commands.rs        # 61 tauri:: refs
+│   ├── gateway_cmds.rs    # EventBridge, the worker window
+│   ├── tools.rs  workbuddy.rs  app_nap.rs  tools_agent_tests.rs
+└── bin/
+    └── aiproviderd.rs     # NEW — the standalone service
+```
+
+**Three things did not go where §7 of the task prompt said they would**, and each was measured rather
+than assumed:
+
+1. **`persist.rs` and `egress.rs` are in `core/`, not `tauri/`.** They cannot be anywhere else.
+   `gateway.rs` calls `crate::persist::{active_gateway_key_ids, gateway_key_cap, month_spend_micros,
+   app_month_spend_micros, spend_cap_micros}` in **non-test** code, so putting `persist` in `tauri/`
+   makes `core/` depend on it. Putting `persist` in `core/` while `egress` and `CommandError` stayed
+   in `tauri/` fails the same way from the other side: `persist` imports `crate::egress::EgressState`
+   and `crate::commands::CommandError`. `{persist, egress, CommandError}` is one cluster, so all
+   three moved and `CommandError` was extracted to `core/error.rs`.
+2. **`core/` still imports the `tauri` crate.** `persist.rs` carries 32 `#[tauri::command]` handlers
+   and `egress::stream` takes a `tauri::ipc::Channel`. `Cargo.toml` makes `tauri` an unconditional
+   dependency and `build.rs` runs `tauri_build::build()` for every target, so `cargo build --bin
+   aiproviderd` compiles Tauri regardless. The service is therefore Tauri-free in **source**, not in
+   **dependency** — which is also why the Linux CI job has to install WebKitGTK. Removing those types
+   is Phase 2 work.
+3. **One `cfg(test)` edge points backwards.** `gateway_tests.rs` constructs a
+   `gateway_cmds::GatewayState`. Harmless — `cargo build --bin aiproviderd` does not compile tests —
+   but it means "core never names tauri" is true of the build and false of the test build.
+
+**One new route: `GET /health`.** The plan (§4.2) and the task prompt (§8.3) both assume it exists; it
+did not. It is the single unauthenticated route and returns `{"status":"ok"}` — nothing else, no
+version, no key state. It answers before any key is produced because a client that does not yet hold
+one must still be able to find the service. Every other route, including the 404 and 405 refusals,
+still authenticates first.
+
+**What the binary proves, stated exactly.** `aiproviderd` opens the same SQLite file, reads the master
+key from the keychain, binds `127.0.0.1:8800` (persisted setting first, then 8800 — **not**
+`DEFAULT_PORT`, which is 8787 and collides with AI Hub v2), and answers `/health` with 200. It
+installs `HeadlessBridge`, which discards every dispatch, because the router core is still TypeScript
+in a webview. `is_available()` is `is_running() && beat_is_fresh()`, and no heartbeat ever arrives, so
+**every completion route answers 503 — by design**. Verified locally 2026-09-23:
+`curl http://127.0.0.1:8800/health` → `200 {"status":"ok"}`; `POST /v1/chat/completions` → `503`.
 
 ### 2.2 The line count
 

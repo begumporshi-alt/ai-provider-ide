@@ -13,18 +13,19 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 
 | Area | State | Evidence |
 |---|---|---|
-| Gateway ingress | 4 dialects, SSE streaming, 7 routes | `gateway.rs:1755-1761` |
-| Rotation and failover | Per-key cooldowns, circuit breakers, 6-attempt bound | `gateway_tests.rs`, [08](08-flows.md) |
+| Gateway ingress | 4 dialects, SSE streaming, **8 routes** (7 OpenAI-compatible + `GET /health`) | `core/gateway.rs:1938-1945` |
+| Rotation and failover | Per-key cooldowns, circuit breakers, 6-attempt bound | `core/gateway_tests.rs`, [08](08-flows.md) |
 | Capacity control | 8 in flight, 32 queued, `429` on overflow | `MAX_CONCURRENT` / `MAX_QUEUED`, `gateway.rs:39-41` |
 | Adapter tiers | Builtin templates, manifest interpreter, QuickJS sandbox | `router-core`, Tier-2 review screen |
 | Onboarding | Deterministic fingerprint path, AI fallback, contract-gated | `onboarding-e2e.test.ts` |
 | Drift and repair | Detection window, patch flow, versioned rollback | `drift-repair-e2e.test.ts` |
 | Secrets | Keychain-only, key-blind TypeScript, one-shot reveal | Invariants 1–2, `key-leak-grep` in CI |
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
-| Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tools.rs` |
-| Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `commands.rs`, `gateway_keys` table (0017) |
+| Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tauri/tools.rs` |
+| Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |
 | Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. **0016 is in the source but not in the installed database** — measured 2026-09-23, the live DB sits at `schema_version` 15, so `ledger.app_key_id` does not exist there yet and attribution begins on the first launch after a rebuild |
-| Schema | 17 versions, count asserted, rewind-tested | `store.rs:1009-1013` |
+| Schema | 17 versions, count asserted, rewind-tested | `core/store.rs:1009-1013` |
+| Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Does not serve completions** — the router core is still TypeScript in a webview, so every completion route answers 503 by design | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1; new CI job `headless-service` |
 | Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
@@ -193,9 +194,14 @@ Not gaps — things that work but carry a cost worth stating.
 TypeScript core, so a reloading or crashed renderer means `503` for every client, and quitting the app takes
 the gateway with it. What closing the window does *not* do is stop it: `hideOnClose` defaults on, so the window
 hides and the gateway keeps serving, with the tray as the way back. Headless service mode — the gateway
-detached from any window *and* from the app process — is an explicit v2 extension point. Until it exists this
-is a desktop app that serves HTTP, not a service. This is the project's main structural risk, and it is
-mitigated by the 503 contract rather than solved.
+detached from any window *and* from the app process — is [under way: Phase 1 landed 2026-09-23](10-headless-service.md),
+and `aiproviderd` starts and serves `GET /health` with no window and no Tauri app.
+
+**This row stays, and Phase 1 is why.** What Phase 1 does not do is serve completions. The router core is
+still TypeScript in a hidden webview, reached through the `Bridge` trait, and the standalone service has
+nothing to bridge to — so it installs a bridge that discards every dispatch and every completion route answers
+503. The gateway's availability is still bound to a webview until Phase 2 ports the router core to Rust. The
+503 contract mitigates it; it does not solve it.
 
 **The two recall paths differ on exactly one axis, and it reads as a bug.** Gateway recall is scoped and
 excludes unscoped atoms; Assistant recall passes `None`. Every atom is born unscoped, so gateway recall returns

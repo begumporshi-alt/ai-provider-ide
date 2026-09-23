@@ -33,7 +33,8 @@ never persisted to the allowlist.
 
 ## The HTTP surface
 
-Seven routes, registered in `gateway.rs` around line 1755. Every one of them translates to a single canonical
+Eight routes, registered in `core/gateway.rs:1938-1945`. Seven are the OpenAI-compatible surface below,
+every one of which translates to a single canonical
 OpenAI-shaped chat body before dispatch, which is why memory injection has one shape at four call sites rather
 than four implementations.
 
@@ -46,6 +47,12 @@ than four implementations.
 | `/v1/messages/count_tokens` | POST | Anthropic token counting |
 | `/v1/responses` | POST | OpenAI Responses (Codex-style) |
 | `/v1beta/models/{*tail}` | POST | Gemini `generateContent` and `:streamGenerateContent` |
+
+The eighth is `GET /health`, added 2026-09-23 for the standalone service (`aiproviderd`) and for the UI's
+service discovery. It is the **one unauthenticated route** and returns `{"status":"ok"}` — nothing else. It
+answers before any key is produced because a client that does not yet hold one must still be able to find the
+service; the seven above, and both the 404 and 405 refusals, all authenticate first, because an
+unauthenticated answer is a statement that the route exists.
 
 `/v1/embeddings` is out of scope for v1; the modality enum is the extension point.
 
@@ -63,10 +70,10 @@ the alias map is the only mechanism.
 | Status | Body / meaning | Where |
 |---|---|---|
 | `401` | Invalid or revoked key. **A healthy gateway answers 401 to a bad key** | key check |
-| `429` | `"router at capacity"` — the gateway's own admission ceiling was hit | `gateway.rs:1302`, `:1315` |
-| `429` | `"too many failed auth attempts — backing off"` — 30s backoff after repeated bad keys | `gateway.rs:1437` |
+| `429` | `"router at capacity"` — the gateway's own admission ceiling was hit | `core/gateway.rs:1302`, `:1315` |
+| `429` | `"too many failed auth attempts — backing off"` — 30s backoff after repeated bad keys | `core/gateway.rs:1437` |
 | `429` | Upstream `RATE_LIMITED`, including a cooled key's wait | execution engine |
-| `503` | `"AI-Provider Router core unavailable — is the app open?"` — the webview is gone | `gateway.rs:1668` |
+| `503` | `"AI-Provider Router core unavailable — is the app open?"` — the webview is gone | `core/gateway.rs:1668` |
 | `503` | `"master key unavailable"` — **the keychain entry has not been approved yet** | master-key check |
 
 > **`503 master key unavailable` is not a bug, and it precedes authentication.** After reinstalling the app,
@@ -94,7 +101,7 @@ silently dropped**.
 | Error shape | OpenAI-style: `{"error": {"message", "type", "code"}}` |
 
 Anthropic and Gemini ingress re-frame errors into their own envelopes: `429` → `rate_limit_error`, `503` →
-`overloaded_error` (asserted in `gateway_tests.rs`).
+`overloaded_error` (asserted in `core/gateway_tests.rs`).
 
 ## Concurrency and timeouts
 
@@ -111,7 +118,7 @@ One "request timeout" cannot serve every phase, so the budget is per phase.
 
 ### Concurrency is two semaphores, not one
 
-`MAX_CONCURRENT = 8`, `MAX_QUEUED = 32`, `MAX_TOTAL = 40`. Two separate semaphores in `gateway.rs`:
+`MAX_CONCURRENT = 8`, `MAX_QUEUED = 32`, `MAX_TOTAL = 40`. Two separate semaphores in `core/gateway.rs`:
 
 - `permits` (`MAX_TOTAL`) — **admits** the request.
 - `dispatch` (`MAX_CONCURRENT`) — **routes** it to the core.
@@ -124,7 +131,7 @@ the same mechanism.
 
 ## The IPC surface
 
-125 commands, registered in `commands.rs::handlers()`. Grouped by module:
+125 commands, registered in `tauri/commands.rs::handlers()`. Grouped by module:
 
 | Module | Count | Covers |
 |---|---|---|
