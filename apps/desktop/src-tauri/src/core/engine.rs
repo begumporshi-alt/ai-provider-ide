@@ -39,9 +39,13 @@
 
 use std::collections::HashMap;
 
-use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs};
+use futures_util::StreamExt;
+use serde_json::Value;
+
+use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs, TextArgs, ToolCall};
 use crate::core::limiter::ProviderLimiter;
 use crate::core::persist::{ApiKeyRow, ModelRow, ProviderRow};
+use crate::core::usage::UsageTokens;
 
 /// The shortest cooldown a rate-limited key is ever given, in milliseconds.
 ///
@@ -686,6 +690,334 @@ impl AllAttemptsFailed {
         // as a budget.
         let detail = if detail.is_empty() { "empty plan".to_string() } else { detail };
         format!("all attempts failed for {} [{}]", self.model, detail)
+    }
+}
+
+// ---------- the text loop over the same plan ----------
+
+/// What one text request is asked to do. The Rust port of `executeText`'s argument
+/// (`execution-engine.ts:23-39`).
+///
+/// **The plan is taken by value, like the image path's** — the serving candidate is returned to the
+/// caller, and moving it out of the plan is how that is done without cloning three rows.
+///
+/// **The payloads are owned here and borrowed by `TextArgs`, and that asymmetry is deliberate.**
+/// This struct is built once per request; `core::adapter::TextArgs` is built once per *attempt*, so
+/// the borrow is what keeps a retry from deep-copying the conversation. See `TextArgs`' own note.
+///
+/// **The two callbacks are the caller's own.** `on_tool_call` is passed through untouched (`:97`);
+/// `on_usage` is *wrapped*, because the engine must record the counts as well as forward them.
+pub struct ExecuteTextArgs<'a> {
+    pub plan: Vec<Candidate>,
+    pub messages: Vec<Value>,
+    /// The model the caller asked for, as the caller named it — carried so a failure can name it.
+    /// The candidate's own `model.native_id` is what is actually sent.
+    pub model: String,
+    pub stream: bool,
+    pub max_tokens: Option<u64>,
+    pub temperature: Option<f64>,
+    pub tools: Option<Value>,
+    pub tool_choice: Option<Value>,
+    pub response_format: Option<Value>,
+    pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
+    pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    pub max_attempts: Option<usize>,
+}
+
+/// A served text request. The Rust port of the three readers on `TextExecution`
+/// (`execution-engine.ts:41-47`): `served()`, `fallbackChain()`, `usage()`.
+#[derive(Debug)]
+pub struct TextSuccess {
+    /// The candidate that served it, set once the first chunk reached the sink (`:100-103`).
+    pub candidate: Candidate,
+    /// Every attempt that failed before this one succeeded, in the order they were tried.
+    pub attempts: Vec<AttemptOutcome>,
+    /// Whatever the upstream reported, if it reported anything at all.
+    pub usage: Option<UsageTokens>,
+}
+
+/// A text request that produced no successful stream — and the state the caller can still read.
+///
+/// **The attempts and the usage ride on the failure, because the TypeScript leaves them readable
+/// after the throw.** `executeText` returns the `TextExecution` object *before* `chunks` is
+/// iterated, so `model-router.ts`'s `catch` reads `exec.served()`, `exec.fallbackChain()` and
+/// `exec.usage()` on the failing path (`:488`, `:517-519`) and writes all three to the ledger. A
+/// `Result` whose error carried only a message would drop them on the floor.
+///
+/// **The variants encode which of those are possible, which is why this is three variants and not
+/// one struct with an `Option<Candidate>`.** A mid-stream break can only happen after a chunk has
+/// reached the sink, so it always carries the serving candidate; cancellation and exhaustion only
+/// happen with nothing served, so they do not carry one at all. An `Option` would make "cancelled,
+/// yet somehow served" representable.
+/// **`large_enum_variant`, and the measurement is why.** `MidStream` carries a whole `Candidate`
+/// (536 bytes), which makes it the largest variant at 616 bytes against `TextSuccess`'s 592 — but
+/// the `Result` is ~600 bytes either way, because *both* arms carry that payload by value. Boxing
+/// `served` would save 16 of those 616 bytes and add a heap allocation to every failure. The image
+/// path is the control: the same 536-byte `Candidate` in its `Ok`, a 48-byte `Err` clippy never
+/// mentions, and a 608-byte `Result`. See
+/// `the_text_results_size_comes_from_the_payload_not_from_the_error`, which fails if that stops
+/// being true.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+pub enum TextFailure {
+    /// The break arrived after the sink already held text (`:112-116`).
+    ///
+    /// **The original adapter error is carried, not a classification.** The TypeScript rethrows `e`
+    /// itself (`:115`), and that is deliberate rather than incidental: the consumer already has
+    /// output, so what it needs is the error itself — re-running the attempt would show it the text
+    /// twice. The classification is not lost; it is in `attempts`.
+    MidStream {
+        error: AttemptError,
+        served: Candidate,
+        attempts: Vec<AttemptOutcome>,
+        usage: Option<UsageTokens>,
+    },
+    /// Cancellation ended the loop before any chunk reached the sink (`:80`, `:133`).
+    ///
+    /// **Not a failure in the TypeScript.** It `return`s from the generator, so no
+    /// `AllAttemptsFailedError` is raised and the caller sees an empty stream — which is why this is
+    /// a variant rather than an empty `Ok`: `Ok` with no candidate would be two spellings of one
+    /// state, and the caller writes a different ledger row for each (`:451`).
+    Cancelled { attempts: Vec<AttemptOutcome>, usage: Option<UsageTokens> },
+    /// Nothing reached the sink and the budget was spent (`:141-143`).
+    AllAttemptsFailed { error: AllAttemptsFailed, usage: Option<UsageTokens> },
+}
+
+/// Try each candidate in the plan until one streams to `on_chunk`. The Rust port of `executeText`
+/// (`execution-engine.ts:68-152`).
+///
+/// **The sink is this increment's one shape decision, and it is a deviation from the source.** The
+/// TypeScript returns `TextExecution { chunks: AsyncGenerator }` — a *pull* stream the caller
+/// iterates. This takes `on_chunk` and runs to completion instead. Two reasons:
+///
+/// 1. **The source's generator is not a plain generator.** `yield chunk` sits inside an
+///    `await`-driven retry loop, so a pull port would have to express "await the factory, then await
+///    `generate_text`, then poll its stream, then decide whether to retry" as a hand-written state
+///    machine — there is no `async-stream` dependency in this crate and this port may not add one.
+///    Here every `await` is a real `await` and every `yield` is a call, so the loop is a
+///    transcription rather than a re-derivation.
+/// 2. **A pull port cannot report plan exhaustion honestly.** The source *throws*
+///    `AllAttemptsFailedError` from inside the generator (`:141-143`), which a
+///    `BoxStream<Item = Result<String, AttemptError>>` has no room for. The alternatives are to widen
+///    the item type, or to leave the caller to infer exhaustion from an empty stream — and the second
+///    is how a failed request becomes a `200` with no body.
+///
+/// The cost is stated rather than hidden: **a caller can no longer stop early by not draining.** It
+/// cancels instead, which the loop honours at `:80` and `:133` — an explicit signal in place of an
+/// implicit one, and the same mechanism the source already relies on.
+///
+/// **A chunk reaches the sink as it arrives, and the sink owns it from there.** `&str` rather than
+/// `String` so a caller that only writes it out does not copy.
+///
+/// **The failure handling is not re-derived.** `attempt_disposition`, `attempt_outcome` and
+/// `records_key_health` (increment 6) are the loop's whole classification policy, and they reproduce
+/// `:112-133` exactly: `emitted` alone decides whether a break can be retried, a rethrown failure
+/// carries no retry hint and does not cool its key, and the abort check comes *after* the record so
+/// a cancelled attempt still lands in the chain.
+///
+/// **The loop cannot end having served, and the structure is what makes that true.** The source
+/// guards its terminal throw with `if (!served)` (`:141`), which is defensive: a served attempt
+/// returns at `:107`, so the loop can only fall through with nothing served. Here the success
+/// `return` is inside the iteration, so there is no guard to get wrong.
+///
+/// **`result_large_err`, and the measurement is the reason.** The lint sees a 616-byte `Err` and
+/// proposes boxing it. But the `Ok` type is 592 bytes carrying the same 536-byte `Candidate`, so the
+/// `Result` is ~600 bytes either way and the box would buy 16 of them at the cost of a heap
+/// allocation on every failure. `gateway.rs:1402` allows this lint on `try_slot` for the same shape
+/// of reason: the lint's premise — a large error paid on the happy path — does not hold. The
+/// arithmetic is asserted by `the_text_results_size_comes_from_the_payload_not_from_the_error`.
+#[allow(clippy::result_large_err)]
+pub async fn execute_text(
+    adapters: &dyn AdapterFactory,
+    health: &mut HealthTracker,
+    limiter: Option<&ProviderLimiter>,
+    mut args: ExecuteTextArgs<'_>,
+    cancel: &Cancel,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<TextSuccess, TextFailure> {
+    let mut attempts: Vec<AttemptOutcome> = Vec::new();
+    let mut usage: Option<UsageTokens> = None;
+    let budget = attempt_budget(args.plan.len(), args.max_attempts);
+
+    // How the loop stopped. It cannot return directly, because `usage` is written by a callback the
+    // adapter may hold for as long as its stream lives — so a read *inside* the body would sit
+    // inside that borrow, and the borrow checker is right to refuse it: a closure created in a loop
+    // body keeps its captures borrowed for the whole body. The loop `break`s with an outcome
+    // instead, and every reader lives after it — which is also where the TypeScript's readers are,
+    // on the object it returned *before* the throw.
+    enum Ended {
+        /// A candidate streamed to the sink (`:107`).
+        Served(Candidate),
+        /// The break arrived after the sink already held text (`:112-116`).
+        MidStream { error: AttemptError, served: Candidate },
+        /// Cancellation stopped the loop (`:80`, `:133`).
+        Cancelled,
+        /// The budget was spent with nothing served (`:141-143`).
+        Spent,
+    }
+
+    let ended = 'plan: {
+        for candidate in args.plan.into_iter().take(budget) {
+            // `:80`, checked *before* the permit is taken — see `candidate_gate`, which states the
+            // order and why: a cancelled request must not consume a slot on its way out.
+            if cancel.is_cancelled() {
+                break 'plan Ended::Cancelled;
+            }
+            // `:83-87`. `acquire` is the check *and* the increment. `None` from `limiter` is no
+            // limiter at all; `None` from `acquire` is a saturated provider — told apart by
+            // `limiter.is_some()`.
+            let release = limiter.and_then(|l| l.acquire(&candidate.provider.id));
+            if limiter.is_some() && release.is_none() {
+                attempts.push(saturated_outcome());
+                continue;
+            }
+
+            // `:90` — a factory rejection lands in the same `catch` as a thrown `generateText`,
+            // where it is not a `ManifestHttpError`, so it is `NETWORK`/`0` with no wait.
+            let adapter = match adapters.for_provider(&candidate.provider.id).await {
+                Ok(adapter) => adapter,
+                Err(_) => {
+                    let outcome = transport_outcome();
+                    health.record_result(
+                        &candidate.key.id,
+                        outcome.cls,
+                        outcome.retry_after_ms,
+                        now_ms(),
+                    );
+                    attempts.push(outcome);
+                    if cancel.is_cancelled() {
+                        break 'plan Ended::Cancelled;
+                    }
+                    continue;
+                }
+            };
+
+            let mut emitted = false;
+            let mut broke: Option<AttemptError> = None;
+            let refused = {
+                // `:97` — the engine's own `onUsage` does double duty: it fills the box the ledger
+                // reads, and it forwards to the caller's callback. Dropping the caller's here is how
+                // every gateway response came to report `usage: null` on requests that had usage.
+                let mut caller_on_usage = args.on_usage.as_deref_mut();
+                let mut record_usage = |u: UsageTokens| {
+                    usage = Some(u);
+                    if let Some(cb) = caller_on_usage.as_deref_mut() {
+                        cb(u);
+                    }
+                };
+                // **`forward_tool` exists to give the borrow a local to live in, and that is not a
+                // stylistic choice.** Handing the seam `args.on_tool_call.as_deref_mut()` directly
+                // does not compile: the reference taken off that field carries the field's declared
+                // object lifetime, rustc resolves the seam's callback lifetime to *it* rather than
+                // to a shorter subregion, and the borrow is then required to outlive `execute_text`
+                // itself — `E0499` on the next iteration, `E0597` at the end of the function. A
+                // local closure makes the referent a local, whose borrow ends with the iteration.
+                //
+                // **This was measured, and the first diagnosis was wrong.** The obvious reading is
+                // that `TextArgs` needs two lifetimes — payloads for the request, callbacks for the
+                // attempt. Splitting them changes nothing; a 60-line reproduction (`/tmp`) shows the
+                // same four errors either way, and a single `'a` compiles the moment this closure
+                // exists. So the seam did not need changing and the call site did.
+                let mut caller_on_tool_call = args.on_tool_call.as_deref_mut();
+                let mut forward_tool = |tc: ToolCall| {
+                    if let Some(cb) = caller_on_tool_call.as_deref_mut() {
+                        cb(tc);
+                    }
+                };
+                let text_args = TextArgs {
+                    model: candidate.model.native_id.clone(),
+                    messages: &args.messages,
+                    stream: args.stream,
+                    max_tokens: args.max_tokens,
+                    temperature: args.temperature,
+                    tools: args.tools.as_ref(),
+                    tool_choice: args.tool_choice.as_ref(),
+                    response_format: args.response_format.as_ref(),
+                    on_tool_call: Some(&mut forward_tool),
+                    on_usage: Some(&mut record_usage),
+                };
+
+                // **The `let` is load-bearing, not stylistic.** `Result<BoxStream<…>, _>` is a
+                // temporary that holds the callbacks' borrow, and the stream inside it borrows
+                // `record_usage` and `forward_tool` by name. As this block's *tail expression* its
+                // destructor would run after those locals are dropped — `E0597`, "borrowed value does
+                // not live long enough", with the compiler pointing at the whole `match`. Binding the
+                // result first drops the temporary at the end of this statement, which is before the
+                // locals and after the stream has been drained.
+                let refusal =
+                    match adapter.generate_text(&candidate.key.secret_ref, text_args, cancel).await
+                    {
+                        // The response phase refused: nothing reached the sink, so this attempt is
+                        // retryable and the loop classifies it below.
+                        Err(e) => Some(e),
+                        Ok(mut stream) => {
+                            while let Some(item) = stream.next().await {
+                                match item {
+                                    Ok(chunk) => {
+                                        // `:100-103`. Only the flag is needed: the candidate is the loop
+                                        // variable, so `served` is carried out rather than cloned.
+                                        emitted = true;
+                                        on_chunk(&chunk);
+                                    }
+                                    Err(e) => {
+                                        broke = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            None
+                        }
+                    };
+                refusal
+            };
+
+            // One handler for both failure shapes, because `attempt_disposition` is what tells them
+            // apart — `emitted` is its whole input, and it is the predicate increment 6 pinned.
+            if let Some(e) = refused.or(broke) {
+                let disposition = attempt_disposition(emitted, cancel.is_cancelled());
+                let outcome = attempt_outcome(&e, disposition);
+                if records_key_health(disposition) {
+                    health.record_result(
+                        &candidate.key.id,
+                        outcome.cls,
+                        outcome.retry_after_ms,
+                        now_ms(),
+                    );
+                }
+                attempts.push(outcome);
+                match disposition {
+                    // Only reachable with `emitted`, so the sink already holds text and `served` is
+                    // this candidate. The original error travels, not the class.
+                    AttemptDisposition::Rethrow => {
+                        break 'plan Ended::MidStream { error: e, served: candidate }
+                    }
+                    AttemptDisposition::Stop => break 'plan Ended::Cancelled,
+                    AttemptDisposition::Next => continue,
+                }
+            }
+
+            // `:106-107` — the stream ended and the attempt served, so the loop stops rather than
+            // advancing. This is why the source's `if (!served)` guard has nothing to guard.
+            break 'plan Ended::Served(candidate);
+        }
+        Ended::Spent
+    };
+
+    match ended {
+        Ended::Served(candidate) => {
+            health.record_result(&candidate.key.id, ErrorClass::Ok, None, now_ms());
+            Ok(TextSuccess { candidate, attempts, usage })
+        }
+        Ended::MidStream { error, served } => {
+            Err(TextFailure::MidStream { error, served, attempts, usage })
+        }
+        Ended::Cancelled => Err(TextFailure::Cancelled { attempts, usage }),
+        // The only way the loop can fall through: nothing was served. A served attempt breaks with
+        // `Ended::Served` above.
+        Ended::Spent => Err(TextFailure::AllAttemptsFailed {
+            error: AllAttemptsFailed::new(args.model, attempts),
+            usage,
+        }),
     }
 }
 
@@ -1971,5 +2303,663 @@ mod tests {
 
         // And the slot is genuinely reusable rather than merely absent from the map.
         let _again = limiter.acquire("p1").expect("the cap admits again");
+    }
+
+    // ---------- execute_text: the loop, over doubles ----------
+    //
+    // `Scripted` above is the *image* half's double and answers text by failing loudly, so the text
+    // loop needs its own. The split is the same defence the trait's missing default bodies are: a
+    // double that answered both halves could hide a call site that reached the wrong one.
+
+    /// One scripted text attempt, split the way the seam is: the **response** phase, and — only if
+    /// it answered — the **stream** it answered with.
+    ///
+    /// `Err` is a refusal before any byte. `Ok(items)` is a stream whose items are each either a
+    /// chunk or a mid-stream break. Keeping the two apart *in the script* is what lets a test say
+    /// "this attempt refused" and "this attempt broke after two chunks" without the double having to
+    /// guess which one was meant — and the loop's whole classification turns on which it was.
+    type TextReply = Result<Vec<Result<String, AttemptError>>, AttemptError>;
+
+    struct TextScripted {
+        replies: Mutex<VecDeque<TextReply>>,
+        usage: Option<UsageTokens>,
+        tool_call: Option<ToolCall>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl TextScripted {
+        fn new(replies: Vec<TextReply>) -> Self {
+            Self {
+                replies: Mutex::new(replies.into()),
+                usage: None,
+                tool_call: None,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn reporting_usage(mut self, usage: UsageTokens) -> Self {
+            self.usage = Some(usage);
+            self
+        }
+
+        fn calling_tool(mut self, tool_call: ToolCall) -> Self {
+            self.tool_call = Some(tool_call);
+            self
+        }
+
+        fn shared(self) -> Arc<Self> {
+            Arc::new(self)
+        }
+
+        /// `"<secret_ref>|<model>"` per call — the same shape `Scripted` records, so a test can prove
+        /// which *key* and which *native* model id actually reached the wire.
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl AdapterInstance for TextScripted {
+        fn generate_image<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            // The mirror of `Scripted`'s text half: failing loudly beats answering a question this
+            // double was never built to answer.
+            Box::pin(async { Err(AttemptError::Transport) })
+        }
+
+        fn generate_text<'a>(
+            &'a self,
+            secret_ref: &'a str,
+            mut args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push(format!("{secret_ref}|{}", args.model));
+
+                // An under-scripted test fails loudly rather than passing on a silent default.
+                let next = self
+                    .replies
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Err(AttemptError::Transport));
+                let items = match next {
+                    Err(e) => return Err(e),
+                    Ok(items) => items,
+                };
+
+                // **The callbacks are taken here and fired at exhaustion, which is the source's
+                // stream branch** — `manifest-interpreter.ts:424` for tool calls, `:430` for usage,
+                // both in the loop's `finally`. Firing them as the *future* resolves would make this
+                // the non-stream branch (`:312-329`) while `args.stream` says otherwise, and the
+                // difference is exactly what the loop depends on: `execute_text` reads `usage` after
+                // the stream has been drained, not after the future returned.
+                let usage = self.usage;
+                let tool_call = self.tool_call.clone();
+                let mut on_usage = args.on_usage.take();
+                let mut on_tool_call = args.on_tool_call.take();
+
+                let mut inner = futures_util::stream::iter(items);
+                let mut flushed = false;
+                let stream: BoxStream<'a, Result<String, AttemptError>> =
+                    Box::pin(futures_util::stream::poll_fn(move |cx| {
+                        match inner.poll_next_unpin(cx) {
+                            std::task::Poll::Ready(Some(item)) => {
+                                std::task::Poll::Ready(Some(item))
+                            }
+                            std::task::Poll::Ready(None) => {
+                                if !flushed {
+                                    flushed = true;
+                                    if let (Some(cb), Some(tc)) =
+                                        (on_tool_call.as_deref_mut(), tool_call.clone())
+                                    {
+                                        cb(tc);
+                                    }
+                                    if let (Some(cb), Some(u)) = (on_usage.as_deref_mut(), usage) {
+                                        cb(u);
+                                    }
+                                }
+                                std::task::Poll::Ready(None)
+                            }
+                            std::task::Poll::Pending => std::task::Poll::Pending,
+                        }
+                    }));
+                Ok(stream)
+            })
+        }
+    }
+
+    fn text_args<'a>(plan: Vec<Candidate>) -> ExecuteTextArgs<'a> {
+        ExecuteTextArgs {
+            plan,
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            model: "as-the-caller-typed-it".to_string(),
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            on_tool_call: None,
+            on_usage: None,
+            max_attempts: None,
+        }
+    }
+
+    /// A sink and the buffer behind it. Shared rather than borrowed because `execute_text` holds the
+    /// sink for the whole call, which would keep a plain `Vec` borrowed past the assertions.
+    fn sink() -> (Arc<Mutex<Vec<String>>>, impl FnMut(&str) + Send) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&seen);
+        (seen, move |chunk: &str| writer.lock().unwrap().push(chunk.to_string()))
+    }
+
+    fn usage_sink() -> (Arc<Mutex<Vec<UsageTokens>>>, impl FnMut(UsageTokens) + Send) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&seen);
+        (seen, move |u: UsageTokens| writer.lock().unwrap().push(u))
+    }
+
+    fn tool_sink() -> (Arc<Mutex<Vec<ToolCall>>>, impl FnMut(ToolCall) + Send) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let writer = Arc::clone(&seen);
+        (seen, move |tc: ToolCall| writer.lock().unwrap().push(tc))
+    }
+
+    /// A stream that answered with these chunks, in order.
+    fn chunks_of(parts: &[&str]) -> TextReply {
+        Ok(parts.iter().map(|p| Ok((*p).to_string())).collect())
+    }
+
+    /// A **response-phase** refusal, as the script records it: the attempt answered with a failure
+    /// before a single byte, so the loop may retry it.
+    fn refused(status: u16) -> TextReply {
+        Err(AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None })
+    }
+
+    /// A **mid-stream** break, as the script records it: one item of an otherwise-answered stream.
+    /// The type is the *stream's*, not the script's — that is the two-phase split written down.
+    fn broke(status: u16) -> Result<String, AttemptError> {
+        Err(AttemptError::Http { status, kind: FailureKind::MidStream, retry_after_ms: None })
+    }
+
+    /// The same error value, for comparing against what the loop carried out. `AttemptError` is
+    /// `PartialEq` precisely so a test can assert the *original* travelled rather than a summary.
+    fn http_error(status: u16, kind: FailureKind) -> AttemptError {
+        AttemptError::Http { status, kind, retry_after_ms: None }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_candidate_that_streams_serves_and_the_rest_are_never_tried() {
+        let adapter = TextScripted::new(vec![chunks_of(&["Hel", "lo"])]).shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the first candidate streams");
+
+        assert_eq!(served.candidate.provider.id, "p1");
+        assert_eq!(*seen.lock().unwrap(), vec!["Hel".to_string(), "lo".to_string()], "in order");
+        assert!(served.attempts.is_empty(), "nothing failed before the success");
+        assert_eq!(adapter.calls().len(), 1, "a served request must not try the rest of the plan");
+        assert_eq!(served.usage, None, "this script reported none");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_native_model_id_is_what_reaches_a_text_adapter_not_the_requested_name() {
+        // The same rule as the image path (`:176`): `c.model.nativeId` is sent and `args.model` is
+        // only ever used to *name* the failure. A port that sent the requested name would pass every
+        // other test in this block.
+        let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "gpt-4o")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("served");
+
+        assert_eq!(adapter.calls(), vec!["key:p1:k1|gpt-4o".to_string()]);
+        assert!(
+            !adapter.calls()[0].contains("as-the-caller-typed-it"),
+            "the requested name must not reach the wire"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_phase_refusal_advances_and_is_recorded_with_its_status() {
+        let adapter = TextScripted::new(vec![
+            Err(AttemptError::Http {
+                status: 429,
+                kind: FailureKind::Response,
+                retry_after_ms: Some(30_000),
+            }),
+            chunks_of(&["ok"]),
+        ])
+        .shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the second candidate streams");
+
+        assert_eq!(served.candidate.provider.id, "p2");
+        assert_eq!(served.attempts.len(), 1, "the refusal is reported");
+        assert_eq!(served.attempts[0].cls, ErrorClass::RateLimited);
+        assert_eq!(served.attempts[0].status, 429, "the refusal keeps its status");
+        assert_eq!(*seen.lock().unwrap(), vec!["ok".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_stream_break_is_midstream_and_does_not_try_the_next_candidate() {
+        // `:112-116`. The consumer already holds text, so re-running the attempt would show it the
+        // text twice. The distinguishing case is a plan with somewhere to go: a port that advanced
+        // would serve from `p2` and report no failure at all.
+        let adapter =
+            TextScripted::new(vec![Ok(vec![Ok("half".to_string()), broke(200)])]).shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("the break is not retryable");
+
+        match failure {
+            TextFailure::MidStream { error, served, attempts, .. } => {
+                assert_eq!(served.provider.id, "p1", "the break names who had already served");
+                assert_eq!(
+                    error,
+                    http_error(200, FailureKind::MidStream),
+                    "the original error travels, not a classification"
+                );
+                assert_eq!(attempts.len(), 1, "the break is still in the chain");
+                // Mid-stream is `ParseError` whatever the status — the status here is `200`, because
+                // the *request* succeeded and the *stream* broke.
+                assert_eq!(attempts[0].cls, ErrorClass::ParseError);
+                assert_eq!(attempts[0].status, 200);
+            }
+            other => panic!("expected MidStream, got {other:?}"),
+        }
+        assert_eq!(*seen.lock().unwrap(), vec!["half".to_string()], "the text it did get is kept");
+        assert_eq!(adapter.calls().len(), 1, "a mid-stream break must not be retried");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_same_status_is_a_refusal_or_a_break_depending_on_which_phase_threw() {
+        // The seam's two phases (`AdapterInstance::generate_text`), seen from the loop: two
+        // identical `AttemptError` values, opposite handling. A port that classified by status alone
+        // would retry the second and show the consumer its text twice.
+        let response = TextScripted::new(vec![refused(429), chunks_of(&["second"])]).shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(response),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the second candidate streams");
+        assert_eq!(served.candidate.provider.id, "p2", "a response-phase 429 advances");
+        assert_eq!(*seen.lock().unwrap(), vec!["second".to_string()]);
+
+        let mid = TextScripted::new(vec![Ok(vec![Ok("first".to_string()), broke(429)])]).shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(mid.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("the mid-stream 429 rethrows");
+
+        assert!(matches!(failure, TextFailure::MidStream { .. }), "got {failure:?}");
+        assert_eq!(mid.calls().len(), 1, "and it is not retried");
+        assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saturated_provider_is_skipped_on_the_text_path_and_recorded_rate_limited() {
+        let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        let mut health = HealthTracker::new();
+        let limiter = ProviderLimiter::new(1);
+        let _held = limiter.acquire("p1").expect("free to start with");
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            Some(&limiter),
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("both candidates are on the saturated provider");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                assert_eq!(error.chain.len(), 2, "consecutive candidates of one provider too");
+                for attempt in &error.chain {
+                    assert_eq!(attempt.cls, ErrorClass::RateLimited);
+                    assert_eq!(attempt.status, 429);
+                }
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert!(adapter.calls().is_empty(), "a saturated provider is never contacted");
+        assert_eq!(limiter.in_flight_count("p1"), 1, "a skip must not consume a slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_budget_tries_nothing_on_the_text_path_either() {
+        // `Some(0)` is zero, not "unset" — the loop's half of what `attempt_budget` pins.
+        let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.max_attempts = Some(0);
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("a budget of zero cannot serve");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => assert!(error.chain.is_empty()),
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert!(adapter.calls().is_empty(), "no candidate may be contacted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_request_returns_cancelled_rather_than_all_attempts_failed() {
+        // `:80`/`:133`. The source `return`s from the generator, so no `AllAttemptsFailedError` is
+        // raised, and the caller writes a different ledger row for each (`:451`). Collapsing the two
+        // would make "cancelled" indistinguishable from "tried and lost".
+        let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &cancel,
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("cancelled");
+
+        assert!(matches!(failure, TextFailure::Cancelled { .. }), "got {failure:?}");
+        assert!(adapter.calls().is_empty(), "cancellation breaks before the adapter is reached");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn exhausting_the_plan_reports_every_attempt_in_order() {
+        let adapter = TextScripted::new(vec![
+            refused(404),
+            Err(AttemptError::Transport),
+            Err(AttemptError::Http {
+                status: 429,
+                kind: FailureKind::Response,
+                retry_after_ms: Some(1_500),
+            }),
+        ])
+        .shared();
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            text_args(vec![
+                candidate("p1", "k1", "m1"),
+                candidate("p2", "k2", "m2"),
+                candidate("p3", "k3", "m3"),
+            ]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("nothing served");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                let classes: Vec<ErrorClass> = error.chain.iter().map(|a| a.cls).collect();
+                assert_eq!(
+                    classes,
+                    vec![ErrorClass::NotFound, ErrorClass::Network, ErrorClass::RateLimited],
+                    "in the order they were tried"
+                );
+                assert_eq!(
+                    error.model, "as-the-caller-typed-it",
+                    "the caller's own name, not the native id that was sent"
+                );
+                // **Not zero**, and that is the text path's half of D22: a text attempt *can* name a
+                // wait, so the client is told the shortest one. The image path cannot.
+                assert_eq!(error.min_retry_after_ms(), 1_500);
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(adapter.calls().len(), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_permit_comes_back_on_every_text_path() {
+        // The text loop has more exits than the image one — served, exhausted, mid-stream,
+        // cancelled — so the `Drop` that releases the slot has more ways to leak.
+        let limiter = ProviderLimiter::new(1);
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let plan = || vec![candidate("p1", "k1", "m1")];
+
+        let served = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        execute_text(
+            &Always(served),
+            &mut health,
+            Some(&limiter),
+            text_args(plan()),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("served");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the served path released");
+
+        let exhausted = TextScripted::new(vec![Err(AttemptError::Transport)]).shared();
+        execute_text(
+            &Always(exhausted),
+            &mut health,
+            Some(&limiter),
+            text_args(plan()),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("exhausted");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the exhausted path released");
+
+        let broke = TextScripted::new(vec![Ok(vec![broke(200)])]).shared();
+        execute_text(
+            &Always(broke),
+            &mut health,
+            Some(&limiter),
+            text_args(plan()),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("mid-stream");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the mid-stream path released");
+
+        // Cancelled takes nothing at all, because the break precedes the acquire.
+        let cancel = Cancel::new();
+        cancel.cancel();
+        let never = TextScripted::new(vec![chunks_of(&["x"])]).shared();
+        execute_text(
+            &Always(never),
+            &mut health,
+            Some(&limiter),
+            text_args(plan()),
+            &cancel,
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("cancelled");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the cancelled path took nothing");
+
+        let _again = limiter.acquire("p1").expect("the cap admits again");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn usage_reaches_both_the_result_and_the_caller_callback() {
+        // `:97`. The engine's own `onUsage` does double duty — it fills the box the ledger reads
+        // *and* forwards to the caller's callback. Dropping the caller's is how every gateway
+        // response came to report `usage: null` on requests that had usage, so both halves are
+        // asserted rather than only the one the ledger happens to read.
+        let reported = UsageTokens::new(120, 34, Some(64));
+        let adapter = TextScripted::new(vec![chunks_of(&["x"])]).reporting_usage(reported).shared();
+        let mut health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let (forwarded, mut on_usage) = usage_sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.on_usage = Some(&mut on_usage);
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("served");
+
+        assert_eq!(served.usage, Some(reported), "the box the ledger reads");
+        assert_eq!(*forwarded.lock().unwrap(), vec![reported], "and the caller's own callback");
+        // `cached_tokens` is the field migration 0015 exists to take, so it has to survive the
+        // callback rather than being flattened to the two counts `BridgeMsg::Usage` carries (D23).
+        assert_eq!(served.usage.unwrap().cached_for_ledger(), Some(64));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_call_passes_through_untouched_and_carries_no_chunk() {
+        // `:97` passes the caller's `onToolCall` through unwrapped. Tool calls cannot ride in the
+        // chunk stream — a chunk is a string — so a port that forgot this callback would answer a
+        // tool-call turn with an empty body and no error at all.
+        let call = ToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("get_weather".to_string()),
+            arguments: Some("{\"city\":\"Dhaka\"}".to_string()),
+            raw: None,
+        };
+        let adapter = TextScripted::new(vec![Ok(vec![])]).calling_tool(call.clone()).shared();
+        let mut health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+        let (tool_calls, mut on_tool_call) = tool_sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.on_tool_call = Some(&mut on_tool_call);
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("a tool-call turn still serves");
+
+        assert_eq!(*tool_calls.lock().unwrap(), vec![call], "byte-for-byte, not re-derived");
+        assert!(seen.lock().unwrap().is_empty(), "the text is empty on a tool-call turn");
+        assert_eq!(served.candidate.provider.id, "p1");
+    }
+
+    /// **The two `#[allow]`s on the text path rest on this arithmetic, so it is asserted.**
+    ///
+    /// Clippy proposes boxing the error — `large_enum_variant` on `TextFailure`, `result_large_err`
+    /// on `execute_text`. Both lints assume a large `Err` makes the `Result` large and is paid on the
+    /// happy path. Here it is not: `Candidate` is 536 bytes and **both** arms carry one by value
+    /// (`TextSuccess.candidate`, `TextFailure::MidStream.served`), so the `Result` is the payload's
+    /// size with or without the box — `TextSuccess` 592, `TextFailure` 616, and boxing `served`
+    /// would save 16 of those 616 bytes while adding a heap allocation to every failure, including
+    /// the mid-stream one where the caller already holds text.
+    ///
+    /// The image path is the control, and it is the clearest evidence: its `Err` is 48 bytes, clippy
+    /// says nothing about it, and its `Result` is *still* 608 bytes — because the size comes from
+    /// `ImageSuccess.candidate`. Same 536-byte payload, same ~600-byte `Result`, no lint.
+    ///
+    /// If a future field makes the error dominate the payload, this fails and the allowances have to
+    /// be re-argued rather than inherited.
+    #[test]
+    fn the_text_results_size_comes_from_the_payload_not_from_the_error() {
+        let payload = std::mem::size_of::<TextSuccess>();
+        let error = std::mem::size_of::<TextFailure>();
+        let image = std::mem::size_of::<ImageSuccess>();
+
+        assert!(
+            error <= payload + 64,
+            "TextFailure ({error}) has outgrown TextSuccess ({payload}); boxing it may now be the \
+             cheaper fix, so the two `#[allow]`s need re-arguing"
+        );
+        assert!(
+            image >= payload,
+            "the image path's Ok type ({image}) is the control: it is at least as large as the text \
+             path's, which is why `result_large_err` cannot be about the text path's Err"
+        );
     }
 }

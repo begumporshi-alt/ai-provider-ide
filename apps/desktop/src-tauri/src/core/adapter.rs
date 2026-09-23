@@ -119,6 +119,15 @@ pub struct ToolCall {
 /// `tool_choice` and `response_format` are forwarded verbatim; the router never interprets them,
 /// which is what lets one shape serve every dialect's request template.
 ///
+/// **They are borrowed, not owned, and the loop is why.** Increment 9 landed them as owned
+/// (`Vec<Value>`, `Option<Value>`) because that is what the TypeScript's `unknown[]` looks like
+/// written down. The engine's loop is their first consumer, and it builds one `TextArgs` per
+/// attempt — so owned payloads mean a deep copy of the whole conversation *per attempt*, which is
+/// once per request in the common case, where the TypeScript passes one array by reference and
+/// copies nothing. `messages` grows with the conversation and `tools` with the client's toolset, so
+/// they are the wrong things to copy for a shape's convenience. The borrow is also the faithful
+/// reading: the TypeScript's own parameter is `messages: unknown[]`, a reference.
+///
 /// **The two callbacks sit on this struct because the TypeScript puts them there**, and that is the
 /// whole reason for the `'a`. A `&mut dyn FnMut` cannot be a field of a struct without a lifetime,
 /// so `TextArgs` is parameterised rather than the callbacks being moved out into a sibling
@@ -126,15 +135,24 @@ pub struct ToolCall {
 /// its source is checkable against that source, where two structs require the reader to re-derive
 /// why the split is where it is. The cost is stated rather than hidden — **`TextArgs` has no
 /// derives**, because `dyn FnMut` is neither `Debug`, `Clone` nor `Eq`.
+///
+/// **One lifetime is enough, and the first consumer nearly proved otherwise.** The obvious reading
+/// of "the callbacks are re-borrowed per attempt, the payloads are held for the request" is that
+/// the two need separate lifetimes. It is wrong, and it was measured: splitting them changes
+/// nothing, and a single `'a` compiles the engine's loop once the *call site* is right. What
+/// actually fails is handing this struct a `&mut dyn FnMut` taken straight off a field of the
+/// caller's own argument struct — see `execute_text`'s `forward_tool` for the shape that works and
+/// the reasoning. A shape diagnosis was made here, falsified against a 60-line reproduction, and
+/// replaced by the call-site one; the seam did not need changing.
 pub struct TextArgs<'a> {
     pub model: String,
-    pub messages: Vec<Value>,
+    pub messages: &'a [Value],
     pub stream: bool,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
-    pub tools: Option<Value>,
-    pub tool_choice: Option<Value>,
-    pub response_format: Option<Value>,
+    pub tools: Option<&'a Value>,
+    pub tool_choice: Option<&'a Value>,
+    pub response_format: Option<&'a Value>,
     /// Reports REAL tool calls. They cannot ride along in the chunk stream — the chunk protocol is
     /// strings only — and they cannot be derived from the text, which is empty on a tool-call turn.
     pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
@@ -352,7 +370,7 @@ mod tests {
     fn text_args<'a>(model: &str) -> TextArgs<'a> {
         TextArgs {
             model: model.to_string(),
-            messages: vec![],
+            messages: &[],
             stream: true,
             max_tokens: None,
             temperature: None,

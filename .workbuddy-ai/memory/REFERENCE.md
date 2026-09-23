@@ -792,6 +792,22 @@ Mirrors `ci.yml` step for step, adds a Node >= 19 preflight, and unsets the prox
 `pnpm install` by default; `--install` to include it, `--skip-browser` to drop the ~48s Playwright
 run. **Use this as the inner loop, not as a substitute for CI** (see next).
 
+### Rust borrow shapes that cost an afternoon (2026-09-23)
+
+- **A `&mut dyn FnMut` taken off a field of a struct with a lifetime parameter pins the borrow to that
+  lifetime.** Handing it straight into another struct's `&'x mut dyn FnMut` field makes rustc resolve `'x` to the
+  *field's declared* lifetime rather than to a shorter subregion, so the borrow outlives the loop that created it
+  (`E0499` twice, `E0597`, `E0373`) — and `where 'b: 'a` on the receiving trait method does not help, because it
+  is not the cause. Route it through a **local closure**: the referent becomes a local and the borrow ends with
+  the iteration. Falsified both ways in `/tmp/lifetime-repro.rs` (three lifetimes reproduce the same four errors;
+  dropping the field makes all of them vanish).
+- **A block's tail expression keeps its temporaries alive past the block's locals.** `match f().await { .. }` as a
+  tail expression is `E0597` whenever the returned value borrows a local declared in the block — the temporary's
+  destructor runs after the locals are dropped. `let x = match ..; x` fixes it and is worth a comment saying why.
+- **Reproduce before diagnosing a borrow error.** Bisect by *removing fields from the struct literal*, not by
+  re-reading the error text. My first diagnosis (two lifetimes) was plausible, wrong, and cost churn in two files;
+  a 60-line standalone repro answered it in four compiles. See also: "a reason is a claim too".
+
 ### What it costs, and when not to run all of it (measured 2026-09-23)
 It is 16 steps and it compiles the **same code three times per language** — Rust: `tauri build` (release, default
 features), `aiproviderd --release --no-default-features`, and `cargo test` (debug); JS: typecheck, test, build —

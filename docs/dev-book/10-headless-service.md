@@ -1060,6 +1060,94 @@ and take a sink. The TypeScript answers none of this, because a generator borrow
 which is exactly the affordance Rust does not have. That makes it a design decision with three named options
 rather than a translation.
 
+### Increment 10 as built — the text loop over the seam (2026-09-23)
+
+**What landed:** `engine::execute_text` and its three shapes — `ExecuteTextArgs<'a>`, `TextSuccess` and
+`TextFailure`. This is the last piece of Phase 2: the seam had both members the engine calls, and this is the
+loop over them. `cargo test` **583 → 596**.
+
+**The sink is the increment's one real shape decision, and it is a deviation from the source.** `executeText`
+returns `TextExecution { chunks: AsyncGenerator }` — a *pull* stream the caller iterates. This takes
+`on_chunk: &mut dyn FnMut(&str)` and runs to completion. Two reasons, both structural:
+
+1. The source's generator is not a plain generator. `yield chunk` sits inside an `await`-driven retry loop, so a
+   pull port would have to express "await the factory, then await `generate_text`, then poll its stream, then
+   decide whether to retry" as a hand-written state machine — and there is no `async-stream` dependency, which
+   this port may not add.
+2. A pull port cannot report plan exhaustion honestly. The source *throws* `AllAttemptsFailedError` from inside
+   the generator (`:141-143`), and a `BoxStream<Item = Result<String, AttemptError>>` has no room for it. The
+   alternatives are widening the item type or leaving the caller to infer exhaustion from an empty stream — and
+   the second is how a failed request becomes a `200` with no body.
+
+The cost is stated rather than hidden: **a caller can no longer stop early by not draining.** It cancels
+instead, which the loop honours at `:80` and `:133` — an explicit signal replacing an implicit one.
+
+**Failures carry what the source leaves readable.** `TextFailure` has three variants, each with `attempts` and
+`usage`, because `executeText` returns the `TextExecution` object *before* `chunks` is iterated, so
+`model-router.ts`'s `catch` reads `exec.served()`, `exec.fallbackChain()` and `exec.usage()` on the failing
+path (`:488`, `:517-519`). `Cancelled` is its own variant rather than an empty `Ok` because the source
+`return`s from the generator instead of throwing, and the caller writes a different ledger row for each
+(`:451`) — `Ok` with no candidate would be two spellings of one state.
+
+**Two borrow-checker findings, and the first was mine and it was wrong.** `execute_text` initially did not
+compile, and the obvious diagnosis was that `TextArgs` needed **two** lifetimes — payloads for the request,
+callbacks for the attempt — with `'b: 'a` so a stream that is `+ 'a` can hold `&'b mut` callbacks. Built it;
+it changed nothing. A 60-line reproduction isolated it instead:
+
+- Removing `on_tool_call` from the struct literal made **every** error vanish (`on_usage` never was the
+  problem — it is already wrapped in a local closure, because the engine must record usage as well as forward it).
+- Three lifetimes (`'b` for tool calls, `'c` for usage) reproduced the same four errors.
+- A single `'a` compiled the moment the tool-call callback was routed through a **local closure**.
+
+So the seam did not need changing and the call site did. `TextArgs<'a>` is unchanged from increment 9; the fix
+is `forward_tool` in `execute_text`, and the rule is recorded in both places: **the value handed to the seam
+must borrow a local, not a field of the caller's own argument struct.** A `&mut dyn FnMut` taken off a field
+carries that field's declared lifetime and rustc resolves the seam's lifetime to *it* rather than to a shorter
+subregion, which forces the borrow to outlive the whole retry loop — `E0499`, twice, plus `E0597` and `E0373`.
+The second finding is smaller and older: `match adapter.generate_text(..).await` was the block's tail
+expression, so the `Result<BoxStream<…>, _>` temporary's destructor ran *after* `record_usage` and
+`forward_tool` were dropped. Binding it to `let refusal` first drops it at the end of the statement instead.
+
+**`TextArgs`' payloads are now borrowed.** Increment 9 landed `messages`, `tools`, `tool_choice` and
+`response_format` as owned `Value`s, which is what the TypeScript's `unknown[]` looks like written down. The
+loop is their first consumer and builds one `TextArgs` per *attempt*, so owned payloads meant a deep copy of the
+whole conversation per attempt — where the source passes one array by reference and copies nothing. `messages`
+grows with the conversation, so it is the wrong thing to copy for a shape's convenience.
+
+**Two `#[allow]`s, each with a measurement rather than an assertion.** Clippy reads `TextFailure` as a large
+enum (`large_enum_variant`) and `execute_text` as returning a large error (`result_large_err`). Measured:
+`Candidate` **536** bytes, `TextSuccess` **592**, `TextFailure` **616**. Both arms carry that payload by value,
+so the `Result` is ~600 bytes either way and boxing the error would save 16 of 616 while adding a heap
+allocation to every failure — including the mid-stream one, where the caller already holds text. The image path
+is the control: its `Err` is 48 bytes, clippy never mentions it, and its `Result` is *still* 608, because the
+size comes from `ImageSuccess.candidate`. Same 536-byte payload, same ~600-byte result, no lint. The arithmetic
+is asserted by `the_text_results_size_comes_from_the_payload_not_from_the_error`, which fails if a future field
+makes the error dominate. `gateway.rs:1402` allows the same lint for the same shape of reason.
+
+**One open contract question, recorded rather than fixed.** The engine `break`s out of the stream on a
+mid-stream error and drops it. In the source, `for await` calls `return()` on the inner generator when the loop
+body throws, so its `finally` — where `onToolCall` and `onUsage` fire (`manifest-interpreter.ts:424`, `:430`) —
+still runs. A Rust adapter that fires those callbacks only when its stream is polled to `None` will not fire
+them on the break path, so `usage` stays `None` for a broken stream that did report one. Nothing exercises it
+yet because no adapter is ported; it is a contract the first adapter must be written against, and the two
+candidate answers are a `Drop` impl on the stream or the engine draining to `None` before it reports the break
+— the latter would change what "mid-stream" means, so it is a decision and not a port step.
+
+**Thirteen tests, thirteen falsifications.** Chunks reach the sink in order; the native model id reaches the
+adapter rather than the caller's name; a response-phase refusal advances and keeps its status; a mid-stream
+break is `MidStream`, names who served, and is **not** retried; the same `429` is a refusal or a break
+depending on which phase threw; a saturated provider is skipped, recorded `RATE_LIMITED`/`429` and consumes no
+slot; `Some(0)` is a budget of zero; cancellation returns `Cancelled` and not `AllAttemptsFailed`; exhaustion
+reports every attempt in order and names the caller's model; the permit comes back on all four exit paths;
+usage reaches both the result and the caller's callback, with `cached_tokens` intact; a tool call passes
+through byte-for-byte on a turn that produced no text. Every mutation produced a red test, including the one
+that pads `TextFailure` by 512 bytes to check the size test is not merely decorative, and every restore was
+verified byte-identical.
+
+**What remains of Phase 2:** nothing in `core`. What is still open overall is unchanged from increment 9 —
+`AttemptOutcome` cannot name the provider it tried, and it is now confirmed load-bearing by
+`model-router.ts:537-539`, which reads `a.candidate.provider.id/slug` off each attempt.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
