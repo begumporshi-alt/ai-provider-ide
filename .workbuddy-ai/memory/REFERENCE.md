@@ -2133,6 +2133,21 @@ A non-zero result means the staged copy is contaminated — revert, regenerate, 
 **`grep -c` counts lines; `str.count()` counts occurrences** — 1143 vs 4998 for the same file. When the number
 matters, say which one you measured.
 
+**The guard is mechanical now — 2026-09-23.** It had been written down here and was still skipped by the person
+who wrote it, one session later, on a commit that captured **6,540** occurrences. `scripts/git-hooks/pre-commit`
+refuses a staged `book.html` carrying the attribute; install it once per clone with
+`git config core.hooksPath scripts/git-hooks`. Two things about it are worth keeping:
+
+- **It is a hook and not a gate step.** `pnpm ci:local` runs `docs:book`, which regenerates the file, so a
+  gate-time check passes while the *staged* copy stays contaminated. The only reliable moment is between staging
+  and the commit object.
+- **Its boundary is exact, and finding it cost a false alarm.** The check reads the staged copy only when the file
+  is a *change* in this commit, because `git diff --cached` compares the index against HEAD — so staging HEAD's own
+  contaminated bytes produces no diff, the file is not listed, and the guard returns early. The first version was
+  tested exactly that way: the mutation did not fire and the guard looked broken when the test was. The hook
+  therefore prevents *new* contamination and cannot repair an already-contaminated HEAD; that repair is the
+  one-liner above.
+
 ### What still is not closeable by code
 
 The one-time Apple Developer account action: creating the Developer ID certificate, exporting the `.p12`,
