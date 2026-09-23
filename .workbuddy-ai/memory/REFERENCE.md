@@ -2422,3 +2422,48 @@ are `#[path]` submodules of `gateway.rs` (`gateway.rs:1784-1808`) and therefore 
 `gateway_anthropic.rs`, `context_scope.rs`, `gateway_gemini.rs`, `gateway_handlers.rs`, `model_context.rs`,
 `principal.rs`, `gateway_responses.rs`, `session_context.rs`, `gateway_tests.rs`.
 
+## Shapes the source keeps as one type, and how a port keeps them honest (2026-09-23)
+
+`ports.ts` explains why `UsageTokens` is one shared type rather than three inline literals: it is *written* by the
+manifest interpreter, *carried* by the execution engine and *read* by the ledger, and "a field added in one place
+and not the others is silently dropped — which is precisely how `cached_tokens` went unrecorded until migration
+0015". Porting the shape inherits the exposure. Three mechanisms kept it honest, and none is obvious.
+
+### No runtime assertion can see a field that does not exist yet
+
+The defence is an **exhaustive struct literal** in the tests:
+
+```rust
+let u = UsageTokens { prompt_tokens: 120, completion_tokens: 34, cached_tokens: Some(64) };
+```
+
+A fourth field breaks every construction in the module. That is a compile error rather than a red test, and it is
+the point: it forces whoever adds the field to decide which boundary carries it, at the moment they add it. The
+assertions beside the literal are the readable half; the literal is the load-bearing one, and the test's own doc
+comment has to say so or the next person deletes it as redundant. `core/usage.rs` is the worked example.
+
+The falsification is what turns this from a claim into a measurement: the mutation making the third field
+non-optional is rejected by the **compiler**, not by a test. So a mutation harness must report DID-NOT-COMPILE as
+a verdict distinct from DID-NOT-FIRE — scoring them together hides the difference between "the compiler caught it"
+and "nothing caught it". The same harness must assert its anchor occurs exactly once *before* mutating, or a
+mutation that never applied reads as a sleeping test.
+
+### A fallible conversion must not map failure onto an absence value
+
+`cached_tokens: Option<u64>` becomes `Option<i64>` for `ledger.cached_tokens`, a nullable column whose `NULL`
+means "the provider reported no cache block" — deliberately **not** the same as a reported `0`. The tidier cast,
+`i64::try_from(x).ok()`, would turn an out-of-range count into `None`, indistinguishable from "reported nothing":
+it forges the exact state the column exists to keep separate. The lossy `as` is correct, and the doc comment says
+why — **a wrong number is recoverable, a wrong state is not.** The general rule: when a nullable column encodes
+absence-≠-zero, never route a fallible conversion's failure into the absence value.
+
+### A finding can be a contradiction rather than a fact
+
+Increment 8 set out to record "the crate's only usage type carries two of `UsageTokens`' three fields". Measured,
+that was **already recorded** at `09-status.md:179`, with the same citations. What was *not* recorded is that the
+plan's own Phase-2 dependency table claimed those shapes were "already realised" — the sentence a porter reads.
+The register entry was rewritten to say which half is missing, to cross-reference the existing entry explicitly,
+and to state that it is not a second finding of it. **Read the register and the status table before recording;
+then record the contradiction, not the fact.**
+
+

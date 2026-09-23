@@ -10,8 +10,11 @@
 //! side those `unknown`s become `serde_json::Value` and the callbacks become owned closures, and
 //! `onUsage` would introduce a **second** usage shape beside the `BridgeMsg::Usage` the crate
 //! already has (`gateway.rs:366`) — the two-spellings-of-one-state defect this repo keeps finding
-//! (D19, D21). So the text half waits for that shape to be decided rather than being invented here
-//! and unravelled later. The streaming half needs the same decision.
+//! (D19, D21). **That shape is now decided rather than deferred:** the callback carries
+//! `core::usage::UsageTokens`, the crate's single three-field home for token counts, landed in
+//! increment 8 and recorded as D23. So the text half is unblocked on that count and on nothing else
+//! — the streaming shape, and the ownership of the mutable state the loop must keep alive after
+//! `execute_text` returns, are still open.
 //!
 //! What is here is the Rust port of `adapter-instance.ts` (31 lines) together with the shapes the
 //! engine passes across it. It is its own module for the same reason the TypeScript keeps it in its

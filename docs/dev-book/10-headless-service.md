@@ -781,7 +781,7 @@ Measured before writing any code:
 |---|---|
 | `manifest-interpreter.ts` in Rust | **Nothing.** A Grep for `manifestVersion`, `requestTemplate` and `modalityRules` over the Rust tree matches no file. The only manifest awareness is `manifest_forwards_tools` (`tauri/workbuddy.rs:145-152`), a shallow single-purpose probe reading `endpoints.generateText.requestTemplate.tools` — and it lives in `tauri/`, not `core/` |
 | `Candidate`, the engine's other import | `{provider, key, model}` (`route-planner.ts:13-17`) — Phase 3's type, assembled from three `domain.ts` types |
-| `ports.ts` shapes | already realised: `UsageTokens.cached_tokens` is `LedgerRow.cached_tokens` plus `BridgeMsg::Usage` |
+| `ports.ts` shapes | **half realised, and the missing half is the third field (D23).** `UsageTokens` has three fields; `LedgerRow.cached_tokens` is one of them and `BridgeMsg::Usage` is the other two — the bridge variant has no `cached_tokens` at all (`gateway.rs:365-368`). Increment 8 lands the single shape in `core::usage` |
 | `adapter-instance.ts` | a trait written over `manifest-interpreter.ts`'s types, so it cannot land alone |
 
 So the adapter layer is genuinely blocked, and `Candidate` would be a scope expansion into Phase 3. What is
@@ -933,6 +933,52 @@ shape as above and nothing else. One gap is *unblocked but deliberately not clos
 cannot name the provider it tried, because in Rust the faithful shape clones three owned rows per failed
 attempt where the TypeScript copies a reference — the cheap alternative is to carry the `slug/label` string
 `describe` actually reads, and that is a decision rather than a port step.
+
+#### Increment 8 as built — the usage shape (2026-09-23)
+
+**The increment is the blocker, not a step toward it.** Increment 7's own note ends by saying the streaming half
+is blocked on the `TextArgs`/`usage` shape. Increment 8 settles that shape and nothing else: one new module of
+144 lines, against increment 7's 2,327 insertions across eleven files. The ratio is the point — the expensive part
+of the text half is the *streaming* shape, and this removes the other blocker so the next increment has one open
+question instead of two.
+
+**What landed.** `core/usage.rs` holds `UsageTokens` — `prompt_tokens: u64`, `completion_tokens: u64`,
+`cached_tokens: Option<u64>` — the Rust port of `ports.ts:106-117`, plus the two accessors that name where each
+field goes: `counts()` for the pair a client sees, `cached_for_ledger()` for the `Option<i64>` the column takes.
+Six tests; `cargo test` **569 → 575/0**, the predicted count exactly.
+
+**Why the third field decided it, rather than the first two.** `UsageTokens` has three fields and the crate's only
+usage type has two. A Grep for `UsageTokens`, `struct Usage` and `TokenUsage` over `src-tauri/src` matches **no
+file**, so `BridgeMsg::Usage` (`gateway.rs:365-368`) is what a porter would reach for — and it has nowhere to put
+`cached_tokens`, the field migration 0015 and the entire prompt-cache measurement exist to capture. That is D23.
+The subtlety worth keeping is that the crate is *not* losing the measurement today, and the reason is what makes
+the gap look like nothing: **the ledger is not written through the bridge.** The webview's router reads
+`exec.usage()?.cached_tokens` in process (`model-router.ts:435`, `:519`) and writes the row itself, while the
+two-field `gateway_usage` forward (`gateway-bridge.ts:299-305`) feeds only the response body. So the same
+asymmetry costs a **client** a field it cannot derive, and would cost a **porter** the measurement. The
+client-facing half was already recorded (`09-status.md:179`); D23 records the port-planning half, which was not.
+
+**The absence/zero distinction is carried by the type, not by a comment.** `cached_tokens: Option<u64>` is what
+makes "the provider reported no cache block" unrepresentable as `Some(0)`, and `cached_for_ledger` keeps `None` as
+`None` so the column receives SQL `NULL` rather than a forged zero. The cast is `as` rather than
+`i64::try_from(..).ok()`, and the tidier-looking alternative is worse: it would turn an out-of-range count into
+`None`, which is indistinguishable from "reported nothing" — a wrong number is recoverable, a wrong state is not.
+
+**One property has no runtime test, and the tests say so.** No assertion can see a field that does not exist yet.
+What can is an exhaustive struct literal: a fourth field breaks every construction in the module, which forces a
+decision about which boundary carries it. `every_field_reaches_one_of_the_two_boundaries` keeps that literal
+exhaustive and says in its own doc comment that the assertions are the readable half and the literal is the
+load-bearing one. The falsification run is where that stops being a claim: the mutation making the third field
+non-optional is rejected by the *compiler* rather than by a test, and the rejection is the guard firing.
+
+**Six falsifications.** Five fail a named test — forging absence into zero, swapping the two counts, doubling the
+prompt count, discarding every cache count as unreported, and a constructor that ignores its third argument — and
+the sixth is the compile-time one above. Every restore verified byte-identical to the baseline hash.
+
+**What this narrows.** The `TextArgs` shape is decided: `on_usage` carries `core::usage::UsageTokens`. What
+remains is the streaming shape itself, and one question this increment made visible rather than answered — the
+text loop must outlive the call that starts it, so `execute_image`'s `&mut HealthTracker` borrow is not available
+to it, and how the loop owns its mutable state is a design decision rather than a translation.
 
 ### Phase 3 — Port the model router and route planner (2-3 days)
 

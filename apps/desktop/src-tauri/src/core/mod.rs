@@ -40,4 +40,5 @@ pub mod orchestrator;
 pub mod persist;
 pub mod skills;
 pub mod store;
+pub mod usage;
 pub mod vault;
