@@ -2240,14 +2240,126 @@ Assistant/UI path only, so moving it to `tauri/` wholesale costs the service not
 4. **CI has no OS matrix.** `ci.yml` is a single job `checks` on `macos-14`. A 3-OS binary build is a **new
    job**, not a matrix edit.
 
-### Two structural caveats
+### Two structural caveats — both closed 2026-09-23
 
-- **`tauri` is an unconditional dependency and `build.rs` runs `tauri_build::build()` for every target.** So
-  `cargo build --bin aiproviderd` still compiles all of Tauri. The binary is Tauri-free in **source** only.
-  Real decoupling needs a feature flag or a separate crate.
-- **`gateway_tests.rs:1947` imports `crate::gateway_cmds::GatewayState`** — a core → tauri edge that exists only
-  in `cfg(test)`. Harmless for `--bin aiproviderd`, but it means "core never imports tauri/" is false under
-  `cargo test` and must be stated rather than assumed.
+- **`tauri` was an unconditional dependency and `build.rs` ran `tauri_build::build()` for every target.** So
+  `cargo build --bin aiproviderd` compiled all of Tauri; the binary was Tauri-free in **source** only. Closed by
+  the `app` feature — see "Feature-gating `core/` away from Tauri" below.
+- **`gateway_tests.rs` imports `crate::gateway_cmds::GatewayState`** — a core → tauri edge that exists only in
+  `cfg(test)`. Harmless for `--bin aiproviderd`, but "core never imports tauri/" is false under `cargo test`.
+  Still true, and now gated: **8 references in 5 functions**, each carrying `#[cfg(feature = "app")]`.
+
+## Feature-gating `core/` away from Tauri — landed 2026-09-23
+
+The end state: `cargo build --bin aiproviderd --no-default-features` compiles **no Tauri at all** — not the
+runtime crate, not `wry`, not WebKitGTK. Measured with
+`cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → **0**.
+
+### The Cargo.toml shape
+
+```toml
+[[bin]]
+name = "aiproviderd"
+path = "src/bin/aiproviderd.rs"
+
+[[bin]]
+name = "ai-provider-router"
+path = "src/main.rs"
+required-features = ["app"]      # without this a feature-less build still compiles main.rs
+
+[features]
+default = ["app"]
+app = ["dep:tauri", "dep:tauri-plugin-opener"]
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+```
+
+`build.rs`:
+
+```rust
+fn main() {
+    if std::env::var_os("CARGO_FEATURE_APP").is_some() {
+        tauri_build::build()
+    }
+}
+```
+
+`CARGO_FEATURE_<NAME>` is the documented env var Cargo sets for each enabled feature — uppercased, `-` → `_`.
+
+### `tauri-build` cannot be gated — Cargo has no optional build-dependencies
+
+`[build-dependencies]` has no `optional` key. So `tauri-build` compiles even with the feature off; what the
+feature buys is that `build.rs` does not *call* it. Verified harmless for Linux: `tauri-build` pulls no
+GTK/WebKit, and the runtime `tauri` crate is what drags in `wry` → `webkit2gtk`.
+
+### The trap that cost the first compile: a trait impl in the glue that `core` needs
+
+**29 × `E0277: the trait From<rusqlite::Error> is not implemented for CommandError`**, all one root cause.
+`From<rusqlite::Error> for CommandError` lived in `tauri/commands.rs`, but ungated `core/persist.rs` accessors
+use `?` on rusqlite results. **A trait impl is visible crate-wide regardless of which module it is written in**,
+so it worked by accident while the feature was on, and disappeared the moment the glue was gated out.
+
+Fix: move the impl *and* its redaction helper `ui_db_error` into `core/error.rs`. Neither names a glue-side
+type (`StoreError`, `rusqlite::Error` are both core deps), so the module's own rule — "conversions that mention
+glue-side types stay in `tauri::commands`" — puts them on the core side. The conversions that *do* name glue
+types (`egress::EgressError`, `vault::VaultError`) stayed put.
+
+**Generalise it:** before gating a glue module away, grep for `impl ... for <core type>` in the glue. A trait
+impl is not a call site, so nothing else in the compiler points at it until the impl is gone.
+
+### The dead-code cascade is shallow, and gating it is correct rather than cosmetic
+
+Gating the 28 `#[tauri::command]` attributes plus `egress::stream()` leaves **15 warnings** — 14 app-only
+helpers/constants in `persist.rs` (`replace_models`, `list_models`, `ledger_insert`, `LEDGER_SELECT`,
+`ledger_row_from`, `AUDIT_MAX_LIMIT`, `list_generator_audit`, `DRIFT_MAX_LIMIT`, `list_drift_events`,
+`config_export_rows`, `find_secret_keys`, `parse_import`, `config_import_checked`, `diagnostics_json`) and
+`egress::UPSTREAM_IDLE_TIMEOUT`. Gating those leaves **1** (`serde_json::{json, Value}` unused), then **0**.
+
+Do not suppress these with `#[allow(dead_code)]`. They are the app-only half of `core/persist.rs` showing
+through — exactly the coupling the split exists to expose.
+
+### Verifying the claim — the binary size is the independent corroboration
+
+```bash
+cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'   # expect 0
+cargo build --bin aiproviderd --release --no-default-features             # expect ok
+ls -l target/release/aiproviderd                                          # 4,073,968 B vs 4,454,336 B
+cargo check --bin aiproviderd --no-default-features                       # expect 0 warnings
+cargo test                                                                # 489 passed / 0 failed
+cargo clippy --all-targets -- -D warnings && cargo fmt --check             # expect clean
+pnpm --filter ai-provider-router-desktop tauri build --bundles app         # the app must still bundle
+```
+
+The **380 KB** difference between the two binaries is Tauri not being linked — a measurement that is
+independent of the dependency-graph query, so the two can falsify each other.
+
+### `cargo tree --bin X` does NOT show build-dependencies
+
+The first check used `cargo tree --bin aiproviderd --no-default-features` and reported **0** tauri lines while
+`cargo build` was visibly compiling `tauri-build`. Use `--edges all` (or `-e build`) before claiming a crate is
+absent from the graph.
+
+### The CI job must pass the flag, or the split rots silently
+
+`headless-service` ran `cargo build --bin aiproviderd --release` — **default features**. Before the feature
+existed that was merely a claim that overstated itself; afterwards, with `default = ["app"]`, the flagless
+command still compiles Tauri, so the job would have stayed green while proving nothing about the split it
+exists to test. Recorded as **D15**. It now passes `--no-default-features`, and the GTK/WebKit apt packages are
+gone from the Linux leg — which was the whole point.
+
+**Deliberately not `-D warnings` on that job yet.** `--no-default-features` is warning-free on macOS, but
+macOS-only code cfg'd out on Linux can surface dead-code lints macOS never sees. Tightening waits until a Linux
+run has shown its own lint set.
+
+### Counting traps, hit again
+
+- `grep -c 'tauri::command'` counts **doc-comment mentions** → 32, when the real attribute count is **28**.
+- `grep -c 'tauri::'` counts attribute lines too → 106, when 57 are attributes and 49 are not.
+- Count attributes with an anchored pattern: `^\s*#\[tauri::command\]\s*$`.
+- Same class as the "104 tests" (real 489), the "9 references" (real 8), and the "61 tauri:: refs" (matches no
+  reading). **Four instances of one mistake in this project: a `grep -c` whose pattern was never validated.**
 
 ### Stale numbers in the prompt
 
