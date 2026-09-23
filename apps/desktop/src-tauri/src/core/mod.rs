@@ -29,6 +29,7 @@ pub mod capture;
 pub mod context;
 pub mod crash_report;
 pub mod egress;
+pub mod engine;
 pub mod error;
 pub mod gateway;
 pub mod injection_log;

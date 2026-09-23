@@ -170,6 +170,7 @@ and nothing was weakened to get there.
 |---|---|
 | **`thinking` blocks** | Not started, and not startable yet. Measured 2026-09-23: four drop sites, no protocol field to carry it, and nothing to test it against |
 | **`previous_response_id`** | Closed as not applicable — Codex points at a different gateway, and sets `wire_api = "responses"` with `disable_response_storage = true` |
+| **Headless Phase 2 — the router core in Rust** | **Increment 1 landed 2026-09-23.** `core/engine.rs` holds the port's pure core: the error taxonomy, `COOLDOWN_FLOOR_MS`, and the shortest-wait fold. 9 tests (3 ported from `retry-after.test.ts`), `cargo test` 498/0. **Still parked:** the attempt loop, which needs `route_planner`'s `Candidate` (Phase 3); the streaming half, which needs a `Stream` adapter for `chunks: AsyncIterable<string>`; and the bridge→core back-reference, which `GatewayCore`'s ownership of `Arc<dyn Bridge>` makes a reference cycle. Scoped in [10](10-headless-service.md) §7 — the port is 1,114 lines, not the 229 the plan implied |
 
 **Two rows left this table on 2026-09-22.** **rustfmt adoption** moved to "Working and verified" — it is now a
 gate. **`IDE/`** was removed: a file count showed it held none at all, only an empty `IDE/.workbuddy-ai/memory/`

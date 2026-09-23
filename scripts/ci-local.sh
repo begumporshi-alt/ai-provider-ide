@@ -104,6 +104,13 @@ step "One product version"    pnpm check-version-sync
 # A relative link or image that does not resolve is invisible until someone clicks it.
 # See docs/dev-book/07-drift-register.md D9.
 step "Doc links resolve"      pnpm check-doc-links
+# `docs:book` validates structure as well as rendering, and it is a *different* check from the one
+# above: `check-doc-links` resolves links, this parses tables and rejects a row that disagrees with
+# its header. Measured 2026-09-23: an escaped pipe written inside a code span split one row into
+# four cells, `docs:book` failed, and every other step in this gate stayed green -- which is how a
+# broken table reaches a reader looking like a merely ugly one. It runs after the link check so a
+# dead link is reported before a render error.
+step "Dev book builds"        pnpm docs:book
 
 if command -v cargo >/dev/null 2>&1; then
   # Stated, not assumed. The lint set moves with the toolchain -- 1.88 was clean here and 1.98

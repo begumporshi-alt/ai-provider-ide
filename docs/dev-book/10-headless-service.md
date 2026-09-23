@@ -464,6 +464,67 @@ and `async-stream` for the generator pattern.
 **Test strategy:** port the tests first. `gateway_tests.rs` already has synthetic bridge tests.
 Replace the synthetic bridge with the real Rust engine and verify the same assertions pass.
 
+#### Phase 2 as scoped, and increment 1 as built (2026-09-23)
+
+Measured before writing code, not estimated. `execution-engine.ts` is **229 lines**, but its real
+dependency set is **885 lines** across six modules this plan never names — so the honest size of
+"port the execution engine" is **1,114 lines of TypeScript**:
+
+| module | lines | why the engine needs it |
+|---|---|---|
+| `execution-engine.ts` | 229 | the attempt loop itself |
+| `manifest-interpreter.ts` | 492 | `ManifestHttpError`; the adapter layer |
+| `ports.ts` | 152 | `ToolCall`, `UsageTokens` — the callback shapes |
+| `concurrency.ts` | 92 | `ProviderLimiter` (audit R3, skip-don't-wait) |
+| `health-tracker.ts` | 79 | `COOLDOWN_FLOOR_MS`, `HealthTracker` |
+| `errors.ts` | 39 | `classify`, `ErrorClass` |
+| `adapter-instance.ts` | 31 | `AdapterInstance` — a type only |
+
+**Phase 2 is independently landable.** Of the six, only `Candidate` comes from `route-planner.ts`,
+and it is imported as a **type**, not a value — so the engine does not depend on Phase 3's logic.
+The ordering above holds.
+
+**The test surface is 14 engine-relevant cases across five files**, concentrated in
+`packages/router-core/test/acceptance.test.ts` (4 — 401→second-key-serves, failover-disabled,
+anthropic dialect, abort mid-stream), `retry-after.test.ts` (2 pure cases), and
+`concurrency.test.ts` (1 — the slot is released when an attempt fails).
+
+**One contract already spans both halves of the port.** `AllAttemptsFailedError.minRetryAfterMs()`
+in TypeScript and `BridgeMsg::Error::retry_after_ms` in Rust state the same rule — *shortest*, not
+longest — and `gateway::cooldown_secs` already consumes it. They agree today. That is exactly why
+the ported tests are worth having: they are what keeps them agreeing.
+
+**The 1-second floor is spelled at four code sites across two languages, and only one is named:**
+
+| site | spelling |
+|---|---|
+| `health-tracker.ts:27` | `COOLDOWN_FLOOR_MS = 1000` — the only named one; used by the tracker *and* `minRetryAfterMs` |
+| `gateway.rs:1720` (`cooldown_secs`) | `.max(1)` |
+| `gateway_handlers.rs:236` | `unwrap_or_else` falling back to the string `"1"` |
+| `gateway.rs:1911` (`ensure_retry_after`) | `HeaderValue::from_static("1")` |
+
+The coupling is documented only in prose — `gateway.rs:1903-1905` says its `1` "matches the core's
+own key-cooldown floor (`health-tracker.ts`: `cooldownUntil = now + max(retryAfterMs ?? 0, 1000)`)".
+Four literals and a comment is the drift surface; collapsing them onto one named constant per side
+is port work, not cleanup. `cooldown_secs` had **no test at all** before this increment.
+
+**Increment 1 landed.** `core/engine.rs` — the pure core, with no I/O, no async and no store:
+`COOLDOWN_FLOOR_MS`, `ErrorClass`, `BodyHint`, `classify`, `is_retryable_with_next_key`,
+`ErrorClass::is_drift`, `AttemptOutcome`, `min_retry_after_ms`. Nine tests, three ported from
+`retry-after.test.ts` (shortest-wins fold, every-named-wait-counts, the sub-second floor).
+`cargo test` **498 passed / 0 failed** (was 489); clippy `--all-targets -- -D warnings` and
+`cargo fmt --check` clean; the `--no-default-features` service build still succeeds.
+
+Three falsifications prove the tests bite rather than describe: folding `min`→`max` fails the
+shortest-wait test, dropping `ms.max(COOLDOWN_FLOOR_MS)` fails the floor test, and adding
+`Timeout` to the retryable set fails the set test. The file was restored byte-identically after.
+
+**Deliberately not here yet.** `AttemptOutcome` carries no `Candidate` — that type is Phase 3's —
+so a failed chain cannot name what it tried, and `AllAttemptsFailedError` has no Rust home. That is
+a recorded gap, not an oversight. Also unbuilt: the attempt loop itself, which needs
+`route_planner`'s `Candidate`, and the streaming half, which needs a `Stream` adapter for
+`chunks: AsyncIterable<string>`.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
