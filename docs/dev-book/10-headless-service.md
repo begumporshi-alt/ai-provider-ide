@@ -682,6 +682,95 @@ faithful Rust `Stream` has to reproduce, none of them touched by this increment:
   the same class of no-op guard as `recordResult`'s `else if`: harmless in TypeScript, and a hazard to
   port literally, because a reader would infer a state that cannot exist.
 
+#### Increment 5 as built — the per-provider limiter (2026-09-23)
+
+`core/limiter.rs`, a new file, 22 tests. `cargo test` 519 → **541 / 0**.
+
+**The gap it closes was not a porting gap.** Before this increment, `per_provider_concurrency`
+appeared **nowhere** in the Rust tree — a Grep over `apps/desktop/src-tauri` returns nothing. Audit
+finding R3 is implemented in TypeScript only, so the Rust gateway has the one global semaphore and no
+per-provider cap at all. That is precisely the starvation `concurrency.ts`'s own header describes: a
+global bound cannot see providers, so one slow or rate-limited provider can hold every permit. This
+increment is therefore the first one that **adds** a behaviour to the Rust side rather than relocating
+one, and the plan's "no behaviour change" constraint does not apply to it in the usual direction —
+there was nothing here to preserve.
+
+**It is a separate file, not another section of `engine.rs`.** `engine.rs` is the port's *pure* half —
+a taxonomy, two arithmetic folds, and no state. `ProviderLimiter` is the only piece of the six
+dependency modules that is **shared mutable state across threads**, and the hazard that comes with it
+(the check-then-act race below) is a different hazard from the ones in `engine.rs`. Grouping by kind
+rather than by "which TypeScript file it came from" is what makes the race visible to the next reader.
+`engine.rs`'s header now points at it.
+
+**Three places the port deliberately differs.**
+
+- **The release is RAII, and still idempotent.** TypeScript returns `(() => void) | null`; a call site
+  that forgets to call it holds the slot for the lifetime of the process and nothing reports it.
+  `acquire` returns a `Permit` that releases on `Drop`, so the forgettable step is gone.
+  `Permit::release` remains callable and idempotent, so the double-release case is still representable
+  and still tested, and `Drop` calls that same method.
+- **The check and the increment are one critical section.** `concurrency.ts:75-76` is
+  `if (!this.hasCapacity(id)) return null;` then `this.inFlight.set(...)`. That is atomic there
+  because JavaScript runs one thread. Here it is a race, and a literal translation admits more than the
+  cap. `has_capacity` is consequently **advisory only** and must not be used to gate an acquire; its
+  doc-comment says so, because rewriting `acquire` as `if !self.has_capacity(p) { return None }` is
+  exactly how the race would come back.
+- **The cap is `usize`.** In TypeScript `-1` satisfies `maxPerProvider <= 0` and so behaves as
+  *unlimited* while displaying as a bound — the hazard `clampConcurrency` exists to catch. The type
+  removes it. `clamp_concurrency` still rejects a stored negative, because a stored value is untrusted
+  input from the settings blob (`model-router.ts:85` hydrates it with no validation), not a number this
+  program produced.
+
+**The finiteness check is load-bearing, not defensive.** `"Infinity"` parses to `f64::INFINITY` and
+`"NaN"` to `f64::NAN`, and `f64::min` **ignores a `NaN` operand** — so without the check both would
+clamp to `MAX_PER_PROVIDER`, turning a corrupted string into the largest cap the program allows. The
+test `a_string_that_parses_to_a_non_finite_number_falls_back_rather_than_to_the_maximum` pins it, and
+deleting the check fires it.
+
+**One documented divergence.** JavaScript's `Number("0x10")` is `16` and `Number("0o7")` is `7`;
+`str::parse::<f64>()` rejects both, so they fall back to the default here. Neither is a concurrency cap
+a person types, and matching `Number()`'s coercion table would mean accepting spellings nobody
+intended — but a port that differs silently is worse than one that differs loudly, so it is tested
+(`a_hex_string_is_rejected_where_javascript_would_coerce_it`).
+
+**Six falsifications, all fired, restores byte-identical.** Splitting the check from the increment into
+two locks fails `the_cap_holds_under_concurrent_acquires` in **5 of 5 runs** — the test is exact rather
+than statistical, because no permit is released until all 64 threads have finished deciding, so the
+number of simultaneous holders is precisely the cap for a correct implementation and can only exceed it
+for a racy one. Removing the `released` guard fails `an_explicit_release_followed_by_drop_counts_once`.
+Clamping a negative to zero instead of falling back fails `rejects_a_negative_rather_than_letting_it_mean_unlimited`.
+Flooring zero to one fails `keeps_zero_because_it_means_unlimited`. Removing `impl Drop` fails
+`dropping_a_permit_returns_the_slot`. Removing the finiteness check fails the non-finite test.
+
+**The four tests that failed on the first run were the port announcing itself.** They were written as
+`assert!(lim.acquire("p1").is_some())`, which binds the `Option` and drops the `Permit` at the end of
+the statement — so the slot came back immediately and the cap was never under pressure. That is the
+RAII difference made concrete: in TypeScript an ignored `acquire` return value holds the slot forever,
+and here it releases at once. The worst case for a careless caller is therefore that the cap is not
+enforced for one attempt — **fail-open, not fail-closed** — and `Option` being `#[must_use]` makes the
+careless call site a compiler warning too. `a_permit_that_is_never_bound_cannot_leak_capacity` pins it.
+
+**A finding about the TypeScript suite: its idempotence test does not test idempotence.** Recorded as
+[D18](07-drift-register.md). Deleting the `released` flag from `concurrency.ts:77-80` leaves
+`release is idempotent — a double release cannot leak capacity` **passing** — measured 2026-09-23, 1
+passed and 272 skipped. With a cap of 1 the count is already 0 and the entry already deleted after the
+first release, so the second and third calls take the "delete at zero" branch again and change nothing.
+The property only bites with **two** permits held, where a double release drops the count from 2 to 0
+while the other permit is still in flight and the limiter then admits two more. The Rust port keeps the
+weak test for fidelity, marks it as weak in place, and carries the property in
+`an_explicit_release_followed_by_drop_counts_once` — which is the one the falsification fires.
+
+**Preserved, for the loop port.** A skipped candidate is reported with class `RATE_LIMITED` and status
+`429` (`execution-engine.ts:85`, `:169`) even though the provider was never contacted and may be
+perfectly healthy — it is saturated by our own in-flight count. The port keeps that, because the class
+drives the client-facing `Retry-After` and a saturated provider genuinely does want a wait. It does
+mean the reported chain cannot distinguish "we never tried" from "the provider said 429", which is a
+fidelity gap rather than a bug, and Phase 3 inherits it.
+
+**Still not ported, and still blocked on Phase 3.** The attempt loop and the streaming half. The
+limiter's *consumer* is the loop (`:83-87`, `:167-171`), so this increment ports the decision and not
+its use; nothing in the shipping gateway consults the limiter yet.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.

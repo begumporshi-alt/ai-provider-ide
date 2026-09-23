@@ -22,6 +22,11 @@
 //! it cannot yet say *which* provider failed. A recorded gap, narrowed in increment 4 and not
 //! closed.
 //!
+//! **The per-provider limiter is not here.** `concurrency.ts` is the fifth of the six dependency
+//! modules, and it is the one piece of the port that is *shared mutable state* rather than a pure
+//! function, so it lives in `core::limiter` instead of in this file. See `limiter.rs` for the
+//! three places that port deliberately differs from the original.
+//!
 //! **Increment 2 adds the enforcement half.** `HealthTracker` is the module that *cools* a key,
 //! and `min_retry_after_ms` is the one that *reports* the wait. The TypeScript exports
 //! `COOLDOWN_FLOOR_MS` from the tracker specifically so the two cannot drift apart

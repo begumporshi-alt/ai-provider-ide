@@ -33,6 +33,7 @@ pub mod engine;
 pub mod error;
 pub mod gateway;
 pub mod injection_log;
+pub mod limiter;
 pub mod memory;
 pub mod orchestrator;
 pub mod persist;
