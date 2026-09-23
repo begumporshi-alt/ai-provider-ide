@@ -16,6 +16,7 @@ import { ExecutionEngine, type TextExecution } from "./execution-engine.js";
 import { ProviderLimiter, PER_PROVIDER_DEFAULT, clampConcurrency } from "./concurrency.js";
 import { estimateCostMicros } from "./pricing.js";
 import { UsageLedger, type LedgerSource } from "./usage-ledger.js";
+import { compressMessages, promptBudget, DEFAULT_CONTEXT_WINDOW } from "./context-compress.js";
 
 export interface RouterSettings {
   failoverEnabled: boolean;
@@ -91,9 +92,24 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       await this.recordNoRoute(req.model, "text", opts?.source ?? "ui", t0, opts?.appKeyId);
       throw new Error(`no route for model "${req.model}" (no enabled provider carries it)`);
     }
+    // Auto context compression. Both callers converge here — the gateway (external clients,
+    // arbitrary message arrays) and the assistant (history replayed from the transcript) — so
+    // this is the one place a long conversation is trimmed, and the two cannot drift apart.
+    //
+    // The budget is the narrowest *known* window across the plan rather than the first
+    // candidate's: failover may serve the request from any of them, and sizing for the smallest
+    // is what stops a failover from overflowing. A plan where no model published a window falls
+    // back to the conservative default, which under-sends rather than overflows.
+    const knownWindows = plan
+      .map((c) => c.model?.contextWindow)
+      .filter((w): w is number => typeof w === "number" && w > 0);
+    const contextWindow =
+      knownWindows.length > 0 ? Math.min(...knownWindows) : DEFAULT_CONTEXT_WINDOW;
+    const compressed = compressMessages(req.messages, promptBudget(contextWindow, req.maxTokens));
+
     const exec = await this.engine.executeText({
       plan,
-      messages: req.messages,
+      messages: compressed.messages,
       model: req.model,
       stream: true,
       maxTokens: req.maxTokens,

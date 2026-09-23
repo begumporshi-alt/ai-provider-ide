@@ -16,6 +16,16 @@ export { ExecutionEngine, AllAttemptsFailedError, MAX_ATTEMPTS_DEFAULT, type Att
 export { ProviderLimiter, PER_PROVIDER_DEFAULT, MAX_PER_PROVIDER, clampConcurrency } from "./concurrency.js";
 export { parsePricing, estimateCostMicros, priceRank, type PricingMicros } from "./pricing.js";
 export { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
+export {
+  compressMessages,
+  promptBudget,
+  estimateTokens,
+  estimateMessageTokens,
+  DEFAULT_CONTEXT_WINDOW,
+  CHARS_PER_TOKEN,
+  RESERVE_FRACTION,
+  type CompressResult,
+} from "./context-compress.js";
 export { UsageLedger, type LedgerEntry, type LedgerSource } from "./usage-ledger.js";
 export { AdapterRuntime } from "./adapter-runtime.js";
 export { ModelCatalog } from "./model-catalog.js";
