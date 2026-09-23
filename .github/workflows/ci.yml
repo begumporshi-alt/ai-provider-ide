@@ -101,3 +101,46 @@ jobs:
         run: pnpm --filter ai-provider-router-desktop exec playwright install chromium
       - name: Live-UI tests (Playwright harness — wizard, Tier-2 review, egress image)
         run: pnpm --filter ai-provider-router-desktop web-test
+
+  # Headless service binary (`aiproviderd`) — dev-book §10, Phase 1.
+  #
+  # This is a NEW job rather than an entry in an existing matrix: `checks` is a single macOS job
+  # with no strategy block at all, so there is nothing to extend. The point of building on all
+  # three is that the service has never been compiled anywhere but this Mac; a module split that
+  # accidentally reached back into Tauri glue would surface here, not in `checks`.
+  headless-service:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: apps/desktop/src-tauri
+      # `tauri` is still an unconditional dependency of this package and `build.rs` still runs
+      # `tauri_build::build()` for every target, so building the service still compiles Tauri --
+      # and on Linux that means WebKitGTK. These packages are the cost of that coupling, not of
+      # the service; a separate `core` crate or a `tauri` feature would remove this step.
+      - name: Linux system deps (WebKitGTK, via the tauri dependency)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential curl wget file libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev patchelf
+      - name: Build headless service binary
+        run: cargo build --bin aiproviderd --release
+        working-directory: apps/desktop/src-tauri
+      # `--version` is the whole of the runtime assertion here, deliberately. It needs no port,
+      # no keychain approval and no store, so it cannot flake -- and it still proves the binary
+      # links and starts. The `/health` proof is a manual step (dev-book §10 records it): binding
+      # a port and reading the OS keychain on a shared runner is exactly the kind of step that
+      # fails for reasons unrelated to the change under test.
+      - name: Service binary runs
+        shell: bash
+        run: |
+          bin=target/release/aiproviderd
+          [ -f "$bin.exe" ] && bin="$bin.exe"
+          "$bin" --version
