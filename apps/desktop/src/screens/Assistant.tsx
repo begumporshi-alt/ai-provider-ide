@@ -57,6 +57,55 @@ function replayHistory(msgs: Msg[]): ChatMessage[] {
 }
 
 /**
+ * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
+ * summary rather than vanishing.
+ *
+ * Three decisions worth stating, because each is a way this could go wrong:
+ *
+ *  - **`skipCompression` on the inner call.** Without it, producing a summary would compress,
+ *    which would summarize, which would compress. That flag is the only thing breaking the
+ *    chain.
+ *  - **The input is capped.** The dropped turns are precisely the ones that did not fit, so
+ *    feeding them back verbatim can overflow the summarizer's own request. Clipping is not a
+ *    correctness measure — a summary is lossy either way — it is what stops the fix from
+ *    becoming the next overflow.
+ *  - **Failure is already handled, here by doing nothing.** A throw is caught inside
+ *    `compressWithSummary`, which falls back to Tier 1 truncation, so this function may fail
+ *    freely and the request still goes out.
+ *
+ * The call is ledgered like any other: it spends real tokens, and a summarizer that concealed
+ * its own cost would make the spend numbers lie.
+ */
+const SUMMARIZER_INPUT_CHARS = 12_000;
+const SUMMARIZER_MAX_TOKENS = 300;
+const SUMMARY_PROMPT =
+  "Summarise the conversation above for an assistant that must continue it. Keep decisions, " +
+  "names, numbers, file paths and anything still pending. Plain prose, no preamble, no headings.";
+
+function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<string> {
+  return async (dropped) => {
+    const transcript = dropped
+      .map((m) => `${m.role}: ${m.content}`)
+      .join("\n")
+      .slice(0, SUMMARIZER_INPUT_CHARS);
+    const exec = await router.generateText(
+      {
+        model,
+        messages: [
+          { role: "system", content: SUMMARY_PROMPT },
+          { role: "user", content: transcript },
+        ],
+        maxTokens: SUMMARIZER_MAX_TOKENS,
+      },
+      { skipCompression: true, source: "ui" },
+    );
+    let out = "";
+    for await (const chunk of exec.chunks) out += chunk;
+    return out.trim();
+  };
+}
+
+/**
  * Agent-mode system prompt. Unlike the no-tools guard (which suppresses tool-call markup),
  * this one tells the model it DOES have tools and how to use them — confined to the workspace
  * root the user sets. It is deliberately terse; the sandbox, not the prompt, is the enforcement.
@@ -701,7 +750,10 @@ function Chat({
           messages: history,
           system: agentSystem(root) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
           registry: AGENT_TOOLS,
-          generate: (req, opts) => router.generateText(req, opts),
+          // Tier 2: when this request has to drop context, the dropped turns are summarized
+          // rather than discarded. One summarizer per run, built against the chosen model.
+          generate: (req, opts) =>
+            router.generateText(req, { ...opts, summarize: createSummarizer(chosen) }),
           host,
           // Clamped again at the call site: this is the number that actually bounds the spend,
           // and it is reached from a setting that a future build may have written differently.
