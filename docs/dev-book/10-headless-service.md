@@ -562,6 +562,79 @@ a recorded gap, not an oversight. Also unbuilt: the attempt loop itself, which n
 `route_planner`'s `Candidate`, and the streaming half, which needs a `Stream` adapter for
 `chunks: AsyncIterable<string>`.
 
+#### Increment 3 as built — the reply seam (2026-09-23)
+
+The engine is pure; a bridge is not. Before a Rust router can answer a single request it needs a way
+*back* to the request that is waiting, and outside the Tauri event system that way back did not
+exist. So this is a prerequisite for both remaining halves rather than a detour from them.
+
+**The cycle, stated exactly.** `GatewayCore` owns `Arc<dyn Bridge>` (`gateway.rs:584`) and the reply
+path is `GatewayCore::reply(id, msg)`, so a bridge that wants to answer must reach the core that
+owns it. `SynthBridge` — the test bridge, and the only working example of a replying bridge in the
+tree — did precisely that, with `core: Mutex<Option<Arc<GatewayCore>>>` filled in by a hand-written
+`attach()` after construction. Two defects, and only the first is obvious:
+
+1. **A strong cycle.** core → bridge → core. Neither ever drops. Invisible in a test process; in a
+   service it is the entire core — store, semaphores, injection log — held alive forever by a bridge
+   nothing can reach.
+2. **The wiring was a step nothing required.** `Bridge` documented a hand-off surface and never
+   mentioned `attach`. A bridge that forgot it compiled, passed every test that did not dispatch, and
+   then failed *silently*: `dispatch` panicked inside a detached `std::thread` (`.unwrap()` on
+   `None`), which nothing joins, so the request waited out `FIRST_MSG_TIMEOUT` and answered a
+   generic 503.
+
+**The seam.** `ReplyHandle` — `Clone`, holding `Arc<Mutex<HashMap<u64, UnboundedSender<BridgeMsg>>>>`
+and nothing else. `Bridge::dispatch` takes one: `fn dispatch(&self, req: BridgeRequest, replies:
+ReplyHandle)`. `GatewayCore::dispatch(req)` is the single entry point that supplies it, and
+`GatewayCore::reply` delegates to the same handle — so the map has one owner, and the two doors onto
+it cannot drift apart.
+
+**A parameter, not a stored handle — and that is the whole design.** A handle installed on the bridge
+at construction is the same defect in a different shape: still a step, still forgettable. A parameter
+cannot be forgotten, because the call does not compile without it. The consequence is stronger than
+"the cycle is absent" — **it is unrepresentable.** `GatewayCore::dispatch(&self)` has no `Arc<Self>`
+to put into the handle, and `new_with_key_wait` builds the handle *before* the `Arc` exists. The
+construction order forbids the back-reference, so no later edit can reintroduce it by accident.
+
+**Blast radius, measured.** Six dispatch sites across four files (`gateway_handlers.rs` ×3,
+`gateway_responses.rs`, `gateway_anthropic.rs`, `gateway_gemini.rs`), four `Bridge` impls, one field.
+`SynthBridge` lost its back-pointer and its `attach()`, and seven call sites went with them.
+
+**Three new tests, each pinning a different half of the claim.**
+
+- `a_bridge_answers_through_the_handle_it_was_handed_and_nothing_else` — a bridge with no core field
+  answers a real HTTP request end to end. This is deliberately the shape the headless bridge will
+  take, so the test states the contract as much as it checks the wiring.
+- `the_bridge_holds_no_reference_that_keeps_the_core_alive` — asserted with a `Weak`, because that is
+  the only way to state "it really was dropped" rather than "we believe nothing holds it". No server
+  is started, deliberately: a spawned listener holds the core too, and the assertion would then be
+  measuring task teardown timing instead of the reference graph. It also pins that a reply after the
+  core is gone is a plain `false`, not a panic.
+- `the_bridge_and_the_core_answer_into_the_same_place` — a terminal reply through the bridge's handle
+  retires the registration `try_slot` made, asserted through the *other* door
+  (`GatewayCore::reply`). Were they two maps, the core would go on offering to serve a finished
+  request and the entry would never be freed.
+
+`cargo test` **514 passed / 0 failed** (511 before); clippy `--all-targets -- -D warnings` and
+`cargo fmt --check` clean; the headless build and the Tauri build both unaffected.
+
+**Four falsifications, one of which is the measurement that gives this increment its point.** Handing
+the bridge a *fresh* handle instead of the core's — the two-maps defect — fails the same-place test
+immediately, and fails the end-to-end test after exactly **30.01 s**: `FIRST_MSG_TIMEOUT` observed
+rather than quoted. That 30 seconds of a client waiting for a generic 503 is what a forgotten
+`attach()` produced. Also falsified: making `reply` report success for an unregistered id (fails the
+after-drop assertion), and giving the core a second owner (fails the `Weak` assertion, which proves
+that check is not vacuous). Restored byte-identically after each run (`cmp -s`).
+
+**One thing this increment found and did not fix.** `cargo check --no-default-features --all-targets`
+fails with **33 errors**: `persist.rs:2349` calls `list_drift_events`, which is defined behind
+`#[cfg(feature = "app")]` at `persist.rs:825`. Both mirrors build `--no-default-features` *without*
+`--all-targets`, so the lib's test code is never compiled in that configuration and the failure stays
+invisible. `core/`'s shipping code is Tauri-free — which is what the Phase 1 claim was about, and it
+holds — but `core/`'s tests are not. Pre-existing rather than introduced here: `persist.rs` is
+untouched by this increment (`git diff --name-only`), and `cargo check --no-default-features` without
+`--all-targets` still passes. Recorded as **D17**, Open.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.

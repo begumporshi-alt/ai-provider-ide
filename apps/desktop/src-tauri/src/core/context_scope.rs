@@ -1309,7 +1309,12 @@ mod context_scope_tests {
 
     struct NoopBridge;
     impl crate::core::gateway::Bridge for NoopBridge {
-        fn dispatch(&self, _req: crate::core::gateway::BridgeRequest) {}
+        fn dispatch(
+            &self,
+            _req: crate::core::gateway::BridgeRequest,
+            _replies: crate::core::gateway::ReplyHandle,
+        ) {
+        }
         fn cancel(&self, _request_id: u64) {}
     }
 

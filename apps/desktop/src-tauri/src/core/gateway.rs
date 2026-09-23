@@ -463,7 +463,7 @@ mod core_recovery_tests {
 
     struct NoopBridge;
     impl Bridge for NoopBridge {
-        fn dispatch(&self, _req: BridgeRequest) {}
+        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
         fn cancel(&self, _id: u64) {}
     }
 
@@ -564,15 +564,76 @@ mod tool_call_shape_tests {
 }
 
 /// Hand-off surface to the router core. Production emits Tauri events; the Phase-2b
-/// integration test injects a synthetic bridge (the §3.5 entry-gate spike).
+/// integration test injects a synthetic bridge (the §3.5 entry-gate spike); Phase 2 of the
+/// headless plan will put a Rust router core here.
 pub trait Bridge: Send + Sync + 'static {
-    fn dispatch(&self, req: BridgeRequest);
+    /// Route one request, answering it through `replies`.
+    ///
+    /// The handle arrives *with the dispatch* rather than being installed on the bridge at
+    /// construction. That is deliberate. A stored handle is a wiring step somebody can forget,
+    /// and the failure it produces is silent: the request waits out `FIRST_MSG_TIMEOUT` and
+    /// answers a generic 503, which reads as "the core is down" rather than "nobody gave the
+    /// bridge a way to answer". A parameter cannot be forgotten — the call does not compile.
+    fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle);
     fn cancel(&self, request_id: u64);
+}
+
+/// The bridge's way back to the request that is waiting for it.
+///
+/// Holds the pending map and nothing else — deliberately **not** an `Arc<GatewayCore>`. The
+/// core owns the bridge (`Arc<dyn Bridge>`) and the bridge owns this, so a handle that held
+/// the core would close a reference cycle and neither would ever drop: the core, its store,
+/// its semaphores and its injection log would all outlive every reference to them. The bridge
+/// does not need the core; it needs somewhere to put messages, and that is exactly this.
+///
+/// A consequence worth stating: `reply` after the core is gone is an ordinary `false` —
+/// "nobody is listening", the same answer it already gives for a stale id — not a panic, and
+/// not a reason to keep anything alive.
+#[derive(Clone, Default)]
+pub struct ReplyHandle {
+    pending: Arc<Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>>,
+}
+
+impl ReplyHandle {
+    /// Register a waiting request. Called by the core when a request takes a slot; not part of
+    /// the bridge's surface.
+    fn register(&self, id: u64, tx: mpsc::UnboundedSender<BridgeMsg>) {
+        self.pending.lock().unwrap().insert(id, tx);
+    }
+
+    /// Hand a bridge message to the HTTP handler waiting on this request.
+    ///
+    /// Returns whether anyone was still listening. That is load-bearing, not incidental: the
+    /// bridge streams into this channel, and if the client has already gone (disconnect, or a
+    /// completed pass-through response) there is no point paying for more upstream tokens.
+    /// `false` lets the caller tear the loop down instead of streaming into a void.
+    pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
+        let tx = self.pending.lock().unwrap().get(&id).cloned();
+        match tx {
+            Some(tx) => {
+                let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
+                let sent = tx.send(msg).is_ok();
+                if terminal {
+                    self.pending.lock().unwrap().remove(&id);
+                }
+                sent
+            }
+            None => false,
+        }
+    }
+
+    /// Drop a request's registration without answering it — the client is gone.
+    fn close(&self, id: u64) {
+        self.pending.lock().unwrap().remove(&id);
+    }
 }
 
 pub struct GatewayCore {
     next_id: AtomicU64,
-    pending: Mutex<HashMap<u64, mpsc::UnboundedSender<BridgeMsg>>>,
+    /// Where bridge replies land. A separate value rather than an inline map so the bridge can
+    /// be handed it directly — see `ReplyHandle` for why it must be handed *that* and not the
+    /// core it belongs to.
+    replies: ReplyHandle,
     /// Admission: how many requests may be in the building at all, dispatched + waiting.
     permits: Arc<Semaphore>,
     /// Routing: how many may be dispatched to the core at once (§3.5). This is the half the
@@ -725,7 +786,7 @@ impl GatewayCore {
     ) -> Self {
         Self {
             next_id: AtomicU64::new(1),
-            pending: Mutex::new(HashMap::new()),
+            replies: ReplyHandle::default(),
             permits: Arc::new(Semaphore::new(MAX_TOTAL)),
             dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT)),
             last_heartbeat: Mutex::new(Instant::now()),
@@ -1157,29 +1218,26 @@ impl GatewayCore {
 
     /// Webview bridge replies land here (gateway_chunk / gateway_result / gateway_done /
     /// gateway_error commands). Unknown/stale id = client already gone -> idempotent no-op.
-    /// Hand a bridge message to the HTTP handler waiting on this request.
     ///
-    /// Returns whether anyone was still listening. That is load-bearing, not incidental: the
-    /// bridge streams into this channel, and if the client has already gone (disconnect, or a
-    /// completed pass-through response) there is no point paying for more upstream tokens.
-    /// `false` lets the caller tear the loop down instead of streaming into a void.
+    /// Delegates to the core's own `ReplyHandle` rather than keeping a second copy of the map,
+    /// so the map has one owner and one authority: a bridge holding a handle and the core
+    /// receiving a Tauri command are two doors onto the same room, not two rooms that must be
+    /// kept in step. `ReplyHandle::reply` documents what the return value means.
     pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
-        let tx = self.pending.lock().unwrap().get(&id).cloned();
-        match tx {
-            Some(tx) => {
-                let terminal = matches!(msg, BridgeMsg::Done | BridgeMsg::Error { .. });
-                let sent = tx.send(msg).is_ok();
-                if terminal {
-                    self.pending.lock().unwrap().remove(&id);
-                }
-                sent
-            }
-            None => false,
-        }
+        self.replies.reply(id, msg)
+    }
+
+    /// Hand one request to the bridge, attaching the way back.
+    ///
+    /// The single dispatch entry point. Six handlers route requests and four of them live
+    /// outside this module; giving each one `bridge.dispatch(req, replies)` by hand would be
+    /// four chances to pass the wrong thing. Here they cannot.
+    pub fn dispatch(&self, req: BridgeRequest) {
+        self.bridge.dispatch(req, self.replies.clone());
     }
 
     fn close(&self, id: u64) {
-        self.pending.lock().unwrap().remove(&id);
+        self.replies.close(id);
     }
 
     pub fn is_tools_enabled(&self) -> bool {
@@ -1393,7 +1451,7 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
     };
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
-    core.pending.lock().unwrap().insert(id, tx);
+    core.replies.register(id, tx);
     Ok(Slot { core: core.clone(), _permit: permit, _dispatch: dispatch, id, rx, started: false })
 }
 

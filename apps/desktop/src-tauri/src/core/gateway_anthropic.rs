@@ -375,7 +375,7 @@ pub(crate) async fn messages_h(
     core.record_injection(id, &model, &outcome);
     // `chat`, not `req`: the canonical body is the one with normalized messages and a model.
     let prep = prepare_capture(&core, &headers, &chat, id);
-    core.bridge.dispatch(BridgeRequest {
+    core.dispatch(BridgeRequest {
         request_id: id,
         kind: "chat",
         body: chat,

@@ -11,10 +11,13 @@ use futures_util::StreamExt as _;
 type SentRequest = (String, Value, HashMap<String, String>);
 
 /// Synthetic bridge = the §3.5 entry-gate spike: answers chat with deltas + Done,
-/// models/image with JSON, records cancels. Holds a back-pointer to the core so it can
-/// reply.
+/// models/image with JSON, records cancels.
+///
+/// It used to hold a back-pointer to the core, installed by a manual `attach()` after
+/// construction. Both are gone: the way back now arrives with every dispatch, so this bridge
+/// holds no reference to the core at all. That is what breaks the core↔bridge cycle — see
+/// `ReplyHandle`.
 struct SynthBridge {
-    core: Mutex<Option<Arc<GatewayCore>>>,
     cancels: AtomicUsize,
     slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
     /// Make the synthetic model answer with tool calls instead of a plain finish.
@@ -43,7 +46,6 @@ struct SynthBridge {
 impl SynthBridge {
     fn new() -> Self {
         Self {
-            core: Mutex::new(None),
             cancels: AtomicUsize::new(0),
             slow: AtomicUsize::new(0),
             tool_calls: AtomicBool::new(false),
@@ -71,9 +73,6 @@ impl SynthBridge {
     fn dispatched(&self) -> usize {
         self.sent.lock().unwrap().len()
     }
-    fn attach(&self, core: &Arc<GatewayCore>) {
-        *self.core.lock().unwrap() = Some(core.clone());
-    }
     fn go_silent(&self, on: bool) {
         self.silent.store(on, Ordering::Relaxed);
     }
@@ -96,7 +95,7 @@ impl SynthBridge {
 }
 
 impl Bridge for SynthBridge {
-    fn dispatch(&self, req: BridgeRequest) {
+    fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle) {
         if self.silent.load(Ordering::Relaxed) {
             return; // never replies — the request must fail, not hang
         }
@@ -108,7 +107,10 @@ impl Bridge for SynthBridge {
         // Recorded before the reply thread is spawned: that closure moves `req.request_id`, so
         // reading the field after it would not compile.
         self.app_keys.lock().unwrap().push(req.app_key_id.clone());
-        let core = self.core.lock().unwrap().clone().unwrap();
+        // `replies` is moved into the thread. This used to be a `Mutex<Option<Arc<GatewayCore>>>`
+        // field filled in by an `attach()` call after construction — a strong reference back to
+        // the core that owned this bridge. The handle arriving as a parameter is both less state
+        // and one fewer step to forget.
         let slow = self.slow.load(Ordering::Relaxed);
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
@@ -120,7 +122,7 @@ impl Bridge for SynthBridge {
             }
             if fail > 0 {
                 // The worker decided this status. Everything downstream must respect it.
-                core.reply(
+                replies.reply(
                     req.request_id,
                     BridgeMsg::Error {
                         status: fail as u16,
@@ -133,14 +135,14 @@ impl Bridge for SynthBridge {
             match req.kind {
                 "chat" => {
                     if with_empty {
-                        core.reply(req.request_id, BridgeMsg::Delta(String::new()));
+                        replies.reply(req.request_id, BridgeMsg::Delta(String::new()));
                     }
-                    core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
-                    core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                    replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
+                    replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
                     if with_tools {
                         // Pass-through: the client declared these, so the gateway hands
                         // them straight back and never executes them itself.
-                        core.reply(
+                        replies.reply(
                                 req.request_id,
                                 BridgeMsg::ToolCalls(json!([{
                                     "id": "call_1",
@@ -149,29 +151,29 @@ impl Bridge for SynthBridge {
                                 }])),
                             );
                     }
-                    core.reply(req.request_id, BridgeMsg::Done);
+                    replies.reply(req.request_id, BridgeMsg::Done);
                 }
                 "responses" => {
                     // Same synthetic text output as chat; responses_h wraps it into Responses API frames.
-                    core.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
-                    core.reply(req.request_id, BridgeMsg::Delta("lo".into()));
-                    core.reply(req.request_id, BridgeMsg::Done);
+                    replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
+                    replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                    replies.reply(req.request_id, BridgeMsg::Done);
                 }
                 "models" => {
-                    core.reply(req.request_id, BridgeMsg::Result(json!({
+                    replies.reply(req.request_id, BridgeMsg::Result(json!({
                             "object": "list",
                             "data": [{ "id": "openrouter/gpt-4o", "object": "model" }, { "id": "opencode/gpt-4o", "object": "model" }]
                         })));
-                    core.reply(req.request_id, BridgeMsg::Done);
+                    replies.reply(req.request_id, BridgeMsg::Done);
                 }
                 "image" => {
-                    core.reply(
+                    replies.reply(
                         req.request_id,
                         BridgeMsg::Result(
                             json!({ "data": [{ "url": "https://img.example/x.png" }] }),
                         ),
                     );
-                    core.reply(req.request_id, BridgeMsg::Done);
+                    replies.reply(req.request_id, BridgeMsg::Done);
                 }
                 _ => {}
             }
@@ -203,7 +205,6 @@ fn test_core(key: Arc<Mutex<Option<String>>>) -> (Arc<GatewayCore>, Arc<SynthBri
     let bridge = Arc::new(SynthBridge::new());
     let core =
         Arc::new(GatewayCore::new(bridge.clone(), Arc::new(move || key.lock().unwrap().clone())));
-    bridge.attach(&core);
     (core, bridge)
 }
 
@@ -1010,7 +1011,6 @@ fn core_with(
         }));
     }
     let core = Arc::new(core);
-    bridge.attach(&core);
     (core, bridge)
 }
 
@@ -1050,7 +1050,6 @@ async fn start_with_spend(
     }
     core = core.with_spend(spend);
     let core = Arc::new(core);
-    bridge.attach(&core);
     core.set_running(true);
     let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
     TestServer {
@@ -1201,7 +1200,6 @@ fn key_core(
         }))
         .with_store(store);
     let core = Arc::new(core);
-    bridge.attach(&core);
     (core, reads, dir)
 }
 
@@ -1275,7 +1273,6 @@ fn without_a_store_nothing_is_cached() {
             keys.lock().unwrap().clone()
         }));
     let core = Arc::new(core);
-    bridge.attach(&core);
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(reads.load(Ordering::SeqCst), 2, "never cache what cannot be validated");
@@ -2033,7 +2030,6 @@ async fn a_silent_worker_fails_the_request_instead_of_hanging() {
 async fn start_with_key_lookup(lookup: KeyProvider, wait: Duration) -> TestServer {
     let bridge = Arc::new(SynthBridge::new());
     let core = Arc::new(GatewayCore::new_with_key_wait(bridge.clone(), lookup, wait));
-    bridge.attach(&core);
     core.set_running(true);
     let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
     TestServer {
@@ -2998,7 +2994,6 @@ async fn start_with_memory() -> (TestServer, std::path::PathBuf) {
     let core = GatewayCore::new(bridge.clone(), Arc::new(move || master.lock().unwrap().clone()))
         .with_store(store.clone());
     let core = Arc::new(core);
-    bridge.attach(&core);
     core.set_memory_enabled(true);
     core.set_running(true);
     let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
@@ -3153,4 +3148,139 @@ async fn phase6_no_aip_header_of_any_kind_reaches_the_provider() {
     // otherwise this test would pass against a bridge that forwards nothing at all.
     assert!(!sent.2.is_empty(), "the forwarding allowlist must not be empty");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------- the bridge's way back (Phase 2: the headless service needs one) ----------
+
+/// The smallest bridge that can answer.
+///
+/// It holds no reference to the core — it has no field for one — and the only thing it knows
+/// how to do is reply through the handle it was handed. That is deliberately the shape the
+/// headless Rust router core will take, so this is as much a statement of the contract `Bridge`
+/// offers as it is a test fixture.
+#[derive(Default)]
+struct MinimalBridge {
+    /// Request ids, in dispatch order, so a test can talk about the request the bridge saw
+    /// rather than about an id it guessed.
+    ids: Mutex<Vec<u64>>,
+    /// The handle from the most recent dispatch. Kept because a real bridge moves it into the
+    /// task that makes the upstream call, and so still holds it after the request is answered.
+    last: Mutex<Option<ReplyHandle>>,
+}
+
+impl MinimalBridge {
+    fn new() -> Self {
+        Self::default()
+    }
+    fn only_id(&self) -> u64 {
+        let ids = self.ids.lock().unwrap();
+        assert_eq!(ids.len(), 1, "expected exactly one dispatch, saw {}", ids.len());
+        ids[0]
+    }
+}
+
+impl Bridge for MinimalBridge {
+    fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle) {
+        self.ids.lock().unwrap().push(req.request_id);
+        *self.last.lock().unwrap() = Some(replies.clone());
+        replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
+        replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+        replies.reply(req.request_id, BridgeMsg::Done);
+    }
+    fn cancel(&self, _id: u64) {}
+}
+
+fn bare_request(id: u64) -> BridgeRequest {
+    BridgeRequest {
+        request_id: id,
+        kind: "chat",
+        body: json!({}),
+        headers: HashMap::new(),
+        app_key_id: None,
+    }
+}
+
+/// The seam, stated as a test rather than as a comment: a bridge that was never handed the core
+/// can still answer a request.
+///
+/// This used to be impossible. `SynthBridge` reached the reply path through a
+/// `Mutex<Option<Arc<GatewayCore>>>` filled in by a hand-written `attach()` after construction,
+/// so "can a bridge answer?" and "did somebody remember to attach it?" were the same question —
+/// and answering it wrong failed silently, as a generic 503 after `FIRST_MSG_TIMEOUT` rather
+/// than as a complaint about the wiring.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bridge_answers_through_the_handle_it_was_handed_and_nothing_else() {
+    let bridge = Arc::new(MinimalBridge::new());
+    let core = Arc::new(GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".into()))));
+    core.set_running(true);
+    let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+    let res = reqwest::Client::new()
+        .post(format!("http://{}/v1/chat/completions", handle.addr))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "a bridge with no core reference must still be answerable");
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+}
+
+/// The reason the handle has the shape it does.
+///
+/// The core owns the bridge (`Arc<dyn Bridge>`) and the bridge owns the handle, so a handle
+/// that held the core would close a cycle: neither would ever drop. In a long-lived service
+/// that is not a small leak — it is the entire core, store and semaphores and injection log
+/// included, kept alive forever by a bridge nothing can reach.
+///
+/// Asserted with a `Weak`, because that is the only way to state "it really was dropped" rather
+/// than "we believe nothing holds it". No server is started: a spawned listener holds the core
+/// too, and the assertion would then be measuring task teardown timing instead of the reference
+/// graph.
+#[test]
+fn the_bridge_holds_no_reference_that_keeps_the_core_alive() {
+    let bridge = Arc::new(MinimalBridge::new());
+    let core = Arc::new(GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".into()))));
+    core.dispatch(bare_request(7));
+    let held = bridge.last.lock().unwrap().clone().expect("the bridge was handed a handle");
+    let id = bridge.only_id();
+    assert_eq!(id, 7);
+
+    let weak = Arc::downgrade(&core);
+    drop(core);
+    assert!(weak.upgrade().is_none(), "the bridge's reply handle must not keep the core alive");
+    assert!(
+        !held.reply(id, BridgeMsg::Done),
+        "and a reply after the core is gone is a plain false, not a panic"
+    );
+}
+
+/// One authority, one map.
+///
+/// The bridge replies through the handle it was handed; the core answers through
+/// `GatewayCore::reply`. Those are two doors, and if they opened onto two maps then a terminal
+/// reply from the bridge would leave the core's registration behind — the core would go on
+/// offering to serve a request that is already finished, and the entry would never be freed.
+///
+/// Asserted through the *other* door: once the bridge has finished with the id, the core is
+/// asked for it and must find nothing.
+#[test]
+fn the_bridge_and_the_core_answer_into_the_same_place() {
+    let bridge = Arc::new(MinimalBridge::new());
+    let core = Arc::new(GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".into()))));
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    core.replies.register(7, tx);
+    core.dispatch(bare_request(7));
+
+    let mut seen = Vec::new();
+    while let Ok(msg) = rx.try_recv() {
+        seen.push(format!("{msg:?}"));
+    }
+    assert_eq!(seen.len(), 3, "both deltas and the terminator must arrive: {seen:?}");
+    assert!(seen[2].contains("Done"), "and the terminator must be last: {seen:?}");
+
+    assert!(
+        !core.reply(7, BridgeMsg::Done),
+        "a terminal reply through the bridge's handle must retire the registration the core made"
+    );
 }

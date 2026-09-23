@@ -57,7 +57,10 @@ fn data_dir() -> Result<PathBuf, String> {
 struct HeadlessBridge;
 
 impl gateway::Bridge for HeadlessBridge {
-    fn dispatch(&self, _req: gateway::BridgeRequest) {}
+    /// Discards the request *and* the reply handle. Every completion route therefore answers
+    /// 503 by design — see the module note — and the handle being dropped rather than stored is
+    /// the seam working, not a gap in it.
+    fn dispatch(&self, _req: gateway::BridgeRequest, _replies: gateway::ReplyHandle) {}
     fn cancel(&self, _id: u64) {}
 }
 

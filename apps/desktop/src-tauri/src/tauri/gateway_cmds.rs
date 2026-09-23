@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use crate::core::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore};
+use crate::core::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore, ReplyHandle};
 use crate::core::injection_log::InjectionStats;
 use crate::core::store::Store;
 
@@ -80,7 +80,12 @@ struct EventBridge {
 }
 
 impl Bridge for EventBridge {
-    fn dispatch(&self, req: BridgeRequest) {
+    /// `replies` is unused here, and that is the shape of this bridge rather than an oversight:
+    /// the webview answers through separate Tauri commands (`gateway_result` and friends), which
+    /// resolve the core out of managed state and call `GatewayCore::reply`. The handle exists so
+    /// the *other* bridges — the headless Rust one above all — have a way back that is a
+    /// parameter instead of a wiring step.
+    fn dispatch(&self, req: BridgeRequest, _replies: ReplyHandle) {
         let _ =
             self.app.emit_to(EventTarget::webview_window(GATEWAY_WINDOW), "gateway-request", &req);
     }

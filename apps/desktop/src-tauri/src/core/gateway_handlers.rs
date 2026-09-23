@@ -83,7 +83,7 @@ pub(crate) async fn chat_h(
     // Capture inputs are computed before dispatch: the stream branch builds a `'static` body and so
     // cannot borrow the request.
     let prep = prepare_capture(&core, &headers, &req, id);
-    core.bridge.dispatch(BridgeRequest {
+    core.dispatch(BridgeRequest {
         request_id: id,
         kind: "chat",
         body: req.clone(),
@@ -284,7 +284,7 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest {
+    core.dispatch(BridgeRequest {
         request_id: id,
         kind: "models",
         body: json!({}),
@@ -386,7 +386,7 @@ pub(crate) async fn image_h(
         Err(r) => return r,
     };
     let id = slot.id;
-    core.bridge.dispatch(BridgeRequest {
+    core.dispatch(BridgeRequest {
         request_id: id,
         kind: "image",
         body: req,
