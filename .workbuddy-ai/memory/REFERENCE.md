@@ -1922,3 +1922,166 @@ Clippy suggests `/*!` for a detached doc block. The crate has **16 files using `
 the consistent fix was `//!`. Six files converted by script; the six other files that open with `/**` were
 correctly *skipped* — their block is attached to the item below, which is a different (and non-broken) shape.
 
+## Per-app budgets — landed 2026-09-23 (migration 0017)
+
+Parts 2 and 3 of the three-part job 0016 started. 0016 added `ledger.app_key_id` (attribution); **0017 adds
+`gateway_keys.cap_micros` plus `idx_ledger_app_key_ts`** on `ledger(app_key_id, ts)` — the index ships with the
+query that needs it, not with the column, and 0016's own comment says why.
+
+### The two caps are independent, not narrowed
+
+The tempting implementation is `min(global_remaining, app_remaining)` and one refusal. It is wrong, and only at
+scale: with a **$10 global** cap and a **$100 per-app** cap, an app that spends $50 has breached the global
+limit at half of its own. One number cannot say "this app is fine, the install is not". So `SpendLimits` carries
+**two pairs** — `(total_micros, total_cap_micros)` and `(app_micros, app_cap_micros)` — and `spend_gate` checks
+them **sequentially**, global first.
+
+The refusals stay distinct (`spend_cap_exceeded` vs `app_budget_exceeded`) although both are
+`402 insufficient_quota`, because the remedies are opposite: raise the global cap, or raise *this app's* budget.
+A caller that cannot tell them apart cannot act.
+
+`SpendProvider` went from `Arc<dyn Fn() -> (i64, i64)>` — **zero arguments**, so the gate physically could not
+tell callers apart — to `Arc<dyn Fn(Option<&str>) -> SpendLimits>`.
+
+### `NULL` is the only spelling of "no cap"
+
+`gateway_key_cap_set` normalizes `<= 0` to `NULL`. `NOT NULL DEFAULT 0` would collapse "not reported" and
+"explicitly zero" into one value — the same defect class 0015 recorded. `clearing_a_per_app_cap_stores_null_not_zero`
+is the **only** test that can see this: the behavioural test passes either way (Probe F).
+
+### Probe B, and the reason it was rewritten
+
+The doc comment first claimed a defaulted `0` cap "would refuse every request from an app that has no cap at
+all". **Probe B removed the `Option` and all 113 tests still passed** — the `cap > 0` guard short-circuits
+first, so the claim was false. Refined to **B′** (remove *both* defences) → both per-app tests failed, which is
+the real mechanism. The comment and the test docstring now describe the **observable property** and state that
+two independent defences guard the uncapped case. "A reason is a claim too."
+
+Seven probes in all (A per-app check, B/B′ missing-cap default, C identity hardcoded, D global check, E index
+renamed, F clear-stores-zero, G app predicate dropped from the `SUM`) — each failing exactly the naming tests.
+Table in the 2026-09-23 daily log.
+
+### The shim argument-key bug, found twice
+
+`shim.ts:toRustArgs` renames top-level camelCase keys to **snake_case before `dispatch`**. A case that reads
+`args.capMicros` therefore gets `undefined`, and `Number(undefined) || 0` is `0` — the command silently
+no-ops. My new `gateway_app_key_cap_set` case had this; so did the **pre-existing** `gateway_spend_cap_set`,
+since the day it was written. Nothing could catch the latter: the only spec exercising the global cap seeds it
+through `__webTest.spendStatus` and never calls the command. **Read the post-rename spelling** — verified
+against working cases (`args.value_json`, `args.run_id`).
+
+### The draft re-seed bug, caught by the new spec
+
+`setting a budget round-trips` failed with the row still reading "no budget" while the input held "12.5". The
+mount-time `gateway_app_keys` response resolved *after* the user typed and re-seeded `capDrafts`, so the save
+sent `0` — clearing the budget instead of setting one, silently. Fixed by seeding only keys not already present
+(`prev[k.id] ?? …`) plus an optimistic local write in `saveAppKeyCap` / `clearAppKeyCap`. **Seed a draft field
+only when absent; never re-seed on refresh.**
+
+Corollary, same shape as "assert on the loaded state": **a spec must not assert on an input's value to prove a
+round-trip.** The field mirrors local state; the row re-read from the host is the only proof the command
+landed.
+
+### The `webServer` timeout was the proxy, again
+
+Both timeouts this session came from all six proxy vars pointing at `http://127.0.0.1:63517`.
+`DEBUG=pw:webserver` showed vite up in 835 ms while the readiness probe got **404**; a manual curl gave 200 once
+and **502** the next, which proves the proxy. **A proxy `502` satisfies a "status != 000" readiness loop**, so
+the loop exits instantly and every probe after it measures the proxy. The trap is that the *symptom* — a 60 s
+`webServer` timeout — is identical to the bulk-delete guard's.
+
+## Releasing — the self-verifying pipeline (2026-09-23)
+
+### The defect, and why the gap was mislabelled
+
+`09-status.md` read "**No notarized release**", which named the symptom and implied the pipeline was missing.
+The pipeline was not missing — it was **unfalsifiable**, and that was the real defect: `tauri build` succeeds
+with **no** Apple secrets at all and emits an **ad-hoc signed** app. So a tag push produced a green job and a
+draft Release containing something macOS refuses to launch, and the failure surfaced on a user's machine.
+`05-workflow.md` warned about it in prose; nothing enforced it.
+
+Second, separate defect: `release.yml` said "Required secrets (see CONTRIBUTING.md)" and `CONTRIBUTING.md`
+documented **no** `APPLE_*` secrets at all — a Grep for `APPLE_|secret|release|sign` returned two unrelated
+hits. Logged as drift register **D11**; fixed by adding a "Releasing" section to `CONTRIBUTING.md`.
+
+### `codesign --verify` proves nothing about Developer ID — measured
+
+This is the finding the verifier is built around. Against an ad-hoc bundle:
+
+    codesign --verify --deep --strict --verbose=2 /tmp/adhoc-test.app
+      /tmp/adhoc-test.app: valid on disk
+      /tmp/adhoc-test.app: satisfies its Designated Requirement
+      exit 0
+
+An ad-hoc signature **is** a valid signature. What actually separates signed-and-notarized from ad-hoc:
+
+| | ad-hoc | Developer ID + notarized (Chrome, measured) |
+|---|---|---|
+| `codesign --verify --strict` | **exit 0** | exit 0 |
+| `spctl -a -vvv -t exec` | **exit 3**, `rejected` | exit 0, `accepted`, `source=Notarized Developer ID` |
+| `xcrun stapler validate` | **exit 65**, "no ticket stapled" | exit 0, "The validate action worked!" |
+| `CodeDirectory … flags=` | `0x2(adhoc)` | `0x12a00(kill,restrict,library-validation,runtime)` |
+| `Signature=` line | `Signature=adhoc` | absent |
+| `Authority=` | absent | `Developer ID Application: … (TEAM)` |
+| `TeamIdentifier=` | `not set` | `EQHXZ8M8AV` |
+
+Two measurement notes that cost time and are easy to repeat wrong:
+
+- **The flags word is on the `CodeDirectory` line**, not a separate `flags=` line — a grep for `^flags` matches
+  nothing on either kind of bundle.
+- **`$?` after a pipeline reports the last command's status, and `PIPESTATUS` is empty in zsh.** Both produced
+  meaningless exit codes while probing this. Capture with `out=$(cmd 2>&1) || rc=$?`, never `cmd | head`.
+  The hardened-runtime check asserts the numeric bit (`flags & 0x10000`) rather than only the `runtime`
+  keyword, because the bit is authoritative.
+
+### The two scripts
+
+`scripts/release-preflight.sh` — runs first in `release.yml`, before the Rust toolchain download, because it
+costs about a second and catches the one mistake that otherwise survives a 20-minute universal build. Fails on
+a missing/empty secret, when the `.p12` will not open with the given password (catches a truncated paste or a
+mismatched password), and when `bundle.macOS.signingIdentity` is pinned in `tauri.conf.json` — the rule no
+other job can catch, since nothing outside `release.yml` runs a full `tauri build`. Never prints a secret.
+
+`scripts/verify-release-signature.sh` — runs after the build, discovers bundles under `target/` or takes a
+path. Asserts the seal, non-ad-hoc, `Developer ID Application` authority, the hardened-runtime bit, the team
+identifier (and, when `APPLE_TEAM_ID` is set, that it matches), `spctl` acceptance **as** `Notarized Developer
+ID`, and a stapled ticket. On failure the job goes red **and** the draft release is deleted, so a bad artefact
+cannot be published by someone who only sees that a release exists.
+
+Both were falsified in both directions before being wired in: ad-hoc bundle → 6 failures; Chrome → all pass;
+wrong expected team → exactly 1 failure; garbage base64 → 1 failure; pinned identity in a throwaway root →
+exactly 1 failure, with the same config unpinned as the control.
+
+### Two traps hit while writing them
+
+- **`mapfile` does not exist in bash 3.2**, which is what macOS ships and what a `macos-14` runner gives you
+  under `#!/usr/bin/env bash`. The discovery branch died with `mapfile: command not found` — and only on the
+  no-argument path, which the earlier probes never touched. Replaced with a `while IFS= read -r` loop over
+  process substitution, which is 3.2-compatible and, unlike `for x in $(...)`, survives the spaces in
+  "AI-Provider Router.app".
+- **`hdiutil` leaves scratch images behind.** A failed DMG build deposits `rw.<pid>.<Product>_<v>_<arch>.dmg`
+  files in `bundle/macos/`. The first discovery run found 13 of them, every one unsigned, and reported **35**
+  bogus failures that buried the one real finding. The glob now excludes `! -name 'rw.*'`.
+
+### `tauri.conf.json` — authoritative `bundle.macOS` field names
+
+Taken from `https://schema.tauri.app/config/2.11.6`, not guessed (the docs pages truncate the definition):
+
+`frameworks`, `files` ({}), `bundleVersion`, `bundleName`, `minimumSystemVersion` (default **"10.13"**),
+`exceptionDomain`, `signingIdentity` (must stay unset), `hardenedRuntime` (default **true**),
+`providerShortName`, `entitlements`, `infoPlist`, `dmg`.
+
+`signingIdentity` is the one that matters: it is deliberately absent, and the preflight now enforces that
+mechanically.
+
+**`minimumSystemVersion` is "11.0" because it was measured, not chosen.** The built binary's own
+`VersionMin=720896` decodes to `major<<16 | minor<<8 | patch` = **11.0.0** (its `VersionSDK=984320` is 15.5.0).
+Declaring anything lower would offer the app to systems the binary cannot run on; higher would exclude users
+for nothing.
+
+### What still is not closeable by code
+
+The one-time Apple Developer account action: creating the Developer ID certificate, exporting the `.p12`,
+base64-ing it, creating an app-specific password, and setting six repository secrets. Written out in
+`CONTRIBUTING.md` under "Releasing". No code change can perform it.
+

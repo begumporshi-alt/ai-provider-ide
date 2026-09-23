@@ -13,6 +13,29 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **Per-app budgets.** A per-app gateway key can now carry its own monthly cap, so one runaway
+  consumer — an agent loop in a connected IDE — is stopped without touching any other app, and
+  without touching the owner's global budget. Until now the only cap was global and monthly: one
+  `month_micros` against one `cap_micros`, which a single app could exhaust while every other app
+  sat idle.
+
+  The two limits are enforced **independently**, and the refusals are distinguishable. Both are
+  `402 insufficient_quota`, but the body names which limit bound: `spend_cap_exceeded` for the
+  global cap, `app_budget_exceeded` for one app's own. That distinction is load-bearing, because
+  the remedies are opposite — the first is an operator problem that stops every app, the second is
+  fixed by raising one key's budget or waiting for the month to turn.
+
+  Migration 0017 adds the nullable `gateway_keys.cap_micros` and the index the per-app spend SUM
+  needs, `ledger(app_key_id, ts)` — which 0016 deliberately declined to ship until a query existed
+  to justify it. `cap_micros` is nullable and clearing stores `NULL` rather than `0`, so there is
+  one spelling of "no budget" rather than two that behave identically until something queries
+  `IS NULL`.
+
+  Budgets are set per key on **Local Gateway**, beside the key they limit; the global cap stays on
+  **Control**. Per-app *attribution* (0016) is the prerequisite and landed first — a budget has
+  nothing to sum without it, and rows written before 0016 stay unattributed, so an app's total
+  starts from the first request made after it.
+
 - **Auto context compression.** Long conversations no longer overflow the model's window. Tier 1
   (hard truncation) and Tier 2 (summarization) are both included.
 
@@ -85,6 +108,30 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
   This is **attribution only**. Nothing yet sets or enforces a per-app cap, and existing rows stay
   `NULL` — nothing can reconstruct which app paid for them.
+
+- **A self-verifying release pipeline.** A release build can no longer succeed into a broken
+  artefact. `scripts/release-preflight.sh` runs first and refuses to start the build when an Apple
+  secret is missing, when the `.p12` will not open with the given password, or when a signing
+  identity has been pinned in `tauri.conf.json`. `scripts/verify-release-signature.sh` then reads
+  the built artefacts back and requires them to be Developer ID signed, hardened, and notarized; if
+  they are not, the job fails and the draft release is deleted.
+
+  The defect this closes was silent rather than loud. `tauri build` succeeds with **no** Apple
+  secrets at all and emits an **ad-hoc signed** app, which launches fine locally — where Gatekeeper
+  does not assess it — and is refused on a user's machine. A tag push therefore produced a green
+  job and a draft Release containing something macOS refuses to open, and the failure surfaced for
+  a user instead of in CI.
+
+  **`codesign --verify` is not sufficient, which is why the verifier does not rely on it.** Measured
+  against an ad-hoc bundle, it prints `valid on disk` and `satisfies its Designated Requirement` and
+  **exits 0** — an ad-hoc signature is a valid signature. The checks that separate signed and
+  notarized from ad-hoc are `spctl` (exit 3 vs 0), `stapler validate` (exit 65 vs 0), the
+  `CodeDirectory` flags word (`0x2(adhoc)` versus `0x12a00(…,runtime)`) and the `Authority=` chain.
+  Both scripts were falsified against both states before being written into the workflow.
+
+  Provisioning the certificate and the six repository secrets remains a one-time manual step,
+  written out in `CONTRIBUTING.md` under "Releasing" — it is an Apple Developer account action that
+  no code change can perform.
 
 ### Fixed
 

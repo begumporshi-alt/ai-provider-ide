@@ -840,7 +840,9 @@ deleting a provider cascades keys/manifests/catalog rows (ledger history is pres
 no FKs by design); Assistant conversations persist per session only (v1); models-cache TTL
 24 h with manual refresh and stale-fallback; the app is single-window (a second window would
 instantiate a second router core — rejected); i18n and a11y beyond platform defaults are
-declared **non-goals for v1**; per-app gateway keys ship (§3.6), while per-app budgets do not.
+declared **non-goals for v1**; per-app gateway keys ship (§3.6), and so do per-app budgets
+(0017 — a nullable `gateway_keys.cap_micros`, enforced alongside the global cap with its own
+`app_budget_exceeded` refusal).
 
 ---
 
@@ -865,7 +867,11 @@ declared **non-goals for v1**; per-app gateway keys ship (§3.6), while per-app 
   explains the prerequisite clearly. **Minor.**
 - **Linux keychain absence on headless setups** — first-run check + clear error. **Minor.**
 - **E2E testing of rotation/failover** — local mock OpenAI-compatible server. **Major.**
-- App signing/notarization + updater — **minor for v1, major before sharing.**
+- App signing/notarization + updater — the **release pipeline ships and is self-verifying** as of 2026-09-23:
+  the preflight refuses an unprovisioned build and the artefact is read back and must be notarized, so signing
+  is down to a one-time Apple credential provisioning — **minor**. The **updater** is still absent, by decision:
+  the v1-era docs described a mechanism nobody had built, and they were deleted rather than fixed — **major
+  before sharing.**
 
 Risks added from the 2026-09-15 audit, each now carried by a design section:
 

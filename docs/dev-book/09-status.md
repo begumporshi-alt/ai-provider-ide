@@ -1,6 +1,6 @@
 # 09 — Status
 
-**As of 2026-09-22**, against `e4edece`.
+**As of 2026-09-23**, against `8795cd5`.
 
 > **This is the one chapter expected to age quickly, and the only one where staleness is normal.** Every other
 > chapter states a rule that changes only when someone decides to change it. This one states where the work
@@ -22,14 +22,14 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Secrets | Keychain-only, key-blind TypeScript, one-shot reveal | Invariants 1–2, `key-leak-grep` in CI |
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tools.rs` |
-| Gateway keys | Per-app keys, monthly spend cap | `commands.rs:713-718`, `gateway_keys` table |
-| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015 (applied 2026-09-22) and 0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. 0016 is **defined but not yet applied** — the installed bundle predates it |
-| Schema | 16 versions, count asserted, rewind-tested | `store.rs:977-980` |
-| Governance | Apache-2.0, changelog, security policy, release workflow, weekly audit | `LICENSE`, `.github/workflows/` |
+| Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `commands.rs`, `gateway_keys` table (0017) |
+| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. **0016 is in the source but not in the installed database** — measured 2026-09-23, the live DB sits at `schema_version` 15, so `ledger.app_key_id` does not exist there yet and attribution begins on the first launch after a rebuild |
+| Schema | 17 versions, count asserted, rewind-tested | `store.rs:1009-1013` |
+| Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
 | Rust formatting | `cargo fmt --check` is clean under `apps/desktop/src-tauri/rustfmt.toml` | 354 hunks rewritten once on 2026-09-22, then converged to 0. A stock config would have rewritten 638 |
-| Tests | **460** TS unit (18 adapter-spec · 249 router-core · 193 desktop) · **27** end-to-end · **98** browser · **481** Rust | TS unit, browser and Rust re-measured 2026-09-23; the `433` / `166 desktop` and `473` this row used to carry were stale |
+| Tests | **460** TS unit (18 adapter-spec · 249 router-core · 193 desktop) · **27** end-to-end · **104** browser · **489** Rust | Browser and Rust re-measured 2026-09-23 after 0017 (+6 and +8); TS unit unchanged |
 | Coverage | **43.8%** statements · 37.3% branches · 31.1% functions · 45.4% lines, weighted across the three packages | `pnpm test:coverage`; a report, **not** a gate step — [`../PRODUCT_COMPLETION_PLAN.md`](../PRODUCT_COMPLETION_PLAN.md) §4.2 |
 
 ## Gaps
@@ -38,8 +38,31 @@ Real absences, with the reason each one is absent.
 
 | Gap | Why it is not closed |
 |---|---|
-| **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
-| **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not. Attribution landed 2026-09-23 (migration 0016), so a budget finally has something to sum — but only for rows written from then on, and nothing yet sets or enforces a per-app cap |
+| **Release not provisioned** | The *pipeline* is complete and now self-verifying — `release-preflight.sh` refuses to start a build whose Apple secrets are missing, and `verify-release-signature.sh` proves the artefact is Developer ID signed and notarized. What remains is a **one-time account action**: creating the Developer ID certificate and setting six repository secrets. No code change can do it. See `CONTRIBUTING.md`, "Releasing" |
+
+**The release row was reworded on 2026-09-23, and the rewording is the finding.** It read "no notarized
+release", which named the *symptom* and implied the pipeline was missing. The pipeline was not missing — it
+was **unfalsifiable**, and that was the actual defect: `tauri build` succeeds with no Apple secrets at all and
+emits an **ad-hoc signed** app, so a tag push produced a green job and a draft Release containing something
+macOS refuses to launch. The docs warned about it in prose and nothing enforced it.
+
+Two guards now enforce it. `release-preflight.sh` runs first, costs about a second, and fails when a secret is
+absent, when the `.p12` will not open with the given password, or when `bundle.macOS.signingIdentity` is pinned
+in `tauri.conf.json` — the rule no other job can catch, because nothing outside `release.yml` runs a full
+`tauri build`. `verify-release-signature.sh` reads the artefacts back afterwards and asserts the signature is
+not ad-hoc, the authority is a `Developer ID Application`, the hardened-runtime bit is set, `spctl` accepts the
+artefact **as** `Notarized Developer ID`, and the notarization ticket is stapled. If it fails, the job goes red
+and the draft is deleted.
+
+**`codesign --verify` is not sufficient, and this was measured rather than assumed.** On an ad-hoc bundle it
+prints `valid on disk` and `satisfies its Designated Requirement` and **exits 0** — an ad-hoc signature is a
+valid signature. The checks that separate the two states are `spctl` (exit 3 vs 0), `stapler validate` (exit 65
+vs 0), the `CodeDirectory` flags word (`0x2(adhoc)` vs `0x12a00(…,runtime)`) and the `Authority=` chain. A
+verifier that stops at `codesign` is decoration.
+
+**"No per-app budgets" left this table on 2026-09-23 and is now closed.** It was three parts, and only the
+last was the one the row implied — attribution, a cap column, enforcement. All three shipped. The reasoning is
+kept rather than deleted, because the *order* was the finding.
 
 **"No auto context compression" left this table on 2026-09-23 and is now closed.** The failure was real:
 neither caller trimmed anything, so a long session failed at the provider with a context-length error. Tier 1
@@ -81,9 +104,26 @@ project's own rule, so the chain was traced rather than assumed. Four tests cove
 being trusted. **Caveat:** it attributes rows written from now on; the existing rows stay `NULL`, and nothing
 can reconstruct which app paid for them.
 
-**Parts 2 and 3 remain.** A cap column on `gateway_keys` — today `id, label, created_at, last_used_at,
-revoked_at`, with no cap — then enforcement, which changes `SpendProvider`'s signature: it is
-`Arc<dyn Fn() -> (i64, i64)>`, **zero arguments**, so the gate cannot tell callers apart today.
+**Part 2 — the cap column — landed 2026-09-23 (migration 0017).** `gateway_keys.cap_micros`, nullable, with
+clearing storing `NULL` rather than `0` so there is one spelling of "no budget" instead of two that behave
+identically until something queries `IS NULL`. The migration also adds `idx_ledger_app_key_ts ON
+ledger(app_key_id, ts)` — the index 0016 explicitly declined to ship, on the grounds that a column with no
+consumer should not arrive with an index for a query nobody had written. 0017 is that consumer.
+
+**Part 3 — enforcement — landed with it.** `SpendProvider` was `Arc<dyn Fn() -> (i64, i64)>`, **zero
+arguments**, so the gate could not tell callers apart. It is now `Fn(Option<&str>) -> SpendLimits`, carrying
+both the global pair and the app's, because the two limits are independent and neither is derivable from the
+other: with a $10 global cap and a $100 app cap, one app can breach the global limit while far under its own,
+so a minimum of the two is wrong. `spend_gate` checks the global cap first, then the per-app cap, and the two
+refusals carry **different codes** — `spend_cap_exceeded` and `app_budget_exceeded`. Both are `402
+insufficient_quota`, so a client branching on `error.type` alone could not tell "the owner's budget is gone"
+from "this one app's slice is gone", and those have opposite remedies.
+
+**Seven falsification probes, one at a time.** Each failed exactly the tests naming its mechanism and left the
+others passing. One probe falsified a claim this very section had written: defaulting a missing app cap to `0`
+turns out to be *harmless while the `cap > 0` guard stands*, because the guard short-circuits first — so the
+two are independent defences, and the test pins the observable property rather than either mechanism. The
+comment says so now, where before it asserted a mechanism that does not exist.
 
 **Three rows left this table on 2026-09-22.**
 

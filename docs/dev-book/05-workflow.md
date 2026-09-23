@@ -164,9 +164,40 @@ that workflow runs a full `tauri build`, so an identity pinned in the config wou
 check in this repository** — a green push would prove nothing about signing. Build to verify it.
 
 Repository secrets: `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`, optionally `APPLE_SIGNING_IDENTITY`, and
-`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` for notarization. Without a certificate the build still
-succeeds, but it is **ad-hoc signed** — fine locally, not fine for a download, because macOS refuses to launch
-an unnotarized app from an unidentified developer.
+`APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` for notarization. The one-time provisioning — creating the
+Developer ID certificate, base64-ing the `.p12`, setting the secrets — is written out in `CONTRIBUTING.md`,
+"Releasing", because it is an account action and every step of it is manual.
+
+### Two guards, and the defect they close
+
+Without a certificate the build still succeeds and emits an **ad-hoc signed** app — fine locally, not fine for
+a download, because macOS refuses to launch an unnotarized app from an unidentified developer. Until
+2026-09-23 that failure was silent: the job went green and a draft appeared, and the problem surfaced on a
+user's machine. The workflow now refuses to reach that state.
+
+- **`scripts/release-preflight.sh`** runs **first**, before the Rust toolchain is even downloaded, because it
+  costs about a second and catches the only mistake that otherwise survives the whole build. It fails when a
+  required secret is absent or empty; decodes the `.p12` and opens it with the given password, which catches a
+  truncated paste or a mismatched password twenty minutes earlier than the signing step would; and asserts
+  `bundle.macOS.signingIdentity` is **not** pinned in `tauri.conf.json`. That last check is the rule above,
+  now enforced mechanically — nothing else in the repository runs a full `tauri build`, so a pinned identity
+  would otherwise be invisible to every other check.
+- **`scripts/verify-release-signature.sh`** runs **after** the build and reads the artefacts back, asserting
+  the signature is not ad-hoc, the authority is a `Developer ID Application`, the hardened-runtime bit is set,
+  the team identifier matches, `spctl` accepts the artefact **as** `Notarized Developer ID`, and the
+  notarization ticket is stapled. If it fails, the job goes red and the draft release is **deleted**, so a bad
+  artefact cannot be published by someone who only sees that a release exists.
+
+**`codesign --verify` cannot stand in for either of them, and this was measured, not assumed.** Against an
+ad-hoc bundle it prints `valid on disk` and `satisfies its Designated Requirement` and **exits 0** — an ad-hoc
+signature is a *valid* signature. What separates the two states is `spctl` (exit 3 vs 0), `stapler validate`
+(exit 65 vs 0), the `CodeDirectory` flags word (`0x2(adhoc)` vs `0x12a00(…,runtime)`) and the `Authority=`
+chain. Run either script by hand the same way the workflow does:
+
+```bash
+./scripts/verify-release-signature.sh                  # discovers bundles under target/
+./scripts/verify-release-signature.sh path/to/App.app ABCD123456
+```
 
 ### The one-time keychain prompt
 
