@@ -2109,3 +2109,76 @@ The Actions **HTML** page is usable and does not count against that budget, but 
 run number (`CI #NN`) and the status token sit far apart in the row, so "nearest status token" associated a
 token belonging to a different run. Prefer the API when the answer must be tied to a specific commit.
 
+---
+
+## Headless service (aiproviderd) — the measured starting point
+
+*Measured 2026-09-23 against `main` at `f7fdf2c`+ (tree clean except the untracked prompt file). Baseline
+`cargo test` **489 passed / 0 failed**, rustc 1.98.1. Full pre-flight in `2026-09-23.md`.*
+
+### The Tauri seam already exists — the split is mostly file moves
+
+`gateway.rs` was already written to be host-agnostic:
+
+- `pub trait Bridge { fn dispatch(&self, req: BridgeRequest); fn cancel(&self, id: u64); }` — `gateway.rs:568`
+- The only **production** impl is `EventBridge` (`gateway_cmds.rs:82`), which emits Tauri events to the hidden
+  gateway worker window. The other two impls are test doubles: `NoopBridge` (`gateway.rs:465`) and `SynthBridge`
+  (`gateway_tests.rs:98`).
+- `GatewayCore::new(bridge, key_provider)` therefore takes the host as an **injection**, not a global.
+
+Consequence: `core/` needs no inversion work. It needs the host supplied at construction, which is exactly what
+a headless binary cannot yet do — see "no bridge" below.
+
+### Which files are actually Tauri-coupled (`tauri::` reference counts)
+
+| File | refs | Note |
+|---|---|---|
+| `commands.rs` | 61 | all `#[tauri::command]` |
+| `gateway_cmds.rs` | 37 | `EventBridge`, worker window, `log_to_file` |
+| `lib.rs` | 16 | `generate_context!`, tray, `RunEvent` |
+| `persist.rs` | 32 | **surprise** — 32 commands + `tauri::State` + `crate::commands::CommandError` |
+| `workbuddy.rs` | 6 | 3 commands |
+| `tools.rs` | 4 | 4 commands |
+| `egress.rs` | 1 | `stream()` takes `tauri::ipc::Channel<StreamEvent>` |
+
+Tauri-free: `gateway.rs` + 9 `#[path]` submodules, `store.rs`, `vault.rs`, `injection_log.rs`, `capture.rs`,
+`context.rs`, `crash_report.rs`, `memory.rs`, `orchestrator.rs`, `skills.rs`.
+
+**The two traps.** `persist.rs` and `egress.rs` look like data/HTTP modules from their names and from the plan,
+and both were assigned to `core/` in the prompt. Neither can move without an edit:
+`persist.rs` is a Tauri command module (2,305 lines, commands interleaved with logic), and `egress.rs`'s
+`stream()` signature is Tauri's IPC channel. `gateway.rs` does **not** import `egress` — egress is the
+Assistant/UI path only, so moving it to `tauri/` wholesale costs the service nothing.
+
+### Four things a headless Phase 1 cannot do as specified
+
+1. **No `/health`.** `spawn()` registers 7 routes (`gateway.rs:1904-1911`): `/v1/models`,
+   `/v1/chat/completions`, `/v1/images/generations`, `/v1/messages`, `/v1/messages/count_tokens`,
+   `/v1/responses`, `/v1beta/models/{*tail}`. The fallback is `unknown_route` → 404 after auth. The plan
+   (§4.2, §9.2) and the prompt (§8.3) both assume `/health` exists; it does not. Adding it **is** a behaviour
+   change, which the same prompt forbids in §8.2.
+2. **No bridge ⇒ 503 on every completion.** `is_available() = is_running() && beat_is_fresh()`. No webview
+   means no heartbeat, so the core is never available. The binary can bind and serve; it cannot answer
+   `/v1/chat/completions` until Phase 2 ports the router core.
+3. **`DEFAULT_PORT` is 8787** (`gateway.rs:36`), consumed at `gateway_cmds.rs:274`. 8787 is AI Hub v2's port;
+   the gateway runs on 8800. A binary hardcoding it binds the wrong port — read the persisted setting the way
+   `persisted_gateway_port` (`lib.rs:81`) does.
+4. **CI has no OS matrix.** `ci.yml` is a single job `checks` on `macos-14`. A 3-OS binary build is a **new
+   job**, not a matrix edit.
+
+### Two structural caveats
+
+- **`tauri` is an unconditional dependency and `build.rs` runs `tauri_build::build()` for every target.** So
+  `cargo build --bin aiproviderd` still compiles all of Tauri. The binary is Tauri-free in **source** only.
+  Real decoupling needs a feature flag or a separate crate.
+- **`gateway_tests.rs:1947` imports `crate::gateway_cmds::GatewayState`** — a core → tauri edge that exists only
+  in `cfg(test)`. Harmless for `--bin aiproviderd`, but it means "core never imports tauri/" is false under
+  `cargo test` and must be stated rather than assumed.
+
+### Stale numbers in the prompt
+
+It says "104 Rust tests" (measured **489**) and lists 15 of 29 `.rs` files. The 14 unlisted ones include 9 that
+are `#[path]` submodules of `gateway.rs` (`gateway.rs:1784-1808`) and therefore move with it for free:
+`gateway_anthropic.rs`, `context_scope.rs`, `gateway_gemini.rs`, `gateway_handlers.rs`, `model_context.rs`,
+`principal.rs`, `gateway_responses.rs`, `session_context.rs`, `gateway_tests.rs`.
+
