@@ -46,9 +46,14 @@ A release is a `v*` tag. `.github/workflows/release.yml` then runs the preflight
 
 ### The one-time provisioning
 
-This needs an **Apple Developer Program membership** (paid) and a **Developer ID Application** certificate.
-Neither can be created by a script, and neither is in the repository — the certificate is a secret, and this
-repository is public, so `pnpm key-leak-grep` is a gate step for exactly this reason.
+This needs an **Apple Developer Program membership** (paid — **$99/year**, checked 2026-09-23) and a
+**Developer ID Application** certificate. Neither can be created by a script, and neither is in the repository
+— the certificate is a secret, and this repository is public, so `pnpm key-leak-grep` is a gate step for
+exactly this reason.
+
+**Without the membership there is no path to a notarized release, and none of the steps below can start.** This
+is a purchase, not a task. Local builds are unaffected — see `docs/dev-book/09-status.md`, which records this as
+blocked rather than pending.
 
 1. Create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates, or
    the Developer portal), then export it from Keychain Access as a `.p12` **with a password**.

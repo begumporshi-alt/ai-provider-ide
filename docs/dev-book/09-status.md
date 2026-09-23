@@ -38,7 +38,7 @@ Real absences, with the reason each one is absent.
 
 | Gap | Why it is not closed |
 |---|---|
-| **Release not provisioned** | The *pipeline* is complete and now self-verifying — `release-preflight.sh` refuses to start a build whose Apple secrets are missing, and `verify-release-signature.sh` proves the artefact is Developer ID signed and notarized. What remains is a **one-time account action**: creating the Developer ID certificate and setting six repository secrets. No code change can do it. See `CONTRIBUTING.md`, "Releasing" |
+| **Release not provisionable yet** | **Blocked, not pending.** The pipeline is complete and self-verifying; what it needs is a **paid Apple Developer Program membership** ($99/year), which is the only thing that can issue a Developer ID Application certificate. Measured 2026-09-23: the login keychain holds exactly **one** codesigning identity, `AI-Provider IDE Dev Signing`, and it is **self-signed** (subject == issuer) — a local dev certificate that cannot notarize. So no route to a notarized release exists until the membership does, and no code change can substitute for it. See `CONTRIBUTING.md`, "Releasing" |
 
 **The release row was reworded on 2026-09-23, and the rewording is the finding.** It read "no notarized
 release", which named the *symptom* and implied the pipeline was missing. The pipeline was not missing — it
@@ -59,6 +59,23 @@ prints `valid on disk` and `satisfies its Designated Requirement` and **exits 0*
 valid signature. The checks that separate the two states are `spctl` (exit 3 vs 0), `stapler validate` (exit 65
 vs 0), the `CodeDirectory` flags word (`0x2(adhoc)` vs `0x12a00(…,runtime)`) and the `Authority=` chain. A
 verifier that stops at `codesign` is decoration.
+
+**What "blocked" means in practice, because it is a real constraint and not a formality.** The release workflow
+no longer produces **any** downloadable artefact until the certificate exists. That is the guards working as
+intended — a tag push fails in about a second at the preflight, naming the missing secrets, rather than emitting
+an ad-hoc draft. The workflow triggers on `v*` tags and on `workflow_dispatch`, but both paths run the
+preflight, so there is no way to route around it from inside the pipeline.
+
+**Local builds are unaffected, and that is the fallback.** `pnpm --filter ai-provider-router-desktop tauri build`
+still produces a working `.app` — ad-hoc signed, which is correct for running on your own machine. Measured
+2026-09-23: about 4 minutes, succeeds completely, and only the DMG step fails (`hdiutil`), which is why
+`REFERENCE.md` says to take the `.app` and ignore that error. Such a bundle can be zipped and shared by hand,
+but a recipient is met with the unidentified-developer warning and has to override Gatekeeper explicitly — which
+is exactly the experience the pipeline now refuses to ship as a release.
+
+**The membership is the gate, and it is a purchase, not a task.** Everything downstream is already written down
+in `CONTRIBUTING.md`: create the Developer ID certificate, export the `.p12`, base64 it, create an app-specific
+password, set five repository secrets, then tag. None of that can start first.
 
 **"No per-app budgets" left this table on 2026-09-23 and is now closed.** It was three parts, and only the
 last was the one the row implied — attribution, a cap column, enforcement. All three shipped. The reasoning is
