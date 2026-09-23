@@ -449,8 +449,9 @@ webview. No Tauri events. No heartbeat.
 
 ### 9.1 What must be re-tested
 
-Every gateway test in `gateway_tests.rs` (104 tests, measured 2026-09-23) must pass against the
-Rust-native engine. The synthetic bridge (`SynthBridge`) is replaced with the real router core.
+Every gateway test in `gateway_tests.rs` (**113** tests, re-measured 2026-09-23 — this plan said 104,
+inherited from the task prompt; the crate total is **489**) must pass against the Rust-native engine.
+The synthetic bridge (`SynthBridge`) is replaced with the real router core.
 
 ### 9.2 New tests needed
 
