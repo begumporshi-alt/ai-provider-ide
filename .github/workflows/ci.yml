@@ -138,9 +138,20 @@ jobs:
       # links and starts. The `/health` proof is a manual step (dev-book §10 records it): binding
       # a port and reading the OS keychain on a shared runner is exactly the kind of step that
       # fails for reasons unrelated to the change under test.
+      #
+      # `working-directory` is load-bearing, and its absence is the reason the first run of this
+      # job failed on all three platforms at this step with
+      # `target/release/aiproviderd: No such file or directory`. The build step above sets it, so
+      # `target/` means `apps/desktop/src-tauri/target`; here the same relative path resolved
+      # against the repo root instead. `--version` itself was never the problem -- the step could
+      # not find the file. The rule: a step that only *asserts* what a previous step produced must
+      # resolve paths the way that step did, and an explicit `test -f` with a named error beats a
+      # silent `command not found`.
       - name: Service binary runs
         shell: bash
+        working-directory: apps/desktop/src-tauri
         run: |
           bin=target/release/aiproviderd
-          [ -f "$bin.exe" ] && bin="$bin.exe"
+          if [ -f "$bin.exe" ]; then bin="$bin.exe"; fi
+          test -f "$bin" || { echo "::error::service binary not found at $bin"; exit 1; }
           "$bin" --version
