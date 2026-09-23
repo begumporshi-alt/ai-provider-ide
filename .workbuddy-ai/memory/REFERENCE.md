@@ -2167,8 +2167,15 @@ and "you are being refused" were indistinguishable.** Any poll loop must check f
 |---|---|---|
 | `github.com/.../badge.svg?branch=main` | free | reports the last **completed** run, and `cache-control: max-age=300` — so it can be 5 min stale |
 | `github.com/.../actions/runs/<id>` (HTML) | free | JS-rendered; job conclusions are **not** in the HTML, but a **`Total duration`** is shown only once the run ends |
-| `github.com/.../commit/<sha>` (HTML) | free | shows a **`N / N`** check count (4 / 4 = all four jobs) |
+| `github.com/.../commit/<sha>` (HTML) | free | shows an **`N / N`** tally — but it counts checks **completed**, not checks that **passed**. A run with a failed job also reads `4 / 4`. `0 / 4` means none have finished. **Not evidence of success** |
 | reproducing the step locally | free | strongest evidence of all, and what actually diagnosed the bug above |
+
+**Do not read the `N / N` tally as a pass.** Measured on 2026-09-23: the commit page for the green run
+`9666983` read `4 / 4`, and the page for the freshly-pushed `ac99bb7` read `0 / 4` while its run was still
+starting. That confirms the denominator is the job count and the numerator is *finished* jobs — so a run in
+which one of four jobs **failed** would also read `4 / 4`. I initially recorded this as evidence of success
+and had to correct it; the load-bearing evidence for that run was the badge-cache deduction above plus a
+direct step-level API read taken before the budget ran out.
 
 **The badge can still be made conclusive by reasoning about its cache window.** #86 failed at ~10:32, #87
 started 10:33 and ran 10m13s. A badge fetched at 10:48 with `max-age=300` cannot have been generated before
