@@ -2079,6 +2079,60 @@ mechanically.
 Declaring anything lower would offer the app to systems the binary cannot run on; higher would exclude users
 for nothing.
 
+### The verifier read the bundle, not what was in it (2026-09-23)
+
+`verify-release-signature.sh` asserted five properties of the `.app` — not ad-hoc, Developer ID authority,
+hardened runtime, team identifier, `spctl` accepted, ticket stapled. **All of them describe the *bundle*, which
+is to say the main executable.** A second binary sitting beside it in `Contents/MacOS/` was invisible to every
+one of them.
+
+Not hypothetical: adding a second `[[bin]]` makes `tauri build` copy it in undeclared, and on a dev build both
+binaries report `Signature=adhoc` / `TeamIdentifier=not set` (`flags=0x20002(adhoc,linker-signed)`).
+
+**`codesign --verify --deep --strict` cannot be relied on to cover it, and the test that appeared to prove it
+did was confounded.** On the real bundle it exits 1 for an unrelated reason — "code has no resources but
+signature indicates they must be present" — and its output is **byte-identical** whether the nested binary is
+signed or has had its signature removed with `codesign --remove-signature`. Two failures masking each other.
+**To test a check, the surrounding checks must pass first**, or you measure the loudest failure and call it the
+answer.
+
+Fix: enumerate every Mach-O under `Contents/MacOS/` and `Contents/Frameworks/` with `find` — *not* a hardcoded
+list, because which binaries are in the bundle is a property of `Cargo.toml`'s `[[bin]]` section, and a
+hardcoded list silently stops covering the next binary someone adds, which is exactly how this opened — and
+apply the same three discriminators per file.
+
+**Falsified in both directions before trusting it:**
+- **fires** — on the ad-hoc dev bundle it finds both binaries and adds exactly **6** failures (2 × ad-hoc / no
+  authority / hardened runtime); the run goes **7 → 13**, exit 1.
+- **does not fire falsely** — the same test against `/bin/echo` (Apple-signed, `flags=0x0(none)`,
+  `Authority=Software Signing`) reports "not ad-hoc", so the branch is not always-true.
+
+**Notarization remains the primary guard, not this.** Apple's notary service rejects improperly signed nested
+code, so a release with an unsigned second binary would fail anyway. The verifier's job is to name the offending
+file rather than leave it to a notary error to explain.
+
+`codesign` treats `Contents/MacOS/*` as **subcomponents** — proven by its own error text,
+`In subcomponent: …/Contents/MacOS/extra`, emitted when signing a bundle that contains an unsigned binary.
+
+### The generated book is rewritten by something outside the repo
+
+`docs/dev-book/book.html` acquires `data-page-node-id="<21 chars>"` on essentially every element — 1143
+**lines**, ~4998 **occurrences**. `pnpm docs:book` does not emit that attribute. It happened twice in one
+session, both times after the file had been generated.
+
+**Check and repair:** `git checkout -- <file>`, re-run the generator, and confirm the file drops out of
+`git status`. If it does, the generator reproduces HEAD exactly and the injection was foreign.
+
+**Guard it before committing**, because the rewrite can land between `git add` and `git commit`:
+```bash
+git add -A
+git show :docs/dev-book/book.html | python3 -c "import sys;print(sys.stdin.read().count('data-page-node-id'))"
+```
+A non-zero result means the staged copy is contaminated — revert, regenerate, re-add.
+
+**`grep -c` counts lines; `str.count()` counts occurrences** — 1143 vs 4998 for the same file. When the number
+matters, say which one you measured.
+
 ### What still is not closeable by code
 
 The one-time Apple Developer account action: creating the Developer ID certificate, exporting the `.p12`,
