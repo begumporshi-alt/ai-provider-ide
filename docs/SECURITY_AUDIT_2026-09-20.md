@@ -489,6 +489,12 @@ option.)*
 
 **Fix:** Add `eslint` + `@typescript-eslint` to the root workspace with a baseline config. Start with `--init` and `--ignore-patterns` for generated files. Run `pnpm lint:fix` and commit the result.
 
+> **Updated 2026-09-23 — the dependency list above is incomplete.** Measuring this recommendation showed a
+> **third** package is required: the repo already carries three `eslint-disable` comments naming
+> `react-hooks/exhaustive-deps` (`Assistant.tsx:381`, `:389`, `Settings.tsx:57`), and without
+> `eslint-plugin-react-hooks` ESLint reports each as an unknown-rule error rather than as a suppression. Two
+> files also fail to parse under a naive config. See `PRODUCT_COMPLETION_PLAN.md` §4.1.
+
 ---
 
 ### L2 — `is_local()` trusts any port on localhost

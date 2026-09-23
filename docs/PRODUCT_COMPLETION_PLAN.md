@@ -307,6 +307,8 @@ larger conversation — worth having explicitly.
 > the *adoption*: the step is one line, but running it once rewrites 42.2% of the host under a stock config.
 > `use_small_heuristics = "Max"` cuts that to 30.1%, and that is what made it payable. **ESLint is the only
 > remaining half**, and it is open because it is not installed anywhere rather than because it was rejected.
+> **Measured 2026-09-23**: it is cheap, and there is more to reconcile than this paragraph assumed — see the
+> closing note in this section.
 
 ### 4.2 No coverage measurement
 
@@ -530,8 +532,25 @@ session that ran with the wrong working directory. `rmdir` closed it, and `rmdir
 directory, so the removal was safe by construction rather than by inspection.
 
 **ESLint is the one thing still deliberately absent**, and it is a different kind of absence: it is not
-installed in any of the four manifests, so there is no configuration to write and nothing to reconcile. Adding
-it would be new work with a new dependency surface rather than the closing of an existing gap.
+installed in any of the four manifests, so there is no configuration to write. Adding it would be new work
+with a new dependency surface rather than the closing of an existing gap.
+
+**Measured 2026-09-23 — the second half of that claim is wrong.** There *is* something to reconcile. An
+isolated install (`eslint` 10 + `typescript-eslint` 8, running `tseslint.configs.recommended` and nothing
+else) linted **136 files** and returned **14 messages across 7 files** — 12 errors, 2 warnings: 6
+`no-unused-vars`, 2 `no-this-alias`, 1 `no-explicit-any`, 2 parse failures, and 3 attributed to
+`react-hooks/exhaustive-deps`. Those last three are not findings about the code. The repo already carries
+three `eslint-disable` comments naming that rule — `Assistant.tsx:381`, `Assistant.tsx:389`,
+`Settings.tsx:57` — and with the plugin absent ESLint reports each as *"Definition for rule
+'react-hooks/exhaustive-deps' was not found"*, attributed to the rule's own id. So the real churn is **11
+messages**, and adoption needs a **third** dependency (`eslint-plugin-react-hooks`) — or the removal of three
+comments. A linter that is silent about a rule the code already disables for has a baseline that is wrong on
+arrival.
+
+The two parse failures are the concrete form of the cost this section names: a naive config does not merely
+report on this codebase, it fails to parse two of its files. They are unnamed — identifying them means
+reinstalling the packages, which was reverted, and that re-run belongs to the adoption work rather than to
+the measurement.
 
 ### What the gate caught that the unit tests could not
 
