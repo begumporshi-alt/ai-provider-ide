@@ -97,6 +97,10 @@ step "One product version"    pnpm check-version-sync
 step "Doc links resolve"      pnpm check-doc-links
 
 if command -v cargo >/dev/null 2>&1; then
+  # Stated, not assumed. The lint set moves with the toolchain -- 1.88 was clean here and 1.98
+  # found four more lints -- so the gate should say which toolchain it ran against rather than
+  # leave that to be inferred from the lints. The Rust half of the `node -v` line above.
+  rustc --version
   # Formatting first: it is the cheapest check in this block and the only one that is
   # a no-op whenever the tree is already formatted. `--check` never writes a file.
   # The config it reads is apps/desktop/src-tauri/rustfmt.toml -- see that file for

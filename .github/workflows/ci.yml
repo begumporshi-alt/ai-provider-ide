@@ -61,6 +61,12 @@ jobs:
       # as broken images. The same class of bug recurred within the hour. See drift register D9.
       - name: Doc links resolve
         run: pnpm check-doc-links
+      # Stated, not assumed. These steps run against whatever `stable` is, and the lint set moves
+      # with it -- so when clippy goes red, the log should say which toolchain produced it rather
+      # than leave it to be inferred from the lint names. The local mirror already prints
+      # `node -v` for the same reason; this is the Rust half of that.
+      - name: Rust toolchain
+        run: rustc --version
       # Formatting first: cheapest check in this block, and a no-op whenever the tree is
       # already formatted. `--check` never writes a file. The config it reads is
       # apps/desktop/src-tauri/rustfmt.toml -- see that file for why
