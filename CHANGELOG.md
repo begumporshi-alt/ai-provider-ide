@@ -13,21 +13,22 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
-- **Auto context compression.** Long conversations no longer overflow the model's window. The
-  oldest **complete turns** are dropped until the prompt fits the budget, sized against the
-  narrowest context window in the failover plan.
+- **Auto context compression.** Long conversations no longer overflow the model's window. Tier 1
+  (hard truncation) and Tier 2 (summarization) are both included.
 
-  Three properties are preserved, each pinned by a test: the `system` turn survives (it carries
-  the client's instructions and, on the gateway, the injected memory block); the **newest** turn
-  survives even when it alone exceeds the budget, because dropping it would answer a question the
-  user did not ask; and a tool call and its results are always dropped together, since a provider
-  rejects a result whose originating call is gone.
+  Tier 1 drops the oldest **complete turns** until the prompt fits the budget, sized against the
+  narrowest context window in the failover plan. Three properties are preserved, each pinned by a
+  test: the `system` turn survives; the **newest** turn survives even when it alone exceeds the
+  budget; and a tool call and its results are always dropped together.
 
-  Both the gateway and the assistant are covered by the **same** trim: the two converge on
-  `router.generateText`, so there is one rule rather than two that could drift apart.
+  Tier 2 replaces the dropped turns with a compact summary, wired for the assistant via
+  `createSummarizer`. The summarizer's own inner call sets `skipCompression: true`, because
+  without it the chain would be unbounded — compressing would trigger a summary, which would
+  compress again. The gateway stays on Tier 1 (stateless, latency-sensitive); Tier 2 is available
+  via `generateText`'s `summarize` option for callers that want it.
 
-  This is **Tier 1 — truncation**. Replacing dropped turns with a summary instead of discarding
-  them is Tier 2, and is not included: it costs an extra model call on the request path.
+  Both tiers are covered by the **same** trim: the two callers converge on `router.generateText`,
+  so there is one rule rather than two that could drift apart.
 
 - **Prompt-cache measurement.** The ledger now records `cached_tokens` for every request, read in
   whichever dialect the provider uses: OpenAI-shaped `prompt_tokens_details.cached_tokens`, or

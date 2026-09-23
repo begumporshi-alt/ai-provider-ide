@@ -40,9 +40,8 @@ Real absences, with the reason each one is absent.
 |---|---|
 | **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
 | **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not. Attribution landed 2026-09-23 (migration 0016), so a budget finally has something to sum — but only for rows written from then on, and nothing yet sets or enforces a per-app cap |
-| **No context summarisation** | Tier 1 — hard truncation — landed 2026-09-23, so a conversation no longer overflows the window. Still absent is Tier 2: replacing dropped turns with a *summary* rather than discarding them, which costs an extra model call on the request path |
 
-**"No auto context compression" left this table on 2026-09-23 — narrowed, not closed.** The failure was real:
+**"No auto context compression" left this table on 2026-09-23 and is now closed.** The failure was real:
 neither caller trimmed anything, so a long session failed at the provider with a context-length error. Tier 1
 fixes the overflow by dropping the oldest **complete turns** until the prompt fits. Three properties make that
 safe rather than merely smaller, and all three are pinned by tests: the `system` turn survives (it carries the
@@ -57,6 +56,14 @@ through `gateway-bridge.ts`, the assistant through `runAgentLoop` — so the tri
 cannot drift. The budget is the narrowest *known* window across the failover plan rather than the first
 candidate's, because failover may serve the request from any of them; a plan where no model published a window
 falls back to `DEFAULT_CONTEXT_WINDOW`, which under-sends rather than overflows.
+
+**Tier 2 — summarization — also landed 2026-09-23.** `compressWithSummary` replaces the dropped turns with a
+compact summary rather than discarding them. The assistant wires `createSummarizer` into every agent turn: a
+second call to the same model with `skipCompression: true` — without that flag, the summarizer would compress,
+which would summarize, which would compress: an unbounded chain. Three properties are tested: the summary
+lands in the system prefix so it survives any later trim; the summarizer receives exactly the dropped
+messages; and a failed summarizer falls back to Tier 1 truncation without failing the request. The gateway
+stays on Tier 1 (stateless, latency-sensitive).
 
 **"No per-app budgets" understates itself.** Measured against the live database, the cap was not the first
 missing piece — attribution was. Two different columns are called `key_id`: `ledger.key_id` is the *provider*
