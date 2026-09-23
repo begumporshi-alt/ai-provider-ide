@@ -1932,6 +1932,7 @@ fn the_refusal_message_tells_the_model_what_to_do() {
     assert!(reason.contains("Assistant"), "offer the confirmed path: {reason}");
 }
 
+#[cfg(feature = "app")]
 /// A bound socket and a gateway that is meant to be serving are different states — but the
 /// difference that matters is *operator intent*, not whether the worker happens to be awake.
 ///
@@ -2797,6 +2798,7 @@ async fn a_streamed_responses_failure_carries_a_code() {
     );
 }
 
+#[cfg(feature = "app")]
 /// These three drive `gateway_cmds::run_gateway_tool` — the extracted command body — rather
 /// than its helper. That is the coverage the isolated helper tests could not give: they
 /// proved `record_gateway_tool_call` works, not that the command ever calls it. Deleting the
@@ -2821,6 +2823,7 @@ fn tool_test_state(
     )
 }
 
+#[cfg(feature = "app")]
 #[test]
 fn a_refused_gateway_tool_call_is_gated_logged_and_recorded() {
     let (state, _ws) = tool_test_state("refused");
@@ -2867,6 +2870,7 @@ fn a_refused_gateway_tool_call_is_gated_logged_and_recorded() {
     assert!(!meta.contains("hunter2"), "the body is never stored: {meta}");
 }
 
+#[cfg(feature = "app")]
 #[test]
 fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
     let (state, ws) = tool_test_state("success");
@@ -2913,6 +2917,7 @@ fn a_successful_gateway_tool_call_runs_logs_the_outcome_and_records() {
     assert!(meta.contains("\"refused\":false"), "{meta}");
 }
 
+#[cfg(feature = "app")]
 #[test]
 fn a_bad_workspace_root_is_refused_before_anything_stores_it() {
     let (state, _ws) = tool_test_state("wsroot");

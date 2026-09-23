@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "app")]
 use tauri::ipc::Channel;
 
 use crate::core::store::Store;
@@ -339,8 +340,10 @@ pub async fn fetch_image(
 /// 30s. 120s is more than 4x the worst observed, so no legitimate request is at risk, while a
 /// genuine stall now ends in two minutes instead of never. It bounds *silence*, not duration:
 /// a stream that keeps producing data is never cut off, however long it runs.
+#[cfg(feature = "app")]
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+#[cfg(feature = "app")]
 pub async fn stream(
     state: &EgressState,
     req: EgressRequest,

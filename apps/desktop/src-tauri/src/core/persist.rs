@@ -4,11 +4,16 @@
 //! the webview has NO command that mutates it (diff-review Blocker 2).
 
 use std::collections::HashMap;
+// Only the `#[tauri::command]` wrappers below hold an `Arc<Store>` (Tauri managed state).
+#[cfg(feature = "app")]
 use std::sync::Arc;
 
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
+// `json!`/`Value` are used by the export/import surface and its tests, all of which need `app`.
+#[cfg(feature = "app")]
 use serde_json::{json, Value};
+#[cfg(feature = "app")]
 use tauri::State;
 
 use crate::core::error::CommandError;
@@ -38,6 +43,7 @@ pub struct ProviderRow {
     pub updated_at: i64,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -60,6 +66,7 @@ pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, 
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn provider_upsert(
     store: State<'_, Arc<Store>>,
@@ -79,6 +86,7 @@ pub fn provider_upsert(
     Ok(())
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn provider_delete(
     store: State<'_, Arc<Store>>,
@@ -183,6 +191,7 @@ pub struct ApiKeyRow {
     pub last_tested_at: Option<i64>,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn api_keys_list(
     store: State<'_, Arc<Store>>,
@@ -214,6 +223,7 @@ pub fn api_keys_list(
     Ok(rows)
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn api_key_upsert(store: State<'_, Arc<Store>>, k: ApiKeyRow) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -226,6 +236,7 @@ pub fn api_key_upsert(store: State<'_, Arc<Store>>, k: ApiKeyRow) -> Result<(), 
     Ok(())
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn api_key_delete(store: State<'_, Arc<Store>>, id: String) -> Result<(), CommandError> {
     // Deleting a key removes its keychain entry in the same operation (§7 hygiene).
@@ -257,6 +268,7 @@ pub struct ManifestRow {
     pub is_active: bool,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -278,6 +290,7 @@ pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn manifest_upsert_active(
     store: State<'_, Arc<Store>>,
@@ -325,6 +338,7 @@ pub struct ModelRow {
     pub capabilities_json: Option<String>,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn models_cache_replace(
     store: State<'_, Arc<Store>>,
@@ -335,6 +349,7 @@ pub fn models_cache_replace(
     replace_models(&mut conn, &provider_id, &rows).map_err(Into::into)
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -345,6 +360,7 @@ pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, 
 /// `pricing_json` rides along because the catalog is re-fetched only once per 24h: a launch
 /// that hydrates from this table and finds no price will price every request as unknown,
 /// which zeroes cost and leaves the monthly spend cap unable to fire.
+#[cfg(feature = "app")]
 fn replace_models(
     conn: &mut rusqlite::Connection,
     provider_id: &str,
@@ -363,6 +379,7 @@ fn replace_models(
     tx.commit()
 }
 
+#[cfg(feature = "app")]
 fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
     let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json FROM models_cache")?;
     let rows = stmt.query_map([], |r| {
@@ -388,6 +405,7 @@ pub struct AliasRow {
     pub priority: i64,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn aliases_replace(
     store: State<'_, Arc<Store>>,
@@ -407,6 +425,7 @@ pub fn aliases_replace(
     Ok(())
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -479,6 +498,7 @@ pub struct LedgerRow {
 /// Split out of the command so the column list and the bound values can be tested *together*. A
 /// `#[tauri::command]` taking `State` cannot be called from a unit test, and an INSERT no test can
 /// reach is how 0015's column ended up present, nullable, correctly shaped — and empty.
+#[cfg(feature = "app")]
 fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO ledger (ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
@@ -488,6 +508,7 @@ fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result
     Ok(())
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -497,6 +518,7 @@ pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), C
 
 /// The ledger's read statement. It lives next to the mapper below and is used by the command *and*
 /// by the round-trip test, so the test drives the real statement rather than a copy that can drift.
+#[cfg(feature = "app")]
 const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
          FROM ledger ORDER BY ts DESC LIMIT ?1";
 
@@ -505,6 +527,7 @@ const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, a
 /// Split out of the command so the mapping can be tested. `r.get(5)` is a *position*, not a name:
 /// adding `app_key_id` to the SELECT without shifting every index after it would have returned the
 /// requested model in the app-key field, and the compiler would have been perfectly happy about it.
+#[cfg(feature = "app")]
 fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
     Ok(LedgerRow {
         ts: r.get(0)?,
@@ -527,6 +550,7 @@ fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
     })
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn ledger_recent(
     store: State<'_, Arc<Store>>,
@@ -541,6 +565,7 @@ pub fn ledger_recent(
 
 /// Nightly/on-start rollup job (§4): aggregate complete months into ledger_rollups
 /// (idempotent ON CONFLICT DO UPDATE). Kept as one fixed statement.
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -582,6 +607,7 @@ pub struct OnboardingRow {
     pub outcome: Option<String>,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn onboarding_save(
     store: State<'_, Arc<Store>>,
@@ -607,6 +633,7 @@ pub fn onboarding_save(
     }
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn onboarding_latest_active(
     store: State<'_, Arc<Store>>,
@@ -635,6 +662,7 @@ pub fn onboarding_latest_active(
 
 // ---------- generator audit (§2.5) ----------
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn generator_audit_record(
     store: State<'_, Arc<Store>>,
@@ -675,6 +703,7 @@ pub struct GeneratorAuditEntry {
 }
 
 /// A caller asking for more than this is not reading a trail, it is scraping one.
+#[cfg(feature = "app")]
 const AUDIT_MAX_LIMIT: usize = 500;
 
 /// Read the generation audit, newest first.
@@ -689,6 +718,7 @@ const AUDIT_MAX_LIMIT: usize = 500;
 ///
 /// The floor of one matches `gateway_log_tail`'s. Two readers of two trails, sitting on the same
 /// screen, should not disagree about what `limit: 0` means.
+#[cfg(feature = "app")]
 pub(crate) fn list_generator_audit(
     store: &Store,
     limit: usize,
@@ -713,6 +743,7 @@ pub(crate) fn list_generator_audit(
 }
 
 /// The AI generation trail, newest first — see `list_generator_audit`.
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn generator_audit_list(
     store: State<'_, Arc<Store>>,
@@ -723,6 +754,7 @@ pub fn generator_audit_list(
 
 // ---------- drift events + repair staging (§2.10, Phase 5) ----------
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn drift_event_record(
     store: State<'_, Arc<Store>>,
@@ -737,6 +769,7 @@ pub fn drift_event_record(
     Ok(())
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn drift_event_resolve(
     store: State<'_, Arc<Store>>,
@@ -752,6 +785,7 @@ pub fn drift_event_resolve(
 }
 
 /// A caller asking for more than this is not reading a trail, it is scraping one.
+#[cfg(feature = "app")]
 const DRIFT_MAX_LIMIT: usize = 500;
 
 /// One recorded drift event, as read back for the history card.
@@ -787,6 +821,7 @@ pub struct DriftEventEntry {
 ///
 /// The floor of one matches the other two trail readers. Three readers of three trails on one screen
 /// must not disagree about what `limit: 0` means.
+#[cfg(feature = "app")]
 pub(crate) fn list_drift_events(
     store: &Store,
     limit: usize,
@@ -811,6 +846,7 @@ pub(crate) fn list_drift_events(
 }
 
 /// The recorded drift history, newest first — see `list_drift_events`.
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn drift_events_list(
     store: State<'_, Arc<Store>>,
@@ -819,6 +855,7 @@ pub fn drift_events_list(
     list_drift_events(&store, limit.unwrap_or(50))
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn manifests_history(
     store: State<'_, Arc<Store>>,
@@ -844,6 +881,7 @@ pub fn manifests_history(
 }
 
 /// Stage a repair candidate as a NEW version without activating it (human confirms first).
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i64, CommandError> {
     let conn = store.conn.lock().unwrap();
@@ -860,6 +898,7 @@ pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i6
 }
 
 /// Activate a staged manifest; returns the previously-active version for one-click rollback.
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn manifest_activate(
     store: State<'_, Arc<Store>>,
@@ -1728,6 +1767,7 @@ pub struct SettingRow {
     pub value_json: String,
 }
 
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn config_export(store: State<'_, Arc<Store>>) -> Result<ExportSnapshot, CommandError> {
     // Secrets NEVER leave the keychain: keys export as id/label/ref/hint only.
@@ -1735,6 +1775,7 @@ pub fn config_export(store: State<'_, Arc<Store>>) -> Result<ExportSnapshot, Com
     Ok(config_export_rows(&conn)?)
 }
 
+#[cfg(feature = "app")]
 fn config_export_rows(conn: &rusqlite::Connection) -> Result<ExportSnapshot, rusqlite::Error> {
     let providers = {
         let mut stmt = conn.prepare("SELECT id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at FROM providers ORDER BY created_at")?;
@@ -1825,6 +1866,7 @@ pub struct ExportManifest {
 /// Reject any `secret`-named key anywhere in the snapshot (defense in depth: the webview's
 /// TS validator scans the raw text first; this scans the deserialized Rust structs so a
 /// hand-crafted invoke can't bypass the UI check).
+#[cfg(feature = "app")]
 fn find_secret_keys(v: &serde_json::Value, path: String, out: &mut Vec<String>) {
     match v {
         serde_json::Value::Object(map) => {
@@ -1851,6 +1893,7 @@ fn find_secret_keys(v: &serde_json::Value, path: String, out: &mut Vec<String>) 
 /// everything. All-or-nothing: one transaction. The command takes the RAW JSON value so
 /// the host-side secret scan sees exactly what arrived — typed structs can't carry a
 /// smuggled `secret` field, so scanning them would be theater.
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn config_import(
     store: State<'_, Arc<Store>>,
@@ -1861,6 +1904,7 @@ pub fn config_import(
     config_import_checked(&mut conn, &snap)
 }
 
+#[cfg(feature = "app")]
 fn parse_import(raw: serde_json::Value) -> Result<ImportSnapshot, CommandError> {
     let mut secret_paths = Vec::new();
     find_secret_keys(&raw, "$".to_string(), &mut secret_paths);
@@ -1873,6 +1917,7 @@ fn parse_import(raw: serde_json::Value) -> Result<ImportSnapshot, CommandError> 
     serde_json::from_value(raw).map_err(|e| CommandError(e.to_string()))
 }
 
+#[cfg(feature = "app")]
 fn config_import_checked(
     conn: &mut rusqlite::Connection,
     snap: &ImportSnapshot,
@@ -1969,12 +2014,14 @@ pub struct ImportApplied {
 
 /// Diagnostics bundle: scrubbed recent state for bug reports — no request/response bodies,
 /// no header values, no secrets (invariants 1-2 hold because this reads rows, never vault).
+#[cfg(feature = "app")]
 #[tauri::command]
 pub fn diagnostics_bundle(store: State<'_, Arc<Store>>) -> Result<String, CommandError> {
     let conn = store.conn.lock().unwrap();
     Ok(diagnostics_json(&conn)?)
 }
 
+#[cfg(feature = "app")]
 fn diagnostics_json(conn: &rusqlite::Connection) -> Result<String, rusqlite::Error> {
     // Scrubbed bug-report bundle: ledger rows + drift events + schema version.
     // No bodies, no header values, no secrets — only stored columns (req. 14).

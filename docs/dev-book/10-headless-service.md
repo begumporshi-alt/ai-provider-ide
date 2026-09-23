@@ -91,14 +91,14 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 
 ```
 src/
-├── lib.rs                 # thin crate root: `pub mod core; pub mod tauri; pub use tauri::app::run;`
+├── lib.rs                 # thin crate root: `pub mod core;` + `#[cfg(feature = "app")] pub mod tauri;`
 ├── main.rs                # Tauri app binary (unchanged)
-├── core/                  # NEW — no dependency on the tauri/ module
+├── core/                  # no dependency on the tauri/ module; every `tauri` mention is gated
 │   ├── gateway.rs         # HTTP server, auth, capacity, the Bridge trait
 │   ├── store.rs           # SQLite + migrations
-│   ├── persist.rs         # store queries + 32 #[tauri::command] handlers
-│   ├── egress.rs          # allowlist + reqwest; stream() takes a tauri::ipc::Channel
-│   ├── error.rs           # NEW — CommandError, extracted from commands.rs
+│   ├── persist.rs         # store queries + 28 #[tauri::command] handlers, all 28 gated
+│   ├── egress.rs          # allowlist + reqwest; stream() takes a tauri::ipc::Channel (gated)
+│   ├── error.rs           # NEW — CommandError, its store conversions, and the DB-error redaction
 │   ├── vault.rs  injection_log.rs  capture.rs  context.rs
 │   ├── crash_report.rs  memory.rs  orchestrator.rs  skills.rs
 │   └── gateway_{anthropic,gemini,responses,handlers,tests}.rs
@@ -106,7 +106,7 @@ src/
 │       — all `#[path]` submodules of gateway.rs, so they moved with it
 ├── tauri/
 │   ├── app.rs             # was src/lib.rs — setup, tray, RunEvent
-│   ├── commands.rs        # 61 tauri:: refs
+│   ├── commands.rs        # 106 lines mention `tauri::`; 57 are `#[tauri::command]` attributes
 │   ├── gateway_cmds.rs    # EventBridge, the worker window
 │   ├── tools.rs  workbuddy.rs  app_nap.rs  tools_agent_tests.rs
 └── bin/
@@ -123,19 +123,36 @@ than assumed:
    in `tauri/` fails the same way from the other side: `persist` imports `crate::egress::EgressState`
    and `crate::commands::CommandError`. `{persist, egress, CommandError}` is one cluster, so all
    three moved and `CommandError` was extracted to `core/error.rs`.
-2. **`core/` still imports the `tauri` crate.** `persist.rs` carries 32 `#[tauri::command]` handlers
-   and `egress::stream` takes a `tauri::ipc::Channel`. `Cargo.toml` makes `tauri` an unconditional
-   dependency and `build.rs` runs `tauri_build::build()` for every target, so `cargo build --bin
-   aiproviderd` compiles Tauri regardless. The service is therefore Tauri-free in **source**, not in
-   **dependency** — which is also why the Linux CI job has to install WebKitGTK. Removing those types
-   is Phase 2 work.
-3. **One test-only file points backwards — nine times.** `core/gateway_tests.rs` names
-   `crate::tauri::gateway_cmds::{GatewayState, run_gateway_tool, set_gateway_workspace_root}` in **9
-   references**. It is declared `#[cfg(test)] #[path = "gateway_tests.rs"] mod tests;`
-   (`core/gateway.rs:1806-1808`), so it compiles only under `cfg(test)` and never reaches
-   `cargo build --bin aiproviderd` — "core never names tauri" is therefore true of the build and
-   false of the test build. (An earlier note said "one `cfg(test)` edge"; that counted the *file*,
-   not the references.)
+2. **`core/` still imported the `tauri` crate — closed the same day by the `app` feature.** As
+   built, `persist.rs` carried **28** `#[tauri::command]` handlers (this chapter said 32; that number
+   counted four doc-comment mentions — the same mistake as the "104 tests" of §9.1) and
+   `egress::stream` took a `tauri::ipc::Channel`. `Cargo.toml` made `tauri` an unconditional
+   dependency and `build.rs` ran `tauri_build::build()` for every target, so `cargo build --bin
+   aiproviderd` compiled Tauri regardless — Tauri-free in **source**, not in **dependency**, which is
+   also why the Linux CI job had to install WebKitGTK.
+   Now: `default = ["app"]`, `tauri`/`tauri-plugin-opener` are `optional`, every `tauri` mention in
+   `core/` carries `#[cfg(feature = "app")]` (the 28 attributes, `use tauri::State`, the `Channel`,
+   and the app-only helpers those wrappers reach), and `build.rs` reads `CARGO_FEATURE_APP` before
+   calling `tauri_build::build()`. Measured: `cargo tree --no-default-features --edges all | grep -ci
+   'webkit|wry|gtk'` → **0**, and the runtime `tauri` crate is absent from the graph;
+   `cargo check --bin aiproviderd --no-default-features` is **warning-free**; `cargo test` still
+   **489 passed / 0 failed**; clippy `--all-targets -- -D warnings` and `fmt --check` clean. The Linux
+   job now builds with `--no-default-features` and installs no GTK/WebKit. `tauri-build` is the one
+   exception — Cargo has no optional build-dependencies, so it still compiles, but it pulls no
+   GTK/WebKit and is not called.
+3. **One test-only file points backwards — eight times, in five functions.** `core/gateway_tests.rs`
+   names `crate::tauri::gateway_cmds::{GatewayState, run_gateway_tool, set_gateway_workspace_root}`
+   in **8 references**: `tool_test_state` (2),
+   `a_bad_workspace_root_is_refused_before_anything_stores_it` (3), and one each in
+   `a_bound_listener_is_stale_only_when_serving_was_never_asked_for`,
+   `a_refused_gateway_tool_call_is_gated_logged_and_recorded` and
+   `a_successful_gateway_tool_call_runs_logs_the_outcome_and_records`. It is declared
+   `#[cfg(test)] #[path = "gateway_tests.rs"] mod tests;` (`core/gateway.rs:1806-1808`), so it
+   compiles only under `cfg(test)` and never reaches `cargo build --bin aiproviderd` — "core never
+   names tauri" is therefore true of the build and false of the test build. All five functions carry
+   `#[cfg(feature = "app")]`, so the feature-less test build does not see them either.
+   Two earlier notes were wrong for the same reason — counting the *file*, then counting a
+   doc-comment mention as a reference: first "one `cfg(test)` edge", then "nine times".
 4. **The service binary is copied into the macOS app bundle, undeclared.** Adding the second `[[bin]]`
    makes `tauri build` place `aiproviderd` in `Contents/MacOS/` beside the app binary — a separate
    physical copy (distinct inode), with `bundle.externalBin` unset and nothing in `build.rs` naming

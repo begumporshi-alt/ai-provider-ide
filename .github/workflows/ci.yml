@@ -49,6 +49,15 @@ jobs:
       # the local mirror stricter than CI.
       - name: Build (the bundle must compile)
         run: pnpm build
+      # `pnpm build` above is TypeScript + Vite only — it never invokes the Tauri bundler, so it
+      # cannot fail on a bundling error. That is not hypothetical: adding the second `[[bin]]`
+      # broke `tauri build` with "failed to find main binary" while `pnpm build`, cargo
+      # check/test/clippy and fmt were ALL green (drift D14). This step is the net for that class.
+      # `--bundles app` deliberately skips the DMG step, which needs AppleScript and is not what
+      # this gate is testing. `tauri build` runs `beforeBuildCommand` (`pnpm build`) itself, so the
+      # step above is a fast-fail for the frontend, not a prerequisite for this one.
+      - name: Tauri build (the bundle must bundle)
+        run: pnpm --filter ai-provider-router-desktop tauri build --bundles app
       - name: Key-leak grep (criterion 5)
         run: pnpm key-leak-grep
       - name: Single TypeScript version (audit R6)
@@ -120,18 +129,30 @@ jobs:
       - uses: swatinem/rust-cache@v2
         with:
           workspaces: apps/desktop/src-tauri
-      # `tauri` is still an unconditional dependency of this package and `build.rs` still runs
-      # `tauri_build::build()` for every target, so building the service still compiles Tauri --
-      # and on Linux that means WebKitGTK. These packages are the cost of that coupling, not of
-      # the service; a separate `core` crate or a `tauri` feature would remove this step.
-      - name: Linux system deps (WebKitGTK, via the tauri dependency)
+      # `--no-default-features` is the whole point of this job, and its absence is why the first
+      # version of it proved nothing: it built the service WITH the `app` feature, so Tauri was
+      # compiled and the WebKitGTK step below was genuinely required. The package now declares
+      # `default = ["app"]` with `tauri`/`tauri-plugin-opener` optional, so this flag drops the
+      # runtime crate (and `wry`, and WebKitGTK) from the graph entirely -- measured locally with
+      # `cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` -> 0.
+      #
+      # GTK/WebKit/rsvg/appindicator are therefore no longer installed. What remains is the C
+      # toolchain (`rusqlite`) and `libssl-dev`/`pkg-config` (a transitive TLS build); the ubuntu
+      # runner image carries all three already, so this step is a statement of the requirement
+      # rather than a fix -- and CI is the only measurement of it. `tauri-build` is still compiled:
+      # Cargo has no optional build-dependencies, so `[build-dependencies]` cannot be feature-gated
+      # even though `build.rs` no longer calls `tauri_build::build()` without the feature.
+      #
+      # Deliberately NOT `-D warnings`: `cargo check --no-default-features` is warning-free on
+      # macOS, but macOS-only code cfg'd out on Linux can surface dead-code lints that macOS never
+      # sees. Tightening this step waits until a Linux run has shown its own lint set.
+      - name: Linux system deps (no WebKitGTK -- the service no longer compiles Tauri)
         if: matrix.os == 'ubuntu-latest'
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential curl wget file libssl-dev libgtk-3-dev \
-            libayatana-appindicator3-dev librsvg2-dev libwebkit2gtk-4.1-dev patchelf
+          sudo apt-get install -y build-essential pkg-config libssl-dev
       - name: Build headless service binary
-        run: cargo build --bin aiproviderd --release
+        run: cargo build --bin aiproviderd --release --no-default-features
         working-directory: apps/desktop/src-tauri
       # `--version` is the whole of the runtime assertion here, deliberately. It needs no port,
       # no keychain approval and no store, so it cannot flake -- and it still proves the binary

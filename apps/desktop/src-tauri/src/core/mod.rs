@@ -1,18 +1,29 @@
 //! Tauri-independent half of the crate: the HTTP gateway, the SQLite store, the keychain
 //! vault, and the store helpers they call.
 //!
-//! Split for the headless service (`src/bin/aiproviderd.rs`). The rule is **module-level, not
-//! crate-level**: nothing here may name `crate::tauri::*`. Importing the `tauri` *crate* is
-//! still tolerated and still happens — `persist` carries `#[tauri::command]` handlers and
-//! `egress::stream` takes a `tauri::ipc::Channel`, because those annotations sit on functions
-//! that are otherwise just store queries. `Cargo.toml` makes `tauri` an unconditional
-//! dependency either way, so the binary links it regardless. Removing those *types* from this
-//! half is Phase 2 work, not Phase 1.
+//! Split for the headless service (`src/bin/aiproviderd.rs`). Two rules, and they are different
+//! strengths:
 //!
-//! One `cfg(test)` edge does point back at `tauri/`: `gateway_tests` constructs a
-//! `gateway_cmds::GatewayState`. That is fine for `cargo build --bin aiproviderd` (tests are
-//! not compiled) and harmless for `cargo test` (the whole crate is), and it is recorded rather
-//! than hidden.
+//! 1. **No `core` module may name `crate::tauri::*`** in code that is not `cfg(test)`.
+//! 2. **Every mention of the `tauri` *crate* is behind `#[cfg(feature = "app")]`.** This is the
+//!    stronger claim and it is the one that makes the dependency split real: with
+//!    `--no-default-features` the `tauri` runtime crate, `wry` and WebKitGTK leave the graph
+//!    entirely, so `cargo build --bin aiproviderd --no-default-features` compiles no Tauri at
+//!    all. The mentions are the 28 `#[tauri::command]` attributes in `persist`, its
+//!    `use tauri::State;`, `egress::stream`'s `tauri::ipc::Channel`, and the app-only helpers
+//!    those wrappers reach — gated so that "the service is Tauri-free" is a property of the
+//!    build, not just of the source.
+//!
+//! `Cargo.toml` declares `default = ["app"]` and makes `tauri`/`tauri-plugin-opener` optional, so
+//! a plain `cargo build`/`test`/`clippy` behaves exactly as before. `tauri-build` is the one
+//! exception that cannot be gated: Cargo has no optional build-dependencies, so it is compiled
+//! even when the feature is off. `build.rs` reads `CARGO_FEATURE_APP` and skips
+//! `tauri_build::build()` in that case, which is what keeps the build script itself Tauri-free.
+//!
+//! One `cfg(test)` edge points back at `tauri/`: `gateway_tests` constructs a
+//! `gateway_cmds::GatewayState` in five functions, each carrying the same gate. That is fine for
+//! `cargo build --bin aiproviderd` (tests are not compiled) and harmless for `cargo test` (the
+//! whole crate is), and it is recorded rather than hidden.
 
 pub mod capture;
 pub mod context;

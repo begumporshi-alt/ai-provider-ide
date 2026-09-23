@@ -32,76 +32,6 @@ impl From<vault::VaultError> for CommandError {
         CommandError(e.to_string())
     }
 }
-impl From<crate::core::store::StoreError> for CommandError {
-    fn from(e: crate::core::store::StoreError) -> Self {
-        match e {
-            crate::core::store::StoreError::Sql(inner) => CommandError(ui_db_error(&inner)),
-            crate::core::store::StoreError::Io(inner) => {
-                tracing::warn!("store io error (detail withheld from the UI): {inner}");
-                CommandError(match inner.kind() {
-                    std::io::ErrorKind::NotFound => {
-                        "a required file or folder is missing".to_string()
-                    }
-                    std::io::ErrorKind::PermissionDenied => "permission was denied".to_string(),
-                    std::io::ErrorKind::AlreadyExists => "that already exists".to_string(),
-                    _ => "a file operation failed".to_string(),
-                })
-            }
-            // A migration carries its own id, which is safe and is the one thing the operator
-            // needs — the rest of the detail is SQL.
-            crate::core::store::StoreError::Migration(id, detail) => {
-                tracing::warn!("migration {id} failed: {detail}");
-                CommandError(format!("migration {id} failed"))
-            }
-        }
-    }
-}
-impl From<rusqlite::Error> for CommandError {
-    fn from(e: rusqlite::Error) -> Self {
-        CommandError(ui_db_error(&e))
-    }
-}
-
-/// What the webview is told when the store fails.
-///
-/// rusqlite's `Display` is honest, and that is exactly the problem — measured, not assumed:
-///
-/// | failure | `e.to_string()` |
-/// |---|---|
-/// | cannot open | `unable to open database file: /Users/<account>/Library/…/ai-provider-router.db` |
-/// | bad SQL | `near "FROM": syntax error in SELECT FROM WHERE at offset 7` |
-/// | missing column | `no such column: nope in SELECT nope FROM t at offset 7` |
-///
-/// All three carry something the person using the app does not need: an absolute path that
-/// names the account, or the schema's own table and column names. None of it helps them decide
-/// what to do next. So the detail is logged host-side and the boundary returns a stable
-/// sentence that still names the *class* of failure.
-///
-/// Deliberately not applied to hand-written messages (`context::record`'s "unknown node kind")
-/// — those are already written for a person to read, and sanitising them would strip the one
-/// thing that makes them useful.
-fn ui_db_error(e: &rusqlite::Error) -> String {
-    tracing::warn!("store error (detail withheld from the UI): {e}");
-    match e {
-        // The SQL text is embedded in this variant by construction.
-        rusqlite::Error::SqlInputError { .. } => "an internal query failed".to_string(),
-        rusqlite::Error::SqliteFailure(ffi, _) => match ffi.code {
-            rusqlite::ErrorCode::CannotOpen => "the database could not be opened".to_string(),
-            rusqlite::ErrorCode::NotADatabase => {
-                "the database file is not a valid database".to_string()
-            }
-            rusqlite::ErrorCode::DatabaseBusy => "the database is busy; try again".to_string(),
-            rusqlite::ErrorCode::DiskFull => "the disk is full".to_string(),
-            rusqlite::ErrorCode::ReadOnly => "the database is read-only".to_string(),
-            rusqlite::ErrorCode::ConstraintViolation => {
-                "the change was rejected by a database constraint".to_string()
-            }
-            _ => "a database error occurred".to_string(),
-        },
-        rusqlite::Error::QueryReturnedNoRows => "no matching row was found".to_string(),
-        _ => "a database error occurred".to_string(),
-    }
-}
 
 /// All webview-facing vault accounts must be provider keys (`key:<keyId>`); the gateway
 /// `masterkey` account is host-only (invariant 10).
@@ -813,7 +743,7 @@ mod ui_error_tests {
         let db = dir.join(format!("secret-{}-path", whoamiish())).join("db.sqlite");
         let err = rusqlite::Connection::open(&db).expect_err("a missing parent must fail");
         assert!(err.to_string().contains("secret"), "the raw error really does carry the path");
-        let ui = ui_db_error(&err);
+        let ui = crate::core::error::ui_db_error(&err);
         assert!(!ui.contains("secret"), "path leaked to the UI: {ui}");
         assert!(!ui.contains('/'), "path leaked to the UI: {ui}");
         assert_eq!(ui, "the database could not be opened");
@@ -833,7 +763,7 @@ mod ui_error_tests {
             .prepare("SELECT api_secret FROM private_table WHERE FROM")
             .expect_err("malformed SQL must fail");
         assert!(err.to_string().contains("private_table"), "raw error carries the SQL: {err}");
-        let ui = ui_db_error(&err);
+        let ui = crate::core::error::ui_db_error(&err);
         assert!(!ui.contains("private_table"), "SQL leaked to the UI: {ui}");
         assert!(!ui.contains("api_secret"), "SQL leaked to the UI: {ui}");
     }
@@ -843,7 +773,7 @@ mod ui_error_tests {
         let c = rusqlite::Connection::open_in_memory().unwrap();
         c.execute_batch("CREATE TABLE keys (id TEXT PRIMARY KEY);").unwrap();
         let err = c.prepare("SELECT api_secret FROM keys").expect_err("unknown column");
-        let ui = ui_db_error(&err);
+        let ui = crate::core::error::ui_db_error(&err);
         assert!(!ui.contains("api_secret"), "column leaked to the UI: {ui}");
         assert!(!ui.contains("keys"), "table leaked to the UI: {ui}");
     }
@@ -862,7 +792,7 @@ mod ui_error_tests {
             Ok(())
         })()
         .expect_err("a zeroed file is not a database");
-        let ui = ui_db_error(&err);
+        let ui = crate::core::error::ui_db_error(&err);
         assert!(ui.contains("not a valid database"), "was: {ui}");
         let _ = std::fs::remove_dir_all(&dir);
     }

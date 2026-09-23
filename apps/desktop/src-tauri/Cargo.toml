@@ -24,10 +24,25 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 # Standalone gateway service — headless mode, dev-book §10. Cargo would discover this from
 # `src/bin/` anyway; it is declared so the target name cannot drift from the docs and so a
 # reader can see there are two binaries without hunting the filesystem.
-# The desktop app's own binary is `src/main.rs`, auto-discovered as `ai-provider-router`.
 [[bin]]
 name = "aiproviderd"
 path = "src/bin/aiproviderd.rs"
+
+# The desktop app's own binary. `required-features` is what makes `cargo build
+# --no-default-features` skip it — without it, a feature-less build would still compile
+# `src/main.rs`, which calls the Tauri `run()` entry point the feature gates away.
+[[bin]]
+name = "ai-provider-router"
+path = "src/main.rs"
+required-features = ["app"]
+
+[features]
+# `app` is the desktop application — everything that needs Tauri. The headless service does not:
+# `cargo build --bin aiproviderd --no-default-features` compiles **no Tauri at all**, which is
+# what lets the Linux CI job stop installing WebKitGTK, and what makes "headless" true of the
+# dependency graph rather than only of the source. See dev-book §10 §2.1.1.
+default = ["app"]
+app = ["dep:tauri", "dep:tauri-plugin-opener"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -35,8 +50,8 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 # `tray-icon` (R1): background mode needs a way back into a windowless app. `image-png`
 # lets the tray reuse the bundled icon instead of shipping a second one.
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
-tauri-plugin-opener = "2"
+tauri = { version = "2", features = ["tray-icon", "image-png"], optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }

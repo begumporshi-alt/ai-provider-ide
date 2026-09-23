@@ -25,7 +25,7 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |
 | Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. **0016 is in the source but not in the installed database** — measured 2026-09-23, the live DB sits at `schema_version` 15, so `ledger.app_key_id` does not exist there yet and attribution begins on the first launch after a rebuild |
 | Schema | 17 versions, count asserted, rewind-tested | `core/store.rs:1009-1013` |
-| Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Does not serve completions** — the router core is still TypeScript in a webview, so every completion route answers 503 by design | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1; new CI job `headless-service` |
+| Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; **`core/` no longer compiles Tauri at all** — `default = ["app"]` with both Tauri crates `optional` and every `tauri` mention behind `#[cfg(feature = "app")]`, so `cargo build --bin aiproviderd --no-default-features` drops `tauri`/`wry`/WebKitGTK from the graph entirely. `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Does not serve completions** — the router core is still TypeScript in a webview, so every completion route answers 503 by design | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1; CI job `headless-service`, which now builds with `--no-default-features` and installs no GTK/WebKit |
 | Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
@@ -197,6 +197,21 @@ hides and the gateway keeps serving, with the tray as the way back. Headless ser
 detached from any window *and* from the app process — is [under way: Phase 1 landed 2026-09-23](10-headless-service.md),
 and `aiproviderd` starts and serves `GET /health` with no window and no Tauri app.
 
+**The dependency half of the split closed on 2026-09-23, and it is a stronger claim than the source
+half.** Phase 1 originally made `core/` Tauri-free in *source* only: `persist` still carried 28
+`#[tauri::command]` attributes, `egress::stream` still took a `tauri::ipc::Channel`, and `Cargo.toml`
+kept `tauri` unconditional — so `cargo build --bin aiproviderd` compiled Tauri, and the Linux CI job
+had to install WebKitGTK to let it. The package now declares `default = ["app"]`, both Tauri crates are
+`optional`, and every `tauri` mention in `core/` sits behind `#[cfg(feature = "app")]`. Measured:
+`cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → **0**; the feature-less
+release binary is **380 KB smaller** (4,073,968 B vs 4,454,336 B, the difference being Tauri not
+linked); `cargo check --no-default-features` is warning-free; `cargo test` still 489 passed / 0 failed.
+The Linux job builds with `--no-default-features` and installs no GTK/WebKit. Two things this does
+**not** do: `tauri-build` still compiles, because Cargo has no optional build-dependencies, so
+`[build-dependencies]` cannot be feature-gated even though `build.rs` no longer calls
+`tauri_build::build()` without the feature; and the `Bridge` trait itself is untouched — `aiproviderd`
+still installs `HeadlessBridge`, which discards every dispatch, so the 503 contract is unchanged.
+
 **This row stays, and Phase 1 is why.** What Phase 1 does not do is serve completions. The router core is
 still TypeScript in a hidden webview, reached through the `Bridge` trait, and the standalone service has
 nothing to bridge to — so it installs a bridge that discards every dispatch and every completion route answers
@@ -234,6 +249,8 @@ sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provide
 sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
   "SELECT COUNT(*) FROM pragma_table_info('ledger') WHERE name='cached_tokens';"   # expect 1
 cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings  # expect clean
+cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --bin aiproviderd --release --no-default-features
+cargo tree  --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --edges all | grep -ci 'webkit|wry|gtk'  # expect 0
 ```
 
 Counts in this chapter came from the tree, not from other docs — the documented test counts had drifted twice
