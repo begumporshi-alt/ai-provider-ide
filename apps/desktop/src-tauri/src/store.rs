@@ -336,6 +336,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0014_superseded_at", backfill_superseded_at),
     ("0015_ledger_cached_tokens", backfill_ledger_cached_tokens),
     ("0016_ledger_app_key", backfill_ledger_app_key),
+    ("0017_gateway_key_cap", backfill_gateway_key_cap),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -866,6 +867,38 @@ fn backfill_ledger_app_key(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<(
     Ok(())
 }
 
+/// 0017 — the cap itself, plus the index the enforcement query needs.
+///
+/// 0016 recorded *who* paid. This records *how much they are allowed to*, which is the half the
+/// global cap could not express: `settings.spend.capMicrosPerMonth` compares one `month_micros`
+/// against one `cap_micros`, so a runaway consumer could spend the owner's whole budget while
+/// every other app sat idle. A cap on the key is the narrow instrument that was missing.
+///
+/// **Nullable, and `NULL` is the only representation of "no cap".** `gateway_key_cap_set`
+/// normalizes `<= 0` to `NULL` rather than storing a zero, so the column never carries two
+/// spellings of the same state — the defect that makes a later SUM ambiguous. (The global cap
+/// collapses `<= 0` at *read* time instead, because its value lives in a JSON blob where a legacy
+/// `0` may already exist; a new column has no such history to honour.)
+///
+/// **The index belongs here, not in 0016, and 0016 says so** — it declined to ship a column with
+/// an index for a query nobody had written. This is that query: `SUM(cost_estimate_micros) WHERE
+/// app_key_id = ? AND ts >= <month start>`, which is the same shape as the existing
+/// `idx_ledger_provider_ts` and would otherwise be a full scan on every gateway request.
+///
+/// The `CREATE INDEX` is deliberately unguarded. `app_key_id` is guaranteed to exist by now:
+/// 0016 precedes this step in the same pass, and any database already past 0016 got the column on
+/// the launch that applied it. If it somehow does not exist, failing loudly is right — a silent
+/// skip would leave the gate doing full scans with no symptom to notice.
+fn backfill_gateway_key_cap(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "gateway_keys", "cap_micros")? {
+        tx.execute_batch("ALTER TABLE gateway_keys ADD COLUMN cap_micros INTEGER;")?;
+    }
+    tx.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_ledger_app_key_ts ON ledger(app_key_id, ts);",
+    )?;
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -973,11 +1006,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0016 data migrations.
-        assert_eq!(info.schema_version, 16);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0017 data migrations.
+        assert_eq!(info.schema_version, 17);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(16, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(17, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1129,6 +1162,73 @@ mod tests {
         // `stmt` still borrows `conn`, so it has to be dropped before `conn` can be moved.
         drop(stmt);
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0017 — the per-app cap column and the index the gate reads it with.
+    ///
+    /// Two separate claims, both of which can be false while the migration reports success. The
+    /// **column** must be nullable with no default, because `NULL` is how "this app has no cap"
+    /// is spelled; a `NOT NULL DEFAULT 0` would make every app look capped at zero and refuse
+    /// every request. The **index** is the difference between the gate's per-app SUM being an
+    /// indexed range scan and being a full table scan on every single gateway request — invisible
+    /// in behaviour, and therefore invisible in every test that does not look for it.
+    #[test]
+    fn gateway_key_cap_is_nullable_and_the_app_key_index_exists() {
+        let dir = std::env::temp_dir().join(format!("aip-keycap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+
+        let conn = s.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(gateway_keys)").unwrap();
+        let cols: Vec<(String, i64, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let cap = cols
+            .iter()
+            .find(|(n, _, _)| n == "cap_micros")
+            .expect("gateway_keys is missing cap_micros");
+        assert_eq!(cap.1, 0, "cap_micros must be nullable (notnull=0)");
+        assert!(cap.2.is_none(), "cap_micros must carry no default, so an uncapped key stays NULL");
+
+        // A key created the ordinary way must not arrive capped.
+        conn.execute(
+            "INSERT INTO gateway_keys (id, label, created_at) VALUES ('ak-1','cursor',1)",
+            [],
+        )
+        .unwrap();
+        let v: Option<i64> = conn
+            .query_row("SELECT cap_micros FROM gateway_keys WHERE id='ak-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, None, "a new key must be uncapped, not capped at zero");
+
+        // Present-but-unwritable would satisfy everything above, so write through it as well.
+        conn.execute("UPDATE gateway_keys SET cap_micros=2500000 WHERE id='ak-1'", []).unwrap();
+        let v: Option<i64> = conn
+            .query_row("SELECT cap_micros FROM gateway_keys WHERE id='ak-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, Some(2_500_000), "cap_micros must accept a value");
+
+        // The index the enforcement SUM needs. Named exactly, because a missing index degrades
+        // silently — the query still answers, just by scanning every ledger row per request.
+        let idx: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_ledger_app_key_ts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(idx, 1, "the per-app spend SUM needs idx_ledger_app_key_ts");
+
+        // `stmt` still borrows `conn`, so it has to be dropped before `conn` can be moved.
+        drop(stmt);
+        drop(conn);
+        // Re-migrating must not fail: app startup runs this on every launch.
+        s.migrate().expect("0017 is idempotent");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

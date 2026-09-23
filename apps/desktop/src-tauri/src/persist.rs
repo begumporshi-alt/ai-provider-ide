@@ -3,6 +3,7 @@
 //! (camelCase wire format). Provider CRUD also maintains the egress allowlist host-side —
 //! the webview has NO command that mutates it (diff-review Blocker 2).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use rusqlite::params;
@@ -915,12 +916,15 @@ pub struct GatewayKeyRow {
     pub created_at: i64,
     pub last_used_at: Option<i64>,
     pub revoked_at: Option<i64>,
+    /// 0017: this app's own monthly cap in micro-USD. `None` = uncapped. Never `Some(0)` — see
+    /// `gateway_key_cap_set`.
+    pub cap_micros: Option<i64>,
 }
 
 pub fn gateway_keys_list(store: &Store) -> Result<Vec<GatewayKeyRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
-        "SELECT id, label, created_at, last_used_at, revoked_at FROM gateway_keys ORDER BY created_at DESC",
+        "SELECT id, label, created_at, last_used_at, revoked_at, cap_micros FROM gateway_keys ORDER BY created_at DESC",
     )?;
     let rows = stmt
         .query_map([], |r| {
@@ -930,10 +934,42 @@ pub fn gateway_keys_list(store: &Store) -> Result<Vec<GatewayKeyRow>, CommandErr
                 created_at: r.get(2)?,
                 last_used_at: r.get(3)?,
                 revoked_at: r.get(4)?,
+                cap_micros: r.get(5)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// 0017: set or clear one app's monthly cap, in micro-USD.
+///
+/// `<= 0` **clears** the cap and stores `NULL` rather than a zero. Two spellings of "uncapped"
+/// would make the column ambiguous the moment anything sums or compares it, and the ambiguity
+/// would be invisible: both values behave identically until a query uses `IS NULL` to mean
+/// "no cap was ever set", at which point the zeros quietly fall on the wrong side.
+///
+/// A cap on a key that does not exist is an error rather than a silent no-op, mirroring
+/// `gateway_key_revoke`: an update that changed no row reported success for nothing.
+pub fn gateway_key_cap_set(store: &Store, id: &str, cap_micros: i64) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let stored = if cap_micros > 0 { Some(cap_micros) } else { None };
+    let changed =
+        conn.execute("UPDATE gateway_keys SET cap_micros=?2 WHERE id=?1", params![id, stored])?;
+    if changed == 0 {
+        return Err(CommandError(format!("gateway key not found: {id}")));
+    }
+    Ok(())
+}
+
+/// One app's cap, or `None` when it has none. Read by the spend gate on every gateway request.
+pub fn gateway_key_cap(store: &Store, id: &str) -> Option<i64> {
+    let conn = store.conn.lock().ok()?;
+    conn.query_row("SELECT cap_micros FROM gateway_keys WHERE id=?1", params![id], |r| {
+        r.get::<_, Option<i64>>(0)
+    })
+    .ok()
+    .flatten()
+    .filter(|cap| *cap > 0)
 }
 
 /// Register a key row. The caller generates the secret, copies it to the clipboard, and stores
@@ -988,6 +1024,58 @@ pub fn month_spend_micros(store: &Store) -> i64 {
         |r| r.get(0),
     )
     .unwrap_or(0)
+}
+
+/// One app's month-to-date spend in micro-USD.
+///
+/// The same UTC month boundary and the same "all sources" scope as `month_spend_micros`; the only
+/// difference is the `app_key_id` predicate. Rows written before 0016 carry `NULL` there, so an
+/// app's total starts from the first request made after attribution was connected — which is the
+/// honest number, because nothing can reconstruct which app paid before that.
+///
+/// Served by `idx_ledger_app_key_ts`, added in 0017 for exactly this query.
+pub fn app_month_spend_micros(store: &Store, app_key_id: &str) -> i64 {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return 0,
+    };
+    conn.query_row(
+        "SELECT COALESCE(SUM(cost_estimate_micros), 0) FROM ledger
+         WHERE app_key_id = ?1
+           AND ts >= CAST(strftime('%s', 'now', 'start of month', 'utc') AS INTEGER) * 1000",
+        params![app_key_id],
+        |r| r.get(0),
+    )
+    .unwrap_or(0)
+}
+
+/// Every app's month-to-date spend, keyed by `gateway_keys.id`.
+///
+/// One grouped query rather than one per key: the screen renders a row per key, so a per-key query
+/// would make that screen's cost scale with the number of apps configured. A key with no
+/// attributed spend is simply absent — the caller reads a missing entry as zero, which is the same
+/// answer the SQL would have given.
+pub fn month_spend_by_app(store: &Store) -> HashMap<String, i64> {
+    let conn = match store.conn.lock() {
+        Ok(c) => c,
+        Err(_) => return HashMap::new(),
+    };
+    let mut stmt = match conn.prepare(
+        "SELECT app_key_id, COALESCE(SUM(cost_estimate_micros), 0) FROM ledger
+         WHERE app_key_id IS NOT NULL
+           AND ts >= CAST(strftime('%s', 'now', 'start of month', 'utc') AS INTEGER) * 1000
+         GROUP BY app_key_id",
+    ) {
+        Ok(s) => s,
+        Err(_) => return HashMap::new(),
+    };
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
+        .and_then(|it| it.collect::<Result<Vec<_>, _>>());
+    match rows {
+        Ok(v) => v.into_iter().collect(),
+        Err(_) => HashMap::new(),
+    }
 }
 
 /// Spend cap in micro-USD, or 0/None when disabled.
@@ -1495,6 +1583,93 @@ mod persist_tests {
             }
         }
         assert_eq!(month_spend_micros(&store), 350, "only the current UTC month counts");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0017: the per-app cap round-trips, `<= 0` clears it, and a missing key is an error.
+    ///
+    /// The last one is the point of the test. `UPDATE ... WHERE id=?` that matches nothing is not
+    /// a failure in SQL — it changes zero rows and reports success — so a cap set against a key the
+    /// UI has already deleted would be acknowledged and then silently absent, which is the worst
+    /// shape: the operator believes a budget is in force and none is.
+    #[test]
+    fn per_app_cap_round_trips_and_clears_and_rejects_an_unknown_key() {
+        let (store, dir) = tmp_store("appcap");
+        gateway_key_insert(&store, "ak-1", "cursor").unwrap();
+
+        assert_eq!(gateway_key_cap(&store, "ak-1"), None, "a new key has no cap");
+        gateway_key_cap_set(&store, "ak-1", 2_500_000).unwrap();
+        assert_eq!(gateway_key_cap(&store, "ak-1"), Some(2_500_000));
+        gateway_key_cap_set(&store, "ak-1", 4_000_000).unwrap();
+        assert_eq!(gateway_key_cap(&store, "ak-1"), Some(4_000_000), "set must overwrite");
+
+        gateway_key_cap_set(&store, "ak-1", 0).unwrap();
+        assert_eq!(gateway_key_cap(&store, "ak-1"), None, "0 clears the cap");
+        gateway_key_cap_set(&store, "ak-1", 7_000_000).unwrap();
+        gateway_key_cap_set(&store, "ak-1", -5).unwrap();
+        assert_eq!(gateway_key_cap(&store, "ak-1"), None, "a negative clears it too");
+
+        assert!(
+            gateway_key_cap_set(&store, "ak-nope", 1_000).is_err(),
+            "a cap on a key that does not exist must report, not silently no-op"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Clearing a cap stores `NULL`, never `0`. Both read as "uncapped" today, so this can only be
+    /// caught by looking at the stored value — which is exactly why it needs a test: the moment
+    /// anything queries `cap_micros IS NULL` to mean "no cap was ever set", the zeros land on the
+    /// wrong side of it and nothing in the behaviour changes to warn anyone.
+    #[test]
+    fn clearing_a_per_app_cap_stores_null_not_zero() {
+        let (store, dir) = tmp_store("appcapnull");
+        gateway_key_insert(&store, "ak-1", "cursor").unwrap();
+        gateway_key_cap_set(&store, "ak-1", 0).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        let raw: Option<i64> = conn
+            .query_row("SELECT cap_micros FROM gateway_keys WHERE id='ak-1'", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(raw, None, "clearing must store NULL, not 0 — one spelling, not two");
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Per-app spend is scoped by **two** things at once, and a test that only varied one would
+    /// pass against an implementation that ignored the other. So the same app has an out-of-month
+    /// row and a second app has an in-month row, and neither may leak into the answer.
+    #[test]
+    fn app_month_spend_is_scoped_by_app_and_by_month() {
+        let (store, dir) = tmp_store("appspend");
+        let now = now_ms();
+        let two_months_ago = now - 62 * 24 * 3600 * 1000;
+        {
+            let conn = store.conn.lock().unwrap();
+            for (app, ts, cost) in [
+                (Some("ak-1"), now, 100_i64),
+                (Some("ak-1"), two_months_ago, 999_i64), // wrong month
+                (Some("ak-2"), now, 250_i64),            // wrong app
+                (None, now, 777_i64),                    // unattributed: belongs to no app
+            ] {
+                conn.execute(
+                    "INSERT INTO ledger (ts, modality, source, provider_id, model, status, tokens_in, tokens_out, cost_estimate_micros, app_key_id)
+                     VALUES (?1,'text','gateway','p','m','ok',1,1,?2,?3)",
+                    params![ts, cost, app],
+                )
+                .unwrap();
+            }
+        }
+        assert_eq!(app_month_spend_micros(&store, "ak-1"), 100, "only ak-1, only this month");
+        assert_eq!(app_month_spend_micros(&store, "ak-2"), 250);
+        assert_eq!(app_month_spend_micros(&store, "ak-nobody"), 0, "an unseen app spent nothing");
+
+        // The grouped read must agree with the per-key one, or the list screen and the gate would
+        // report different numbers for the same app — the drift this pair of functions exists to
+        // avoid. The unattributed row appears under no key at all.
+        let by_app = month_spend_by_app(&store);
+        assert_eq!(by_app.get("ak-1"), Some(&100));
+        assert_eq!(by_app.get("ak-2"), Some(&250));
+        assert_eq!(by_app.len(), 2, "an unattributed row is nobody's spend");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -136,7 +136,8 @@ const queueStatus = {
 // screen quietly lies. Keep this list in step with the audit in REFERENCE.md.
 
 /** R4: per-app gateway keys. Mirrors persist.rs — revoke marks, delete removes, revoking twice
- * reports rather than silently succeeding. */
+ * reports rather than silently succeeding, and a budget is set per key (0017). Rows carry
+ * `capMicros` (null = uncapped) and `monthMicros`, matching `AppKeyView` in gateway_cmds.rs. */
 const appKeys: Row[] = [];
 /** R4 spend cap in micro-USD. `capped` is "at or over the cap", not "a cap is set" — that is what
  * gateway_cmds.rs computes, and the UI colours the number off it. */
@@ -510,6 +511,18 @@ let eventSeq = 0;
   /** Month-to-date spend, so a spec can put the cap in force without faking a month of traffic. */
   spendStatus: (next: Partial<typeof spendStatus>): void => {
     Object.assign(spendStatus, next);
+  },
+  /**
+   * Replace the per-app key list.
+   *
+   * Assigns rather than merges: the screen renders one row per key, and the states worth testing —
+   * capped and at its limit, capped and under it, uncapped — all require a specific combination of
+   * `capMicros` and `monthMicros` that no amount of clicking can produce, because a real month of
+   * traffic is what sets the second one.
+   */
+  appKeys: (next: Row[]): void => {
+    appKeys.length = 0;
+    appKeys.push(...next);
   },
   /**
    * Replace what `gateway_log_tail` answers. Assigns rather than merges: the log is a sequence, and
@@ -1588,13 +1601,16 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "gateway_app_key_create": {
       const label = String(args.label ?? "untitled");
       // Only {id, label} come back: the secret is generated and copied host-side and never
-      // enters the webview (R4).
+      // enters the webview (R4). `capMicros`/`monthMicros` mirror `AppKeyView` in gateway_cmds.rs
+      // — a key is born uncapped and has spent nothing.
       const row = {
         id: `ak-${appKeys.length + 1}`,
         label,
         createdAt: Date.now(),
         lastUsedAt: null,
         revokedAt: null,
+        capMicros: null,
+        monthMicros: 0,
       };
       appKeys.push(row);
       return { id: row.id, label };
@@ -1613,11 +1629,30 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       if (i >= 0) appKeys.splice(i, 1);
       return null;
     }
+    case "gateway_app_key_cap_set": {
+      const row = appKeys.find((k) => k.id === args.id);
+      // Mirrors persist.rs: a cap on a key that does not exist reports rather than silently
+      // succeeding — an acknowledged no-op reads to the operator as a budget in force.
+      if (!row) throw new Error(`gateway key not found: ${String(args.id)}`);
+      // `<= 0` clears, and is stored as `null` rather than `0`. One spelling of "no budget":
+      // persist.rs normalizes at write time for the same reason.
+      // `cap_micros`, not `capMicros`: `toRustArgs` renames top-level keys before `dispatch`, so a
+      // camelCase read here is always `undefined` and the cap silently becomes 0.
+      const micros = Number(args.cap_micros) || 0;
+      row.capMicros = micros > 0 ? micros : null;
+      return null;
+    }
     case "gateway_spend_status":
       return { ...spendStatus };
     case "gateway_spend_cap_set": {
       // Negative is clamped to 0, and 0 means "no cap" — which is also why `capped` is false then.
-      spendStatus.capMicros = Math.max(0, Number(args.capMicros) || 0);
+      //
+      // `cap_micros`, not `capMicros`. This case read the camel spelling until 2026-09-23, which
+      // `toRustArgs` had already renamed — so `Number(undefined) || 0` was always `0` and setting a
+      // global cap through the UI silently cleared it. Nothing caught it because the only spec that
+      // exercises the cap seeds it through `__webTest.spendStatus` and never calls this command;
+      // the same defect was found in the new per-app case below and traced back here.
+      spendStatus.capMicros = Math.max(0, Number(args.cap_micros) || 0);
       spendStatus.capped = spendStatus.capMicros > 0 && spendStatus.monthMicros >= spendStatus.capMicros;
       return null;
     }

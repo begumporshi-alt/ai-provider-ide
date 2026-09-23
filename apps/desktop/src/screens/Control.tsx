@@ -39,6 +39,7 @@ import {
   type InjectionStats,
   type MemoryStats,
 } from "../store";
+import { usd } from "../lib/format";
 import { useUi } from "../ui-state";
 
 // ---------- vocabulary ----------
@@ -166,14 +167,6 @@ function ago(ms: number | null | undefined): string {
   const m = Math.round(s / 60);
   if (m < 60) return `${m}m ago`;
   return `${Math.round(m / 60)}h ago`;
-}
-
-function usd(micros: number): string {
-  return (micros / 1_000_000).toLocaleString(undefined, {
-    style: "currency",
-    currency: "USD",
-    maximumFractionDigits: micros < 10_000 ? 4 : 2,
-  });
 }
 
 function clock(tsMs: number): string {

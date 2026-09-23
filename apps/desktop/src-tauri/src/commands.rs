@@ -735,6 +735,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::gateway_cmds::gateway_app_keys,
         crate::gateway_cmds::gateway_app_key_revoke,
         crate::gateway_cmds::gateway_app_key_delete,
+        // 0017: the per-app budget. Kept beside the key commands rather than with the global cap,
+        // because it is a property of one key — the same ownership rule that put the global cap on
+        // Control and the keys on Local Gateway.
+        crate::gateway_cmds::gateway_app_key_cap_set,
         crate::gateway_cmds::gateway_spend_status,
         crate::gateway_cmds::gateway_spend_cap_set,
         crate::gateway_cmds::gateway_heartbeat,

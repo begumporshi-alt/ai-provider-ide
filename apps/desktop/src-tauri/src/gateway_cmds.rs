@@ -466,11 +466,61 @@ pub fn gateway_app_key_create(
     Ok(AppKeyCreated { id, label })
 }
 
+/// One per-app key as the screen needs it: the stored metadata, plus the two numbers the budget
+/// control renders.
+///
+/// `monthMicros` is joined here rather than fetched per row by the UI, so listing the keys stays
+/// one grouped query instead of one per key — the shape that makes a screen's cost scale with the
+/// number of apps configured.
+///
+/// A field on this struct is not wiring: `store.ts` reads `capMicros` and `monthMicros`, and a
+/// rename here would leave the screen rendering `undefined` with nothing failing to compile.
+/// `web-test/shim.ts` carries the same shape, which is what makes the pair checkable.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AppKeyView {
+    pub id: String,
+    pub label: String,
+    pub created_at: i64,
+    pub last_used_at: Option<i64>,
+    pub revoked_at: Option<i64>,
+    /// 0017: this app's own monthly budget in micro-USD. `None` = uncapped.
+    pub cap_micros: Option<i64>,
+    /// Month-to-date spend attributed to this app. Zero for a key that has not served a request
+    /// since attribution landed — not an error, and not evidence the key is unused.
+    pub month_micros: i64,
+}
+
 #[tauri::command]
-pub fn gateway_app_keys(
+pub fn gateway_app_keys(store: State<'_, Arc<Store>>) -> Result<Vec<AppKeyView>, String> {
+    let rows = crate::persist::gateway_keys_list(&store).map_err(|e| e.to_string())?;
+    let spend = crate::persist::month_spend_by_app(&store);
+    Ok(rows
+        .into_iter()
+        .map(|k| AppKeyView {
+            month_micros: spend.get(&k.id).copied().unwrap_or(0),
+            id: k.id,
+            label: k.label,
+            created_at: k.created_at,
+            last_used_at: k.last_used_at,
+            revoked_at: k.revoked_at,
+            cap_micros: k.cap_micros,
+        })
+        .collect())
+}
+
+/// 0017: set one app's monthly budget in micro-USD. `0` — or anything negative — clears it.
+///
+/// The value is passed through rather than clamped here: `gateway_key_cap_set` owns the
+/// normalization (`<= 0` → `NULL`), and clamping in two places is how two spellings of "uncapped"
+/// get introduced.
+#[tauri::command]
+pub fn gateway_app_key_cap_set(
     store: State<'_, Arc<Store>>,
-) -> Result<Vec<crate::persist::GatewayKeyRow>, String> {
-    crate::persist::gateway_keys_list(&store).map_err(|e| e.to_string())
+    id: String,
+    cap_micros: i64,
+) -> Result<(), String> {
+    crate::persist::gateway_key_cap_set(&store, &id, cap_micros).map_err(|e| e.to_string())
 }
 
 /// Revoke one app key. Takes effect on the next request — the master key and every other app

@@ -997,7 +997,17 @@ fn core_with(
         core = core.with_app_keys(Arc::new(move || ak.lock().unwrap().clone()));
     }
     if let Some(sp) = spend {
-        core = core.with_spend(Arc::new(move || *sp.lock().unwrap()));
+        // The tuple is the *global* pair. The per-app half stays `None` here so these cases keep
+        // testing exactly what they always did; the per-app cases use `start_with_spend`.
+        core = core.with_spend(Arc::new(move |_app: Option<&str>| {
+            let (spent, cap) = *sp.lock().unwrap();
+            SpendLimits {
+                total_micros: spent,
+                total_cap_micros: cap,
+                app_micros: None,
+                app_cap_micros: None,
+            }
+        }));
     }
     let core = Arc::new(core);
     bridge.attach(&core);
@@ -1019,6 +1029,53 @@ async fn start_with(
         bridge,
         _handle: handle,
     }
+}
+
+/// `start()` with a spend provider the test writes by hand.
+///
+/// `start_with`'s tuple is a *fixed* global pair, which cannot express the per-app cases: those
+/// need the answer to depend on **who is asking**, and that dependency is the entire change. A
+/// closure is the only shape that lets one request from `ak-1` be refused while the same moment's
+/// request from `ak-2` is served.
+async fn start_with_spend(
+    app_keys: Option<Arc<Mutex<Vec<AppKey>>>>,
+    spend: SpendProvider,
+) -> TestServer {
+    let master = Arc::new(Mutex::new(Some("sk-aip-master".to_string())));
+    let bridge = Arc::new(SynthBridge::new());
+    let mut core =
+        GatewayCore::new(bridge.clone(), Arc::new(move || master.lock().unwrap().clone()));
+    if let Some(ak) = app_keys {
+        core = core.with_app_keys(Arc::new(move || ak.lock().unwrap().clone()));
+    }
+    core = core.with_spend(spend);
+    let core = Arc::new(core);
+    bridge.attach(&core);
+    core.set_running(true);
+    let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+    TestServer {
+        client: reqwest::Client::new(),
+        base: format!("http://{}", handle.addr),
+        core,
+        bridge,
+        _handle: handle,
+    }
+}
+
+/// A spend provider that answers from `limits_for` **and records every caller it is asked about**.
+///
+/// Recording the argument is the only way to prove the gate passes the identity that actually
+/// authenticated. A gate that passed, say, the first configured key would satisfy every
+/// status-code assertion below while billing the wrong app — the failure would be invisible
+/// until the wrong app hit its budget.
+fn recording_spend(
+    calls: Arc<Mutex<Vec<Option<String>>>>,
+    limits_for: impl Fn(Option<&str>) -> SpendLimits + Send + Sync + 'static,
+) -> SpendProvider {
+    Arc::new(move |app: Option<&str>| {
+        calls.lock().unwrap().push(app.map(str::to_string));
+        limits_for(app)
+    })
 }
 
 async fn post_chat(s: &TestServer, bearer: &str) -> reqwest::Response {
@@ -1370,6 +1427,132 @@ async fn r4_spend_cap_not_disclosed_to_unauthenticated() {
     assert_eq!(res.status(), 401, "spend state must not leak pre-auth");
 }
 
+// ---------- 0017: per-app budgets ----------
+//
+// The global cap bounds what the owner pays. These four cover the narrower instrument: one app's
+// slice. They are deliberately cross-checked, because the interesting failure is not "a cap was
+// ignored" — it is "the wrong cap was applied to the wrong caller", which every single-sided
+// assertion passes.
+
+/// The property the feature exists for: one app reaching its budget must not stop any other app,
+/// and must not stop the owner. A gate that refused everything once any app was capped would
+/// satisfy a test that only checked the refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_per_app_cap_refuses_only_the_app_that_reached_it() {
+    let s = start_with_spend(
+        Some(ak(&[("ak-1", "sk-aip-app1"), ("ak-2", "sk-aip-app2")])),
+        Arc::new(|app: Option<&str>| SpendLimits {
+            total_micros: 0,
+            total_cap_micros: 0, // no global cap in play
+            app_micros: Some(50),
+            app_cap_micros: if app == Some("ak-1") { Some(50) } else { None },
+        }),
+    )
+    .await;
+
+    let refused = post_chat(&s, "sk-aip-app1").await;
+    assert_eq!(refused.status(), 402, "the app at its budget is refused");
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["error"]["type"], "insufficient_quota");
+    assert_eq!(
+        body["error"]["code"], "app_budget_exceeded",
+        "a per-app refusal must name itself, not the global cap"
+    );
+
+    assert_eq!(
+        post_chat(&s, "sk-aip-app2").await.status(),
+        200,
+        "one app's budget must not close another's"
+    );
+    assert_eq!(
+        post_chat(&s, "sk-aip-master").await.status(),
+        200,
+        "nor the owner's — the master key has no app budget to exhaust"
+    );
+}
+
+/// The two limits are independent, and this is the case that proves it: the global cap is spent
+/// while this app is far under its own. A gate that computed a single binding limit (say, the
+/// smaller of the two) would let this request through, because the app's own numbers look fine.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_global_cap_refuses_an_app_that_is_under_its_own_cap() {
+    let s = start_with_spend(
+        Some(ak(&[("ak-1", "sk-aip-app1")])),
+        Arc::new(|_app: Option<&str>| SpendLimits {
+            total_micros: 900,
+            total_cap_micros: 900, // the owner's budget is gone
+            app_micros: Some(1),
+            app_cap_micros: Some(1_000_000), // this app has barely spent anything
+        }),
+    )
+    .await;
+
+    let res = post_chat(&s, "sk-aip-app1").await;
+    assert_eq!(res.status(), 402);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body["error"]["code"], "spend_cap_exceeded",
+        "the refusal must name the limit that actually bound, or the operator raises the wrong one"
+    );
+}
+
+/// An app that was never given a budget is governed by the global cap alone.
+///
+/// This pins the **property**, not one mechanism. Measured while falsifying it: `spend_gate` has
+/// two independent guards here — the `Some/Some` destructure and a `cap > 0` test — and removing
+/// either *alone* leaves this test passing. Collapsing the pair to `app_cap_micros.unwrap_or(0)`
+/// **and** dropping the `cap > 0` test together is what refuses every uncapped app: a total outage
+/// from a plausible tidy-up, and one that a test asserting only the capped case would never see.
+/// That pairing is the probe; a single-site probe cannot demonstrate teeth here, and pretending
+/// otherwise would be recording a mechanism that does not exist.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_app_with_no_cap_is_governed_only_by_the_global_cap() {
+    let s = start_with_spend(
+        Some(ak(&[("ak-1", "sk-aip-app1")])),
+        Arc::new(|_app: Option<&str>| SpendLimits {
+            total_micros: 10,
+            total_cap_micros: 1_000, // global cap is fine
+            app_micros: Some(999_999),
+            app_cap_micros: None, // never budgeted
+        }),
+    )
+    .await;
+
+    assert_eq!(
+        post_chat(&s, "sk-aip-app1").await.status(),
+        200,
+        "no per-app cap means no per-app refusal"
+    );
+}
+
+/// The gate must be asked about the caller that **authenticated**, not about whatever key happens
+/// to be first. Asserted on the recorded argument rather than on a status code: a gate handed the
+/// wrong id still answers 200 here, so only the argument can tell the two apart.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_gate_is_asked_about_the_caller_that_authenticated() {
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let s = start_with_spend(
+        Some(ak(&[("ak-1", "sk-aip-app1"), ("ak-2", "sk-aip-app2")])),
+        recording_spend(calls.clone(), |_app| SpendLimits::default()),
+    )
+    .await;
+
+    assert_eq!(post_chat(&s, "sk-aip-app2").await.status(), 200);
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[Some("ak-2".to_string())],
+        "the second key authenticated, so the second key's budget is the one to check"
+    );
+
+    calls.lock().unwrap().clear();
+    assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        &[None],
+        "the master key names no app, so there is no per-app budget to consult"
+    );
+}
+
 // ---------- audit R1: background mode liveness ----------
 
 /// R1: a hidden window's heartbeat is throttled by the OS, so the liveness bound must
@@ -1419,7 +1602,10 @@ fn r1_leaving_background_restores_the_tight_bound() {
 #[test]
 fn r4_uncapped_without_provider() {
     let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".to_string())));
-    assert!(spend_gate(&core).is_none());
+    assert!(spend_gate(&core, None).is_none());
+    // And still uncapped when the caller names an app: with no provider there is nothing to ask,
+    // so a per-app request must not be refused by a gate that has no numbers.
+    assert!(spend_gate(&core, Some("ak-1")).is_none());
 }
 
 /// Phase 5: JSON 404 for unknown /v1/* routes

@@ -279,19 +279,55 @@ impl AppKeyCache {
     }
 }
 
-/// R4: month-to-date spend vs. the configured cap, in micro-USD — `(spent, cap)`, where
-/// `cap <= 0` means "no cap". Injected the same way as the key providers so the HTTP surface
-/// is testable without SQLite.
-pub type SpendProvider = Arc<dyn Fn() -> (i64, i64) + Send + Sync + 'static>;
+/// Everything the spend gate needs about one caller, read in one pass.
+///
+/// Two independent limits, not one narrowed one. The global cap bounds what the *owner* pays;
+/// a per-app cap bounds what *one connected app* may spend. Neither implies the other, and the
+/// binding one cannot be computed as a minimum: with a $10 global and a $100 app cap, a single
+/// app can breach the global limit while sitting far under its own — so both have to be checked
+/// against their own numerator, which is why this carries two pairs rather than one.
+///
+/// `total_cap_micros <= 0` means the global cap is off. `app_*` are `None` when the caller is not
+/// a per-app key (the master key) or has no cap of its own.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SpendLimits {
+    /// Month-to-date across every source — the global cap's numerator.
+    pub total_micros: i64,
+    /// The global monthly cap; `<= 0` = uncapped.
+    pub total_cap_micros: i64,
+    /// Month-to-date for the calling app. `None` when the caller names no app.
+    pub app_micros: Option<i64>,
+    /// That app's own cap. `None` when it has none.
+    pub app_cap_micros: Option<i64>,
+}
+
+/// R4: the caller's spend and caps. Takes the authenticated app key so a per-app budget can be
+/// enforced; `None` is the master key, which is subject only to the global cap.
+///
+/// Injected the same way as the key providers, so the HTTP surface is testable without SQLite.
+pub type SpendProvider = Arc<dyn Fn(Option<&str>) -> SpendLimits + Send + Sync + 'static>;
 
 /// Production spend gate. Reads on every request (not cached): the ledger is capped at 90 days
-/// and the SUM is an indexed range scan, so the cost is negligible next to an upstream LLM
+/// and both SUMs are indexed range scans, so the cost is negligible next to an upstream LLM
 /// round-trip — and a stale cap is exactly the failure this feature exists to prevent.
+///
+/// The per-app half is only read when there *is* an app, so a master-key request pays for one
+/// query rather than two.
 pub fn vault_spend_provider(store: Arc<crate::store::Store>) -> SpendProvider {
-    Arc::new(move || {
-        let spent = crate::persist::month_spend_micros(&store);
-        let cap = crate::persist::spend_cap_micros(&store).unwrap_or(0);
-        (spent, cap)
+    Arc::new(move |app_key_id: Option<&str>| {
+        let (app_micros, app_cap_micros) = match app_key_id {
+            Some(id) => (
+                Some(crate::persist::app_month_spend_micros(&store, id)),
+                crate::persist::gateway_key_cap(&store, id),
+            ),
+            None => (None, None),
+        };
+        SpendLimits {
+            total_micros: crate::persist::month_spend_micros(&store),
+            total_cap_micros: crate::persist::spend_cap_micros(&store).unwrap_or(0),
+            app_micros,
+            app_cap_micros,
+        }
     })
 }
 
@@ -1481,7 +1517,9 @@ fn check_gateway_key(
     }
     if matched {
         core.failures.lock().unwrap().remove(&ip);
-        if let Some(r) = spend_gate(core) {
+        // The identity is passed, not just the fact of authentication: a per-app cap can only be
+        // enforced against the app that is actually asking. `None` is the master key.
+        if let Some(r) = spend_gate(core, matched_app.as_deref()) {
             return Err(r);
         }
         return Ok(matched_app);
@@ -1505,23 +1543,63 @@ fn check_gateway_key(
     })
 }
 
-/// R4: deny once month-to-date spend has reached the cap. Checked *after* auth so the cap
-/// (and the current spend) is never disclosed to an unauthenticated caller.
+/// R4: deny once a spend limit has been reached. Checked *after* auth so the caps (and the
+/// current spend) are never disclosed to an unauthenticated caller.
+///
+/// Two limits, checked in order, with **different codes**:
+///
+/// - the **global** cap, which applies to every caller including the master key;
+/// - the **per-app** cap, which applies only when the request authenticated with a per-app key
+///   that has one.
+///
+/// The distinct code matters more than it looks. Both are `402 insufficient_quota`, so a client
+/// that branches on `error.type` alone cannot tell "the owner's whole budget is gone" from "this
+/// one app's slice is gone" — and those have opposite remedies. The first is an operator problem
+/// that stops every app; the second is fixed by raising one key's budget, or by the app waiting
+/// for the month to turn. A body that says which is the difference between a diagnosable refusal
+/// and a support ticket.
 ///
 /// 402 is deliberate: it is the one status clients already read as "you are out of credit",
 /// so a runaway agent loop stops retrying instead of hammering a 429/403.
-fn spend_gate(core: &GatewayCore) -> Option<GateRefusal> {
+fn spend_gate(core: &GatewayCore, app_key_id: Option<&str>) -> Option<GateRefusal> {
     // Clone the Arc out of the lock before calling it — never hold a mutex across a DB read.
     let provider = core.spend_provider.lock().ok().and_then(|g| g.clone())?;
-    let (spent, cap) = provider();
-    if cap > 0 && spent >= cap {
+    let limits = provider(app_key_id);
+
+    if limits.total_cap_micros > 0 && limits.total_micros >= limits.total_cap_micros {
         return Some(GateRefusal {
             status: StatusCode::PAYMENT_REQUIRED,
-            message: format!("monthly spend cap reached — {spent}/{cap} micro-USD this month"),
+            message: format!(
+                "monthly spend cap reached — {}/{} micro-USD this month",
+                limits.total_micros, limits.total_cap_micros
+            ),
             retry_after: Some("0"),
             openai_type: "insufficient_quota",
             openai_code: Some("spend_cap_exceeded"),
         });
+    }
+
+    // Both halves are required: `app_micros` is `None` for the master key, and `app_cap_micros`
+    // is `None` for an app that was never given a budget. Either alone means "no per-app limit
+    // applies", so the pair is destructured rather than collapsed into one number.
+    //
+    // Two independent defences guard the uncapped case, and it is worth knowing which is which:
+    // the destructure, and the `cap > 0` test below. Measured 2026-09-23 — collapsing to
+    // `app_cap_micros.unwrap_or(0)` is *harmless while `cap > 0` stands*, because the guard
+    // short-circuits first; the zero only becomes a refusal of every uncapped app when both are
+    // removed together. The test for this pins the observable property, not either mechanism.
+    if let (Some(spent), Some(cap)) = (limits.app_micros, limits.app_cap_micros) {
+        if cap > 0 && spent >= cap {
+            return Some(GateRefusal {
+                status: StatusCode::PAYMENT_REQUIRED,
+                message: format!(
+                    "this app's monthly budget is spent — {spent}/{cap} micro-USD this month"
+                ),
+                retry_after: Some("0"),
+                openai_type: "insufficient_quota",
+                openai_code: Some("app_budget_exceeded"),
+            });
+        }
     }
     None
 }
