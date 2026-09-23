@@ -1214,6 +1214,29 @@ fixture's own rows come back untouched, which `aliases()` returning `&[AliasRow]
 mutation. It is kept as a statement of what the signature buys, and the test's falsifiable half is its
 ordering assertion.
 
+### Increment 12 — `core/ledger.rs`, the usage ledger (2026-09-24)
+
+The blocker for the model router. `model-router.ts` calls `ledger.append()` in `generateText`,
+`generateImage`, `complete`, and `recordNoRoute`; without a Rust ledger, every one of those methods
+would be stubbed at its append. `usage-ledger.ts` is 115 lines: an in-memory ring buffer (`Vec` in
+TypeScript, `VecDeque` in Rust — `O(1)` pop_front vs `O(n)` splice) plus an optional `LedgerSink` for
+persistence.
+
+**`LedgerRow` already exists** as `persist::LedgerRow` (`persist.rs:459`), the wire shape the webview
+sends and the SQL INSERT receives. It gained `Clone` and `Debug` in this increment — `Clone` because
+`query` returns owned rows (the caller may hold them longer than the next `append`), and `Debug`
+because the test spy sink derives it. The port adds only the *buffer* and the *query* surface.
+
+**The sink is a trait, not a struct of callbacks — the same lesson as `PlanContext`.** A struct
+holding `&'a dyn Fn(..)` cannot be built from inline closures in tests; a trait lets the fixture be
+the sink. The one method returns `Result` so a full disk is observable rather than swallowed.
+
+**`is_none_or` replaces `map_or(true, ...)`** — a clippy lint (`unnecessary_map_or`) that is also
+clearer: "if None, true; if Some, apply the predicate" is exactly what the filter needs.
+
+16 tests, `cargo test` 637 → 653. 12/12 falsifications (11 red tests + 1 control that does not
+compile). Gate green.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
@@ -1222,6 +1245,13 @@ ordering assertion.
 it, and its three row types are `persist.rs`'s unchanged. What Phase 3 adds is the *planner* that produces a
 plan of them, not the type — and `context_scope::MemoryItem` is a different thing under a name that no longer
 collides (D21).
+
+**The planner is done (increment 11b).** `core/planner.rs` holds `build_plan`, `resolve_wanted`,
+`strip_client_namespace`, `order_keys`, `order_carriers`. The ledger is done (increment 12).
+**What remains of Phase 3** is the router glue itself: `generateText`, `generateImage`, `complete`,
+`listModels`, `systemAiAvailable`, `syncConcurrency`, and the `plan` helper that builds a
+`PlanContext` and calls `build_plan`. The compression module (`context-compress.ts`) is deferred to
+Phase 4.
 
 These are less risky than the execution engine — they are synchronous, stateful logic without async
 streams. The main challenge is the registry and catalog data structures, which today live in JS

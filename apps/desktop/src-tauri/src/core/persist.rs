@@ -454,7 +454,7 @@ pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, Comma
 /// exactly the shape migration 0015 left behind: 1530 rows `NULL`, reported as "0". `memory.rs:142`
 /// carries the same attribute for the same reason, and this payload is the one the app-key
 /// attribution now rides on.
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LedgerRow {
     pub ts: i64,
