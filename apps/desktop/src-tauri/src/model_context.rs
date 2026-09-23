@@ -17,7 +17,7 @@
 //! qualified key and falls back to the default. That is the correct direction to fail, and resolving
 //! aliases here would mean duplicating the alias table's precedence rules in Rust.
 use rusqlite::params;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 use crate::store::Store;
 
@@ -118,16 +118,6 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
-}
-
-/// The wire shape for a diagnostic dump. Kept next to the module so a column added here cannot
-/// silently drop out of what the UI shows.
-#[derive(Debug, Clone, Serialize)]
-pub struct ModelContextRow {
-    pub model_key: String,
-    pub context_window: i64,
-    pub chars_per_token: Option<f64>,
-    pub updated_at: i64,
 }
 
 #[cfg(test)]

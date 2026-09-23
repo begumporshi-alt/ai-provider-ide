@@ -933,13 +933,14 @@ pub struct Candidate {
     pub pinned: bool,
 }
 
-/// Pinned first. A **stable** sort, so everything else keeps the order `recall_scoped` produced —
+/// Pinned first. A **stable** sort — `sort_by_key` is stable too, so this is observably identical
+/// to the `sort_by` it replaced — so everything else keeps the order `recall_scoped` produced,
 /// which is already relevance band, then recency, then distillation level.
 ///
 /// Pinned means *retention and eligibility*, not truth precedence: a stale pin must not outrank a
 /// newer correction on relevance, it only guarantees the row survives pruning and a tight budget.
 pub fn rank(candidates: &mut [Candidate]) {
-    candidates.sort_by(|a, b| b.pinned.cmp(&a.pinned));
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.pinned));
 }
 
 /// Greedy fill in rank order. Pinned rows are always taken — the review's point was that a single

@@ -1297,6 +1297,14 @@ async fn await_core(core: &Arc<GatewayCore>) -> bool {
 }
 
 /// 503 if the core is unreachable, 429 if over capacity, otherwise the Slot.
+///
+/// The `Err` is a whole `Response`, which `clippy::result_large_err` flags. Boxing it would be
+/// worse, not better: the value is built once and consumed once, and no caller propagates with `?`
+/// — three return it straight to hyper, two read only its `status()` and rebuild the envelope, and
+/// one maps it. Boxing would buy a smaller `Result` and pay for it with a heap allocation on every
+/// refusal, including the at-capacity 429, which is the one refusal that is hot by construction. So
+/// the lint's premise (a large `Err` paid on the happy path) does not hold here.
+#[allow(clippy::result_large_err)]
 async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
     // Stopped is terminal — waiting would only delay the same answer. A lapsed beat is not.
     if !core.is_running() {
