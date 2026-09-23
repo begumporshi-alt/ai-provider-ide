@@ -77,9 +77,16 @@ jobs:
       # no test reached at all. Linting only the lib would have missed half the class.
       #
       # `-D warnings`, not a warning count: a gate that tolerates warnings stops being read the
-      # moment there are 25 of them. Reaching zero was mostly `cargo clippy --fix`; the two
-      # remaining judgement calls (a test helper with 8 positional args, three counts from three
-      # statements) carry a local `#[allow]` with its reason written down.
+      # moment there are 25 of them. Reaching zero was mostly `cargo clippy --fix`; what is left
+      # carries a local `#[allow]` with its reason written down -- a test helper with 8 positional
+      # args (`memory.rs`), and `result_large_err` on `try_slot`, where boxing the error would add a
+      # heap allocation to every refusal and buy nothing. (The `type_complexity` allow this comment
+      # used to name is gone: both sites now return a named type and cite the lint in a comment.)
+      #
+      # This step runs against whatever `stable` is, so a Rust release can turn it red with no code
+      # change at all. 1.88 was clean here; 1.98 found four more lints -- a dead struct,
+      # `manual_is_multiple_of`, `sort_by_key`, `result_large_err`. Keep the local toolchain current
+      # (`rustup update stable`), or pin one so this step moves only when you move it.
       - name: Rust clippy (lints must be clean)
         run: cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings
       - name: Rust tests (gateway criterion 8, egress invariants, store, persist)
