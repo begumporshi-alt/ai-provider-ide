@@ -79,6 +79,12 @@ interface BridgeRequest {
   kind: "chat" | "responses" | "models" | "image";
   body: Record<string, unknown>;
   headers: Record<string, string>;
+  /**
+   * The per-app key that authenticated this request (`gateway_keys.id`), or `null` when the
+   * master key did. The ledger row is written on this side of the bridge, so this is the only
+   * thing that makes a spend attributable to an app rather than to the machine as a whole.
+   */
+  appKeyId: string | null;
 }
 
 // Imported, not re-declared. This used to be a second `= 8` kept in step with agentLoop's by a
@@ -298,7 +304,11 @@ async function handle(req: BridgeRequest): Promise<void> {
               }).catch(() => undefined);
             },
           },
-          { signal: ac.signal, source: "gateway" as LedgerSource },
+          {
+            signal: ac.signal,
+            source: "gateway" as LedgerSource,
+            appKeyId: req.appKeyId ?? undefined,
+          },
         );
 
         for await (const rawChunk of exec.chunks) {
@@ -379,7 +389,11 @@ async function handle(req: BridgeRequest): Promise<void> {
     if (req.kind === "image") {
       const res = await router.generateImage(
         { model: String(req.body.model ?? ""), prompt: String(req.body.prompt ?? "") },
-        { signal: ac.signal, source: "gateway" as LedgerSource },
+        {
+          signal: ac.signal,
+          source: "gateway" as LedgerSource,
+          appKeyId: req.appKeyId ?? undefined,
+        },
       );
       await invoke("gateway_result", {
         requestId: req.requestId,

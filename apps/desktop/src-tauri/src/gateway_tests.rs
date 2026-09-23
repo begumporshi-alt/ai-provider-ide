@@ -35,6 +35,9 @@ struct SynthBridge {
     /// for the provider — asserting on the *ingress* body would prove nothing, because every
     /// dialect is translated twice and either hop can drop the injected block.
     sent: Mutex<Vec<SentRequest>>,
+    /// The app key each dispatch carried, in dispatch order — kept beside `sent` rather than
+    /// inside it so the existing `(kind, body, headers)` readers did not have to change.
+    app_keys: Mutex<Vec<Option<String>>>,
 }
 
 impl SynthBridge {
@@ -49,12 +52,19 @@ impl SynthBridge {
             fail_status: AtomicUsize::new(0),
             fail_retry_after: AtomicUsize::new(0),
             sent: Mutex::new(Vec::new()),
+            app_keys: Mutex::new(Vec::new()),
         }
     }
 
     /// `(kind, body, headers)` of the nth dispatch.
     fn sent(&self, n: usize) -> Option<(String, Value, HashMap<String, String>)> {
         self.sent.lock().unwrap().get(n).cloned()
+    }
+
+    /// The app key carried by the nth dispatch. Outer `None` means there was no such dispatch;
+    /// inner `None` means the master key authenticated, which is not a per-app key.
+    fn app_key(&self, n: usize) -> Option<Option<String>> {
+        self.app_keys.lock().unwrap().get(n).cloned()
     }
     /// How many requests have been handed to the worker — i.e. actually routed, which is the
     /// number §3.5 caps at 8. Counting admissions instead would prove nothing.
@@ -95,6 +105,9 @@ impl Bridge for SynthBridge {
             req.body.clone(),
             req.headers.clone(),
         ));
+        // Recorded before the reply thread is spawned: that closure moves `req.request_id`, so
+        // reading the field after it would not compile.
+        self.app_keys.lock().unwrap().push(req.app_key_id.clone());
         let core = self.core.lock().unwrap().clone().unwrap();
         let slow = self.slow.load(Ordering::Relaxed);
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
@@ -1025,6 +1038,55 @@ async fn r4_app_key_authenticates() {
     let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
     let res = post_chat(&s, "sk-aip-app1").await;
     assert_eq!(res.status(), 200, "per-app key must be accepted");
+}
+
+/// Per-app attribution: the key that authenticated has to reach the bridge, because the ledger
+/// row — the thing a per-app budget sums — is written on the webview side of it.
+///
+/// Asserted at the bridge rather than on `check_gateway_key`'s return value, because that is only
+/// half the wiring. A `None` on `BridgeRequest` leaves the column present and every row `NULL`,
+/// which reads as "no app ever spent anything" rather than "attribution was never connected".
+#[tokio::test(flavor = "multi_thread")]
+async fn the_authenticating_app_key_reaches_the_bridge() {
+    let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
+    assert_eq!(post_chat(&s, "sk-aip-app1").await.status(), 200);
+    assert_eq!(
+        s.bridge.app_key(0),
+        Some(Some("ak-1".to_string())),
+        "the per-app key that paid must travel with the request"
+    );
+}
+
+/// The identity is the key that *matched*, not the first key in the list. Both are active here,
+/// so a lookup that ignored the presented secret would answer `ak-1` and still satisfy a test
+/// that only asserted `Some(_)`.
+#[tokio::test(flavor = "multi_thread")]
+async fn attribution_names_the_key_that_matched_not_the_first_one() {
+    let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1"), ("ak-2", "sk-aip-app2")])), None).await;
+    assert_eq!(post_chat(&s, "sk-aip-app2").await.status(), 200);
+    assert_eq!(s.bridge.app_key(0), Some(Some("ak-2".to_string())));
+}
+
+/// The master key is not a per-app key, so it has no `gateway_keys.id` to attribute spend to.
+/// `None` is the honest answer; inventing an id here would bill a phantom app.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_master_key_request_carries_no_app_key() {
+    let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
+    assert_eq!(post_chat(&s, "sk-aip-master").await.status(), 200);
+    assert_eq!(
+        s.bridge.app_key(0),
+        Some(None),
+        "the master key authenticates without naming an app"
+    );
+}
+
+/// A refused request must not be attributed at all — otherwise a typo'd credential would be
+/// billed to whichever app happens to be listed first.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rejected_key_is_never_dispatched() {
+    let s = start_with(Some(ak(&[("ak-1", "sk-aip-app1")])), None).await;
+    assert_eq!(post_chat(&s, "not-a-key").await.status(), 401);
+    assert_eq!(s.bridge.app_key(0), None, "nothing was dispatched, so nothing is attributable");
 }
 
 /// R4(a): revocation is immediate. The provider is re-read per request, so dropping a key

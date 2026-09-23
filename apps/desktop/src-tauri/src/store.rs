@@ -335,6 +335,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0013_model_context", backfill_model_context),
     ("0014_superseded_at", backfill_superseded_at),
     ("0015_ledger_cached_tokens", backfill_ledger_cached_tokens),
+    ("0016_ledger_app_key", backfill_ledger_app_key),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -836,6 +837,35 @@ fn backfill_ledger_cached_tokens(tx: &rusqlite::Transaction<'_>) -> rusqlite::Re
     Ok(())
 }
 
+/// 0016 — per-app attribution. A per-app budget cannot be summed from anything the ledger held.
+///
+/// The monthly cap is global on purpose (`month_spend_micros`: "the user sets a budget on what they
+/// pay, not on one client"), so this is a different axis rather than a narrowing of that one. But
+/// the gateway's own app key — `gateway_keys.id` — was held by **no column at all**: measured
+/// 2026-09-23, 713 of 792 gateway rows join `api_keys` through `key_id`, and **zero** join
+/// `gateway_keys`. `key_id` is the *provider* credential, so a per-app figure had nothing to sum.
+///
+/// **Nullable, and that is the design.** Only `source='gateway'` rows carry an app key: `ui` and
+/// `generator` rows are not attributable to one, and the rows written before this migration cannot
+/// be backfilled because nothing recorded the key at the time. `NULL` therefore means "not
+/// attributable to an app", which is the honest value — a `NOT NULL DEFAULT ''` would invent a key
+/// that no row actually used, and would read as a real one in every later SUM.
+///
+/// The column is named `app_key_id` rather than a second `key_id` deliberately: the two columns
+/// this table would otherwise have called `key_id` mean different things, which is what made the
+/// gap hard to see in the first place.
+///
+/// **No index here, on purpose.** The per-app SUM that will need one on `(app_key_id, ts)` — the
+/// same shape as the existing `idx_ledger_provider_ts` — does not exist yet, and a column with no
+/// consumer should not arrive with an index for a query nobody has written. The enforcement change
+/// adds it, and this note is here so that step does not have to rediscover why.
+fn backfill_ledger_app_key(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "ledger", "app_key_id")? {
+        tx.execute_batch("ALTER TABLE ledger ADD COLUMN app_key_id TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -943,11 +973,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0015 data migrations.
-        assert_eq!(info.schema_version, 15);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0016 data migrations.
+        assert_eq!(info.schema_version, 16);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(15, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(16, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1047,6 +1077,55 @@ mod tests {
         let v: Option<i64> =
             conn.query_row("SELECT cached_tokens FROM ledger", [], |r| r.get(0)).unwrap();
         assert_eq!(v, None, "an unreported cache must stay NULL, not become 0");
+        // `stmt` still borrows `conn`, so it has to be dropped before `conn` can be moved.
+        drop(stmt);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0016 — attribution. The same trap as 0015, one table over, and the reason it is worth a
+    /// test of its own: a column that is present but never populated is indistinguishable from one
+    /// that is populated, right up until something sums it and gets zero. So this asserts the
+    /// column's *shape* (nullable, no default) and that a value written through it round-trips.
+    #[test]
+    fn ledger_app_key_is_nullable_and_carries_no_default() {
+        let dir = std::env::temp_dir().join(format!("aip-appkey-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+
+        let conn = s.conn.lock().unwrap();
+        let mut stmt = conn.prepare("PRAGMA table_info(ledger)").unwrap();
+        let cols: Vec<(String, i64, Option<String>)> = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, String>(1)?, r.get::<_, i64>(3)?, r.get::<_, Option<String>>(4)?))
+            })
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let app_key =
+            cols.iter().find(|(n, _, _)| n == "app_key_id").expect("ledger is missing app_key_id");
+        assert_eq!(app_key.1, 0, "app_key_id must be nullable (notnull=0)");
+        assert!(
+            app_key.2.is_none(),
+            "app_key_id must carry no default, so an unattributed row stays NULL"
+        );
+
+        // A row that names no app — a `ui` row, or any row written before this migration — keeps
+        // NULL rather than being coerced to an empty key that would later sum as though real.
+        conn.execute(
+            "INSERT INTO ledger (ts, modality, model, status) VALUES (1,'text','gpt-4o','ok')",
+            [],
+        )
+        .unwrap();
+        let v: Option<String> =
+            conn.query_row("SELECT app_key_id FROM ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(v, None, "an unattributed row must stay NULL, not become an empty key");
+
+        // Present-but-unwritable would satisfy everything above, so write through it as well.
+        conn.execute("UPDATE ledger SET app_key_id='gk-1'", []).unwrap();
+        let v: Option<String> =
+            conn.query_row("SELECT app_key_id FROM ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(v.as_deref(), Some("gk-1"), "app_key_id must accept a value");
         // `stmt` still borrows `conn`, so it has to be dropped before `conn` can be moved.
         drop(stmt);
         drop(conn);

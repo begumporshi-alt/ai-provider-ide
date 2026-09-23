@@ -118,9 +118,10 @@ pub(crate) async fn gemini_h(
             }
         }
     }
-    if let Some(r) = check_gateway_key(&core, &headers2, peer_ip(&headers)) {
-        return r.gemini();
-    }
+    let app_key = match check_gateway_key(&core, &headers2, peer_ip(&headers)) {
+        Ok(k) => k,
+        Err(r) => return r.gemini(),
+    };
     // path: /v1beta/models/<model>:generateContent | :streamGenerateContent
     let path = uri.path().to_string();
     let tail = match path.rsplit("/models/").next() {
@@ -231,6 +232,7 @@ pub(crate) async fn gemini_h(
         kind: "chat",
         body: chat,
         headers: fwd.clone(),
+        app_key_id: app_key,
     });
     tracing::info!(request_id = id, kind = "gemini", "dispatching gemini request");
 

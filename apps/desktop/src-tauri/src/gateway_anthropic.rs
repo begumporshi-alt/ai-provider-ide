@@ -137,7 +137,8 @@ pub(crate) async fn count_tokens_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    // Identity discarded on purpose: this probe dispatches nothing, so it writes no ledger row.
+    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.anthropic();
     }
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
@@ -321,9 +322,10 @@ pub(crate) async fn messages_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r.anthropic();
-    }
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        Ok(k) => k,
+        Err(r) => return r.anthropic(),
+    };
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(
             StatusCode::BAD_REQUEST,
@@ -378,6 +380,7 @@ pub(crate) async fn messages_h(
         kind: "chat",
         body: chat,
         headers: fwd.clone(),
+        app_key_id: app_key,
     });
 
     if wants_stream {

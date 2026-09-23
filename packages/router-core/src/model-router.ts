@@ -80,12 +80,15 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     this.limiter.maxPerProvider = clampConcurrency(this.settings.perProviderConcurrency);
   }
 
-  async generateText(req: TextRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<TextExecution> {
+  async generateText(
+    req: TextRequest,
+    opts?: { signal?: AbortSignal; source?: LedgerSource; appKeyId?: string },
+  ): Promise<TextExecution> {
     const t0 = Date.now();
     this.syncConcurrency();
     const plan = this.plan(req.model, "text");
     if (!plan.length) {
-      await this.recordNoRoute(req.model, "text", opts?.source ?? "ui", t0);
+      await this.recordNoRoute(req.model, "text", opts?.source ?? "ui", t0, opts?.appKeyId);
       throw new Error(`no route for model "${req.model}" (no enabled provider carries it)`);
     }
     const exec = await this.engine.executeText({
@@ -107,15 +110,26 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       onUsage: req.onUsage,
       signal: opts?.signal,
     });
-    return this.wrapLedger(exec, req.model, "text", opts?.source ?? "ui", t0, opts?.signal);
+    return this.wrapLedger(
+      exec,
+      req.model,
+      "text",
+      opts?.source ?? "ui",
+      t0,
+      opts?.signal,
+      opts?.appKeyId,
+    );
   }
 
-  async generateImage(req: ImageRequest, opts?: { signal?: AbortSignal; source?: LedgerSource }): Promise<{ url?: string; base64?: string }> {
+  async generateImage(
+    req: ImageRequest,
+    opts?: { signal?: AbortSignal; source?: LedgerSource; appKeyId?: string },
+  ): Promise<{ url?: string; base64?: string }> {
     const t0 = Date.now();
     this.syncConcurrency();
     const plan = this.plan(req.model, "image");
     if (!plan.length) {
-      await this.recordNoRoute(req.model, "image", opts?.source ?? "ui", t0);
+      await this.recordNoRoute(req.model, "image", opts?.source ?? "ui", t0, opts?.appKeyId);
       // The bare "no route for image model" blamed the model id. Measured live 2026-09-22: the
       // gateway advertised 15 image-named models and 404'd every one, because the catalog tagged
       // zero of them as image — no configured provider declared an image capability, so the id
@@ -130,6 +144,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       source: opts?.source ?? "ui",
       providerId: res.candidate.provider.id,
       keyId: res.candidate.key.id,
+      appKeyId: opts?.appKeyId,
       requestedModel: req.model,
       model: res.candidate.model.nativeId,
       status: "ok",
@@ -308,17 +323,24 @@ export class ModelRouter implements RouterFacade, AiTextPort {
    * guard threw before the engine ran, so a model nothing could serve failed in the UI and left no
    * trace here: the ledger was silent about the request the user is most likely to be confused by.
    * `fallbackChain: []` is the honest value — there were no attempts to record.
+   *
+   * `appKeyId` is carried here too. A `NO_ROUTE` row costs nothing, so it is tempting to leave
+   * unattributed — but it is a gateway request that happened, and a per-app view that dropped
+   * exactly the failures would under-report the app that is misconfigured rather than the one
+   * that is expensive.
    */
   private async recordNoRoute(
     requestedModel: string,
     modality: Modality,
     source: LedgerSource,
     t0: number,
+    appKeyId?: string,
   ): Promise<void> {
     await this.ledger.append({
       ts: Date.now(),
       modality,
       source,
+      appKeyId,
       requestedModel,
       model: requestedModel,
       status: "error",
@@ -338,6 +360,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     source: LedgerSource,
     t0: number,
     signal?: AbortSignal,
+    appKeyId?: string,
   ): TextExecution {
     const ledger = this.ledger;
     const router = this;
@@ -362,6 +385,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
             ts: Date.now(),
             modality,
             source,
+            appKeyId,
             requestedModel,
             model: requestedModel,
             status: "error",
@@ -382,6 +406,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           source,
           providerId: served?.provider.id,
           keyId: served?.key.id,
+          appKeyId,
           requestedModel,
           model: served?.model.nativeId ?? requestedModel,
           status: "ok",
@@ -418,6 +443,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           // provider that never produced a token. The attempt that failed is in the chain below.
           providerId: served?.provider.id,
           keyId: served?.key.id,
+          appKeyId,
           requestedModel,
           model: served?.model.nativeId ?? requestedModel,
           status: "error",

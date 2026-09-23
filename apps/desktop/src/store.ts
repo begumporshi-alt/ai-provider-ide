@@ -104,6 +104,10 @@ export const ledger = new UsageLedger({
         source: e.source,
         providerId: e.providerId ?? null,
         keyId: e.keyId ?? null,
+        // The gateway app key. `null` for a `ui` or `generator` row, which belongs to no app. This
+        // key name must match `LedgerRow::app_key_id` exactly: the Rust payload now carries
+        // `deny_unknown_fields`, so a misspelling here is an error rather than a silent `NULL`.
+        appKeyId: e.appKeyId ?? null,
         requestedModel: e.requestedModel,
         model: e.model,
         status: e.status,

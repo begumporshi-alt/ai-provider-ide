@@ -25,9 +25,10 @@ pub(crate) async fn chat_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r.openai();
-    }
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        Ok(k) => k,
+        Err(r) => return r.openai(),
+    };
     let Ok(mut req) = serde_json::from_str::<Value>(&body) else {
         return err(
             StatusCode::BAD_REQUEST,
@@ -87,6 +88,7 @@ pub(crate) async fn chat_h(
         kind: "chat",
         body: req.clone(),
         headers: fwd.clone(),
+        app_key_id: app_key,
     });
     tracing::info!(request_id = id, kind = "chat", model = %req.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching chat request");
 
@@ -273,9 +275,10 @@ pub(crate) async fn chat_h(
 }
 
 pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r.openai();
-    }
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        Ok(k) => k,
+        Err(r) => return r.openai(),
+    };
     let mut slot = match try_slot(&core).await {
         Ok(s) => s,
         Err(r) => return r,
@@ -286,6 +289,7 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
         kind: "models",
         body: json!({}),
         headers: forwarded_headers(&headers),
+        app_key_id: app_key,
     });
     tracing::info!(request_id = id, kind = "models", "dispatching models request");
     while let Some(msg) = slot.recv().await {
@@ -326,7 +330,9 @@ pub(crate) async fn unknown_route(
     // Invariant 10: authenticate before any routing work. Answering 404 to a caller that never
     // presented a credential makes the route table an oracle — 404-vs-401 separated a real route
     // from a typo with no key at all, which is exactly what the invariant exists to prevent.
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    //
+    // Identity discarded on purpose: nothing is dispatched from here, so nothing is billed.
+    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.openai();
     }
     tracing::warn!("unknown gateway route hit");
@@ -342,7 +348,8 @@ pub(crate) async fn method_not_allowed(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    // Identity discarded on purpose: a 405 dispatches nothing.
+    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
         return r.openai();
     }
     err(
@@ -356,9 +363,10 @@ pub(crate) async fn image_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
-        return r.openai();
-    }
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        Ok(k) => k,
+        Err(r) => return r.openai(),
+    };
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(
             StatusCode::BAD_REQUEST,
@@ -383,6 +391,7 @@ pub(crate) async fn image_h(
         kind: "image",
         body: req,
         headers: forwarded_headers(&headers),
+        app_key_id: app_key,
     });
     tracing::info!(request_id = id, kind = "image", "dispatching image request");
     while let Some(msg) = slot.recv().await {

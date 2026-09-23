@@ -301,10 +301,17 @@ pub fn vault_spend_provider(store: Arc<crate::store::Store>) -> SpendProvider {
 #[serde(rename_all = "camelCase")]
 pub struct BridgeRequest {
     pub request_id: u64,
-    pub kind: &'static str, // "chat" | "models" | "image"
+    pub kind: &'static str, // "chat" | "responses" | "models" | "image"
     pub body: Value,
     /// Select headers forwarded for client detection (User-Agent, X-Client-Name, etc.).
     pub headers: HashMap<String, String>,
+    /// The per-app key that authenticated this request (`gateway_keys.id`), or `None` when the
+    /// master key did.
+    ///
+    /// Carried across the bridge because the ledger row is written on the webview side: without
+    /// it the column exists and every row is `NULL`, which reads as "no app ever spent anything"
+    /// rather than "attribution was never wired up".
+    pub app_key_id: Option<String>,
 }
 
 /// Messages the webview bridge sends back for one request.
@@ -1398,7 +1405,8 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
     e.1 = Instant::now() + delay;
 }
 
-/// Returns Some(response) to deny, None to allow.
+/// `Err(response)` denies; `Ok(app_key_id)` allows — `Some` naming the per-app key that
+/// authenticated, `None` meaning the master key did.
 ///
 /// The master key comes from a bounded cache that `gateway_key_generate` / `gateway_key_revoke`
 /// invalidate, so rotation still kills the old key on the very next request (§3.3, criterion 8)
@@ -1414,9 +1422,17 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
 /// the loopback — with per-app keys (R4) that is one misconfigured app locking out all the
 /// others. Throttling only attempts that would have been rejected anyway keeps the same
 /// anti-brute-force bound (one attempt per backoff window) without collateral damage.
-fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Option<GateRefusal> {
+///
+/// The identity is returned rather than recomputed by the caller: this is the one place that
+/// knows *which* credential matched, and a second lookup elsewhere would be a second authority
+/// free to drift from this one.
+fn check_gateway_key(
+    core: &GatewayCore,
+    headers: &HeaderMap,
+    ip: IpAddr,
+) -> Result<Option<String>, GateRefusal> {
     if !core.running.load(Ordering::Relaxed) {
-        return Some(GateRefusal {
+        return Err(GateRefusal {
             status: StatusCode::SERVICE_UNAVAILABLE,
             message: "gateway disabled".into(),
             retry_after: Some("1"),
@@ -1427,7 +1443,7 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
     let stored = match core.master_key.get() {
         MasterKeyLookup::Ready(k) => k,
         MasterKeyLookup::Absent => {
-            return Some(GateRefusal {
+            return Err(GateRefusal {
                 status: StatusCode::UNAUTHORIZED,
                 message: "no master key configured".into(),
                 retry_after: None,
@@ -1438,7 +1454,7 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
         MasterKeyLookup::Unavailable => {
             // The keychain did not answer in time. A 401 here would blame the caller's credential
             // for a purely local fault and send it hunting for a new key, so say what happened.
-            return Some(GateRefusal {
+            return Err(GateRefusal {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 message: "master key unavailable — the OS keychain did not respond; approve the keychain prompt for this app, then retry".into(),
                 retry_after: Some("5"),
@@ -1448,6 +1464,9 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
         }
     };
     let presented = presented_key(headers);
+    // Stays `None` on the master-key path: the master is not a per-app key, so there is no
+    // `gateway_keys.id` to attribute the spend to.
+    let mut matched_app: Option<String> = None;
     let mut matched = constant_time_eq(presented, &stored);
     if !matched {
         // R4: per-app key. Every comparison is constant-time, and we deliberately do NOT break
@@ -1456,15 +1475,19 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
         for k in core.app_keys() {
             if constant_time_eq(presented, &k.secret) {
                 matched = true;
+                matched_app = Some(k.id);
             }
         }
     }
     if matched {
         core.failures.lock().unwrap().remove(&ip);
-        return spend_gate(core);
+        if let Some(r) = spend_gate(core) {
+            return Err(r);
+        }
+        return Ok(matched_app);
     }
     if !auth_allowed(core, ip) {
-        return Some(GateRefusal {
+        return Err(GateRefusal {
             status: StatusCode::TOO_MANY_REQUESTS,
             message: "too many failed auth attempts — backing off".into(),
             retry_after: Some("30"),
@@ -1473,7 +1496,7 @@ fn check_gateway_key(core: &GatewayCore, headers: &HeaderMap, ip: IpAddr) -> Opt
         });
     }
     note_auth_failure(core, ip);
-    Some(GateRefusal {
+    Err(GateRefusal {
         status: StatusCode::UNAUTHORIZED,
         message: "invalid gateway key".into(),
         retry_after: None,

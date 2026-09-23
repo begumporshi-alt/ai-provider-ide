@@ -226,10 +226,11 @@ pub(crate) async fn responses_h(
     body: String,
 ) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
-    if let Some(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+        Ok(k) => k,
         // The Responses API error envelope is the OpenAI one, so this needs no translation.
-        return r.openai();
-    }
+        Err(r) => return r.openai(),
+    };
     let _ = uri;
     let Ok(req) = serde_json::from_str::<Value>(&body) else {
         return err(StatusCode::BAD_REQUEST, responses_error("invalid JSON body", "invalid_json"));
@@ -270,6 +271,7 @@ pub(crate) async fn responses_h(
         kind: "responses",
         body: chat.clone(),
         headers: fwd.clone(),
+        app_key_id: app_key,
     });
     tracing::info!(request_id = id, kind = "responses", model = %chat.get("model").unwrap_or(&json!("")).as_str().unwrap_or(""), "dispatching responses request");
 

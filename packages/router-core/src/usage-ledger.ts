@@ -17,7 +17,18 @@ export interface LedgerEntry {
   modality: Modality;
   source: LedgerSource;
   providerId?: string;
+  /** The *provider* credential that served the request (`api_keys.id`). */
   keyId?: string;
+  /**
+   * The gateway app key that paid for this request (`gateway_keys.id`), when it arrived through the
+   * local gateway.
+   *
+   * Deliberately a separate field from `keyId`: the two are different ids that both answer to
+   * "key", and conflating them is why per-app spend was uncomputable for so long. Left `undefined`
+   * for `ui` and `generator` rows, which are not attributable to any app — `ledger.app_key_id` is
+   * nullable for the same reason (migration 0016).
+   */
+  appKeyId?: string;
   requestedModel: string;
   model: string; // native model that actually served
   status: "ok" | "error";

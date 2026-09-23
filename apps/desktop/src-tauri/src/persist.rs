@@ -423,8 +423,16 @@ pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, Comma
 
 // ---------- ledger ----------
 
+/// One row of the usage ledger, as sent by the webview.
+///
+/// `deny_unknown_fields` is not cosmetic here. Serde ignores unknown keys by default, so a
+/// misspelled `appKeyId` from the TypeScript sender would deserialize to `None` and write `NULL`
+/// on every row — the feature would look like it worked while recording nothing at all. That is
+/// exactly the shape migration 0015 left behind: 1530 rows `NULL`, reported as "0". `memory.rs:142`
+/// carries the same attribute for the same reason, and this payload is the one the app-key
+/// attribution now rides on.
 #[derive(Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct LedgerRow {
     pub ts: i64,
     pub modality: String,
@@ -433,6 +441,14 @@ pub struct LedgerRow {
     pub provider_id: Option<String>,
     #[serde(default)]
     pub key_id: Option<String>,
+    /// The gateway app key that paid for this row (`gateway_keys.id`), when the request arrived
+    /// through the gateway.
+    ///
+    /// **Not the same thing as `key_id`**, which is the *provider* credential — two different ids
+    /// that both answer to "key", which is what made the attribution gap hard to see. `None` is the
+    /// honest value for a `ui` or `generator` row, and for every row written before migration 0016.
+    #[serde(default)]
+    pub app_key_id: Option<String>,
     #[serde(default)]
     pub requested_model: Option<String>,
     pub model: String,
@@ -457,15 +473,57 @@ pub struct LedgerRow {
     pub fallback_chain_json: Option<String>,
 }
 
+/// The one place a ledger row is written.
+///
+/// Split out of the command so the column list and the bound values can be tested *together*. A
+/// `#[tauri::command]` taking `State` cannot be called from a unit test, and an INSERT no test can
+/// reach is how 0015's column ended up present, nullable, correctly shaped — and empty.
+fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
+        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.app_key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.cached_tokens, e.fallback_chain_json],
+    )?;
+    Ok(())
+}
+
 #[tauri::command]
 pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
-    conn.execute(
-        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16)",
-        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.cached_tokens, e.fallback_chain_json],
-    )?;
+    ledger_insert(&conn, &e)?;
     Ok(())
+}
+
+/// The ledger's read statement. It lives next to the mapper below and is used by the command *and*
+/// by the round-trip test, so the test drives the real statement rather than a copy that can drift.
+const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
+         FROM ledger ORDER BY ts DESC LIMIT ?1";
+
+/// Map one `ledger` row to its wire shape.
+///
+/// Split out of the command so the mapping can be tested. `r.get(5)` is a *position*, not a name:
+/// adding `app_key_id` to the SELECT without shifting every index after it would have returned the
+/// requested model in the app-key field, and the compiler would have been perfectly happy about it.
+fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
+    Ok(LedgerRow {
+        ts: r.get(0)?,
+        modality: r.get(1)?,
+        source: r.get(2)?,
+        provider_id: r.get(3)?,
+        key_id: r.get(4)?,
+        app_key_id: r.get(5)?,
+        requested_model: r.get(6)?,
+        model: r.get(7)?,
+        status: r.get(8)?,
+        http_status: r.get(9)?,
+        error_class: r.get(10)?,
+        latency_ms: r.get(11)?,
+        tokens_in: r.get(12)?,
+        tokens_out: r.get(13)?,
+        cost_estimate_micros: r.get(14)?,
+        cached_tokens: r.get(15)?,
+        fallback_chain_json: r.get(16)?,
+    })
 }
 
 #[tauri::command]
@@ -475,30 +533,8 @@ pub fn ledger_recent(
 ) -> Result<Vec<LedgerRow>, CommandError> {
     let limit = limit.unwrap_or(100).clamp(1, 1000);
     let conn = store.conn.lock().unwrap();
-    let mut stmt = conn.prepare(
-        "SELECT ts, modality, source, provider_id, key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
-         FROM ledger ORDER BY ts DESC LIMIT ?1",
-    )?;
-    let rows = stmt.query_map(params![limit], |r| {
-        Ok(LedgerRow {
-            ts: r.get(0)?,
-            modality: r.get(1)?,
-            source: r.get(2)?,
-            provider_id: r.get(3)?,
-            key_id: r.get(4)?,
-            requested_model: r.get(5)?,
-            model: r.get(6)?,
-            status: r.get(7)?,
-            http_status: r.get(8)?,
-            error_class: r.get(9)?,
-            latency_ms: r.get(10)?,
-            tokens_in: r.get(11)?,
-            tokens_out: r.get(12)?,
-            cost_estimate_micros: r.get(13)?,
-            cached_tokens: r.get(14)?,
-            fallback_chain_json: r.get(15)?,
-        })
-    })?;
+    let mut stmt = conn.prepare(LEDGER_SELECT)?;
+    let rows = stmt.query_map(params![limit], ledger_row_from)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
@@ -1290,6 +1326,138 @@ mod persist_tests {
         gateway_key_insert(&store, "ak-1", "tmp").unwrap();
         gateway_key_delete(&store, "ak-1").unwrap();
         assert!(gateway_keys_list(&store).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The **writer**, not the schema. `ledger.app_key_id` being present and correctly shaped says
+    /// nothing about whether anything ever writes to it — migration 0015 left a column in exactly
+    /// that state behind: present, nullable, right, and `NULL` on all 1530 rows, which a summary
+    /// then reported as "0".
+    #[test]
+    fn ledger_insert_writes_the_app_key_and_leaves_it_null_when_absent() {
+        let (store, dir) = tmp_store("appkey");
+        let row = |app_key_id: Option<&str>| LedgerRow {
+            ts: 1,
+            modality: "text".into(),
+            source: "gateway".into(),
+            provider_id: Some("p".into()),
+            key_id: Some("ak-1".into()),
+            app_key_id: app_key_id.map(str::to_string),
+            requested_model: Some("m".into()),
+            model: "m".into(),
+            status: "ok".into(),
+            http_status: Some(200),
+            error_class: None,
+            latency_ms: Some(5),
+            tokens_in: 1,
+            tokens_out: 1,
+            cost_estimate_micros: 10,
+            cached_tokens: None,
+            fallback_chain_json: None,
+        };
+        {
+            let conn = store.conn.lock().unwrap();
+            ledger_insert(&conn, &row(Some("gk-1"))).unwrap();
+            // A `ui` row — and every row written before 0016 — names no app. It must stay NULL
+            // rather than be coerced into an empty string that would later sum as a real key.
+            ledger_insert(&conn, &row(None)).unwrap();
+        }
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT app_key_id FROM ledger ORDER BY id").unwrap();
+        let got: Vec<Option<String>> =
+            stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<_, _>>().unwrap();
+        assert_eq!(got, vec![Some("gk-1".to_string()), None]);
+
+        // The provider credential still lands in its own column. Collapsing the two is the mistake
+        // `app_key_id` exists to undo, so a passing test must not have done it by accident.
+        let key_id: Option<String> =
+            conn.query_row("SELECT key_id FROM ledger WHERE id=1", [], |r| r.get(0)).unwrap();
+        assert_eq!(key_id.as_deref(), Some("ak-1"));
+        drop(stmt);
+        drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard that makes attribution enforceable rather than merely conventional. Without
+    /// `deny_unknown_fields`, a misspelled `appKeyId` from the webview deserializes to `None` and
+    /// writes `NULL` on every row — the feature looks like it works while recording nothing, and
+    /// nothing anywhere reports a problem.
+    #[test]
+    fn a_ledger_row_with_an_unknown_key_is_rejected() {
+        let known = serde_json::json!({
+            "ts": 1, "modality": "text", "source": "gateway", "model": "m", "status": "ok",
+            "tokensIn": 0, "tokensOut": 0, "costEstimateMicros": 0,
+        });
+        assert!(serde_json::from_value::<LedgerRow>(known).is_ok(), "the known shape must parse");
+
+        let mut misspelled = serde_json::json!({
+            "ts": 1, "modality": "text", "source": "gateway", "model": "m", "status": "ok",
+            "tokensIn": 0, "tokensOut": 0, "costEstimateMicros": 0,
+        });
+        // `appKey`, not `appKeyId`: exactly the kind of slip that would otherwise be swallowed.
+        misspelled["appKey"] = serde_json::json!("gk-1");
+        assert!(
+            serde_json::from_value::<LedgerRow>(misspelled).is_err(),
+            "a misspelled app key must be loud, not silently dropped"
+        );
+    }
+
+    /// The read path, driven through the same statement and mapper the command uses.
+    ///
+    /// Every column is given a *distinct* value on purpose. The failure this exists to catch is a
+    /// shifted index, and two columns holding the same value would let an off-by-one pass.
+    #[test]
+    fn ledger_recent_maps_every_column_to_its_own_field() {
+        let (store, dir) = tmp_store("map");
+        {
+            let conn = store.conn.lock().unwrap();
+            ledger_insert(
+                &conn,
+                &LedgerRow {
+                    ts: 11,
+                    modality: "text".into(),
+                    source: "gateway".into(),
+                    provider_id: Some("prov-1".into()),
+                    key_id: Some("key-1".into()),
+                    app_key_id: Some("app-1".into()),
+                    requested_model: Some("req-1".into()),
+                    model: "mod-1".into(),
+                    status: "ok".into(),
+                    http_status: Some(201),
+                    error_class: Some("cls-1".into()),
+                    latency_ms: Some(7),
+                    tokens_in: 13,
+                    tokens_out: 17,
+                    cost_estimate_micros: 19,
+                    cached_tokens: Some(23),
+                    fallback_chain_json: Some("chain-1".into()),
+                },
+            )
+            .unwrap();
+        }
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare(LEDGER_SELECT).unwrap();
+        let got = stmt.query_row(params![1], ledger_row_from).unwrap();
+
+        assert_eq!(got.ts, 11);
+        assert_eq!(got.modality, "text");
+        assert_eq!(got.source, "gateway");
+        assert_eq!(got.provider_id.as_deref(), Some("prov-1"));
+        assert_eq!(got.key_id.as_deref(), Some("key-1"), "key_id is the provider credential");
+        assert_eq!(got.app_key_id.as_deref(), Some("app-1"), "app_key_id is the gateway app key");
+        assert_eq!(got.requested_model.as_deref(), Some("req-1"));
+        assert_eq!(got.model, "mod-1");
+        assert_eq!(got.status, "ok");
+        assert_eq!(got.http_status, Some(201));
+        assert_eq!(got.error_class.as_deref(), Some("cls-1"));
+        assert_eq!(got.latency_ms, Some(7));
+        assert_eq!(got.tokens_in, 13);
+        assert_eq!(got.tokens_out, 17);
+        assert_eq!(got.cost_estimate_micros, 19);
+        assert_eq!(got.cached_tokens, Some(23));
+        assert_eq!(got.fallback_chain_json.as_deref(), Some("chain-1"));
+        drop(stmt);
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
