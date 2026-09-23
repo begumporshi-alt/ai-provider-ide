@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Local mirror of the step set in .github/workflows/ci.yml.
+# Local mirror of the step set in .github/workflows/ci.yml, plus the
+# `headless-service` job's feature-less build (see the `Headless service build` step below).
 #
 # Why this exists: CI runs on macos-14, but from ~2026-09-16 to 2026-09-21 it never started a job
 # — every run failed in ~8s with "the job was not started because recent account payments have
@@ -7,8 +8,9 @@
 # public now, so minutes are free and CI runs again: 3-7 minutes, real results. A ~9-second
 # "failure" is that old signature, not a test result.
 #
-# It still earns its place. It runs the same step set as ci.yml, so it answers
-# "would CI pass?" in ~3 minutes rather than waiting on a runner queue, and it is the only gate if
+# It still earns its place. It runs the same step set as ci.yml -- plus the `headless-service`
+# job's feature-less build, which ci.yml runs as a separate 3-OS job -- so it answers "would CI
+# pass?" in a few minutes rather than waiting on a runner queue, and it is the only gate if
 # Actions is unavailable again.
 #
 # Usage:
@@ -86,9 +88,16 @@ fi
 step "Dependency audit"       pnpm audit --audit-level=moderate
 step "Typecheck"              pnpm typecheck
 step "Unit tests"             pnpm test
-# ci.yml has no build step at all, so nothing in CI would catch a bundle that no
-# longer compiles -- typecheck passing does not mean vite can bundle it.
+# Both mirrors now build the bundle, and they are not the same check. `pnpm build` is
+# `build:clean && tsc && vite build` -- TypeScript and Vite only, no cargo and no bundler -- so
+# a bundling error survives it. Measured 2026-09-23: adding a second `[[bin]]` broke
+# `tauri build` with "failed to find main binary" while `pnpm build`, `cargo check`, `cargo
+# test`, `cargo clippy` and `cargo fmt --check` were ALL green. See drift register D14.
 step "Build"                  pnpm build
+# `--bundles app` deliberately skips the DMG step, which needs AppleScript and is not what this
+# gate is testing. `tauri build` runs `beforeBuildCommand` (`pnpm build`) itself, so the step
+# above is a fast-fail for the frontend rather than a prerequisite for this one.
+step "Tauri build"            pnpm --filter ai-provider-router-desktop tauri build --bundles app
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
 step "One product version"    pnpm check-version-sync
@@ -112,6 +121,28 @@ if command -v cargo >/dev/null 2>&1; then
   # lib-only lint, and one of them sat on a path no test reached.
   step "Rust clippy"          cargo clippy --manifest-path "$ROOT/$TAURI_MANIFEST" --all-targets -- -D warnings
   step "Rust tests"           cargo test  --manifest-path "$ROOT/$TAURI_MANIFEST"
+  # The service must build with the Tauri glue switched off -- that is the entire claim of the
+  # `app` feature, and it is a different build from the default one above: `default = ["app"]`
+  # means the flagless command still compiles Tauri. Mirrors the `headless-service` CI job,
+  # which passes the same flag on all three platforms. Without this, the local gate answers
+  # "would CI pass?" with a no for the one job it does not model.
+  step "Headless service build" cargo build --manifest-path "$ROOT/$TAURI_MANIFEST" --bin aiproviderd --release --no-default-features
+  # ci.yml's `headless-service` job has three steps and this gate modelled one. The third asserts
+  # the binary *starts*, not merely that it builds -- and building is not starting: a change that
+  # links but dies on startup passed this gate and failed CI. `--version` is the whole of the
+  # assertion on purpose; ci.yml records why (no port, no keychain approval, no store, so it cannot
+  # flake, and it still proves the binary links). Path resolution is the part that already broke
+  # once in CI: `working-directory` there is `apps/desktop/src-tauri`, so this resolves the same
+  # way the build step above does rather than against the repo root, and a missing binary is a
+  # named error rather than a bare `command not found`. ci.yml also probes `aiproviderd.exe` for
+  # its Windows leg; there is no `.exe` to find here. The job's first step is a Linux-only apt
+  # install with no local counterpart by design.
+  headless_binary_runs() {
+    local bin="$ROOT/apps/desktop/src-tauri/target/release/aiproviderd"
+    test -f "$bin" || { echo "service binary not found at $bin" >&2; return 1; }
+    "$bin" --version
+  }
+  step "Service binary runs"  headless_binary_runs
 else
   echo "SKIP Rust check/tests — cargo not on PATH (export PATH=\"\$HOME/.cargo/bin:\$PATH\")"
   FAILED+=("Rust (cargo missing)")
