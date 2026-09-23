@@ -512,12 +512,49 @@ is port work, not cleanup. `cooldown_secs` had **no test at all** before this in
 `COOLDOWN_FLOOR_MS`, `ErrorClass`, `BodyHint`, `classify`, `is_retryable_with_next_key`,
 `ErrorClass::is_drift`, `AttemptOutcome`, `min_retry_after_ms`. Nine tests, three ported from
 `retry-after.test.ts` (shortest-wins fold, every-named-wait-counts, the sub-second floor).
-`cargo test` **498 passed / 0 failed** (was 489); clippy `--all-targets -- -D warnings` and
-`cargo fmt --check` clean; the `--no-default-features` service build still succeeds.
 
-Three falsifications prove the tests bite rather than describe: folding `min`→`max` fails the
-shortest-wait test, dropping `ms.max(COOLDOWN_FLOOR_MS)` fails the floor test, and adding
-`Timeout` to the retryable set fails the set test. The file was restored byte-identically after.
+**Increment 2 landed — the enforcement half.** `HealthTracker`, `KeyHealth` and
+`AUTH_BREAKER_THRESHOLD`: the module that *cools* a key, beside the one that *reports* the wait.
+`COOLDOWN_FLOOR_MS` now backs both, so the floor the tracker enforces and the floor the client is
+told cannot drift — which is the entire reason the TypeScript exports it (`health-tracker.ts:23-25`).
+Thirteen more tests. `cargo test` **511 passed / 0 failed** (489 when Phase 2 began); clippy
+`--all-targets -- -D warnings` and `cargo fmt --check` clean; `cargo check --no-default-features`
+warning-free and the service build still succeeds.
+
+**One invariant spans both increments, and it is now a test.**
+`the_enforced_floor_and_the_reported_floor_agree` walks every wait a provider could name — 1, 400,
+999, 1000, 1001, 30 000, 60 000 ms — and asserts that the cooldown `record_result` enforces equals the
+value `min_retry_after_ms` reports. `Some(0)` is the single deliberate exception, pinned separately:
+the tracker still cools for the floor while the report returns 0, meaning *omit the header* and let the
+middleware's floor apply. Both end up telling the client to wait; only the reporting path defers.
+
+**Three behaviours of the ported tracker are load-bearing and non-obvious, so each has a test.**
+The key status check is a **deny-list** (only `disabled`/`invalid` refuse, so an unrecognised status is
+*tried*) while the provider check is an **allow-list** (only `enabled` passes) — opposite polarities, so
+"fixing" either to match the other fails a test. The breaker counts **consecutive** failures, so one
+`Ok` closes it *and* resets the count. And the model-side drift classes (`NotFound`,
+`BadRequestSchema`, `ParseError`) leave key health alone, as do `ServerError`, `Network` and `Timeout`.
+
+**The TypeScript's `else if (!isRetryableWithNextKey(cls)) return;` in `recordResult` is a no-op.**
+The classes it names would fall through to the same "do nothing" anyway, and `SERVER_ERROR`, `NETWORK`
+and `TIMEOUT` are not named by it at all yet still reach it. The Rust port keeps the behaviour and
+replaces the branch with an exhaustive match arm, so the cases that change nothing are visible rather
+than implied by an absent branch.
+
+**`ApiKeyRow.cooldown_until` has no writer.** `is_key_usable` honours the record's own cooldown, and
+that check is unreachable today: every `updateKey` call site passes `status`, `lastTestedAt`, or both —
+four sites in source, measured 2026-09-23 — and nothing assigns the field directly. Its unit is
+therefore pinned only by the TypeScript comparing it against `Date.now()`, which is milliseconds, so
+the Rust test asserts ms and says why. This is the `NULL` ≠ `0` family: a persisted field that two
+layers map and no layer writes.
+
+**Eight falsifications across the two increments prove the tests bite rather than describe.**
+Increment 1: folding `min`→`max` fails the shortest-wait test, dropping the floor fails the floor test,
+adding `Timeout` to the retryable set fails the set test. Increment 2: dropping the floor from the
+enforced cooldown fails the cross-module invariant, `>=`→`>` on the breaker threshold fails the
+threshold test, inverting the key deny-list fails the status test, inverting the provider allow-list
+fails its test, and making `record_result` a no-op fails the map-growth test. The file was restored
+byte-identically after each run (`cmp -s`).
 
 **Deliberately not here yet.** `AttemptOutcome` carries no `Candidate` — that type is Phase 3's —
 so a failed chain cannot name what it tried, and `AllAttemptsFailedError` has no Rust home. That is

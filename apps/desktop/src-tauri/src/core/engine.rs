@@ -20,6 +20,16 @@
 //! `Candidate` (provider + key + model) so a failed chain can name what it tried. That type is
 //! Phase 3's; until it exists the label is absent and `AllAttemptsFailedError` has no home. This
 //! is a recorded gap, not an oversight.
+//!
+//! **Increment 2 adds the enforcement half.** `HealthTracker` is the module that *cools* a key,
+//! and `min_retry_after_ms` is the one that *reports* the wait. The TypeScript exports
+//! `COOLDOWN_FLOOR_MS` from the tracker specifically so the two cannot drift apart
+//! (`health-tracker.ts:23-25`); here they share one constant, and
+//! `the_enforced_floor_and_the_reported_floor_agree` is what keeps it that way.
+
+use std::collections::HashMap;
+
+use crate::core::persist::{ApiKeyRow, ProviderRow};
 
 /// The shortest cooldown a rate-limited key is ever given, in milliseconds.
 ///
@@ -184,6 +194,125 @@ pub fn min_retry_after_ms(attempts: &[AttemptOutcome]) -> u64 {
     shortest.unwrap_or(0)
 }
 
+/// Consecutive auth failures before a key is treated as invalid rather than merely unlucky.
+pub const AUTH_BREAKER_THRESHOLD: u32 = 3;
+
+/// The key statuses that make a key unusable outright.
+///
+/// **This is a deny-list, and that is load-bearing.** [`HealthTracker::is_key_usable`] rejects
+/// these two and accepts *everything else*, including a status string this code has never seen. A
+/// key left at `"pending"` is therefore tried. The TypeScript behaves the same way, and its
+/// polarity is the **opposite** of the provider check below — a reader who assumes one rule for
+/// both gets it backwards in one direction or the other.
+const KEY_STATUS_DENIED: [&str; 2] = ["disabled", "invalid"];
+
+/// The one provider status that makes a provider usable. An **allow-list**, unlike the key check.
+const PROVIDER_STATUS_ENABLED: &str = "enabled";
+
+/// Per-key circuit state. Every time is epoch **milliseconds**.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyHealth {
+    /// Epoch ms; `0` means ready.
+    pub cooldown_until_ms: i64,
+    /// Reset to zero by any `Ok`, because the breaker counts *consecutive* failures.
+    pub consecutive_auth_failures: u32,
+    /// Too many auth failures in a row: treat the key as invalid, not merely rate-limited.
+    pub breaker_open: bool,
+}
+
+/// Per-key and per-provider circuit state, kept free of I/O so failover ordering can be tested
+/// against it (TS `health-tracker.ts`).
+#[derive(Debug, Default)]
+pub struct HealthTracker {
+    keys: HashMap<String, KeyHealth>,
+}
+
+impl HealthTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether `key` may be tried at `now_ms`.
+    ///
+    /// Four independent ways to be unusable, deliberately separate: the persisted status, this
+    /// tracker's breaker, this tracker's cooldown, and the key record's **own** `cooldown_until` —
+    /// a different field from the in-memory one, and currently unreachable. See
+    /// `a_key_cooldown_on_the_record_is_honoured`.
+    pub fn is_key_usable(&self, key: &ApiKeyRow, now_ms: i64) -> bool {
+        if KEY_STATUS_DENIED.contains(&key.status.as_str()) {
+            return false;
+        }
+        // A read must not create an entry. The TypeScript `health()` inserts on read, which grows
+        // the map for every key ever *considered*; the answer is identical either way, because an
+        // absent entry means default health.
+        if let Some(h) = self.keys.get(&key.id) {
+            if h.breaker_open || h.cooldown_until_ms > now_ms {
+                return false;
+            }
+        }
+        if let Some(until) = key.cooldown_until {
+            if until > now_ms {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Whether `provider` may be tried at all. An allow-list: only `"enabled"` passes.
+    pub fn is_provider_usable(provider: &ProviderRow) -> bool {
+        provider.status == PROVIDER_STATUS_ENABLED
+    }
+
+    /// Record what an attempt did to `key_id`'s health.
+    ///
+    /// `retry_after_ms` is what the provider asked us to wait, and the cooldown is floored at
+    /// [`COOLDOWN_FLOOR_MS`] — the same constant [`min_retry_after_ms`] uses, so the wait enforced
+    /// and the wait reported are one number rather than two 1000s free to drift apart.
+    pub fn record_result(
+        &mut self,
+        key_id: &str,
+        cls: ErrorClass,
+        retry_after_ms: Option<u64>,
+        now_ms: i64,
+    ) {
+        let h = self.keys.entry(key_id.to_string()).or_default();
+        match cls {
+            ErrorClass::Ok => {
+                h.consecutive_auth_failures = 0;
+                h.cooldown_until_ms = 0;
+                h.breaker_open = false;
+            }
+            ErrorClass::RateLimited => {
+                let wait = retry_after_ms.unwrap_or(0).max(COOLDOWN_FLOOR_MS);
+                h.cooldown_until_ms = now_ms + wait as i64;
+            }
+            ErrorClass::AuthFailed => {
+                h.consecutive_auth_failures += 1;
+                if h.consecutive_auth_failures >= AUTH_BREAKER_THRESHOLD {
+                    h.breaker_open = true;
+                }
+            }
+            // Everything else leaves key health alone, and this arm is *explicit* on purpose. The
+            // TypeScript spells it as `else if (!isRetryableWithNextKey(cls)) return;`, which is a
+            // no-op: the classes it names would fall through to the same "do nothing" anyway, and
+            // SERVER_ERROR, NETWORK and TIMEOUT are not named by it at all yet still reach it.
+            // Listing them exhaustively keeps the cases that change nothing visible instead of
+            // implied by an absent branch.
+            ErrorClass::NotFound
+            | ErrorClass::BadRequestSchema
+            | ErrorClass::ParseError
+            | ErrorClass::ServerError
+            | ErrorClass::Timeout
+            | ErrorClass::Network => {}
+        }
+    }
+
+    /// Forget everything known about a key.
+    pub fn reset_key(&mut self, key_id: &str) {
+        self.keys.remove(key_id);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +461,244 @@ mod tests {
     #[test]
     fn an_empty_chain_names_no_wait() {
         assert_eq!(min_retry_after_ms(&[]), 0);
+    }
+
+    // ---- HealthTracker: the enforcement half ------------------------------------------------
+
+    fn key_row(id: &str, status: &str, cooldown_until: Option<i64>) -> ApiKeyRow {
+        ApiKeyRow {
+            id: id.to_string(),
+            provider_id: "p1".to_string(),
+            label: id.to_string(),
+            secret_ref: format!("key:p1:{id}"),
+            secret_hint: None,
+            status: status.to_string(),
+            priority: 0,
+            cooldown_until,
+            added_at: 1,
+            last_used_at: None,
+            last_tested_at: None,
+        }
+    }
+
+    fn provider_row(status: &str) -> ProviderRow {
+        ProviderRow {
+            id: "p1".to_string(),
+            slug: "p1".to_string(),
+            name: "p1".to_string(),
+            r#type: Some("builtin".to_string()),
+            base_url: "https://p1.test/v1".to_string(),
+            status: status.to_string(),
+            rotation_strategy: "round_robin".to_string(),
+            created_at: 1,
+            updated_at: 1,
+        }
+    }
+
+    const NOW: i64 = 1_000_000;
+
+    #[test]
+    fn a_rate_limited_key_is_cooled_for_at_least_the_floor() {
+        let mut asked = HealthTracker::new();
+        asked.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
+        assert_eq!(asked.keys["k1"].cooldown_until_ms, NOW + 60_000, "the provider's wait is kept");
+
+        // A sub-second wait, and no wait at all, both land on the floor.
+        for wait in [Some(400u64), Some(0), None] {
+            let mut t = HealthTracker::new();
+            t.record_result("k1", ErrorClass::RateLimited, wait, NOW);
+            assert_eq!(
+                t.keys["k1"].cooldown_until_ms,
+                NOW + COOLDOWN_FLOOR_MS as i64,
+                "wait {wait:?} must be floored, not honoured as-is"
+            );
+        }
+    }
+
+    #[test]
+    fn the_enforced_floor_and_the_reported_floor_agree() {
+        // This is the invariant the TypeScript exports COOLDOWN_FLOOR_MS for: the cooldown the
+        // tracker *enforces* must equal the wait the client is *told*. Two hardcoded 1000s would
+        // be free to drift apart; here one constant backs both, and this is what keeps it so.
+        for ms in [1u64, 400, 999, 1000, 1001, 30_000, 60_000] {
+            let mut t = HealthTracker::new();
+            t.record_result("k1", ErrorClass::RateLimited, Some(ms), NOW);
+            let enforced = t.keys["k1"].cooldown_until_ms - NOW;
+            let reported = min_retry_after_ms(&[outcome(ErrorClass::RateLimited, 429, Some(ms))]);
+            assert_eq!(enforced, reported as i64, "provider named {ms}ms");
+        }
+    }
+
+    #[test]
+    fn a_wait_of_zero_is_the_one_place_the_two_deliberately_differ() {
+        // `Some(0)` means "the provider named nothing", not "retry now". The tracker still cools
+        // for the floor; the report returns 0, which means *omit the header*, after which the
+        // middleware's own floor applies. Both end up telling the client to wait — only the
+        // reporting path defers. Pinned so the divergence is a decision rather than a surprise.
+        let mut t = HealthTracker::new();
+        t.record_result("k1", ErrorClass::RateLimited, Some(0), NOW);
+        assert_eq!(t.keys["k1"].cooldown_until_ms - NOW, COOLDOWN_FLOOR_MS as i64);
+        assert_eq!(min_retry_after_ms(&[outcome(ErrorClass::RateLimited, 429, Some(0))]), 0);
+    }
+
+    #[test]
+    fn three_consecutive_auth_failures_open_the_breaker_and_an_ok_closes_it() {
+        let key = key_row("k1", "active", None);
+        let mut t = HealthTracker::new();
+
+        for i in 1..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+            assert!(!t.keys["k1"].breaker_open, "still closed after {i} failure(s)");
+            assert!(t.is_key_usable(&key, NOW));
+        }
+        t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        assert!(t.keys["k1"].breaker_open, "opens on failure {AUTH_BREAKER_THRESHOLD}");
+        assert!(!t.is_key_usable(&key, NOW));
+
+        // One success clears it: the breaker counts *consecutive* failures, so the count resets
+        // too rather than merely closing.
+        t.record_result("k1", ErrorClass::Ok, None, NOW);
+        assert!(!t.keys["k1"].breaker_open);
+        assert_eq!(t.keys["k1"].consecutive_auth_failures, 0);
+        assert!(t.is_key_usable(&key, NOW));
+    }
+
+    #[test]
+    fn an_ok_result_clears_the_cooldown_the_breaker_and_the_failure_count() {
+        let mut t = HealthTracker::new();
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        }
+        t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
+        let before = t.keys["k1"];
+        assert!(
+            before.breaker_open
+                && before.cooldown_until_ms > NOW
+                && before.consecutive_auth_failures > 0
+        );
+
+        t.record_result("k1", ErrorClass::Ok, None, NOW);
+        assert_eq!(t.keys["k1"], KeyHealth::default(), "an Ok leaves nothing behind");
+        assert!(t.is_key_usable(&key_row("k1", "active", None), NOW));
+    }
+
+    #[test]
+    fn a_disabled_or_invalid_key_is_unusable_and_an_unknown_status_is_not() {
+        let t = HealthTracker::new();
+        for denied in ["disabled", "invalid"] {
+            assert!(
+                !t.is_key_usable(&key_row("k1", denied, None), NOW),
+                "{denied} must be refused"
+            );
+        }
+        // A deny-list, so anything else is tried — including a status this code has never seen.
+        // Pinned because the intuitive reading ("only `active` is usable") is the wrong one, and
+        // the comparison is case-sensitive: `"ACTIVE"` is not `"active"` but passes anyway.
+        for allowed in ["active", "pending", "", "ACTIVE"] {
+            assert!(
+                t.is_key_usable(&key_row("k1", allowed, None), NOW),
+                "{allowed:?} must be tried"
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_is_usable_only_when_its_status_is_enabled() {
+        // The opposite polarity to the key check above: an allow-list, so an unrecognised
+        // provider status is refused rather than tried. Both polarities are pinned so that
+        // "fixing" either one to match the other fails a test.
+        assert!(HealthTracker::is_provider_usable(&provider_row("enabled")));
+        for refused in ["disabled", "invalid", "pending", "", "ENABLED"] {
+            assert!(
+                !HealthTracker::is_provider_usable(&provider_row(refused)),
+                "{refused:?} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn a_key_cooldown_on_the_record_is_honoured() {
+        // The record's own `cooldown_until` is a *different* field from this tracker's in-memory
+        // one, and it is the only place the unit is asserted. Nothing in the codebase ever writes
+        // a non-null value: every `updateKey` call site passes `status`, `lastTestedAt`, or both
+        // (measured 2026-09-23, four call sites in source). The TypeScript compares the field
+        // against `Date.now()`, which is milliseconds, so milliseconds is the contract — pinned
+        // here so the first writer to arrive has it stated rather than guessed.
+        let t = HealthTracker::new();
+        assert!(
+            !t.is_key_usable(&key_row("k1", "active", Some(NOW + 1)), NOW),
+            "a future cooldown blocks"
+        );
+        assert!(
+            t.is_key_usable(&key_row("k1", "active", Some(NOW - 1)), NOW),
+            "an elapsed one does not"
+        );
+        assert!(
+            t.is_key_usable(&key_row("k1", "active", Some(NOW)), NOW),
+            "the boundary is exclusive"
+        );
+    }
+
+    #[test]
+    fn a_model_side_drift_class_leaves_key_health_alone() {
+        // NOT_FOUND, BAD_REQUEST_SCHEMA and PARSE_ERROR are provider/manifest problems, not key
+        // problems. Burning a good key for them is the bug this prevents.
+        for cls in [ErrorClass::NotFound, ErrorClass::BadRequestSchema, ErrorClass::ParseError] {
+            let mut t = HealthTracker::new();
+            t.record_result("k1", cls, None, NOW);
+            assert_eq!(t.keys["k1"], KeyHealth::default(), "{cls:?} changed key health");
+        }
+    }
+
+    #[test]
+    fn server_error_network_and_timeout_also_leave_key_health_alone() {
+        // These three reach the end of the TypeScript chain rather than its explicit early
+        // return, and the outcome is the same: nothing. Asserted separately, and with a wait
+        // attached, so that if the port ever grows a backoff for them it is a deliberate change
+        // rather than a silent one — `retry_after_ms` is ignored for every class but RATE_LIMITED.
+        for cls in [ErrorClass::ServerError, ErrorClass::Network, ErrorClass::Timeout] {
+            let mut t = HealthTracker::new();
+            t.record_result("k1", cls, Some(60_000), NOW);
+            assert_eq!(t.keys["k1"], KeyHealth::default(), "{cls:?} changed key health");
+        }
+    }
+
+    #[test]
+    fn resetting_a_key_forgets_its_cooldown_and_its_breaker() {
+        let key = key_row("k1", "active", None);
+        let mut t = HealthTracker::new();
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        }
+        assert!(!t.is_key_usable(&key, NOW));
+
+        t.reset_key("k1");
+        assert!(t.is_key_usable(&key, NOW));
+        // A reset key starts from nothing, not from "cooldown cleared but breaker open".
+        assert!(!t.keys.contains_key("k1"));
+    }
+
+    #[test]
+    fn reading_a_keys_health_does_not_create_an_entry_for_it() {
+        // A deliberate divergence from the TypeScript, whose `health()` inserts on read. The
+        // answer is the same — an absent entry means default health — but considering a thousand
+        // keys does not grow the map.
+        let t = HealthTracker::new();
+        assert!(t.is_key_usable(&key_row("never-seen", "active", None), NOW));
+        assert!(t.keys.is_empty(), "a read must not insert");
+    }
+
+    #[test]
+    fn the_map_does_grow_when_something_is_recorded() {
+        // The companion to the test above: `is_empty()` there is only evidence if the map *is*
+        // populated when it should be. Without this, a tracker whose `record_result` silently did
+        // nothing would make the non-inserting read look correct for the wrong reason.
+        let mut t = HealthTracker::new();
+        t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
+        assert_eq!(t.keys.len(), 1);
+        t.record_result("k2", ErrorClass::AuthFailed, None, NOW);
+        assert_eq!(t.keys.len(), 2);
+        t.reset_key("k1");
+        assert_eq!(t.keys.len(), 1);
     }
 }
