@@ -13,7 +13,13 @@
  */
 import { describe, expect, it } from "vitest";
 import type { ChatMessage } from "../src/ports.js";
-import { compressMessages, estimateTokens, promptBudget } from "../src/context-compress.js";
+import {
+  compressMessages,
+  compressWithSummary,
+  estimateTokens,
+  promptBudget,
+  SUMMARY_LABEL,
+} from "../src/context-compress.js";
 
 const msg = (
   role: ChatMessage["role"],
@@ -167,5 +173,105 @@ describe("compressMessages", () => {
     expect(r.beforeTokens).toBe(estimateTokens(all));
     expect(r.afterTokens).toBe(estimateTokens(r.messages));
     expect(r.afterTokens).toBeLessThanOrEqual(r.budget);
+  });
+
+  it("a summary in the system prefix is never trimmed away", () => {
+    // The property Tier 2 depends on: the summary is stored as a leading system turn, and
+    // leading system turns survive every later trim.
+    const system = msg("system", "sys");
+    const summary = msg("system", `${SUMMARY_LABEL}\n earlier stuff`);
+    const turns = [msg("user", "q1"), msg("user", "q2")];
+    const budget = estimateTokens([system, summary, msg("user", "q2")]);
+    const r = compressMessages([system, summary, ...turns], budget);
+    expect(r.messages).toContainEqual(summary);
+  });
+});
+
+describe("compressWithSummary", () => {
+  const system = msg("system", "sys");
+  const oldQ = msg("user", "old question");
+  const newQ = msg("user", "new question");
+  const tightBudget = () => estimateTokens([system, newQ]);
+
+  it("replaces the dropped turns with a summary instead of discarding them", async () => {
+    const r = await compressWithSummary(
+      [system, oldQ, newQ],
+      tightBudget(),
+      async () => "They asked something earlier.",
+    );
+    expect(r.compressed).toBe(true);
+    expect(r.messages).toContainEqual(system);
+    expect(r.messages).toContainEqual(newQ);
+    const summary = r.messages.find(
+      (m) => m.role === "system" && m.content.includes(SUMMARY_LABEL),
+    );
+    expect(summary).toBeDefined();
+    expect(summary!.content).toContain("They asked something earlier.");
+  });
+
+  it("hands the summarizer exactly the messages that were dropped", async () => {
+    let seen: ChatMessage[] = [];
+    await compressWithSummary([system, oldQ, newQ], tightBudget(), async (d) => {
+      seen = d;
+      return "s";
+    });
+    expect(seen).toEqual([oldQ]);
+  });
+
+  it("falls back to plain truncation when the summarizer throws", async () => {
+    // An added feature must never turn a working request into a failed one.
+    const r = await compressWithSummary([system, oldQ, newQ], tightBudget(), async () => {
+      throw new Error("summarizer unavailable");
+    });
+    expect(r.messages).toEqual([system, newQ]);
+    expect(r.messages.some((m) => m.content.includes(SUMMARY_LABEL))).toBe(false);
+  });
+
+  it("falls back when the summarizer returns nothing usable", async () => {
+    const r = await compressWithSummary([system, oldQ, newQ], tightBudget(), async () => "   ");
+    expect(r.messages).toEqual([system, newQ]);
+  });
+
+  it("does not call the summarizer when nothing was dropped", async () => {
+    const all = [system, newQ];
+    let calls = 0;
+    await compressWithSummary(all, estimateTokens(all), async () => {
+      calls += 1;
+      return "s";
+    });
+    expect(calls).toBe(0);
+  });
+
+  it("places the summary ahead of the conversation, in the system prefix", async () => {
+    // Sized so the budget is genuinely tight: it forces `q1` out, yet still leaves room for the
+    // summary beside the newest turn. With one-word turns nothing would be dropped, no summary
+    // would be produced, and the assertions would run against a case that never happened.
+    const q1 = sized("user", 50);
+    const q2 = msg("user", "q2");
+    const budget = estimateTokens([system, q1, q2]) - estimateTokens([q1]) + 40;
+    const r = await compressWithSummary([system, q1, q2], budget, async () => "summary text");
+    const summaryIdx = r.messages.findIndex(
+      (m) => m.role === "system" && m.content.includes(SUMMARY_LABEL),
+    );
+    const lastIdx = r.messages.findIndex((m) => m === q2);
+    expect(summaryIdx).toBeGreaterThanOrEqual(0);
+    expect(lastIdx).toBeGreaterThan(summaryIdx);
+  });
+
+  it("still fits the budget after the summary is added — re-fitting may drop more", async () => {
+    // This exercises the re-fit: the summary itself costs tokens, so adding it can push the
+    // result back over budget and cost a further turn. The newest turn must survive that too.
+    const q1 = sized("user", 50);
+    const q2 = sized("user", 50);
+    const q3 = msg("user", "q3");
+    const budget = estimateTokens([system, q3]) + 60;
+    const r = await compressWithSummary([system, q1, q2, q3], budget, async () => "a compact summary");
+    expect(r.compressed).toBe(true);
+    expect(r.afterTokens).toBeLessThanOrEqual(budget);
+    expect(r.messages[r.messages.length - 1]).toBe(q3);
+    // The summary survived the re-fit that removed q2.
+    expect(
+      r.messages.some((m) => m.role === "system" && m.content.includes(SUMMARY_LABEL)),
+    ).toBe(true);
   });
 });

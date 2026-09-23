@@ -5,7 +5,7 @@
  * exclusion rule and system-route preference enforced here, in one auditable place.
  */
 import type { Modality } from "@aiprovider/adapter-spec";
-import type { ImageRequest, ModelInfo, RouterFacade, TextRequest } from "./ports.js";
+import type { ChatMessage, ImageRequest, ModelInfo, RouterFacade, TextRequest } from "./ports.js";
 import type { ProviderRegistry } from "./provider-registry.js";
 import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ModelCatalog } from "./model-catalog.js";
@@ -16,7 +16,13 @@ import { ExecutionEngine, type TextExecution } from "./execution-engine.js";
 import { ProviderLimiter, PER_PROVIDER_DEFAULT, clampConcurrency } from "./concurrency.js";
 import { estimateCostMicros } from "./pricing.js";
 import { UsageLedger, type LedgerSource } from "./usage-ledger.js";
-import { compressMessages, promptBudget, DEFAULT_CONTEXT_WINDOW } from "./context-compress.js";
+import {
+  compressMessages,
+  compressWithSummary,
+  promptBudget,
+  DEFAULT_CONTEXT_WINDOW,
+  type CompressResult,
+} from "./context-compress.js";
 
 export interface RouterSettings {
   failoverEnabled: boolean;
@@ -83,7 +89,24 @@ export class ModelRouter implements RouterFacade, AiTextPort {
 
   async generateText(
     req: TextRequest,
-    opts?: { signal?: AbortSignal; source?: LedgerSource; appKeyId?: string },
+    opts?: {
+      signal?: AbortSignal;
+      source?: LedgerSource;
+      appKeyId?: string;
+      /**
+       * Tier 2, opt-in: turn dropped context into a summary instead of discarding it.
+       *
+       * Off by default, because it costs an extra model call on the request path. Tier 1
+       * truncation is what runs when this is absent, and it is a correct answer to the same
+       * problem — it merely keeps less.
+       */
+      summarize?: (dropped: ChatMessage[]) => Promise<string>;
+      /**
+       * The summarizer's own inner call sets this. Without it, producing a summary would
+       * compress, which would summarize, which would compress — an unbounded chain.
+       */
+      skipCompression?: boolean;
+    },
   ): Promise<TextExecution> {
     const t0 = Date.now();
     this.syncConcurrency();
@@ -105,7 +128,27 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       .filter((w): w is number => typeof w === "number" && w > 0);
     const contextWindow =
       knownWindows.length > 0 ? Math.min(...knownWindows) : DEFAULT_CONTEXT_WINDOW;
-    const compressed = compressMessages(req.messages, promptBudget(contextWindow, req.maxTokens));
+    const budget = promptBudget(contextWindow, req.maxTokens);
+
+    let compressed: CompressResult;
+    if (opts?.skipCompression) {
+      // The summarizer's own call. Compressing here would mean summarizing, which would mean
+      // compressing — so the inner request is passed through untouched.
+      compressed = {
+        messages: req.messages,
+        dropped: 0,
+        droppedMessages: [],
+        beforeTokens: 0,
+        afterTokens: 0,
+        budget,
+        compressed: false,
+      };
+    } else if (opts?.summarize) {
+      // Tier 2, opt-in: the dropped turns become a summary rather than vanishing.
+      compressed = await compressWithSummary(req.messages, budget, opts.summarize);
+    } else {
+      compressed = compressMessages(req.messages, budget);
+    }
 
     const exec = await this.engine.executeText({
       plan,

@@ -18,6 +18,8 @@ export { parsePricing, estimateCostMicros, priceRank, type PricingMicros } from 
 export { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
 export {
   compressMessages,
+  compressWithSummary,
+  SUMMARY_LABEL,
   promptBudget,
   estimateTokens,
   estimateMessageTokens,

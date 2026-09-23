@@ -51,6 +51,14 @@ export interface CompressResult {
   messages: ChatMessage[];
   /** Messages removed. Zero when nothing needed dropping. */
   dropped: number;
+  /**
+   * The messages that were removed, in their original order — what a summarizer is handed.
+   *
+   * Carried rather than recomputed by the caller: which turns went is decided in exactly one
+   * place, and a second derivation of the same set is how two paths come to disagree about
+   * what "the earlier part of the conversation" means.
+   */
+  droppedMessages: ChatMessage[];
   beforeTokens: number;
   afterTokens: number;
   budget: number;
@@ -153,6 +161,7 @@ export function compressMessages(
   const unchanged = (): CompressResult => ({
     messages: [...messages],
     dropped: 0,
+    droppedMessages: [],
     beforeTokens,
     afterTokens: beforeTokens,
     budget: budgetTokens,
@@ -175,13 +184,88 @@ export function compressMessages(
     start += 1;
   }
 
+  const droppedTurns = turns.slice(0, start).flat();
   const kept: ChatMessage[] = [...systemPrefix, ...turns.slice(start).flat()];
   return {
     messages: kept,
     dropped: messages.length - kept.length,
+    droppedMessages: droppedTurns,
     beforeTokens,
     afterTokens: estimateTokens(kept),
     budget: budgetTokens,
     compressed: kept.length < messages.length,
+  };
+}
+
+/**
+ * Heading the summary block is published under.
+ *
+ * Plain prose, no dialect-specific syntax — the same rule the memory block follows. A summary
+ * that arrives as bare text reads as if the assistant had said it, which is a worse failure
+ * than a summary nobody notices.
+ */
+export const SUMMARY_LABEL = "Summary of the earlier part of this conversation:";
+
+/**
+ * Tier 2: replace the dropped turns with a summary rather than discarding them.
+ *
+ * **What is decided where.** Which turns go is decided by `compressMessages` and nowhere else.
+ * This function only decides how the dropped ones are *represented*. That split is deliberate:
+ * a second opinion on what counts as "the earlier part of the conversation" is exactly the kind
+ * of divergence that leaves two callers summarising different histories.
+ *
+ * **Failure degrades, never propagates.** A summarizer that throws, or returns nothing, yields
+ * Tier 1's answer — already a correct solution to the same problem, merely one that keeps less.
+ * An added feature must not turn a working request into a failed one.
+ *
+ * **The summary cannot be trimmed away.** It is placed in the system prefix, which
+ * `compressMessages` preserves, so the re-fit below may drop further *conversation* turns but
+ * never the summary itself.
+ */
+export async function compressWithSummary(
+  messages: readonly ChatMessage[],
+  budgetTokens: number,
+  summarize: (dropped: ChatMessage[]) => Promise<string>,
+): Promise<CompressResult> {
+  const base = compressMessages(messages, budgetTokens);
+  // Nothing dropped, so nothing to summarize — and paying for a model call to summarize zero
+  // turns would be pure cost on the request path.
+  if (!base.compressed || base.droppedMessages.length === 0) return base;
+
+  let summary: string;
+  try {
+    summary = await summarize(base.droppedMessages);
+  } catch {
+    return base;
+  }
+  const text = typeof summary === "string" ? summary.trim() : "";
+  if (text === "") return base;
+
+  let at = 0;
+  while (at < base.messages.length && base.messages[at]!.role === "system") at += 1;
+  const summaryMsg: ChatMessage = { role: "system", content: `${SUMMARY_LABEL}\n${text}` };
+  const withSummary: ChatMessage[] = [
+    ...base.messages.slice(0, at),
+    summaryMsg,
+    ...base.messages.slice(at),
+  ];
+
+  // The summary costs tokens too, so the result has to be re-fitted. This may drop further
+  // turns, and those go without a second summary — the summary already covers the oldest
+  // material, and recursing would put an unbounded number of model calls on the request path.
+  const final = compressMessages(withSummary, budgetTokens);
+
+  // Reported against the ORIGINAL conversation rather than the intermediate one, so "what was
+  // removed" does not change meaning depending on whether a summary happened to be produced.
+  const kept = new Set(final.messages);
+  const droppedMessages = messages.filter((m) => !kept.has(m));
+  return {
+    messages: final.messages,
+    dropped: droppedMessages.length,
+    droppedMessages,
+    beforeTokens: base.beforeTokens,
+    afterTokens: final.afterTokens,
+    budget: budgetTokens,
+    compressed: true,
   };
 }
