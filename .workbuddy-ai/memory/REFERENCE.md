@@ -792,6 +792,32 @@ Mirrors `ci.yml` step for step, adds a Node >= 19 preflight, and unsets the prox
 `pnpm install` by default; `--install` to include it, `--skip-browser` to drop the ~48s Playwright
 run. **Use this as the inner loop, not as a substitute for CI** (see next).
 
+### What it costs, and when not to run all of it (measured 2026-09-23)
+It is 16 steps and it compiles the **same code three times per language** — Rust: `tauri build` (release, default
+features), `aiproviderd --release --no-default-features`, and `cargo test` (debug); JS: typecheck, test, build —
+before `playwright install chromium` and the browser suite. That is deliberate (D14/D17: each configuration is a
+separate control), and it is why it is slow.
+
+Measured on a **Rust-only + docs diff**: `pnpm ci:local` ran **8m46s and had finished 5 of 16 steps**, still inside
+`Tauri build`. The four Rust controls it would have run, run alone, were **green in 1m35s**. So for a diff that
+touches only `src-tauri/` and `docs/`, run those four plus the three doc checks, and let CI pay for the release
+builds and the browser matrix:
+
+```bash
+M=apps/desktop/src-tauri/Cargo.toml
+cargo fmt --manifest-path $M --check
+cargo check --manifest-path $M --no-default-features --all-targets
+cargo clippy --manifest-path $M --all-targets -- -D warnings
+cargo test  --manifest-path $M
+pnpm docs:book && pnpm check-doc-links && pnpm key-leak-grep
+```
+
+**The silence is not a stall.** A release compile prints one `Compiling <crate>` line per crate and then *nothing*
+for minutes while the final crate compiles and links. Read the log tail (`grep -a '^=== ' <log>` for step banners)
+before concluding it hung — and note `ps` is **not permitted** in this sandbox, so process enumeration is not
+available as a liveness check. Redirect the gate to a file rather than piping it: a pipeline's exit status is the
+last command's, so `| tail` reports `tail`'s status and buffers until exit.
+
 ## CI runs again — the billing block was a *private*-repo artefact (corrected 2026-09-22)
 **This section previously claimed CI was dead. That was wrong, and the way it was wrong cost four
 runs of misdiagnosis.** GitHub Actions bills minutes for *private* repos; the account's block
