@@ -1,6 +1,6 @@
 # 09 — Status
 
-**As of 2026-09-23**, against `8795cd5`.
+**As of 2026-09-23**, against `031ae4f`.
 
 > **This is the one chapter expected to age quickly, and the only one where staleness is normal.** Every other
 > chapter states a rule that changes only when someone decides to change it. This one states where the work
