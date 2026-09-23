@@ -44,7 +44,8 @@ use serde_json::Value;
 
 use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs, TextArgs, ToolCall};
 use crate::core::limiter::ProviderLimiter;
-use crate::core::persist::{ApiKeyRow, ModelRow, ProviderRow};
+use crate::core::persist::{ApiKeyRow, ProviderRow};
+use crate::core::planner::Candidate;
 use crate::core::usage::UsageTokens;
 
 /// The shortest cooldown a rate-limited key is ever given, in milliseconds.
@@ -467,29 +468,16 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
 
 // ---------- the plan, and the image loop over it ----------
 
-/// One planned attempt: which provider to call, with which key, for which model.
-///
-/// The Rust home of `route-planner.ts`'s `Candidate` (`:13-17`). It lives in this module rather
-/// than in a `route_planner` of its own because the planner itself is not ported yet, and a module
-/// named for the planner that held only its type would promise more than it carries. The three row
-/// types are already the crate's (`persist.rs:33`, `:176`, `:321`), so the shape needs nothing new.
-///
-/// **The name was taken, and the other holder gave way.** `context_scope.rs` already had a
-/// `Candidate` — a *recalled memory* headed for the prompt, `{id, layer, text, pinned}` — now
-/// `context_scope::MemoryItem`. The TypeScript is this port's reference and cannot move, so the
-/// port keeps the source's name and the Rust-only type is the one renamed. Recorded as D21.
-///
-/// **`Debug`, and only `Debug`.** The three row types carried `Serialize`/`Deserialize` alone, so
-/// this meant adding one derive to each — done, because the buyer is concrete rather than
-/// speculative: `Result::expect_err` requires `Debug` on the **success** type, which is how the
-/// loop's failure tests are written. `Clone` and `PartialEq` are deliberately still absent; see the
-/// module note for why `AttemptOutcome` does not carry a candidate yet.
-#[derive(Debug)]
-pub struct Candidate {
-    pub provider: ProviderRow,
-    pub key: ApiKeyRow,
-    pub model: ModelRow,
-}
+// `Candidate` — one planned attempt: which provider to call, with which key, for which model.
+//
+// It moved to `core::planner` in increment 11b. The type was parked in this module from increment 7
+// with a note saying it was here only "because the planner itself is not ported yet"; the planner is
+// now ported and owns its own output type, and this file imports it, so no call site changed. The
+// definition and its history — the D21 renaming of `context_scope::Candidate`, and why `Debug` and
+// only `Debug` — are with it.
+//
+// (A plain comment, not a doc comment: there is no item here for it to document any more, and
+// clippy's `empty_line_after_doc_comments` would otherwise attach it to `transport_outcome`.)
 
 /// What the image path records when the adapter did not answer at all.
 ///
@@ -1143,6 +1131,9 @@ impl HealthTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests name the model row: the engine reads a candidate's `model.native_id` without
+    // ever spelling the type, so importing it at the top would be unused in a non-test build.
+    use crate::core::persist::ModelRow;
 
     fn outcome(cls: ErrorClass, status: u16, retry_after_ms: Option<u64>) -> AttemptOutcome {
         AttemptOutcome { cls, status, retry_after_ms }

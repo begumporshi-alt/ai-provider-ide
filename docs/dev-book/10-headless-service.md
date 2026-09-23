@@ -1148,6 +1148,72 @@ verified byte-identical.
 `AttemptOutcome` cannot name the provider it tried, and it is now confirmed load-bearing by
 `model-router.ts:537-539`, which reads `a.candidate.provider.id/slug` off each attempt.
 
+### Increment 11 as built — the planner, and the pricing it needed (2026-09-23)
+
+Phase 3 starts with the planner because it is the cheap half, and it is the cheap half because it is pure.
+`route-planner.ts` is 173 lines of `buildPlan(input, ctx, now) -> Candidate[]` plus two helpers: no I/O, no
+async, no SQLite, no adapter. Its row types are already this crate's (`ProviderRow`, `ApiKeyRow`, `ModelRow`,
+`AliasRow`, `HealthTracker`), so the whole of the gap between "the planner is pure" and "the planner can be
+ported" was one import — `priceRank`, from `pricing.ts:9`. That is why the increment ships in two commits.
+
+**11a — `core/pricing.rs`** (335 lines, 12 tests, `cargo test` 596 → 608). Micro-USD per 1M tokens as an
+`i64`, because the ledger column is `cost_estimate_micros INTEGER` and a per-token price is ~1e-7. "Unknown"
+is `None` and never `Some(0)`: a provider that publishes no pricing is a different fact from one that
+publishes free, and a zero would make it the cheapest carrier in any `cost_spread` ordering — the same defect
+class as `NULL ≠ 0` in `usage.rs` and "no cap" as `NULL` in `limiter.rs`. Three findings came from the
+falsification harness and none from reading: a dead finiteness filter (the conversion checks the product, so
+the gate was a second spelling of a state it already refuses); a test that never reached its own `is_object`
+branch; and a `?` chain that is **not** TypeScript's `??` — `to_number(a.get("prompt")?).or_else(||
+to_number(a.get("input")?))` returns from the function on the first miss, so a catalog using the
+`input`/`output` spelling parsed as *unknown*, which in a cheapest-first ordering silently demotes that
+provider to last. Fixed with `find_map` over the four spellings.
+
+**11b — `core/planner.rs`** (~740 lines, 29 tests, `cargo test` 608 → 637). `build_plan`, `resolve_wanted`,
+`strip_client_namespace`, `order_keys`, `order_carriers`. `Candidate` moved here from `core::engine`, which
+redeems the promise its own doc-comment made in increment 7 — it was parked there "because the planner itself
+is not ported yet", and a planner module that did not own its output type would be that promise unredeemed;
+the engine imports it, so no call site changed. `ProviderRow`, `ApiKeyRow` and `ModelRow` gained `Clone`,
+because the TypeScript's `Candidate` holds *references* — five candidates sharing one provider object — and
+the port clones.
+
+**The context is a trait, not a struct of `&dyn Fn` fields, and a borrow decided it.** A struct holding
+`&'a dyn Fn(..)` forces every test to keep its closures alive longer than the context built from them: `&|pid|
+...` is a temporary, and the borrow checker is right to refuse it. `PlanContext` as a trait lets the fixture
+*be* the context, which is also what the TypeScript is — an object literal with methods.
+
+**Three places the port is provably identical but not literally identical**, each pinned:
+
+1. `order_keys` uses `rem_euclid` where JavaScript uses `%` **plus** negative `slice` indices. `-1 % 3` is
+   `-1`, and `slice(-1)`/`slice(0, -1)` count from the end, so `start = -1` on three keys means "begin at
+   index 2" — exactly `rem_euclid(3)`. It is a total, panic-free spelling of the same rotation, not a
+   rounding of it.
+2. The TypeScript guards `orderCarriers` with `if (!ctx.pricingFor) return wanted`. With `pricing_for`
+   returning `Option<PricingMicros>`, "no lookup supplied" and "a lookup that answers `None` for everything"
+   are the *same* ordering: every rank is `None`, every comparison is `Equal`, and a stable sort is the
+   identity. The guard is unobservable, so `pricing_for` is a **required** trait method with no default body
+   — this crate's rule — and "no pricing" is one of its answers rather than a missing one.
+3. The dedup key is a `(provider_id, native_id)` tuple where the TypeScript builds `` `${providerId}
+   ${nativeId}` ``. The string collapses two pairs that split differently (`("a b", "c")` and `("a",
+   "b c")`); the tuple does not. Reachable only with an id containing a space, but it is the stricter
+   reading and costs nothing.
+
+**Two behaviours kept rather than fixed, both now pinned by a test.** `orderCarriers` decides whether to
+reorder by `wanted.some(...)`, so *one* carrier asking for `cost_spread` reorders every other carrier on the
+list, including providers whose own strategy is something else. And `stripClientNamespace` and the qualified-id
+lookup both read `ctx.providers` **regardless of status**, while `buildPlan` then requires `enabled` — so
+`a/m1` resolves as qualified against a *disabled* `a`, the bare-id fallback is suppressed by `qualified`, and
+the plan comes back empty even though another enabled provider carries a model literally named `a/m1`. That is
+the intended "never silently reroute" rule (`:131`) reaching further than its author describes.
+
+**Twenty-two falsifications, all red tests, all restores byte-identical.** They include one test rewritten
+mid-harness: the first `the_same_provider_and_model_are_planned_once` used an alias named `m1`, which the
+`alias_rows.is_empty()` gate suppresses — so it never reached the dedup and passed for the wrong reason. The
+shape that actually duplicates is a qualifier and an alias resolving to the same pair. One assertion is
+honestly *not* falsifiable: `the_alias_pass_sorts_a_copy_and_never_the_callers_rows` also asserts the
+fixture's own rows come back untouched, which `aliases()` returning `&[AliasRow]` makes unreachable by
+mutation. It is kept as a statement of what the signature buys, and the test's falsifiable half is its
+ordering assertion.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.

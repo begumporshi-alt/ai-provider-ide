@@ -2557,4 +2557,34 @@ caller); polling the stream is the **mid-stream** phase (a break is `Err` as an 
 already holds text and a clean `Err` would invite the retry that duplicates it). Those are exactly
 `FailureKind::Response` and `FailureKind::MidStream`, and the classification turns on which one was seen.
 
+### Porting JS index arithmetic and callback contexts into Rust (2026-09-24)
 
+**A negative index in JS is two operations, and `rem_euclid` is both of them.** `arr.slice(-1)` /
+`arr.slice(0, -1)` count from the end, so `start = cursor % n` with a negative `cursor` means
+`start = n + cursor` — which is `cursor.rem_euclid(n)`, not `cursor % n`. A literal `%` in Rust keeps the sign
+and then panics when cast to `usize`. Whenever a port rotates, windows or slices by a JS-computed index,
+`rem_euclid` is the faithful spelling. Pinned in `core/planner` by
+`a_negative_cursor_rotates_from_the_end_exactly_as_javascript_slice_does`.
+
+**A "context object" of callbacks is a trait, not a struct of `&dyn Fn` fields.** A struct field of type
+`&'a dyn Fn(..)` cannot be built from an inline closure in a test — `&|x| ...` borrows a temporary that dies
+at the end of the statement. Turning the context into a trait (with the fixture as the implementor) removes
+the lifetime entirely and is also closer to what the TypeScript is. Reach for this before adding
+`Box<dyn Fn>` fields or fighting the borrow checker.
+
+**When the source's optional callback becomes a required method, prove the guard is dead before deleting
+it.** `route-planner.ts` guards with `if (!ctx.pricingFor) return wanted`. Once the Rust method returns
+`Option<T>` and every comparison on `None` is `Equal`, a stable sort is the identity — so "absent" and
+"answers `None`" are the same ordering and the guard has no observable effect. That proof is what licenses
+making the method **required** (no default body) rather than `Option`-wrapped.
+
+**Removing a struct from a module can strand its imports.** After `Candidate` moved to `core::planner`,
+`ModelRow` was used only inside `engine.rs`'s `mod tests`. Importing it at the top would warn in a non-test
+build; the import belongs in the test module.
+
+**A `|` inside a markdown table cell is a column separator.** `docs/dev-book/09-status.md` is one long table;
+writing closure notation like `&|pid|` there fails `build-dev-book` with "table row has 4 cells but the
+header has 2".
+
+**A `///` block with no item under it attaches to the next item** and trips clippy's
+`empty_line_after_doc_comments`. When deleting a struct, turn its doc-comment into `//` or delete it too.

@@ -28,7 +28,10 @@ fn now_ms() -> i64 {
 
 // ---------- providers ----------
 
-#[derive(Serialize, Deserialize, Debug)]
+/// `Clone` is here for the planner: `build_plan` builds a `Candidate` per usable key, and a
+/// candidate owns its three rows (`core::planner`), so one provider row is cloned once per key of
+/// that provider. The TypeScript shares a reference instead.
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRow {
     pub id: String,
@@ -171,7 +174,7 @@ pub fn recompute_allow(egress: &crate::core::egress::EgressState, store: &Store)
 
 // ---------- api keys ----------
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeyRow {
     pub id: String,
@@ -316,7 +319,7 @@ pub fn manifest_upsert_active(
 
 // ---------- model catalog + aliases ----------
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRow {
     pub provider_id: String,

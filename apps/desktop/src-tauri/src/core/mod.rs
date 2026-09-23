@@ -38,6 +38,7 @@ pub mod limiter;
 pub mod memory;
 pub mod orchestrator;
 pub mod persist;
+pub mod planner;
 pub mod pricing;
 pub mod skills;
 pub mod store;
