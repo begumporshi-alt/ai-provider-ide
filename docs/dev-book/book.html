@@ -172,11 +172,12 @@ figure.diagram figcaption a{border-bottom:none}
 <a class="nav-item" href="#ch-08" data-target="ch-08"><span class="nav-num">08</span><span class="nav-title">08 — Flows</span></a>
 <a class="nav-item" href="#ch-09" data-target="ch-09"><span class="nav-num">09</span><span class="nav-title">09 — Status</span></a>
 <a class="nav-item" href="#ch-10" data-target="ch-10"><span class="nav-num">10</span><span class="nav-title">10 — Headless service mode</span></a>
+<a class="nav-item" href="#ch-11" data-target="ch-11"><span class="nav-num">11</span><span class="nav-title">11 — Cross-platform tech choice: how to run the gateway without a WebView</span></a>
 <a class="nav-item" href="#appendix-diagrams" data-target="appendix-diagrams"><span class="nav-num">A</span><span class="nav-title">Diagram index</span></a>
 </nav>
 <main>
   <p class="generated-note">
-    Generated from <code>docs/dev-book/</code> — 11 chapters.
+    Generated from <code>docs/dev-book/</code> — 12 chapters.
     Edit the markdown, then run <code>pnpm docs:book</code>. Never edit this file.
   </p>
 <section class="chapter" id="ch-00" data-title="The developer book">
@@ -189,9 +190,9 @@ figure.diagram figcaption a{border-bottom:none}
 <pre><code class="language-bash">pnpm docs:book</code></pre>
 <p><code>scripts/build-dev-book.mjs</code> has no dependencies. It <strong>fails the build</strong> if any relative link or image does not resolve, or if two elements claim the same <code>id</code> — the two failure modes that <a href="#ch-07">07</a> D9 records. Edit the markdown, regenerate, and commit both.</p>
 <h2 id="ch-00-how-to-read-it">How to read it</h2>
-<div class="table-wrap"><table><thead><tr><th>If you are</th><th>Read</th></tr></thead><tbody><tr><td>New to the repository</td><td><a href="#ch-01">01 Orientation</a> → <a href="#ch-02">02 Architecture</a> → <a href="#ch-05">05 Workflow</a></td></tr><tr><td>About to change code</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-06">06 Conventions</a> → the checklist in <a href="#ch-07">07</a></td></tr><tr><td>About to cut a release</td><td><a href="#ch-05">05 Workflow</a> § Release, then <a href="#ch-07">07</a></td></tr><tr><td>Debugging something that &quot;should work&quot;</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-04">04 Data model</a></td></tr><tr><td>Wanting the picture rather than the prose</td><td><a href="#ch-08">08 Flows</a> → <a href="#ch-02">02 Architecture</a></td></tr><tr><td>Picking up the backlog</td><td><a href="#ch-09">09 Status</a> → <a href="#ch-07">07 Drift register</a></td></tr><tr><td>Planning a major architectural change</td><td><a href="#ch-10">10 Headless service</a></td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>If you are</th><th>Read</th></tr></thead><tbody><tr><td>New to the repository</td><td><a href="#ch-01">01 Orientation</a> → <a href="#ch-02">02 Architecture</a> → <a href="#ch-05">05 Workflow</a></td></tr><tr><td>About to change code</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-06">06 Conventions</a> → the checklist in <a href="#ch-07">07</a></td></tr><tr><td>About to cut a release</td><td><a href="#ch-05">05 Workflow</a> § Release, then <a href="#ch-07">07</a></td></tr><tr><td>Debugging something that &quot;should work&quot;</td><td><a href="#ch-03">03 Contracts</a> → <a href="#ch-04">04 Data model</a></td></tr><tr><td>Wanting the picture rather than the prose</td><td><a href="#ch-08">08 Flows</a> → <a href="#ch-02">02 Architecture</a></td></tr><tr><td>Picking up the backlog</td><td><a href="#ch-09">09 Status</a> → <a href="#ch-07">07 Drift register</a></td></tr><tr><td>Planning a major architectural change</td><td><a href="#ch-10">10 Headless service</a> → <a href="#ch-11">11 Tech choice</a></td></tr></tbody></table></div>
 <h2 id="ch-00-chapters">Chapters</h2>
-<div class="table-wrap"><table><thead><tr><th>#</th><th>Chapter</th><th>Owns</th></tr></thead><tbody><tr><td>01</td><td><a href="#ch-01">Orientation</a></td><td>What the product is, the repository map, the toolchain, the screen map</td></tr><tr><td>02</td><td><a href="#ch-02">Architecture</a></td><td>The two-runtime split, the layer stack, the one security boundary, self-construction</td></tr><tr><td>03</td><td><a href="#ch-03">Contracts</a></td><td>Invariants, the HTTP surface, the IPC surface, status-code semantics, budgets</td></tr><tr><td>04</td><td><a href="#ch-04">Data model</a></td><td>Schema, migration rules, identifier rules, retention</td></tr><tr><td>05</td><td><a href="#ch-05">Workflow</a></td><td>The gate, the fast loops, the test suites, releasing, verification discipline</td></tr><tr><td>06</td><td><a href="#ch-06">Conventions</a></td><td>Code, test, UI and doc conventions — each with the bug it cost</td></tr><tr><td>07</td><td><a href="#ch-07">Drift register</a></td><td>Known doc-versus-code disagreements, and the change checklist</td></tr><tr><td>08</td><td><a href="#ch-08">Flows</a></td><td>The request lifecycle and the user journey, with diagrams</td></tr><tr><td>09</td><td><a href="#ch-09">Status</a></td><td>Where the work stands: working, gaps, parked, needs improvement</td></tr><tr><td>10</td><td><a href="#ch-10">Headless service</a></td><td>Plan for detaching the gateway from the webview process</td></tr></tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>#</th><th>Chapter</th><th>Owns</th></tr></thead><tbody><tr><td>01</td><td><a href="#ch-01">Orientation</a></td><td>What the product is, the repository map, the toolchain, the screen map</td></tr><tr><td>02</td><td><a href="#ch-02">Architecture</a></td><td>The two-runtime split, the layer stack, the one security boundary, self-construction</td></tr><tr><td>03</td><td><a href="#ch-03">Contracts</a></td><td>Invariants, the HTTP surface, the IPC surface, status-code semantics, budgets</td></tr><tr><td>04</td><td><a href="#ch-04">Data model</a></td><td>Schema, migration rules, identifier rules, retention</td></tr><tr><td>05</td><td><a href="#ch-05">Workflow</a></td><td>The gate, the fast loops, the test suites, releasing, verification discipline</td></tr><tr><td>06</td><td><a href="#ch-06">Conventions</a></td><td>Code, test, UI and doc conventions — each with the bug it cost</td></tr><tr><td>07</td><td><a href="#ch-07">Drift register</a></td><td>Known doc-versus-code disagreements, and the change checklist</td></tr><tr><td>08</td><td><a href="#ch-08">Flows</a></td><td>The request lifecycle and the user journey, with diagrams</td></tr><tr><td>09</td><td><a href="#ch-09">Status</a></td><td>Where the work stands: working, gaps, parked, needs improvement</td></tr><tr><td>10</td><td><a href="#ch-10">Headless service</a></td><td>Plan for detaching the gateway from the webview process</td></tr><tr><td>11</td><td><a href="#ch-11">Cross-platform tech choice</a></td><td>How to run the gateway without a WebView on Windows, macOS, and Linux</td></tr></tbody></table></div>
 <h2 id="ch-00-single-ownership-where-truth-lives">Single ownership — where truth lives</h2>
 <p>Every fact has exactly one home. If two files state the same fact, one of them is a copy and will rot.</p>
 <div class="table-wrap"><table><thead><tr><th>Subject</th><th>Authoritative source</th></tr></thead><tbody><tr><td>Product overview, install, first run, signing</td><td><code>README.md</code></td></tr><tr><td>What changed, per release</td><td><code>CHANGELOG.md</code></td></tr><tr><td>Build, test, gate, contribution mechanics</td><td><code>CONTRIBUTING.md</code></td></tr><tr><td>Vulnerability reporting and threat scope</td><td><code>SECURITY.md</code></td></tr><tr><td>Design narrative, module map, data flows, acceptance criteria</td><td><code>docs/ARCHITECTURE.md</code></td></tr><tr><td>Why a decision was made, dated</td><td><code>docs/DECISIONS.md</code></td></tr><tr><td>Memory and context subsystem design</td><td><code>docs/GATEWAY_MEMORY_LAYER.md</code></td></tr><tr><td>Control screen design and the audit trails</td><td><code>docs/CONTROL_SCREEN_BUILD.md</code></td></tr><tr><td>Product-completion <strong>audit</strong> and its dated evidence trail</td><td><code>docs/PRODUCT_COMPLETION_PLAN.md</code></td></tr><tr><td>Product-completion <strong>current status</strong> (the live snapshot)</td><td><a href="#ch-09">09 Status</a></td></tr><tr><td>Diagrams and visual assets</td><td><code>diagrams/</code> — at the repository <strong>root</strong>, not under <code>docs/</code></td></tr><tr><td>The rendered single-page book</td><td><code>docs/dev-book/book.html</code> — <strong>generated</strong>, never hand-edited</td></tr><tr><td><strong>Rules, invariants, interfaces, workflow, conventions</strong></td><td><strong>this book</strong></td></tr><tr><td>Working notes discovered while building</td><td><code>.workbuddy-ai/memory/REFERENCE.md</code></td></tr><tr><td>Known doc-versus-code disagreements</td><td><a href="#ch-07">07 Drift register</a></td></tr></tbody></table></div>
@@ -964,6 +965,158 @@ fn route_request(req: Request) -&gt; Response {
 <h2 id="ch-10-13-where-this-plan-lives">13. Where this plan lives</h2>
 <p>This is a plan, not a specification. When implementation starts, each phase gets its own design document in <code>docs/</code> and its own branch. This chapter is updated as decisions are made and assumptions are tested.</p>
 <p><strong>Next action:</strong> answer the four decisions in §10, then begin Phase 1 (extract core library).</p>
+</section>
+<section class="chapter" id="ch-11" data-title="11 — Cross-platform tech choice: how to run the gateway without a WebView">
+<h1 id="ch-11-11-cross-platform-tech-choice-how-to-run-the-gateway-without-a-webview">11 — Cross-platform tech choice: how to run the gateway without a WebView</h1>
+<p><strong>Status:</strong> analysis — no implementation yet.</p>
+<p><strong>Question answered:</strong> which technology path lets the gateway survive the UI process on Windows, macOS, and Linux, while keeping the product a desktop app.</p>
+<p><strong>Date:</strong> 2026-09-23 <strong>Assessed tree:</strong> <code>7ac97e3</code> <strong>Reference project analysed:</strong> <code>tashfeenahmed/freellmapi</code> (FreeLLMAPI)</p>
+<p>---</p>
+<h2 id="ch-11-0-the-headline">0. The headline</h2>
+<p><strong>FreeLLMAPI solved the same problem by making the server a standalone Node.js process. The user's project cannot copy that answer without abandoning its security model.</strong></p>
+<p>FreeLLMAPI is TypeScript end-to-end: Express server, React dashboard, Electron-style tray. Every layer speaks the same language, and the server runs as a background Node.js process that the tray app merely watches.</p>
+<p>This project is different: the security boundary is Rust. The keychain, the credential injection, and the SQLite store are all Rust-native. Moving the gateway to Node.js would mean either duplicating that boundary in JavaScript (which breaks the &quot;key-blind by construction&quot; invariant) or bridging across the Rust→Node boundary on every request (which adds latency and complexity).</p>
+<p>So the question is not &quot;which language should the server be in?&quot; — it is &quot;how do we run the existing TypeScript router core outside a WebView, on all three platforms, without rewriting it?&quot;</p>
+<p>There are three answers. This chapter evaluates all three and recommends one.</p>
+<p>---</p>
+<h2 id="ch-11-1-what-freellmapi-does-and-what-we-can-borrow">1. What FreeLLMAPI does, and what we can borrow</h2>
+<h3 id="ch-11-11-freellmapi-architecture">1.1 FreeLLMAPI architecture</h3>
+<pre><code>┌─────────────────────────────────────────────┐
+│  Desktop tray app (Electron-style)          │
+│  ── just a manager ──                       │
+│  • Start/stop the server                    │
+│  • Show dashboard in a window               │
+│  • Tray icon for status                     │
+└──────────────┬──────────────────────────────┘
+               │
+               │ launches as child process
+               ▼
+┌─────────────────────────────────────────────┐
+│  Node.js server (Express + SQLite)          │
+│  ── the actual gateway ──                   │
+│  • HTTP server on localhost                 │
+│  • Router core in TypeScript                │
+│  • Provider adapters in TypeScript          │
+│  • SQLite with AES-256-GCM                  │
+│  • Self-updating model catalog              │
+└─────────────────────────────────────────────┘</code></pre>
+<p>The tray app is <strong>expendable</strong>. Kill it, and the server keeps serving. Reopen it, and it reconnects. This is exactly the property the user's project needs.</p>
+<h3 id="ch-11-12-what-we-can-borrow">1.2 What we can borrow</h3>
+<div class="table-wrap"><table><thead><tr><th>FreeLLMAPI pattern</th><th>Applicable here?</th><th>How</th></tr></thead><tbody><tr><td>Server as separate process</td><td>Yes</td><td>The service binary (<code>aiproviderd</code>)</td></tr><tr><td>Tray app as manager</td><td>Yes</td><td>The Tauri app becomes a pure consumer</td></tr><tr><td>Server auto-starts at login</td><td>Yes</td><td>Platform-specific service registration</td></tr><tr><td>Dashboard talks HTTP to server</td><td>Yes</td><td>UI replaces <code>invoke</code> with <code>fetch</code></td></tr><tr><td>SQLite as single data store</td><td>Yes</td><td>Same database, same path</td></tr><tr><td>TypeScript router core</td><td><strong>Partially</strong></td><td>Our router core is TS, but our host is Rust</td></tr></tbody></table></div>
+<h3 id="ch-11-13-what-we-cannot-borrow">1.3 What we cannot borrow</h3>
+<p>FreeLLMAPI's server is <strong>pure Node.js</strong>. It handles auth, encryption, and key storage in JavaScript. This project's security model depends on the Rust host having exclusive access to the keychain. Moving that to Node.js would:</p>
+<ol><li>Break the key-blind invariant (<code>03-contracts.md</code> §1 — the TypeScript layer must never see a raw secret).</li><li>Require a Node.js keychain library (<code>keytar</code> or <code>node-keychain</code>), which adds a native dependency that is less audited than Rust's <code>keyring</code>.</li><li>Split the security boundary across two languages, making it harder to reason about.</li></ol>
+<p>So the server cannot become a Node.js process. The Rust host must remain the server. The question is how the router core — which is TypeScript — runs without a WebView.</p>
+<p>---</p>
+<h2 id="ch-11-2-the-three-paths-evaluated">2. The three paths evaluated</h2>
+<h3 id="ch-11-path-a-port-the-router-core-to-rust">Path A: Port the router core to Rust</h3>
+<p><strong>What it is:</strong> Rewrite <code>execution-engine.ts</code>, <code>model-router.ts</code>, <code>route-planner.ts</code>, <code>context-compress.ts</code>, <code>adapter-runtime.ts</code>, and supporting modules in Rust.</p>
+<p><strong>Current state:</strong></p>
+<ul><li>Rust host: 25,612 lines across 25 modules</li><li>TypeScript router core: 5,880 lines across 35 modules</li><li>Estimated to move: ~2,100 lines (execution, router, planner, compression, health, ledger)</li></ul>
+<p><strong>Cross-platform process management:</strong></p>
+<div class="table-wrap"><table><thead><tr><th>Platform</th><th>Mechanism</th><th>Effort</th></tr></thead><tbody><tr><td>macOS</td><td>launchd LaunchAgent</td><td>Low — plist + <code>launchctl load</code></td></tr><tr><td>Windows</td><td>Windows Service (via <code>windows-service</code> crate)</td><td>Medium — service wrapper + SCM registration</td></tr><tr><td>Linux</td><td>systemd user service</td><td>Low — unit file + <code>systemctl --user</code></td></tr></tbody></table></div>
+<p>All three are well-documented, well-tested patterns. The binary is a single static executable that needs no runtime.</p>
+<p><strong>Pros:</strong></p>
+<ul><li>Single binary, no runtime dependency</li><li>Native performance, no JS→Rust bridge overhead</li><li>The security boundary stays in one language</li><li>Process management is standard and well-understood on all platforms</li><li>No WebView means no App Nap, no renderer crashes, no HMR teardown</li></ul>
+<p><strong>Cons:</strong></p>
+<ul><li>3-4 weeks of focused development (§10 estimate)</li><li>The execution engine has async generators, AbortSignal propagation, and SSE multiplexing — all harder in Rust than in TypeScript</li><li>Tier-2 adapters use QuickJS-WASM; porting the sandbox to Rust needs <code>rquickjs</code> or equivalent</li><li>Risk of introducing bugs in the rewrite</li></ul>
+<p><strong>Mitigation:</strong> Phase 1 of §10 (extract core library) proves the HTTP server can start without Tauri. Phase 2 ports the execution engine test-first. A <code>webview-gateway</code> feature flag keeps both paths for one release.</p>
+<p>---</p>
+<h3 id="ch-11-path-b-embed-a-javascript-runtime-in-rust">Path B: Embed a JavaScript runtime in Rust</h3>
+<p><strong>What it is:</strong> Use <code>deno_core</code> or <code>rquickjs</code> to run the TypeScript router core inside the Rust process, without a WebView.</p>
+<p><strong>How it would work:</strong></p>
+<pre><code>Rust process (aiproviderd)
+├── axum HTTP server
+├── keychain vault
+├── SQLite store
+└── deno_core / rquickjs runtime
+    ├── execution-engine.ts  ← loaded as a module
+    ├── model-router.ts
+    ├── route-planner.ts
+    └── ...</code></pre>
+<p>The JS runtime lives in the same process as the Rust host. The Rust side exposes an API to the JS side for HTTP egress, keychain access, and SQLite reads.</p>
+<p><strong>Cross-platform:</strong> <code>deno_core</code> compiles for all three platforms. <code>rquickjs</code> is pure Rust and also cross-platform.</p>
+<p><strong>Pros:</strong></p>
+<ul><li>Minimal changes to the router core — it stays TypeScript</li><li>Faster to implement than a full port (1-2 weeks vs 3-4)</li><li>No WebView means no App Nap or renderer crashes</li><li>Single binary if using <code>rquickjs</code>; <code>deno_core</code> adds ~15MB</li></ul>
+<p><strong>Cons:</strong></p>
+<ul><li><code>deno_core</code> embedding API is complex, unstable, and poorly documented</li><li><code>rquickjs</code> lacks built-in async/await support (QuickJS itself supports it, but the Rust bindings are limited)</li><li>The execution engine uses <code>fetch()</code>, <code>AbortSignal</code>, and <code>ReadableStream</code> — all Web APIs that <code>rquickjs</code> does not provide natively</li><li>Two languages in one process means two garbage collectors and two error-handling disciplines</li><li>Debugging a panic in the JS runtime is harder than debugging TypeScript in a browser</li></ul>
+<p><strong>Measured feasibility:</strong> A 1-day spike would answer whether <code>rquickjs</code> can load the router core and execute a simple <code>generateText</code> call. Until that spike runs, this path is speculative.</p>
+<p>---</p>
+<h3 id="ch-11-path-c-nodejs-subprocess">Path C: Node.js subprocess</h3>
+<p><strong>What it is:</strong> Bundle the router core as a standalone Node.js script, spawn it as a child process from Rust, and communicate via HTTP or IPC.</p>
+<p><strong>How it would work:</strong></p>
+<pre><code>Rust process (aiproviderd)          Node.js process (router-core)
+├── axum HTTP server  ───────────►  ├── Express server (or plain HTTP)
+├── keychain vault                  │   ├── execution-engine.ts
+├── SQLite store                    │   ├── model-router.ts
+└── process manager                 │   └── route-planner.ts
+                                    └── HTTP on localhost:8801</code></pre>
+<p>The Rust host proxies requests to the Node.js router, or the Node.js router listens directly and the Rust host delegates.</p>
+<p><strong>Cross-platform:</strong> Node.js runs on all three platforms. Process management is the challenge:</p>
+<div class="table-wrap"><table><thead><tr><th>Platform</th><th>Mechanism</th><th>Effort</th></tr></thead><tbody><tr><td>macOS</td><td>launchd LaunchAgent for Rust binary; Node.js spawned by Rust</td><td>Medium</td></tr><tr><td>Windows</td><td>Windows Service for Rust binary; Node.js spawned by Rust</td><td>Medium-High</td></tr><tr><td>Linux</td><td>systemd user service for Rust binary; Node.js spawned by Rust</td><td>Medium</td></tr></tbody></table></div>
+<p>The Node.js process is a child of the Rust service. If the Rust service restarts, it must re-spawn Node.js. If Node.js crashes, Rust must detect it and restart it.</p>
+<p><strong>Pros:</strong></p>
+<ul><li>Zero changes to the router core</li><li>Node.js has mature async/await, fetch, streams — everything the engine needs</li><li>Quickest path to a working prototype (days, not weeks)</li></ul>
+<p><strong>Cons:</strong></p>
+<ul><li>Two runtimes in memory: Rust + Node.js (~50MB+ additional RSS)</li><li>Two HTTP hops (client → Rust → Node.js → provider) adds latency</li><li>Bundling Node.js with the app: either require users to install it (bad UX) or ship a bundled runtime (increases bundle size by ~40MB)</li><li>The Node.js process is a child — if the Rust parent dies unexpectedly, the child may become a zombie or be re-parented to PID 1</li><li>Process management code is platform-specific and error-prone</li><li>The security boundary is split: Rust holds the keychain, but Node.js handles the request logic</li></ul>
+<p><strong>Critical issue:</strong> The router core today calls <code>fetch()</code> to providers. In a Node.js subprocess, <code>fetch()</code> works. But the router core also relies on the Tauri event bridge (<code>gateway-bridge.ts</code>) to stream chunks back to Rust. That bridge would need to be replaced with an HTTP/WebSocket stream — a non-trivial change.</p>
+<p>---</p>
+<h2 id="ch-11-3-comparison-matrix">3. Comparison matrix</h2>
+<div class="table-wrap"><table><thead><tr><th>Criterion</th><th>Path A: Port to Rust</th><th>Path B: Embed JS runtime</th><th>Path C: Node.js subprocess</th></tr></thead><tbody><tr><td><strong>Time to implement</strong></td><td>3-4 weeks</td><td>1-2 weeks</td><td>3-5 days</td></tr><tr><td><strong>Router core changes</strong></td><td>Full rewrite</td><td>Minimal</td><td>Moderate (bridge replacement)</td></tr><tr><td><strong>Binary size</strong></td><td>+0MB (single binary)</td><td>+15MB (deno_core) or +2MB (rquickjs)</td><td>+40MB (bundled Node.js)</td></tr><tr><td><strong>Memory at idle</strong></td><td>Low (~20MB)</td><td>Medium (~40MB)</td><td>High (~70MB)</td></tr><tr><td><strong>Cross-platform ease</strong></td><td>High (Rust compiles everywhere)</td><td>Medium (runtime dependency)</td><td>Medium (runtime + process mgmt)</td></tr><tr><td><strong>Security boundary</strong></td><td>Strong (single language)</td><td>Weak (two GCs, two error models)</td><td>Weak (split across processes)</td></tr><tr><td><strong>Performance</strong></td><td>Best (no bridge)</td><td>Good (in-process)</td><td>Poor (two HTTP hops)</td></tr><tr><td><strong>Debuggability</strong></td><td>Good (Rust tools)</td><td>Poor (JS-in-Rust stack traces)</td><td>Good (separate Node.js process)</td></tr><tr><td><strong>Reliability</strong></td><td>Best (no JS runtime to fail)</td><td>Medium (runtime can panic)</td><td>Medium (child process mgmt)</td></tr><tr><td><strong>App Nap / renderer crash</strong></td><td>Eliminated</td><td>Eliminated</td><td>Eliminated</td></tr><tr><td><strong>Long-term maintainability</strong></td><td>Best</td><td>Poor (runtime API churn)</td><td>Poor (two runtimes to update)</td></tr></tbody></table></div>
+<p>---</p>
+<h2 id="ch-11-4-the-recommendation">4. The recommendation</h2>
+<h3 id="ch-11-41-primary-recommendation-path-a-port-to-rust">4.1 Primary recommendation: Path A (port to Rust)</h3>
+<p><strong>Rationale:</strong></p>
+<ol><li><strong>The security model demands it.</strong> The key-blind invariant (<code>02-architecture.md</code> §1) is only enforceable because the TypeScript layer cannot touch credentials. Path B and Path C both put the router core — which handles request bodies, headers, and provider URLs — in a JavaScript runtime that could, in principle, be tricked into exfiltrating data. Rust's type system and memory safety make that class of bug impossible by construction.</li></ol>
+<ol><li><strong>The existing investment is Rust-heavy.</strong> The host is 25,612 lines of Rust. The router core is 5,880 lines of TypeScript, but only ~2,100 lines are in the hot path. The adapters are already in Rust (<code>gateway_anthropic.rs</code>, <code>gateway_gemini.rs</code>, etc.). Porting is less work than it appears because the boundary is already half-crossed.</li></ol>
+<ol><li><strong>Cross-platform is free with Rust.</strong> A single <code>cargo build</code> produces binaries for macOS, Windows, and Linux. No runtime to bundle, no process management hell, no &quot;works on my machine.&quot;</li></ol>
+<ol><li><strong>The other paths have fatal flaws.</strong> Path B's <code>deno_core</code> is immature and heavy. Path C's Node.js subprocess adds 40MB, two HTTP hops, and splits the security boundary. Both are short-term wins that create long-term debt.</li></ol>
+<h3 id="ch-11-42-the-phased-approach-revised-for-cross-platform">4.2 The phased approach (revised for cross-platform)</h3>
+<p>The original §10 plan is correct, but the process management phase needs to be cross-platform from day one.</p>
+<p><strong>Phase 1 — Extract core library (1-2 weeks)</strong></p>
+<ul><li>Split <code>src/</code> into <code>src/core/</code> (Tauri-independent) and <code>src/tauri/</code> (Tauri glue)</li><li>Add <code>src/bin/aiproviderd.rs</code> as a standalone binary</li><li>Verify: <code>cargo test</code>, <code>cargo clippy</code>, <code>cargo build --bin aiproviderd</code> on all three platforms</li><li><strong>Cross-platform gate:</strong> CI builds the binary on <code>macos-latest</code>, <code>windows-latest</code>, and <code>ubuntu-latest</code>.</li></ul>
+<p><strong>Phase 2 — Port execution engine (3-5 weeks)</strong></p>
+<ul><li>Rewrite <code>execution-engine.ts</code> in Rust, test-first</li><li>Replace <code>SynthBridge</code> in tests with the real Rust engine</li><li><strong>Cross-platform gate:</strong> Tests pass on all three platforms (they are platform-agnostic, but verifying this is cheap)</li></ul>
+<p><strong>Phase 3 — Port router + planner (2-3 weeks)</strong></p>
+<ul><li>Port <code>model-router.ts</code> and <code>route-planner.ts</code></li><li>Keep the <code>webview-gateway</code> feature flag active</li></ul>
+<p><strong>Phase 4 — Port context compression (2-3 weeks)</strong></p>
+<ul><li>Port <code>context-compress.ts</code></li><li>The summarizer makes recursive calls — verify no deadlock</li></ul>
+<p><strong>Phase 5 — Delete the bridge (1 week)</strong></p>
+<ul><li>Remove <code>gateway_cmds.rs</code> bridge, <code>gateway-worker.ts</code>, <code>gateway.html</code>, <code>app_nap.rs</code></li><li>Gateway routes directly into Rust router core</li></ul>
+<p><strong>Phase 6 — Cross-platform service installer (2-3 weeks)</strong></p>
+<ul><li><strong>macOS:</strong> <code>launchd</code> LaunchAgent plist</li><li><strong>Windows:</strong> Windows Service via <code>windows-service</code> crate (or <code>sc</code> CLI for registration)</li><li><strong>Linux:</strong> <code>systemd</code> user service unit file</li><li><strong>Tauri app changes:</strong> Service discovery (<code>GET /health</code>), install/uninstall UI, status indicator</li><li><strong>CI gate:</strong> Build and package on all three platforms</li></ul>
+<p><strong>Total: 11-17 weeks.</strong> The wide range depends on how the execution engine port goes — it is the riskiest phase.</p>
+<h3 id="ch-11-43-risk-tier-2-adapters-quickjs-wasm">4.3 Risk: Tier-2 adapters (QuickJS-WASM)</h3>
+<p>The router core's <code>adapter-runtime.ts</code> loads Tier-2 adapters into a QuickJS-WASM sandbox. Porting this to Rust requires either:</p>
+<ol><li><strong><code>rquickjs</code></strong> — a Rust binding to QuickJS. A 1-day spike is needed to verify it can run the existing adapter code.</li><li><strong>WASM runtime in Rust</strong> — <code>wasmtime</code> or <code>wasmer</code>. The existing sandbox compiles to WASM, so this is theoretically possible.</li><li><strong>Drop Tier-2 support temporarily</strong> — Tier-0 (builtin templates) and Tier-1 (manifest interpreter) cover most providers. Tier-2 is the escape hatch for edge cases.</li></ol>
+<p><strong>Recommendation:</strong> Spike <code>rquickjs</code> in Phase 1. If it fails, document Tier-2 as a known limitation of the headless mode and keep the WebView path behind the feature flag for Tier-2 users.</p>
+<p>---</p>
+<h2 id="ch-11-5-what-to-do-now">5. What to do now</h2>
+<h3 id="ch-11-decision-1-do-we-commit-to-path-a">Decision 1: Do we commit to Path A?</h3>
+<p><strong>Yes.</strong> The other paths compromise the security model or create unsustainable operational complexity. Path A is the only one that makes the gateway a true service without sacrificing the architecture's core invariant.</p>
+<h3 id="ch-11-decision-2-do-we-drop-tier-2-adapters-if-rquickjs-fails">Decision 2: Do we drop Tier-2 adapters if <code>rquickjs</code> fails?</h3>
+<p><strong>Yes, temporarily.</strong> The plan documents Tier-2 as a limitation and keeps the WebView path behind a feature flag. When <code>rquickjs</code> matures or a better alternative appears, Tier-2 can be restored.</p>
+<h3 id="ch-11-decision-3-do-we-ship-headless-mode-as-the-default">Decision 3: Do we ship headless mode as the default?</h3>
+<p><strong>No, not immediately.</strong> The <code>webview-gateway</code> feature flag keeps the current architecture as the default for one release. Headless mode is opt-in via a build flag. This gives users a release cycle to report issues before it becomes the only path.</p>
+<h3 id="ch-11-decision-4-do-we-support-windows-services-or-just-background-processes">Decision 4: Do we support Windows Services or just background processes?</h3>
+<p><strong>Background processes on Windows, Services optional.</strong> A Windows Service requires admin rights to install, which is a barrier. A background process (no console window, started by the Tauri app) is simpler and sufficient for v1. A Service can be added later for enterprise deployments.</p>
+<p>---</p>
+<h2 id="ch-11-6-what-freellmapi-got-right-that-we-should-copy">6. What FreeLLMAPI got right that we should copy</h2>
+<ol><li><strong>The server is the product; the tray app is just a viewer.</strong> This is the mental model shift. The user's project currently treats the Tauri app as the product and the gateway as a feature. Headless mode reverses that.</li></ol>
+<ol><li><strong>The dashboard talks HTTP to the server, never directly to the database.</strong> This keeps the data layer behind one API. The user's project already does this via Tauri IPC; moving to HTTP is a small change.</li></ol>
+<ol><li><strong>Single SQLite file, single source of truth.</strong> FreeLLMAPI encrypts the whole database; the user's project encrypts only the keychain entries. Both approaches are valid, but the &quot;single file&quot; principle is the same.</li></ol>
+<ol><li><strong>The server auto-starts and auto-restarts.</strong> This is the user experience that matters. A user should never have to think about whether the gateway is running.</li></ol>
+<p>---</p>
+<h2 id="ch-11-7-what-the-users-project-does-better">7. What the user's project does better</h2>
+<ol><li><strong>The security boundary is stronger.</strong> FreeLLMAPI handles credentials in Node.js; the user's project handles them in Rust with OS keychain integration. This is not paranoia — it is the difference between &quot;we try not to leak keys&quot; and &quot;keys are physically impossible to leak from the TypeScript layer.&quot;</li></ol>
+<ol><li><strong>The adapter system is more sophisticated.</strong> FreeLLMAPI has provider adapters; the user's project has a three-tier adapter system (builtin → manifest → sandboxed code) with drift detection and repair. Porting this to Rust is work, but the result is a more capable system.</li></ol>
+<ol><li><strong>The gateway is already HTTP-native.</strong> FreeLLMAPI's dashboard talks to the server over HTTP; the user's UI talks over Tauri IPC. But the gateway itself already speaks OpenAI-compatible HTTP. The UI just needs to become another HTTP client.</li></ol>
+<p>---</p>
+<h2 id="ch-11-8-next-action">8. Next action</h2>
+<p>Begin <strong>Phase 1</strong> of §10: extract the core library.</p>
+<p>The first commit should:</p>
+<ol><li>Create <code>src/core/</code> and <code>src/tauri/</code> directories</li><li>Move <code>gateway.rs</code>, <code>store.rs</code>, <code>persist.rs</code>, <code>vault.rs</code>, <code>egress.rs</code>, and adapter modules into <code>src/core/</code></li><li>Keep <code>commands.rs</code>, <code>lib.rs</code>, and <code>gateway_cmds.rs</code> in <code>src/tauri/</code></li><li>Add <code>src/bin/aiproviderd.rs</code> that imports <code>core</code> and starts the HTTP server</li><li>Verify <code>cargo test</code> and <code>cargo clippy</code> still pass</li><li>Update <code>09-status.md</code> and the drift register</li></ol>
+<p>This commit changes no behaviour. It only changes file paths. If it breaks anything, the blast radius is the import graph, not the logic.</p>
 </section>
 <section class="chapter" id="appendix-diagrams" data-title="Appendix — Diagram index">
 <h1>Appendix — Diagram index</h1>
