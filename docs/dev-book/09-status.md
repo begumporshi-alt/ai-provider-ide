@@ -40,6 +40,23 @@ Real absences, with the reason each one is absent.
 |---|---|
 | **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
 | **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not. Attribution landed 2026-09-23 (migration 0016), so a budget finally has something to sum — but only for rows written from then on, and nothing yet sets or enforces a per-app cap |
+| **No context summarisation** | Tier 1 — hard truncation — landed 2026-09-23, so a conversation no longer overflows the window. Still absent is Tier 2: replacing dropped turns with a *summary* rather than discarding them, which costs an extra model call on the request path |
+
+**"No auto context compression" left this table on 2026-09-23 — narrowed, not closed.** The failure was real:
+neither caller trimmed anything, so a long session failed at the provider with a context-length error. Tier 1
+fixes the overflow by dropping the oldest **complete turns** until the prompt fits. Three properties make that
+safe rather than merely smaller, and all three are pinned by tests: the `system` turn survives (it carries the
+client's instructions and, on the gateway, the injected memory block); the **newest** turn survives even when it
+alone exceeds the budget, because dropping it would answer a question the user did not ask; and a turn boundary
+only ever falls on a `user` message, so an assistant `tool_calls` turn and the `tool` results answering it are
+always dropped together — providers reject a result whose originating call is gone.
+
+**Why one implementation and not two.** The gateway and the assistant look like separate features, and treating
+them as two would have put a truncation rule in each. Both converge on `router.generateText` — the gateway
+through `gateway-bridge.ts`, the assistant through `runAgentLoop` — so the trim lives there once, and the two
+cannot drift. The budget is the narrowest *known* window across the failover plan rather than the first
+candidate's, because failover may serve the request from any of them; a plan where no model published a window
+falls back to `DEFAULT_CONTEXT_WINDOW`, which under-sends rather than overflows.
 
 **"No per-app budgets" understates itself.** Measured against the live database, the cap was not the first
 missing piece — attribution was. Two different columns are called `key_id`: `ledger.key_id` is the *provider*

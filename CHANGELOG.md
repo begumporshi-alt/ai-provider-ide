@@ -13,6 +13,22 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **Auto context compression.** Long conversations no longer overflow the model's window. The
+  oldest **complete turns** are dropped until the prompt fits the budget, sized against the
+  narrowest context window in the failover plan.
+
+  Three properties are preserved, each pinned by a test: the `system` turn survives (it carries
+  the client's instructions and, on the gateway, the injected memory block); the **newest** turn
+  survives even when it alone exceeds the budget, because dropping it would answer a question the
+  user did not ask; and a tool call and its results are always dropped together, since a provider
+  rejects a result whose originating call is gone.
+
+  Both the gateway and the assistant are covered by the **same** trim: the two converge on
+  `router.generateText`, so there is one rule rather than two that could drift apart.
+
+  This is **Tier 1 — truncation**. Replacing dropped turns with a summary instead of discarding
+  them is Tier 2, and is not included: it costs an extra model call on the request path.
+
 - **Prompt-cache measurement.** The ledger now records `cached_tokens` for every request, read in
   whichever dialect the provider uses: OpenAI-shaped `prompt_tokens_details.cached_tokens`, or
   Anthropic's top-level `cache_read_input_tokens`.
