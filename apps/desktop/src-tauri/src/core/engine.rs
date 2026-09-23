@@ -18,8 +18,9 @@
 //!
 //! **What is deliberately NOT here yet.** `AttemptOutcome` in TypeScript also carries a
 //! `Candidate` (provider + key + model) so a failed chain can name what it tried. That type is
-//! Phase 3's; until it exists the label is absent and `AllAttemptsFailedError` has no home. This
-//! is a recorded gap, not an oversight.
+//! Phase 3's, so the label is still absent: `AllAttemptsFailed` has a home and an arithmetic, but
+//! it cannot yet say *which* provider failed. A recorded gap, narrowed in increment 4 and not
+//! closed.
 //!
 //! **Increment 2 adds the enforcement half.** `HealthTracker` is the module that *cools* a key,
 //! and `min_retry_after_ms` is the one that *reports* the wait. The TypeScript exports
@@ -84,6 +85,24 @@ pub enum BodyHint {
     NotFound,
 }
 
+/// Every class, so completeness is checkable rather than assumed.
+///
+/// `every_class_has_the_spelling_the_typescript_uses` walks this list against the TypeScript
+/// union spelled out verbatim. A variant added without a spelling fails there — which is the
+/// point: the wire spellings are a cross-language contract, and a new class that quietly
+/// rendered as `{:?}` would be a spelling nobody agreed to.
+pub const ALL_CLASSES: [ErrorClass; 9] = [
+    ErrorClass::AuthFailed,
+    ErrorClass::RateLimited,
+    ErrorClass::NotFound,
+    ErrorClass::BadRequestSchema,
+    ErrorClass::ParseError,
+    ErrorClass::ServerError,
+    ErrorClass::Timeout,
+    ErrorClass::Network,
+    ErrorClass::Ok,
+];
+
 impl ErrorClass {
     /// Errors that count toward provider drift (TS `DRIFT_CLASSES`, §2.10).
     ///
@@ -97,6 +116,27 @@ impl ErrorClass {
                 | ErrorClass::ParseError
                 | ErrorClass::AuthFailed
         )
+    }
+
+    /// The class's spelling on the wire, matching `errors.ts:5-14` exactly.
+    ///
+    /// Spelled out rather than derived from `Debug`, because the two are different strings and
+    /// only one of them is a contract. `{:?}` yields `RateLimited` where every other surface in
+    /// this system — the TypeScript, the audit notes, the docs — says `RATE_LIMITED`. An error
+    /// message or a log line that renders the Rust form is a second vocabulary for one concept,
+    /// which is how two halves of a port stop agreeing about what they are saying.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorClass::AuthFailed => "AUTH_FAILED",
+            ErrorClass::RateLimited => "RATE_LIMITED",
+            ErrorClass::NotFound => "NOT_FOUND",
+            ErrorClass::BadRequestSchema => "BAD_REQUEST_SCHEMA",
+            ErrorClass::ParseError => "PARSE_ERROR",
+            ErrorClass::ServerError => "SERVER_ERROR",
+            ErrorClass::Timeout => "TIMEOUT",
+            ErrorClass::Network => "NETWORK",
+            ErrorClass::Ok => "OK",
+        }
     }
 }
 
@@ -192,6 +232,77 @@ pub fn min_retry_after_ms(attempts: &[AttemptOutcome]) -> u64 {
         });
     }
     shortest.unwrap_or(0)
+}
+
+/// §3.6: how many candidates one request may try when the caller names no budget.
+pub const MAX_ATTEMPTS_DEFAULT: usize = 6;
+
+/// How many of a plan's candidates this request may actually try.
+///
+/// `None` means "the caller named none" and takes [`MAX_ATTEMPTS_DEFAULT`]. `Some(0)` means
+/// **zero**, and the two are not the same thing — which is the whole reason this takes an
+/// `Option` rather than an `usize` whose default the caller applies. The TypeScript uses `??`
+/// (`execution-engine.ts:73`), so a caller passing `0` gets no attempts at all and the request
+/// fails with an empty chain. A port that used `||`, or that pre-parsed an empty string into `0`
+/// and then treated `0` as falsy, would silently turn "try nothing" into "try six" — the same
+/// shape as the clamp bug where `Number("")` comes out as *unlimited*.
+pub fn attempt_budget(plan_len: usize, max_attempts: Option<usize>) -> usize {
+    plan_len.min(max_attempts.unwrap_or(MAX_ATTEMPTS_DEFAULT))
+}
+
+/// `AllAttemptsFailedError` — every candidate the budget allowed was tried, and none served.
+///
+/// The chain is carried rather than summarised: it is both what `min_retry_after_ms` folds and
+/// what `describe` names, and a caller that wants only the wait still gets it from the same list.
+///
+/// Deliberately a plain data type rather than an `Error` impl. This crate's error type is
+/// `core::error::CommandError`, which exists to carry a message to the webview; coupling the
+/// ported arithmetic to that would make it untestable without the crate's surface, for no gain —
+/// the bridge converts at the boundary anyway.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AllAttemptsFailed {
+    /// The model the caller asked for, as the caller named it.
+    pub model: String,
+    /// Every attempt that failed, in the order they were tried.
+    pub chain: Vec<AttemptOutcome>,
+}
+
+impl AllAttemptsFailed {
+    pub fn new(model: impl Into<String>, chain: Vec<AttemptOutcome>) -> Self {
+        Self { model: model.into(), chain }
+    }
+
+    /// The shortest wait any attempt named; `0` when none named one.
+    ///
+    /// **Delegates, deliberately.** The TypeScript spells this fold twice — once as
+    /// `minRetryAfterMs` on the error (`execution-engine.ts:220-227`) and once as the same loop
+    /// in the engine's own reporting — and two spellings of one floor is how the floor drifts.
+    /// Here there is one arithmetic with two entry points, and
+    /// `the_error_reports_the_same_wait_as_the_free_fold` is what keeps it that way.
+    pub fn min_retry_after_ms(&self) -> u64 {
+        min_retry_after_ms(&self.chain)
+    }
+
+    /// The message the TypeScript builds — minus the part that cannot be built yet.
+    ///
+    /// The TypeScript names each attempt `<provider.slug>/<key.label>:<cls>`
+    /// (`execution-engine.ts:199`). Those two fields live on `Candidate`, which is Phase 3's
+    /// type, so this names the class and the status and leaves the provider unnamed. The recorded
+    /// gap is therefore narrowed rather than closed: the arithmetic has a home now, the label
+    /// still does not.
+    pub fn describe(&self) -> String {
+        let detail = self
+            .chain
+            .iter()
+            .map(|a| format!("{}:{}", a.cls.as_str(), a.status))
+            .collect::<Vec<_>>()
+            .join(" -> ");
+        // The TypeScript's `detail || "empty plan"`. An empty chain is a real state — reached
+        // whenever the budget is zero — and rendering it as `[]` would read as a bug rather than
+        // as a budget.
+        let detail = if detail.is_empty() { "empty plan".to_string() } else { detail };
+        format!("all attempts failed for {} [{}]", self.model, detail)
+    }
 }
 
 /// Consecutive auth failures before a key is treated as invalid rather than merely unlucky.
@@ -700,5 +811,104 @@ mod tests {
         assert_eq!(t.keys.len(), 2);
         t.reset_key("k1");
         assert_eq!(t.keys.len(), 1);
+    }
+
+    // ---------- increment 4: the attempt budget and the terminal error ----------
+
+    /// The TypeScript union, verbatim from `errors.ts:5-14`.
+    ///
+    /// Spelled out rather than derived from anything, so a variant added to `ErrorClass` without
+    /// a wire spelling fails here instead of quietly rendering as its `Debug` form.
+    const TS_SPELLINGS: [&str; 9] = [
+        "AUTH_FAILED",
+        "RATE_LIMITED",
+        "NOT_FOUND",
+        "BAD_REQUEST_SCHEMA",
+        "PARSE_ERROR",
+        "SERVER_ERROR",
+        "TIMEOUT",
+        "NETWORK",
+        "OK",
+    ];
+
+    #[test]
+    fn every_class_has_the_spelling_the_typescript_uses() {
+        let mut got: Vec<&str> = ALL_CLASSES.iter().map(|c| c.as_str()).collect();
+        got.sort_unstable();
+        let mut want = TS_SPELLINGS.to_vec();
+        want.sort_unstable();
+        // Comparing the sorted vectors covers three things at once, which is why there is no
+        // separate length or uniqueness test: a missing variant shortens `got`, an extra one
+        // lengthens it, and two classes sharing a spelling duplicates an entry. Each fails here.
+        assert_eq!(got, want, "the wire spellings are a cross-language contract");
+    }
+
+    #[test]
+    fn the_attempt_budget_treats_a_named_zero_as_zero() {
+        // The TypeScript is `args.maxAttempts ?? MAX_ATTEMPTS_DEFAULT` — `??`, not `||`. So a
+        // caller that names zero gets zero attempts and an empty chain, not six.
+        assert_eq!(attempt_budget(10, Some(0)), 0, "a named zero is a budget, not an absence");
+        assert_eq!(attempt_budget(10, None), MAX_ATTEMPTS_DEFAULT);
+        // The plan is the other bound, and it wins when it is the smaller one.
+        assert_eq!(attempt_budget(3, None), 3);
+        assert_eq!(attempt_budget(0, None), 0);
+        assert_eq!(attempt_budget(3, Some(9)), 3);
+        assert_eq!(attempt_budget(9, Some(3)), 3);
+    }
+
+    #[test]
+    fn the_error_reports_the_same_wait_as_the_free_fold() {
+        // One arithmetic, two entry points. If they ever disagree, the client is told a different
+        // wait depending on which path produced the failure — and the TypeScript spells this fold
+        // twice, so there is a real precedent for them drifting.
+        let chains: Vec<Vec<AttemptOutcome>> = vec![
+            vec![],
+            vec![outcome(ErrorClass::Network, 0, None)],
+            vec![outcome(ErrorClass::RateLimited, 429, Some(58_000))],
+            vec![
+                outcome(ErrorClass::RateLimited, 429, Some(58_000)),
+                outcome(ErrorClass::ServerError, 503, Some(42_000)),
+                outcome(ErrorClass::RateLimited, 429, Some(71_000)),
+            ],
+            vec![
+                outcome(ErrorClass::RateLimited, 429, Some(400)),
+                outcome(ErrorClass::ServerError, 503, Some(30_000)),
+            ],
+            vec![outcome(ErrorClass::RateLimited, 429, Some(0))],
+            vec![
+                outcome(ErrorClass::AuthFailed, 401, None),
+                outcome(ErrorClass::RateLimited, 429, Some(1)),
+            ],
+        ];
+        for chain in chains {
+            let err = AllAttemptsFailed::new("gpt-4o", chain.clone());
+            assert_eq!(
+                err.min_retry_after_ms(),
+                min_retry_after_ms(&chain),
+                "the error and the free fold must be one arithmetic, for {chain:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_chain_is_named_as_a_budget_not_as_an_empty_list() {
+        let err = AllAttemptsFailed::new("gpt-4o", vec![]);
+        assert_eq!(err.describe(), "all attempts failed for gpt-4o [empty plan]");
+        assert_eq!(err.min_retry_after_ms(), 0, "and it names no wait at all");
+    }
+
+    #[test]
+    fn the_message_names_each_attempt_in_order_with_the_wire_spelling() {
+        let err = AllAttemptsFailed::new(
+            "gpt-4o",
+            vec![
+                outcome(ErrorClass::AuthFailed, 401, None),
+                outcome(ErrorClass::RateLimited, 429, Some(60_000)),
+            ],
+        );
+        assert_eq!(
+            err.describe(),
+            "all attempts failed for gpt-4o [AUTH_FAILED:401 -> RATE_LIMITED:429]"
+        );
     }
 }

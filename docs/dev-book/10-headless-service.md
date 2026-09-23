@@ -635,6 +635,53 @@ holds — but `core/`'s tests are not. Pre-existing rather than introduced here:
 untouched by this increment (`git diff --name-only`), and `cargo check --no-default-features` without
 `--all-targets` still passes. Recorded as **D17**, Open.
 
+#### Increment 4 as built — the attempt budget and the terminal error (2026-09-23)
+
+**`AllAttemptsFailedError` now has a home, and its arithmetic has exactly one implementation.** The
+TypeScript spells the shortest-wait fold **twice** — as `minRetryAfterMs()` on the error
+(`execution-engine.ts:220-227`) and as the engine's own reporting loop — and the two are the same
+rule: drop a `0`/absent wait, floor at `COOLDOWN_FLOOR_MS`, take the minimum, return `0` when nothing
+was named. Increment 1 had already ported that fold as `min_retry_after_ms`; the error's method now
+**delegates** to it instead of carrying a second copy, and `the_error_reports_the_same_wait_as_the_free_fold`
+walks seven chains to keep them one arithmetic. The realistic drift is a re-implementation that forgets
+the floor — that is the falsification used, and it fails on the chain naming 400 ms (400 against 1000).
+
+**The attempt budget, and the `??` that is not `||`.** `attempt_budget(plan_len, max_attempts:
+Option<usize>)` ports `Math.min(args.plan.length, args.maxAttempts ?? MAX_ATTEMPTS_DEFAULT)`. The
+`Option` is the point: `None` is "the caller named none" and takes the default of **6**, while
+`Some(0)` is **zero** — no attempts, an empty chain, and a message that says `empty plan`. A port using
+`||`, or one that pre-parsed an empty string into `0` and then treated `0` as falsy, would silently turn
+"try nothing" into "try six". Same family as the clamp bug where `Number("")` comes out *unlimited*: an
+absent value and a zero value are different facts, and a falsy test erases the difference. Falsified by
+adding `.filter(|&n| n > 0)`.
+
+**The wire spellings are now a checked contract rather than a convention.** `ErrorClass::as_str()`
+returns the `errors.ts:5-14` strings verbatim, and `ALL_CLASSES` plus
+`every_class_has_the_spelling_the_typescript_uses` compare the Rust list against the TypeScript union
+spelled out in the test. The reason is concrete: `{:?}` yields `RateLimited` where every other surface —
+the TypeScript, the audit notes, this book — says `RATE_LIMITED`, and a message rendering the Rust form
+is a second vocabulary for one concept. Comparing sorted vectors covers a missing, an extra and a
+duplicated spelling in one assertion, which is why there is no separate length or uniqueness test.
+
+**Five more tests; `cargo test` 514 → 519 / 0.** Five falsifications, restores byte-identical.
+
+**What the loop port must still preserve — read, not yet ported.** Three properties of `executeText` a
+faithful Rust `Stream` has to reproduce, none of them touched by this increment:
+
+- **The terminal failure is thrown on *drain*, not on call.** `throw new AllAttemptsFailedError(...)`
+  sits at `execution-engine.ts:141-143`, *inside* the async generator, after the loop. `executeText`
+  itself returns a `TextExecution` successfully; a caller that never drains `chunks` never learns the
+  plan failed. The Rust equivalent is a `Stream` whose last item is a terminal `Err` — a port returning
+  `Result<Stream, E>` would report the failure at the wrong moment.
+- **An aborted signal ends the stream silently** (`:80` and `:133` are plain `return`s). So "ended with
+  no output and no error" is a legal terminal state, and a port that turned it into an error would turn
+  a cancellation into a failure.
+- **`if (!served)` at `:141` cannot be false.** `served` is assigned only inside `if (!emitted)`, and
+  every path that sets `emitted` either returns at `:107` or rethrows at `:115`. This is an *inspection*
+  of those four paths, not a measurement — stated as one so it can be checked rather than trusted. It is
+  the same class of no-op guard as `recordResult`'s `else if`: harmless in TypeScript, and a hazard to
+  port literally, because a reader would infer a state that cannot exist.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
