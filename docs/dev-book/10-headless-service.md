@@ -844,13 +844,104 @@ disposition order swapped; the rethrown path keeping its hint; `records_key_heal
 its mechanism (exit 101), and `cmp` confirmed the restore.
 
 **What this narrows.** The previous subsection records the attempt loop as "still blocked on Phase 3".
-Increment 6 lands the part of it that is not: the loop's *policy* is now complete, and what remains is the
-adapter call itself — `AdapterInstance` over `manifest-interpreter.ts`'s types — plus `Candidate`, which is
-Phase 3's type. The streaming half is unchanged.
+Increment 6 lands the part of it that is not: the loop's *policy* is now complete. At the time, what remained
+was the adapter call itself — `AdapterInstance` over `manifest-interpreter.ts`'s types — plus `Candidate`,
+described here as "Phase 3's type". **Increment 7 discharges both for the image path**, and shows the second
+half of that description was wrong: `Candidate`'s three row types already existed in `persist.rs`, and only
+its *name* belonged to something else (D21).
+
+#### Increment 7 as built — the adapter seam and the image loop (2026-09-23)
+
+**What landed.** `core/adapter.rs` — `Cancel` (the `AbortSignal` port), `ImageArgs`, `ImageReply`, and the two
+traits `AdapterInstance` / `AdapterFactory` — and `engine::execute_image` over them, together with
+`engine::Candidate`. This is the first Phase 2 increment to cross the line increments 1–6 held deliberately: it
+is `async`, it calls out, and it is the first consumer of `core::limiter`'s cap and of increment 6's
+`saturated_outcome`.
+
+**The seam is half the source, and it says so now.** `adapter-instance.ts` declares seven members;
+`execution-engine.ts` calls exactly two — `generateImage` (`:174`) and `generateText` (`:91`). Only
+`generate_image` is here, and the reason is not effort. `TextArgs` carries `messages`, `tools`, `toolChoice`
+and `responseFormat` as `unknown`, plus an `onUsage` callback that is load-bearing: dropping the caller's
+callback is how every gateway response came to report `usage: null` (`:93-96`). On this side those `unknown`s
+become `serde_json::Value` and the callbacks become owned closures, and `onUsage` would introduce a **second**
+usage shape beside the `BridgeMsg::Usage` the crate already has (`gateway.rs:366`). That is the
+two-spellings-of-one-state defect this project keeps finding (D19, D21), so the text half waits for the shape
+to be decided rather than being invented here and unravelled later. **The first correction in this increment
+was to the doc comment**: it read "what the execution engine needs from a provider adapter, and nothing more",
+which was true of surplus and false of completeness. It now names which half it is.
+
+**The name had to be freed before the type could land.** `engine::Candidate` is `{provider, key, model}`
+(`route-planner.ts:13-17`), and its three row types already existed (`persist.rs:33`, `:176`, `:321`) — so the
+shape needed nothing new. The *name* did: `context_scope.rs` already owned it for a recalled memory headed for
+the prompt. Two further collisions sat behind it, latent only because they are cross-language —
+`CHARS_PER_TOKEN` is **3.5** here and **4** there, `RESERVE_FRACTION` is **0.20** here and **0.25** there,
+while `DEFAULT_WINDOW_TOKENS` agrees at 8192 *deliberately* (`context-compress.ts:32-34`). All three are D21.
+The TypeScript is this port's reference and cannot move, so the Rust-only names gave way: `MemoryItem`,
+`MEMORY_CHARS_PER_TOKEN`, `MEMORY_RESERVE_FRACTION`. `SkipReason::NoCandidates` was **left alone on purpose** —
+its string `"no_candidates"` is written into the `aip-memory` response header (`apply_memory_headers:447`), so
+renaming the variant would have meant either a wire change or a name contradicting its own value. The rename
+is compiler-verified and behaviour-preserving: `cargo test` was **554/0 before and 554/0 after**, no test
+touched.
+
+**Four properties the loop has to keep.**
+
+1. **Cancellation is checked before the cap** (`:165` then `:167`). Observable, and pinned by the
+   *distinguishing* case rather than the easy one: with a saturated limiter **and** a cancelled request, a port
+   that took the slot first would record a `RATE_LIMITED` skip, and this one leaves the chain empty.
+2. **The native model id reaches the adapter, never the requested name.** `:176` sends `c.model.nativeId`;
+   `args.model` exists only to name a failure. A port that sent the requested name would pass every other test
+   in the block.
+3. **A saturation skip is recorded, not merely skipped** — `RATE_LIMITED`/`429` from `saturated_outcome`,
+   though the provider was never contacted.
+4. **The permit comes back on both the served and the failed path.** The TypeScript's `finally` (`:189-191`) is
+   `Permit`'s `Drop` here; a port that released only on success would leak one slot per failure until the
+   provider stopped being admitted at all.
+
+**Two properties it inherits from the TypeScript, one of them a live defect — D22.**
+
+- **Live.** `generateImage` returns `{ok: false, status, errorBody}` for `>= 400`
+  (`manifest-interpreter.ts:461`) and never calls `retryAfterFrom`, though `res.headers` is in scope on that
+  line — while `listModels` (`:246`) and `generateText` (`:304`) both pass it. `ImageAttemptResult` (`:57-60`)
+  has **no field** for it, so the wait cannot travel even in principle. `executeImage` therefore records an
+  outcome with no `retry_after_ms` (`:184`), `recordResult` falls through to the 1000 ms floor, and a
+  `429 Retry-After: 30` on the image path is retried after one second. That is the exact failure the text
+  path's own fix describes at `:126-128` — "a key that asked for a minute is retried a second later — straight
+  back into the window it was told to wait out" — one path away. It reaches the client too: no image attempt
+  can name a wait, so `minRetryAfterMs()` is **0** for an image-only chain and the client is told nothing.
+- **Latent.** `catch {}` (`:186`) names `NETWORK`/`0` and keeps nothing the error carried, where `:117-121`
+  classifies a thrown `ManifestHttpError` by its status. The two agree only because a status-bearing refusal is
+  **returned** rather than thrown, so that arm is never reached with a status — the same shape as D19, where a
+  rule's two spellings agree only because of a constant at a producer.
+
+**The port keeps the image path's behaviour in both cases**, which is what makes Rust and TypeScript
+comparable, and pins each with a test that cites D22. The fix belongs in `manifest-interpreter.ts:461` plus the
+`ImageAttemptResult` shape, and would correct both implementations at once; fixing it in Rust alone would
+create a silent behavioural difference between the two, which is the defect class this book keeps recording.
+
+**Twelve falsifications, all fired, every restore byte-identical.** The cancel check moved after the cap; the
+requested name sent instead of the native id; the adapter error classified instead of called `Network`; a
+refusal treated as a success; the refusal recording a named wait; the refusal's status recorded as `200`; a
+named zero budget becoming the default; a saturation skip not recorded; the permit leaked on the failure path;
+a failing factory recorded as rate-limited; an empty chain rendered as `[]`; and `Cancel::clone` copying the
+flag instead of sharing it.
+
+**What this narrows.** Increment 6 recorded the remaining work as "the adapter call itself — `AdapterInstance`
+over `manifest-interpreter.ts`'s types — plus `Candidate`, which is Phase 3's type". Both halves of that
+sentence are now discharged for the **image** path, and neither is for the text path. What remains is the
+streaming half: a `Stream` adapter for `chunks: AsyncIterable<string>`, which is blocked on the same `TextArgs`
+shape as above and nothing else. One gap is *unblocked but deliberately not closed*: `AttemptOutcome` still
+cannot name the provider it tried, because in Rust the faithful shape clones three owned rows per failed
+attempt where the TypeScript copies a reference — the cheap alternative is to carry the `slug/label` string
+`describe` actually reads, and that is a decision rather than a port step.
 
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
+
+**`Candidate` is already in Rust.** `engine::Candidate` landed with increment 7, because the image loop needs
+it, and its three row types are `persist.rs`'s unchanged. What Phase 3 adds is the *planner* that produces a
+plan of them, not the type — and `context_scope::MemoryItem` is a different thing under a name that no longer
+collides (D21).
 
 These are less risky than the execution engine — they are synchronous, stateful logic without async
 streams. The main challenge is the registry and catalog data structures, which today live in JS

@@ -622,9 +622,9 @@ pub fn inject_context_deadline(
                 Err(_) => return skip(SkipReason::NoCandidates),
             };
 
-            let mut candidates: Vec<Candidate> = rows
+            let mut candidates: Vec<MemoryItem> = rows
                 .into_iter()
-                .map(|m| Candidate { id: m.id, layer: m.layer, text: m.text, pinned: m.pinned })
+                .map(|m| MemoryItem { id: m.id, layer: m.layer, text: m.text, pinned: m.pinned })
                 .collect();
             // No memory is not a reason to stop: live context stands on its own, and a first
             // request in a new project legitimately has no atoms yet but still has turns and open
@@ -868,21 +868,21 @@ pub const DEFAULT_WINDOW_TOKENS: usize = 8192;
 /// No tokenizer in Rust and adding one is a new dependency for a number that only has to be safe.
 /// 3.5 chars/token over-estimates typical prose and JSON, and over-estimating under-injects — the
 /// correct direction to be wrong in.
-pub const CHARS_PER_TOKEN: f64 = 3.5;
+pub const MEMORY_CHARS_PER_TOKEN: f64 = 3.5;
 
 /// Share of the remaining window that memory may take. Raised from 10% after review: 10% of an 8k
 /// window and 10% of a 200k window are not the same behavioural cost, and the ceiling below is what
 /// actually protects the top end.
 const MEMORY_FRACTION: f64 = 0.25;
 
-const RESERVE_FRACTION: f64 = 0.20;
+const MEMORY_RESERVE_FRACTION: f64 = 0.20;
 /// Overhead per injected bullet, so the estimate accounts for the marker and newline too.
 const BULLET_OVERHEAD_TOKENS: usize = 8;
 /// One memory is clipped to this before it is considered at all.
 const MAX_ITEM_CHARS: usize = 300;
 
 pub fn estimate_tokens(text: &str) -> usize {
-    (text.chars().count() as f64 / CHARS_PER_TOKEN).ceil() as usize
+    (text.chars().count() as f64 / MEMORY_CHARS_PER_TOKEN).ceil() as usize
 }
 
 /// Rough size of the client's own prompt. Only string content is counted — a Rust-side estimate over
@@ -903,7 +903,7 @@ pub fn estimate_prompt_tokens_at(body: &Value, chars_per_token: f64) -> usize {
 }
 
 pub fn estimate_prompt_tokens(body: &Value) -> usize {
-    estimate_prompt_tokens_at(body, CHARS_PER_TOKEN)
+    estimate_prompt_tokens_at(body, MEMORY_CHARS_PER_TOKEN)
 }
 
 /// `min(25% of what is left, MAX_BUDGET_TOKENS)`. `max_tokens` is honoured when the client declares
@@ -913,20 +913,21 @@ pub fn estimate_prompt_tokens(body: &Value) -> usize {
 /// The default-window form below is what tests and any caller without a store use.
 pub fn plan_budget_for(body: &Value, window: usize, chars_per_token: f64) -> usize {
     let declared = body.get("max_tokens").and_then(Value::as_i64).unwrap_or(0).max(0) as usize;
-    let reserve = if declared > 0 { declared } else { (window as f64 * RESERVE_FRACTION) as usize };
+    let reserve =
+        if declared > 0 { declared } else { (window as f64 * MEMORY_RESERVE_FRACTION) as usize };
     let avail = window.saturating_sub(reserve + estimate_prompt_tokens_at(body, chars_per_token));
     ((avail as f64) * MEMORY_FRACTION) as usize
 }
 
 pub fn plan_budget(body: &Value) -> usize {
-    plan_budget_for(body, DEFAULT_WINDOW_TOKENS, CHARS_PER_TOKEN)
+    plan_budget_for(body, DEFAULT_WINDOW_TOKENS, MEMORY_CHARS_PER_TOKEN)
 }
 
 // ---------- rank, trim, compose ----------
 
 /// One memory headed for the prompt.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Candidate {
+pub struct MemoryItem {
     pub id: String,
     pub layer: String,
     pub text: String,
@@ -939,7 +940,7 @@ pub struct Candidate {
 ///
 /// Pinned means *retention and eligibility*, not truth precedence: a stale pin must not outrank a
 /// newer correction on relevance, it only guarantees the row survives pruning and a tight budget.
-pub fn rank(candidates: &mut [Candidate]) {
+pub fn rank(candidates: &mut [MemoryItem]) {
     candidates.sort_by_key(|c| std::cmp::Reverse(c.pinned));
 }
 
@@ -949,10 +950,10 @@ pub fn rank(candidates: &mut [Candidate]) {
 ///
 /// Items are dropped whole rather than split mid-sentence; only the text is clipped, and only to
 /// `MAX_ITEM_CHARS`.
-pub fn trim<'a>(candidates: &'a [Candidate], budget: usize) -> Vec<&'a Candidate> {
-    let cost = |c: &Candidate| estimate_tokens(&c.text) + BULLET_OVERHEAD_TOKENS;
+pub fn trim<'a>(candidates: &'a [MemoryItem], budget: usize) -> Vec<&'a MemoryItem> {
+    let cost = |c: &MemoryItem| estimate_tokens(&c.text) + BULLET_OVERHEAD_TOKENS;
     let mut used = 0usize;
-    let mut out: Vec<&'a Candidate> = Vec::new();
+    let mut out: Vec<&'a MemoryItem> = Vec::new();
     for c in candidates {
         let t = cost(c);
         if c.pinned {
@@ -970,7 +971,7 @@ pub fn trim<'a>(candidates: &'a [Candidate], budget: usize) -> Vec<&'a Candidate
 
 /// Vendor-neutral block. Plain prose, no tool markup, no dialect-specific syntax — structured enough
 /// to be ignorable, plain enough that no provider chokes on it.
-pub fn compose_block(items: &[&Candidate]) -> String {
+pub fn compose_block(items: &[&MemoryItem]) -> String {
     if items.is_empty() {
         return String::new();
     }
@@ -1167,8 +1168,8 @@ mod context_scope_tests {
         assert_eq!(scope.agent.as_deref(), Some("cursor"));
     }
 
-    fn cand(id: &str, text: &str, pinned: bool) -> Candidate {
-        Candidate { id: id.into(), layer: "L1".into(), text: text.into(), pinned }
+    fn cand(id: &str, text: &str, pinned: bool) -> MemoryItem {
+        MemoryItem { id: id.into(), layer: "L1".into(), text: text.into(), pinned }
     }
 
     #[test]
@@ -1216,7 +1217,7 @@ mod context_scope_tests {
     #[test]
     fn the_composed_block_is_delimited_and_bulleted() {
         let v = [cand("a", "uses Postgres", false)];
-        let refs: Vec<&Candidate> = v.iter().collect();
+        let refs: Vec<&MemoryItem> = v.iter().collect();
         let block = compose_block(&refs);
         assert!(block.starts_with("<memory>\n"));
         assert!(block.contains("- uses Postgres"));
@@ -1227,7 +1228,7 @@ mod context_scope_tests {
     #[test]
     fn an_overlong_memory_is_clipped_not_dropped() {
         let v = [cand("a", &"x".repeat(900), false)];
-        let refs: Vec<&Candidate> = v.iter().collect();
+        let refs: Vec<&MemoryItem> = v.iter().collect();
         let block = compose_block(&refs);
         assert!(block.len() < 400, "clipped to MAX_ITEM_CHARS: {}", block.len());
     }

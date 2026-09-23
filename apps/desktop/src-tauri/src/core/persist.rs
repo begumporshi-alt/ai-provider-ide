@@ -28,7 +28,7 @@ fn now_ms() -> i64 {
 
 // ---------- providers ----------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderRow {
     pub id: String,
@@ -171,7 +171,7 @@ pub fn recompute_allow(egress: &crate::core::egress::EgressState, store: &Store)
 
 // ---------- api keys ----------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeyRow {
     pub id: String,
@@ -316,7 +316,7 @@ pub fn manifest_upsert_active(
 
 // ---------- model catalog + aliases ----------
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ModelRow {
     pub provider_id: String,

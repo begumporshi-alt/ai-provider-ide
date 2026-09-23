@@ -45,7 +45,7 @@ impl Default for ModelWindow {
     fn default() -> Self {
         Self {
             window: crate::core::gateway::context_scope::DEFAULT_WINDOW_TOKENS,
-            chars_per_token: crate::core::gateway::context_scope::CHARS_PER_TOKEN,
+            chars_per_token: crate::core::gateway::context_scope::MEMORY_CHARS_PER_TOKEN,
         }
     }
 }
@@ -102,7 +102,7 @@ pub fn lookup(store: Option<&Store>, model: Option<&str>) -> ModelWindow {
         },
         chars_per_token: cpt
             .filter(|v| v.is_finite() && *v > 0.5 && *v < 20.0)
-            .unwrap_or(crate::core::gateway::context_scope::CHARS_PER_TOKEN),
+            .unwrap_or(crate::core::gateway::context_scope::MEMORY_CHARS_PER_TOKEN),
     }
 }
 
@@ -193,7 +193,10 @@ mod model_context_tests {
         .unwrap();
         let got = lookup(Some(&s), Some("m/1"));
         assert_eq!(got.window, 32_000);
-        assert_eq!(got.chars_per_token, crate::core::gateway::context_scope::CHARS_PER_TOKEN);
+        assert_eq!(
+            got.chars_per_token,
+            crate::core::gateway::context_scope::MEMORY_CHARS_PER_TOKEN
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -3,12 +3,12 @@
 //! `COOLDOWN_FLOOR_MS` half of `health-tracker.ts`, and `AllAttemptsFailedError.minRetryAfterMs`
 //! (the wait the client is told).
 //!
-//! Phase 2 of the headless plan (`docs/dev-book/10-headless-service.md` §7). This file is the
-//! first increment and it is deliberately the part with **no I/O, no async and no store**: the
-//! attempt loop that consumes it needs `route_planner` (Phase 3) for its `Candidate` type, and
-//! the streaming half needs a `Stream` adapter. Landing the pure core first means the taxonomy
-//! and the wait arithmetic can be tested in isolation, which is what the plan's "port the tests
-//! first" asks for.
+//! Phase 2 of the headless plan (`docs/dev-book/10-headless-service.md` §7). Increments 1–6 were
+//! deliberately the part with **no I/O, no async and no store**, so the taxonomy and the wait
+//! arithmetic could be tested in isolation — the plan's "port the tests first". Increment 7 is the
+//! first to cross that line: `execute_image` is `async`, calls an adapter, and is the first
+//! consumer of the seam in `core::adapter`. The streaming half still needs a `Stream` adapter for
+//! `chunks: AsyncIterable<string>` and is not here.
 //!
 //! **The contract this file exists to hold.** The client-facing `Retry-After` is the *shortest*
 //! wait any attempt named, floored at `COOLDOWN_FLOOR_MS`. The Rust gateway already consumes
@@ -16,11 +16,15 @@
 //! `BridgeMsg::Error::retry_after_ms` states the same "shortest, not longest" rule — so the two
 //! halves of the port already agree, and the tests below are what keep them agreeing.
 //!
-//! **What is deliberately NOT here yet.** `AttemptOutcome` in TypeScript also carries a
-//! `Candidate` (provider + key + model) so a failed chain can name what it tried. That type is
-//! Phase 3's, so the label is still absent: `AllAttemptsFailed` has a home and an arithmetic, but
-//! it cannot yet say *which* provider failed. A recorded gap, narrowed in increment 4 and not
-//! closed.
+//! **`Candidate` now exists; the label is still absent.** `AttemptOutcome` in TypeScript also
+//! carries a `Candidate` (provider + key + model) so a failed chain can name what it tried
+//! (`execution-engine.ts:199`). Increment 7 lands the type — see its definition below — so the gap
+//! is no longer blocked by a missing shape. It is **not closed**, because in Rust the faithful
+//! shape costs more than it does in JavaScript: the three fields are owned rows, so carrying one
+//! in every `AttemptOutcome` clones three rows per failed attempt where the TypeScript copies a
+//! reference. The cheap faithful alternative is to carry the `slug/label` string that `describe`
+//! actually reads, and that is a decision rather than a port step. So the label stays absent: the
+//! gap is narrowed in increment 4, unblocked in 7, and open.
 //!
 //! **The per-provider limiter is not here.** `concurrency.ts` is the fifth of the six dependency
 //! modules, and it is the one piece of the port that is *shared mutable state* rather than a pure
@@ -35,7 +39,9 @@
 
 use std::collections::HashMap;
 
-use crate::core::persist::{ApiKeyRow, ProviderRow};
+use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs};
+use crate::core::limiter::ProviderLimiter;
+use crate::core::persist::{ApiKeyRow, ModelRow, ProviderRow};
 
 /// The shortest cooldown a rate-limited key is ever given, in milliseconds.
 ///
@@ -453,6 +459,179 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
     } else {
         CandidateGate::Try
     }
+}
+
+// ---------- the plan, and the image loop over it ----------
+
+/// One planned attempt: which provider to call, with which key, for which model.
+///
+/// The Rust home of `route-planner.ts`'s `Candidate` (`:13-17`). It lives in this module rather
+/// than in a `route_planner` of its own because the planner itself is not ported yet, and a module
+/// named for the planner that held only its type would promise more than it carries. The three row
+/// types are already the crate's (`persist.rs:33`, `:176`, `:321`), so the shape needs nothing new.
+///
+/// **The name was taken, and the other holder gave way.** `context_scope.rs` already had a
+/// `Candidate` — a *recalled memory* headed for the prompt, `{id, layer, text, pinned}` — now
+/// `context_scope::MemoryItem`. The TypeScript is this port's reference and cannot move, so the
+/// port keeps the source's name and the Rust-only type is the one renamed. Recorded as D21.
+///
+/// **`Debug`, and only `Debug`.** The three row types carried `Serialize`/`Deserialize` alone, so
+/// this meant adding one derive to each — done, because the buyer is concrete rather than
+/// speculative: `Result::expect_err` requires `Debug` on the **success** type, which is how the
+/// loop's failure tests are written. `Clone` and `PartialEq` are deliberately still absent; see the
+/// module note for why `AttemptOutcome` does not carry a candidate yet.
+#[derive(Debug)]
+pub struct Candidate {
+    pub provider: ProviderRow,
+    pub key: ApiKeyRow,
+    pub model: ModelRow,
+}
+
+/// What the image path records when the adapter did not answer at all.
+///
+/// The TypeScript's `catch {}` arm (`execution-engine.ts:187`) names `NETWORK` and status `0`, and
+/// **keeps nothing else the error carried** — not the status, not the `Retry-After`. See
+/// [`execute_image`] for why that is faithful and what it costs.
+pub fn transport_outcome() -> AttemptOutcome {
+    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None }
+}
+
+/// What one image request is asked to do. The Rust port of `executeImage`'s argument
+/// (`execution-engine.ts:154-161`).
+///
+/// The plan is taken **by value**, where the TypeScript borrows its array: the serving candidate is
+/// returned to the caller, and moving it out of the plan is how that is done without cloning three
+/// rows. The plan is not reused after a request either way.
+pub struct ExecuteImageArgs {
+    pub plan: Vec<Candidate>,
+    pub prompt: String,
+    /// The model the caller asked for, as the caller named it — carried only so a failure can name
+    /// it. The candidate's own `model.native_id` is what is actually sent.
+    pub model: String,
+    pub size: Option<String>,
+    pub max_attempts: Option<usize>,
+}
+
+/// A served image request. The TypeScript returns this shape inline (`execution-engine.ts:161`).
+#[derive(Debug)]
+pub struct ImageSuccess {
+    /// The candidate that served it.
+    pub candidate: Candidate,
+    pub base64: Option<String>,
+    pub url: Option<String>,
+    /// Every attempt that failed before this one succeeded, in the order they were tried.
+    pub attempts: Vec<AttemptOutcome>,
+}
+
+/// Try each candidate in the plan until one returns an image. The Rust port of `executeImage`
+/// (`execution-engine.ts:154-194`).
+///
+/// **`Err` is the whole-failure case, and an empty plan is one of them.** The TypeScript falls out
+/// of the loop and throws unconditionally (`:193`), so a plan of zero candidates is a failure
+/// rather than an empty success. [`attempt_budget`] is what turns `None` into
+/// [`MAX_ATTEMPTS_DEFAULT`] and `Some(0)` into *zero* — the distinction that function exists to
+/// keep, and the one a `||` would silently lose.
+///
+/// **Cancellation is checked before the cap** (`:165` then `:167`). The order is observable: a
+/// cancelled request must not take a limiter slot on its way out.
+///
+/// **A saturation skip is recorded, not merely skipped.** [`saturated_outcome`] supplies the
+/// `RATE_LIMITED`/`429` the TypeScript pushes at `:169`, even though the provider was never
+/// contacted — `core::limiter` carries the argument for keeping that class.
+///
+/// **`Err` from the adapter is always `Network`, whatever it carries — and that is asymmetric with
+/// the text path.** `executeText` classifies a thrown `ManifestHttpError` by its status (`:113`,
+/// `:117-121`); `executeImage`'s `catch {}` (`:186`) discards the error and names no class but
+/// `NETWORK`. The two agree today only because `generateImage` **returns** a refusal as
+/// `{ok: false, status}` (`manifest-interpreter.ts:461`) rather than throwing it, so a
+/// status-bearing error never reaches that arm. The port keeps the image path's behaviour, and
+/// `a_status_bearing_adapter_error_still_records_network` is what pins it. Recorded as D22.
+///
+/// **A refusal cools its key by the tracker's floor, never by the provider's own wait.** That
+/// follows from the same place: `ImageAttemptResult` is `{ok, status, errorBody?}`
+/// (`manifest-interpreter.ts:57-60`) and has **nowhere to put** a `Retry-After`, so `:184-185`
+/// records an outcome with no `retry_after_ms` and `recordResult` falls through to
+/// [`COOLDOWN_FLOOR_MS`]. A `429 Retry-After: 30` on the image path therefore retries after one
+/// second — the exact failure the text path's fix describes at `:126-128`, one path away. Recorded
+/// as D22; `an_image_refusal_cools_its_key_by_the_floor_not_the_named_wait` pins it.
+pub async fn execute_image(
+    adapters: &dyn AdapterFactory,
+    health: &mut HealthTracker,
+    limiter: Option<&ProviderLimiter>,
+    args: ExecuteImageArgs,
+    cancel: &Cancel,
+) -> Result<ImageSuccess, AllAttemptsFailed> {
+    let mut attempts: Vec<AttemptOutcome> = Vec::new();
+    let budget = attempt_budget(args.plan.len(), args.max_attempts);
+
+    for candidate in args.plan.into_iter().take(budget) {
+        // `:165`, before the cap so a cancelled request takes no slot.
+        if cancel.is_cancelled() {
+            break;
+        }
+        // `:167-171`. `acquire` is the check *and* the increment; asking `has_capacity` first would
+        // reintroduce the race `limiter.rs` exists to remove. `None` from `acquire` is a saturated
+        // provider, and `None` from `limiter` is no limiter at all — which is why the two are told
+        // apart by `limiter.is_some()` rather than by the `Option` alone.
+        let release = limiter.and_then(|l| l.acquire(&candidate.provider.id));
+        if limiter.is_some() && release.is_none() {
+            attempts.push(saturated_outcome());
+            continue;
+        }
+
+        // `:174-178`. Owned rather than borrowed, so one is built per attempt; the TypeScript
+        // builds a fresh object literal per call too.
+        let image_args = ImageArgs {
+            model: candidate.model.native_id.clone(),
+            prompt: args.prompt.clone(),
+            size: args.size.clone(),
+        };
+
+        // `:172-188`, with the factory rejection and the adapter rejection collapsed into the one
+        // `catch {}` the TypeScript has — both are `Network`/`0` there.
+        let outcome = match adapters.for_provider(&candidate.provider.id).await {
+            Err(_) => transport_outcome(),
+            Ok(adapter) => {
+                match adapter.generate_image(&candidate.key.secret_ref, image_args, cancel).await {
+                    Err(_) => transport_outcome(),
+                    // `:179-182` — the only success arm, and the only one that returns.
+                    Ok(reply) if reply.ok => {
+                        health.record_result(&candidate.key.id, ErrorClass::Ok, None, now_ms());
+                        return Ok(ImageSuccess {
+                            candidate,
+                            base64: reply.base64,
+                            url: reply.url,
+                            attempts,
+                        });
+                    }
+                    // `:183-185` — a refusal is an `Ok` reply with `ok: false`, and its status is
+                    // what gets classified. `retry_after_ms` is `None` because the reply shape has
+                    // no field for it; see the doc comment above and D22.
+                    Ok(reply) => AttemptOutcome {
+                        cls: classify(reply.status, None),
+                        status: reply.status,
+                        retry_after_ms: None,
+                    },
+                }
+            }
+        };
+
+        health.record_result(&candidate.key.id, outcome.cls, outcome.retry_after_ms, now_ms());
+        attempts.push(outcome);
+        // `:189-191`'s `finally` is the `Permit`'s `Drop` here — on this path, on the `return`
+        // above, and on a panic alike. There is nothing to remember to call.
+    }
+
+    Err(AllAttemptsFailed::new(args.model, attempts))
+}
+
+/// Wall-clock milliseconds. A private copy, matching the eight other modules that each carry one
+/// (`persist.rs:22`, `capture.rs:108`, …) — this crate has no shared clock.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// `AllAttemptsFailedError` — every candidate the budget allowed was tried, and none served.
@@ -1323,5 +1502,458 @@ mod tests {
         // An unconfigured limiter is not a saturated one: `false` here means "no limiter, or one
         // that admitted", and both must try the candidate.
         assert_eq!(candidate_gate(false, false), CandidateGate::Try);
+    }
+
+    // ---------- execute_image: the loop, over doubles ----------
+    //
+    // The doubles are the point of the seam. `AdapterInstance` and `AdapterFactory` are traits so
+    // the loop can be driven without a manifest, a sandbox or a socket — which is also what keeps
+    // the sandbox decision open (`core::adapter`).
+
+    use crate::core::adapter::{AdapterInstance, ImageReply};
+    use futures_util::future::BoxFuture;
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+
+    /// An adapter that answers from a script, one reply per call, and records what it was asked.
+    ///
+    /// Interior mutability is not a convenience here: `AdapterInstance` is `Send + Sync` and
+    /// `generate_image` takes `&self`, so a `&mut self` recorder would not be callable at all.
+    struct Scripted {
+        replies: Mutex<VecDeque<Result<ImageReply, AttemptError>>>,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Scripted {
+        fn new(replies: Vec<Result<ImageReply, AttemptError>>) -> Arc<Self> {
+            Arc::new(Self { replies: Mutex::new(replies.into()), calls: Mutex::new(Vec::new()) })
+        }
+
+        /// `"<secret_ref>|<model>"` per call, so a test can prove which *key* and which *native*
+        /// model id actually reached the wire.
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl AdapterInstance for Scripted {
+        fn generate_image<'a>(
+            &'a self,
+            secret_ref: &'a str,
+            args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            self.calls.lock().unwrap().push(format!("{secret_ref}|{}", args.model));
+            // A script that runs out answers as a transport failure, so an under-scripted test
+            // fails loudly instead of passing on a silent default.
+            let next =
+                self.replies.lock().unwrap().pop_front().unwrap_or(Err(AttemptError::Transport));
+            Box::pin(async move { next })
+        }
+    }
+
+    /// A factory that always resolves to one adapter.
+    struct Always(Arc<dyn AdapterInstance>);
+
+    impl AdapterFactory for Always {
+        fn for_provider<'a>(
+            &'a self,
+            _provider_id: &'a str,
+        ) -> BoxFuture<'a, Result<Arc<dyn AdapterInstance>, String>> {
+            let adapter = Arc::clone(&self.0);
+            Box::pin(async move { Ok(adapter) })
+        }
+    }
+
+    /// A factory that resolves nothing — the `forProvider` rejection (`execution-engine.ts:173`).
+    struct NoneResolved;
+
+    impl AdapterFactory for NoneResolved {
+        fn for_provider<'a>(
+            &'a self,
+            provider_id: &'a str,
+        ) -> BoxFuture<'a, Result<Arc<dyn AdapterInstance>, String>> {
+            let msg = format!("no adapter for {provider_id}");
+            Box::pin(async move { Err(msg) })
+        }
+    }
+
+    fn ok_reply(base64: &str) -> Result<ImageReply, AttemptError> {
+        Ok(ImageReply {
+            ok: true,
+            status: 200,
+            base64: Some(base64.to_string()),
+            url: None,
+            error_body: None,
+        })
+    }
+
+    fn refusal(status: u16) -> Result<ImageReply, AttemptError> {
+        Ok(ImageReply {
+            ok: false,
+            status,
+            base64: None,
+            url: None,
+            error_body: Some("refused".to_string()),
+        })
+    }
+
+    fn provider_named(id: &str) -> ProviderRow {
+        ProviderRow {
+            id: id.to_string(),
+            slug: id.to_string(),
+            name: id.to_string(),
+            r#type: None,
+            base_url: "https://example.invalid".to_string(),
+            status: "enabled".to_string(),
+            rotation_strategy: "round_robin".to_string(),
+            created_at: 0,
+            updated_at: 0,
+        }
+    }
+
+    fn model_row(provider_id: &str, native_id: &str) -> ModelRow {
+        ModelRow {
+            provider_id: provider_id.to_string(),
+            native_id: native_id.to_string(),
+            modality: "image".to_string(),
+            context_window: None,
+            fetched_at: 0,
+            pricing_json: None,
+            capabilities_json: None,
+        }
+    }
+
+    /// One candidate on provider `p`, with key `k` and native model id `m`.
+    fn candidate(p: &str, k: &str, m: &str) -> Candidate {
+        let mut key = key_row(k, "enabled", None);
+        key.provider_id = p.to_string();
+        Candidate { provider: provider_named(p), key, model: model_row(p, m) }
+    }
+
+    fn image_args(plan: Vec<Candidate>) -> ExecuteImageArgs {
+        ExecuteImageArgs {
+            plan,
+            prompt: "a cat".to_string(),
+            model: "as-the-caller-typed-it".to_string(),
+            size: Some("1024x1024".to_string()),
+            max_attempts: None,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_first_candidate_that_answers_serves_and_the_rest_are_never_tried() {
+        let adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        let mut health = HealthTracker::new();
+
+        let served = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect("the first candidate answers");
+
+        assert_eq!(served.candidate.provider.id, "p1");
+        assert_eq!(served.base64.as_deref(), Some("AAAA"));
+        assert!(served.attempts.is_empty(), "nothing failed before the success");
+        assert_eq!(adapter.calls().len(), 1, "a served request must not try the rest of the plan");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_native_model_id_is_what_reaches_the_adapter_not_the_requested_name() {
+        // `:176` sends `c.model.nativeId`; `args.model` is only ever used to *name* the failure.
+        // A port that sent the requested name would pass every other test in this block.
+        let adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        let mut health = HealthTracker::new();
+
+        execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "gpt-image-1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect("served");
+
+        assert_eq!(adapter.calls(), vec!["key:p1:k1|gpt-image-1".to_string()]);
+        assert!(
+            !adapter.calls()[0].contains("as-the-caller-typed-it"),
+            "the requested name must not reach the wire"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refusal_advances_to_the_next_candidate_and_is_recorded_with_its_status() {
+        let adapter = Scripted::new(vec![refusal(429), ok_reply("BBBB")]);
+        let mut health = HealthTracker::new();
+
+        let served = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect("the second candidate answers");
+
+        assert_eq!(served.candidate.provider.id, "p2");
+        assert_eq!(served.attempts.len(), 1, "the refusal is reported");
+        assert_eq!(served.attempts[0].cls, ErrorClass::RateLimited);
+        assert_eq!(served.attempts[0].status, 429, "the refusal keeps its status");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_whole_chain_of_failures_reports_every_attempt_in_order() {
+        let adapter = Scripted::new(vec![refusal(404), refusal(500), refusal(429)]);
+        let mut health = HealthTracker::new();
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![
+                candidate("p1", "k1", "m1"),
+                candidate("p2", "k2", "m2"),
+                candidate("p3", "k3", "m3"),
+            ]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("nothing served");
+
+        let classes: Vec<ErrorClass> = err.chain.iter().map(|a| a.cls).collect();
+        assert_eq!(
+            classes,
+            vec![ErrorClass::NotFound, ErrorClass::ServerError, ErrorClass::RateLimited],
+            "in the order they were tried"
+        );
+        assert_eq!(adapter.calls().len(), 3);
+        // **Zero, not the floor** — and this is D22 seen from the reporting side. `min_retry_after_ms`
+        // folds only waits an attempt actually *named* (`:220-227`: "Zero when none named one — the
+        // caller then omits the hint entirely and the middleware's floor stands"). The image path
+        // cannot name one, because `ImageAttemptResult` has no field for it, so a chain of image
+        // failures tells the client nothing at all. The floor is what *cools* the key
+        // (`record_result`), not what gets reported.
+        assert_eq!(
+            err.min_retry_after_ms(),
+            0,
+            "no image attempt can name a wait, so the client is told nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_empty_plan_fails_rather_than_succeeding_with_nothing() {
+        // `:193` throws unconditionally once the loop ends, so zero candidates is a failure.
+        let adapter = Scripted::new(vec![]);
+        let mut health = HealthTracker::new();
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("an empty plan cannot serve");
+
+        assert!(err.chain.is_empty());
+        assert!(err.describe().contains("empty plan"), "got: {}", err.describe());
+        assert!(adapter.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_zero_budget_tries_nothing_even_with_candidates_to_try() {
+        // `Some(0)` is zero, not "unset". `attempt_budget` exists to keep that distinction, and
+        // this is the loop's half of it: the adapter must never be reached.
+        let adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        let mut health = HealthTracker::new();
+        let mut args = image_args(vec![candidate("p1", "k1", "m1")]);
+        args.max_attempts = Some(0);
+
+        let err = execute_image(&Always(adapter.clone()), &mut health, None, args, &Cancel::new())
+            .await
+            .expect_err("a budget of zero cannot serve");
+
+        assert!(err.chain.is_empty());
+        assert!(adapter.calls().is_empty(), "no candidate may be contacted");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_request_breaks_before_the_cap_and_takes_no_slot() {
+        // The order at `:165` then `:167`, pinned by the *distinguishing* case: the limiter is
+        // saturated too, so a port that checked the cap first would record a RATE_LIMITED skip.
+        // Breaking first leaves the chain empty.
+        let adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        let mut health = HealthTracker::new();
+        let limiter = ProviderLimiter::new(1);
+        let _held = limiter.acquire("p1").expect("the slot is free to start with");
+
+        let cancel = Cancel::new();
+        cancel.cancel();
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            Some(&limiter),
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &cancel,
+        )
+        .await
+        .expect_err("cancelled");
+
+        assert!(err.chain.is_empty(), "cancellation breaks before anything is recorded");
+        assert_eq!(limiter.in_flight_count("p1"), 1, "the held slot is the only one taken");
+        assert!(adapter.calls().is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_saturated_provider_is_skipped_and_recorded_as_rate_limited_429() {
+        let adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        let mut health = HealthTracker::new();
+        let limiter = ProviderLimiter::new(1);
+        let _held = limiter.acquire("p1").expect("free to start with");
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            Some(&limiter),
+            image_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m2")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("both candidates are on the saturated provider");
+
+        assert_eq!(err.chain.len(), 2, "consecutive candidates of one provider are skipped too");
+        for attempt in &err.chain {
+            assert_eq!(attempt.cls, ErrorClass::RateLimited);
+            assert_eq!(
+                attempt.status, 429,
+                "the class the client-facing Retry-After is built from"
+            );
+        }
+        assert!(adapter.calls().is_empty(), "a saturated provider is never contacted");
+        assert_eq!(limiter.in_flight_count("p1"), 1, "a skip must not consume a slot");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_factory_that_resolves_nothing_is_a_transport_failure() {
+        let mut health = HealthTracker::new();
+
+        let err = execute_image(
+            &NoneResolved,
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("no adapter");
+
+        assert_eq!(err.chain.len(), 1);
+        assert_eq!(err.chain[0].cls, ErrorClass::Network);
+        assert_eq!(err.chain[0].status, 0, "there was no response to name a status from");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_status_bearing_adapter_error_still_records_network_on_the_image_path() {
+        // D22. `executeText` classifies a thrown `ManifestHttpError` by its status (`:117-121`);
+        // `executeImage`'s `catch {}` (`:186`) names `NETWORK` and nothing else. The port keeps the
+        // image path's behaviour. This is the *unreachable* case — `generateImage` returns refusals
+        // rather than throwing them (`manifest-interpreter.ts:461`) — so it is pinned here rather
+        // than left to be discovered by whoever writes a status-carrying adapter.
+        let adapter = Scripted::new(vec![Err(AttemptError::Http {
+            status: 429,
+            kind: FailureKind::Response,
+            retry_after_ms: Some(30_000),
+        })]);
+        let mut health = HealthTracker::new();
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("the adapter did not answer");
+
+        assert_eq!(err.chain[0].cls, ErrorClass::Network, "not RateLimited, whatever it carried");
+        assert_eq!(err.chain[0].status, 0, "and the status is discarded with it");
+        assert_eq!(err.chain[0].retry_after_ms, None, "so is the wait it named");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_image_refusal_cools_its_key_by_the_floor_not_the_named_wait() {
+        // D22, the reachable half. `ImageAttemptResult` is `{ok, status, errorBody?}`
+        // (`manifest-interpreter.ts:57-60`) — there is nowhere for a `Retry-After` to travel — so
+        // `:184-185` records an outcome with no wait and `recordResult` falls through to the floor.
+        // A `429 Retry-After: 30` on the image path therefore retries after one second, which is
+        // the failure the text path's fix describes at `:126-128`, one path away.
+        //
+        // Asserted against the clock rather than a captured `now`, because the loop reads its own
+        // (`record_result`'s `now` parameter is the port of the TypeScript's `Date.now()` default).
+        // The bound is the point: had a named wait survived, the cooldown would be ~30 s out.
+        let adapter = Scripted::new(vec![refusal(429)]);
+        let mut health = HealthTracker::new();
+
+        execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("refused");
+
+        let cooled_until = health.keys["k1"].cooldown_until_ms;
+        assert!(cooled_until > 0, "a 429 refusal must cool the key at all");
+        assert!(
+            cooled_until <= now_ms() + COOLDOWN_FLOOR_MS as i64,
+            "the image path cools for the floor only — a named wait has nowhere to travel (D22)"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_permit_comes_back_on_both_the_served_and_the_failed_path() {
+        // `:189-191` is a `finally` in the TypeScript. Here it is `Drop`, so the property to pin is
+        // that the slot is free afterwards on *both* paths — a port that released only on success
+        // would leak a slot per failure until the provider stopped being admitted.
+        let limiter = ProviderLimiter::new(1);
+        let mut health = HealthTracker::new();
+
+        let served_adapter = Scripted::new(vec![ok_reply("AAAA")]);
+        execute_image(
+            &Always(served_adapter),
+            &mut health,
+            Some(&limiter),
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect("served");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the served path released");
+
+        let failed_adapter = Scripted::new(vec![refusal(500)]);
+        execute_image(
+            &Always(failed_adapter),
+            &mut health,
+            Some(&limiter),
+            image_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("failed");
+        assert_eq!(limiter.in_flight_count("p1"), 0, "the failed path released too");
+
+        // And the slot is genuinely reusable rather than merely absent from the map.
+        let _again = limiter.acquire("p1").expect("the cap admits again");
     }
 }
