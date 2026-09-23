@@ -865,8 +865,14 @@ In Rust they become structs loaded from `store.rs` on startup and kept in an `Ar
 Tier 1 (trimming turns) is pure logic — port directly.
 
 Tier 2 (summarization) is harder: it makes an AI call. In Rust this means the compression module
-calls the execution engine recursively. The `skipCompression` flag (`gateway-bridge.ts:102`)
-prevents infinite recursion — the same flag exists in the Rust port.
+calls the execution engine recursively. The `skipCompression` flag (`model-router.ts:108`, the option
+on the request; the branch that honours it is `:134`, and the caller that sets it is
+`Assistant.tsx:100`) prevents infinite recursion. **It does not exist in Rust yet.** There is no
+compression path in `src-tauri` at all — measured 2026-09-23, a Grep for `compress` and `summari[sz]`
+over the tree matches one unrelated doc comment, and `trim`, `compact`, `drop_turn` and
+`reduce_context` match only string `.trim()` calls. Phase 4 must introduce the compression and the
+guard together, and the guard is the part that is easy to leave out because its absence is invisible
+until the first summary recurses. See D20.
 
 ### Phase 5 — Delete the bridge (1 day)
 
@@ -894,7 +900,7 @@ webview. No Tauri events. No heartbeat.
 | **Execution engine port introduces bugs** | High | Critical | Port tests first; keep JS implementation behind a feature flag; run both in parallel for one release |
 | **Adapter runtime (QuickJS-WASM) is hard to port** | Medium | High | Evaluate `rquickjs` or `boa` crates; fallback: keep Tier-2 adapters in a sandboxed subprocess |
 | **SQLite concurrent access deadlocks** | Low | High | WAL mode is already on; add connection pooling; test with `cargo test` under `tokio::task::spawn` |
-| ** launchd plist gets out of sync with binary path** | Medium | Medium | Version the plist; on app update, check path and rewrite if the bundle moved |
+| ** launchd plist gets out of sync with binary path** | Medium | Medium | The template above points `ProgramArguments` at an absolute path **inside** the bundle (`/Applications/AI-Provider Router.app/Contents/MacOS/aiproviderd`), so anything that moves the bundle — a versioned install path, an atomic directory swap — leaves the job pointing at a path that no longer exists. Remedies, in order of preference: (1) put the binary at a fixed path **outside** the bundle, or behind a stable symlink, and point the plist there; (2) have the updater run `launchctl bootout` before the swap and `launchctl bootstrap` after it. "Check the path and rewrite the plist if the bundle moved" is the weakest of the three, because it only helps once the app is running again. Note that `KeepAlive` **throttles**, and can leave the job disabled after repeated failed execs, so a path that is briefly missing during a swap is not self-healing |
 | **UI → service discovery fails on first install** | Medium | Medium | Graceful degradation: UI shows "service not running" with manual start instructions |
 | **CORS misconfiguration blocks UI in dev** | High | Low | Dev mode allows `*`; production allows `tauri://localhost` only |
 | **Bundle size increases** | High | Low | Service binary is ~5MB stripped; acceptable |
