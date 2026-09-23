@@ -52,7 +52,9 @@ absent, when the `.p12` will not open with the given password, or when `bundle.m
 in `tauri.conf.json` — the rule no other job can catch, because nothing outside `release.yml` runs a full
 `tauri build`. `verify-release-signature.sh` reads the artefacts back afterwards and asserts the signature is
 not ad-hoc, the authority is a `Developer ID Application`, the hardened-runtime bit is set, `spctl` accepts the
-artefact **as** `Notarized Developer ID`, and the notarization ticket is stapled. If it fails, the job goes red
+artefact **as** `Notarized Developer ID`, the notarization ticket is stapled, and the same three signature
+properties hold for **every Mach-O inside the bundle** — added 2026-09-23, because a second `[[bin]]` is copied
+into `Contents/MacOS/` undeclared while the bundle-level checks describe only the main executable. If it fails, the job goes red
 and the draft is deleted.
 
 **`codesign --verify` is not sufficient, and this was measured rather than assumed.** On an ad-hoc bundle it

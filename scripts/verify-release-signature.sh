@@ -180,6 +180,70 @@ verify_one() {
     bad "no stapled notarization ticket (exit $RC)"
     printf '%s\n' "$OUT" | sed 's/^/        /'
   fi
+
+  # --- 5. Every Mach-O *inside* the bundle carries the same signature. ---
+  # Checks 1-4 all describe the bundle, which means they describe the *main* executable.
+  # A second binary sitting beside it in Contents/MacOS/ is invisible to every one of them.
+  #
+  # Measured 2026-09-23: adding a second `[[bin]]` to the package makes `tauri build` copy it
+  # into Contents/MacOS/ with nothing declaring it (dev-book §10 §2.1.1, deviation 4). Both
+  # binaries then report `Signature=adhoc` / `TeamIdentifier=not set` on a dev build, and
+  # `codesign -dv` on the .app reports only the main binary's signature.
+  #
+  # `--deep --strict` in check 1 is the only check that could reach it, and it cannot be shown
+  # to: on this bundle it exits 1 for an unrelated reason ("code has no resources but signature
+  # indicates they must be present") and its output is *byte-identical* whether the nested
+  # binary is signed or has had its signature removed. Two failures masking each other, so the
+  # nested state was never actually measured. Reading each Mach-O explicitly removes the doubt.
+  #
+  # What this does NOT do is replace notarization, which remains the primary guard: Apple's
+  # notary service rejects a bundle containing improperly signed nested code, so an unsigned
+  # second binary would fail the release anyway. This makes the verifier's own claim complete
+  # and names the offending file, instead of leaving it to a notary error to explain.
+  #
+  # `find` rather than a hardcoded list: which binaries are in the bundle is a property of
+  # Cargo.toml's `[[bin]]` section, and a hardcoded list silently stops covering the next
+  # binary anyone adds — which is exactly how this gap opened.
+  if [ "$is_dmg" -eq 0 ]; then
+    while IFS= read -r nested; do
+      [ -z "$nested" ] && continue
+      # Only Mach-O carries a code signature worth reading; Info.plist and friends do not.
+      case "$(file -b "$nested" 2>/dev/null)" in
+        Mach-O*) : ;;
+        *) continue ;;
+      esac
+
+      note "nested Mach-O: ${nested#$path/}"
+      run codesign -dv --verbose=4 "$nested"
+      if [ "$RC" -ne 0 ]; then
+        bad "  no readable signature (exit $RC)"
+        continue
+      fi
+      local ndetails="$OUT"
+
+      if printf '%s\n' "$ndetails" | grep -q '^Signature=adhoc' \
+         || printf '%s\n' "$ndetails" | grep -Eq 'flags=0x[0-9a-f]+\([^)]*\badhoc\b'; then
+        bad "  ad-hoc signed — every Mach-O in the bundle needs the Developer ID signature"
+      else
+        ok "  not ad-hoc signed"
+      fi
+
+      if printf '%s\n' "$ndetails" | grep -q '^Authority=Developer ID Application:'; then
+        ok "  Developer ID authority present"
+      else
+        bad "  no 'Authority=Developer ID Application:'"
+      fi
+
+      local ncd nhex
+      ncd=$(printf '%s\n' "$ndetails" | grep -m1 '^CodeDirectory' || true)
+      nhex=$(printf '%s' "$ncd" | sed -n 's/.*flags=0x\([0-9a-fA-F]*\).*/\1/p')
+      if [ -n "$nhex" ] && [ "$(( 0x$nhex & 0x10000 ))" -ne 0 ]; then
+        ok "  hardened runtime enabled (CodeDirectory flags 0x$nhex)"
+      else
+        bad "  hardened runtime NOT enabled (flags=${nhex:-unreadable}; bit 0x10000 clear)"
+      fi
+    done < <(find "$path/Contents/MacOS" "$path/Contents/Frameworks" -type f 2>/dev/null || true)
+  fi
 }
 
 for t in "${TARGETS[@]}"; do

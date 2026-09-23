@@ -187,6 +187,15 @@ user's machine. The workflow now refuses to reach that state.
   the team identifier matches, `spctl` accepts the artefact **as** `Notarized Developer ID`, and the
   notarization ticket is stapled. If it fails, the job goes red and the draft release is **deleted**, so a bad
   artefact cannot be published by someone who only sees that a release exists.
+- **…and, since 2026-09-23, the same three signature properties for every Mach-O *inside* the bundle.** All of
+  the checks above describe the *bundle*, which means they describe the main executable — so a second binary
+  sitting beside it in `Contents/MacOS/` was invisible to every one of them. That is not hypothetical: adding a
+  second `[[bin]]` to the package makes `tauri build` copy it in undeclared ([10](10-headless-service.md)
+  §2.1.1, deviation 4). `codesign --verify --deep --strict` cannot be relied on to cover it either — measured
+  on an ad-hoc bundle, it exits 1 for an unrelated reason and its output is **byte-identical** whether the
+  nested binary is signed or has had its signature removed, so two failures were masking each other.
+  Notarization remains the primary guard (Apple rejects improperly signed nested code), but the verifier now
+  names the offending file instead of leaving it to a notary error to explain.
 
 **`codesign --verify` cannot stand in for either of them, and this was measured, not assumed.** Against an
 ad-hoc bundle it prints `valid on disk` and `satisfies its Designated Requirement` and **exits 0** — an ad-hoc

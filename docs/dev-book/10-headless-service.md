@@ -161,7 +161,7 @@ than assumed:
    `/Applications` held only `ai-provider-router`. Two consequences for Phase 6: **useful** — the
    service already ships with the app, so no sidecar config is needed; and an **obligation** — a
    Developer ID release must sign *every* Mach-O in the bundle with the same identity and hardened
-   runtime, and `aiproviderd` is currently only linker-signed (`adhoc`). Not a regression by itself:
+   runtime, and `aiproviderd` is currently only linker-signed (`adhoc`). That obligation is now partly mechanical: `verify-release-signature.sh` gained an explicit per-Mach-O check on 2026-09-23, so a nested binary that is not Developer ID signed is named **by file** instead of being left to notarization to reject. Not a regression by itself:
    `codesign --verify --deep --strict` reports "code has no resources but signature indicates they
    must be present" for the **new** bundle, the **pre-change installed** bundle, and the app binary
    **alone** — it is a property of Tauri's ad-hoc dev bundle, not of the second binary. (`aiproviderd`
