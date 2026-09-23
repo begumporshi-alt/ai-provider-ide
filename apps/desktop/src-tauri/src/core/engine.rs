@@ -255,6 +255,206 @@ pub fn attempt_budget(plan_len: usize, max_attempts: Option<usize>) -> usize {
     plan_len.min(max_attempts.unwrap_or(MAX_ATTEMPTS_DEFAULT))
 }
 
+// ---------- the per-attempt policy ----------
+//
+// Everything `executeText` decides *between* attempts, as pure functions: what class a caught
+// error gets, and what the loop does next. The one thing left out is the adapter call itself,
+// which needs `AdapterInstance` — a trait written over `manifest-interpreter.ts`'s types, so it
+// cannot land until the adapter layer does. Splitting the policy out means the decisions that are
+// easy to get wrong are pinned now, and the Phase 3 loop is left with the I/O.
+
+/// When a provider failure arrived relative to the first byte of the stream.
+///
+/// The TypeScript carries this as a string literal on `ManifestHttpError`
+/// (`manifest-interpreter.ts:210`). It matters because a stream that has already yielded cannot be
+/// retried: the consumer would see the text twice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureKind {
+    /// The provider refused the request before any body was read.
+    Response,
+    /// The failure arrived after the stream had started.
+    MidStream,
+}
+
+/// A caught attempt failure — the port of `ManifestHttpError | unknown` as `executeText` sees it.
+///
+/// The TypeScript separates these with `instanceof`, which silently folds every *other* error into
+/// the same branch as a transport failure. An enum makes the split exhaustive, so a new failure
+/// shape cannot join the port without a decision about which side it belongs on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AttemptError {
+    /// The provider answered. `200` is a real value here rather than a placeholder: the sole
+    /// mid-stream producer reports `200` because the *request* succeeded and the *stream* broke
+    /// (`manifest-interpreter.ts:360`).
+    Http {
+        status: u16,
+        kind: FailureKind,
+        /// What the provider asked us to wait, when the header was readable at all.
+        retry_after_ms: Option<u64>,
+    },
+    /// No HTTP answer: a transport failure, a timeout, or an adapter fault.
+    Transport,
+}
+
+impl AttemptError {
+    /// The status the chain and the ledger record, or `0` when there was no answer.
+    ///
+    /// `0` is the TypeScript's own sentinel (`execution-engine.ts:114`: `e instanceof
+    /// ManifestHttpError ? e.status : 0`). A `u16` cannot hold `None`, so the sentinel is part of
+    /// the contract rather than a value nobody chose.
+    pub fn status_or_zero(&self) -> u16 {
+        match self {
+            AttemptError::Http { status, .. } => *status,
+            AttemptError::Transport => 0,
+        }
+    }
+
+    /// What the provider asked us to wait, when it said so at all.
+    pub fn retry_after_ms(&self) -> Option<u64> {
+        match self {
+            AttemptError::Http { retry_after_ms, .. } => *retry_after_ms,
+            AttemptError::Transport => None,
+        }
+    }
+}
+
+/// The class `executeText` assigns to a caught attempt error — **one rule, spelled once**.
+///
+/// Three cases, in this order:
+///
+/// 1. **No answer → `NETWORK`.** There is no status to classify.
+/// 2. **Mid-stream → `PARSE_ERROR`, whatever the status.** The failure arrived after the consumer
+///    had already been given bytes, so what broke is the *stream*, not the request. The status is
+///    deliberately ignored, not merely unused.
+/// 3. **Otherwise the status decides** — with one exception: a `2xx` maps to `PARSE_ERROR` rather
+///    than `OK`. A provider that answers `200` and then throws has a body we could not read; it is
+///    not a request that succeeded.
+///
+/// **This is the stricter of the two spellings the TypeScript has.** The engine spells this rule
+/// twice, and the two disagree for a mid-stream error carrying a non-2xx status:
+/// `execution-engine.ts:113` (the already-emitted path) tests only `classify(status) === "OK"`,
+/// while `:118` (the not-yet-emitted path) also tests `kind === "mid-stream"`. They agree on every
+/// input reachable today, and *only* because the one producer of a mid-stream error hardcodes
+/// status `200` (`manifest-interpreter.ts:360`). Rule 2 above is the `:118` spelling, kept because
+/// it is the one that holds regardless of the status a future call site passes — and because the
+/// emitted path is the one that skips `record_result`, so under the `:113` spelling a mid-stream
+/// `429` would classify as `RateLimited` and then never cool its key. See D19.
+pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
+    match e {
+        AttemptError::Transport => ErrorClass::Network,
+        AttemptError::Http { status, kind, .. } => {
+            if *kind == FailureKind::MidStream {
+                return ErrorClass::ParseError;
+            }
+            match classify(*status, None) {
+                ErrorClass::Ok => ErrorClass::ParseError,
+                other => other,
+            }
+        }
+    }
+}
+
+/// What the loop does after an attempt failed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptDisposition {
+    /// Fail loud: rethrow the original error and try no further candidate.
+    Rethrow,
+    /// Stop quietly: the caller cancelled. **No `AllAttemptsFailed` is raised** — the `return` at
+    /// `execution-engine.ts:133` leaves the loop before the terminal throw at `:141`, so an
+    /// aborted request ends in an empty stream rather than an error.
+    Stop,
+    /// Record the outcome and advance to the next candidate.
+    Next,
+}
+
+/// The loop's decision after an attempt failed.
+///
+/// **`emitted` is checked before `aborted`, and that order is load-bearing.** Once a byte has
+/// reached the consumer the request can neither be retried nor quietly abandoned — the caller
+/// holds partial output, so the only honest end is the error itself. A cancelled stream that had
+/// already produced text therefore *rethrows* rather than stopping.
+pub fn attempt_disposition(emitted: bool, aborted: bool) -> AttemptDisposition {
+    if emitted {
+        AttemptDisposition::Rethrow
+    } else if aborted {
+        AttemptDisposition::Stop
+    } else {
+        AttemptDisposition::Next
+    }
+}
+
+/// The outcome the loop records for a failed attempt.
+///
+/// **The retry hint is dropped on the one path that cannot act on it.** The mid-stream path
+/// rethrows, so a wait it will never honour would be noise in the chain — and the TypeScript says
+/// so by omission (`execution-engine.ts:114` pushes `{candidate, cls, status}` with no
+/// `retryAfterMs`), while both other paths carry it (`:122-130`).
+pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> AttemptOutcome {
+    AttemptOutcome {
+        cls: classify_attempt_error(e),
+        status: e.status_or_zero(),
+        retry_after_ms: match disposition {
+            AttemptDisposition::Rethrow => None,
+            _ => e.retry_after_ms(),
+        },
+    }
+}
+
+/// Whether a failed attempt cools its key.
+///
+/// The mid-stream path records the outcome in the chain but **not** in key health: the TypeScript
+/// pushes to `fallbackChain` and throws, never reaching `recordResult`
+/// (`execution-engine.ts:113-116`). Skipping it is safe today only because a mid-stream failure
+/// classifies as `PARSE_ERROR` and [`HealthTracker::record_result`] ignores the drift classes —
+/// a dependency between two functions, so
+/// `a_rethrown_failure_is_always_a_drift_class_so_skipping_health_cannot_lose_a_cooldown` states
+/// it rather than leaving it implied.
+pub fn records_key_health(disposition: AttemptDisposition) -> bool {
+    !matches!(disposition, AttemptDisposition::Rethrow)
+}
+
+/// The outcome a candidate gets when its provider is already at its in-flight cap.
+///
+/// Audit R3's contract with [`crate::core::limiter`], written down because the limiter has no
+/// consumer in the shipping gateway yet. The class and the status are not decorative:
+/// `RATE_LIMITED` is the class [`HealthTracker::record_result`] cools a key on, and `429` is what
+/// the ledger shows, so a caller inventing its own pair would change both.
+///
+/// **It is recorded in the chain and deliberately *not* in key health.** The provider is busy, not
+/// the key bad; cooling the key would punish it for a limit the provider imposed on everyone.
+pub fn saturated_outcome() -> AttemptOutcome {
+    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None }
+}
+
+/// What the loop does with one candidate before calling the adapter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CandidateGate {
+    /// Try it.
+    Try,
+    /// Skip it and advance: the provider is at its in-flight cap.
+    SkipSaturated,
+    /// Stop: the caller cancelled.
+    Stop,
+}
+
+/// The gate at the top of each iteration of `executeText`'s loop.
+///
+/// **Cancellation is checked before the permit is taken** (`execution-engine.ts:80` precedes
+/// `:83`), so a cancelled request does not consume a slot even when one is free. A port that
+/// acquired first and checked after would hold a permit on a request that is already over.
+///
+/// `saturated` is true only when a limiter is configured *and* refused. An unconfigured limiter is
+/// not a saturated one — conflating them would turn R3's opt-in behaviour into a mandatory one.
+pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
+    if aborted {
+        CandidateGate::Stop
+    } else if saturated {
+        CandidateGate::SkipSaturated
+    } else {
+        CandidateGate::Try
+    }
+}
+
 /// `AllAttemptsFailedError` — every candidate the budget allowed was tried, and none served.
 ///
 /// The chain is carried rather than summarised: it is both what `min_retry_after_ms` folds and
@@ -915,5 +1115,213 @@ mod tests {
             err.describe(),
             "all attempts failed for gpt-4o [AUTH_FAILED:401 -> RATE_LIMITED:429]"
         );
+    }
+
+    // ---------- increment 6: the per-attempt policy ----------
+
+    fn http(status: u16, kind: FailureKind, retry_after_ms: Option<u64>) -> AttemptError {
+        AttemptError::Http { status, kind, retry_after_ms }
+    }
+
+    /// Every status the taxonomy names, plus the two bands it falls through on.
+    const ALL_STATUSES: [u16; 10] = [0, 200, 204, 400, 401, 404, 408, 429, 500, 503];
+
+    #[test]
+    fn a_transport_failure_is_network_because_there_is_no_status_to_classify() {
+        assert_eq!(classify_attempt_error(&AttemptError::Transport), ErrorClass::Network);
+        assert_eq!(AttemptError::Transport.status_or_zero(), 0);
+        assert_eq!(AttemptError::Transport.retry_after_ms(), None);
+    }
+
+    #[test]
+    fn a_midstream_failure_is_a_parse_error_whatever_status_it_carries() {
+        // The status is *ignored*, not merely unused. This is the rule that keeps the emitted
+        // path's skipped `record_result` harmless — see the D19 test below.
+        for status in ALL_STATUSES {
+            let e = http(status, FailureKind::MidStream, Some(60_000));
+            assert_eq!(
+                classify_attempt_error(&e),
+                ErrorClass::ParseError,
+                "a mid-stream failure carrying {status} must still be drift"
+            );
+        }
+    }
+
+    #[test]
+    fn a_two_hundred_that_threw_is_a_parse_error_rather_than_ok() {
+        // A provider that answers 200 and then throws has a body we could not read. Classifying it
+        // OK would make the loop treat a broken stream as a served request.
+        for status in [200u16, 201, 204, 299] {
+            assert_eq!(
+                classify_attempt_error(&http(status, FailureKind::Response, None)),
+                ErrorClass::ParseError,
+                "status {status}"
+            );
+        }
+        // The boundary is the 2xx band, not a named code.
+        assert_eq!(
+            classify_attempt_error(&http(300, FailureKind::Response, None)),
+            ErrorClass::Network
+        );
+    }
+
+    #[test]
+    fn a_refusal_is_classified_from_the_status_alone() {
+        // The engine calls `classify(status)` with no body hint, so a 400 is BAD_REQUEST_SCHEMA
+        // here even though the adapter *could* have known it was a missing model. Pinned because
+        // it is a consequence of the call site, not of the taxonomy.
+        let cases = [
+            (401u16, ErrorClass::AuthFailed),
+            (403, ErrorClass::AuthFailed),
+            (429, ErrorClass::RateLimited),
+            (404, ErrorClass::NotFound),
+            (400, ErrorClass::BadRequestSchema),
+            (408, ErrorClass::Timeout),
+            (500, ErrorClass::ServerError),
+            (503, ErrorClass::ServerError),
+            (418, ErrorClass::Network),
+        ];
+        for (status, want) in cases {
+            assert_eq!(
+                classify_attempt_error(&http(status, FailureKind::Response, None)),
+                want,
+                "status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_two_spellings_agree_only_because_the_midstream_producer_reports_two_hundred() {
+        // D19. The engine spells this rule twice: `execution-engine.ts:113` (already-emitted)
+        // tests only `classify(status) === "OK"`, while `:118` (not-yet-emitted) also tests
+        // `kind === "mid-stream"`. They differ for a mid-stream error with a non-2xx status — and
+        // the only producer of one hardcodes 200 (`manifest-interpreter.ts:360`), which is the
+        // whole reason the difference is invisible today.
+        //
+        // The reachable input, on which both spellings agree:
+        assert_eq!(
+            classify_attempt_error(&http(200, FailureKind::MidStream, None)),
+            ErrorClass::ParseError
+        );
+
+        // The input that separates them. The port takes rule 2, so the class does not depend on a
+        // constant chosen at the throw site.
+        let divergent = http(429, FailureKind::MidStream, None);
+        assert_eq!(classify_attempt_error(&divergent), ErrorClass::ParseError);
+        assert!(
+            classify_attempt_error(&divergent).is_drift(),
+            "under the other spelling this is RATE_LIMITED, and the emitted path never records it"
+        );
+    }
+
+    #[test]
+    fn a_rethrown_failure_is_always_a_drift_class_so_skipping_health_cannot_lose_a_cooldown() {
+        // The emitted path records the outcome in the chain but never in key health. That is only
+        // safe while every mid-stream failure is a drift class, which `record_result` ignores — a
+        // dependency between two functions, so it is asserted rather than assumed.
+        for status in ALL_STATUSES {
+            let e = http(status, FailureKind::MidStream, Some(60_000));
+            let cls = classify_attempt_error(&e);
+            assert!(cls.is_drift(), "a mid-stream {status} classified as {}", cls.as_str());
+
+            let mut t = HealthTracker::new();
+            t.record_result("k1", cls, e.retry_after_ms(), NOW);
+            assert!(
+                t.is_key_usable(&key_row("k1", "enabled", None), NOW),
+                "a drift class must not cool the key"
+            );
+            assert_eq!(t.keys["k1"].cooldown_until_ms, 0);
+        }
+
+        // The contrast that makes the rule non-vacuous: a class that is *not* drift does cool it,
+        // so "skipping health" is a real omission rather than a no-op for every class.
+        let mut t = HealthTracker::new();
+        t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
+        assert!(!t.is_key_usable(&key_row("k1", "enabled", None), NOW));
+    }
+
+    #[test]
+    fn an_emitted_failure_rethrows_even_when_the_caller_cancelled() {
+        // `emitted` is checked before `aborted` (`execution-engine.ts:112` precedes `:133`). Once a
+        // byte has reached the consumer the only honest end is the error: the caller holds partial
+        // output, and a quiet stop would look like an empty response.
+        assert_eq!(attempt_disposition(true, true), AttemptDisposition::Rethrow);
+        assert_eq!(attempt_disposition(true, false), AttemptDisposition::Rethrow);
+    }
+
+    #[test]
+    fn a_failure_before_the_first_byte_stops_on_cancel_and_advances_otherwise() {
+        assert_eq!(attempt_disposition(false, true), AttemptDisposition::Stop);
+        assert_eq!(attempt_disposition(false, false), AttemptDisposition::Next);
+    }
+
+    #[test]
+    fn only_the_emitted_path_skips_key_health() {
+        assert!(!records_key_health(AttemptDisposition::Rethrow));
+        assert!(records_key_health(AttemptDisposition::Stop));
+        assert!(records_key_health(AttemptDisposition::Next));
+    }
+
+    #[test]
+    fn the_outcome_writes_the_class_and_the_status_the_chain_reports() {
+        let e = http(401, FailureKind::Response, Some(30_000));
+        assert_eq!(
+            attempt_outcome(&e, AttemptDisposition::Next),
+            outcome(ErrorClass::AuthFailed, 401, Some(30_000))
+        );
+
+        // No answer at all: status 0 is the sentinel, not a status.
+        assert_eq!(
+            attempt_outcome(&AttemptError::Transport, AttemptDisposition::Next),
+            outcome(ErrorClass::Network, 0, None)
+        );
+    }
+
+    #[test]
+    fn the_rethrown_path_drops_the_wait_it_will_never_honour() {
+        // The TypeScript says this by omission (`:114` pushes no `retryAfterMs`), while both paths
+        // that can act on a wait carry it (`:122-130`, and `:129` for the stopped path).
+        let e = http(429, FailureKind::MidStream, Some(60_000));
+        assert_eq!(
+            attempt_outcome(&e, AttemptDisposition::Rethrow).retry_after_ms,
+            None,
+            "a path that rethrows must not advertise a wait"
+        );
+        assert_eq!(
+            attempt_outcome(&e, AttemptDisposition::Stop).retry_after_ms,
+            Some(60_000),
+            "a stopped attempt still reports what the provider asked for"
+        );
+        assert_eq!(attempt_outcome(&e, AttemptDisposition::Next).retry_after_ms, Some(60_000));
+    }
+
+    #[test]
+    fn a_saturated_provider_is_reported_as_rate_limited_429_and_is_not_a_key_problem() {
+        let o = saturated_outcome();
+        assert_eq!(o.cls, ErrorClass::RateLimited);
+        assert_eq!(o.status, 429);
+        assert_eq!(o.retry_after_ms, None, "the provider named no wait; the cap is ours, not its");
+
+        // RATE_LIMITED *would* cool a key if it were recorded, so the skip being absent from
+        // `record_result` is a decision rather than a no-op. This is the contrast that proves it —
+        // and the reason the loop must not record it: the provider is busy, not the key bad.
+        let mut t = HealthTracker::new();
+        t.record_result("k1", o.cls, o.retry_after_ms, NOW);
+        assert!(
+            !t.is_key_usable(&key_row("k1", "enabled", None), NOW),
+            "if the skip were recorded it would cool the key for the floor"
+        );
+    }
+
+    #[test]
+    fn the_gate_checks_cancellation_before_the_cap() {
+        // Abort precedes the acquire in the TypeScript (`:80` before `:83`), so a cancelled request
+        // never takes a slot even when one is free.
+        assert_eq!(candidate_gate(true, true), CandidateGate::Stop);
+        assert_eq!(candidate_gate(true, false), CandidateGate::Stop);
+        assert_eq!(candidate_gate(false, true), CandidateGate::SkipSaturated);
+        // An unconfigured limiter is not a saturated one: `false` here means "no limiter, or one
+        // that admitted", and both must try the candidate.
+        assert_eq!(candidate_gate(false, false), CandidateGate::Try);
     }
 }

@@ -771,6 +771,83 @@ fidelity gap rather than a bug, and Phase 3 inherits it.
 limiter's *consumer* is the loop (`:83-87`, `:167-171`), so this increment ports the decision and not
 its use; nothing in the shipping gateway consults the limiter yet.
 
+#### Increment 6 as built — the per-attempt policy (2026-09-23)
+
+**The increment was redirected by a gap-check, then scoped by measuring `Candidate`.** The plan's Phase 2
+dependency table names six modules; five are landed and the sixth is `manifest-interpreter.ts` (491 lines).
+Measured before writing any code:
+
+| what | measurement |
+|---|---|
+| `manifest-interpreter.ts` in Rust | **Nothing.** A Grep for `manifestVersion`, `requestTemplate` and `modalityRules` over the Rust tree matches no file. The only manifest awareness is `manifest_forwards_tools` (`tauri/workbuddy.rs:145-152`), a shallow single-purpose probe reading `endpoints.generateText.requestTemplate.tools` — and it lives in `tauri/`, not `core/` |
+| `Candidate`, the engine's other import | `{provider, key, model}` (`route-planner.ts:13-17`) — Phase 3's type, assembled from three `domain.ts` types |
+| `ports.ts` shapes | already realised: `UsageTokens.cached_tokens` is `LedgerRow.cached_tokens` plus `BridgeMsg::Usage` |
+| `adapter-instance.ts` | a trait written over `manifest-interpreter.ts`'s types, so it cannot land alone |
+
+So the adapter layer is genuinely blocked, and `Candidate` would be a scope expansion into Phase 3. What is
+**not** blocked is everything `executeText` decides *between* attempts — which is the last piece of the
+engine that needs no adapter layer. That is increment 6.
+
+**The rule the TypeScript spells twice.** `executeText` classifies a caught error in two places, and the two
+expressions are not the same rule:
+
+| site | expression |
+|---|---|
+| `:113` — already emitted | only `classify(status) === "OK"` forces `PARSE_ERROR` |
+| `:118` — not yet emitted | the failure kind `mid-stream` **or** `classify(status) === "OK"` forces `PARSE_ERROR` |
+
+Executed against the real `classify` — not transcribed; the control imports `errors.ts` and evaluates both
+expressions verbatim — the two disagree:
+
+| kind | status | `:113` | `:118` |
+|---|---|---|---|
+| mid-stream | 200 | `PARSE_ERROR` | `PARSE_ERROR` |
+| mid-stream | 429 | `RATE_LIMITED` | `PARSE_ERROR` |
+| mid-stream | 503 | `SERVER_ERROR` | `PARSE_ERROR` |
+
+They agree on the one input a producer emits, and *only* because `manifest-interpreter.ts:360` hardcodes the
+status: `new ManifestHttpError(200, …, "mid-stream")` is the sole mid-stream construction site, and the other
+two pass a real status. **Latent, not live** — recorded as D19. The port states the rule once, takes the
+`:118` spelling because it does not depend on a constant chosen at a throw site, and
+`the_two_spellings_agree_only_because_the_midstream_producer_reports_two_hundred` pins the choice.
+
+**What landed** (`core/engine.rs`, +204 lines): `FailureKind`, `AttemptError`, `classify_attempt_error`,
+`AttemptDisposition`, `attempt_disposition`, `attempt_outcome`, `records_key_health`, `saturated_outcome`,
+`CandidateGate` and `candidate_gate`. Thirteen tests; `cargo test` 541 → **554 / 0**.
+
+**Four invariants the port had to state, each with a test.**
+
+1. **A `2xx` that threw is `PARSE_ERROR`, not `OK`.** A provider that answers `200` and then throws has a
+   body we could not read; calling it `OK` would make the loop treat a broken stream as a served request.
+2. **`emitted` is checked before `aborted`.** Once a byte has reached the consumer the request can neither be
+   retried nor quietly abandoned — the caller holds partial output, so a cancelled stream that had already
+   produced text *rethrows* rather than stopping.
+3. **The rethrown path drops its retry hint.** The mid-stream path rethrows, so a wait it will never honour
+   would be noise in the chain; the TypeScript says so by omission (`:114` pushes no `retryAfterMs`) while
+   both other paths carry it.
+4. **The R3 skip is recorded in the chain and deliberately not in key health.** `RATE_LIMITED` is exactly the
+   class `record_result` cools a key on, so omitting the skip is a decision rather than a no-op —
+   `a_saturated_provider_is_reported_as_rate_limited_429_and_is_not_a_key_problem` asserts the contrast that
+   proves it. This is the limiter's first written contract: increment 5 ported the decision and had no
+   consumer to define its use.
+
+**A fifth invariant is a dependency between two functions, so it is asserted rather than assumed.** The
+mid-stream path records the outcome in the chain but never in key health. That is safe only while every
+mid-stream failure is a drift class, which `record_result` ignores — so
+`a_rethrown_failure_is_always_a_drift_class_so_skipping_health_cannot_lose_a_cooldown` walks all ten statuses,
+classifies each as a mid-stream failure, records it, and asserts the key is still usable; then does the
+opposite with `RATE_LIMITED`, to show the rule is not vacuous.
+
+**Seven falsifications, all fired, every restore byte-identical.** Rule 2 removed; rule 3 removed; the
+disposition order swapped; the rethrown path keeping its hint; `records_key_health` no longer exempting
+`Rethrow`; the saturated status changed to `500`; the gate order swapped. Each failed exactly the test naming
+its mechanism (exit 101), and `cmp` confirmed the restore.
+
+**What this narrows.** The previous subsection records the attempt loop as "still blocked on Phase 3".
+Increment 6 lands the part of it that is not: the loop's *policy* is now complete, and what remains is the
+adapter call itself — `AdapterInstance` over `manifest-interpreter.ts`'s types — plus `Candidate`, which is
+Phase 3's type. The streaming half is unchanged.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
