@@ -2085,3 +2085,27 @@ The one-time Apple Developer account action: creating the Developer ID certifica
 base64-ing it, creating an app-specific password, and setting six repository secrets. Written out in
 `CONTRIBUTING.md` under "Releasing". No code change can perform it.
 
+## Checking CI after a push (measured 2026-09-23)
+
+**The workflow badge is not evidence about your push.** `.../ci.yml/badge.svg?branch=main` reports the latest
+**completed** run on the branch. Immediately after pushing `5757c52`, it read `CI - passing` while that commit's
+run (#81) was still `in_progress` — the green was run **#80**, on the previous commit. A green badge right after
+a push is consistent with your run still running *and* with your run being red.
+
+Key the check on the **head SHA**, not the branch status. One unauthenticated call:
+
+    api.github.com/repos/<owner>/<repo>/actions/runs?per_page=6
+    #81 5757c52 in_progress null      <- ours
+    #80 8795cd5 completed  success    <- what the badge was reporting
+
+Then poll by run id (`.../actions/runs/<id>`) until `status=completed` and read `conclusion`.
+
+**Falsify the method first** — a matcher that always answers "success" is indistinguishable from a correct one.
+Running the same query with `?status=failure` returned three genuine runs (#72 `7dcbf0f`, #55, #50), each
+`conclusion=failure`; #72 is a run this project already knew had failed, which is what makes it a working
+control. Three calls total against a 60/hour unauthenticated budget — cheap because it was not polled in a loop.
+
+The Actions **HTML** page is usable and does not count against that budget, but it is hard to key reliably: the
+run number (`CI #NN`) and the status token sit far apart in the row, so "nearest status token" associated a
+token belonging to a different run. Prefer the API when the answer must be tied to a specific commit.
+
