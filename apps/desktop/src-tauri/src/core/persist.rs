@@ -1141,6 +1141,9 @@ pub fn spend_cap_set(store: &Store, cap_micros: i64) -> Result<(), CommandError>
     Ok(())
 }
 
+// Four tests below carry `#[cfg(feature = "app")]` because the readers they exercise are
+// app-gated; the other ten compile without the feature, which is the point of
+// `cargo check --no-default-features --all-targets` — see D17.
 #[cfg(test)]
 mod persist_tests {
     use super::*;
@@ -1219,6 +1222,7 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn model_pricing_survives_the_cache_round_trip() {
         let (store, dir) = tmp_store("pricing");
@@ -1323,6 +1327,7 @@ mod persist_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(feature = "app")]
     #[test]
     fn config_export_import_safety() {
         let (store, dir) = tmp_store("cfg");
@@ -1460,6 +1465,7 @@ mod persist_tests {
     /// nothing about whether anything ever writes to it — migration 0015 left a column in exactly
     /// that state behind: present, nullable, right, and `NULL` on all 1530 rows, which a summary
     /// then reported as "0".
+    #[cfg(feature = "app")]
     #[test]
     fn ledger_insert_writes_the_app_key_and_leaves_it_null_when_absent() {
         let (store, dir) = tmp_store("appkey");
@@ -1533,6 +1539,7 @@ mod persist_tests {
     ///
     /// Every column is given a *distinct* value on purpose. The failure this exists to catch is a
     /// shifted index, and two columns holding the same value would let an off-by-one pass.
+    #[cfg(feature = "app")]
     #[test]
     fn ledger_recent_maps_every_column_to_its_own_field() {
         let (store, dir) = tmp_store("map");
@@ -2070,7 +2077,10 @@ fn diagnostics_json(conn: &rusqlite::Connection) -> Result<String, rusqlite::Err
     .to_string())
 }
 
-#[cfg(test)]
+// Every test here exercises an app-gated reader (`list_generator_audit`), so the module carries the same
+// gate. Without it the test target cannot compile under `--no-default-features --all-targets`,
+// which is the configuration that proves `core/` is Tauri-free — see D17.
+#[cfg(all(test, feature = "app"))]
 mod generator_audit_tests {
     use super::*;
 
@@ -2190,7 +2200,10 @@ mod generator_audit_tests {
     }
 }
 
-#[cfg(test)]
+// Every test here exercises an app-gated reader (`list_drift_events`), so the module carries the same
+// gate. Without it the test target cannot compile under `--no-default-features --all-targets`,
+// which is the configuration that proves `core/` is Tauri-free — see D17.
+#[cfg(all(test, feature = "app"))]
 mod drift_history_tests {
     use super::*;
 

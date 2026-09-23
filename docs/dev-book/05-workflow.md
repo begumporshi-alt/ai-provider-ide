@@ -34,7 +34,8 @@ missing)` even when everything else passed, which reads like a Rust failure and 
 | 16 | Live-UI tests | 18 | 19 |
 | — | Rust toolchain (`rustc --version`) | 12 | inline, not a `step` |
 | — | Headless service build (`--bin aiproviderd --no-default-features`) | `headless-service` job, step 2 | 16 |
-| — | Service binary runs (`aiproviderd --version`) | `headless-service` job, step 3 | 17 |
+| — | Headless targets check (`--no-default-features --all-targets`) | `headless-service` job, step 3 | 17 |
+| — | Service binary runs (`aiproviderd --version`) | `headless-service` job, step 4 | 18 |
 
 **The shared steps are in the same order in both, and that is checked rather than asserted.** They were not
 until 2026-09-22: the dependency audit ran second in CI and seventh locally, while both `ci-local.sh:2` and
@@ -47,20 +48,26 @@ builds` diverge by one:
 - **`Rust toolchain`** (`rustc --version`) is a CI step because a runner's toolchain is otherwise invisible;
   `ci-local.sh` prints the same line inline, since the local toolchain is the one you are already using. It
   sits at position 12 and pushes the Rust block one place later.
-- **`Headless service build`** (`cargo build --bin aiproviderd --release --no-default-features`) and **`Service
-  binary runs`** (`aiproviderd --version`) are the second and third steps of a *separate job* in CI —
-  `headless-service`, a 3-OS matrix — so `ci-local.sh` runs them at positions 16 and 17 to answer "would CI
-  pass?" for the job it would otherwise not model. They are what make `ci-local.sh` a **superset** of `checks`
-  rather than an exact copy. `Service binary runs` reached `ci-local.sh` on 2026-09-23 for the reason the row
-  exists in CI at all: the local gate modelled the *build* and not the *start*, so a binary that links but dies
-  on startup passed locally and failed CI. The job's **first** step, the Linux-only `apt-get` install, is the
-  one row with no local counterpart at all, and deliberately so.
+- **`Headless service build`** (`cargo build --bin aiproviderd --release --no-default-features`), **`Headless
+  targets check`** (`cargo check --no-default-features --all-targets`) and **`Service binary runs`**
+  (`aiproviderd --version`) are steps 2, 3 and 4 of a *separate job* in CI — `headless-service`, a 3-OS
+  matrix — so `ci-local.sh` runs them at positions 16, 17 and 18 to answer "would CI pass?" for the job it
+  would otherwise not model. They are what make `ci-local.sh` a **superset** of `checks` rather than an exact
+  copy. `Service binary runs` reached `ci-local.sh` on 2026-09-23 for the reason the row exists in CI at all:
+  the local gate modelled the *build* and not the *start*, so a binary that links but dies on startup passed
+  locally and failed CI. **`Headless targets check` arrived the same day, closing
+  [07](07-drift-register.md) D17**: the build step compiles the *binary*, and a binary target does not compile
+  the lib's `cfg(test)` code, so a `cfg(test)` dependency on the gated-out `app` feature was invisible there.
+  It was not hypothetical — there were **33** such errors, all in `persist.rs`'s three test modules, plus one
+  shared helper that went dead once they were gated. `--all-targets` is the whole of the difference, and it is
+  the flag whose absence was D17. The job's **first** step, the Linux-only `apt-get` install, is the one row
+  with no local counterpart at all, and deliberately so.
 
 `Build` and `Tauri build` are two steps on purpose: `pnpm build` is `tsc && vite build` and never invokes the
 bundler, so a bundling error survives it — see [07](07-drift-register.md) D14. Both were added to `ci-local.sh`
 on 2026-09-23, the same day `Tauri build` reached `ci.yml`; before that the local mirror was *stricter* than CI
 on the bundle, and after it the reverse. **Re-measure both counts whenever a step is added** — 18 named steps in
-`checks`, 19 in `ci-local.sh`, and every `checks` step has a counterpart, one of them (`Rust toolchain`) inline
+`checks`, 20 in `ci-local.sh`, and every `checks` step has a counterpart, one of them (`Rust toolchain`) inline
 rather than a `step`. Adding a step on one side only is the failure this table exists to catch.
 
 `Dev book builds` was added to both mirrors on 2026-09-23, the same day it earned its place: a table row in

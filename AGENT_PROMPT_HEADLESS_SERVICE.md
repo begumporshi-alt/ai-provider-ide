@@ -230,7 +230,8 @@ Follow the project's commit style: `feat(core): extract Tauri-independent gatewa
 | Rust format | `cargo fmt --check` | Yes |
 | TypeScript typecheck | `pnpm typecheck` | Yes (indirect — no TS changes expected) |
 | Tauri build | `pnpm build` | Yes |
-| Headless binary build | `cargo build --bin aiproviderd` | Yes (new for Phase 1) |
+| Headless binary build | `cargo build --bin aiproviderd --release --no-default-features` | Yes (new for Phase 1) |
+| Headless targets check | `cargo check --no-default-features --all-targets` | Yes (added 2026-09-23, closing D17) |
 | Doc links | `pnpm check-doc-links` | Yes |
 | Dev book | `pnpm docs:book` | Yes |
 

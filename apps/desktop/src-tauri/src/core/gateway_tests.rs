@@ -194,6 +194,10 @@ struct TestServer {
 
 /// A real store on a temp dir, because `GatewayState` now carries one for the context-graph
 /// audit path. Returns the dir so the caller keeps it alive until the test ends.
+///
+/// Gated with its callers: the five tests that build a `GatewayState` are app-only, so without the
+/// feature this helper has none and would be dead code.
+#[cfg(feature = "app")]
 fn gateway_test_store(tag: &str) -> (Arc<crate::core::store::Store>, std::path::PathBuf) {
     let dir = std::env::temp_dir().join(format!("aip-gw-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);

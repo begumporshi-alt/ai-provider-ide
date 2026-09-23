@@ -163,6 +163,20 @@ jobs:
       - name: Build headless service binary
         run: cargo build --bin aiproviderd --release --no-default-features
         working-directory: apps/desktop/src-tauri
+      # D17. The build above compiles the *binary*, and a binary target does not compile the lib's
+      # `cfg(test)` code -- so a `cfg(test)` dependency on the gated-out `app` feature stayed
+      # invisible. There were 33 of them: `persist.rs`'s three test modules call app-gated readers,
+      # and one shared test helper went dead once they were gated. This step compiles every target
+      # in the same configuration, which is what makes the "`core/` is Tauri-free" claim cover the
+      # tests as well as the shipping code -- and it is the claim that gets weaker every time the
+      # port adds a `cfg(test)` module to `core/`.
+      #
+      # Deliberately NOT `-D warnings`, for the reason recorded above: the claim here is that it
+      # *compiles*. A test reaching into Tauri glue is an unresolved-name error, not a lint, so this
+      # catches what it exists for without also taking on Linux's lint set.
+      - name: Check every target without the app feature
+        run: cargo check --no-default-features --all-targets
+        working-directory: apps/desktop/src-tauri
       # `--version` is the whole of the runtime assertion here, deliberately. It needs no port,
       # no keychain approval and no store, so it cannot flake -- and it still proves the binary
       # links and starts. The `/health` proof is a manual step (dev-book §10 records it): binding

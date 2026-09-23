@@ -134,7 +134,14 @@ if command -v cargo >/dev/null 2>&1; then
   # which passes the same flag on all three platforms. Without this, the local gate answers
   # "would CI pass?" with a no for the one job it does not model.
   step "Headless service build" cargo build --manifest-path "$ROOT/$TAURI_MANIFEST" --bin aiproviderd --release --no-default-features
-  # ci.yml's `headless-service` job has three steps and this gate modelled one. The third asserts
+  # D17. The build above compiles the *binary*, and a binary target does not compile the lib's
+  # `cfg(test)` code -- so a `cfg(test)` dependency on the gated-out `app` feature stayed invisible.
+  # There were 33 of them: `persist.rs`'s three test modules call app-gated readers, and one shared
+  # test helper went dead once those were gated. `--all-targets` compiles the test target in the
+  # same configuration, which is what makes "`core/` is Tauri-free" cover the tests too. The flag is
+  # the whole of the difference from the step above, and it is the flag whose absence was D17.
+  step "Headless targets check" cargo check --manifest-path "$ROOT/$TAURI_MANIFEST" --no-default-features --all-targets
+  # ci.yml's `headless-service` job has four steps and this gate models three. The third asserts
   # the binary *starts*, not merely that it builds -- and building is not starting: a change that
   # links but dies on startup passed this gate and failed CI. `--version` is the whole of the
   # assertion on purpose; ci.yml records why (no port, no keychain approval, no store, so it cannot
