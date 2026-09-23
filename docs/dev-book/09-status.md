@@ -39,7 +39,16 @@ Real absences, with the reason each one is absent.
 | Gap | Why it is not closed |
 |---|---|
 | **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
-| **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not |
+| **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not — and, measured 2026-09-23, no per-app *attribution* either, so a budget would have nothing to sum |
+
+**"No per-app budgets" understates itself.** Measured against the live database, the cap is not the first
+missing piece — attribution is. Two different columns are called `key_id`: `ledger.key_id` is the *provider*
+credential (`api_keys.id`), which **713 of 792** gateway rows join, while the gateway's own app key
+(`gateway_keys.id`) is joined by **0** rows and is held by no column at all. A budget therefore has nothing to
+sum. The work is three parts, and only the last is the one the row implies: a migration adding the app key to
+the ledger **and the TypeScript router passing it** — a column alone proves nothing, which is this project's
+own rule — then a cap column on `gateway_keys`, then enforcement, which changes `SpendProvider`'s signature.
+It is `Arc<dyn Fn() -> (i64, i64)>`, **zero arguments**, so the gate cannot tell callers apart today.
 
 **Three rows left this table on 2026-09-22.**
 
@@ -64,13 +73,25 @@ and nothing was weakened to get there.
 
 | Item | State |
 |---|---|
-| **`thinking` blocks** | Not started. Quality-only, and last by design |
+| **`thinking` blocks** | Not started, and not startable yet. Measured 2026-09-23: four drop sites, no protocol field to carry it, and nothing to test it against |
 | **`previous_response_id`** | Closed as not applicable — Codex points at a different gateway, and sets `wire_api = "responses"` with `disable_response_storage = true` |
 
 **Two rows left this table on 2026-09-22.** **rustfmt adoption** moved to "Working and verified" — it is now a
 gate. **`IDE/`** was removed: a file count showed it held none at all, only an empty `IDE/.workbuddy-ai/memory/`
 skeleton from a session that ran with the wrong working directory, so `rmdir` closed it with nothing at risk.
 The hesitation on that row was about the directory's *name*, and the measurement retired it.
+
+**"Quality-only, and last by design" was the wrong label for `thinking` blocks.** The measurement says the item
+is not *low priority* but *not yet measurable* — a different thing, with a different next action. The drop is
+deliberate and documented (`gateway_anthropic.rs:204-206`): "Anything else (thinking, images) has no OpenAI
+equivalent here and is dropped rather than guessed at." What the old label hid is that **four separate things**
+are dropped, not one — the `thinking: {type, budget_tokens}` request parameter (no passthrough in
+`to_chat_body`), `thinking` blocks in history, every non-stream response, and the stream, which multiplexes only
+`text` and `tool_use` (`:393`, `:446`). The bridge cannot carry it either: `BridgeMsg` has no reasoning variant,
+so this is a Rust *and* TypeScript protocol change. And there is nothing to verify it against — **0 of 455**
+cached models mention reasoning, so no provider in this install can exercise it. Same shape as `cache_control`,
+which the plan also parked as blocked on measurement: measure, decide, rework, and the measurement is not
+available.
 
 ## Needs improvement
 

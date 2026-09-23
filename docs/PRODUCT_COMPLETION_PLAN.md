@@ -427,7 +427,7 @@ unreproducible now. Not urgent, but it is the kind of citation that ages into a 
 | 2 | `count_tokens` | **DONE** | route at `gateway.rs:1757`, handler `gateway_anthropic.rs:135`, three 200-proving tests |
 | 3 | `previous_response_id` | **CLOSED — not applicable** | Codex points at OmniRoute, not this gateway, and sets `wire_api = "responses"` + `disable_response_storage = true` |
 | 4 | `cache_control` | **BLOCKED on measurement** | see below |
-| 5 | `thinking` blocks | **NOT STARTED** | quality-only, last |
+| 5 | `thinking` blocks | **BLOCKED on measurement** | see below |
 
 **On `cache_control` specifically.** The feature is real but currently unmeasurable: the signal is
 `prompt_tokens_details.cached_tokens`, which appears **nowhere** in the codebase, and the `ledger` table has no
@@ -435,6 +435,18 @@ column for it. The ledger does show the shape of the problem — `agnes-2.5-flas
 tokens against ~213K output, roughly 55.5K input per request — so caching would pay. But no active manifest
 mentions caching either. The order is **measure → decide → rework**, and measuring needs a real migration.
 This is parked pending your call (see §8).
+
+**On `thinking` blocks specifically.** Also real, also currently unmeasurable, and the same shape as
+`cache_control` above — so it should be read the same way, not as "quality-only, last". That label said the item
+was low *priority*; the measurement says it is not yet *measurable*, which is a different thing with a different
+next action. The drop is deliberate and documented (`gateway_anthropic.rs:204-206`). What makes it larger than
+it sounds is that **four separate things** are dropped, not one: the `thinking: {type, budget_tokens}` request
+parameter (no passthrough in `to_chat_body`), `thinking` blocks in history, every non-stream response, and the
+stream, which multiplexes only `text` and `tool_use` (`:393`, `:446`). The bridge cannot carry it either —
+`BridgeMsg` has no reasoning variant — so this is a Rust *and* TypeScript protocol change, not an adapter-local
+edit. And there is nothing to verify it against: **0 of 455** cached models mention reasoning, so no provider in
+this install can exercise it. The order is again **measure → decide → rework**, and the measurement is not
+available.
 
 ---
 
@@ -450,8 +462,8 @@ narrow `bundle.targets` or state the macOS-only support; `SECURITY.md`.
 **Phase C — "this is maintainable" (~a day).** `cargo fmt --check` + `cargo clippy -D warnings` in CI
 (clippy landed 2026-09-22 — see §4.1); dependency audit job; the `docs/` reorganisation; `CONTRIBUTING.md`.
 
-**Phase D — optional.** ESLint; the `cache_control` migration; `thinking` blocks. *(Coverage measurement left
-this list on 2026-09-22 — see §4.2.)*
+**Phase D — optional.** ESLint; the `cache_control` migration. *(Coverage measurement left this list on
+2026-09-22 — see §4.2. `thinking` blocks left it on 2026-09-23: blocked on measurement, not on effort — see §6.)*
 
 ---
 
