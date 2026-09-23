@@ -38,6 +38,85 @@ pnpm --filter ai-provider-router-desktop web-test
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
+## Releasing
+
+A release is a `v*` tag. `.github/workflows/release.yml` then runs the preflight, the gate, a
+**universal** (`aarch64` + `x86_64`) build, and the artefact verification, and attaches the result to a
+**draft** GitHub Release. Nothing is publicly downloadable until someone publishes the draft.
+
+### The one-time provisioning
+
+This needs an **Apple Developer Program membership** (paid) and a **Developer ID Application** certificate.
+Neither can be created by a script, and neither is in the repository — the certificate is a secret, and this
+repository is public, so `pnpm key-leak-grep` is a gate step for exactly this reason.
+
+1. Create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates, or
+   the Developer portal), then export it from Keychain Access as a `.p12` **with a password**.
+2. Create an **app-specific password** for the Apple ID at <https://appleid.apple.com> → Sign-In and
+   Security → App-Specific Passwords. This is `APPLE_PASSWORD`; the Apple ID's own password will not work.
+3. Base64 the certificate and set the secrets:
+
+   ```bash
+   base64 -i DeveloperIDApplication.p12 | tr -d '\n' > cert.b64
+   gh secret set APPLE_CERTIFICATE              < cert.b64
+   gh secret set APPLE_CERTIFICATE_PASSWORD      # the .p12 export password
+   gh secret set APPLE_ID                        # the Apple ID email
+   gh secret set APPLE_PASSWORD                  # the app-specific password from step 2
+   gh secret set APPLE_TEAM_ID                   # 10 chars, from the portal
+   rm cert.b64
+   ```
+
+   `APPLE_SIGNING_IDENTITY` is **optional** — Tauri derives it from the certificate. Set it only to
+   disambiguate when the `.p12` holds more than one identity.
+
+4. Cutting the release: `git tag v1.2.3 && git push origin v1.2.3`.
+
+### What the two guards are for
+
+Both live in `scripts/`, and both exist because of the same defect: **`tauri build` succeeds with no Apple
+secrets at all**, emitting an *ad-hoc signed* app. That build launches fine locally — where Gatekeeper does
+not assess it — and is refused on a user's machine. A pipeline that does not check for this ships a green
+job and a broken download.
+
+- **`release-preflight.sh`** runs first, before the toolchain download, and costs about a second. It fails
+  when a required secret is absent or empty, decodes the `.p12` and opens it with the given password (which
+  catches a truncated paste or a mismatched password before a 20-minute build), and asserts that
+  `bundle.macOS.signingIdentity` is **not** pinned in `tauri.conf.json`. That last one is the rule no other
+  check can catch: nothing outside this workflow runs a full `tauri build`, so a pinned identity is invisible
+  to every other job and a green push would prove nothing about signing.
+- **`verify-release-signature.sh`** runs after the build and reads the artefacts back. Run it by hand the
+  same way:
+
+  ```bash
+  ./scripts/verify-release-signature.sh                       # discovers bundles under target/
+  ./scripts/verify-release-signature.sh path/to/App.app ABCD123456
+  ```
+
+  It asserts the seal is consistent, that the signature is **not** ad-hoc, that the authority chain is a
+  `Developer ID Application`, that the hardened-runtime bit is set, that the team identifier is present and
+  matches, that `spctl` accepts the artefact **as** `Notarized Developer ID`, and that the notarization
+  ticket is stapled.
+
+  **Do not "simplify" it to `codesign --verify`.** An ad-hoc signature *is* a valid signature: measured
+  2026-09-23, `codesign --verify --deep --strict` prints `valid on disk` and `satisfies its Designated
+  Requirement` and **exits 0** on an ad-hoc bundle. The checks that actually separate signed-and-notarized
+  from ad-hoc are `spctl` (exit 3 vs 0), `stapler validate` (exit 65 vs 0), the `CodeDirectory` flags word
+  (`0x2(adhoc)` vs `0x12a00(…,runtime)`), and the `Authority=` chain. A verifier that stops at `codesign`
+  is decoration.
+
+If verification fails, the job goes red **and** the draft release is deleted, so a bad artefact cannot be
+published by someone who only sees that a release exists. **Do not publish a draft whose verification step
+is not green.**
+
+### Without the secrets
+
+The preflight fails in about a second with the names of the missing secrets, and no build starts. This is
+deliberate: the previous behaviour was a successful build and an unsigned draft. If you only want a local
+build, skip the workflow entirely — `pnpm --filter ai-provider-router-desktop tauri build` produces an
+ad-hoc signed app, which is correct for local use and useless as a download. Note that on this machine the
+DMG step of a local build fails (`hdiutil`); the `.app` is already complete by then, so take the `.app` and
+ignore the DMG error.
+
 ## What CI enforces
 
 | Step | Why |

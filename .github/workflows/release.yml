@@ -22,6 +22,20 @@ jobs:
           node-version: 22
           cache: pnpm
 
+      # First, and before the toolchain download, because it costs about a second and catches
+      # the one mistake that otherwise survives the whole build: a missing or malformed Apple
+      # credential. Without this, `tauri build` *succeeds* with no secrets at all and emits an
+      # ad-hoc signed app — a green job and a draft Release that macOS refuses to launch. The
+      # failure used to surface on a user's machine. See scripts/release-preflight.sh.
+      - name: Release preflight
+        run: bash scripts/release-preflight.sh
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
       # Both targets, because the artefact is built universal — one download that runs on Apple
       # Silicon and Intel alike.
       - uses: dtolnay/rust-toolchain@stable
@@ -47,9 +61,10 @@ jobs:
           # Signing and notarization come entirely from the environment. They are deliberately NOT
           # configured in tauri.conf.json: no job in this repository runs a full `tauri build`
           # outside this workflow, so a signing identity pinned in the config would be invisible to
-          # every other check — a green push would prove nothing about it.
+          # every other check — a green push would prove nothing about it. `release-preflight.sh`
+          # now enforces that mechanically.
           #
-          # Required secrets (see CONTRIBUTING.md):
+          # Required secrets (see CONTRIBUTING.md, "Releasing"):
           #   APPLE_CERTIFICATE, APPLE_CERTIFICATE_PASSWORD  — the Developer ID .p12, base64
           #   APPLE_SIGNING_IDENTITY                         — optional; derived from the cert if unset
           #   APPLE_ID, APPLE_PASSWORD, APPLE_TEAM_ID        — notarization credentials
@@ -68,3 +83,28 @@ jobs:
           # or un-notarized macOS build is worse than no build: it fails to launch for the user.
           releaseDraft: true
           prerelease: false
+
+      # Read the artefacts back and prove what they are, instead of trusting that the environment
+      # variables above were enough. `codesign --verify` alone would NOT catch this: an ad-hoc
+      # signature is a *valid* signature and passes it. The checks that separate the two states are
+      # `spctl`, `stapler validate`, the CodeDirectory flags word and the Authority chain — all
+      # measured against both states before this step was written.
+      - name: Verify artifacts are signed and notarized
+        run: bash scripts/verify-release-signature.sh
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+      # The draft is withdrawn if verification failed, so a bad artefact cannot be published by
+      # someone who only sees that the release exists. A draft that outlives a red job is the exact
+      # "worse than no build" case this workflow is written to avoid.
+      - name: Withdraw the draft release
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ github.ref_name }}" >/dev/null 2>&1; then
+            echo "Verification failed — deleting the draft release for ${{ github.ref_name }}."
+            gh release delete "${{ github.ref_name }}" --yes
+          else
+            echo "No release exists for ${{ github.ref_name }}; nothing to withdraw."
+          fi
