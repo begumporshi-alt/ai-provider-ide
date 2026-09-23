@@ -12,6 +12,19 @@ Prerequisites, and the reason each one is pinned, are in `README.md`. The short 
 pnpm 10.12.4 (via `packageManager`, so corepack picks it up), stable Rust, and Xcode command line
 tools for `codesign`.
 
+Then install the hooks — once per clone, because `core.hooksPath` is local configuration and cannot
+travel in the repository:
+
+```bash
+git config core.hooksPath scripts/git-hooks
+```
+
+`scripts/git-hooks/pre-commit` refuses to commit a `docs/dev-book/book.html` that carries
+`data-page-node-id`. That attribute is injected by whatever renders the file and never by
+`scripts/build-dev-book.mjs`, and the injection can land *between* `git add` and `git commit` — which
+is why the check is a hook and not a gate step, since `pnpm ci:local` regenerates the book and would
+pass while the staged copy stayed contaminated.
+
 ## The gate
 
 ```bash

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+#
+# Refuse to commit a `book.html` carrying the renderer's node ids.
+#
+# `scripts/build-dev-book.mjs` never emits `data-page-node-id`
+# (`grep -c data-page-node-id scripts/build-dev-book.mjs` -> 0). Whatever renders the file injects it
+# afterwards, and the injection can land **between `git add` and `git commit`** — measured 2026-09-23,
+# three times, the third being the commit that added this hook.
+#
+# That window is why this is a hook and not a gate step. `pnpm ci:local` regenerates the book, so a
+# gate-time check would pass while the *staged* copy stayed contaminated; and a guard that lives only
+# in prose is a guard that gets skipped, which is what happened to the one this replaces.
+#
+# Install once:  git config core.hooksPath scripts/git-hooks
+#
+# Bypassing it is `git commit --no-verify`, which is a decision to commit foreign markup — not a
+# shortcut. The repair is three commands and they are printed below.
+#
+# **Its boundary, measured the hard way.** The check reads the *staged* copy, and only when the file
+# is a change in this commit — `git diff --cached` compares the index against HEAD, so a file whose
+# staged bytes already equal HEAD's is not listed and the guard returns early. That is deliberate: the
+# remedy below rewrites the file, and a hook must not demand a change the committer did not intend.
+# The consequence is exact: **this prevents new contamination and cannot repair a HEAD that is already
+# contaminated.** The check for that is one command, and it is a one-time repair rather than a
+# per-commit one:
+#
+#   git show HEAD:docs/dev-book/book.html | grep -c data-page-node-id
+#
+# This is not hypothetical — the first version of this hook was tested by staging HEAD's own
+# contaminated bytes, which produces no diff, so the mutation did not fire and the guard looked broken
+# when the test was.
+set -euo pipefail
+
+file="docs/dev-book/book.html"
+
+# Nothing to check when the book is not part of this commit. `--diff-filter` keeps a *deletion* of
+# the file from being inspected.
+git diff --cached --name-only --diff-filter=ACMR | grep -qx "$file" || exit 0
+
+# Occurrences, not lines. `grep -c` reports ~1239 lines for ~6540 occurrences of the same file, and
+# this repo has confused the two before. `|| true` is load-bearing: with `pipefail` a no-match run
+# exits 1, which under `set -e` would reject a clean book.
+occurrences=$(git show ":$file" | grep -o 'data-page-node-id' | wc -l | tr -d ' ' || true)
+
+if [ "${occurrences:-0}" -ne 0 ]; then
+  cat >&2 <<EOF
+pre-commit: refusing to commit $file
+
+  The staged copy carries $occurrences \`data-page-node-id\` occurrences, which the generator never
+  emits — they come from whatever renders the file. Repair and re-stage:
+
+    git checkout -- $file
+    node scripts/build-dev-book.mjs
+    git add $file
+EOF
+  exit 1
+fi
