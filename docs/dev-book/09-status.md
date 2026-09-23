@@ -23,13 +23,13 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tools.rs` |
 | Gateway keys | Per-app keys, monthly spend cap | `commands.rs:713-718`, `gateway_keys` table |
-| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens` | Migration 0015, applied 2026-09-22 — 17 columns, 1530 rows preserved, all `NULL` by design |
-| Schema | 15 versions, count asserted, rewind-tested | `store.rs:943-946` |
+| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015 (applied 2026-09-22) and 0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. 0016 is **defined but not yet applied** — the installed bundle predates it |
+| Schema | 16 versions, count asserted, rewind-tested | `store.rs:977-980` |
 | Governance | Apache-2.0, changelog, security policy, release workflow, weekly audit | `LICENSE`, `.github/workflows/` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
 | Rust formatting | `cargo fmt --check` is clean under `apps/desktop/src-tauri/rustfmt.toml` | 354 hunks rewritten once on 2026-09-22, then converged to 0. A stock config would have rewritten 638 |
-| Tests | **433** TS unit (18 adapter-spec · 249 router-core · 166 desktop) · **27** end-to-end · **98** browser · **473** Rust | all four re-measured 2026-09-22; the `~425` / `87` this row used to carry were stale |
+| Tests | **460** TS unit (18 adapter-spec · 249 router-core · 193 desktop) · **27** end-to-end · **98** browser · **481** Rust | TS unit, browser and Rust re-measured 2026-09-23; the `433` / `166 desktop` and `473` this row used to carry were stale |
 | Coverage | **43.8%** statements · 37.3% branches · 31.1% functions · 45.4% lines, weighted across the three packages | `pnpm test:coverage`; a report, **not** a gate step — [`../PRODUCT_COMPLETION_PLAN.md`](../PRODUCT_COMPLETION_PLAN.md) §4.2 |
 
 ## Gaps
@@ -39,16 +39,27 @@ Real absences, with the reason each one is absent.
 | Gap | Why it is not closed |
 |---|---|
 | **No notarized release** | `release.yml` builds a draft, but without the Apple secrets it is ad-hoc signed — fine locally, not fine for a download |
-| **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not — and, measured 2026-09-23, no per-app *attribution* either, so a budget would have nothing to sum |
+| **No per-app budgets** | The spend cap is global and monthly — one `month_micros` against one `cap_micros`. Per-app keys exist; per-app *limits* do not. Attribution landed 2026-09-23 (migration 0016), so a budget finally has something to sum — but only for rows written from then on, and nothing yet sets or enforces a per-app cap |
 
-**"No per-app budgets" understates itself.** Measured against the live database, the cap is not the first
-missing piece — attribution is. Two different columns are called `key_id`: `ledger.key_id` is the *provider*
-credential (`api_keys.id`), which **713 of 792** gateway rows join, while the gateway's own app key
-(`gateway_keys.id`) is joined by **0** rows and is held by no column at all. A budget therefore has nothing to
-sum. The work is three parts, and only the last is the one the row implies: a migration adding the app key to
-the ledger **and the TypeScript router passing it** — a column alone proves nothing, which is this project's
-own rule — then a cap column on `gateway_keys`, then enforcement, which changes `SpendProvider`'s signature.
-It is `Arc<dyn Fn() -> (i64, i64)>`, **zero arguments**, so the gate cannot tell callers apart today.
+**"No per-app budgets" understates itself.** Measured against the live database, the cap was not the first
+missing piece — attribution was. Two different columns are called `key_id`: `ledger.key_id` is the *provider*
+credential (`api_keys.id`), which **713 of 1297** gateway rows join, while the gateway's own app key
+(`gateway_keys.id`) was joined by **0** rows and held by no column at all. The database holds exactly one app
+key — `ak-fc85…`, labelled "Work buddy" — and it was attributable to nothing. A budget therefore had nothing
+to sum. The work is three parts, and only the last is the one the row implies.
+
+**Part 1 — attribution — landed 2026-09-23.** Migration 0016 adds the nullable `ledger.app_key_id`; the write
+path carries it (`LedgerRow`, now `deny_unknown_fields`, so a misspelled key is an error rather than a silent
+`NULL`); and the producer chain is connected end to end — `check_gateway_key` now returns the identity it was
+already computing, all six dispatch sites put it on `BridgeRequest`, `gateway-bridge.ts` hands it to
+`router.generateText`/`generateImage`, and `store.ts` maps it. A column alone proves nothing, which is this
+project's own rule, so the chain was traced rather than assumed. Four tests cover it, each falsified before
+being trusted. **Caveat:** it attributes rows written from now on; the existing rows stay `NULL`, and nothing
+can reconstruct which app paid for them.
+
+**Parts 2 and 3 remain.** A cap column on `gateway_keys` — today `id, label, created_at, last_used_at,
+revoked_at`, with no cap — then enforcement, which changes `SpendProvider`'s signature: it is
+`Arc<dyn Fn() -> (i64, i64)>`, **zero arguments**, so the gate cannot tell callers apart today.
 
 **Three rows left this table on 2026-09-22.**
 

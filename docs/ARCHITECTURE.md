@@ -5,7 +5,7 @@
 > directive: *the IDE can automatically add and set up any new AI provider; an AI model is
 > required inside the IDE so it can self-construct if needed.*
 >
-> Status: **shipped** — v1.0.0 on macOS, 15 migrations, release workflow green. Pattern: layered modular
+> Status: **shipped** — v1.0.0 on macOS, 16 migrations, release workflow green. Pattern: layered modular
 > monolith + hexagonal router core + registry/plugin adapter subsystem · Stack: Tauri 2 + React +
 > TypeScript + Rust host
 >

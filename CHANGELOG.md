@@ -35,7 +35,7 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
   It is a **report, not a gate**. A coverage threshold fails unrelated refactors, and the cheapest way
   out of that failure is to lower the threshold — after which nobody reads the number. The gate keeps
-  holding the line that matters: all 460 unit, 98 browser and 473 Rust tests must pass.
+  holding the line that matters: all 460 unit, 98 browser and 481 Rust tests must pass.
 
   Two mechanics worth knowing. The aggregate is **weighted** — counts are summed and the percentage
   recomputed, never the three `pct` values averaged, which would weight a 300-line package the same as
@@ -53,6 +53,21 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   was raised to `moderate` and both mirrors re-verified. The scheduled job exists because an
   advisory can be published against code that has not changed, and a push-triggered gate never
   fires for that.
+
+- **Per-app spend attribution.** The ledger now records *which* app key paid for a request
+  (`ledger.app_key_id`, migration 0016), so a per-app budget finally has something to sum. The
+  gateway's own app key (`gateway_keys.id`) previously appeared in no column at all: `ledger.key_id`
+  holds the *provider* credential, and the two are different ids that both answer to "key".
+
+  The column is only half of it. The identity is now returned by the gateway's auth check instead of
+  being looked up a second time, threaded through all six dispatch sites, carried across the bridge
+  to the webview, and mapped into the ledger write — and that last hop is the one that mattered,
+  because the ledger is written on the webview side. A column, a TypeScript field and a sink mapping
+  together would still have recorded nothing. Four tests cover it, each falsified before being
+  trusted.
+
+  This is **attribution only**. Nothing yet sets or enforces a per-app cap, and existing rows stay
+  `NULL` — nothing can reconstruct which app paid for them.
 
 ### Fixed
 

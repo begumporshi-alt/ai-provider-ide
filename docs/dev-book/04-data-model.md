@@ -108,6 +108,13 @@ All 1530 rows predate the column, so `NULL` is the correct value for every one o
 as "the providers reported zero cached tokens"** — see the next section. Closing D8 made the column *writable*;
 it did not produce any data.
 
+**0016 is in the same position today, and that is why this table is worth keeping.** Migration
+`0016_ledger_app_key` is defined in code — **16** versions now — but the live database is still at
+`schema_version` **15**, with no `ledger.app_key_id` column: the installed bundle predates it, exactly as it
+did for 0015. Per-app attribution is therefore wired and tested and will record nothing until the app is
+rebuilt and relaunched. Reading `app_key_id IS NULL` before that would be reading the absence of a *column*,
+not the absence of spend.
+
 ## Identifier rules
 
 **A database-lifetime-unique ID must not come from a per-process counter.** `next_id` restarts at 1 on every
