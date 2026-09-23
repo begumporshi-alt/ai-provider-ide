@@ -181,6 +181,45 @@ in a webview. `is_available()` is `is_running() && beat_is_fresh()`, and no hear
 **every completion route answers 503 — by design**. Verified locally 2026-09-23:
 `curl http://127.0.0.1:8800/health` → `200 {"status":"ok"}`; `POST /v1/chat/completions` → `503`.
 
+### 2.1.2 Phase 1 acceptance, audited (2026-09-23)
+
+The task prompt's §10 is a nine-item checklist. Two sibling claims in the same file had already proved false
+(D12, D14), so the checklist was audited rather than assumed. **Eight of the nine hold as written; one cannot**,
+because the command it names does not do what it says.
+
+| # | Criterion, as the prompt words it | Verdict |
+|---|---|---|
+| 1 | `cargo test` passes with 0 failures | **met** — 489 passed / 0 failed |
+| 2 | `cargo clippy --all-targets -- -D warnings` passes | **met** — exit 0 |
+| 3 | `cargo fmt --check` passes | **met** — exit 0 |
+| 4 | `cargo build --bin aiproviderd` produces a runnable binary | **met** — `aiproviderd 1.0.0`; and now also under `--no-default-features`, which compiles no Tauri |
+| 5 | `pnpm build` produces a working Tauri app | **not met as written** — `pnpm build` is `build:clean && tsc && vite build`, frontend only; it never invokes the bundler. Satisfied only by substituting the real command: `tauri build --bundles app` → exit 0, 2m37s. Recorded as **D14**, and now a CI step, so the substitution is enforced rather than remembered |
+| 6 | CI builds `aiproviderd` on macOS, Windows, and Linux | **met** — run #92, all three legs green. Note the job built with **default features** until this pass (**D15**) |
+| 7 | `10-headless-service.md` updated with the actual module layout | **met** — §2.1.1 |
+| 8 | `09-status.md` has a new row for the phase | **met** |
+| 9 | All changes committed and pushed to `origin/main` | **met** |
+
+The prompt is left unedited. It is a dated input, and ticking its boxes would misrepresent what was asked
+versus what was found — the same reasoning as **D13**.
+
+**§8.2's five "must NOT change" constraints were checked by diff against `ef539c1`, not asserted:**
+
+| Constraint | Measurement |
+|---|---|
+| HTTP API surface | **8** `.route(...)` registrations at both revisions, identical (`gateway.rs:1938-1945`) |
+| SQLite schema | no `*.sql` file touched |
+| Keychain access pattern | no `vault*` file touched |
+| Tauri IPC command surface | **85** handlers — 57 in `tauri/commands.rs` + 28 in `core/persist.rs` — identical name sets, none added, none removed |
+| WebView worker window | no `*.ts` / `*.html` / `*.json` touched |
+
+**One instrument error was caught in the act, and it points the other way.** A first pass counted routes with a
+regex requiring `/v1/…` or `/health`. It returned **7**, which made the docs' "8 routes" look like a fifth false
+count. The regex was the defect: the eighth route is `/v1beta/models/{*tail}`, which the pattern could not
+match. Counting `.route(` call sites gives 8, agreeing with the docs. **Here the docs were right and the
+instrument was wrong** — the opposite of the four earlier cases, and the reason a count is only as good as the
+pattern that produced it. A near-miss worth keeping: the previous four corrections make a fifth one *plausible*,
+and plausibility is not evidence.
+
 ### 2.2 The line count
 
 ```
