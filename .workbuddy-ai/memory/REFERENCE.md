@@ -2109,6 +2109,73 @@ The Actions **HTML** page is usable and does not count against that budget, but 
 run number (`CI #NN`) and the status token sit far apart in the row, so "nearest status token" associated a
 token belonging to a different run. Prefer the API when the answer must be tied to a specific commit.
 
+### `run_number` is not `id` — and job logs are not readable unauthenticated
+
+**`.../actions/runs/86` returns `404`, not a run.** The listing prints `run_number` (`86`, `3`) but the API path
+wants `id` (`35848547911`). Print **both** when listing, or you will construct a 404 and read it as "the run
+does not exist". Cost two wasted calls on 2026-09-23.
+
+**`GET /repos/<o>/<r>/actions/jobs/<job_id>/logs` answers `403 "Must have admin rights to Repository"`** even
+though the repo is public and the runs list is readable unauthenticated. So the *step-level log is not available*
+the way the run list is. `gh` is not installed on this machine. **Reproducing the failing step locally is both
+cheaper and stronger evidence than fetching its log** — that is how the `working-directory` bug below was
+diagnosed, in one command, with no API budget spent.
+
+### An assertion step must resolve paths the way the step that produced them did
+
+The first run of the new `headless-service` job (#86, `599c933`) **built the binary on all three platforms** and
+then failed all three at the last step:
+
+    headless-service (macos-latest)    failure   FAILED STEP: Service binary runs
+    headless-service (ubuntu-latest)   failure   FAILED STEP: Service binary runs
+    headless-service (windows-latest)  failure   FAILED STEP: Service binary runs
+
+Cause: the **build** step set `working-directory: apps/desktop/src-tauri`; the **assert** step did not. So
+`target/release/aiproviderd` meant `apps/desktop/src-tauri/target/...` for one and `<repo root>/target/...` for
+the other. The binary was never missing.
+
+Reproduced before fixing, and the fix falsified rather than assumed:
+
+    from apps/desktop/src-tauri  -> aiproviderd 1.0.0            exit 0
+    from the repo root           -> ::error::service binary not found   exit 1
+
+**Second candidate, ruled out by measurement instead of "fixed anyway":** `[ -f "$bin.exe" ] && bin="$bin.exe"`
+was suspected of aborting the step under `set -e`/`pipefail`. It does **not** — a false test inside an `&&`
+list does not trip `set -e` (verified in isolation: the script continues, exit 0). Two candidate causes, one
+real. Measuring first kept the behavioural diff to a single line.
+
+**The general rule:** a step whose only job is to *assert* what an earlier step produced is as capable of being
+broken as the thing it asserts — and when it breaks, the artifact gets blamed first. Give the assert step the
+same `working-directory`, and make the check explicit (`test -f ... || { echo "::error::not found at $path"; exit 1; }`)
+so the failure names the path instead of surfacing as `command not found`.
+
+### Do not poll the API in a loop — a 20s interval exhausts the hour in ~20 minutes
+
+**Measured 2026-09-23.** A `while` loop polling `.../actions/runs/<id>` every 20 s hit **`API rate limit
+exceeded`, `remaining=0`**, reset 38 minutes out. The unauthenticated budget is 60 requests/hour and one
+long wait is enough to spend it. Cost of the mistake: the run could not be read at the moment it finished.
+
+**The failure is silent, which is the part worth remembering.** The rate-limit response is
+`{"message": "API rate limit exceeded ..."}` — it has **no `status` field**, so a loop matching on
+`status`/`conclusion` printed `None None` on every iteration and kept looping to its bound. **"Still running"
+and "you are being refused" were indistinguishable.** Any poll loop must check for the error body explicitly
+(`d.get("message")` → abort), not just for the terminal status it is waiting on.
+
+**Cheaper methods that do not touch the budget at all:**
+
+| method | cost | caveat |
+|---|---|---|
+| `github.com/.../badge.svg?branch=main` | free | reports the last **completed** run, and `cache-control: max-age=300` — so it can be 5 min stale |
+| `github.com/.../actions/runs/<id>` (HTML) | free | JS-rendered; job conclusions are **not** in the HTML, but a **`Total duration`** is shown only once the run ends |
+| `github.com/.../commit/<sha>` (HTML) | free | shows a **`N / N`** check count (4 / 4 = all four jobs) |
+| reproducing the step locally | free | strongest evidence of all, and what actually diagnosed the bug above |
+
+**The badge can still be made conclusive by reasoning about its cache window.** #86 failed at ~10:32, #87
+started 10:33 and ran 10m13s. A badge fetched at 10:48 with `max-age=300` cannot have been generated before
+10:43 — i.e. **cannot predate #86's failure**. So "passing" at 10:48 could not be the stale #85 green; it had
+to be a post-#86 completed run. That is a real deduction, but note it only works because the *previous*
+completed run was a failure — had #86 passed, a stale badge would have been indistinguishable.
+
 ---
 
 ## Headless service (aiproviderd) — the measured starting point
