@@ -75,8 +75,11 @@ const COST_SPREAD: &str = "cost_spread";
 /// it is why `ProviderRow`, `ApiKeyRow` and `ModelRow` gained `Clone` in this increment.
 ///
 /// **`Debug`, and only `Debug`.** `Clone` is here because building a plan needs it; `PartialEq` is
-/// still deliberately absent — see the engine's module note for why `AttemptOutcome` does not
-/// carry a candidate yet.
+/// still deliberately absent — "are these two candidates the same row set" is a question no caller
+/// asks, and the port would be inventing a comparison to satisfy a derive. (`AttemptOutcome` does
+/// derive it, because the chains tests build are compared as values; the two types answer
+/// different questions, which is why they differ.) The engine's module note records what
+/// `AttemptOutcome` carries *instead* of a whole candidate, and why.
 #[derive(Debug)]
 pub struct Candidate {
     pub provider: ProviderRow,

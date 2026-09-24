@@ -126,6 +126,42 @@ pub fn parse_pricing(raw: &Value) -> Option<PricingMicros> {
     })
 }
 
+/// Read pricing back out of the **normalized** form the catalog cache stores.
+///
+/// `models_cache.pricing_json` holds `{prompt, completion}` in micro-USD per 1M tokens
+/// (`persist.rs:331`) — which is the *output* of [`parse_pricing`], not its input. Running
+/// `parse_pricing` over it would read micros as USD-per-token and multiply by 1e12: a $3/1M model
+/// would come back as $3,000,000/1M. That error is a constant factor, so **every ordering would
+/// still look plausible** — `cost_spread` compares ranks with each other, and a uniform scale
+/// factor preserves their order — while the ledger's `cost_estimate_micros` column and the
+/// monthly spend cap were both wrong by twelve orders of magnitude. It is the worst kind of
+/// defect: invisible to every test that checks relative order.
+///
+/// So this is a second *reader*, not a second spelling of one rule. The two parse two different
+/// wire shapes, and the shapes disagree about what a field means — which is precisely the case
+/// where sharing code would hide the difference. The one rule they do share, "unreadable is
+/// unknown and never free", is stated in each because each can fail on its own.
+///
+/// The TypeScript reader is `parsePricingJson` (`store.ts:66-74`), and it is as narrow as this
+/// one: two numeric fields, or `undefined`. Three deliberate details, each matching the original:
+///
+/// - **A negative is accepted.** `parse_pricing` refuses one, because its input is a third
+///   party's JSON and a negative there is corruption. This input is this program's own cache, so a
+///   negative can only come from a hand-edited database; adding a check the reference does not
+///   have would be inventing a rule, and a port that invents rules is a port that drifts.
+/// - **A fractional value is unknown.** The TypeScript's `typeof x === "number"` would accept
+///   `150000.5`; the writer (`JSON.stringify` of an integer pair) never produces one, so the two
+///   agree on every input this program can generate.
+/// - **Unparseable JSON is unknown**, not an error and not a zero. A row that fails to parse must
+///   not read as free.
+pub fn pricing_from_cache_json(raw: &str) -> Option<PricingMicros> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    Some(PricingMicros {
+        prompt: v.get("prompt")?.as_i64()?,
+        completion: v.get("completion")?.as_i64()?,
+    })
+}
+
 /// Cost of one request in micro-USD, or `None` when pricing is unknown.
 ///
 /// **The sum is rounded once, not each term.** The original is
@@ -331,5 +367,68 @@ mod tests {
         // comparator to trip over.
         assert_eq!(price_rank(None), None);
         assert_eq!(price_rank(Some(micros(3, 4))), Some(7));
+    }
+
+    // ---------- the cache reader: a different shape, not a different rule ----------
+
+    /// **The test that would have caught the 1e12 bug, and it is written as an inequality.**
+    ///
+    /// A round-trip assertion alone would pass with `parse_pricing` doing the reading, because
+    /// both directions would be wrong by the same factor — 150_000 micros would come back as
+    /// 150_000 *after* being multiplied by 1e12 and divided again. What separates the two readers
+    /// is that this one does **not** convert: the number in the JSON is the number out.
+    #[test]
+    fn the_cache_reader_returns_the_stored_number_without_converting_it() {
+        let stored = r#"{"prompt":150000,"completion":600000}"#;
+        assert_eq!(
+            pricing_from_cache_json(stored),
+            Some(PricingMicros { prompt: 150_000, completion: 600_000 })
+        );
+        // The same input through the raw-catalog reader is a *different* answer, and that is the
+        // point: the two shapes are not interchangeable.
+        assert_ne!(
+            pricing_from_cache_json(stored),
+            parse_pricing(&json!({ "pricing": { "prompt": 150_000, "completion": 600_000 } })),
+            "reading micros as USD-per-token is the twelve-orders-of-magnitude defect"
+        );
+    }
+
+    #[test]
+    fn a_cache_row_that_cannot_be_read_is_unknown_rather_than_free() {
+        // Every one of these would be `Some(PricingMicros { 0, 0 })` under a defaulting reader,
+        // which is the cheapest possible carrier in a `cost_spread` ordering.
+        for bad in [
+            "not json",
+            "{}",
+            r#"{"prompt":150000}"#,
+            r#"{"prompt":null,"completion":600000}"#,
+            r#"{"prompt":"150000","completion":"600000"}"#,
+            r#"{"prompt":150000.5,"completion":600000}"#,
+            "null",
+            "",
+        ] {
+            assert_eq!(pricing_from_cache_json(bad), None, "must be unknown: {bad}");
+        }
+    }
+
+    #[test]
+    fn a_cache_row_of_zeros_is_a_price_of_zero_and_not_an_absence() {
+        // The other side of the same rule: a provider that really published free is `Some(0)`, and
+        // the reader must not confuse it with a row it could not read.
+        assert_eq!(
+            pricing_from_cache_json(r#"{"prompt":0,"completion":0}"#),
+            Some(PricingMicros { prompt: 0, completion: 0 })
+        );
+    }
+
+    #[test]
+    fn a_negative_in_the_cache_is_read_as_written() {
+        // Documented, not accidental. `parse_pricing` refuses a negative because a third party
+        // wrote it; this column is written by this program, so a negative is a hand-edited
+        // database, and inventing a rule the reference does not have is how a port drifts.
+        assert_eq!(
+            pricing_from_cache_json(r#"{"prompt":-1,"completion":600000}"#),
+            Some(PricingMicros { prompt: -1, completion: 600_000 })
+        );
     }
 }

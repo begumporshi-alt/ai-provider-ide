@@ -1237,6 +1237,102 @@ clearer: "if None, true; if Some, apply the predicate" is exactly what the filte
 16 tests, `cargo test` 637 → 653. 12/12 falsifications (11 red tests + 1 control that does not
 compile). Gate green.
 
+### Increment 13 — the router glue, and the label the chain could not carry (2026-09-24)
+
+Phase 3's last piece. `model-router.ts` is 557 lines, and every one of them now has a Rust
+counterpart in `core/router.rs`: `generateText`, `generateImage`, `complete`, `listModels`,
+`systemAiAvailable`, `syncConcurrency`, and the private `plan` that builds a `PlanContext` and calls
+`build_plan`. Compression is not here — `messages` still pass through verbatim, which is Phase 4's
+job and is recorded as such (D20).
+
+`cargo test` 653 → 712: +5 in `engine.rs` (13a), +4 in `pricing.rs`, +50 in the new `router.rs`.
+
+**13a — the attempt label, and the decision the note got half wrong.** Increment 11b parked a
+decision: `AttemptOutcome` could not name the provider it tried, because the faithful shape clones
+three owned rows per failed attempt where the TypeScript copies a reference. The note proposed
+carrying the joined `slug/label` string. That is the cheap option and it is wrong, for a reason the
+ledger already states: `fallbackChainJson` is `{provider, key, cls}` as **three separate JSON
+fields** — `Activity.tsx` and `Context.tsx` read them separately — so a joined string would have to
+be split again, and a label containing the separator would split in the wrong place. The port
+therefore adds two fields, not one, via `AttemptLabel { provider_slug, key_label }` and a free
+function `labelled(outcome, candidate)`.
+
+The cost the note *did* carry is real and was paid: **`AttemptOutcome` is no longer `Copy`**, so two
+call sites now read `(outcome.cls, outcome.retry_after_ms)` before pushing instead of after.
+`AllAttemptsFailed::describe()` renders `slug/key:CLS` where a label exists and `CLS:status` where it
+does not — the unlabelled shape states that it cannot name the attempt rather than forging a name
+for it, and a test asserts exactly that. The drift hook still cannot be ported: it needs the provider
+id and the model's native id, and a label deliberately carries neither.
+
+**13b — `core/router.rs`.** 2,644 lines, 1,506 of them the test module; 50 tests.
+
+**The store is a plain struct, and its derives are a measurement.** `RouterStore` carries
+`#[derive(Default)]` and nothing else, because `AliasRow` implements neither `Debug` nor `Clone` —
+the planner only borrows alias rows, so nothing ever needed to clone one. No trait was invented to
+paper over it: the store has no second implementation, and a trait with one implementor is a
+comment that costs a vtable.
+
+**Three findings came from failing tests, not from reading.** Each is the kind that compiles and
+looks right:
+
+1. **`complete`'s terminal error was `NoRoute`, and `NoRoute` is an HTTP status.** The source throws
+   a plain `Error` (`:329`) whose text does not contain the phrase `gatewayStatus` maps to `404`, so
+   a Generator failure is a `500`. Reusing `NoRoute` here would have quietly changed the status a
+   client sees. Fixed with a distinct `SystemAiUnavailable` variant, and
+   `complete_reports_the_sources_message_when_nothing_answers` now asserts `!matches!(.., NoRoute)`
+   so the distinction cannot be folded back.
+2. **The first fall-through test asserted the wrong loop.** It assumed `complete` retries per *key*;
+   the source's `modelOrder` falls through per *model*, so a provider whose first model returns
+   nothing is left entirely rather than tried again on its next key. Rewritten as
+   `complete_moves_on_to_the_next_provider_when_a_candidate_returns_nothing`, which asserts the
+   adapter call log is `["text:key:k1|m1", "text:key:k3|m2"]` — `k2` is never reached.
+3. **The image failure path writes no ledger row, and that is the source, not a gap.**
+   `generateText` ends in `wrapLedger` (`:172-180`), which catches `AllAttemptsFailed` and appends an
+   error row; `generateImage` (`:183-218`) has no wrapper and throws before its `append` is reached.
+   So a failed image plan leaves no trace while a failed text plan leaves one. Pinned with a comment
+   saying so, because it is exactly the asymmetry a later reader "fixes".
+
+**`RouterError::Text` is boxed, and the engine's allowance was not inherited.** `clippy` raised
+`result_large_err` on five returns and `large_enum_variant` on the enum. `execute_text` allows the
+first of those (`engine.rs:891`) on a measured argument: its `Ok` arm carries the same 536-byte
+`Candidate` the failure does, so its `Result` is ~600 bytes either way and a box would save 16 of
+them. That argument is about *that* function. Measured here — `TextFailure` 616, `NoRoute` 72,
+`AllAttemptsFailed` 48, against `TextSuccess` 592, `ImageResult` 48, `String` 24, `()` 0 — the error
+outgrows the payload by 8× to 77× on four of the five returns, so the lint's premise holds and
+suppressing it would be suppressing a true finding. `RouterError` went 616 → 80 bytes. The
+arithmetic is asserted by
+`the_error_is_boxed_because_it_outgrows_every_payload_but_the_text_one`, which fails if a future
+`Ok` type grows past the error and the decision needs re-arguing rather than extending.
+
+**Two source asymmetries are kept and pinned.** `complete` does **not** call `syncConcurrency()`
+while `generateText` and `generateImage` do, so a stored cap reaches the Generator only on the next
+UI or gateway request. And `complete` writes no `fallbackChainJson` — the column is `NULL`, not
+`"[]"`, and the difference is meaningful: `"[]"` means "there were no attempts to record".
+
+**The `E0521` that the engine's note already documents reappeared here.** Handing the seam
+`on_usage.as_deref_mut()` off the request field does not compile — the borrow is required to outlive
+`generate_text` itself. Two local forwarding closures fix it, exactly as `execute_text` does it. The
+binding *outside* the closure, though, is a plain move: clippy's `needless_option_as_deref` is right
+that `as_deref_mut()` on a local `Option<&mut dyn FnMut>` is a no-op, and only the reborrow *inside*
+each closure is load-bearing.
+
+**Test fixtures leak two adapters on purpose.** `ModelRouter::new` takes `&dyn AdapterFactory`, and
+`&Always(adapter.clone())` is a temporary that cannot outlive the call (`E0716`, ~20 sites), so a
+`factory()` helper `Box::leak`s one per test. The alternative — an `Arc<dyn AdapterFactory>` field —
+was rejected because it would make the router own a seam the source's `AdapterRuntime` outlives.
+
+**Falsification: 12/12** (11 red tests + 1 control that does not compile), each restoring
+byte-identical. One mutation initially *missed*, and the miss was informative: mutating
+`record_no_route`'s `chain_json(&[])` did not redden
+`an_empty_chain_is_written_as_an_empty_array_and_not_as_absent`, because that test is a unit test of
+`chain_json` itself and cannot be reached from the call site. The call site's own test is
+`a_request_with_no_route_is_recorded_and_never_reaches_the_adapter`; a second mutation was added to
+cover `chain_json`'s empty branch directly. A mutation whose expectation names the wrong test is a
+green-looking harness measuring nothing.
+
+Gate green: `cargo fmt --check` clean, `clippy --all-targets -- -D warnings` clean,
+`cargo test` 712 passed / 0 failed, `cargo check --no-default-features --all-targets` clean.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
@@ -1247,11 +1343,12 @@ plan of them, not the type — and `context_scope::MemoryItem` is a different th
 collides (D21).
 
 **The planner is done (increment 11b).** `core/planner.rs` holds `build_plan`, `resolve_wanted`,
-`strip_client_namespace`, `order_keys`, `order_carriers`. The ledger is done (increment 12).
-**What remains of Phase 3** is the router glue itself: `generateText`, `generateImage`, `complete`,
-`listModels`, `systemAiAvailable`, `syncConcurrency`, and the `plan` helper that builds a
-`PlanContext` and calls `build_plan`. The compression module (`context-compress.ts`) is deferred to
-Phase 4.
+`strip_client_namespace`, `order_keys`, `order_carriers`. The ledger is done (increment 12), and the
+router glue is done (increment 13): `core/router.rs` carries `generateText`, `generateImage`,
+`complete`, `listModels`, `systemAiAvailable`, `syncConcurrency`, and the `plan` helper that builds a
+`PlanContext` and calls `build_plan`. **Phase 3 is complete.** The compression module
+(`context-compress.ts`) is deferred to Phase 4 — it is the only part of `model-router.ts` without a
+Rust counterpart, and `messages` reach the engine verbatim today.
 
 These are less risky than the execution engine — they are synchronous, stateful logic without async
 streams. The main challenge is the registry and catalog data structures, which today live in JS
@@ -1402,8 +1499,8 @@ would need a second bridge between them.
 - Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
 the test; until it is run, this is an open question.
 - Whether the summarization call in context compression (Tier 2) works correctly when the engine
-calls itself recursively. The `skipCompression` flag is designed for this, but recursive async
-calls in Rust are harder to reason about than in JS.
+  calls itself recursively. The `skipCompression` flag is designed for this, but recursive async
+  calls in Rust are harder to reason about than in JS.
 - Whether launchd's `KeepAlive` behaves correctly when the binary is inside an `.app` bundle that
 is updated (the path changes). This needs a real update cycle to verify.
 

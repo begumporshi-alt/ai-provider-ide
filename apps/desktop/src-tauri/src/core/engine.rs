@@ -16,15 +16,18 @@
 //! `BridgeMsg::Error::retry_after_ms` states the same "shortest, not longest" rule — so the two
 //! halves of the port already agree, and the tests below are what keep them agreeing.
 //!
-//! **`Candidate` now exists; the label is still absent.** `AttemptOutcome` in TypeScript also
-//! carries a `Candidate` (provider + key + model) so a failed chain can name what it tried
-//! (`execution-engine.ts:199`). Increment 7 lands the type — see its definition below — so the gap
-//! is no longer blocked by a missing shape. It is **not closed**, because in Rust the faithful
-//! shape costs more than it does in JavaScript: the three fields are owned rows, so carrying one
-//! in every `AttemptOutcome` clones three rows per failed attempt where the TypeScript copies a
-//! reference. The cheap faithful alternative is to carry the `slug/label` string that `describe`
-//! actually reads, and that is a decision rather than a port step. So the label stays absent: the
-//! gap is narrowed in increment 4, unblocked in 7, and open.
+//! **The label gap is closed, and Phase 3's router is what closed it (increment 13a).**
+//! `AttemptOutcome` in TypeScript carries a whole `Candidate` (provider + key + model) so a failed
+//! chain can name what it tried (`execution-engine.ts:199`). The port could not copy that shape —
+//! the three rows are owned here, so it would clone three of them per failed attempt where the
+//! original copies a reference — and the note that used to live here said so while leaving the
+//! decision open. Two consumers then made it unavoidable: `AllAttemptsFailed::describe`, and the
+//! router's `fallback_chain_json`, which the Activity screen renders as `provider · key → cls`
+//! (`store.ts:124-128`). [`AttemptLabel`] is the answer — the two strings those readers use, and
+//! nothing else. **`AttemptOutcome` therefore lost `Copy`**, which is the whole cost: two call
+//! sites read the class and the wait before pushing rather than after. The drift hook still cannot
+//! be ported, because it wants the provider *id* and the model native id as well; that stays
+//! recorded rather than guessed at.
 //!
 //! **The per-provider limiter is not here.** `concurrency.ts` is the fifth of the six dependency
 //! modules, and it is the one piece of the port that is *shared mutable state* rather than a pure
@@ -204,11 +207,53 @@ pub fn is_retryable_with_next_key(cls: ErrorClass) -> bool {
     )
 }
 
-/// One failed attempt, as the wait arithmetic needs it.
+/// Who tried, in the two names every reader of a chain actually uses.
 ///
-/// TypeScript's version also carries the `Candidate` it tried, for the error message. That type
-/// is Phase 3's — see the module note — so this holds only what `min_retry_after_ms` reads.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// **This is the decision the module note called open, and Phase 3's router is what forced it.**
+/// Three consumers wanted the same missing thing: [`AllAttemptsFailed::describe`], which the
+/// TypeScript builds as `<provider.slug>/<key.label>:<cls>`; the router's `fallback_chain_json`,
+/// which the Activity screen renders as `provider · key → cls` (`store.ts:124-128`); and Phase 5's
+/// drift hook, which wants the provider id and the model native id as well.
+///
+/// The TypeScript gets all of it by carrying a whole `Candidate` on every outcome
+/// (`execution-engine.ts:199`). The port cannot: the three rows are *owned* here, so that shape
+/// clones three of them per failed attempt where the original copies a reference. The note
+/// suggested carrying the joined `slug/label` string instead — which is enough for `describe` and
+/// **not** enough for the ledger, whose chain entries are `{provider, key, cls}` as three
+/// separate JSON fields; a joined string would have to be split by its reader, and splitting on
+/// the wrong separator is a defect waiting for a label that contains one. So: two fields.
+///
+/// **`Copy` is the price, and it is paid.** `AttemptOutcome` was `Copy` before this and is not
+/// now. Two call sites in the text loop read `outcome.cls` after pushing the outcome into the
+/// chain and now read them first; that is the whole of the churn. What it buys is `describe`
+/// naming its provider, which has been listed as a gap since increment 4, and a ledger chain the
+/// Rust router can write at all.
+///
+/// **Still absent: the provider *id* and the model.** The drift hook needs both, so it stays
+/// unported — see `core::router`'s module note. Adding fields for a consumer that does not exist
+/// yet would be a guess, and this type has been burned by a guessed field before.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptLabel {
+    /// The provider's slug, as the plan resolved it. Never the id: `slug` is what a person reads.
+    pub provider_slug: String,
+    /// The key's label — the human name for the credential, never the secret.
+    pub key_label: String,
+}
+
+impl AttemptLabel {
+    pub fn of(candidate: &Candidate) -> Self {
+        Self {
+            provider_slug: candidate.provider.slug.clone(),
+            key_label: candidate.key.label.clone(),
+        }
+    }
+}
+
+/// One failed attempt, as the wait arithmetic and the chain's readers need it.
+///
+/// TypeScript's version also carries the `Candidate` it tried. This carries [`AttemptLabel`]
+/// instead — the two fields of it that are read, rather than three owned rows.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptOutcome {
     /// What the failure was classified as.
     pub cls: ErrorClass,
@@ -216,6 +261,22 @@ pub struct AttemptOutcome {
     pub status: u16,
     /// What the provider asked us to wait, when it said so at all.
     pub retry_after_ms: Option<u64>,
+    /// Who tried, when the outcome came from a candidate at all.
+    ///
+    /// `None` is "unknown" and stays unknown. The three constructors below default to it, and the
+    /// loops attach it with [`labelled`] — so an outcome that never had a candidate cannot forge
+    /// a name, and the two paths that do have one are the two that say so.
+    pub label: Option<AttemptLabel>,
+}
+
+/// Attach the candidate's identity to an outcome, for the chain a caller reads.
+///
+/// A free function rather than a constructor parameter so the three constructors keep their
+/// signatures — and therefore so does every test that calls them. The name is deliberately
+/// verb-shaped: it states that this is the step where an outcome learns who it was.
+pub fn labelled(mut outcome: AttemptOutcome, candidate: &Candidate) -> AttemptOutcome {
+    outcome.label = Some(AttemptLabel::of(candidate));
+    outcome
 }
 
 /// The shortest wait any attempt named, floored at [`COOLDOWN_FLOOR_MS`]; `0` when none named one.
@@ -408,6 +469,8 @@ pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> Att
             AttemptDisposition::Rethrow => None,
             _ => e.retry_after_ms(),
         },
+        // Attached by the loop, which is the only place that holds the candidate.
+        label: None,
     }
 }
 
@@ -434,7 +497,7 @@ pub fn records_key_health(disposition: AttemptDisposition) -> bool {
 /// **It is recorded in the chain and deliberately *not* in key health.** The provider is busy, not
 /// the key bad; cooling the key would punish it for a limit the provider imposed on everyone.
 pub fn saturated_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None }
+    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None, label: None }
 }
 
 /// What the loop does with one candidate before calling the adapter.
@@ -485,7 +548,7 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
 /// **keeps nothing else the error carried** — not the status, not the `Retry-After`. See
 /// [`execute_image`] for why that is faithful and what it costs.
 pub fn transport_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None }
+    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None, label: None }
 }
 
 /// What one image request is asked to do. The Rust port of `executeImage`'s argument
@@ -567,7 +630,7 @@ pub async fn execute_image(
         // apart by `limiter.is_some()` rather than by the `Option` alone.
         let release = limiter.and_then(|l| l.acquire(&candidate.provider.id));
         if limiter.is_some() && release.is_none() {
-            attempts.push(saturated_outcome());
+            attempts.push(labelled(saturated_outcome(), &candidate));
             continue;
         }
 
@@ -582,10 +645,10 @@ pub async fn execute_image(
         // `:172-188`, with the factory rejection and the adapter rejection collapsed into the one
         // `catch {}` the TypeScript has — both are `Network`/`0` there.
         let outcome = match adapters.for_provider(&candidate.provider.id).await {
-            Err(_) => transport_outcome(),
+            Err(_) => labelled(transport_outcome(), &candidate),
             Ok(adapter) => {
                 match adapter.generate_image(&candidate.key.secret_ref, image_args, cancel).await {
-                    Err(_) => transport_outcome(),
+                    Err(_) => labelled(transport_outcome(), &candidate),
                     // `:179-182` — the only success arm, and the only one that returns.
                     Ok(reply) if reply.ok => {
                         health.record_result(&candidate.key.id, ErrorClass::Ok, None, now_ms());
@@ -599,16 +662,22 @@ pub async fn execute_image(
                     // `:183-185` — a refusal is an `Ok` reply with `ok: false`, and its status is
                     // what gets classified. `retry_after_ms` is `None` because the reply shape has
                     // no field for it; see the doc comment above and D22.
-                    Ok(reply) => AttemptOutcome {
-                        cls: classify(reply.status, None),
-                        status: reply.status,
-                        retry_after_ms: None,
-                    },
+                    Ok(reply) => labelled(
+                        AttemptOutcome {
+                            cls: classify(reply.status, None),
+                            status: reply.status,
+                            retry_after_ms: None,
+                            label: None,
+                        },
+                        &candidate,
+                    ),
                 }
             }
         };
 
-        health.record_result(&candidate.key.id, outcome.cls, outcome.retry_after_ms, now_ms());
+        // Read before the push, because an outcome is no longer `Copy` — it carries its label.
+        let (cls, retry_after_ms) = (outcome.cls, outcome.retry_after_ms);
+        health.record_result(&candidate.key.id, cls, retry_after_ms, now_ms());
         attempts.push(outcome);
         // `:189-191`'s `finally` is the `Permit`'s `Drop` here — on this path, on the `return`
         // above, and on a panic alike. There is nothing to remember to call.
@@ -659,18 +728,23 @@ impl AllAttemptsFailed {
         min_retry_after_ms(&self.chain)
     }
 
-    /// The message the TypeScript builds — minus the part that cannot be built yet.
+    /// The message the TypeScript builds. **The gap this carried since increment 4 is closed.**
     ///
     /// The TypeScript names each attempt `<provider.slug>/<key.label>:<cls>`
-    /// (`execution-engine.ts:199`). Those two fields live on `Candidate`, which is Phase 3's
-    /// type, so this names the class and the status and leaves the provider unnamed. The recorded
-    /// gap is therefore narrowed rather than closed: the arithmetic has a home now, the label
-    /// still does not.
+    /// (`execution-engine.ts:199`), and that is exactly what an outcome carrying an
+    /// [`AttemptLabel`] renders. An outcome with **no** label renders as the class and the status
+    /// instead — the spelling this function used while the label did not exist. That path is now
+    /// unreachable from either of the engine's loops (they label every outcome they push), so it
+    /// is a statement about a caller-built chain rather than a second rule: a chain that cannot
+    /// name its attempts says so, and does not forge a name to fill the space.
     pub fn describe(&self) -> String {
         let detail = self
             .chain
             .iter()
-            .map(|a| format!("{}:{}", a.cls.as_str(), a.status))
+            .map(|a| match &a.label {
+                Some(l) => format!("{}/{}:{}", l.provider_slug, l.key_label, a.cls.as_str()),
+                None => format!("{}:{}", a.cls.as_str(), a.status),
+            })
             .collect::<Vec<_>>()
             .join(" -> ");
         // The TypeScript's `detail || "empty plan"`. An empty chain is a real state — reached
@@ -856,7 +930,7 @@ pub async fn execute_text(
             // `limiter.is_some()`.
             let release = limiter.and_then(|l| l.acquire(&candidate.provider.id));
             if limiter.is_some() && release.is_none() {
-                attempts.push(saturated_outcome());
+                attempts.push(labelled(saturated_outcome(), &candidate));
                 continue;
             }
 
@@ -865,13 +939,10 @@ pub async fn execute_text(
             let adapter = match adapters.for_provider(&candidate.provider.id).await {
                 Ok(adapter) => adapter,
                 Err(_) => {
-                    let outcome = transport_outcome();
-                    health.record_result(
-                        &candidate.key.id,
-                        outcome.cls,
-                        outcome.retry_after_ms,
-                        now_ms(),
-                    );
+                    let outcome = labelled(transport_outcome(), &candidate);
+                    // Read before the push: an outcome carries its label and is no longer `Copy`.
+                    let (cls, retry_after_ms) = (outcome.cls, outcome.retry_after_ms);
+                    health.record_result(&candidate.key.id, cls, retry_after_ms, now_ms());
                     attempts.push(outcome);
                     if cancel.is_cancelled() {
                         break 'plan Ended::Cancelled;
@@ -963,14 +1034,10 @@ pub async fn execute_text(
             // apart — `emitted` is its whole input, and it is the predicate increment 6 pinned.
             if let Some(e) = refused.or(broke) {
                 let disposition = attempt_disposition(emitted, cancel.is_cancelled());
-                let outcome = attempt_outcome(&e, disposition);
+                let outcome = labelled(attempt_outcome(&e, disposition), &candidate);
                 if records_key_health(disposition) {
-                    health.record_result(
-                        &candidate.key.id,
-                        outcome.cls,
-                        outcome.retry_after_ms,
-                        now_ms(),
-                    );
+                    let (cls, retry_after_ms) = (outcome.cls, outcome.retry_after_ms);
+                    health.record_result(&candidate.key.id, cls, retry_after_ms, now_ms());
                 }
                 attempts.push(outcome);
                 match disposition {
@@ -1136,7 +1203,27 @@ mod tests {
     use crate::core::persist::ModelRow;
 
     fn outcome(cls: ErrorClass, status: u16, retry_after_ms: Option<u64>) -> AttemptOutcome {
-        AttemptOutcome { cls, status, retry_after_ms }
+        AttemptOutcome { cls, status, retry_after_ms, label: None }
+    }
+
+    /// The same, with the identity the loops attach. Used by the `describe` tests, which are the
+    /// only place a named chain is built by hand.
+    fn named(
+        slug: &str,
+        key_label: &str,
+        cls: ErrorClass,
+        status: u16,
+        retry_after_ms: Option<u64>,
+    ) -> AttemptOutcome {
+        AttemptOutcome {
+            cls,
+            status,
+            retry_after_ms,
+            label: Some(AttemptLabel {
+                provider_slug: slug.to_string(),
+                key_label: key_label.to_string(),
+            }),
+        }
     }
 
     // ---- classify: the taxonomy table, ported from `errors.ts` -------------------------------
@@ -1619,6 +1706,62 @@ mod tests {
         );
     }
 
+    /// The other half of `describe`, and the half the gap was about.
+    ///
+    /// **`slug/label`, not `slug label` and not `label/slug`.** The TypeScript is
+    /// `` `${a.candidate.provider.slug}/${a.candidate.key.label}:${a.cls}` `` (`:199`), and the
+    /// order is load-bearing for a reader: the provider comes first because that is the unit that
+    /// failed. A mutation swapping the two fields still produces a plausible-looking string, which
+    /// is exactly why this asserts the whole thing rather than `contains("p1")`.
+    #[test]
+    fn a_labelled_attempt_is_named_by_its_provider_and_key() {
+        let err = AllAttemptsFailed::new(
+            "gpt-4o",
+            vec![
+                named("openrouter", "primary", ErrorClass::AuthFailed, 401, None),
+                named("groq", "spare-key", ErrorClass::RateLimited, 429, Some(60_000)),
+            ],
+        );
+        assert_eq!(
+            err.describe(),
+            "all attempts failed for gpt-4o [openrouter/primary:AUTH_FAILED -> groq/spare-key:RATE_LIMITED]"
+        );
+    }
+
+    /// The two spellings coexist, and each is honest about what it knows.
+    ///
+    /// A chain can mix them — a caller-built outcome beside an engine-built one — and the
+    /// label-less half must not borrow the labelled half's shape. `p1/k1` here would be a forged
+    /// name for the second attempt, which never had a candidate.
+    #[test]
+    fn an_unlabelled_attempt_states_that_it_cannot_be_named() {
+        let err = AllAttemptsFailed::new(
+            "gpt-4o",
+            vec![
+                named("p1", "k1", ErrorClass::NotFound, 404, None),
+                outcome(ErrorClass::Network, 0, None),
+            ],
+        );
+        assert_eq!(err.describe(), "all attempts failed for gpt-4o [p1/k1:NOT_FOUND -> NETWORK:0]");
+    }
+
+    #[test]
+    fn the_label_is_built_from_the_candidate_and_not_from_its_id() {
+        // `slug` and `label` are what a person reads; the provider id and the key's secret_ref are
+        // not in the string at all. A port that reached for `provider.id` would pass every
+        // assertion above whenever the fixture happens to use the same string for both — which the
+        // shared fixtures do, so this one does not.
+        let mut c = candidate("p1", "k1", "m1");
+        c.provider.slug = "openrouter".to_string();
+        c.key.label = "work key".to_string();
+        c.key.secret_ref = "key:p1:SUPER-SECRET".to_string();
+
+        let label = AttemptLabel::of(&c);
+        assert_eq!(label.provider_slug, "openrouter");
+        assert_eq!(label.key_label, "work key");
+        assert!(!label.key_label.contains("SUPER-SECRET"));
+    }
+
     // ---------- increment 6: the per-attempt policy ----------
 
     fn http(status: u16, kind: FailureKind, retry_after_ms: Option<u64>) -> AttemptError {
@@ -2082,6 +2225,45 @@ mod tests {
             err.min_retry_after_ms(),
             0,
             "no image attempt can name a wait, so the client is told nothing"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_attempt_the_image_loop_records_names_the_provider_and_key_it_tried() {
+        // The image path's label, and the reason the router can write a `fallback_chain_json` at
+        // all: the chain's entries are `{provider, key, cls}` (`store.ts:124-128`), and before
+        // this the Rust chain could produce only the third. The status is *not* part of what the
+        // ledger renders, which is why the assertion is on the label rather than on the whole row.
+        let adapter = Scripted::new(vec![refusal(404), refusal(429)]);
+        let mut health = HealthTracker::new();
+
+        let err = execute_image(
+            &Always(adapter.clone()),
+            &mut health,
+            None,
+            image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+        )
+        .await
+        .expect_err("nothing served");
+
+        let labels: Vec<(String, String)> = err
+            .chain
+            .iter()
+            .map(|a| {
+                let l = a.label.as_ref().expect("every recorded attempt names what it tried");
+                (l.provider_slug.clone(), l.key_label.clone())
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![("p1".to_string(), "k1".to_string()), ("p2".to_string(), "k2".to_string())],
+            "the second attempt's label must be its own, not the first's"
+        );
+        // And the whole error message now names both, which it could not before increment 13a.
+        assert_eq!(
+            err.describe(),
+            "all attempts failed for as-the-caller-typed-it [p1/k1:NOT_FOUND -> p2/k2:RATE_LIMITED]"
         );
     }
 
@@ -2648,6 +2830,53 @@ mod tests {
         assert!(matches!(failure, TextFailure::MidStream { .. }), "got {failure:?}");
         assert_eq!(mid.calls().len(), 1, "and it is not retried");
         assert_eq!(*seen.lock().unwrap(), vec!["first".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn every_attempt_the_text_loop_records_names_the_provider_and_key_it_tried() {
+        // The label is attached at three separate `labelled(..)` call sites on this path — the
+        // saturation skip, the transport failure, and the classified refusal — and each is its own
+        // statement. Labelling only the refusal would leave the ledger chain's first entries
+        // anonymous, and nothing else in this module would notice: the classes and the statuses
+        // are all still right.
+        let adapter = TextScripted::new(vec![refused(503), chunks_of(&["served"])]).shared();
+        let mut health = HealthTracker::new();
+        let limiter = ProviderLimiter::new(1);
+        // Hold p0's only slot so its candidate is skipped rather than called.
+        let _held = limiter.acquire("p0").expect("free to start with");
+        let (_seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &mut health,
+            Some(&limiter),
+            text_args(vec![
+                candidate("p0", "skipped", "m0"),
+                candidate("p1", "k1", "m1"),
+                candidate("p2", "k2", "m2"),
+            ]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the third candidate streams");
+
+        let labels: Vec<(String, String, ErrorClass)> = served
+            .attempts
+            .iter()
+            .map(|a| {
+                let l = a.label.as_ref().expect("every recorded attempt names what it tried");
+                (l.provider_slug.clone(), l.key_label.clone(), a.cls)
+            })
+            .collect();
+        assert_eq!(
+            labels,
+            vec![
+                ("p0".to_string(), "skipped".to_string(), ErrorClass::RateLimited),
+                ("p1".to_string(), "k1".to_string(), ErrorClass::ServerError),
+            ],
+            "in the order they were tried, each with its own provider and key"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

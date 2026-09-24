@@ -2588,3 +2588,46 @@ header has 2".
 
 **A `///` block with no item under it attaches to the next item** and trips clippy's
 `empty_line_after_doc_comments`. When deleting a struct, turn its doc-comment into `//` or delete it too.
+
+### Test fixtures, lint allowances, and mutation expectations (2026-09-24, increment 13)
+
+**A guard clause earlier in the function can mask the branch under test.** `why_no_image` has three
+branches in order: no image capability → unknown id → known but untagged. Two tests named the *third*
+branch but built a catalog with **no image model at all**, so the first branch fired and the assertion
+passed while measuring nothing — the test only went red once the fixture gained an unrelated image model
+that fails branch 1. **When a test names a specific branch, the fixture must fail every earlier branch.**
+The same trap in the other direction: a fixture that satisfies a broad guard makes the specific assertion
+unreachable. This is the "a readiness wait must match only the awaited view" family.
+
+**An `#[allow]` on a lint is a claim about *that function*, not about the type.** `execute_text` allows
+`clippy::result_large_err` (`engine.rs:891`) on a measured argument: its `Ok` arm carries the same 536-byte
+`Candidate` the failure does, so its `Result` is ~600 bytes either way and a box would save 16 of them. The
+same `TextFailure` inside a new error enum had `Ok` arms of 48, 24 and 0 bytes, so the error outgrew the
+payload by 8×–77× on four of five returns and the lint was **right** there. Re-measure in the new context;
+copying the allow would have suppressed a true finding. Boxing `RouterError::Text` took the enum 616 → 80.
+
+**Pin the arithmetic behind a size decision with an assertion, not a comment.** A future `Ok` type growing
+past the error invalidates the box; `the_error_is_boxed_because_it_outgrows_every_payload_but_the_text_one`
+fails when that happens, so the decision is re-argued rather than inherited. Measure with
+`std::mem::size_of::<T>()` in a temporary test, then convert it into the permanent assertion.
+
+**A mutation whose `expect` names the wrong test is a green-looking harness measuring nothing.** Mutating
+`record_no_route`'s `chain_json(&[])` did not redden
+`an_empty_chain_is_written_as_an_empty_array_and_not_as_absent`, because that test is a unit test of
+`chain_json` itself and is unreachable from the call site; the call site's test was
+`a_request_with_no_route_is_recorded_and_never_reaches_the_adapter`. When a mutation **misses**, check
+whether the named test exercises the helper directly rather than through the site you mutated — then add a
+second mutation for the helper. Also expect honest collateral: one mutation reddened two tests that both
+assert the same terminal error.
+
+**A local `Option<&mut dyn FnMut>`: the outer binding is a plain move, only the inner reborrow is
+load-bearing.** `clippy::needless_option_as_deref` is right that `as_deref_mut()` on such a local is a
+no-op (`Option<&mut T>` derefs to itself). But inside the closure the `as_deref_mut()` **is** required —
+the closure may be called many times and must reborrow rather than move the `Option` out on the first call.
+`execute_text`'s version is not flagged because it derefs a *field behind a borrow*, not a local. Dropping
+the outer `as_deref_mut()` also makes `mut` on the destructured fields unnecessary, which is a second
+`unused_mut` error rather than a silent fix.
+
+**`clippy::needless_option_as_deref` and `result_large_err` arrived on the floating `stable` toolchain**
+(1.98 here), so a new module can go red with no code change — the same class as the 1.88 → 1.98 clippy
+delta. Triage by lint *kind* and count, not by the error total.
