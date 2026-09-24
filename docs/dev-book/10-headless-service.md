@@ -3026,6 +3026,58 @@ in which the symptom was first seen, and it is recorded in the test rather than 
 **Measured:** `cargo test` lib **1174 → 1175**, binary **3 → 5**. The two new binary tests are the ones above;
 the lib test is the seam's.
 
+**25h — D46, closed at the boot path.** The divergence 25g pinned as a *test* is now closed as a *defect*,
+and by the register's own second candidate rather than a new idea: **assert at activation that the host the
+adapter will dial is one the egress will permit**, so it fails loudly at launch instead of per request.
+
+**The divergence, restated because the fix is shaped by it.** The allowlist is derived from
+`providers.base_url` (`persist::recompute_allow`, called on provider CRUD and at boot) while the adapter dials
+`manifest.provider.baseUrl` (`manifest::join_url`). The generator writes both, so they agree on any install
+nobody has edited; editing one and not the other is what a custom-base-URL or proxy feature would do. When
+they disagree every attempt is refused by `check_url` and reported as `NETWORK` — measured 2026-09-24, **56 of
+56** requests answered `502 … [agnes/key-01:NETWORK -> agnes/Key-02:NETWORK]` while the stub's counter never
+moved. The refusal was local policy wearing the upstream's name.
+
+**`egress::host_is_permitted` is the one predicate, and that is the load-bearing choice.** It is
+`is_local(host) || allow.contains(host)`; `check_url` refuses on it and `activation::check_destination` skips on
+it. Two spellings of "is this host allowed" is precisely how a boot-time assertion comes to disagree with the
+enforcement it is asserting about — the class of defect this register keeps finding.
+
+**Why the host is `provider.baseUrl`'s and nothing else.** Because `join_url` **unconditionally prefixes** the
+base: `join_url(base, path)` is `base + path` for every path, including one that looks absolute. So the host of
+every URL a manifest can dial is the host of its `provider.baseUrl`, and checking that one host is *sufficient*
+rather than a sample. An image URL returned *by* a provider is a different destination and is still checked by
+`check_url` at fetch time; the assertion does not claim to cover it, and says so.
+
+**The check declines when there is no host to judge.** A manifest with no `provider.baseUrl` returns `Ok` from
+`check_destination` and is handed to `register`, which names the real problem a moment later. Without that, a
+malformed manifest would be reported as an allowlist problem and send the operator to the wrong screen — a fix
+that *lowers* diagnosability while looking like it raises it.
+
+**Reachability is unchanged, and that is the safety argument.** A provider whose host is not allowlisted could
+not be dialled before either — `check_url` refused it every time. So the fix changes **when and how the problem
+is said**, not what works. That is what makes it safe to land without a migration or a compatibility note.
+
+**Three falsification probes, one at a time, each reddening exactly its own test.** Removing the
+`check_destination` call reddens `a_manifest_whose_host_is_not_allowlisted_is_skipped_by_name` **alone**, and on
+the `registered.is_empty()` assertion rather than on the reason text — so the test is not merely checking a
+string. Dropping the `is_local` branch from the predicate reddens
+`a_localhost_manifest_needs_no_allowlist_entry` alone, which is what pins the local branch: without it every
+fresh install would stop serving Ollama. And making the check claim a host it never saw reddens
+`a_manifest_with_no_base_url_is_left_to_register_to_refuse` alone. Each probe reverted and the tree re-gated.
+
+**What 25h does not close, stated rather than implied.** A provider edited *after* launch does not re-activate —
+`persist` recomputes the allowlist on provider CRUD, and nothing re-runs activation — so a mismatch created at
+runtime still reaches `check_url` and is still reported as `NETWORK`. Closing *that* needs the refusal to carry
+its own class, which would add a token to the cross-language `ErrorClass` contract: `ALL_CLASSES` is walked
+against the TypeScript union spelled out verbatim, so a Rust-only class is a deliberate divergence rather than
+a local edit. **Candidate 1 was rejected on measurement:** deriving the allowlist from the manifest would let a
+manifest widen it, and constraining the adapter's destinations to hosts the operator registered is the one
+property the allowlist exists to hold.
+
+**Measured:** `cargo test` lib **1175 → 1178**, binary **5 → 5** — the D46 test was rewritten rather than added,
+because the old one asserted the behaviour the fix removes.
+
 ---
 
 ## 12. What we know we do not know

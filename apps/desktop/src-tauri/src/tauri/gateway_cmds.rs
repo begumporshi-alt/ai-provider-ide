@@ -96,9 +96,10 @@ pub fn build_core(app: &AppHandle) -> Result<Arc<GatewayCore>, String> {
 
     // 25a's production `HttpPort`, then 25c's activation path: the adapters the request path needs,
     // registered from the store's active manifests. Skip rather than abort, so one corrupt manifest
-    // costs its provider and not the launch.
-    let runtime = AdapterRuntime::new(Arc::new(EgressPort::new(egress)));
-    let activation = activation::activate(&runtime, &store)?;
+    // costs its provider and not the launch — and since 25h a manifest whose host the allowlist
+    // refuses is one of those skips (D46), so the app and the service report it the same way.
+    let runtime = AdapterRuntime::new(Arc::new(EgressPort::new(egress.clone())));
+    let activation = activation::activate(&runtime, &store, &egress.allow)?;
     if !activation.registered.is_empty() {
         log_to_file(
             app,

@@ -140,12 +140,24 @@ pub enum StreamEvent {
     Error { message: String },
 }
 
+/// May the egress dial `host`? — **the one predicate**, so an assertion about it cannot drift.
+///
+/// Localhost is permitted unconditionally (§8 note); everything else must be a registered base
+/// URL host. [`check_url`] refuses on this answer and `core::activation` skips a provider on it,
+/// which is the whole reason it is a function rather than an `if` inside `check_url`: two
+/// spellings of "is this host allowed" is how a boot-time assertion comes to disagree with the
+/// enforcement it is asserting about.
+///
+/// The port is not an input — see [`is_local`].
+pub fn host_is_permitted(allow: &AllowList, host: &str) -> bool {
+    is_local(host) || allow.contains(host)
+}
+
 /// Pure allowlist + URL check (unit-testable).
 pub fn check_url(allow: &AllowList, raw: &str) -> Result<reqwest::Url, EgressError> {
     let url = reqwest::Url::parse(raw).map_err(|e| EgressError::BadUrl(e.to_string()))?;
     let host = url.host_str().ok_or_else(|| EgressError::BadUrl(raw.into()))?;
-    // Localhost providers permitted (§8 note); everything else must be a registered base URL host.
-    if !is_local(host) && !allow.contains(host) {
+    if !host_is_permitted(allow, host) {
         return Err(EgressError::HostDenied(host.into()));
     }
     Ok(url)

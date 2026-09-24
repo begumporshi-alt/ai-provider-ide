@@ -4864,5 +4864,36 @@ manifest rows declare `stream`). Comment corrected; behaviour kept as the refere
 **A streaming client cannot observe a status.** A refusal on a streamed request arrives as an SSE frame under
 an already-committed `200`; only a non-streaming request can assert the 502.
 
+## Increment 25h — D46 closed at the boot path (2026-09-24)
+
+**The two authorities, and which one wins.** The allowlist is built from `providers.base_url`
+(`persist::recompute_allow` — at boot and on provider CRUD). The adapter dials `manifest.provider.baseUrl`
+(`manifest::join_url`). **`join_url` unconditionally prefixes the base** — `base + path` for every path, even
+one that looks absolute — so every URL a manifest can dial carries the manifest's host. That is why checking
+that one host at activation is *sufficient* rather than a sample. The generator writes both, so they agree
+until someone edits one.
+
+**`egress::host_is_permitted(allow, host)` is the one predicate** — `is_local(host) || allow.contains(host)`.
+`check_url` refuses on it; `activation::check_destination` skips on it. **Never spell this twice**: two
+spellings of "is this host allowed" is how a boot-time assertion comes to disagree with the enforcement.
+
+**`activate(runtime, store, allow: &AllowList)`** — a third skip reason beside "not JSON" and "failed to
+build". The reason must name the host **and** the operator's action; a silent skip relocates the problem
+instead of solving it. It declines (returns `Ok`) when there is no host to judge, so it cannot mask a malformed
+manifest as an allowlist problem.
+
+**Reachability is unchanged by design** — a non-allowlisted host could not be dialled before either. The fix
+changes *when and how* it is reported, not what works. That is what makes it safe with no migration.
+
+**A re-activation is not a launch.** `register` builds before it swaps (D32), and a *skip* never reaches
+`register` at all — so a re-activation keeps the previous adapter serving. A test about launch behaviour must
+build a **fresh** `AdapterRuntime`, which is why the `Harness` keeps the `EgressState`.
+
+**Still open:** a provider edited at runtime does not re-activate, so a runtime-created mismatch still reaches
+`check_url` and still reports `NETWORK`. Closing it needs `AttemptError`/`ErrorClass` to carry a local-refusal
+class — and `ALL_CLASSES` is walked against the **TypeScript union spelled out verbatim**
+(`every_class_has_the_spelling_the_typescript_uses`), so a Rust-only class is a cross-language divergence and a
+separate decision, not a local edit.
+
 
 

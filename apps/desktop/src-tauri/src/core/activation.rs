@@ -18,6 +18,15 @@
 //! returns `Err` (D32). Activation's contribution is only the decision to keep going — which is why
 //! a re-activation of a healthy runtime cannot take a provider down.
 //!
+//! # A destination the egress will refuse is the third reason to skip
+//!
+//! Added 2026-09-24, and it closes **D46**. Activation now takes the egress allowlist and refuses a
+//! manifest whose host the request path would refuse anyway — see [`check_destination`] for why the
+//! two authorities diverge and why the host check is sufficient rather than a sample. The reason it
+//! belongs *here* rather than in the egress is the same reason the corrupt-manifest case does: a
+//! launch is the last moment at which the problem can be reported once, with a name, instead of once
+//! per request with the wrong one.
+//!
 //! # What activation is not: the builtin profiles
 //!
 //! The reference's loop runs **over providers**, and for each one it first tries
@@ -37,6 +46,7 @@
 use serde_json::Value;
 
 use crate::core::adapter_runtime::AdapterRuntime;
+use crate::core::egress::{host_is_permitted, AllowList};
 use crate::core::error::CommandError;
 use crate::core::persist::{manifests_active_rows, ManifestRow};
 use crate::core::store::Store;
@@ -72,17 +82,25 @@ impl Activation {
     }
 }
 
-/// Register every active manifest into the runtime, skipping the ones that cannot be built.
+/// Register every active manifest into the runtime, skipping the ones that cannot be built or
+/// cannot be reached.
 ///
 /// **The store read is the only failure that propagates**, and that is the one asymmetry worth
 /// naming: a database this process cannot read is not a degraded launch, it is no launch, so it is
-/// an `Err`. A manifest that cannot be *parsed* or *built* is a fact about one provider, and it is
-/// recorded in [`Activation::skipped`] instead — the reference's `catch`.
-pub fn activate(runtime: &AdapterRuntime, store: &Store) -> Result<Activation, CommandError> {
+/// an `Err`. A manifest that cannot be *parsed*, *built*, or *dialled* is a fact about one provider,
+/// and it is recorded in [`Activation::skipped`] instead — the reference's `catch`.
+///
+/// `allow` is the egress allowlist, and taking it here is what closes **D46** — see
+/// [`check_destination`].
+pub fn activate(
+    runtime: &AdapterRuntime,
+    store: &Store,
+    allow: &AllowList,
+) -> Result<Activation, CommandError> {
     let rows = manifests_active_rows(store)?;
     let mut out = Activation::default();
     for row in rows {
-        match register_row(runtime, &row) {
+        match register_row(runtime, allow, &row) {
             Ok(()) => out.registered.push(row.provider_id),
             Err(reason) => out.skipped.push(Skipped {
                 provider_id: row.provider_id,
@@ -95,15 +113,72 @@ pub fn activate(runtime: &AdapterRuntime, store: &Store) -> Result<Activation, C
     Ok(out)
 }
 
-/// One row: parse, then register.
+/// One row: parse, check the destination, then register.
 ///
-/// The two failures collapse into one `Err` because the caller treats them identically, but the
-/// reason says which it was — "is not JSON" names a corrupt row, anything else names a manifest that
-/// parsed and could not be built.
-fn register_row(runtime: &AdapterRuntime, row: &ManifestRow) -> Result<(), String> {
+/// The three failures collapse into one `Err` because the caller treats them identically, but the
+/// reason says which it was — "is not JSON" names a corrupt row, the allowlist message names a
+/// destination the egress will refuse, and anything else names a manifest that parsed and could not
+/// be built.
+fn register_row(
+    runtime: &AdapterRuntime,
+    allow: &AllowList,
+    row: &ManifestRow,
+) -> Result<(), String> {
     let body: Value =
         serde_json::from_str(&row.body_json).map_err(|e| format!("body_json is not JSON: {e}"))?;
+    check_destination(allow, &body)?;
     runtime.register(&row.provider_id, &body)
+}
+
+/// Refuse a manifest whose destination the egress will not dial — **D46, closed at the boot path**.
+///
+/// # Why this is here as well as in `check_url`
+///
+/// The allowlist is derived from `providers.base_url` (`persist::recompute_allow`) while the adapter
+/// dials `manifest.provider.baseUrl` (`manifest::join_url`). The two are written together by the
+/// generator, so they agree on any install nobody has edited — and they can be made to disagree by
+/// editing one and not the other, which is what a custom-base-URL or proxy feature would do.
+///
+/// When they disagree the request is refused by `check_url` **per attempt**, and the attempt layer
+/// reports that as `NETWORK` — a `502` whose message blames the provider for a local policy refusal.
+/// Measured 2026-09-24: 56 of 56 requests answered `502 … [agnes/key-01:NETWORK -> agnes/Key-02:NETWORK]`
+/// while the stub's own counter did not move once. **The reachability does not change here** — a
+/// provider that cannot be dialled could not be dialled before either. What changes is that it is
+/// said **once, at boot, with a name**, instead of once per request with the wrong one.
+///
+/// # Why the host is `provider.baseUrl`'s and nothing else
+///
+/// Because `join_url` **unconditionally prefixes** the base: `join_url(base, path)` is `base + path`
+/// for every path, including one that looks absolute. So the host of every URL this manifest can
+/// dial is the host of `provider.baseUrl`, and checking that one host is sufficient rather than a
+/// sample. (An image URL *returned by* a provider is a different destination and is still checked by
+/// `check_url` at fetch time; this function does not claim to cover it.)
+///
+/// # Why a missing or unparseable base is `Ok`
+///
+/// So this check cannot mask a different error with a misleading reason. A manifest with no
+/// `provider.baseUrl` fails `ManifestInterpreter::new` a moment later, and that message is the one
+/// worth reading; returning `Ok` here hands the row to `register`, which names the real problem.
+fn check_destination(allow: &AllowList, body: &Value) -> Result<(), String> {
+    let Some(host) = body
+        .get("provider")
+        .and_then(|p| p.get("baseUrl"))
+        .and_then(Value::as_str)
+        .and_then(|base| reqwest::Url::parse(base).ok())
+        .and_then(|url| url.host_str().map(str::to_lowercase))
+    else {
+        return Ok(());
+    };
+    if host_is_permitted(allow, &host) {
+        return Ok(());
+    }
+    Err(format!(
+        "the manifest dials host `{host}`, which the egress allowlist does not permit — every \
+         request would be refused locally and reported as a network failure. The allowlist is \
+         populated from `providers.base_url`, so the provider row and this manifest disagree. \
+         Re-point one of them at the other's host (or delete and re-create the provider, which \
+         writes both)"
+    ))
 }
 
 #[cfg(test)]
@@ -147,6 +222,20 @@ mod tests {
 
     fn runtime() -> AdapterRuntime {
         AdapterRuntime::new(std::sync::Arc::new(NoPort))
+    }
+
+    /// An allowlist permitting the hosts these fixtures dial.
+    ///
+    /// The tempting shortcut — pointing every fixture at `127.0.0.1` so `is_local` permits it — is
+    /// the one to avoid: it would make all of these tests pass through the local branch and stop
+    /// exercising the allowlist at all, and the one test that *is* about the allowlist needs a
+    /// remote host to mean anything.
+    fn allow() -> AllowList {
+        let a = AllowList::default();
+        for h in ["one.test", "two.test", "good.test", "api.example.com"] {
+            a.allow(h);
+        }
+        a
     }
 
     /// A store on disk. The directory is `AtomicUsize`-suffixed rather than `pid + tag`: two tests
@@ -248,7 +337,7 @@ mod tests {
             insert(&conn, "p2", 1, &declarative("https://two.test/v1"), true);
         }
         let rt = runtime();
-        let act = activate(&rt, &store).expect("a readable database activates");
+        let act = activate(&rt, &store, &allow()).expect("a readable database activates");
         assert_eq!(act.registered, vec!["p1".to_string(), "p2".to_string()]);
         assert!(act.skipped.is_empty(), "nothing was skipped");
         assert!(act.is_complete());
@@ -272,7 +361,7 @@ mod tests {
             insert(&conn, "p1", 2, &declarative("https://two.test/v1"), true);
         }
         let rt = runtime();
-        let act = activate(&rt, &store).expect("a readable database activates");
+        let act = activate(&rt, &store, &allow()).expect("a readable database activates");
         assert_eq!(act.registered, vec!["p1".to_string()], "the active version registered");
         assert!(
             act.skipped.is_empty(),
@@ -292,7 +381,7 @@ mod tests {
             insert(&conn, "good", 1, &declarative("https://good.test/v1"), true);
         }
         let rt = runtime();
-        let act = activate(&rt, &store).expect("a corrupt row is not a store failure");
+        let act = activate(&rt, &store, &allow()).expect("a corrupt row is not a store failure");
         assert_eq!(act.registered, vec!["good".to_string()], "the healthy provider still serves");
         assert_eq!(act.skipped.len(), 1, "one row was skipped");
         assert_eq!(act.skipped[0].provider_id, "bad");
@@ -312,7 +401,7 @@ mod tests {
             insert(&conn, "p1", 1, &code_without_source(), true);
         }
         let rt = runtime();
-        let act = activate(&rt, &store).expect("a build failure is not a store failure");
+        let act = activate(&rt, &store, &allow()).expect("a build failure is not a store failure");
         assert!(act.registered.is_empty(), "nothing was registered");
         assert_eq!(act.skipped.len(), 1);
         // The reason is `register`'s, verbatim — activation does not rewrite it.
@@ -331,7 +420,7 @@ mod tests {
     fn activation_on_an_empty_database_registers_nothing() {
         let (store, dir) = tmp_store();
         let rt = runtime();
-        let act = activate(&rt, &store).expect("no rows is not a failure");
+        let act = activate(&rt, &store, &allow()).expect("no rows is not a failure");
         assert!(act.registered.is_empty());
         assert!(act.skipped.is_empty());
         assert!(act.is_complete());
@@ -349,7 +438,7 @@ mod tests {
             insert(&conn, "p1", 1, &declarative("https://one.test/v1"), true);
         }
         let rt = runtime();
-        assert_eq!(activate(&rt, &store).unwrap().registered, vec!["p1".to_string()]);
+        assert_eq!(activate(&rt, &store, &allow()).unwrap().registered, vec!["p1".to_string()]);
 
         // The operator activates a broken v2.
         {
@@ -358,13 +447,106 @@ mod tests {
                 .unwrap();
             insert(&conn, "p1", 2, &code_without_source(), true);
         }
-        let act = activate(&rt, &store).unwrap();
+        let act = activate(&rt, &store, &allow()).unwrap();
         assert!(act.registered.is_empty(), "v2 was skipped");
         assert_eq!(act.skipped.len(), 1);
         assert_eq!(
             rt.registered(),
             vec!["p1".to_string()],
             "the v1 adapter is still serving — a bad activation is not an outage"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **D46.** A manifest naming a host the egress will not dial is skipped **by name** at
+    /// activation, instead of registering and then answering a `502 … :NETWORK` per request.
+    ///
+    /// The two assertions are deliberately different claims. `registered.is_empty()` is that nothing
+    /// was activated; the reason check is that the *report* is the useful part — the whole defect was
+    /// a report that blamed the provider, so a fix that skipped silently would have moved the
+    /// problem rather than solved it. That the host and the operator's action are both named is what
+    /// makes this a fix rather than a relocation.
+    #[test]
+    fn a_manifest_whose_host_is_not_allowlisted_is_skipped_by_name() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert(&conn, "p1", 1, &declarative("https://not-allowlisted.example/v1"), true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a refusal is not a store failure");
+        assert!(act.registered.is_empty(), "nothing was registered");
+        assert_eq!(act.skipped.len(), 1);
+        let reason = &act.skipped[0].reason;
+        assert!(
+            reason.contains("not-allowlisted.example"),
+            "the reason must name the host that was refused: {reason}"
+        );
+        assert!(
+            reason.contains("allowlist"),
+            "the reason must name the allowlist, not the provider's health: {reason}"
+        );
+        assert!(
+            rt.registered().is_empty(),
+            "a provider that could never be dialled must not be reachable"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the predicate: a local provider needs no allowlist entry at all, because
+    /// `is_local` permits it — Ollama and LM Studio are the reason that branch exists.
+    ///
+    /// Run against an **empty** allowlist on purpose. If the check consulted only `contains`, this
+    /// would be skipped, and a local provider would stop working on every fresh install.
+    #[test]
+    fn a_localhost_manifest_needs_no_allowlist_entry() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert(&conn, "p1", 1, &declarative("http://127.0.0.1:8799/v1"), true);
+        }
+        let rt = runtime();
+        let act =
+            activate(&rt, &store, &AllowList::default()).expect("a readable database activates");
+        assert_eq!(
+            act.registered,
+            vec!["p1".to_string()],
+            "localhost is permitted unconditionally"
+        );
+        assert!(act.skipped.is_empty(), "{:?}", act.skipped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The check must not mask a different error.** A manifest with no `provider.baseUrl` has no
+    /// host to check, so `check_destination` declines to have an opinion and `register` names the
+    /// real problem.
+    ///
+    /// This is the assertion that keeps the new check from *lowering* diagnosability: without it,
+    /// "there is no host" could be reported as "the host is not allowlisted", which would send the
+    /// operator to the allowlist for a malformed manifest.
+    #[test]
+    fn a_manifest_with_no_base_url_is_left_to_register_to_refuse() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            let body = json!({
+                "manifestVersion": 1,
+                "kind": "declarative",
+                "dialect": "openai-chat-v1",
+                "provider": { "auth": { "headers": [] } },
+                "endpoints": {},
+                "capabilities": { "text": true, "image": false }
+            })
+            .to_string();
+            insert(&conn, "p1", 1, &body, true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a build failure is not a store failure");
+        assert_eq!(act.skipped.len(), 1);
+        let reason = &act.skipped[0].reason;
+        assert!(
+            !reason.contains("allowlist"),
+            "the destination check has no host to judge and must stay out of the way: {reason}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

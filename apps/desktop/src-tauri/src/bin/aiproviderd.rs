@@ -143,13 +143,18 @@ async fn main() {
     // constructor below did have a production caller (D40), and `AllowList::default()` being empty
     // is intended behaviour rather than a defect. See D45.
     let allow = Arc::new(AllowList::default());
-    let egress_state = Arc::new(EgressState::new(allow, store.clone()));
+    // `allow.clone()` rather than `allow`: the `Arc` is shared with the egress state, so the local
+    // handle sees what `recompute_allow` writes below and can be handed to activation as the same
+    // list the request path will consult. A second `AllowList` here would be the defect D46 is.
+    let egress_state = Arc::new(EgressState::new(allow.clone(), store.clone()));
     persist::recompute_allow(&egress_state, &store);
     let egress_port = Arc::new(EgressPort::new(egress_state));
     let runtime = AdapterRuntime::new(egress_port);
 
-    // Activate every manifest that has an active row (25c). Skip, don't abort.
-    let activation = match activation::activate(&runtime, &store) {
+    // Activate every manifest that has an active row (25c). Skip, don't abort — and since 25h a
+    // manifest whose host the allowlist refuses is one of the skips (D46), so a provider that could
+    // never be dialled is named once here rather than reported as an upstream failure per request.
+    let activation = match activation::activate(&runtime, &store, &allow) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("aiproviderd: activation failed: {e}");
@@ -448,7 +453,13 @@ mod tests {
     struct Harness {
         base: String,
         store: Arc<store::Store>,
-        runtime: Arc<AdapterRuntime>,
+        /// The egress and its allowlist, kept so a test can build a **second** runtime over the same
+        /// policy — which is how the D46 test observes a launch rather than a re-activation.
+        ///
+        /// The boot `AdapterRuntime` is deliberately *not* a field: the bridge owns it from the
+        /// moment `boot` returns, and nothing here reaches for it.
+        egress: Arc<EgressState>,
+        allow: Arc<AllowList>,
         stub: Stub,
         _handle: gateway::ServerHandle,
         _dir: PathBuf,
@@ -489,15 +500,19 @@ mod tests {
 
         let allow = Arc::new(AllowList::default());
         let egress_state = Arc::new(EgressState::with_secret_provider(
-            allow,
+            allow.clone(),
             store.clone(),
             Arc::new(|_: &str| Ok(Some("sk-stub".to_string()))),
         ));
         persist::recompute_allow(&egress_state, &store);
 
-        let runtime = Arc::new(AdapterRuntime::new(Arc::new(EgressPort::new(egress_state))));
+        let runtime =
+            Arc::new(AdapterRuntime::new(Arc::new(EgressPort::new(egress_state.clone()))));
 
-        let act = activation::activate(&runtime, &store).expect("a readable store activates");
+        // The same `AllowList` the request path will consult, so this activation is judged by the
+        // policy that will actually be enforced (25h).
+        let act =
+            activation::activate(&runtime, &store, &allow).expect("a readable store activates");
         assert_eq!(
             act.registered,
             vec!["p1".to_string()],
@@ -527,7 +542,8 @@ mod tests {
         Harness {
             base: format!("http://{}", handle.addr),
             store,
-            runtime,
+            egress: egress_state,
+            allow,
             stub,
             _handle: handle,
             _dir: dir,
@@ -649,20 +665,28 @@ mod tests {
         assert!(rows >= 2, "the store-backed sink must have recorded both requests, got {rows}");
     }
 
-    /// **D46, pinned.** The egress allowlist derives from `providers.base_url`; the adapter calls
-    /// the URL inside the active manifest's `endpoints`. Repoint only the first — or, as here, only
-    /// the second — and every request becomes a local `HostDenied`, which the attempt layer reports
-    /// as `NETWORK`, producing a 502 whose message blames the upstream for local policy.
+    /// **D46, closed at the boot path.** The egress allowlist derives from `providers.base_url`; the
+    /// adapter dials the host in the active manifest's `provider.baseUrl`. Repoint one and not the
+    /// other and the two disagree — which used to mean every request became a local `HostDenied`
+    /// that the attempt layer reported as `NETWORK`: a 502 blaming the upstream for our own policy.
     ///
-    /// **The count assertion is the load-bearing one.** A 502 alone is also what an unreachable
-    /// upstream produces; "the stub was not touched" is what separates a local refusal from a
-    /// network failure.
+    /// **Observed through a *fresh* runtime, and that is not incidental.** A *re*-activation would
+    /// keep the previous adapter serving, because `register` builds before it swaps (D32) and a skip
+    /// never reaches `register` at all — so the request would still succeed and the test would prove
+    /// nothing about a launch. A launch builds an empty runtime, and that is the state asserted here.
+    ///
+    /// **What this does not cover, stated rather than implied:** the running gateway still holds the
+    /// adapter boot registered, and a provider edited at runtime does not re-activate — so a
+    /// mismatch created *after* launch still reaches `check_url` and is still reported as `NETWORK`.
+    /// Closing that needs the refusal to carry its own class, which would add a token to the
+    /// cross-language `ErrorClass` contract; recorded in the register rather than taken here.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_manifest_host_outside_the_allowlist_is_refused_as_network_without_reaching_upstream()
-    {
+    async fn a_manifest_host_outside_the_allowlist_is_skipped_at_activation_not_502d_per_request() {
         let h = boot(false).await;
         let before = h.stub.served();
 
+        // Repoint the manifest's host only. The provider row still names the stub, so the allowlist
+        // no longer contains the host this manifest dials — D46's divergence, created deliberately.
         {
             let conn = h.store.conn.lock().unwrap();
             conn.execute(
@@ -672,23 +696,27 @@ mod tests {
             )
             .unwrap();
         }
-        activation::activate(&h.runtime, &h.store).expect("re-activation swaps the adapter");
 
-        // **Non-streaming on purpose.** A streaming client is already holding a `200` by the time
-        // the router gives up, so the refusal would arrive as an SSE frame and the status assertion
-        // below would be testing the wrong surface. This is the shape in which the symptom was
-        // first seen, and the shape a plain `curl` reports.
-        let (status, body) = chat(&h.base, false).await;
-        assert_eq!(status, 502, "body: {body}");
+        let fresh = AdapterRuntime::new(Arc::new(EgressPort::new(h.egress.clone())));
+        let act = activation::activate(&fresh, &h.store, &h.allow).expect("activation");
+
+        assert!(act.registered.is_empty(), "a provider that cannot be dialled must not register");
+        assert_eq!(act.skipped.len(), 1);
+        let reason = &act.skipped[0].reason;
         assert!(
-            body.contains("NETWORK"),
-            "the refusal must surface as NETWORK — that misattribution is the symptom D46 names: \
-             {body}"
+            reason.contains("not-allowlisted.example"),
+            "the skip must name the host it refused: {reason}"
         );
+        assert!(
+            reason.contains("allowlist"),
+            "the skip must name the local policy, not the provider's health: {reason}"
+        );
+        assert!(fresh.registered().is_empty(), "nothing serves this provider");
         assert_eq!(
             h.stub.served(),
             before,
-            "a locally-refused request must not have reached the upstream at all"
+            "the divergence must be settled without dialling anything — the assertion that separates \
+             a local refusal from a network failure"
         );
     }
 }
