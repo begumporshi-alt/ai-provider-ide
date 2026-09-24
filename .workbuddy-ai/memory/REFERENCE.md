@@ -4368,3 +4368,81 @@ One at a time, each red, file byte-exact (`eac321be…`):
 - **The count.** Rust **1160 → 1165**; headless **1100 → 1105**; the headless build compiles with **no errors
   and no warnings**, which is the measurement that says the un-gating is complete rather than partial.
 
+## Increment 25b — the hydration readers, and the settings nobody read (2026-09-24)
+
+### The gap (D39, and one it did not name)
+
+`RouterStore::hydrate` had no production caller because the four readers that would feed it —
+`providers_list` (`:51`), `api_keys_list` (`:199`), `models_cache_list` (`:357`), `aliases_list` (`:433`) —
+were `#[cfg(feature = "app")]` and `State<'_, Arc<Store>>`-shaped. A headless launch cannot produce a
+Tauri `State`, so the store the router routes from could not be built. **A sixth gap surfaced in
+reconnaissance:** `RouterSettings` had no production source either. The three settings live in the
+`settings` row `key='router'` as camelCase JSON the webview writes (`store.ts:655`) and applies with
+`Object.assign` in a `try`/`catch` that keeps the defaults (`:390-397`); the only reader in Rust was the
+generic `settings_get` command (`tauri/commands.rs:138`). That matters beyond tidiness because
+`BridgeHost::settings` exists so the bridge never holds a second copy of the operator's toggles — and it
+had nothing to point at.
+
+### What changed
+
+Each reader became a pair: an un-gated `pub fn x_rows(store: &Store) -> Result<Vec<Row>, CommandError>`
+hlding the query, and a one-line `#[tauri::command]` wrapper keeping the wire name the webview calls. The
+pattern is not new in that file — `gateway_keys_list`, `active_gateway_key_ids`, `gateway_key_cap`,
+`month_spend_micros` were already un-gated and `&Store`-shaped, and `gateway_keys_list` has no command at
+all. `list_models` (`:427`, the query `models_cache_rows` delegates to) lost the `app` gate it had never
+needed.
+
+`persist::setting_value(store, key) -> Option<Value>` — the core-side, parsed sibling of `settings_get`.
+`None` covers three cases the callers treat identically: no row, a `NULL`, and a value that does not parse.
+`spend_cap_micros` was refactored onto it, removing a duplicated query.
+
+`RouterStore::from_store(store: &Store) -> Result<Self, CommandError>` — `hydrate`'s first production
+caller. Four separate locks rather than one transaction, deliberately: those were four commands and
+therefore four round-trips; a launch reads a database nothing else is writing to yet, and closing the
+window would mean a `&mut Connection`-shaped reader that `persist` does not have.
+
+`RouterSettings::from_store(store: &Store) -> Self` reads through `setting_value(store, "router")` and
+maps camelCase → snake_case. `per_provider_concurrency` is copied through **un-clamped** — the field is a
+`Value` so a stored `-1`, `"4"` or `""` stays representable and `clamp_concurrency`'s corruption branch
+stays reachable. A `systemAi` with no model is treated as no pick at all — a pick that cannot be routed to
+would put an unusable entry in the model order.
+
+### The `#[test]` count trap
+
+`router_bridge.rs` has **9** `#[test]` attributes and **26** test cases (a macro generates the rest). A
+`#[test]` grep undercounts by almost 3×; `cargo test --lib -- --list` is the measurement. I nearly
+"corrected" an accurate header — the discipline that prevents it is **always count with the test runner**.
+
+### The tests
+
+Persist: `setting_value_parses_and_treats_an_unreadable_row_as_absent` (un-gated, headless). Router:
+`router_store_from_store_reads_the_four_tables`,
+`router_store_from_store_on_an_empty_database_is_empty_not_an_error`,
+`router_settings_from_store_maps_the_stored_object`,
+`router_settings_from_store_falls_back_to_the_defaults`,
+`router_settings_from_value_hands_the_concurrency_on_unclamped`,
+`router_settings_from_value_defaults_each_field_independently`. Rust **1165 → 1172**; headless
+**1105 → 1112**, so every new test is reachable with no Tauri in the graph.
+
+### The probes
+
+| probe | change | result |
+|---|---|---|
+| Malformed settings row | `setting_value` returns `Some(null)` instead of `None` | `setting_value_parses_and_treats_an_unreadable_row_as_absent` **alone** red |
+| Un-clamped concurrency | `from_value` coerces through `as_u64` | `router_settings_from_value_hands_the_concurrency_on_unclamped` **alone** red |
+
+**The tests that stayed green are the finding.** The malformed probe left
+`router_settings_from_store_falls_back_to_the_defaults` green, because `from_value(&null)` also yields
+defaults — so only the persist test guards the malformed-is-absent contract. The coercion probe left
+`router_settings_from_store_maps_the_stored_object` green, because `6` is a valid `u64` — so only the
+corruption test guards the un-clamped contract. A round-trip test alone would have missed both.
+
+### The docs
+
+`core/router_bridge.rs` header updated: "Three things this driver needs" → "One thing", recording gaps 1
+and 2 closed and 3 (ledger) open, and noting `BridgeHost::settings` now sourced. D39 status: "Two of three
+closed, and a fourth prerequisite this cell did not name" (the settings). D40 status: "Partly fixed in
+25a–25b" — two of five constructors now have production callers. `10-headless-service.md`: table row 25b
+landed, full increment section. `09-status.md`: new increment row, Tests cell **1165 → 1172** with
+headless **1105 → 1112**. `book.html`: 204 ids, **648.4 KB**, 0 `data-page-node-id`.
+

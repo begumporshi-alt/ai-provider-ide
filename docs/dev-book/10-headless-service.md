@@ -2006,7 +2006,7 @@ one is the deletion:
 | **24b-ii-a — landed** | `SharedRouterState` — the state every request must see one copy of: the circuit breaker, the key cursors, the ledger and the limiter. A prerequisite of 24b-ii, not a follow-up: `execute_text`'s `&mut HealthTracker` and `ModelRouter`'s `&mut self` made "two requests at once" unrepresentable, so the driver could only have been written serialising or with per-request state (D38) |
 | **24b-ii-b — landed** | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`. **Landed against seams, not wired**: three paths it must walk are still Tauri-shaped or Tauri-gated, so nothing installs it yet (D39) |
 | **25a — landed** | `core/egress_port.rs` — `impl HttpPort for EgressPort`, the production implementor the plan's own future tense had assumed existed (D40). Un-gates `egress::stream` off `tauri::ipc::Channel` onto an `mpsc` sink, so `egress.rs` now carries **no** `cfg(feature = "app")` at all |
-| **25b** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1) |
+| **25b — landed** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1). It also gave `RouterSettings` its first production source, a prerequisite none of D39's three gaps had named |
 | **25c** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code does today (D40) |
 | **25d** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability |
 | **25e** | Install `RouterBridge` — hydrate, register the adapters, build the `EgressPort`, point `BridgeHost` at `GatewayCore`, and swap `HeadlessBridge` in `bin/aiproviderd.rs`, whose `ready()` answers `false` and so makes every completion a deliberate 503 |
@@ -2609,6 +2609,56 @@ time, both red, file byte-exact:** flipping the `>= 400` arm to return `lines: S
 timeout rather than a spurious failure. Rust **1160 → 1165**; headless **1100 → 1105**, so every new test
 is reachable with no Tauri in the graph. The headless build compiles with no errors and no warnings,
 which is the measurement that says the un-gating is complete rather than partial.
+
+**Increment 25b — the readers a launch needs, and the settings nobody read.** D39's first gap was
+hydration: `RouterStore::hydrate` had no production caller, because the four readers that would feed it
+were `#[tauri::command]`s taking `State<'_, Arc<Store>>` — a shape a headless launch cannot produce. The
+body never needed the `State`: it locks `store.conn` and runs a query. So each became a pair — an
+un-gated `pub fn x_rows(store: &Store) -> Result<Vec<Row>, CommandError>` holding the query, and a
+one-line `#[tauri::command]` wrapper keeping the wire name the webview calls. The pattern is not new in
+that file: `gateway_keys_list`, `active_gateway_key_ids`, `gateway_key_cap` and `month_spend_micros` were
+already un-gated and `&Store`-shaped, and `gateway_keys_list` has no command at all. `list_models` — the
+query `models_cache_rows` delegates to — lost the `app` gate it had never needed.
+
+`RouterStore::from_store(store: &Store)` is `hydrate`'s **first production caller**, and it is the
+sentence `router.rs`'s own module note already made: "tests build one with `hydrate`, which is also what
+a launch does". It reads the four tables under four separate locks rather than one transaction, which is
+deliberate: those were four commands and therefore four round-trips, a launch reads a database nothing
+else is writing to yet, and closing the window would mean a `&mut Connection`-shaped reader that
+`persist` does not have.
+
+**The sixth gap, and the one this increment did not go looking for.** `RouterSettings` had no production
+source either. The three settings live in the `settings` row `key='router'` as camelCase JSON that the
+webview writes (`store.ts:655`) and applies with `Object.assign` inside a `try`/`catch` that keeps the
+defaults (`:390-397`); the only reader in Rust was the generic `settings_get` command, which is
+`app`-gated and hands back a `String`. That matters beyond tidiness because `BridgeHost::settings` exists
+precisely so the bridge never holds a second copy of the operator's toggles — and it had nothing to point
+at. Closed by `persist::setting_value(store, key)`, the core-side parsed sibling of `settings_get`, which
+`spend_cap_micros` now reads through instead of duplicating the query, plus `RouterSettings::from_store` /
+`from_value`.
+
+**`per_provider_concurrency` is copied through un-clamped, and that is the contract.** The field is a
+`serde_json::Value` so that a stored `-1`, `"4"` or `""` stays representable and `clamp_concurrency`'s
+corruption branch stays reachable; clamping at the reader would move the check and leave that branch
+unreachable from the only path that can produce a corrupt value. `from_value` also treats a `systemAi`
+with no model as no pick at all — a pick that cannot be routed to would put an unusable entry in the
+model order.
+
+**Seven tests, and two falsification probes, one at a time, file byte-exact after each revert.** Rust
+**1165 → 1172**; headless **1105 → 1112**, so every new test is reachable with no Tauri in the graph. The
+probes were chosen for the two claims a compiler cannot check:
+
+| probe | change | red |
+|---|---|---|
+| a malformed settings row | `setting_value` returns `Some(null)` instead of `None` | `setting_value_parses_and_treats_an_unreadable_row_as_absent` **alone** |
+| an un-clamped concurrency | `from_value` coerces through `as_u64` | `router_settings_from_value_hands_the_concurrency_on_unclamped` **alone** |
+
+That the *other* tests stayed green is the useful half of the measurement. The malformed probe left
+`router_settings_from_store_falls_back_to_the_defaults` green, because `from_value(&null)` yields the
+defaults too — so only the persist test guards the malformed-is-absent contract. The coercion probe left
+`router_settings_from_store_maps_the_stored_object` green, because `6` is a valid `u64` — so only the
+corruption test guards the un-clamped contract, and a reader that coerced would pass the happy path. A
+round-trip test alone would have missed both.
 
 ---
 

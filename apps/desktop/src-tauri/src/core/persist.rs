@@ -46,9 +46,26 @@ pub struct ProviderRow {
     pub updated_at: i64,
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, CommandError> {
+// ---------- store -> router readers ----------
+//
+// **Four readers, each a pair, and the split is what lets the headless service route.** Every one
+// of these began life as a `#[tauri::command]` taking `State<'_, Arc<Store>>`, which is a shape a
+// headless launch cannot produce — so `RouterStore::hydrate`, whose whole purpose is to be built
+// from already-read rows, had no production caller at all (D39). The body never needed the
+// `State`: it locks `store.conn` and runs a query. So each became an un-gated `*_rows` function
+// over `&Store`, with the command left behind as a one-line delegate.
+//
+// The pattern is not new here — `gateway_keys_list` (`:966`), `active_gateway_key_ids` (`:946`),
+// `gateway_key_cap` (`:1007`) and `month_spend_micros` (`:1057`) are all un-gated and
+// `&Store`-shaped already, and `gateway_keys_list` has no command at all. What this block does is
+// apply the same shape to the four readers the router actually needs.
+//
+// **The command names are wire names.** `providers_list`, `api_keys_list`, `models_cache_list` and
+// `aliases_list` are what the webview's `invoke` calls, so they keep their names and their
+// signatures; only their bodies moved.
+
+/// Every provider row. See the section note above.
+pub fn providers_rows(store: &Store) -> Result<Vec<ProviderRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at FROM providers ORDER BY created_at",
@@ -67,6 +84,12 @@ pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, 
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, CommandError> {
+    providers_rows(&store)
 }
 
 #[cfg(feature = "app")]
@@ -194,11 +217,13 @@ pub struct ApiKeyRow {
     pub last_tested_at: Option<i64>,
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn api_keys_list(
-    store: State<'_, Arc<Store>>,
-    provider_id: Option<String>,
+/// Every key row, optionally narrowed to one provider. See the section note above.
+///
+/// Takes `Option<&str>` rather than `Option<String>`: the hydration path passes `None`, and a
+/// caller that already holds an owned id should not have to clone it to ask.
+pub fn api_keys_rows(
+    store: &Store,
+    provider_id: Option<&str>,
 ) -> Result<Vec<ApiKeyRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let sql = "SELECT id, provider_id, label, secret_ref, secret_hint, status, priority, cooldown_until, added_at, last_used_at, last_tested_at FROM api_keys".to_string()
@@ -224,6 +249,15 @@ pub fn api_keys_list(
         None => stmt.query_map([], map)?.collect::<Result<Vec<_>, _>>()?,
     };
     Ok(rows)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn api_keys_list(
+    store: State<'_, Arc<Store>>,
+    provider_id: Option<String>,
+) -> Result<Vec<ApiKeyRow>, CommandError> {
+    api_keys_rows(&store, provider_id.as_deref())
 }
 
 #[cfg(feature = "app")]
@@ -352,11 +386,19 @@ pub fn models_cache_replace(
     replace_models(&mut conn, &provider_id, &rows).map_err(Into::into)
 }
 
+/// Every cached model row. See the section note above.
+///
+/// The query itself was already split out into `list_models(conn)` for testability; this is the
+/// `&Store`-shaped sibling the hydration path needs, and `list_models` loses its `app` gate with it.
+pub fn models_cache_rows(store: &Store) -> Result<Vec<ModelRow>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    list_models(&conn).map_err(Into::into)
+}
+
 #[cfg(feature = "app")]
 #[tauri::command]
 pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, CommandError> {
-    let conn = store.conn.lock().unwrap();
-    list_models(&conn).map_err(Into::into)
+    models_cache_rows(&store)
 }
 
 /// The cache write, split out of the command so it can be tested without a Tauri `State`.
@@ -382,7 +424,6 @@ fn replace_models(
     tx.commit()
 }
 
-#[cfg(feature = "app")]
 fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
     let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json FROM models_cache")?;
     let rows = stmt.query_map([], |r| {
@@ -428,9 +469,8 @@ pub fn aliases_replace(
     Ok(())
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, CommandError> {
+/// Every model alias. See the section note above.
+pub fn aliases_rows(store: &Store) -> Result<Vec<AliasRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare("SELECT alias, provider_id, native_model_id, priority FROM model_aliases ORDER BY priority DESC")?;
     let rows = stmt.query_map([], |r| {
@@ -442,6 +482,12 @@ pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, Comma
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn aliases_list(store: State<'_, Arc<Store>>) -> Result<Vec<AliasRow>, CommandError> {
+    aliases_rows(&store)
 }
 
 // ---------- ledger ----------
@@ -1120,13 +1166,30 @@ pub fn month_spend_by_app(store: &Store) -> HashMap<String, i64> {
     }
 }
 
-/// Spend cap in micro-USD, or 0/None when disabled.
-pub fn spend_cap_micros(store: &Store) -> Option<i64> {
+/// One settings row, parsed, or `None` when it is absent or unreadable.
+///
+/// **The core-side sibling of the `settings_get` command.** That command is `app`-gated and hands
+/// back the raw `String`; a launch has no webview to hand it to, and both core readers that want
+/// a settings row — [`spend_cap_micros`] below and `RouterSettings::from_store` in `core::router`
+/// — want it parsed. `None` covers three cases the callers treat identically: no row, a `NULL`,
+/// and a value that does not parse. The only honest thing to do with a settings row that cannot
+/// be read is to keep the default.
+///
+/// It takes the key as an argument rather than being one reader per key because the keys are the
+/// webview's (`store.ts`), not this crate's: `'router'`, `'gateway'`, `'spend'`, `'background'`.
+pub fn setting_value(store: &Store, key: &str) -> Option<serde_json::Value> {
     let conn = store.conn.lock().unwrap();
     let raw: Option<String> =
-        conn.query_row("SELECT value_json FROM settings WHERE key='spend'", [], |r| r.get(0)).ok();
-    let v: serde_json::Value = serde_json::from_str(&raw?).ok()?;
-    let cap = v.get("capMicrosPerMonth")?.as_i64()?;
+        conn.query_row("SELECT value_json FROM settings WHERE key=?1", [key], |r| r.get(0)).ok();
+    serde_json::from_str(&raw?).ok()
+}
+
+/// Spend cap in micro-USD, or `None` when disabled.
+///
+/// `0` and a negative value both read as "no cap"; folding them here means no caller has to
+/// repeat the comparison.
+pub fn spend_cap_micros(store: &Store) -> Option<i64> {
+    let cap = setting_value(store, "spend")?.get("capMicrosPerMonth")?.as_i64()?;
     if cap <= 0 {
         None
     } else {
@@ -1145,8 +1208,10 @@ pub fn spend_cap_set(store: &Store, cap_micros: i64) -> Result<(), CommandError>
 }
 
 // Four tests below carry `#[cfg(feature = "app")]` because the readers they exercise are
-// app-gated; the other ten compile without the feature, which is the point of
+// app-gated; the others compile without the feature, which is the point of
 // `cargo check --no-default-features --all-targets` — see D17.
+// (Deliberately not a count: it was "the other ten" until 25b added an eleventh, and a number in
+// a comment is a second place to remember.)
 #[cfg(test)]
 mod persist_tests {
     use super::*;
@@ -1610,6 +1675,35 @@ mod persist_tests {
         assert_eq!(spend_cap_micros(&store), Some(9_000_000), "set must upsert");
         spend_cap_set(&store, 0).unwrap();
         assert_eq!(spend_cap_micros(&store), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `setting_value` is the one reader of the `settings` table, and the three ways a row can be
+    /// unreadable are one answer: absent.
+    ///
+    /// The malformed case is the point of the test. `settings_set` is a whole-row upsert of
+    /// whatever the webview hands it, so a row that is not JSON is reachable — and a launch that
+    /// treated one as an error would refuse to start over a setting it could have ignored. This
+    /// test compiles without the `app` feature on purpose: `setting_value` is what the headless
+    /// launch reads its settings through, so it is exactly the code that must not need the glue.
+    #[test]
+    fn setting_value_parses_and_treats_an_unreadable_row_as_absent() {
+        let (store, dir) = tmp_store("setval");
+        assert_eq!(setting_value(&store, "router"), None, "no row");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key,value_json) VALUES ('router','{\"failoverEnabled\":false}')",
+                [],
+            )
+            .unwrap();
+            conn.execute("INSERT INTO settings (key,value_json) VALUES ('gateway','not json')", [])
+                .unwrap();
+        }
+        let v = setting_value(&store, "router").expect("a stored object parses");
+        assert_eq!(v.get("failoverEnabled").and_then(serde_json::Value::as_bool), Some(false));
+        assert_eq!(setting_value(&store, "gateway"), None, "malformed is absent, not an error");
+        assert_eq!(setting_value(&store, "never-written"), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -67,11 +67,16 @@ use crate::core::engine::{
     execute_image, execute_text, AllAttemptsFailed, AttemptOutcome, ExecuteImageArgs,
     ExecuteTextArgs, HealthTracker, TextFailure, TextSuccess,
 };
+use crate::core::error::CommandError;
 use crate::core::ledger::UsageLedger;
 use crate::core::limiter::{clamp_concurrency, ProviderLimiter, PER_PROVIDER_DEFAULT};
-use crate::core::persist::{AliasRow, ApiKeyRow, LedgerRow, ModelRow, ProviderRow};
+use crate::core::persist::{
+    aliases_rows, api_keys_rows, models_cache_rows, providers_rows, setting_value, AliasRow,
+    ApiKeyRow, LedgerRow, ModelRow, ProviderRow,
+};
 use crate::core::planner::{build_plan, Candidate, PlanContext, PlanInput};
 use crate::core::pricing::{estimate_cost_micros, pricing_from_cache_json, PricingMicros};
+use crate::core::store::Store;
 use crate::core::usage::UsageTokens;
 
 /// The two modalities, as the strings `ModelRow::modality` holds. Not an enum — see
@@ -128,6 +133,28 @@ impl RouterStore {
         aliases: Vec<AliasRow>,
     ) -> Self {
         Self { providers, keys, models, aliases }
+    }
+
+    /// Read the four tables and build the store a launch routes from.
+    ///
+    /// **This is [`RouterStore::hydrate`]'s first production caller.** Until it existed the only
+    /// callers were tests, because the four readers in `persist` were `#[tauri::command]`s taking
+    /// a Tauri `State` — a shape a headless launch cannot produce — so the store could be built in
+    /// a test and nowhere else (D39, D40). The module note above already claimed "tests build one
+    /// with `hydrate`, which is also what a launch does"; this is the sentence made true.
+    ///
+    /// The four queries take four separate locks rather than one transaction. That is deliberate:
+    /// it is what the webview already did — four commands, four round-trips — and it is the shape
+    /// the four readers have. A launch reads a database nothing else is writing to yet, so the
+    /// window between them is empty in practice; closing it would mean a `&mut Connection`-shaped
+    /// reader that `persist` does not have and that this path does not need.
+    pub fn from_store(store: &Store) -> Result<Self, CommandError> {
+        Ok(Self::hydrate(
+            providers_rows(store)?,
+            api_keys_rows(store, None)?,
+            models_cache_rows(store)?,
+            aliases_rows(store)?,
+        ))
     }
 
     pub fn providers(&self) -> &[ProviderRow] {
@@ -216,6 +243,54 @@ impl Default for RouterSettings {
             failover_enabled: true,
             system_ai: None,
             per_provider_concurrency: Value::from(PER_PROVIDER_DEFAULT),
+        }
+    }
+}
+
+/// The `settings` row the three settings live in. The webview owns the key — it writes it in
+/// `store.ts` and reads it back through the generic `settings_get` command — so this constant is
+/// a second declaration of a string the TypeScript also holds, and the two must agree.
+pub const ROUTER_SETTINGS_KEY: &str = "router";
+
+impl RouterSettings {
+    /// The three settings as the webview stored them, or the defaults.
+    ///
+    /// **Absent or unreadable is the default, not an error.** The webview applies the same row
+    /// with `Object.assign` inside a `try`/`catch` that keeps the defaults on a parse failure
+    /// (`store.ts:390-397`), so a launch that cannot read the row behaves exactly as a webview
+    /// that cannot — which is what keeps one corrupt settings row from bricking startup.
+    pub fn from_store(store: &Store) -> Self {
+        match setting_value(store, ROUTER_SETTINGS_KEY) {
+            Some(v) => Self::from_value(&v),
+            None => Self::default(),
+        }
+    }
+
+    /// The stored object, field by field, over the defaults.
+    ///
+    /// **`per_provider_concurrency` is copied verbatim and never clamped here.** The source reads
+    /// it back from persisted JSON with no validation and clamps at the limiter — that is the
+    /// whole reason the field is a `Value` (see the type's note). Clamping at this reader would
+    /// move the check and leave `clamp_concurrency`'s corruption branch unreachable from the one
+    /// path that can produce a corrupt value.
+    pub fn from_value(v: &Value) -> Self {
+        let default = Self::default();
+        let system_ai = v.get("systemAi").and_then(|s| {
+            Some(SystemAiPick {
+                provider_id: s.get("providerId")?.as_str()?.to_string(),
+                model: s.get("model")?.as_str()?.to_string(),
+            })
+        });
+        Self {
+            failover_enabled: v
+                .get("failoverEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(default.failover_enabled),
+            system_ai,
+            per_provider_concurrency: v
+                .get("perProviderConcurrency")
+                .cloned()
+                .unwrap_or(default.per_provider_concurrency),
         }
     }
 }
@@ -1245,6 +1320,7 @@ fn chain_json(attempts: &[AttemptOutcome]) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use futures_util::future::BoxFuture;
@@ -1318,6 +1394,176 @@ mod tests {
             vec![model("p1", "m1", TEXT)],
             vec![],
         )
+    }
+
+    // ---------- hydration from a real store ----------
+    //
+    // Everything above builds a `RouterStore` by hand with `hydrate`. These build one the way a
+    // launch does — from a database, through `persist`'s four readers and the two `from_store`
+    // constructors. That is the path a headless service has and the webview does not: there is no
+    // Tauri `State` anywhere in it, so if these pass, a launch has a store to route from.
+
+    /// A store on disk. The directory is `AtomicUsize`-suffixed rather than `pid + tag`: two tests
+    /// that picked the same tag would otherwise open the same file, and one would fail with
+    /// `DatabaseBusy` for a reason that has nothing to do with what it is testing.
+    fn tmp_store() -> (Store, std::path::PathBuf) {
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "aip-router-hydrate-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Store::open(&dir).unwrap(), dir)
+    }
+
+    /// The four readers feed the four fields, and the row that proves it is the priced model.
+    ///
+    /// A `ModelRow` whose `pricing_json` did not survive hydration is the expensive failure: the
+    /// catalog is re-fetched only once per 24h, so a launch that loses the price prices every
+    /// request as unknown — which zeroes cost and leaves the monthly spend cap unable to fire. The
+    /// assertion is therefore about the reader, not the router.
+    #[test]
+    fn router_store_from_store_reads_the_four_tables() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,rotation_strategy,created_at,updated_at)
+                 VALUES ('p1','acme','Acme','https://acme.test/v1','enabled','round_robin',7,7)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO api_keys (id,provider_id,label,secret_ref,status,priority,added_at)
+                 VALUES ('k1','p1','primary','key:ref-1','active',3,7)",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO models_cache (provider_id,native_id,modality,fetched_at,pricing_json)
+                 VALUES ('p1','m1','text',7,'{\"prompt\":10,\"completion\":20}')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO model_aliases (alias,provider_id,native_model_id,priority)
+                 VALUES ('fast','p1','m1',5)",
+                [],
+            )
+            .unwrap();
+        }
+
+        let rows = RouterStore::from_store(&store).expect("a launch can read its own database");
+        assert_eq!(rows.providers().len(), 1);
+        assert_eq!(rows.providers()[0].slug, "acme");
+        assert_eq!(rows.keys_of("p1").len(), 1, "the key landed in `keys`, under its provider");
+        assert_eq!(rows.keys_of("p1")[0].label, "primary");
+        assert_eq!(rows.models().len(), 1);
+        assert_eq!(rows.models()[0].native_id, "m1");
+        assert!(rows.pricing_for("p1", "m1").is_some(), "the cached price survived hydration");
+        assert_eq!(rows.aliases().len(), 1, "the alias landed in `aliases`, not in `models`");
+        assert_eq!(rows.aliases()[0].alias, "fast");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A database with no rows is a store with no rows, not an error. A first launch is exactly
+    /// this, and it must reach "no route for model X" rather than fail to build a store at all.
+    #[test]
+    fn router_store_from_store_on_an_empty_database_is_empty_not_an_error() {
+        let (store, dir) = tmp_store();
+        let rows = RouterStore::from_store(&store).expect("no rows is not a failure");
+        assert!(rows.providers().is_empty(), "providers");
+        assert!(rows.models().is_empty(), "models");
+        assert!(rows.aliases().is_empty(), "aliases");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The `settings` row is camelCase JSON the webview wrote, and `from_store` is its only reader.
+    #[test]
+    fn router_settings_from_store_maps_the_stored_object() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key,value_json) VALUES ('router', ?1)",
+                [json!({
+                    "failoverEnabled": false,
+                    "systemAi": { "providerId": "p2", "model": "oracle-mini" },
+                    "perProviderConcurrency": 6
+                })
+                .to_string()],
+            )
+            .unwrap();
+        }
+        let s = RouterSettings::from_store(&store);
+        assert!(!s.failover_enabled, "the stored value wins over the default");
+        assert_eq!(
+            s.system_ai,
+            Some(SystemAiPick { provider_id: "p2".into(), model: "oracle-mini".into() })
+        );
+        assert_eq!(s.per_provider_concurrency, json!(6));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// No row at all, and a row that is not JSON, are the same answer: the defaults. The webview
+    /// keeps its defaults on a parse failure too (`store.ts`), so a corrupt row degrades the same
+    /// way in both builds instead of bricking startup in one of them.
+    #[test]
+    fn router_settings_from_store_falls_back_to_the_defaults() {
+        let (store, dir) = tmp_store();
+        assert_eq!(RouterSettings::from_store(&store), RouterSettings::default(), "no row");
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute("INSERT INTO settings (key,value_json) VALUES ('router','{oops')", [])
+                .unwrap();
+        }
+        assert_eq!(RouterSettings::from_store(&store), RouterSettings::default(), "malformed row");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A stored concurrency reaches the limiter un-clamped, and that is the whole reason the field
+    /// is a `Value`.
+    ///
+    /// The corruption cases are the ones that matter. The webview applies this JSON with
+    /// `Object.assign` and no validation, so `-1`, a string and `null` are all reachable — and
+    /// clamping at this reader would leave `clamp_concurrency`'s corruption branch unreachable
+    /// from the only path that can produce a corrupt value. So the assertion is that the raw value
+    /// is handed on.
+    #[test]
+    fn router_settings_from_value_hands_the_concurrency_on_unclamped() {
+        for corrupt in [json!(-1), json!("4"), json!(""), json!(null)] {
+            let shown = corrupt.to_string();
+            let v = json!({ "perProviderConcurrency": corrupt });
+            let s = RouterSettings::from_value(&v);
+            assert_eq!(
+                s.per_provider_concurrency, v["perProviderConcurrency"],
+                "the reader must not clamp {shown}"
+            );
+        }
+        assert_eq!(
+            RouterSettings::from_value(&json!({})).per_provider_concurrency,
+            RouterSettings::default().per_provider_concurrency,
+            "absent is the one case the reader may substitute for"
+        );
+    }
+
+    /// Every field is optional and independent, and a `systemAi` that is half-written is no system
+    /// AI at all — a pick with no model cannot be routed to, so treating it as a pick would put an
+    /// unusable entry in the model order.
+    #[test]
+    fn router_settings_from_value_defaults_each_field_independently() {
+        assert_eq!(RouterSettings::from_value(&json!({})), RouterSettings::default());
+        assert_eq!(RouterSettings::from_value(&json!({ "systemAi": null })).system_ai, None);
+        assert_eq!(
+            RouterSettings::from_value(&json!({ "systemAi": { "providerId": "p2" } })).system_ai,
+            None,
+            "a pick with no model is not a pick"
+        );
+        assert!(
+            !RouterSettings::from_value(&json!({ "failoverEnabled": false })).failover_enabled,
+            "one field set must not drag the others off their defaults"
+        );
     }
 
     /// A scripted adapter: one queue for text and one for images, consumed in call order, plus a

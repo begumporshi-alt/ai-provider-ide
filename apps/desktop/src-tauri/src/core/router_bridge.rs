@@ -18,27 +18,33 @@
 //! `app_key_id` — and the sink itself is installed on [`SharedRouterState`] by the launch. A bridge
 //! that owned a sink would be a second place a ledger row can be written from.
 //!
-//! # Three things this driver needs that do not exist yet
+//! # One thing this driver needs that does not exist yet
 //!
 //! `RouterBridge` compiles and is tested here (26 tests, against a real `ModelRouter` and a real
-//! `RouterStore` — the only double is the adapter), but **nothing installs it yet**, and the reason
-//! is measured rather than assumed. Three paths the headless binary must walk are still
-//! Tauri-shaped or Tauri-gated (drift register **D39**):
+//! `RouterStore` — the only double is the adapter), but **nothing installs it yet**. Three paths
+//! the headless binary must walk were Tauri-shaped or Tauri-gated (drift register **D39**); this
+//! is where each stands now.
 //!
-//! 1. **Hydration.** `RouterStore::hydrate` is called only from `router.rs`'s own tests, and the
-//!    four readers that would feed it (`providers_list`, `api_keys_list`, `models_cache_list`,
-//!    `aliases_list`) are `#[cfg(feature = "app")]` and take `State<'_, Arc<Store>>`.
-//! 2. **Streaming egress.** `egress::stream` is `#[cfg(feature = "app")]` because it hands events
-//!    to a `tauri::ipc::Channel`. `generate_text` always streams (`router.rs:717`), so without it
-//!    there is no text path at all.
-//! 3. **The ledger row.** `persist::ledger_insert` already takes a plain `&Connection` and is
-//!    nonetheless `#[cfg(feature = "app")]`.
+//! 1. **Hydration — closed in 25b.** `RouterStore::hydrate` is no longer test-only:
+//!    `RouterStore::from_store` reads the four tables, and the readers that feed it
+//!    (`providers_rows`, `api_keys_rows`, `models_cache_rows`, `aliases_rows`) are un-gated
+//!    `&Store` functions, with the `#[tauri::command]` wrappers left behind as one-line delegates.
+//! 2. **Streaming egress — closed in 25a.** `egress::stream` takes an `mpsc` sink rather than a
+//!    `tauri::ipc::Channel`, so `egress.rs` carries no `cfg(feature = "app")` at all, and
+//!    `core::egress_port::EgressPort` is the production `HttpPort` implementor. `generate_text`
+//!    always streams (`router.rs:717`), so without it there is no text path at all.
+//! 3. **The ledger row — still open, and 25d.** `persist::ledger_insert` already takes a plain
+//!    `&Connection` and is nonetheless `#[cfg(feature = "app")]`. This one is durability rather
+//!    than reachability: a router with no sink attached keeps the ledger in memory and raises no
+//!    error, so the bridge can serve without it.
 //!
 //! So this module is deliberately written against seams — `Arc<RouterStore>`,
 //! `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>` — which is what lets it be tested now with the
-//! doubles the crate already has, and what fixes the interface the three gaps must satisfy. See
+//! doubles the crate already has, and what fixes the interface the remaining gap must satisfy. See
 //! the module's own test section for what "tested" means here: every path below runs against a real
-//! `ModelRouter`, not a mock of it.
+//! `ModelRouter`, not a mock of it. What still stands between this and a launch is 25c (the
+//! manifest activation path) and 25e (the install itself) — including a source for
+//! [`BridgeHost::settings`], which 25b supplied as `RouterSettings::from_store`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
