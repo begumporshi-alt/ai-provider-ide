@@ -1983,20 +1983,22 @@ makes the sandbox *reachable*, and Phase 5 is what reaches it.
 This is the satisfying phase. The gateway routes directly into the Rust router core. No hidden
 webview. No Tauri events. No heartbeat.
 
-**Reconnaissance changed the size of this phase, and it is larger than "delete".** A Grep for
-`normalize_gateway_request`, `detect_client`, `parse_assistant_stream`, `to_wire_tool_calls`,
-`registry_to_openai` and `MAX_TOOL_ITERATIONS` over `src-tauri/src` returns **no matches**, and
-`tauri/tools.rs` holds no OpenAI tool schemas at all. So the bridge is not a thin adapter over a Rust
-core that already exists — it is the *only* place the client-facing request pipeline lives. Deleting it
-without porting that pipeline would remove behaviour, not indirection. The phase therefore splits into
-four increments, and only the last one is the deletion:
+**Reconnaissance changed the size of this phase, and it is larger than "delete".** At reconnaissance a Grep
+for `normalize_gateway_request`, `detect_client`, `parse_assistant_stream`, `to_wire_tool_calls`,
+`registry_to_openai` and `MAX_TOOL_ITERATIONS` over `src-tauri/src` returned **no matches**, and
+`tauri/tools.rs` held no OpenAI tool schemas at all. **All six now resolve** — the sentence is dated because
+the tense was not (D36). So the bridge was not a thin adapter over a Rust core that already existed — it was
+the *only* place the client-facing request pipeline lived. Deleting it without porting that pipeline would
+have removed behaviour, not indirection. The phase therefore splits into five increments, and only the last
+one is the deletion:
 
 | Increment | Work |
 |---|---|
 | **22 — landed** | Port `gateway-normalizer.ts` (728 lines) and `gateway-client-detector.ts` (19 lines) to `core/gateway_normalizer.rs` |
 | **23 — landed** | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
 | **24a — landed** | Move the tool host from `tauri/tools.rs` into `core/tools.rs`, where the bridge can reach it |
-| 24b | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
+| **24b-i — landed** | `core/bridge_policy.rs` — the bridge's decisions with no I/O: status, tool ownership, the held-prose gate, the turn outcome, call collection, the retry hint |
+| 24b-ii | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle` |
 | **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
@@ -2171,6 +2173,45 @@ is written. There are two shapes, and the second is the one to take:
   gate that fires on a condition nobody sets. The cost is one trait method pair and two overrides, paid once.
 
 Either way it is a decision, and D35 records that it is currently unnamed.
+
+**Increment 24b-i — the bridge's decisions, separated from the I/O that carries them out.** Phase 5c splits
+in two because the driver is large and its *decisions* are not. `core/bridge_policy.rs` is the decisions: 699
+lines, **34 tests**, Rust **1090 → 1124**, and the headless run **1030 → 1064** — every new test reachable
+without the `app` feature, which is the whole reason policy belongs in `core/`. The reference is
+`gateway-bridge.ts` (421 lines). What is in it: `BridgeKind` and its `parse`/`runs_tool_loop`;
+`CLIENT_ATTRIBUTABLE_STATUS` with `gateway_status` and `gateway_status_for_attempts`; `ToolOwnership` with
+`decide_tool_ownership` and `tool_choice_for`; `ProseGate`; `TurnOutcome` with `decide_turn`;
+`push_tool_call`; `MAX_TOOL_ITERATIONS`; `retry_after_hint`.
+
+**Two scope corrections, both from measuring instead of assuming.** `min_retry_after_ms` and `attempt_budget`
+were on the reconnaissance list for this increment; both are already ported into `core/engine.rs` (`:298`,
+`:326`), so the only new work on the wait is `retry_after_hint`, which turns the engine's `0` into an absent
+field. And the pre-turn liveness probe is **not** ported at all — it exists because a webview can be
+suspended, and a Rust bridge cannot (D35). What the reference parses twice, `ProseGate` takes once: it
+receives text that has already been through `assistant_stream::visible_text`.
+
+**Six rules, each one a defect class rather than a style preference.** An id-less tool call is **always
+kept** — the reference's `if (!collected.some((c) => c.id && c.id === call.id))` leans on the `c.id &&`, and
+comparing the ids directly makes `None == None` true so a turn that asked for three writes runs one. The tool
+toggle is read **only** when the client brought no tools, which is what stops a setting overriding a client
+that declared its own. The upstream status **outranks** the message heuristic, so a chain ending in `400` is
+reported `400` even when the message says "no route" — the status is evidence and the message is not. The
+**last** attempt decides, not the first. `discard` is not `release`: a new turn drops the previous preamble
+where a finished turn hands it over. And an unnamed wait is an **absent field, not a zero**, because
+`retry_after_ms: 0` reads to a client as "retry now" — the wrong advice immediately after an overload.
+
+**`/no route|not found/i` is hand-rolled, and the ASCII folding is argued rather than assumed.** There is no
+`regex` in the runtime graph — the constraint `sandbox.rs:44` records for its header names. JavaScript's `/i`
+folds Unicode, so ASCII folding needs an equivalence proof: neither needle contains `s`, `k` or `i`, the only
+letters with non-ASCII case-fold partners (`ſ`/U+017F, `K`/U+212A, `İ`/U+0130), so no non-ASCII character can
+match either literal. `no_non_ascii_character_can_stand_in_for_a_letter_here` pins the argument with the
+lookalikes themselves.
+
+**Nine falsifications, all red, tree restored byte-exact** (`74d4a4ed…`, 31,004 bytes): the id-less keep, the
+toggle order, the status-over-message precedence, last-versus-first, `discard`, the unnamed-wait omission, the
+empty-chunk guard, mercury-over-collected, and the gateway-only tool steering. **D36 was opened and fixed in
+the same increment** — the Phase 5 reconnaissance sentence above is present tense and asserts a Grep returns
+no matches for six names that all now resolve.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 

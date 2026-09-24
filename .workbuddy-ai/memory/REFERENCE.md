@@ -3924,3 +3924,64 @@ make `await_core` a no-op on its first poll, so the loop and the 503 branch beco
 than silently wrong. Cost: one trait method pair and two overrides — small, and paid once.
 
 **Consequence for the plan: 24b-ii has a prerequisite it did not have — decide the beat's source first.**
+
+## `core/bridge_policy.rs` — the bridge's decisions, no I/O (2026-09-24, increment 24b-i)
+
+The first half of 24b. 699 lines, 34 tests, Rust **1090 → 1124**; the headless run **1030 → 1064**, so every
+new test is reachable without the `app` feature. The reference is `apps/desktop/src/gateway-bridge.ts`
+(421 lines); `router_bridge.rs` (24b-ii) will be the driver, this is what it decides.
+
+**What is in it:** `BridgeKind` (+`parse`, +`runs_tool_loop`); `CLIENT_ATTRIBUTABLE_STATUS` +
+`gateway_status(last_attempt_status, msg)` + `gateway_status_for_attempts`; `ToolOwnership` +
+`decide_tool_ownership(client_tool_count, gateway_tools_enabled)` + `tool_choice_for`; `ProseGate`;
+`TurnOutcome` + `decide_turn`; `push_tool_call`; `MAX_TOOL_ITERATIONS`; `retry_after_hint`.
+
+**What is deliberately not in it:** the heartbeat and the pre-turn liveness probe (D35 — a Rust bridge cannot
+be suspended, so the probe has no counterpart and neither does the 503 it feeds); response shaping for
+`models`/`image` (pure mappings, no decision — they belong where the JSON is built); the chunk parser
+(`ProseGate` takes text already through `assistant_stream::visible_text`, so a chunk is parsed **once** where
+the reference parses it twice).
+
+**The six rules worth remembering, each with its guard:**
+
+1. **An id-less tool call is always kept.** `push_tool_call` mirrors `if (!collected.some((c) => c.id && c.id
+   === call.id))` — and the `c.id &&` is load-bearing. Comparing the ids directly makes `None == None` true
+   and silently drops every id-less call after the first: three writes become one.
+   `a_call_with_no_id_is_always_kept`.
+2. **The tool toggle is read only when the client brought no tools.** `decide_tool_ownership` checks
+   `client_tool_count > 0` **first**, so a setting can never override a client that declared its own tools.
+   `the_toggle_cannot_override_the_clients_own_tools`.
+3. **The status outranks the message.** A chain whose last attempt was a `400` is reported `400` even if the
+   message says "no route" — the upstream's status is evidence, the message is not.
+   `a_client_attributable_status_outranks_a_message_that_says_no_route`.
+4. **The *last* attempt decides, not the first.** `gateway_status_for_attempts` takes `attempts.last()`.
+   `the_last_attempt_decides_the_status_not_the_first`.
+5. **`discard` is not `release`.** Starting a new turn **drops** the previous preamble; finishing a turn
+   hands it over. Using the wrong one at the wrong site is the defect `ProseGate` exists to make visible.
+   `a_new_turn_discards_the_previous_preamble_rather_than_releasing_it`.
+6. **An unnamed wait is an absent field, not a zero.** `min_retry_after_ms` returns `0` for "nobody named
+   one"; `retry_after_hint` maps that to `None`, because `retry_after_ms: 0` reads to a client as "retry now"
+   — the wrong advice straight after an overload.
+   `an_unnamed_wait_omits_the_hint_rather_than_sending_zero`.
+
+**`/no route|not found/i` is hand-rolled and ASCII-folded, and that is measured, not assumed.** No `regex` in
+the runtime graph (same constraint as `sandbox.rs:44`). JS's `/i` folds Unicode, so equivalence needs an
+argument: neither needle contains `s`, `k` or `i`, the only letters with non-ASCII case-fold partners
+(`ſ`/U+017F, `K`/U+212A, `İ`/U+0130) — so no non-ASCII character can match either literal.
+`no_non_ascii_character_can_stand_in_for_a_letter_here` pins it with the lookalikes.
+
+**`MAX_TOOL_ITERATIONS` has one source in the reference and two in the port.** The reference imports it from
+`lib/tools/agentLoop.ts:35` deliberately, so the gateway and the Assistant cannot disagree. The Assistant's
+loop is still TypeScript, so the constant is declared in `bridge_policy.rs` and pinned at 8. **When the
+Assistant's loop is ported, move it there and import it back** — that is the reference's own arrangement.
+
+**`ToolOwnership::None` + collected calls → `PassThrough`.** A client that declared no tools should not
+receive calls, but if a provider returns some anyway they are forwarded rather than run, because running tools
+nobody asked for is the worse failure. The reference's behaviour, kept.
+
+**Nine falsification probes, all red, tree restored byte-exact** (`74d4a4ed…`, 31004 bytes): the id-less
+keep, the toggle order, the status-over-message precedence, last-vs-first, `discard`, the unnamed-wait
+omission, the empty-chunk guard, mercury-over-collected, and the gateway-only tool steering.
+
+**D36 opened and fixed in the same increment:** the Phase 5 reconnaissance sentence is present tense and all
+six names it says do not exist now do. Scoped to the reconnaissance and dated.
