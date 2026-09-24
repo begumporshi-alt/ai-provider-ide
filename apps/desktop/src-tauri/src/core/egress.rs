@@ -223,9 +223,13 @@ async fn build(
         check_secret_host(&state.store, r, host)?;
     }
     let secret = match &req.secret_ref {
-        Some(r) => {
-            Some(vault::get(r)?.ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })?)
-        }
+        Some(r) => Some(
+            // Through the seam, not `vault::get` directly — see `SecretProvider`. The `?` still
+            // propagates a keychain *error* as `EgressError::Vault`, and a `None` from the provider
+            // still means "no secret is stored under this ref", which is a different answer from
+            // "the keychain could not be read".
+            (state.secrets)(r)?.ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })?,
+        ),
         None => None,
     };
     let headers = inject_secret(req.headers.clone(), secret.as_deref())?;
@@ -440,6 +444,20 @@ pub async fn stream(
     }
 }
 
+/// Where a `secret_ref` is resolved to the secret it names.
+///
+/// **Pluggable for the same reason [`crate::core::gateway::KeyProvider`] is**, and that type's own
+/// note is the whole argument: the request path is the one place a provider key is used, so without
+/// a seam it cannot be exercised end to end without an OS keychain — which is to say it cannot be
+/// exercised in CI at all. Production passes [`vault::get`]; a test passes a closure and gets the
+/// whole route (gateway → router → adapter → egress → upstream) with no keychain in it.
+///
+/// **It cannot be used to skip a check.** `check_secret_host` runs before this lookup and
+/// `inject_secret` runs after it, and neither consults this value. What moves is where the bytes
+/// come from, not whether the request is allowed.
+pub type SecretProvider =
+    Arc<dyn Fn(&str) -> Result<Option<String>, vault::VaultError> + Send + Sync>;
+
 /// Managed state: the audited trio (client + allowlist + pairing DB).
 pub struct EgressState {
     pub client: reqwest::Client,
@@ -450,6 +468,8 @@ pub struct EgressState {
     image_client: reqwest::Client,
     pub allow: Arc<AllowList>,
     pub store: Arc<Store>,
+    /// How a `secret_ref` becomes its secret — [`vault::get`], the OS keychain, in production.
+    secrets: SecretProvider,
     /// Invariant-3 lease: hosts returned in response bodies, valid briefly. A provider
     /// that returns an `imageUrl` on a CDN host the allowlist has never seen may have
     /// THAT host fetched back — scoped, expiring, never persisted to the allowlist.
@@ -463,6 +483,19 @@ impl EgressState {
     /// Connect budget per §3.6; redirect policy vetoes any off-allowlist hop (Blocker 1 of
     /// the Phase 1 diff review).
     pub fn new(allow: Arc<AllowList>, store: Arc<Store>) -> Self {
+        Self::with_secret_provider(allow, store, Arc::new(vault::get))
+    }
+
+    /// The same state, reading secrets from `secrets` instead of the keychain.
+    ///
+    /// A second constructor rather than a changed signature: `new` has two production callers
+    /// (`aiproviderd.rs`, `tauri/app.rs`) and four test ones, and none of them should have to name
+    /// the keychain to keep the behaviour they already had.
+    pub fn with_secret_provider(
+        allow: Arc<AllowList>,
+        store: Arc<Store>,
+        secrets: SecretProvider,
+    ) -> Self {
         let allow_clone = allow.clone();
         Self {
             client: reqwest::Client::builder()
@@ -492,6 +525,7 @@ impl EgressState {
                 .expect("reqwest image client"),
             allow,
             store,
+            secrets,
             returned_hosts: RwLock::new(HashMap::new()),
         }
     }
@@ -828,5 +862,108 @@ mod pairing_tests {
             Err(EgressError::SecretMissing { .. })
         ));
         let _ = std::fs::remove_dir_all(&s.path);
+    }
+}
+
+/// The secret seam — that an injected provider is what `build` actually consults.
+///
+/// **This module exists because a seam that compiles is not a seam that is used.** `build` could
+/// have gone on calling `vault::get` and every other test in this file would have stayed green:
+/// they pass `secret_ref: None` on purpose, so the keychain is never reached by any of them.
+#[cfg(test)]
+mod secret_provider_tests {
+    use super::*;
+
+    fn store_with(provider_url: &str, secret_ref: &str) -> Store {
+        let dir = std::env::temp_dir().join(format!("aip-secret-{}-{}", std::process::id(), {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            N.fetch_add(1, Ordering::Relaxed)
+        }));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).unwrap();
+        let conn = s.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, created_at, updated_at) VALUES ('p','s','n',?1,'enabled',1,1)",
+            rusqlite::params![provider_url],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (id, provider_id, label, secret_ref, added_at) VALUES ('k','p','l',?1,1)",
+            rusqlite::params![secret_ref],
+        ).unwrap();
+        drop(conn);
+        s
+    }
+
+    /// "No secret under this ref" as the seam's own error type spells it.
+    fn nothing() -> Result<Option<String>, vault::VaultError> {
+        Ok(None)
+    }
+
+    /// A request whose destination host is its own provider's host, so `check_secret_host` passes
+    /// and the only thing left that can refuse it is the lookup itself.
+    ///
+    /// Port 9 has nothing listening, so the `Some` arm below would fail at *connect* rather than at
+    /// a listener — and `build` does not connect, which is why neither arm needs a server.
+    fn req(secret_ref: &str) -> EgressRequest {
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("Authorization".to_string(), format!("Bearer {SENTINEL}"));
+        EgressRequest {
+            url: "http://127.0.0.1:9/v1/chat/completions".to_string(),
+            method: "POST".to_string(),
+            headers,
+            body: None,
+            secret_ref: Some(secret_ref.to_string()),
+            timeout_ms: None,
+        }
+    }
+
+    /// **Both arms, because one arm alone cannot tell the two designs apart.** A provider answering
+    /// `None` and the real keychain answering `None` produce the *same* `SecretMissing`, so a
+    /// `Some`-only test would stay green against a `build` that ignored the seam entirely. The
+    /// `None` arm pins that the provider is consulted, with the ref the request carried; the `Some`
+    /// arm pins that its answer is believed.
+    ///
+    /// **Measured 2026-09-24, by reverting `build` to call `vault::get`:** the test reddens — and it
+    /// reddens on the `None` arm's *recording* assertion, not on either `matches!`/`is_ok`. That is
+    /// the false pass this test was written to avoid, observed rather than argued: the keychain
+    /// answering `None` for an unknown ref is indistinguishable from an injected provider doing it.
+    #[tokio::test]
+    async fn an_injected_provider_is_what_resolves_a_secret_ref() {
+        let store = Arc::new(store_with("http://127.0.0.1:9/v1", "key:k1"));
+        let path = store.path.clone();
+        let asked: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let refusing =
+            EgressState::with_secret_provider(Arc::new(AllowList::default()), store.clone(), {
+                let asked = asked.clone();
+                Arc::new(move |r: &str| {
+                    asked.lock().unwrap().push(r.to_string());
+                    nothing()
+                })
+            });
+        assert!(matches!(
+            build(&refusing, req("key:k1")).await,
+            Err(EgressError::SecretMissing { .. })
+        ));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec!["key:k1".to_string()],
+            "the provider must be asked for the ref the request carried"
+        );
+
+        let supplying = EgressState::with_secret_provider(
+            Arc::new(AllowList::default()),
+            store,
+            Arc::new(|_: &str| -> Result<Option<String>, vault::VaultError> {
+                Ok(Some("sk-injected".to_string()))
+            }),
+        );
+        assert!(
+            build(&supplying, req("key:k1")).await.is_ok(),
+            "an injected secret must get past the lookup — if it does not, `build` is still reading \
+             the keychain and the seam is decoration"
+        );
+        let _ = std::fs::remove_dir_all(&path);
     }
 }

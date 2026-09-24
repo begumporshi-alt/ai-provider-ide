@@ -416,8 +416,16 @@ impl ManifestInterpreter {
                 return Err(AttemptError::Transport);
             };
             let spec = ep.stream.as_ref();
-            // `args.stream && ep.stream` — a caller may ask for a stream from a manifest that
-            // declares none, and the source then answers with a unary response.
+            // `args.stream && ep.stream` — the reference's own guard (`manifest-interpreter.ts:306`),
+            // and it decides only how the *response* is **read**. It does not decide what is *asked
+            // for*: `values.stream` below is the caller's flag, exactly as the reference's `stream:
+            // args.stream` (`:273`) is, so a manifest that declares no `stream` block still sends
+            // `"stream": true` upstream, and a server that honours it answers with SSE — which
+            // `unary_text` then parses as JSON, fails, and reports as `AttemptError::Transport`,
+            // which the engine classifies as `NETWORK`. Measured 2026-09-24; this is the third route
+            // to the misleading 502 of D45 and D46, and the second with no allowlist involved. Latent
+            // on the installed database — all **3** manifest rows declare the block — so it fires for
+            // a hand-written or imported manifest. Recorded as **D47**.
             let streaming = stream && spec.is_some();
             let wants_usage = wants_usage(&self.view, ep);
 

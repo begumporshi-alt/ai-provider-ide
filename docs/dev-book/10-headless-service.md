@@ -2946,6 +2946,86 @@ gateway run its own tool loop, so turning them off trades that capability for st
 is untouched: it answers from `HostSettings`, a live toggle the UI flips, and unifying the two means
 making that toggle write this key — a UI change, not a host one.
 
+**25g verification — the measurement becomes an assertion.** Everything above is a *measurement*, and no
+gate could tell whether the next change broke it. 25g closes that by booting the real service against a stub
+upstream **inside `cargo test`**, so the 1-frame/6-frame difference is asserted rather than observed once.
+
+**The harness is the real stack with exactly two substitutions.** The test module in `bin/aiproviderd.rs`
+builds a `Store` in a temp dir, seeds one provider (`p1`, slug `stub`), one key, one model and one active
+manifest whose `base_url` points at an in-process `axum` stub on `127.0.0.1:0`, then assembles the chain
+production assembles — `AllowList`, `EgressState`, `AdapterRuntime`, `ModelRouter`, `RouterBridge`,
+`GatewayCore` — and calls `gateway::spawn(core, 0)`. Both substitutions exist because **CI has no OS
+keychain**: the master key is a closure (`GatewayCore::new(bridge, Arc::new(|| Some("test-gw-key".into())))`),
+and the provider key arrives through a new seam.
+
+**The seam, and why it is not a way to skip a check.** `EgressState` gains
+`secrets: SecretProvider` — `Arc<dyn Fn(&str) -> Result<Option<String>, vault::VaultError> + Send + Sync>` —
+and a second constructor, `with_secret_provider(allow, store, secrets)`. `new` keeps its signature and
+delegates with `Arc::new(vault::get)`, so its six existing callers do not have to name the keychain to keep
+the behaviour they already had. It follows `KeyProvider`'s precedent, and that type's own note is the whole
+argument: the request path is the one place a provider key is used, so without a seam it cannot be exercised
+end to end without an OS keychain — which is to say it cannot be exercised in CI at all. Production really
+does use the keychain, and the installed one shows it plainly: **three** account families under the service
+`ai-provider-router`, with `masterkey`, the three `key:<api_keys.id>` rows the request path reads, and no
+`gwkey:<id>` because no per-app key has been created. **What the seam cannot do is skip a check**:
+`check_secret_host` runs before this lookup and `inject_secret` runs after it, and neither consults the value.
+What moves is where the bytes come from, not whether the request is allowed. Falsified before it was trusted —
+reverting `build` to call `vault::get` reddens `an_injected_provider_is_what_resolves_a_secret_ref`, and it
+reddens on the **recording** assertion (`left: [], right: ["key:k1"]`) rather than on either `matches!` or
+`is_ok`, which is the false pass the test was written against.
+
+**The assertion: one frame or six, on the same running gateway.**
+
+| `gatewayToolsEnabled` | frames the client receives | concatenated text |
+|---|---|---|
+| **`true`** (the default, and absence) | **1** | `Hello world!` |
+| **`false`** | **6** | `Hello world!` |
+
+`the_gateway_relays_upstream_deltas_only_when_gateway_tools_are_off` asserts that the stub was reached, then
+the one-frame shape, then flips the store row and re-requests **without restarting anything**, then the
+six-frame shape and the identical concatenation. That the second request sees the flip is what pins the
+per-request read of `RouterSettings::from_store` rather than a value captured at boot — which is the property
+the setting depends on and the one no unit test could reach. Falsified before it was trusted: reverting
+`HeadlessHost::tools_enabled` to a hardcoded `true` reddens it at the second assertion with
+`got 1 frame(s)`, so the table above is **measured** rather than inferred.
+
+**D46 becomes a test, and its two assertions are not redundant.**
+`a_manifest_host_outside_the_allowlist_is_refused_as_network_without_reaching_upstream` rewrites the manifest's
+host to `https://not-allowlisted.example/v1`, re-activates, and asserts **both** the 502 carrying `NETWORK`
+**and** that the stub's request counter did not move. A 502 alone is also what an unreachable upstream
+produces; *"the stub was not touched"* is what separates a local refusal from a network failure — which is
+precisely the distinction D45's first diagnosis got wrong.
+
+**The refusal test had to be sent non-streaming, and that is itself a finding.** Its first version streamed
+and failed with `left: 200, right: 502`: a streaming client is already holding a `200` and its headers by the
+time the router gives up, so the refusal arrives as an SSE frame instead of as a status. Both are correct —
+they are two surfaces for one refusal — but only the non-streaming one can assert a status. This is the shape
+in which the symptom was first seen, and it is recorded in the test rather than in a comment elsewhere.
+
+**Three findings the round produced, none of which any gate could have.**
+
+1. **The ambient-proxy trap.** Six variables are set on this machine (`http_proxy`, `https_proxy` and their
+   uppercase forms, plus `ALL_PROXY`/`all_proxy`) with `NO_PROXY` unset, and `reqwest` reads them at
+   **client-build** time (`async_impl/client.rs:418-420` pushes `ProxyMatcher::system()`) with no per-request
+   override — `Proxy::no_proxy` is per-`Proxy`, and `ClientBuilder::no_proxy` clears all of them. So a test
+   that builds a client in an ambient environment can be routed through a proxy it never asked for, which is
+   how a `502` and a curl `000` both appeared. The test module removes all six behind a `std::sync::Once`;
+   `scripts/measure-gateway-latency.mjs` deletes the same six before spawning the service. **This was a real,
+   undocumented production behaviour and not the cause of the failure it was first blamed for** — the tests
+   failed identically once the proxies were cleared, and only a probe placed the actual cause.
+
+2. **A manifest with no `stream` block hides as `NETWORK`.** See **D47**: the guard decides how the response
+   is *read*, not what is *asked for*, so the request still goes upstream with `"stream": true`, the answer is
+   SSE, and the unary parser reports it as a transport failure. Found because the fixture manifest omitted the
+   block; fixed by declaring it, since the reference's own templates do.
+
+3. **A streaming client cannot observe a status code.** Stated above as the reason the refusal test is
+   non-streaming, and worth separating because it constrains what any future end-to-end assertion about
+   refusals can be written against.
+
+**Measured:** `cargo test` lib **1174 → 1175**, binary **3 → 5**. The two new binary tests are the ones above;
+the lib test is the seam's.
+
 ---
 
 ## 12. What we know we do not know

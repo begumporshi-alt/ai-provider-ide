@@ -283,4 +283,412 @@ mod tests {
         // perProviderConcurrency is copied through un-clamped, so the raw Value is preserved.
         assert_eq!(s.per_provider_concurrency, serde_json::json!(8));
     }
+
+    /* ==================== the end-to-end run, against a stub upstream ==================== */
+
+    /// The stub upstream: a real HTTP server on a loopback port.
+    ///
+    /// **It counts what it served, and the tests assert on that count.** Without it, a gateway that
+    /// refused the request *before* egress — an empty allowlist (D45), or a manifest whose host is
+    /// not its provider's own (D46) — answers 502, and every other assertion here would read that
+    /// refusal as a streaming result. `scripts/measure-gateway-latency.mjs` refuses to print its
+    /// numbers in exactly that state; this is the same guard, as an assertion.
+    struct Stub {
+        served: Arc<AtomicUsize>,
+        addr: std::net::SocketAddr,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Six content deltas, then `[DONE]` — the shape the measurement harness's stub emits, so the
+    /// two agree on what "relayed" means.
+    const STUB_CHUNKS: [&str; 6] = ["Hel", "lo", " ", "wor", "ld", "!"];
+
+    impl Stub {
+        async fn start() -> Stub {
+            use axum::extract::State;
+            use axum::response::IntoResponse;
+            use axum::routing::post;
+
+            let served = Arc::new(AtomicUsize::new(0));
+
+            async fn chat(
+                State(counter): State<Arc<AtomicUsize>>,
+                axum::Json(body): axum::Json<serde_json::Value>,
+            ) -> axum::response::Response {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if body.get("stream").and_then(serde_json::Value::as_bool) == Some(true) {
+                    let mut sse = String::new();
+                    for c in STUB_CHUNKS {
+                        sse.push_str(&format!(
+                            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"{c}\"}}}}]}}\n\n"
+                        ));
+                    }
+                    sse.push_str("data: [DONE]\n\n");
+                    return ([(axum::http::header::CONTENT_TYPE, "text/event-stream")], sse)
+                        .into_response();
+                }
+                axum::Json(serde_json::json!({
+                    "choices": [{ "message": { "role": "assistant", "content": "pong" } }],
+                    "usage": { "prompt_tokens": 7, "completion_tokens": 1, "total_tokens": 8 }
+                }))
+                .into_response()
+            }
+
+            let app = axum::Router::new()
+                .route("/v1/chat/completions", post(chat))
+                .with_state(served.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let task = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+            Stub { served, addr, _task: task }
+        }
+
+        fn base_url(&self) -> String {
+            format!("http://{}/v1", self.addr)
+        }
+
+        fn served(&self) -> usize {
+            self.served.load(Ordering::SeqCst)
+        }
+    }
+
+    /// The declarative manifest the router reaches the stub through.
+    ///
+    /// **The `stream` block is load-bearing, and leaving it out is a trap that cost a debugging
+    /// round.** `run_text` sets `streaming = args.stream && ep.stream.is_some()`, but it renders
+    /// `values.stream` from `args.stream` — the *caller's* flag. So a manifest that declares no
+    /// `stream` block still sends `"stream": true` upstream, the provider answers with SSE, and the
+    /// interpreter then parses that SSE text with `responseMap.text` as if it were JSON. The failure
+    /// surfaces as `AttemptError::Transport`, i.e. `NETWORK` at the gateway, with the discarded
+    /// reason being a `serde_json` error on the body — nothing about it says "your manifest has no
+    /// stream block". This fixture therefore carries the block, as the installed OpenRouter
+    /// template does.
+    fn manifest_json(base_url: &str) -> String {
+        serde_json::json!({
+            "manifestVersion": 1,
+            "kind": "declarative",
+            "dialect": "openai-chat-v1",
+            "provider": {
+                "baseUrl": base_url,
+                "auth": { "headers": [{ "name": "Authorization", "prefix": "Bearer" }] }
+            },
+            "endpoints": {
+                "generateText": {
+                    "method": "POST",
+                    "path": "/chat/completions",
+                    "requestTemplate": {
+                        "model": "{{model}}",
+                        "messages": "{{messages}}",
+                        "stream": "{{stream}}"
+                    },
+                    "responseMap": { "text": "$.choices[0].message.content" },
+                    "stream": {
+                        "protocol": "sse",
+                        "chunkMap": { "delta": "$.choices[0].delta.content" },
+                        "finish": "$.choices[0].finish_reason"
+                    }
+                }
+            },
+            "capabilities": { "text": true, "image": false }
+        })
+        .to_string()
+    }
+
+    /// Every row the four hydrated tables need, all pointing at the stub.
+    ///
+    /// `providers.base_url` and the manifest's `provider.baseUrl` are written from the **same**
+    /// argument, which is the point: D46 is what happens when they disagree, and the second test
+    /// below creates that state deliberately rather than by accident.
+    fn seed(store: &store::Store, base_url: &str, tools_enabled: bool) {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, rotation_strategy, created_at, updated_at)
+             VALUES ('p1','stub','Stub',?1,'enabled','priority',1,1)",
+            rusqlite::params![base_url],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO api_keys (id, provider_id, label, secret_ref, status, priority, added_at)
+             VALUES ('k1','p1','k1','key:k1','active',0,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO models_cache (id, provider_id, native_id, modality, fetched_at)
+             VALUES ('p1:m1','p1','m1','text',1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO manifests (id, provider_id, version, origin, body_json, created_at, is_active)
+             VALUES ('p1-v1','p1',1,'ai-generated',?1,1,1)",
+            rusqlite::params![manifest_json(base_url)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value_json) VALUES ('router', ?1)",
+            rusqlite::params![format!("{{\"gatewayToolsEnabled\":{tools_enabled}}}")],
+        )
+        .unwrap();
+    }
+
+    /// The whole service, in-process, with two substitutions — and both are seams production
+    /// already exposes rather than branches that exist only for tests.
+    ///
+    /// - `EgressState::with_secret_provider` keeps the request path off the OS keychain. Its own
+    ///   note makes the argument; `gateway::KeyProvider` made it first.
+    /// - the master key is injected the same way, for the same reason.
+    ///
+    /// Everything else is the real thing: the real store on a real file, the real allowlist derived
+    /// by `recompute_allow`, the real activation reading `manifests.body_json`, the real router
+    /// hydrating four tables, the real egress, the real `RouterBridge`, the real ledger sink, the
+    /// real `HeadlessHost`, and the real axum surface on an ephemeral port.
+    struct Harness {
+        base: String,
+        store: Arc<store::Store>,
+        runtime: Arc<AdapterRuntime>,
+        stub: Stub,
+        _handle: gateway::ServerHandle,
+        _dir: PathBuf,
+    }
+
+    /// Take this process out of any ambient HTTP proxy, once, before the first client is built.
+    ///
+    /// **Not test hygiene — the trap the measurement harness hit, reproduced here.** `reqwest` reads
+    /// `http_proxy` / `https_proxy` / `all_proxy` from the environment when a client is *built*, and
+    /// there is no per-request override, so on a machine that has a proxy set and no `NO_PROXY`
+    /// every **loopback** provider call is handed to the proxy and fails. The attempt layer
+    /// classifies that as `NETWORK`, so the gateway answers a 502 whose message blames the provider
+    /// for the local environment — which is exactly how the first end-to-end run against a stub
+    /// died, with `all attempts failed for m1 [stub/k1:NETWORK]` and a stub that had served nothing.
+    /// `scripts/measure-gateway-latency.mjs` deletes the same six variables before it spawns the
+    /// service; this is the in-process equivalent.
+    ///
+    /// `Once` rather than a bare loop because both tests below call it and `cargo test` runs them on
+    /// separate threads: the removal has to happen before the first `ClientBuilder::build()`, and
+    /// `call_once` blocks the second caller until the first has finished.
+    fn leave_ambient_proxies() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            for k in
+                ["http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "all_proxy"]
+            {
+                std::env::remove_var(k);
+            }
+        });
+    }
+
+    async fn boot(tools_enabled: bool) -> Harness {
+        leave_ambient_proxies();
+        let stub = Stub::start().await;
+        let (store, dir) = tmp_store();
+        seed(&store, &stub.base_url(), tools_enabled);
+        let store = Arc::new(store);
+
+        let allow = Arc::new(AllowList::default());
+        let egress_state = Arc::new(EgressState::with_secret_provider(
+            allow,
+            store.clone(),
+            Arc::new(|_: &str| Ok(Some("sk-stub".to_string()))),
+        ));
+        persist::recompute_allow(&egress_state, &store);
+
+        let runtime = Arc::new(AdapterRuntime::new(Arc::new(EgressPort::new(egress_state))));
+
+        let act = activation::activate(&runtime, &store).expect("a readable store activates");
+        assert_eq!(
+            act.registered,
+            vec!["p1".to_string()],
+            "the stub provider must activate, or nothing below is measuring a route: {:?}",
+            act.skipped
+        );
+
+        let router_store = Arc::new(RouterStore::from_store(&store).expect("hydration"));
+        let ledger = UsageLedger::new().with_sink(Box::new(StoreLedgerSink::new(store.clone())));
+        let shared = SharedRouterState::new().with_ledger(ledger);
+        let host = Arc::new(HeadlessHost { store: store.clone() });
+        let bridge = Arc::new(RouterBridge::new(
+            router_store,
+            runtime.clone(),
+            shared,
+            host,
+            Handle::current(),
+        ));
+
+        let core = gateway::GatewayCore::new(bridge, Arc::new(|| Some("test-gw-key".to_string())))
+            .with_store(store.clone())
+            .with_app_keys(Arc::new(Vec::<gateway::AppKey>::new))
+            .with_spend(gateway::vault_spend_provider(store.clone()));
+        core.set_running(true);
+        let handle = gateway::spawn(Arc::new(core), 0).await.expect("bind an ephemeral port");
+
+        Harness {
+            base: format!("http://{}", handle.addr),
+            store,
+            runtime,
+            stub,
+            _handle: handle,
+            _dir: dir,
+        }
+    }
+
+    /// The client-visible content deltas of an SSE body, in order.
+    ///
+    /// Parsed rather than counted by substring: `"content":"` also appears in a *request* echo, and
+    /// the assertion this feeds is about frames.
+    fn sse_contents(body: &str) -> Vec<String> {
+        body.lines()
+            .filter_map(|l| l.strip_prefix("data: "))
+            .filter(|d| *d != "[DONE]")
+            .filter_map(|d| serde_json::from_str::<serde_json::Value>(d).ok())
+            .filter_map(|v| {
+                v.pointer("/choices/0/delta/content")
+                    .and_then(serde_json::Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .collect()
+    }
+
+    /// One completion through the gateway.
+    ///
+    /// `stream` is a parameter rather than a constant because the two shapes report a failure
+    /// differently, and both are worth pinning: a streaming client has already been sent `200` and
+    /// its headers by the time the router gives up, so the refusal arrives as an **SSE frame**,
+    /// while a non-streaming client gets the status the gateway actually decided.
+    async fn chat(base: &str, stream: bool) -> (reqwest::StatusCode, String) {
+        let res = reqwest::Client::new()
+            .post(format!("{base}/v1/chat/completions"))
+            .header("authorization", "Bearer test-gw-key")
+            .json(&serde_json::json!({
+                "model": "m1",
+                "messages": [{ "role": "user", "content": "hi" }],
+                "stream": stream
+            }))
+            .send()
+            .await
+            .expect("the gateway must answer");
+        let status = res.status();
+        (status, res.text().await.unwrap_or_default())
+    }
+
+    /// **The measurement from `scripts/measure-gateway-latency.mjs`, as an assertion.**
+    ///
+    /// The script measured time-to-first-token, which is the user-visible symptom. This asserts the
+    /// *structural* fact that timing was evidence for — and it is the version that can run in CI,
+    /// because a buffered answer and a relayed one differ in how many frames the client sees, and
+    /// that count does not depend on the clock.
+    ///
+    /// Measured 2026-09-24, the same request through this harness:
+    ///
+    /// | `gatewayToolsEnabled` | content frames | text |
+    /// |---|---|---|
+    /// | `true` (the default) | 1 | `Hello world!` |
+    /// | `false` | 6 | `Hello world!` |
+    ///
+    /// The text is asserted equal across both cases on purpose: the setting may change *when* the
+    /// client sees the answer, never *what* it is. And the second request runs against the **same
+    /// running gateway** as the first — no restart, no re-activation — which is what pins
+    /// `HeadlessHost::tools_enabled`'s "read per request, so flipping the row reaches the next
+    /// request rather than the next restart" as a claim about behaviour rather than a doc comment.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_gateway_relays_upstream_deltas_only_when_gateway_tools_are_off() {
+        let h = boot(true).await;
+        let before = h.stub.served();
+
+        let (status, body) = chat(&h.base, true).await;
+        assert_eq!(status, 200, "body: {body}");
+        assert!(
+            h.stub.served() > before,
+            "the stub served nothing — the gateway refused before egress (D45/D46), and every \
+             assertion below would be measuring a refusal rather than a route"
+        );
+
+        let held = sse_contents(&body);
+        assert_eq!(
+            held.len(),
+            1,
+            "tools on ⇒ `ToolOwnership::Gateway` ⇒ `ProseGate` holds every delta and releases \
+             once: {body}"
+        );
+        assert_eq!(held.concat(), "Hello world!");
+
+        {
+            let conn = h.store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE settings SET value_json = '{\"gatewayToolsEnabled\":false}' WHERE key = 'router'",
+                [],
+            )
+            .unwrap();
+        }
+
+        let (status, body) = chat(&h.base, true).await;
+        assert_eq!(status, 200, "body: {body}");
+        let relayed = sse_contents(&body);
+        assert_eq!(
+            relayed.len(),
+            STUB_CHUNKS.len(),
+            "tools off ⇒ `ToolOwnership::None` ⇒ no hold, so each of the {} upstream deltas must \
+             reach the client as its own frame; got {} frame(s): {body}",
+            STUB_CHUNKS.len(),
+            relayed.len()
+        );
+        assert_eq!(relayed.concat(), held.concat(), "the setting must not change the text");
+
+        // The ledger, through the store-backed sink (25d) — the other half of what a real request
+        // does, and the half a bridge-level test cannot see.
+        let rows: i64 = h
+            .store
+            .conn
+            .lock()
+            .unwrap()
+            .query_row("SELECT COUNT(*) FROM ledger", [], |r| r.get(0))
+            .unwrap();
+        assert!(rows >= 2, "the store-backed sink must have recorded both requests, got {rows}");
+    }
+
+    /// **D46, pinned.** The egress allowlist derives from `providers.base_url`; the adapter calls
+    /// the URL inside the active manifest's `endpoints`. Repoint only the first — or, as here, only
+    /// the second — and every request becomes a local `HostDenied`, which the attempt layer reports
+    /// as `NETWORK`, producing a 502 whose message blames the upstream for local policy.
+    ///
+    /// **The count assertion is the load-bearing one.** A 502 alone is also what an unreachable
+    /// upstream produces; "the stub was not touched" is what separates a local refusal from a
+    /// network failure.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_manifest_host_outside_the_allowlist_is_refused_as_network_without_reaching_upstream()
+    {
+        let h = boot(false).await;
+        let before = h.stub.served();
+
+        {
+            let conn = h.store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE manifests SET body_json = replace(body_json, ?1, 'https://not-allowlisted.example/v1')
+                 WHERE id = 'p1-v1'",
+                rusqlite::params![h.stub.base_url()],
+            )
+            .unwrap();
+        }
+        activation::activate(&h.runtime, &h.store).expect("re-activation swaps the adapter");
+
+        // **Non-streaming on purpose.** A streaming client is already holding a `200` by the time
+        // the router gives up, so the refusal would arrive as an SSE frame and the status assertion
+        // below would be testing the wrong surface. This is the shape in which the symptom was
+        // first seen, and the shape a plain `curl` reports.
+        let (status, body) = chat(&h.base, false).await;
+        assert_eq!(status, 502, "body: {body}");
+        assert!(
+            body.contains("NETWORK"),
+            "the refusal must surface as NETWORK — that misattribution is the symptom D46 names: \
+             {body}"
+        );
+        assert_eq!(
+            h.stub.served(),
+            before,
+            "a locally-refused request must not have reached the upstream at all"
+        );
+    }
 }

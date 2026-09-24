@@ -4818,5 +4818,51 @@ correct — the defect was in their composition. Run the first real request befo
   provider_upsert/provider_delete" is incomplete); the adapter calls the manifest's `endpoints`. Disagree ⇒
   silent `HostDenied` reported as `NETWORK` — 56/56 502s with the stub's counter unchanged. Repoint both.
 
+## Increment 25g — the harness becomes an assertion, and the third route to a misleading 502 (2026-09-24)
+
+The latency numbers above were a *measurement*; 25g turns them into an assertion that runs in `cargo test`.
+`bin/aiproviderd.rs`'s test module seeds a temp `Store` (provider `p1`/slug `stub`, key, model, one active
+manifest pointing at an in-process `axum` stub on `127.0.0.1:0`), assembles the production chain, and calls
+`gateway::spawn(core, 0)`.
+
+**The keychain seam — the pattern to reuse for any keychain-touching path.** `EgressState` gained
+`secrets: SecretProvider` = `Arc<dyn Fn(&str) -> Result<Option<String>, vault::VaultError> + Send + Sync>`
+plus `with_secret_provider(allow, store, secrets)`; `new` keeps its signature and delegates with
+`Arc::new(vault::get)`. Precedent: `KeyProvider` (`gateway.rs:49`). **It cannot skip a check:**
+`check_secret_host` runs before the lookup and `inject_secret` after it. The master key is injected the same
+way: `GatewayCore::new(bridge, Arc::new(|| Some("test-gw-key".into())))`.
+
+**The keychain IS used in production** — three account families under service `ai-provider-router`:
+`masterkey`; `key:<api_keys.id>` (the request path, `egress.rs:227`); `gwkey:<id>` (per-app keys, none
+created). `keyring` writes generic-password items whose **Name** column shows the *account*, so the service
+string appears only in the detail pane — searching "ai provider router" in Keychain Access finds nothing.
+
+**Asserted, not observed:**
+
+| `gatewayToolsEnabled` | frames | text |
+|---|---|---|
+| `true` / absent | **1** | `Hello world!` |
+| `false` | **6** | `Hello world!` |
+
+Same running gateway — the store row is flipped mid-test and the next request re-reads it, which is what pins
+the per-request `RouterSettings::from_store` read rather than a boot-time capture. Falsified by hardcoding
+`tools_enabled` to `true` (`got 1 frame(s)`). D46 is pinned by **two** assertions (the 502 **and**
+`stub.served()` unchanged) because a 502 alone is also what an unreachable upstream produces.
+
+**Ambient proxies are read at client-build time.** Six vars set on this machine, `NO_PROXY` unset; `reqwest`
+reads them in `ClientBuilder` (`async_impl/client.rs:418-420`) with **no per-request override** —
+`Proxy::no_proxy` is per-`Proxy` and `ClientBuilder::no_proxy` clears all. Clear all six before building a
+client in any test or harness.
+
+**D47 — a manifest with no `stream` block fails as `NETWORK`.** `streaming = stream && ep.stream.is_some()`
+decides how the response is *read*, not what is *asked for*: `values.stream` is the caller's flag (the
+reference's `stream: args.stream`, `manifest-interpreter.ts:273`), so the upstream is still asked to stream,
+answers SSE, and the unary parser reports `Transport` → `NETWORK`. **Third route to D45's misleading 502,
+second with no allowlist involved** — neither of D46's candidate repairs reaches it. Latent here (all 3
+manifest rows declare `stream`). Comment corrected; behaviour kept as the reference's.
+
+**A streaming client cannot observe a status.** A refusal on a streamed request arrives as an SSE frame under
+an already-committed `200`; only a non-streaming request can assert the 502.
+
 
 
