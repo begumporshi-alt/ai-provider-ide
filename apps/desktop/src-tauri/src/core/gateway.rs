@@ -802,6 +802,19 @@ impl ReplyHandle {
     fn close(&self, id: u64) {
         self.pending.lock().unwrap().remove(&id);
     }
+
+    /// Register a request and hand back the receiving end — **test-only**.
+    ///
+    /// A driver's test has to observe what the bridge wrote, and `register` is private to this
+    /// module: `gateway_tests` reaches it because it is a *child* of this module, and
+    /// `core::router_bridge`'s tests are a sibling and cannot. This is the same accommodation
+    /// `HealthTracker::keys` makes for assertions that need the shape rather than the accessor.
+    #[cfg(test)]
+    pub(crate) fn test_channel(&self, id: u64) -> mpsc::UnboundedReceiver<BridgeMsg> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.register(id, tx);
+        rx
+    }
 }
 
 pub struct GatewayCore {
@@ -930,6 +943,30 @@ const WARM_MIN_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Gateway-side tools that can change the workspace. Everything else only reads it.
 pub const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "mkdir", "run_command"];
+
+/// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
+///
+/// **A free function rather than a method, because two callers need the same answer and only one of
+/// them has a `GatewayCore`.** The webview bridge's command reads it through the core; the
+/// Rust-native bridge ([`crate::core::router_bridge::RouterBridge`]) cannot, because the core owns
+/// the bridge and a bridge holding the core would close the reference cycle `ReplyHandle` exists to
+/// avoid. It asks its host for the *toggle* and calls this for the *rule*, so the message the model
+/// reads is written once. This is the same split, for the same reason, that `webview_ready` took
+/// out of `EventBridge::ready`.
+///
+/// The message is written for the model that will read it: it says what is disabled, why, and what
+/// to do instead — a bare "forbidden" sends the model retrying.
+pub fn gateway_tool_refusal(tool: &str, mutation_enabled: bool) -> Option<String> {
+    if MUTATING_TOOLS.contains(&tool) && !mutation_enabled {
+        Some(format!(
+            "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
+             confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
+             the Assistant, which asks before every call."
+        ))
+    } else {
+        None
+    }
+}
 
 /// Re-composites the worker window. Provided by the host, since only it can touch windows.
 pub type WarmFn = Arc<dyn Fn() + Send + Sync + 'static>;
@@ -1453,19 +1490,10 @@ impl GatewayCore {
 
     /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
     ///
-    /// The decision lives here rather than in the command so it can be tested without an
-    /// `AppHandle`. The message is written for the model that will read it: it says what is
-    /// disabled, why, and what to do instead — a bare "forbidden" sends the model retrying.
+    /// Delegates to the free [`gateway_tool_refusal`], which is where the rule and its message live
+    /// — the Rust-native bridge needs the same answer and cannot hold a `GatewayCore`.
     pub fn gateway_tool_refusal(&self, tool: &str) -> Option<String> {
-        if MUTATING_TOOLS.contains(&tool) && !self.is_tools_mutation_enabled() {
-            Some(format!(
-                "\"{tool}\" is disabled on the gateway. The gateway executes tools with no user \
-                 confirmation, so mutation is off by default. Enable it in Gateway settings, or use \
-                 the Assistant, which asks before every call."
-            ))
-        } else {
-            None
-        }
+        gateway_tool_refusal(tool, self.is_tools_mutation_enabled())
     }
 
     pub fn set_tools_mutation_enabled(&self, enabled: bool) {

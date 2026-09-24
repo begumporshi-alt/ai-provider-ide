@@ -4192,3 +4192,88 @@ Three questions the driver must answer, recorded rather than guessed:
    decision.
 3. **`get_tools_enabled` and the router settings must not become a second spelling of state the core already
    holds.**
+
+## Increment 24b-ii-b — the driver, and the three gaps it lands against (2026-09-24)
+
+`core/router_bridge.rs` landed as a new `Bridge` implementor — the port of `gateway-bridge.ts` (421 lines).
+**26 tests, Rust 1134 → 1160, headless 1074 → 1100**; every gate green (`fmt --check` exit 0, `clippy
+--all-targets -- -D warnings` clean, `1160 / 0`, `--no-default-features --all-targets` clean, `1100 / 0`); doc
+links 51 files / 127 links; `book.html` 12 chapters / 204 ids / 621.2 KB.
+
+### The three open questions from 24b-ii-a, answered
+
+1. **Where do the operator's toggles come from?** `BridgeHost` — a four-method trait (`settings`,
+   `tools_enabled`, `tools_mutation_enabled`, `workspace_root`), asked **per request**, never captured. It
+   **cannot be `GatewayCore`**: the core owns the bridge (`Arc<dyn Bridge>`), so a bridge holding the core is
+   the reference cycle `ReplyHandle` exists to avoid. The same constraint as `Beat`, one layer out.
+2. **Who owns the refusal rule?** `gateway_tool_refusal` moved from a `GatewayCore` method to a **free
+   function** (`gateway.rs`, right after `MUTATING_TOOLS`), with the method delegating. Two callers need the
+   same answer and only one has a core — the webview path via `is_tools_mutation_enabled`, the Rust path via
+   the host's bool. Same split as `webview_ready`; two spellings of a refusal message is how the two paths come
+   to disagree about which tools are refused.
+3. **Is `ready` always `true`?** Yes, for any `Beat` — the deliberate opposite of `webview_ready`. Nothing
+   suspends a task in this process, which is exactly why `Bridge::ready` has no default body (D35).
+
+### Shapes worth remembering
+
+- **`dispatch` spawns, `cancel` removes.** `cancel` takes the registry entry *out* as well as raising the flag:
+  a request can be cancelled once, and leaving the entry would grow the map for the life of the process.
+- **`Job` deliberately does not carry `active`.** The entry is inserted by `dispatch` and removed by the task it
+  spawns; a `Job` holding it would be a third place that could remove an entry. (This is also what the
+  `dead_code` warning caught — the field was threaded through and never read.)
+- **Messages are cloned per turn.** `TextRequest` owns its `messages` and `generate_text` consumes them, where
+  the reference hands the same array to every turn and mutates it in place. The divergence costs a deep copy of
+  the conversation per turn and buys a `generate_text` that cannot mutate its caller's history.
+- **`run_tool` goes through `spawn_blocking`.** `tool_run` is synchronous and spawns subprocesses
+  (`run_command`); with up to `MAX_TOOL_ITERATIONS` turns of several calls each, calling it directly would stall
+  a worker thread other requests pay for.
+- **A refusal is the tool's *result*, not a bridge failure.** `gateway_tool_refusal`'s message goes into the
+  `tool` message so the model can choose another way; sending an `Error` would end the request instead.
+- **A cancelled request is answered with silence, not a status.** `serve` returns without a message when
+  `cancel.is_cancelled()` — the honest answer, since nobody is left to read a status code they asked us to stop
+  producing. Same for `TextFailure::Cancelled` inside the loop.
+- **The ceiling releases rather than drops.** On `MAX_TOOL_ITERATIONS` exit the gate's held text is released
+  and `Done` is sent: a client that receives nothing at all cannot tell "gave up" from "broke".
+
+### The test double, and the axis that matters
+
+The adapter double scripts one turn per `generate_text` call and **fires the callbacks at exhaustion** — tool
+calls then usage — because that is where a real adapter fires them (`manifest-interpreter.ts:424`, `:430`). It
+is the axis `core::adapter`'s own double was burned by: a double that fired while the future resolved would go
+green here and fail against every real adapter. The terminal item the `chain` appends is filtered out, so no
+phantom empty chunk reaches the router's own chunk counter — that counter decides between an ok row and
+`PARSE_ERROR`. `then_error` is what makes a **mid-stream** break expressible: chunks first, then an error
+*item*, which is the only way a break can arrive after the consumer already holds text.
+
+### The two probes, and what they proved
+
+One at a time, `bridge_policy.rs` reverted byte-exact (`git diff --stat` empty afterwards).
+
+| Probe | Mutation | Result |
+|---|---|---|
+| **A** | `ProseGate::new` → `hold: false` | **2 red**: `gateway_mode_holds_the_prose_…` (`left: 2, right: 1` — the gate emitted per chunk) **and** `a_break_after_the_first_byte_…` (`left: 1, right: 0` — the held preamble released on a turn that failed). The second was **not** the target: a second property confirmed live by accident |
+| **B** | `decide_turn` → `ownership != None ⇒ SandboxCollected` | **2 red**: both pass-through tests, panicking `the client's calls came back` — no `ToolCalls` message was ever written |
+
+**The proof technique worth reusing:** "the tool did **not** run" is asserted by **counting** `generate_text`
+calls, not by the absence of an effect. Running a tool costs a second turn; a second turn is not scripted; so a
+wrongly-run tool ends the request in a transport error instead of `Done`. One count separates the two.
+
+### D39 — nothing installs this yet, and why
+
+The three gaps named in the reconnaissance are now **recorded as D39** rather than living in a commit message,
+and the module's own header names all three. **The consequence is stated plainly: the headless binary cannot
+serve a text request end-to-end today.** Writing the driver anyway was deliberate — it is written against seams
+(`Arc<RouterStore>`, `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>`), which is what makes it testable now with
+the doubles the crate already has **and** fixes the interface the three gaps must satisfy. The three steps, for
+Phase 5d/6: port `egress::stream` off `tauri::Channel`; gate `persist`'s non-Tauri readers on `core` rather than
+`app`; write a store-backed `LedgerSink`.
+
+### Two tooling traps met while landing this
+
+- **`cargo` is absent from the non-interactive PATH** — the failure is `(eval):1: command not found: cargo`,
+  which reads like a missing toolchain rather than a missing PATH. Every gate command needs
+  `export PATH="$HOME/.cargo/bin:$PATH"` first; the rules index records the fix, not the symptom.
+- **An `Edit` used to *insert* can delete instead.** Anchoring on a two-line block and replacing it with a
+  one-line prefix silently removed the second line — the edit "succeeded", and `stat` and a grep for the new
+  text both agreed. **Neither `stat` nor a grep can see a deleted line**; only reading the region back can. The
+  safe form is to keep the anchor intact and *prefix* the new text to it.

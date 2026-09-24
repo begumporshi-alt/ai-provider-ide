@@ -2000,7 +2000,7 @@ one is the deletion:
 | **24b-i — landed** | `core/bridge_policy.rs` — the bridge's decisions with no I/O: status, tool ownership, the held-prose gate, the turn outcome, call collection, the retry hint |
 | **24c — landed** | `Bridge::ready` — the seam that decides *whose* question readiness is, so a Rust bridge is not measured against a webview's liveness rule (D35). It is a prerequisite of 24b-ii, not a follow-up: installing a Rust bridge without it ships a five-second stall plus a 503 on every request |
 | **24b-ii-a — landed** | `SharedRouterState` — the state every request must see one copy of: the circuit breaker, the key cursors, the ledger and the limiter. A prerequisite of 24b-ii, not a follow-up: `execute_text`'s `&mut HealthTracker` and `ModelRouter`'s `&mut self` made "two requests at once" unrepresentable, so the driver could only have been written serialising or with per-request state (D38) |
-| 24b-ii-b | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle` |
+| **24b-ii-b — landed** | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`. **Landed against seams, not wired**: three paths it must walk are still Tauri-shaped or Tauri-gated, so nothing installs it yet (D39) |
 | **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
@@ -2481,6 +2481,77 @@ and **1074 / 0** without the `app` feature. The tell is that `--lib` alone and `
 *identically* — a parallelism artifact goes green single-threaded, a stale build cannot. **`touch` the sources
 after a probe run, and read a red gate as "which binary am I running?" before "what did I break?"** Every gate
 was then re-run against the fresh build, because a stale cache discredits the earlier results too.
+
+**Increment 24b-ii-b — the driver, and the three gaps it lands against.** `core/router_bridge.rs` is the
+port of `gateway-bridge.ts` (421 lines), and 24b-i had already taken the *decisions* out of it: what is
+left is the I/O that carries them out — the tool loop, the spawned task, and the writes to `ReplyHandle`.
+
+**`BridgeHost` is where the operator's toggles come from, and it is a trait for a measured reason rather
+than a stylistic one.** The reference reads `get_tools_enabled` over an `invoke` on every request. A Rust
+bridge could keep its own `AtomicBool` — and that copy would be the second spelling of state the core
+already holds: the operator flips the switch, the core updates, and the bridge keeps serving the old
+answer with nothing to report it. Holding `GatewayCore` instead is not available either, because the core
+owns the bridge (`Arc<dyn Bridge>`) and the bridge would own the core — the reference cycle `ReplyHandle`
+exists to avoid. So the bridge **asks**, through a narrow four-method handle (`settings`, `tools_enabled`,
+`tools_mutation_enabled`, `workspace_root`), and the wiring is free to point it at the core's own
+accessors without the bridge ever naming the core. That also settles the second half of the question:
+`tools_enabled` is asked per request rather than captured, so there is no second copy to drift.
+
+**One rule, one spelling, for the third time.** `gateway_tool_refusal` moved from a method on
+`GatewayCore` to a free function, because two callers need the same answer and only one of them has a
+core: the webview path reaches it through the core's `is_tools_mutation_enabled`, the Rust path through
+the host's `tools_mutation_enabled`. Two spellings of a refusal message is how the two paths come to
+disagree about which tools are refused. It is the same split `webview_ready` made in 24c, for the same
+reason.
+
+**`RouterBridge` is one `ModelRouter` per request over one `SharedRouterState`**, which is only
+expressible because 24b-ii-a landed first. `dispatch` is synchronous by contract and the loop is not, so
+the spawn is the whole of it; `cancel` **removes** the registry entry as well as raising the flag, because
+a request can only be cancelled once and leaving the entry would grow the map for the life of the process.
+`ready` returns `true` for any beat, and that is the deliberate opposite of `webview_ready`: a webview can
+be suspended by the OS, so its readiness is a question about a heartbeat, and nothing suspends a task in
+this process.
+
+**26 tests, and the load-bearing ones are the two modes of the tool loop.** The suite runs against a real
+`ModelRouter` and a real `RouterStore`, not a mock of either — the only double is the adapter.
+`gateway_mode_holds_the_prose_and_releases_it_once_at_the_end` scripts two chunks and asserts **one**
+delta; `passing_mode_streams_the_prose_as_it_arrives` asserts two. The pair is what makes the held-prose
+gate a claim rather than a description of one. `a_pass_through_turn_hands_the_clients_calls_back_and_runs_nothing`
+proves the call was handed over rather than executed by counting `generate_text` calls: running it costs a
+second turn, a second turn is not scripted, so the request would end in a transport error instead of
+`Done`.
+
+**Two falsification probes, one at a time, both red.** The gate made to never hold reddens **two** tests —
+the held-prose one (`left: 2, right: 1`) and, unexpectedly, the mid-stream one (`left: 1, right: 0`, the
+held preamble released on a turn that failed) — which is a second property confirmed live that the
+mutation was not aimed at. `decide_turn` made to run the client's calls reddens both pass-through tests,
+with `the client's calls came back` as the panic. `bridge_policy.rs` is byte-identical to `HEAD`
+afterwards, so neither probe left residue.
+
+**No behaviour change: 1134 / 0 before and 1160 / 0 after**, headless **1074 → 1100** — every one of the
+26 reachable without the `app` feature, which is a property of the seams the module was written against
+rather than a coincidence.
+
+**D39 — and the honest consequence is that nothing installs this yet.** The row names one deliverable, and
+reconnaissance found three prerequisites it does not have, all measured:
+
+1. **Hydration.** `RouterStore::hydrate` has **no production caller** — its only callers are `router.rs`'s
+   own tests. The four readers that would feed it (`providers_list`, `api_keys_list`, `models_cache_list`,
+   `aliases_list`) are `#[cfg(feature = "app")]` and take `State<'_, Arc<Store>>`.
+2. **Streaming egress.** `egress::stream` is `app`-gated because it hands events to a
+   `tauri::ipc::Channel` — and `generate_text` **always streams** (`router.rs:717`), so without it there is
+   no text path at all, not a degraded one.
+3. **The ledger row.** `persist::ledger_insert` already takes a plain `&Connection` and is nonetheless
+   `app`-gated, and no production `LedgerSink` implementation exists — so even a served request would write
+   nothing.
+
+So **the headless binary cannot serve a text request end-to-end today**, and the module says so in its own
+header rather than in a comment somebody has to find. That is why the driver was written **against seams**
+— `Arc<RouterStore>`, `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>` — which is what lets it be tested
+now, with the doubles the crate already has, and what fixes the interface the three gaps must satisfy.
+Writing the port first and the prerequisites second is the reconnaissance lesson applied: where the port
+needs I/O it cannot set up, compile a *probe* rather than the real thing — and here the seams are exactly
+what makes that possible.
 
 ---
 
