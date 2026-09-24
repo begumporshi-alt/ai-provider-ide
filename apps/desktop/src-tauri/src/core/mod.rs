@@ -36,6 +36,7 @@ pub mod egress;
 pub mod engine;
 pub mod error;
 pub mod gateway;
+pub mod gateway_normalizer;
 pub mod http_port;
 pub mod injection_log;
 pub mod interpreter;

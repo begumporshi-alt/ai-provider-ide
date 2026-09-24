@@ -1983,6 +1983,68 @@ makes the sandbox *reachable*, and Phase 5 is what reaches it.
 This is the satisfying phase. The gateway routes directly into the Rust router core. No hidden
 webview. No Tauri events. No heartbeat.
 
+**Reconnaissance changed the size of this phase, and it is larger than "delete".** A Grep for
+`normalize_gateway_request`, `detect_client`, `parse_assistant_stream`, `to_wire_tool_calls`,
+`registry_to_openai` and `MAX_TOOL_ITERATIONS` over `src-tauri/src` returns **no matches**, and
+`tauri/tools.rs` holds no OpenAI tool schemas at all. So the bridge is not a thin adapter over a Rust
+core that already exists — it is the *only* place the client-facing request pipeline lives. Deleting it
+without porting that pipeline would remove behaviour, not indirection. The phase therefore splits into
+four increments, and only the last one is the deletion:
+
+| Increment | Work |
+|---|---|
+| **22 — landed** | Port `gateway-normalizer.ts` (728 lines) and `gateway-client-detector.ts` (19 lines) to `core/gateway_normalizer.rs` |
+| 23 | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
+| 24 | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
+| 25 | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, and switch `build_core` |
+
+**Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
+clock, no network, which is what lets it be pinned before anything calls it. 53 tests, Rust
+**996 → 1049**. Five divergences from the reference, each stated in the module's header with its
+reason — the tool-name map is returned out of band as a field rather than attached to the body as a
+non-enumerable property (a `serde_json::Value` has nowhere to hide one, and a key in the object would
+be serialized and sent upstream); a non-string `name`/`arguments` contributes nothing to a generated
+id where the reference coerces it; length arithmetic counts Unicode scalars rather than UTF-16 code
+units; object key order is not preserved; and the reference's duplicated guard in
+`promoteInputToMessages` is not reproduced.
+
+**The hash helpers are pinned against the reference's own output rather than against a reading of it.**
+`simple_hash` is the reference's signed-32-bit `|0` accumulator and `generateToolCallId` /
+`normalizeTo9CharId` are its base-36 renderings, so the port was checked by *running* the original in
+Node and asserting the same strings: `generateToolCallId(0, "read", "{}")` is `call_tcdq4k`,
+`normalizeTo9CharId("call_abc123")` is `000d4riwf`. A hand-rolled `parse_glm_version` replaces the
+reference's `/glm-?(\d+)(?:[.p](\d+))?/`, and its grammar is pinned by a test that includes the inputs
+where it does **not** match.
+
+**Two findings, and they are different in kind.**
+
+The first is **D33 — a write with no reader.** `remapClaudeToolNamesInRequest` records every rename in
+`_toolNameMap` on three paths, and the module also builds a global `CLAUDE_REVERSE_MAP` by inverting the
+rename table — and **neither is ever read**. The only consumer of `_toolNameMap` in the whole repository
+is the test for the writer (`gateway-normalizer.test.ts:380`). So the response-path restore the plan
+prescribes in present tense (`gateway-flexibility-plan.md:113` and `:311`) was never implemented, and a
+Claude Code client that sends `bash` receives `Bash` back. This is D31's signature one layer out: a cap
+whose only caller is its own test is not enforced, and a map whose only reader is its own test is not a
+feature. The port carries the per-request map as a field on the returned value, so Phase 5c's response
+path has a consumer to read, and deliberately does **not** port the global reverse map — it would rewrite
+any TitleCase name, including one the client never sent, where the per-request map records only what
+*this* request renamed.
+
+The second is an **asymmetry preserved rather than corrected.** The reference drops
+`max_tokens`/`max_completion_tokens` when `max_output_tokens` is already set, but leaves
+`reasoning_effort` in place when `reasoning` is already set, because there the `delete` sits *inside*
+the guard (`gateway-normalizer.ts:596-602`). The stray alias is ignored by the upstream, and correcting
+it here would be a silent behaviour change in a port, so a test pins the reference's behaviour instead
+and the module header records why.
+
+**Seven falsifications, all red** (baseline `94875ae1…`): the WorkBuddy-first client order, the 32-bit
+`|0` truncation in `simple_hash`, the GLM 5.1 boundary, the reasoning alias, the insertion point of a
+repaired tool result, the open-schema rule, and the 9-character id padding. One of them exposed a
+**coverage gap rather than a defect**: no test distinguished *where* a repaired tool result is inserted —
+the one existing test has a single message, so "after the declaring turn" and "at the end" are the same
+index — and the rule had therefore been unpinned. `inserts_a_missing_tool_result_directly_after_its_assistant_turn`
+now separates the two, which is what makes the probe able to redden.
+
 ### Phase 6 — Process manager and UI changes (2-3 days)
 
 **Goal:** launchd plist, service binary bundling, UI HTTP client.

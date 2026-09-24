@@ -3585,3 +3585,115 @@ The fifth probe reddened only after the test was rewritten to use the operation 
 No store read — `register` takes a parsed manifest, and nothing in production calls `AdapterRuntime`
 yet (the same position `code_adapter.rs` has held since 20a). This increment makes the sandbox
 *reachable*; **Phase 5 is what reaches it.**
+
+## Increment 22 — `core/gateway_normalizer.rs`, and Phase 5 opens (2026-09-24)
+
+Phase 5 ("delete the bridge") opened with reconnaissance that changed its size, and the change is the
+fact worth keeping: **the bridge is not a thin adapter over a Rust core that already exists.** A Grep
+for `normalize_gateway_request`, `detect_client`, `parse_assistant_stream`, `to_wire_tool_calls`,
+`registry_to_openai`, `AGENT_TOOLS` and `MAX_TOOL_ITERATIONS` over `src-tauri/src` returns **no
+matches**, and `tauri/tools.rs` holds no OpenAI tool schemas at all. Deleting `EventBridge` without
+porting that pipeline would remove behaviour rather than indirection. Phase 5 is four increments, and
+only the last is the deletion:
+
+| # | Work |
+|---|---|
+| **22 — landed** | `gateway-normalizer.ts` + `gateway-client-detector.ts` → `core/gateway_normalizer.rs` |
+| 23 | `parseAssistantStream`, `toWireToolCalls`, the tool registry's OpenAI schemas |
+| 24 | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` + `AdapterRuntime` |
+| 25 | Delete `EventBridge`/worker/`gateway.html`/`app_nap.rs`, switch `build_core` |
+
+`gateway_normalizer.rs` is pure — no I/O, no clock, no network — which is what lets it be pinned before
+anything calls it. **53 tests, Rust 996 → 1049.**
+
+### The hash helpers are pinned against the reference's *output*, not against a reading of it
+
+`simple_hash` is JavaScript's signed-32-bit accumulator (`h = (h * 31 + charCode) | 0`, then
+`Math.abs`), and `generateToolCallId` / `normalizeTo9CharId` are its base-36 renderings. Reading that
+and re-typing it is how a port drifts. Instead the original was **run in Node** and the strings baked
+into the tests:
+
+| Input | Reference output |
+|---|---|
+| `generateToolCallId(0, "read", "{}")` | `call_tcdq4k` |
+| `generateToolCallId(1, "bash", "{\"cmd\":")` | `call_dwi9oy` |
+| `normalizeTo9CharId("call_abc123")` | `000d4riwf` |
+| `normalizeTo9CharId("x")` | `00000003c` |
+
+Two details the port had to get right and could not have guessed: the accumulator is `i32`
+(`wrapping_mul`/`wrapping_add`, because `| 0` truncates every step), and the result widens to `i64`
+before `abs` — `Math.abs(-2147483648)` is `2147483648`, which does not fit an `i32`. Iteration is over
+`encode_utf16()` so `charCodeAt` matches exactly; `to_base36` has no Rust builtin.
+
+### Five divergences, each stated in the module header with its reason
+
+1. **The tool-name map is returned out of band.** The reference attaches a non-enumerable `Map` to the
+   body. A `serde_json::Value` has nowhere to hide a non-enumerable property, and a key in the object
+   would be serialized and sent upstream, so it is a `BTreeMap` field on the returned value.
+2. **A non-string `name`/`arguments` contributes nothing to a generated id.** The reference's
+   `String(x || "")` yields `"[object Object]"` for an object; the field is string-typed by the OpenAI
+   dialect's contract and the id is a uniqueness hash, so the two agree on every real input.
+3. **Length arithmetic counts Unicode scalars, not UTF-16 code units** (`id.length === 9`,
+   `.slice(0, 32)`). Identical for ASCII, which is every tool name and id in the dialect.
+4. **Object key order is not preserved** — `serde_json`'s `Map` sorts without the `preserve_order`
+   feature, which is off. No branch reads a key by position.
+5. **The duplicate guard in `promoteInputToMessages` is not reproduced** — the reference's first two
+   lines are the same condition twice.
+
+### Two findings
+
+**(1) D33 — a write with no reader.** `remapClaudeToolNamesInRequest` records every rename in
+`_toolNameMap` on three paths (`:557` tools, `:575` message `tool_use` blocks, `:588` `tool_choice`),
+and the module also builds a global `CLAUDE_REVERSE_MAP` by inverting the rename table (`:513-516`) —
+and **neither is ever read**. The only consumer of `_toolNameMap` in the repository is
+`gateway-normalizer.test.ts:380`, the test for the writer. So the response-path restore the plan
+prescribes in present tense (`gateway-flexibility-plan.md:113`, `:311`) was never implemented, and a
+Claude Code client that sends `bash` receives `Bash` back.
+
+**This is the existing MEMORY.md rule, not a new one.** MEMORY.md already says *"a cap is enforced
+where its function is called, not where it is described — grep the call sites; only-its-own-tests means
+unenforced."* D33 is that rule applied to a *map* instead of a cap, so MEMORY.md was left unchanged —
+the right outcome for a rules index sitting 20 bytes under its 8,000-byte cap. The port carries the
+per-request map so Phase 5c has a consumer to read, and deliberately does **not** port the global
+reverse map: it would rewrite any TitleCase name, including one the client never sent.
+
+**(2) An asymmetry preserved, not corrected.** The reference drops `max_tokens`/`max_completion_tokens`
+when `max_output_tokens` is set, but leaves `reasoning_effort` in place when `reasoning` is set —
+because there the `delete` sits *inside* the guard (`:596-602`). A first draft of the port "fixed" it;
+the test caught the draft, not the code. Correcting it would be a silent behaviour change in a port, so
+a test now pins the reference's behaviour and the header records why.
+
+### Seven falsification probes (each reverted by its inverse edit, hash-verified `94875ae1…`)
+
+The hash is of the **post-`cargo fmt`** revision, and getting there took two passes. The first ran
+against the pre-`fmt` bytes (`2fa4bc11…`); `cargo fmt` then reformatted the file and moved the hash, so
+the probes were re-run against the final bytes. **This is the increment-21 trap repeating**, and the
+lesson is mechanical: run `cargo fmt` *before* the probes, not after.
+
+| Edit | Reddens |
+|---|---|
+| WorkBuddy check replaced by the Codex check | `workbuddy_outranks_a_compound_user_agent` |
+| `i32` accumulator → `i64` | `the_hash_matches_the_reference_implementation` |
+| GLM `minor >= 1` → `minor > 1` | `glm_and_ernie_models_are_treated_as_having_no_system_role` |
+| `reasoning_effort` removal moved outside the guard | `a_stated_reasoning_object_is_not_overwritten_by_the_alias` |
+| insertion index → `messages.len()` | `inserts_a_missing_tool_result_directly_after_its_assistant_turn` |
+| open-schema guard removed | `keeps_opaque_object_schemas_open_without_overriding_a_stated_value` |
+| 9-char left-padding removed | `the_nine_char_id_form_matches_the_reference` |
+
+**The fifth probe exposed a coverage gap rather than a defect.** The only test for the insertion rule
+had a single message, so "after the declaring turn" and "at the end" are the same index — the rule was
+unpinned, and the probe could not have reddened. `inserts_a_missing_tool_result_directly_after_its_assistant_turn`
+(messages: user, assistant-with-tool_calls, user) now separates them. **A test that cannot distinguish
+two candidate behaviours is not a test of either.**
+
+### What is deliberately not here
+
+Nothing calls the normalizer yet. `core/gateway.rs` still forwards to the webview; increment 24 is
+where `core/router_bridge.rs` wires `normalize_gateway_request` in front of `ModelRouter`. So this
+increment adds a module with no production caller — the same position `adapter_runtime.rs` holds.
+
+### Gate
+
+fmt clean · clippy clean · **1049 tests / 0 failed** · `--no-default-features --all-targets` compiles ·
+doc links 51/127 · dev book 12 chapters / 204 ids / 548.9 KB · key-leak OK · TS 6.0.3 · version sync
+1.0.0.

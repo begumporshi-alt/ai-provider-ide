@@ -86,6 +86,8 @@ The practical half of this chapter. Find your change, update every row.
 
 | **D32** | The hot-swap order in `AdapterRuntime.register` — "`const superseded = this.byProvider.get(providerId); if (superseded) void superseded.dispose?.(); this.byProvider.set(providerId, this.build(manifest));`", i.e. the superseded adapter is disposed **before** its replacement is built | `packages/router-core/src/adapter-runtime.ts:29-31` against `core/adapter_runtime.rs`'s `register`, as landed by increment 21 (2026-09-24) | **The order is an artifact of a discarded promise, and porting it would import a race as a determinism.** Two facts about the source, both readable rather than inferred. `dispose?.()` is `void`-ed, so it is fire-and-forget and **asynchronous** — the old adapter's teardown races the new one's construction instead of preceding it, which is not a stated "kill first" policy. And `this.build(manifest)` is evaluated as the *argument* to `set`, so a manifest that fails to build throws **before** `set` runs: `byProvider` keeps the old adapter, now disposed, and every later `forProvider` returns it and fails with `"adapter disposed"` — the provider is dead until something re-registers it. On the Rust side `dispose` is synchronous and **joins the actor thread** (`js_host.rs:473-479`), so the same order would additionally pay a join on a path that then fails. **The port therefore builds first, swaps, then disposes**, and a failed `register` leaves the previous adapter serving with the reason in its `Err`. The lock is released before the dispose runs, because the join may wait on an in-flight operation. `a_manifest_that_fails_to_build_leaves_the_previous_adapter_serving` pins the divergence, and the probe that restores the reference's order reddens exactly that test — the rest of the suite stays green, so the two orders are separable by one observation rather than by a general claim. The TypeScript is left exactly as written, so the reference the port is measured against does not move under it | **Divergence** (the reference's ordering, deliberately not ported) | **Recorded** — with the test and the probe that hold it |
 
+| **D33** | The response-path tool-name restore for Claude Code — "Track renames in `_toolNameMap` for response restoration", and "Restore tool names: TitleCase -> lowercase via `_toolNameMap`" | `docs/gateway-flexibility-plan.md:113` and `:311`, against `packages/router-core/src/gateway-normalizer.ts:513-516` (`CLAUDE_REVERSE_MAP`, built and never read) and `:518-531` (`getRequestToolNameMap` / `trackToolName`) | **The restore was never implemented, and neither map has a reader.** `remapClaudeToolNamesInRequest` records every rename in `_toolNameMap` on three paths (`:557` tools, `:575` message `tool_use` blocks, `:588` `tool_choice`), and the module also builds a global `CLAUDE_REVERSE_MAP` by inverting the rename table (`:513-516`) — but a Grep for both names over `packages/router-core` finds **no read site**: the only consumer of `_toolNameMap` in the whole repository is `gateway-normalizer.test.ts:380`, the test for the writer, and `CLAUDE_REVERSE_MAP` is written at `:515` and read nowhere. So a Claude Code client that sends `bash` is remapped to `Bash` on the request and receives `Bash` back, because nothing restores the response. **No gate could see it** — the map is written, every test passes, and the only artefact claiming a reader is the plan's prose. Same signature as D31: a write whose only caller is its own test | **False** | **Fixed in the port** — `core::gateway_normalizer::NormalizedRequest::tool_name_map` carries the per-request map out of band (increment 22, 2026-09-24), so the response path Phase 5c builds has a consumer to read. The global `CLAUDE_REVERSE_MAP` is **not** ported: it would rewrite any TitleCase name, including ones the client never sent, where the per-request map records only the names *this* request renamed. `tracks_renames_in_the_returned_map` pins the content and `the_tool_name_map_never_leaks_into_the_body` pins the carrier. The TypeScript is left exactly as written, so the reference the port is measured against does not move under it |
+
 ### Notes on the entries
 
 **D5 — closed.** The claim was corrected first, deliberately, and the script was aligned in a later pass once
@@ -223,6 +225,26 @@ What makes the divergence safe to take is that it is *separable*: restoring the 
 exactly one test and leaves the other thirteen green, so the two orders are distinguished by one observation
 rather than by a general argument. The TypeScript is left exactly as written, so the reference the port is
 measured against does not move under it.
+
+**D33 — the plan was the only evidence, and it was writing a cheque the code never cashed.** D31 was a
+doc-comment drifting from the code beside it. D33 is one step further out again: the *claim* lives in a
+planning document two directories away, and the code contains a faithful, tested implementation of the
+*writing* half of it. Every artefact a reader would check agrees that the feature works — the map is
+populated, its test is green, and the plan states the restore as a delivered row rather than as an
+intention (`:311` is written in a present-tense "what ships" table).
+
+What was missing is the half that produces a user-visible effect, and its absence is invisible for a
+structural reason: **a write with no reader changes nothing observable, so no test can be written that
+fails.** The mechanical check is the same one D31 used and costs one search — grep for the writer's name
+and count the readers. Here it returns one hit, and that hit is the writer's own test. That is the
+signature worth carrying: **if a map's only consumer is the test that fills it, the map is not a
+feature.**
+
+The port's divergence is narrow on purpose. It carries the per-request map (a `BTreeMap` field on the
+returned value) and drops the global reverse map, because the two are not equivalent: the global map
+would rewrite *any* TitleCase name, including one the client never sent, while the per-request map
+records only what this request actually renamed. Choosing the stricter carrier is what makes the Phase 5c
+restore safe to build rather than merely possible.
 
 ## The control that was added
 
