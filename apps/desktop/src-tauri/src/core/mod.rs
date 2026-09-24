@@ -43,6 +43,7 @@ pub mod limiter;
 pub mod manifest;
 pub mod manifest_view;
 pub mod memory;
+pub mod modality;
 pub mod orchestrator;
 pub mod persist;
 pub mod planner;

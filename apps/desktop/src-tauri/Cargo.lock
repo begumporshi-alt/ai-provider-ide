@@ -53,6 +53,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "rand 0.8.8",
+ "regex",
  "reqwest 0.12.28",
  "rusqlite",
  "serde",

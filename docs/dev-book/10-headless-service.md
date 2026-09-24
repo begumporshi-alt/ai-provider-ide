@@ -1663,6 +1663,13 @@ and `cargo tree -e normal -i regex --no-default-features` prints *nothing to pri
 be a genuinely new runtime dependency of `aiproviderd`, which this port's own rule
 (`adapter.rs:51-52`) forbids. See §10 decision 5.
 
+**Corrected 2026-09-24, and the correction is the measurement rather than the conclusion (D28).** That
+command carried `--no-default-features`, which is **not** how `aiproviderd` ships — so it answered a
+question about the Tauri-free binary while the claim was about production. Under the default feature
+set `cargo tree -e normal -i regex` lists three parents, `tauri-utils` and `urlpattern` among them.
+`regex` was already in the runtime graph; the cost was zero. Decision 5 was argued from this paragraph
+and is resolved against it above.
+
 **Increment 16 landed 2026-09-24 — the I/O half, and the module is now whole.** Rust **812 → 870**,
 **58 tests** across four files:
 
@@ -1740,13 +1747,69 @@ is the safe direction.
 `674 + 136 + 58 = 868` before the two tests added while falsifying. Count attributes by their full
 form, or count what cargo prints.
 
+**Increment 17 landed 2026-09-24 — `modality.rs`, and §10 decision 5 is taken.** Rust **870 → 900**,
+**30 tests** in one file:
+
+| module | lines | bytes | tests | what it holds |
+|---|---|---|---|---|
+| `core/modality.rs` | 655 | 30,043 | 30 | `rules_from_manifest`, `matches_modality_rule`, `tag_modality` and the `rawMatch` matcher — the port of `modality.ts` |
+
+**Decision 5 was decided by measurement, and the measurement overturned the premise twice.** The plan
+priced the option as "a genuinely new **runtime** dependency of `aiproviderd`" and quoted `cargo tree
+-e normal -i regex --no-default-features` printing *nothing to print*. That command is accurate and
+answers the wrong question, because the flag is not how `aiproviderd` ships. Under the default feature
+set `regex` has three parents — `tauri-utils`, `urlpattern`, and the new direct edge — so it was in the
+runtime graph all along. Settled the only way that settles it: `cargo tree --edges normal` resolves
+**307** crates with the dependency and **307** without it, and the set difference is **empty**. The
+cost is zero, and the increment-15 paragraph that recorded the old figure now carries the correction.
+
+**The features are not the dependent's to choose, and two of my own claims died on that.** I wrote
+`regex = { default-features = false, features = ["std"] }` and recorded that `perf` and `unicode` were
+therefore off. Both were false: Cargo unifies features per crate across the whole graph, `tauri-utils`
+takes `regex` with defaults on, and the resolved set is the full default one — `perf`, `perf-literal`,
+`aho-corasick` and all. `Cargo.toml` now declares a plain `regex = "1"` with the reasoning beside it,
+which is also the safer form: under the old spelling a future `tauri-utils` change would have silently
+produced a build in which `^dall-e-.*$` stops compiling.
+
+**And the assumption under both of them was wrong in a way only a test could show.** `unicode` off is
+not available as a design. It does make `\d`/`\w`/`\s` ASCII, matching JavaScript — but it also makes
+`.` byte-oriented, and the `Regex` type then refuses the pattern outright:
+`RegexBuilder::new("^dall-e-.*$").unicode(false).build()` fails with *pattern can match invalid
+UTF-8*. So the trade is refused, deliberately: **a class divergence on input that cannot occur beats a
+hard failure on input that does.** What is left is measured and pinned in both directions — for ASCII
+input every construct agrees with JavaScript, `.` being the one reachable exception because it matches
+`\r` where JavaScript's excludes it; for non-ASCII input `\d` and `\w` part company, `\b` following
+them. Recorded rather than papered over with a pattern rewriter, which would trade a known difference
+for an unknown defect.
+
+**The source's own test is named the opposite of what it asserts**, and that is **D27** rather than a
+quiet fix: `modality.test.ts:19-20` is called *"does not throw on an invalid regex — an unparseable
+rule simply never matches"* and then asserts `.toThrow()`. The assertion is right and the **name** is
+wrong, so a porter who reads the name implements the silent behaviour that demotes every model of a
+provider to `text`. The port takes the assertion.
+
+**Eight falsification probes, each reverted by its inverse edit, each red on the tests that name the
+property.** OR → AND reddens `either_matcher_may_match` and `a_rule_with_neither_matcher_never_matches`.
+Letting a `text`-keyed rule populate `image` reddens `a_text_keyed_rule_is_ignored`. Removing array
+membership reddens `raw_match_matches_array_membership` **and leaves the `[0]`-indexing tests green**,
+which is what shows those two test indexing rather than membership. An uncompilable pattern turned
+into a non-match reddens the four error-path tests; an unreadable `modalityRules` block read as an
+absence reddens its own; an unresolvable `rawMatch` path treated as an error reddens its own.
+
+Two probes were worth more than they cost. **Anchoring** — wrapping every pattern in `^(?:…)$`, which
+is the natural Rust assumption — reddens **five** tests, so `RegExp.test`'s unanchored semantics is
+load-bearing well beyond the test named for it. And **switching to `unicode(false)`** reddens exactly
+the two divergence tests, reproducing the measurement above as a test failure, while
+`the_builtin_template_rule_matches_the_models_it_exists_for` stays **green** — the only pattern any
+shipped manifest carries has no `.` and no classes, which is the boundedness argument in a single
+observation.
+
 **What remains in this phase, in order:**
 
-1. **`modality.rs`**, once decision 5 is made. The text and image paths do not call `tagModality` —
-   the planner and the catalog do — so nothing above is blocked waiting on it.
-2. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
+1. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
    §2.1.3 lists as untested belongs here, because the probes service `http` synchronously and
-   production does not.
+   production does not. It is now the only module in Phase 4b without a Rust counterpart, and
+   `modality.rs` was the last of the two that decision 5 was holding.
 
 ### Phase 5 — Delete the bridge (1 day)
 
@@ -1853,18 +1916,33 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
    - *Recommendation:* full port. A hybrid still has a JS process that can crash, and the whole
    point is to eliminate the webview as a failure mode.
 
-5. **Does the adapter layer get a regex engine, or does `modelIdPattern` wait?**
-   - **Add `regex` as a direct dependency.** `modality.rs` ports faithfully and modality rules work
-     as written. Cost: a genuinely new **runtime** dependency of `aiproviderd`. `Cargo.lock` already
-     lists `regex 1.13.1`, which makes this look free and is not — it arrives through `tauri-build`'s
-     **build** graph, and `cargo tree -e normal -i regex --no-default-features` prints *nothing to
-     print*. Also a syntax gap: Rust's `regex` has no backreferences or lookaround, so a pattern the
-     JavaScript accepts could fail to compile here.
-   - **Defer `modality.rs`.** No new dependency. Cost: `tagModality` has no Rust counterpart, so a
-     ported adapter cannot classify a model's modality and every model would read as `text`.
-   - *Recommendation:* **decide when the I/O half lands, not before.** The interpreter's text and
-     image paths do not call `tagModality` — the planner and the model catalog do — so the I/O half
-     is not blocked by this, and the measurement above is the whole of what the decision needs.
+5. **Does the adapter layer get a regex engine, or does `modelIdPattern` wait?** — **RESOLVED
+   2026-09-24: add `regex`. The cost is zero crates, and the option's stated price was wrong.**
+   - **Add `regex` as a direct dependency.** ~~Cost: a genuinely new **runtime** dependency of
+     `aiproviderd`.~~ Measured 2026-09-24: `regex` was **already** in the runtime graph, pulled in by
+     `tauri-utils` (through `tauri`) and by `urlpattern`, which `tauri-utils` also takes. `cargo tree
+     --edges normal` resolves **307** crates with the dependency and **307** without it, set
+     difference empty — so the true cost is **zero**. The quoted figure came from `cargo tree -e
+     normal -i regex --no-default-features`, and that flag *is* the defect: `--no-default-features`
+     is not how `aiproviderd` ships, so the command answered "what does the Tauri-free binary link"
+     while the decision was about production. See **D28**.
+   - **The syntax gap is real, and the port handles it loudly.** Rust's `regex` has no backreferences
+     and no lookaround, so a pattern the JavaScript accepts can fail to compile here. The port
+     returns an error rather than a non-match, because the reference throws and nothing catches it —
+     the alternative silently demotes every model of that provider to `text`.
+   - **`unicode` stays on, and that was the increment's actual finding.** The first design turned it
+     off, which does make `\d`/`\w`/`\s` ASCII and so match JavaScript. Measured: it also makes `.`
+     byte-oriented, and `RegexBuilder::new("^dall-e-.*$").unicode(false).build()` fails with *pattern
+     can match invalid UTF-8* — rejecting the most ordinary pattern a manifest can carry. The trade
+     was refused and the divergence is pinned by two tests, in the direction it actually goes. The
+     resolved feature set is the full default one regardless, because Cargo unifies features per
+     crate and `tauri-utils` takes `regex` with defaults on; `Cargo.toml` therefore declares a plain
+     `regex = "1"`, and stating the requirement is what keeps a future `tauri-utils` change from
+     silently moving it.
+   - **Defer `modality.rs`.** Rejected: `tagModality` would have no Rust counterpart and every model
+     would read as `text` — and the cost this option was avoiding turned out not to exist.
+   - **Outcome:** `core/modality.rs` landed in **increment 17** with 30 tests. The Phase 4b account
+     above carries the details.
 
 ---
 

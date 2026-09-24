@@ -2971,3 +2971,125 @@ Here one line (`self.finished = true`) meant the report helper was also the term
 report was tested. The signature of the defect is a probe that fails **more tests than it should** — the
 second failure is not noise, it is an unnamed dependency.
 
+---
+
+# Increment 17 — `core/modality.rs`, and §10 decision 5 (2026-09-24)
+
+**What landed.** `core/modality.rs`, 655 lines / 30,043 bytes, 30 tests, porting the 45-line
+`modality.ts`: `rules_from_manifest`, `matches_modality_rule`, `tag_modality`, `raw_match_hits`.
+Rust **870 → 900**. `pub mod modality;` added to `core/mod.rs`; `regex = "1"` added to `Cargo.toml`.
+Gate: fmt exit 0 / 0 bytes, clippy clean, **900 / 0**, `--no-default-features --all-targets` clean.
+
+## The decision was argued from a false premise, and the premise is the lesson
+
+`modality.ts` was deferred because "a modality rule's `modelIdPattern` is a regular expression, and this
+crate has no `regex` in its **runtime** graph", evidenced by
+`cargo tree -e normal -i regex --no-default-features` printing *nothing to print*.
+
+That command is accurate. It answers the wrong question. `--no-default-features` is not how
+`aiproviderd` ships — it is the Tauri-free configuration added for the D15/D17 checks. Under the default
+feature set the same command lists **three** parents:
+
+```
+regex v1.13.1
+├── tauri-utils v2.9.3   (through tauri, tauri-codegen, tauri-macros, tauri-runtime, …)
+├── urlpattern v0.3.0    (which tauri-utils also takes)
+└── ai-provider-router   (the new direct edge)
+```
+
+So `regex` was in the runtime graph all along, and the cost of the decision was **zero new crates** —
+measured the only way that settles it:
+
+```
+cargo tree --edges normal --prefix none | sed 's/ (.*//' | sort -u | wc -l
+  with regex dep     307
+  without regex dep  307
+  set difference     (empty)
+```
+
+**The failure mode is scope, not arithmetic.** The command reproduces — anyone re-running it gets the
+same confident zero — and that reproducibility is exactly what made it read as evidence. **A
+measurement's configuration is part of its claim:** a flag that selects a different build answers a
+question about *that* build, not about production.
+
+## Two more claims died with it, and both were mine
+
+I wrote `regex = { version = "1", default-features = false, features = ["std"] }` and recorded that
+`perf` and `unicode` were therefore off, "with `aho-corasick` absent". All three wrong:
+
+- **Cargo unifies features per crate across the graph.** `tauri-utils` takes `regex` with defaults on,
+  so the resolved set is the full default one. Read it with `cargo tree -f "{p} {f}"`:
+  `regex v1.13.1 FEATURES=default,perf,perf-backtrack,…,unicode,unicode-age,…`.
+- `aho-corasick v1.1.5 FEATURES=perf-literal,std` is **present**, not absent.
+- `default-features = false` was therefore **inert** — and worse than inert. Had `tauri-utils` ever
+  dropped `regex`, it would have armed a landmine: a Unicode-off build in which `^dall-e-.*$` stops
+  compiling *at runtime*. `Cargo.toml` now declares a plain `regex = "1"` with the reasoning in a
+  comment, because **stating the requirement is what keeps a future dependency change from moving it.**
+
+## The assumption underneath was wrong in a way only a test could show
+
+The design was: turn `unicode` off so `\d`/`\w`/`\s` are ASCII and match JavaScript. A test asserting
+the ASCII behaviour failed on its first run, and the probe explained why:
+
+```
+RegexBuilder::new(".").unicode(false).build()
+RegexBuilder::new(".*").unicode(false).build()
+RegexBuilder::new("^dall-e-.*$").unicode(false).build()
+    -> error: pattern can match invalid UTF-8
+```
+
+Turning Unicode off makes `.` byte-oriented, and the `Regex` type refuses a pattern that can match
+invalid UTF-8. So the trade is refused: **a class divergence on input that cannot occur beats a hard
+failure on input that does.** `^\d+$` and `^dall-e` still compile; `^dall-e-.*$` — the most ordinary
+pattern a manifest can carry — does not.
+
+What remains is measured and pinned in both directions rather than assumed:
+
+| construct | ASCII input | non-ASCII input |
+|---|---|---|
+| `\d` `\w` `\s` `\b` `^` `$` case | agrees with JavaScript | `\d` matches U+0663, `\w` matches `é`, `\b` follows — JavaScript's match none |
+| `.` | **diverges**: matches `\r` and U+2028/2029, where JavaScript's excludes every line terminator | same |
+
+Recorded rather than papered over with a pattern rewriter, which would trade a known difference for an
+unknown defect. **0 of 3 installed manifests declare `modalityRules` at all**, and the only pattern any
+shipped manifest carries (`builtin-templates.ts:66`) has no `.` and no classes — so the divergence is
+unreachable for real input, which is the boundedness argument.
+
+## Eight falsification probes, each reverted by its inverse edit, each verified by hash
+
+| probe | reddens | count |
+|---|---|---|
+| OR → AND (absent matcher vacuously satisfied) | `either_matcher_may_match`, `a_rule_with_neither_matcher_never_matches` | 2 |
+| `#[serde(alias = "text")]` on `ModalityRules::image` | `a_text_keyed_rule_is_ignored` | 1 |
+| array arm removed from `raw_match_hits` | `raw_match_matches_array_membership` | 1 |
+| uncompilable pattern → `Ok(false)` | the four error-path tests | 4 |
+| unreadable `modalityRules` → `None` | `an_unreadable_rules_block_is_an_error_not_an_absence` | 1 |
+| unresolvable `rawMatch` path → `Err` | `raw_match_is_false_when_the_metadata_is_missing_or_unresolvable` | 1 |
+| every pattern wrapped in `^(?:…)$` | five tests | 5 |
+| engine switched to `unicode(false)` | the two divergence tests | 2 |
+
+Two were worth more than they cost:
+
+- **Anchoring reddens five tests, not one.** `RegExp.test`'s unanchored semantics is load-bearing well
+  beyond the test named for it — `matches_a_bare_id`, the empty-pattern case, `either_matcher_may_match`
+  and the builtin-template rule all depend on it.
+- **`unicode(false)` reddens exactly the two divergence tests and leaves
+  `the_builtin_template_rule_matches_the_models_it_exists_for` green** — the boundedness argument as a
+  single observation rather than an assertion.
+
+The array-membership probe carries a third: removing the array arm leaves **both `[0]`-indexing tests
+green**, which is what shows they test indexing rather than membership — the two look alike, and the
+probe separates them.
+
+**D27.** `modality.test.ts:19-20` is named *"does not throw on an invalid regex — an unparseable rule
+simply never matches"* and asserts `.toThrow()`. The assertion is right (`new RegExp("[")` throws, and
+`manifest-interpreter.ts:230` / `code-adapter.ts:134` return directly with no catcher upstream); the
+**name** is wrong, and the name is what a porter reads first.
+
+## Relocated from MEMORY.md — facts, not rules
+
+- DB: `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (`?mode=ro`).
+- Ports: gateway **8800**, AI Hub v2 **8787**; `DEFAULT_PORT` is stale.
+- Recall corpus, measured: **0 gateway vs 14 assistant**; L0 denied on both.
+- Playground is `screens/Assistant.tsx`; skills are frontend-only (SQLite `skills`, `store.rs:230`).
+
