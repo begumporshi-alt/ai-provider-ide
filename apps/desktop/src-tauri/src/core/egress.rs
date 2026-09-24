@@ -22,8 +22,6 @@ use std::time::{Duration, Instant};
 use base64::Engine as _;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "app")]
-use tauri::ipc::Channel;
 
 use crate::core::store::Store;
 use crate::core::vault;
@@ -324,9 +322,6 @@ pub async fn fetch_image(
     })
 }
 
-/// SSE streaming request: lines flow through the channel. When the webview stops consuming
-/// (channel send fails), the loop breaks and the reqwest stream future drops — closing the
-/// provider connection (§3.5 cancellation).
 /// How long an upstream may go completely silent before we give up on it.
 ///
 /// A post-connect stall is the one upstream failure nothing else reports: TCP stays open, no
@@ -340,14 +335,27 @@ pub async fn fetch_image(
 /// 30s. 120s is more than 4x the worst observed, so no legitimate request is at risk, while a
 /// genuine stall now ends in two minutes instead of never. It bounds *silence*, not duration:
 /// a stream that keeps producing data is never cut off, however long it runs.
-#[cfg(feature = "app")]
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
-#[cfg(feature = "app")]
+/// Drive one streaming request and push its events into `sink`.
+///
+/// **The sink is an `mpsc` sender rather than a `tauri::ipc::Channel`, and that is what makes this
+/// function reachable from `core`.** It was the only `app`-gated item in this module and the gate
+/// existed solely because a `Channel` is a Tauri type — the body below never touched Tauri.
+/// `UnboundedSender::send` returns `Result<_, SendError>` exactly as `Channel::send` returns a
+/// `Result`, so the `is_err()` and `let _ =` shapes are unchanged: a consumer that has gone away is
+/// still detected the same way, and dropping the receiver is still what cancels the upstream.
+///
+/// `tauri/commands.rs` keeps its `Channel` and forwards through a task; `core/egress_port.rs`
+/// consumes the receiver as the `HttpPort` line stream.
+///
+/// Cancellation is §3.5 and the sink is what carries it: a consumer that stops receiving drops the
+/// receiver, the next `send` fails, the loop returns, and the reqwest stream future drops — closing
+/// the provider connection.
 pub async fn stream(
     state: &EgressState,
     req: EgressRequest,
-    channel: Channel<StreamEvent>,
+    sink: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<(), EgressError> {
     let b = build(state, req).await?;
     // Bounded the same way as the chunks below: headers are progress too, and a server that
@@ -361,12 +369,12 @@ pub async fn stream(
                 .iter()
                 .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
                 .collect();
-            if channel.send(StreamEvent::Headers { status, headers }).is_err() {
+            if sink.send(StreamEvent::Headers { status, headers }).is_err() {
                 return Ok(()); // consumer gone; provider stream drops => cancelled
             }
             if status >= 400 {
                 let body = res.text().await.unwrap_or_default();
-                let _ = channel.send(StreamEvent::Error {
+                let _ = sink.send(StreamEvent::Error {
                     message: format!(
                         "http {status}: {}",
                         body.chars().take(2000).collect::<String>()
@@ -384,7 +392,7 @@ pub async fn stream(
                     Ok(Some(c)) => c,
                     Ok(None) => break, // upstream closed the stream
                     Err(_) => {
-                        let _ = channel.send(StreamEvent::Error {
+                        let _ = sink.send(StreamEvent::Error {
                             message: format!(
                                 "upstream went silent for {}s — abandoning the stream",
                                 UPSTREAM_IDLE_TIMEOUT.as_secs()
@@ -399,29 +407,29 @@ pub async fn stream(
                         while let Some(pos) = buf.find('\n') {
                             let line = buf[..pos].trim_end_matches('\r').to_string();
                             buf.drain(..=pos);
-                            if channel.send(StreamEvent::Line { text: line }).is_err() {
+                            if sink.send(StreamEvent::Line { text: line }).is_err() {
                                 return Ok(()); // mid-stream disconnect -> cancel upstream
                             }
                         }
                     }
                     Err(e) => {
-                        let _ = channel.send(StreamEvent::Error { message: e.to_string() });
+                        let _ = sink.send(StreamEvent::Error { message: e.to_string() });
                         return Ok(());
                     }
                 }
             }
             if !buf.trim().is_empty() {
-                let _ = channel.send(StreamEvent::Line { text: buf.trim().to_string() });
+                let _ = sink.send(StreamEvent::Line { text: buf.trim().to_string() });
             }
-            let _ = channel.send(StreamEvent::Done);
+            let _ = sink.send(StreamEvent::Done);
             Ok(())
         }
         Ok(Err(e)) => {
-            let _ = channel.send(StreamEvent::Error { message: e.to_string() });
+            let _ = sink.send(StreamEvent::Error { message: e.to_string() });
             Err(e.into())
         }
         Err(_) => {
-            let _ = channel.send(StreamEvent::Error {
+            let _ = sink.send(StreamEvent::Error {
                 message: format!(
                     "upstream sent no response headers for {}s — abandoning the request",
                     UPSTREAM_IDLE_TIMEOUT.as_secs()

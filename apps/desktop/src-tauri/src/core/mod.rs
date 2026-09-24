@@ -35,6 +35,7 @@ pub mod compress;
 pub mod context;
 pub mod crash_report;
 pub mod egress;
+pub mod egress_port;
 pub mod engine;
 pub mod error;
 pub mod gateway;

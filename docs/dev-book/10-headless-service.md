@@ -1788,9 +1788,13 @@ and is resolved against it above.
 | `core/interpreter.rs` | 2,258 | 44 | `ManifestInterpreter` — `list_models`, `ping_key`, `run_image`, and the streaming `run_text` loop |
 | `core/manifest.rs` | — | +6 | `parse_retry_after` / `retry_after_from`, which increment 15's note claimed were already there |
 
-**`HttpPort` is its own module for the same one-way-edge reason `adapter.rs` is.** `egress.rs` will
-implement it and `interpreter.rs` consumes it; putting the trait on either side would make the other
-depend on the whole of it. `stream: bool` on the request replaces `ipc-client.ts:41`'s sniffing — the
+**`HttpPort` is its own module for the same one-way-edge reason `adapter.rs` is.** `egress.rs`
+implements it and `interpreter.rs` consumes it; putting the trait on either side would make the other
+depend on the whole of it. **That sentence read "will implement" until increment 25a, and the future
+tense turned out to be load-bearing: there was no production implementor at all, so it described an
+intention rather than the tree (D40).** The implementation now lives in `core/egress_port.rs` rather
+than in `egress.rs` itself, which keeps the trait at arm's length for the same one-way-edge reason
+the module was split for in the first place. `stream: bool` on the request replaces `ipc-client.ts:41`'s sniffing — the
 host should not have to infer a request's shape from its URL — and there is deliberately no timeout
 field and no third method: the seam carries what the caller decided, not what the host might like to
 do about it.
@@ -2001,7 +2005,12 @@ one is the deletion:
 | **24c — landed** | `Bridge::ready` — the seam that decides *whose* question readiness is, so a Rust bridge is not measured against a webview's liveness rule (D35). It is a prerequisite of 24b-ii, not a follow-up: installing a Rust bridge without it ships a five-second stall plus a 503 on every request |
 | **24b-ii-a — landed** | `SharedRouterState` — the state every request must see one copy of: the circuit breaker, the key cursors, the ledger and the limiter. A prerequisite of 24b-ii, not a follow-up: `execute_text`'s `&mut HealthTracker` and `ModelRouter`'s `&mut self` made "two requests at once" unrepresentable, so the driver could only have been written serialising or with per-request state (D38) |
 | **24b-ii-b — landed** | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`. **Landed against seams, not wired**: three paths it must walk are still Tauri-shaped or Tauri-gated, so nothing installs it yet (D39) |
-| **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
+| **25a — landed** | `core/egress_port.rs` — `impl HttpPort for EgressPort`, the production implementor the plan's own future tense had assumed existed (D40). Un-gates `egress::stream` off `tauri::ipc::Channel` onto an `mpsc` sink, so `egress.rs` now carries **no** `cfg(feature = "app")` at all |
+| **25b** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1) |
+| **25c** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code does today (D40) |
+| **25d** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability |
+| **25e** | Install `RouterBridge` — hydrate, register the adapters, build the `EgressPort`, point `BridgeHost` at `GatewayCore`, and swap `HeadlessBridge` in `bin/aiproviderd.rs`, whose `ready()` answers `false` and so makes every completion a deliberate 503 |
+| **25f** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)**. Safe only once 25a–25e stand a Rust path behind it |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
 clock, no network, which is what lets it be pinned before anything calls it. 53 tests, Rust
@@ -2552,6 +2561,54 @@ now, with the doubles the crate already has, and what fixes the interface the th
 Writing the port first and the prerequisites second is the reconnaissance lesson applied: where the port
 needs I/O it cannot set up, compile a *probe* rather than the real thing — and here the seams are exactly
 what makes that possible.
+
+**Increment 25a — the edge the plan assumed was already there.** Phase 5d was the next step and the
+reconnaissance that preceded it found it was not takeable, for a reason larger than D39's three gaps.
+D39 recorded that the *driver's prerequisites* were missing. Measuring the *dependencies* found the same
+shape one level up: **the Rust provider path has never been connected in production, in either build**
+(D40). `impl HttpPort` occurred seven times and every one was inside a `#[cfg(test)]` module, so the
+adapter seam had no production implementor; `AdapterRuntime`, `ModelRouter::new`, `RouterStore::hydrate`
+and `RouterBridge` likewise had none. The plan's own `:1791` said "`egress.rs` will implement it" — a
+future tense that had never become past.
+
+So 25a is the edge. `core/egress_port.rs` implements `HttpPort` for `EgressPort`:
+
+- **Unary** (`stream: false`) maps straight onto `egress::request`, which was already feature-agnostic.
+- **Streaming** (`stream: true`) spawns `egress::stream` and consumes its events through an `mpsc`
+  channel as the pull stream the trait promises. The two sides want opposite shapes and neither is
+  wrong: `HttpResponse::lines` is a `BoxStream` the interpreter polls, and `egress::stream` is a push
+  producer. The channel is the adapter between them, and it carries cancellation in the direction the
+  egress already understands — dropping the receiver fails the next `send`, which is how a push
+  producer learns a consumer has gone away (§3.5). A watcher task aborts the driver when the `Cancel`
+  flag is raised, because a *silent* upstream produces no `send` to fail.
+
+**Two design points that are the contract rather than style.** *Headers are out of band*: `HttpResponse`
+carries `status` and `headers` beside the stream, so the first event is awaited before the response is
+built — a status that stayed `0` until the first poll would be a lie the interpreter cannot detect,
+because it reads the status before it touches the stream. *The `>= 400` case is the documented
+asymmetry*, not a special case: `http_port.rs:25-31` says `body` is filled for a unary request **and for
+a streaming request that failed**, with `lines` present only for one that succeeded. The egress already
+sends exactly the shape that needs — `Headers`, then one `Error` carrying the provider's words — so the
+module reads that second event into `body` and returns `lines: None`.
+
+**The un-gating is what makes the headless build real.** `egress::stream`'s last parameter was a
+`tauri::ipc::Channel`, which was the *only* reason the function was `app`-gated; the body never touched
+Tauri. It is now an `UnboundedSender<StreamEvent>`, whose `send` returns a `Result` exactly as
+`Channel::send` does, so every `is_err()` and `let _ =` in the body is unchanged. **`egress.rs` now
+carries no `cfg(feature = "app")` at all.** `tauri/commands.rs:80` keeps its `Channel` and forwards
+through one task, so the webview path is untouched.
+
+**Five tests, and they are the first in the crate to drive the egress over a real socket.** `egress.rs`'s
+three test modules are pure — allowlist, secret injection, host scanning — and nothing had ever performed
+an HTTP request in a test, so `request`, `stream` and `fetch_image` were exercised only in production, by
+a webview. The new tests stand up a loopback axum server (which `check_url` permits unconditionally, the
+same affordance a local Ollama provider relies on) and assert on what the server *saw*, so "the line
+arrived" and "the line is correct" are two claims rather than one. **Two falsification probes, one at a
+time, both red, file byte-exact:** flipping the `>= 400` arm to return `lines: Some(empty)` reddens the
+500 test alone; disabling the cancellation watcher reddens the cancel test alone, at 5.13 s, which is the
+timeout rather than a spurious failure. Rust **1160 → 1165**; headless **1100 → 1105**, so every new test
+is reachable with no Tauri in the graph. The headless build compiles with no errors and no warnings,
+which is the measurement that says the un-gating is complete rather than partial.
 
 ---
 

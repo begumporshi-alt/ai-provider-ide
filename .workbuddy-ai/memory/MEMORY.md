@@ -4,13 +4,13 @@
 
 ## Non-negotiables
 - A tool result is not evidence. **A `Write`/`Edit` can report success while the file keeps its old bytes *and* mtime** — `Read` serves the *unwritten* text. Verify by `stat` mtime + **Grep tool**, retrying until it moves. **An `Edit` that inserts must not shrink its anchor block** — read the region back.
-- Falsify **one** probe at a time; measure before recording a cause. **A reason is a claim too** — "cannot be tested" needs the same evidence as "is not tested". **Re-snapshot after every accepted change** — a probe reverted from a stale snapshot deletes the fix. **`touch` the sources after a probe run** — a preserved-mtime restore leaves the build stale and the mutation running. **A module written against seams is testable before its prerequisites exist** — name them in its header; a driver with no caller compiles green (D39).
+- Falsify **one** probe at a time; measure before recording a cause. **A reason is a claim too** — "cannot be tested" needs the same evidence as "is not tested". **Re-snapshot after every accepted change** — a probe reverted from a stale snapshot deletes the fix. **`touch` sources after a probe run** — a preserved-mtime restore leaves the build stale. **A module written against seams is testable before its prerequisites exist** — name them in its header; a driver with no caller compiles green (D39). **A plan's future tense is a claim**: "`x` will implement it" needs an `impl <Trait> for` grep whose hits are not all `#[cfg(test)]` (D40).
 - Unset **all six** proxy vars on probe *and* app — else `502`; partial → curl `000`. **A proxy `502` satisfies a "status != 000" readiness loop** — it exits instantly.
-- `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH. Gate needs `PATH="$HOME/.cargo/bin:$PATH"`. **Shell is bash 3.2 here** — no `mapfile`. Commit msgs via `-F <file>`; backticks in `-m` vanish.
+- `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH. Gate needs `PATH="$HOME/.cargo/bin:$PATH"`. **Shell is bash 3.2 here** — no `mapfile`. Commit msgs via `-F <file>`.
 - **One edit per file per batch** — the 2nd lands on a stale snapshot and clobbers the 1st; both report success.
 - Absence claims: **Grep tool** (bash `grep` lies) — **skips dot-dirs** (`.github/`, `.workbuddy-ai/` → `cat <dir>/* | grep`). A hit ≠ completeness; count via node, not `find | grep -c`.
 - **Cargo unifies features per crate** — `default-features = false` is **inert** when another dep takes the crate with defaults (`tauri-utils` → `regex`). Read the *resolved* set: `cargo tree -f "{p} {f}"`. **A measurement's configuration is part of its claim**.
-- **The bulk-delete guard is sandbox-only.** A Playwright `webServer` timeout is a guard symptom **or a proxy `502`**. Clean in `web-test:clean`, *after* `pnpm build`; `DEBUG=pw:webserver` tells `ECONNREFUSED` from a non-2xx.
+- **The bulk-delete guard is sandbox-only.** A Playwright `webServer` timeout is a guard symptom **or a proxy `502`**. Clean in `web-test:clean`, *after* `pnpm build`.
 
 ## Where things are
 - `ARCHITECTURE.md` is a spec, not the app. `dev-book/` = rules/contracts + drift register; `build-dev-book.mjs` → `book.html`, `check-doc-links` is a gate.

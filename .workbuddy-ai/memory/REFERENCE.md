@@ -4277,3 +4277,94 @@ Phase 5d/6: port `egress::stream` off `tauri::Channel`; gate `persist`'s non-Tau
   one-line prefix silently removed the second line — the edit "succeeded", and `stat` and a grep for the new
   text both agreed. **Neither `stat` nor a grep can see a deleted line**; only reading the region back can. The
   safe form is to keep the anchor intact and *prefix* the new text to it.
+
+## Increment 25a — the `HttpPort` edge, and the path that was never connected (2026-09-24)
+
+### The finding (D40), and how it was measured
+
+The plan said, twice and in the future tense, that `egress.rs` would implement `HttpPort`
+(`core/http_port.rs:4`, `docs/dev-book/10-headless-service.md:1791`). It did not. **The check that finds this
+class of defect is a grep for `impl <Trait> for` plus a look at whether every hit is inside `#[cfg(test)]`** —
+7 hits, 4 files, all test modules. Then the same test on the constructors:
+
+| what | production callers |
+|---|---|
+| `impl HttpPort` | **0** (7 exist, all in `#[cfg(test)]`) |
+| `AdapterRuntime` (constructors) | **0** — only mention outside its module is a doc comment (`router.rs:1441`) |
+| `ModelRouter::new` | **0** (61 call sites: all `router.rs` tests + `router_bridge.rs:163`) |
+| `RouterStore::hydrate` | **0** (tests only) |
+| `RouterBridge` | **0** (by construction — D39) |
+
+So `ModelRouter → AdapterRuntime → HttpPort → egress` is a chain where every link is built and tested and no
+link is connected. `bin/aiproviderd.rs` installs `HeadlessBridge` with `ready() == false`, so every completion
+there is a deliberate 503; the desktop app's only working text path is the **webview** doing provider HTTP
+itself through the `egress_stream` command. **The corollary that matters for scoping:** Phase 5d's deletion
+removes the only working path, so it cannot be taken before 25a–25e land. One increment became six.
+
+**The egress's network functions had no test at all.** `egress.rs` has three test modules and all three are
+pure (allowlist, secret injection, host scanning); no test in the crate had ever performed an HTTP request. So
+`request`/`stream`/`fetch_image` were production-only code paths, exercised by a webview.
+
+### The shapes
+
+- `HttpPort::request<'a>(&'a self, req: HttpRequest, cancel: &'a Cancel) -> BoxFuture<'a, Result<HttpResponse<'a>, HttpError>>`.
+  `HttpRequest { url, method: HttpMethod, headers: BTreeMap, body: Option<String>, secret_ref: Option<String>, stream: bool }`
+  — **no timeout field** (`http_port.rs:43`; the egress applies its own), so `timeout_ms: None`.
+- `HttpResponse<'a> { status: u16, headers: BTreeMap<String,String>, body: String, lines: Option<BoxStream<'a, Result<String, HttpError>>> }`.
+  **The asymmetry is the contract** (`http_port.rs:25-31`): `body` filled for unary **and for a streaming
+  request that failed**; `lines` present only for a streaming request that succeeded.
+- `EgressRequest { url, method: String, headers: BTreeMap, body: Option<String>, secret_ref: Option<String>, timeout_ms: Option<u64> }`
+  — `method` is a **string** and `build` accepts only `"GET"`/`"POST"`, so `HttpMethod::as_str()` feeds it.
+- `EgressState::new(allow: Arc<AllowList>, store: Arc<Store>)` is `pub` and un-gated; `EgressState` is already
+  the `Arc` the app puts in managed state (`tauri/app.rs:186`).
+- `Cancel` is `Arc<AtomicBool>` with `cancel()`/`is_cancelled()`, `Clone` — so a watcher task can poll it.
+
+### The design decisions
+
+1. **Push → pull needs a channel.** `HttpResponse::lines` is a pollable `BoxStream`; `egress::stream` is a push
+   producer. The driver is spawned with an `mpsc::UnboundedSender<StreamEvent>` and the returned stream drains
+   the receiver. `async_stream::stream!` (already a dep, used by four gateway handlers) is the generator.
+2. **Cancellation rides the sink.** Dropping the receiver fails the next `send`, which is exactly how
+   `egress::stream` already learns a consumer is gone — so the *streaming* path needs no new plumbing. A
+   watcher task (`CANCEL_POLL` = 25 ms) additionally aborts the driver, because a **silent** upstream produces
+   no `send` to fail and would otherwise hold the request open. The watcher exits on `driver.is_finished()`,
+   so it is bounded by the request's own lifetime.
+3. **Headers are out of band, so the first event is awaited before returning.** A status left at `0` until the
+   first poll would be a lie the interpreter cannot detect — it reads the status *before* it touches the stream
+   (`manifest-interpreter.ts:304`).
+4. **`>= 400` reads the second event into `body` and returns `lines: None`.** The egress already sends
+   `Headers` then one `Error` carrying the provider's words, so the contract holds without either side knowing
+   about the other.
+5. **`egress.rs` lost its last `cfg(feature = "app")`.** `stream`'s `tauri::ipc::Channel` was the *only*
+   reason it was gated — the body never touched Tauri. `UnboundedSender::send` returns `Result<_, SendError>`
+   exactly as `Channel::send` returns a `Result`, so **every `is_err()` and `let _ =` in the body is
+   unchanged**; only the signature moved. `tauri/commands.rs:80` keeps its `Channel` and forwards through one
+   task, so the webview path is untouched.
+
+### The tests, and why they are the first of their kind
+
+A loopback axum server (`axum 0.8` is already a dep — no `[dev-dependencies]` section exists) on
+`127.0.0.1:0`. **Loopback is what makes it possible with no allowlist entry**: `check_url` permits it
+unconditionally, the same affordance a local Ollama provider relies on. Each handler records path/method/body
+into a shared `Seen`, so **"the line arrived" and "the line is correct" stay two claims** — the discipline the
+register keeps rediscovering. Temp store dirs use `AtomicUsize`, not `pid+timestamp` (same-ms → `DatabaseBusy`).
+
+### The probes
+
+One at a time, each red, file byte-exact (`eac321be…`):
+
+| probe | result |
+|---|---|
+| `>= 400` arm returns `lines: Some(empty)` | **the 500 test alone** red — the mapping is what the test is about |
+| cancellation watcher disabled (`if false && …`) | **the cancel test alone** red, at **5.13 s** — the timeout, not a spurious failure |
+
+### Traps this cost
+
+- **`expect_err` / `unwrap_err` need `T: Debug` on the `Ok` type.** `HttpResponse` holds a `dyn Stream` and
+  implements no `Debug`, so the assertion has to be a `match` with an explicit `panic!`.
+- **The trait's `&'a self` borrow propagates into the returned value**, so a test cannot pass `&Cancel::new()`
+  as a temporary — `E0716` — and both the port and the `Cancel` need `let` bindings.
+- `let mut driver` was unnecessary: `abort()` takes `&self` and `await` consumes.
+- **The count.** Rust **1160 → 1165**; headless **1100 → 1105**; the headless build compiles with **no errors
+  and no warnings**, which is the measurement that says the un-gating is complete rather than partial.
+

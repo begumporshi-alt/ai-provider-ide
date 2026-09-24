@@ -83,7 +83,20 @@ pub async fn egress_stream(
     req: EgressRequest,
     on_event: Channel<StreamEvent>,
 ) -> Result<(), CommandError> {
-    egress::stream(&state, req, on_event).await.map_err(Into::into)
+    // The egress now pushes into an `mpsc` sink rather than a `Channel`, which is what lets `core`
+    // drive the same function with no Tauri in the dependency graph. This command is the adapter:
+    // one task forwards every event into the webview's channel. It ends when the egress drops the
+    // sender, and breaking on a failed `send` drops the receiver — which is how the egress learns
+    // the webview stopped listening and cancels the upstream (§3.5).
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<StreamEvent>();
+    tokio::spawn(async move {
+        while let Some(ev) = rx.recv().await {
+            if on_event.send(ev).is_err() {
+                break;
+            }
+        }
+    });
+    egress::stream(&state, req, tx).await.map_err(Into::into)
 }
 
 /// Invariant-3 carve-out: fetch a provider-returned URL (an imageUrl) as base64, scoped to
