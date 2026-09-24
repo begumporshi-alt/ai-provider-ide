@@ -67,6 +67,49 @@ serde_json = "1"
 # unreachable for the ASCII model ids and the class-free builtin rule that actually exist.
 # Adding this dependency costs zero new crates: `regex` is already in the graph via `tauri-utils`.
 regex = "1"
+# The Tier-2 sandbox is a JavaScript module the Generator emits, so the port needs a JS engine and
+# not a subset. `rquickjs` binds the same QuickJS C engine that
+# `@jitl/quickjs-singlefile-mjs-release-eval` compiles to WASM, so the language semantics are
+# identical by construction. **Version 0.9.0 is deliberate, not stale.** Every claim in
+# `docs/dev-book/10-headless-service.md` §2.1.3 was measured against 0.9.0 and cites its source
+# file:line — `context/base.rs:109` (the global lock `Context::with` holds), `runtime/base.rs:162,170`
+# (the two `Runtime` job-queue methods that deadlock under `parallel`), `ctx.rs:375`
+# (`Ctx::execute_pending_job`, the only usable pump), `runtime/base.rs:187-197` and
+# `context/base.rs:144-149` (where `Send`/`Sync` come from). Cargo reports a 0.14.0 available;
+# taking it would void all five measurements at once and re-running them is its own increment.
+#
+# **`parallel` is the only feature, and that is a measurement rather than a guess.** The seam
+# requires `AdapterInstance: Send + Sync` (`core/adapter.rs`) and 0.9.0 declares `Send`/`Sync` for
+# `Runtime` and `Context` under this feature alone. A probe crate that touches every API this port
+# needs — `Module::declare`/`eval`/`get("default")`, `ctx.promise()`, `Function::new`,
+# `ctx.execute_pending_job()`, `Promise::state`/`result`, `Object::set`,
+# `Runtime::set_memory_limit`/`set_max_stack_size`/`set_interrupt_handler`/`memory_usage` — compiles
+# and runs with `features = ["parallel"]` and nothing else. The spike at
+# `.workbuddy-ai/spikes/js-engine/` also enabled `bindgen`, `futures`, `loader` and `macro`; all four
+# are unnecessary here. `bindgen` is the one worth naming: it exists to *regenerate* the FFI
+# bindings and would put libclang in the build path, while `rquickjs-sys` ships pre-generated
+# per-target bindings (`src/bindings/aarch64-apple-darwin.rs`, `x86_64-unknown-linux-gnu.rs`, …) and
+# `cargo tree -f "{p} {f}"` shows it resolving with no features at all.
+#
+# Both `rquickjs` and `rquickjs-core` declare `default = []`, so unlike `regex` there are no default
+# features to disable and `default-features = false` would be a no-op here rather than a landmine.
+#
+# **Cost, measured 2026-09-24:** `cargo tree --edges normal` resolves **310** with this dependency
+# and **307** without it (and 166 vs 163 under `--no-default-features`) — **three new crates, and
+# nothing transitive**: `rquickjs`, `rquickjs-core`, `rquickjs-sys`, which vendors QuickJS as C. A
+# cold `cargo check --lib` is 26.5 s, of which `rquickjs-sys` is the bulk; a C toolchain is already
+# required by `rusqlite`'s `bundled` feature, so this adds no new build prerequisite. Both
+# `cargo check --lib` and `cargo check --no-default-features --all-targets` are green, so the
+# Tauri-free headless build absorbs it — which is the intent: serving adapters is the headless
+# service's job, so the sandbox is not optional.
+#
+# **And the one thing `parallel` does NOT buy, measured in the same probe:** `Runtime` and `Context`
+# are `Send + Sync`, but every handle that *holds a guest value* is neither. `Persistent<T>` carries
+# `rt: *mut JSRuntime` (`persistent.rs:37`), and `T` reaches `NonNull<JSContext>`
+# (`context/ctx.rs:74`, through `Value`'s `Ctx`) and `*mut c_void` (`JSValue`'s `JSValueUnion`). So
+# `Ctx`, `Value`, `Object`, `Function` and `Persistent<T>` are `!Send` and `!Sync` in both
+# directions. This is the constraint that decides the adapter's architecture — see §2.1.3 and D30.
+rquickjs = { version = "0.9", features = ["parallel"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
 futures-util = "0.3.34"

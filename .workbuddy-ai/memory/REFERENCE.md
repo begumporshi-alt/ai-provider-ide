@@ -3209,6 +3209,72 @@ rendered `book.html`.** Neither `docs:book` nor `check-doc-links` fails on a row
 so this is caught by eye in the rendered book, not by a gate. Measured 2026-09-24 when a quoted regex added
 four pipes to a two-column row in `09-status.md` (3 → 7 unescaped); the fix was four `\|`.
 
+## Increment 19a — the `rquickjs` dependency, measured
+
+No port code yet: the measurement changed the plan, so this increment is the dependency plus D30.
+
+### The feature set, and why it is not the spike's
+
+| feature | needed? | evidence |
+|---|---|---|
+| `parallel` | **yes** | the only one that gives `Runtime`/`Context` their `Send`/`Sync` |
+| `bindgen` | no | regenerates FFI bindings → puts **libclang** in the build path; `rquickjs-sys` ships pre-generated per-target bindings (`src/bindings/aarch64-apple-darwin.rs`, `x86_64-unknown-linux-gnu.rs`, …) and resolves with no features |
+| `futures` | no | pulls `async-lock`; the synchronous `Ctx::execute_pending_job` pump is the shape used |
+| `loader` | no | pulls `relative-path`; the guest arrives as a source string, not a module specifier |
+| `macro` | no | `Function::new` is used, not `#[rquickjs::function]` |
+
+Both `rquickjs` and `rquickjs-core` declare `default = []`, so unlike `regex` there is no default
+set to disable — `default-features = false` would be a no-op rather than a landmine.
+
+### Cost
+
+| measurement | without | with |
+|---|---|---|
+| resolved crates, default features | 307 | **310** |
+| resolved crates, `--no-default-features` | 163 | **166** |
+
+Three crates, nothing transitive (`rquickjs`, `rquickjs-core`, `rquickjs-sys`; the last vendors
+QuickJS as C). Cold `cargo check --lib` 26.5 s. No new build prerequisite — `rusqlite`'s `bundled`
+already needs a C toolchain. Both `--lib` and `--no-default-features --all-targets` are green.
+
+**Version 0.9.0 deliberately.** Cargo reports 0.14.0 available; all five §2.1.3 claims cite 0.9.0
+file:line, so an upgrade voids them together.
+
+### D30 — the `Send + Sync` matrix, measured
+
+| type | `Send` | `Sync` | why |
+|---|---|---|---|
+| `Runtime` | yes | yes | under `parallel` — this is all the feature buys |
+| `Context` | yes | yes | same |
+| `Ctx<'js>` | no | no | `NonNull<JSContext>` (`context/ctx.rs:74`) |
+| `Value<'js>` | no | no | `Ctx` + `JSValue`'s `JSValueUnion` (`*mut c_void`) |
+| `Object<'js>` / `Function<'js>` | no | no | wrap `Value` |
+| `Persistent<T>` | **no** | **no** | holds `rt: *mut JSRuntime` (`persistent.rs:37`) — **independent of `T`** |
+
+Probe: `assert_send_sync::<Persistent<Function<'static>>>()` → `error[E0277]`. So an adapter cannot
+hold its runtime, compiled guest or parked resolvers as fields; the `Send + Sync` handle must be a
+**channel to a thread that owns them** (an actor). The bad shape fails at the
+`Arc<dyn AdapterInstance>` coercion, not at the definition.
+
+Also measured: `Persistent::save(&ctx, v)` / `.restore(&ctx)` round-trips a value across two
+separate `ctx.with` scopes, and `restore` **consumes** `self` — so a cached handle is used as
+`persistent.clone().restore(&ctx)`. And `persistent.rs:33-34` warns that a `Persistent` outliving
+its `Runtime` **aborts the process on drop**, so struct field order (drop order) is load-bearing.
+
+### Two API details that differ from the spike's expectations
+
+- `PromiseState` is at `rquickjs::promise::PromiseState`, not the crate root.
+- `Context` is the **owned** type and takes **no** lifetime in 0.9.0; `Ctx<'js>` is the scoped one.
+  So `assert_send_sync::<Context>()`, not `Context<'static>`.
+
+### `rquickjs-core` has no `serde_json` dependency at all
+
+`grep -rn serde_json` over the crate source returns nothing. A guest value → `serde_json::Value`
+dump is therefore code to write (recursive walk over `Value`), not a built-in bridge. `JSON.stringify`
+inside the guest is the tempting shortcut and is **not** equivalent: it drops `undefined`-valued
+properties and maps `NaN`/`Infinity` to `null`, where the reference's `ctx.dump()` keeps them and
+`String(NaN)` is `"NaN"`.
+
 ## Relocated from MEMORY.md — facts, not rules
 
 - DB: `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (`?mode=ro`).

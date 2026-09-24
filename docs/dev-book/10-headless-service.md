@@ -368,6 +368,34 @@ the heap ceiling needs a supervisor process at all or whether the allocating ent
 in-process. **It has not been run, and nothing here claims the fence works.** Until a probe says otherwise,
 §8's subprocess fallback stays the recommended shape for the heap boundary specifically.
 
+**Update, 2026-09-24 (increment 19a): the dependency is in, and the seam's bound is not what this
+section implied.** `rquickjs 0.9` is now a dependency of the crate, with `features = ["parallel"]`
+and nothing else — see `Cargo.toml` for the measurements. The version is 0.9.0 deliberately rather
+than the 0.14.0 Cargo reports as available, because every claim above cites 0.9.0's source by
+file:line and an upgrade would void all of them at once.
+
+The correction is to the paragraph above the table, and it is **D30**. `parallel` does give
+`Runtime` and `Context` both bounds — that half reproduces. But **no handle that holds a guest
+value has them either**, so the feature flag does not by itself make `AdapterInstance: Send + Sync`
+satisfiable. Measured with a probe that failed to compile: `Persistent<T>` carries
+`rt: *mut JSRuntime` (`persistent.rs:37`), so the wrapper is `!Send`/`!Sync` regardless of `T`; and
+`T` reaches `NonNull<JSContext>` (`context/ctx.rs:74`) and `*mut c_void` inside `JSValue`. So `Ctx`,
+`Value`, `Object`, `Function` and `Persistent<T>` are all `!Send` and `!Sync` in both directions.
+
+**What that decides.** The adapter cannot hold its `Runtime`, its compiled guest object or its
+parked resolvers as fields of the struct implementing the trait — that shape does not compile, and
+it fails at the `Arc<dyn AdapterInstance>` coercion rather than at the definition, so it is found
+late. The `Send + Sync` handle must instead be a **channel to a thread that owns them**: a thread
+creates the `Runtime`/`Context`/`Persistent` values as `!Send` locals (which is legal, since the
+closure's body runs on that thread), and the adapter's public surface sends commands to it. That is
+the actor shape, and it is now the plan rather than an option. It also answers half of the
+"async-host shape" this section names as the largest remaining unknown: the pump and the egress
+`await` cannot share one `ctx.with` scope at all, because `Context::with` is synchronous and holds
+the global lock — so a single operation is a **sequence of short synchronous scopes separated by
+awaits on the actor thread**, with every value that must survive a scope boundary crossing it as a
+`Persistent` or as a dumped `serde_json::Value`. The remaining half — how the parked request's
+resolve/reject functions are restored into the next scope — is increment 19b's first question.
+
 ### 2.2 The line count
 
 ```
