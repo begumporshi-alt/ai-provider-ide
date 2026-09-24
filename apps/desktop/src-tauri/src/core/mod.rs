@@ -27,6 +27,7 @@
 
 pub mod adapter;
 pub mod capture;
+pub mod compress;
 pub mod context;
 pub mod crash_report;
 pub mod egress;

@@ -870,12 +870,35 @@ pub const DEFAULT_WINDOW_TOKENS: usize = 8192;
 /// correct direction to be wrong in.
 pub const MEMORY_CHARS_PER_TOKEN: f64 = 3.5;
 
+/// Tokens added per message for the role, the delimiters and the turn wrapper.
+///
+/// **Shared with `core::compress`, whose conversation estimator counts the same overhead — one
+/// fact, one spelling.** It used to be a bare `4` inside [`estimate_prompt_tokens_at`] while
+/// `context-compress.ts` named it `MESSAGE_OVERHEAD_TOKENS`; the port would have made that two
+/// spellings of one number, which is the defect class this crate's `NULL` != `0` rule exists for.
+///
+/// **The neighbours are deliberately *not* shared, and the numbers are close enough to invite it.**
+/// `MEMORY_CHARS_PER_TOKEN` is 3.5 where the compressor uses 4, and `MEMORY_RESERVE_FRACTION` is
+/// 0.20 where the compressor reserves 0.25 — different safety budgets that happen to look similar.
+/// Worst of all, `MEMORY_FRACTION` below is *also* 0.25 while meaning "share of the remaining
+/// window memory may take", which is not a reserve at all. Merging on the value would be a bug.
+pub const MESSAGE_OVERHEAD_TOKENS: usize = 4;
+
 /// Share of the remaining window that memory may take. Raised from 10% after review: 10% of an 8k
 /// window and 10% of a 200k window are not the same behavioural cost, and the ceiling below is what
 /// actually protects the top end.
 const MEMORY_FRACTION: f64 = 0.25;
 
-const MEMORY_RESERVE_FRACTION: f64 = 0.20;
+/// Share of the window held back for the answer, on the memory path.
+///
+/// **Public, and not because a caller needs it — because a sibling asserts it differs.** The
+/// compressor reserves [`core::compress::RESERVE_FRACTION`] = 0.25 where this is 0.20, and
+/// `the_compressors_ratios_are_deliberately_not_the_memory_paths` reads both to prove nobody has
+/// merged them. A private constant would make that guard unrepresentable, and the merge it prevents
+/// is silent: both paths would keep working, one of them with the other's reserve.
+///
+/// Do not "tidy" the two values together on the strength of their both being round fractions.
+pub const MEMORY_RESERVE_FRACTION: f64 = 0.20;
 /// Overhead per injected bullet, so the estimate accounts for the marker and newline too.
 const BULLET_OVERHEAD_TOKENS: usize = 8;
 /// One memory is clipped to this before it is considered at all.
@@ -895,7 +918,8 @@ pub fn estimate_prompt_tokens_at(body: &Value, chars_per_token: f64) -> usize {
             ms.iter()
                 .map(|m| {
                     let text = m.get("content").and_then(Value::as_str).unwrap_or("");
-                    (text.chars().count() as f64 / chars_per_token).ceil() as usize + 4
+                    (text.chars().count() as f64 / chars_per_token).ceil() as usize
+                        + MESSAGE_OVERHEAD_TOKENS
                 })
                 .sum()
         })

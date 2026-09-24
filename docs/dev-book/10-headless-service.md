@@ -73,7 +73,7 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 | **Execution engine** (`execution-engine.ts:228`) | TypeScript — attempt loop, failover, SSE | Must be ported to Rust | **High** — 228 lines, but the logic is load-bearing |
 | **Route planner** (`route-planner.ts:173`) | TypeScript — candidate ordering | Must be ported to Rust | **High** — 173 lines, heuristic-heavy |
 | **Model router** (`model-router.ts:557`) | TypeScript — facade, registry, catalog | Must be ported to Rust | **High** — 557 lines, the public API |
-| **Context compression** (`context-compress.ts:271`) | TypeScript — Tier 1 trim, Tier 2 summary | Must be ported to Rust | **High** — 271 lines, summarizer needs an AI call |
+| **Context compression** (`context-compress.ts:271`) | TypeScript — Tier 1 trim, Tier 2 summary | **Tier 1 and Tier 2 ported** — `core/compress.rs` (increment 14a); the wiring is outstanding | **Medium** — the port is done; what is left is calling it, and Tier 2's summarizer must arrive as a seam rather than a closure (D24) |
 | **Adapter runtime** (`adapter-runtime.ts:60`) | TypeScript — manifest interpreter + sandbox | Must be ported to Rust | **High** — 60 lines, but pulls in QuickJS-WASM |
 | **Health tracker** (`health-tracker.ts:78`) | TypeScript — cooldowns, circuit breakers | Must be ported to Rust | Medium |
 | **Concurrency limiter** (`concurrency.ts:91`) | TypeScript — per-provider in-flight caps | Must be ported to Rust | Low |
@@ -1333,6 +1333,100 @@ green-looking harness measuring nothing.
 Gate green: `cargo fmt --check` clean, `clippy --all-targets -- -D warnings` clean,
 `cargo test` 712 passed / 0 failed, `cargo check --no-default-features --all-targets` clean.
 
+### Increment 14a — context compression, the pure half (2026-09-24)
+
+Phase 4 opens with the half that needs no engine. `core/compress.rs` is 936 lines — 388 of
+implementation against the TypeScript's 271, and 547 of tests — and it carries the whole of
+`context-compress.ts`'s decision-making: `prompt_budget`, `estimate_tokens`, `compress_messages`,
+`dropped_against`, and `compress_with_summary`.
+
+**What is *not* here is the wiring, and the split is deliberate.** `compress_messages` takes
+`&[Value]`, so the TypeScript's "does not mutate the caller's array" test has no counterpart — the
+signature makes the mutation unrepresentable, and a test for it could not fail. The gateway still
+forwards `messages` verbatim and the assistant still replays every prior turn; nothing calls this
+module yet. That is a *wiring* increment, not this one, and the reason it is separate is the next
+finding.
+
+`cargo test` 712 → 746: +34 in the new `compress.rs`.
+
+**The three safety properties are the point, not the byte count.** Tier 1 is hard truncation of the
+oldest *complete turns*, and truncation is only safe because of three things: the `system` prefix
+survives (it carries the client's instructions and, on the gateway, the injected memory block);
+the newest turn survives even when it alone exceeds the budget (dropping it would answer a question
+the user did not ask); and a turn boundary only ever falls on a `user` message, so an assistant
+`tool_calls` turn and the `tool` results answering it always move together. The third is checked at
+**every** budget from 0 to just past the whole conversation rather than at one hand-picked value,
+because a bug that fires at one size is exactly what a single case misses — and the falsification run
+confirms that this exhaustive loop is the *only* test that catches a turn boundary moved onto `tool`.
+
+**Two estimators, kept apart on purpose; one fact, shared on purpose.** `gateway::context_scope`
+already estimates tokens for the memory-injection budget, and the two are close enough that merging
+them is the obvious tidy-up. They are not the same estimate — 3.5 chars/token against 4, a 0.20
+reserve against 0.25, and string-only content against multimodal parts — and the *direction of the
+error* differs: the memory estimator over-estimates deliberately (fewer chars per token means more
+tokens means it under-injects, which is safe), while the compressor is not under that pressure. The
+collision that settles it is `MEMORY_FRACTION`, which is *also* 0.25 while meaning "share of the
+remaining window memory may take" — a value collision with a different meaning, which is exactly the
+D21 pattern. So both ratios, both reserves and the content shape stay separate, with a test asserting
+they differ, and the one genuinely shared fact — the per-message overhead of 4 — was extracted to
+`context_scope::MESSAGE_OVERHEAD_TOKENS` and is now referenced by both.
+
+**`String::length` counts UTF-16 code units, and the difference is not academic here.** The port uses
+`encode_utf16().count()`. Byte length would over-estimate every non-ASCII conversation — Bengali is
+three bytes per character — and drop history that fits; scalar values would under-count astral
+characters by half. The test pins all three readings with inputs where they differ by 4×, including
+four Bengali characters, which is the case that matters for a user in Dhaka.
+
+**`new Set(final.messages)` is object identity, and Rust has no identity to compare.** The port's one
+structural divergence: `dropped_against` spends one unit of allowance per kept copy rather than
+testing membership, which gives the same answer as identity for distinct messages and a *correct*
+answer for duplicates — with `[A, A, B]` reduced to `[A, B]`, exactly one `A` went. The doc-comment
+claims only a partially-kept duplicate can tell the three readings apart, and the falsification run
+**proved that claim the hard way**: a mutation replacing the allowance with a membership test reddens
+the unit test and leaves the budget-driven duplicate test green, because in that test no copy of the
+dropped message survives. The first harness expectation was wrong; the code was right.
+
+**The fallback window is an alias, not a literal.** `DEFAULT_CONTEXT_WINDOW = DEFAULT_WINDOW_TOKENS`
+because both answer one question — what window do we assume when nobody told us — and the TypeScript
+says so in as many words. The test pinning it **cannot fail while the alias holds**, and that is
+recorded rather than hidden: it is a guard on the shape, catching the day someone writes `8192` back
+in. A test whose name overstates its coverage is the same defect as one whose name is simply wrong.
+
+**Tier 2 degrades, and the degrade path is the contract.** A summarizer that fails and one that
+returns only whitespace are the *same* outcome — Tier 1's answer, already a correct solution to the
+same problem, merely one that keeps less — because an added feature must not turn a working request
+into a failed one. The summary lands in the system prefix so the re-fit cannot trim it away; the
+re-fit may drop further turns, and those go without a second summary, since recursing would put an
+unbounded number of model calls on the request path. The dropped set is reported against the
+**original** conversation rather than the intermediate one, so "what was removed" does not change
+meaning depending on whether a summary happened to be produced.
+
+**The re-entrancy blocker is real, and it is measured in both directions.** `Assistant.tsx`'s live
+Tier 2 summarizer closes over the `router` singleton and calls `router.generateText` from inside
+`router.generateText`. In Rust, `generate_text(&mut self, …)` cannot take a callback that re-enters
+the same `&mut self`. Measured rather than guessed: a minimal reproduction is rejected with
+**`E0501`** — `cannot borrow *self as mutable more than once at a time` — and *not* with the `E0499`
+that was the first guess; the sequenced counterpart (summarize, then route) compiles and runs. So the
+guard `skipCompression` exists to provide is not needed in this shape at all, and what Tier 2's
+wiring needs instead is for the summarizer to be handed to the router as a *seam* — a
+`&dyn Fn`-style boundary the router calls and does not own — rather than as a closure over the router
+itself. This supersedes Phase 4's original note and §12's open question; see D24.
+
+**Falsification: 21/21**, every mutation restoring byte-identical. Two initially *missed*, and both
+misses were worth more than the passes:
+
+1. **A harness bug.** M14 expected two tests to redden; the second cannot distinguish the counting
+   rule from membership at all, for the reason above. The expectation was corrected to the single
+   test that can.
+2. **A real coverage gap.** `the_oldest_turn_goes_first_and_the_loop_stops_as_soon_as_it_fits` used
+   **two** turns, and with two turns the bound `turns.len() - 1` ends the loop after one iteration
+   whether or not the running total was decremented — so the second half of the test's own name was
+   unverified, and deleting `total -= turn_tokens[start]` left it green. Rewritten with a third turn,
+   which is what gives the loop somewhere left to go. The test now fails on that mutation.
+
+Gate green: `cargo fmt --check` clean, `clippy --all-targets -- -D warnings` clean,
+`cargo test` 746 passed / 0 failed, `cargo check --no-default-features --all-targets` clean.
+
 ### Phase 3 — Port the model router and route planner (2-3 days)
 
 **Goal:** rewrite `model-router.ts` and `route-planner.ts` in Rust.
@@ -1346,9 +1440,9 @@ collides (D21).
 `strip_client_namespace`, `order_keys`, `order_carriers`. The ledger is done (increment 12), and the
 router glue is done (increment 13): `core/router.rs` carries `generateText`, `generateImage`,
 `complete`, `listModels`, `systemAiAvailable`, `syncConcurrency`, and the `plan` helper that builds a
-`PlanContext` and calls `build_plan`. **Phase 3 is complete.** The compression module
-(`context-compress.ts`) is deferred to Phase 4 — it is the only part of `model-router.ts` without a
-Rust counterpart, and `messages` reach the engine verbatim today.
+`PlanContext` and calls `build_plan`. **Phase 3 is complete.** Compression is Phase 4's, and its pure
+half has since landed — see increment 14a above. `messages` still reach the engine verbatim: the
+module exists and nothing calls it yet.
 
 These are less risky than the execution engine — they are synchronous, stateful logic without async
 streams. The main challenge is the registry and catalog data structures, which today live in JS
@@ -1358,19 +1452,27 @@ In Rust they become structs loaded from `store.rs` on startup and kept in an `Ar
 
 ### Phase 4 — Port context compression (2-3 days)
 
-**Goal:** rewrite `context-compress.ts` in Rust.
+**Goal:** rewrite `context-compress.ts` in Rust, then wire it in.
 
-Tier 1 (trimming turns) is pure logic — port directly.
+**Status — the port is done, the wiring is not.** Increment 14a landed `core/compress.rs`: Tier 1,
+Tier 2, the estimator and the budget rule, 34 tests. What remains is the increment that calls it —
+the gateway's read path and the assistant's turn loop both go through `router.generate_text`, so the
+call belongs there once, and the two cannot drift.
 
-Tier 2 (summarization) is harder: it makes an AI call. In Rust this means the compression module
-calls the execution engine recursively. The `skipCompression` flag (`model-router.ts:108`, the option
-on the request; the branch that honours it is `:134`, and the caller that sets it is
-`Assistant.tsx:100`) prevents infinite recursion. **It does not exist in Rust yet.** There is no
-compression path in `src-tauri` at all — measured 2026-09-23, a Grep for `compress` and `summari[sz]`
-over the tree matches one unrelated doc comment, and `trim`, `compact`, `drop_turn` and
-`reduce_context` match only string `.trim()` calls. Phase 4 must introduce the compression and the
-guard together, and the guard is the part that is easy to leave out because its absence is invisible
-until the first summary recurses. See D20.
+**Tier 2's recursion problem has a different shape in Rust than in TypeScript, and the difference was
+measured.** The TypeScript needs `skipCompression` because the summarizer closes over the same
+`router` singleton it is running inside. In Rust, `generate_text(&mut self, …)` cannot accept a
+callback that re-enters the same `&mut self`: a minimal reproduction is rejected with **`E0501`**,
+and the sequenced counterpart compiles and runs. So the guard is not what the wiring needs — what it
+needs is for the summarizer to arrive as a **seam** the router calls and does not own, rather than as
+a closure over the router. The original note here claimed the flag "does not exist in Rust yet" and
+that Phase 4 "must introduce the compression and the guard together"; the first half was true when
+written and the second half is the wrong prescription. See D24.
+
+**The earlier claim that `src-tauri` had no compression path at all was corrected while landing
+increment 14a.** `context_scope.rs` estimates tokens, sizes a budget and drops what will not fit —
+but it compresses *recalled memory* into a system message and never touches the conversation. What
+was missing was a second input to an existing path, not a missing module. See D20.
 
 ### Phase 5 — Delete the bridge (1 day)
 
@@ -1498,9 +1600,12 @@ would need a second bridge between them.
 
 - Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
 the test; until it is run, this is an open question.
-- Whether the summarization call in context compression (Tier 2) works correctly when the engine
-  calls itself recursively. The `skipCompression` flag is designed for this, but recursive async
-  calls in Rust are harder to reason about than in JS.
+- ~~Whether the summarization call in context compression (Tier 2) works correctly when the engine
+  calls itself recursively.~~ **Answered 2026-09-24, and the question was mis-framed.** Rust does not
+  permit the recursive shape at all — a callback that re-enters the same `&mut self` is `E0501` — so
+  there is no recursion to get wrong. The real question is how the summarizer reaches the router, and
+  the answer is as a seam the router calls rather than a closure it runs inside. See increment 14a
+  and D24.
 - Whether launchd's `KeepAlive` behaves correctly when the binary is inside an `.app` bundle that
 is updated (the path changes). This needs a real update cycle to verify.
 
