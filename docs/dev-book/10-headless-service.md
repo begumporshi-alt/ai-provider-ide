@@ -2008,7 +2008,7 @@ one is the deletion:
 | **25a — landed** | `core/egress_port.rs` — `impl HttpPort for EgressPort`, the production implementor the plan's own future tense had assumed existed (D40). Un-gates `egress::stream` off `tauri::ipc::Channel` onto an `mpsc` sink, so `egress.rs` now carries **no** `cfg(feature = "app")` at all |
 | **25b — landed** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1). It also gave `RouterSettings` its first production source, a prerequisite none of D39's three gaps had named |
 | **25c — landed** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code did before this increment (D40). `core/activation.rs` is `register`'s **first production caller**. It iterates manifest rows rather than providers, because the reference's `PROVIDER_PROFILES[slug]` branch has no Rust port — harmless on this install, a divergence elsewhere (**D41**) |
-| **25d** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability |
+| **25d — landed** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability. `core::ledger::StoreLedgerSink` is the **first production `LedgerSink`**, and `persist::ledger_insert` is `pub` and un-gated, so the headless service writes ledger rows with no command in the path |
 | **25e** | Install `RouterBridge` — hydrate, register the adapters, build the `EgressPort`, point `BridgeHost` at `GatewayCore`, and swap `HeadlessBridge` in `bin/aiproviderd.rs`, whose `ready()` answers `false` and so makes every completion a deliberate 503 |
 | **25f** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)**. Safe only once 25a–25e stand a Rust path behind it |
 
@@ -2695,6 +2695,20 @@ headless **1112 → 1118**, so every new test is reachable with no Tauri in the 
 fixture that carries a superseded version, so a suite of nothing but well-formed active rows would
 have passed with no filter at all. Making activation abort on the first failure reddens exactly the
 three tests that exercise a failure, and none of the three that do not.
+
+**Increment 25d — the ledger sink, and the error that reaches a client.** D39's three gaps are now all closed. 25a took `egress::stream` off `tauri::ipc::Channel`; 25b un-gated `persist`'s row readers and gave `RouterStore::hydrate` its first production caller; 25d does the third, and it is the one whose absence was invisible — a router with no sink attached keeps the ledger in memory and raises no error, so nothing about a served request announces that nothing was written.
+
+`persist::ledger_insert` was `#[cfg(feature = "app")]` for no reason of its own. It takes a plain `&rusqlite::Connection` and touches no Tauri type; the gate was inherited from its caller, the `ledger_append` command. It is now `pub` and un-gated, and the command is a one-line delegate — the same shape `providers_rows` and `manifests_active_rows` took in 25b and 25c.
+
+`StoreLedgerSink` is the first production `LedgerSink`. `trait LedgerSink` (`ledger.rs:50`) had no implementor outside `#[cfg(test)]`; `UsageLedger::with_sink` (`:82`) was therefore reachable only from tests, and `SharedRouterState` built its ledger with no sink at all. The sink holds an `Arc<Store>` — not a `&Store`, because the ledger outlives any borrow once it is installed in `'static` shared state — and writes on the store's own connection.
+
+The error is sanitised because this one reaches a client. `UsageLedger::append` returns the sink's error; the router turns it into `RouterError::Ledger`; `router_bridge.rs:602` answers that with **502**. So the sink goes through `ui_db_error` exactly as a `#[tauri::command]` does: `e.to_string()` here would put SQL text and an absolute database path on the wire.
+
+The write is synchronous, under the ledger's own lock, and that is the reference's shape too. `append` is `&mut self`, reached through `SharedRouterState::ledger()`'s `MutexGuard`, so concurrent requests serialise their INSERTs — one local write, no deadlock, because the lock order is always `ledger → conn` and nothing in `persist` reaches back for the ledger.
+
+Four tests, two probes. Rust **1178 → 1182**; headless **1118 → 1122**, so all four run with no Tauri in the graph. Swallowing the database error reddens `the_store_sink_sanitises_a_database_failure` and `a_row_that_violates_a_check_constraint_is_an_error_not_a_silent_drop` **alone** — the two happy-path tests stay green, which is the point: an error-free sink and a sink that hides its errors are indistinguishable on the happy path. Passing the raw rusqlite error through instead of `ui_db_error` reddens **only** the sanitisation test, so "returns an error" and "returns a *safe* error" are separately enforced.
+
+A correction 25d found while writing the register. 25c's note in `adapter_runtime.rs` called `core::activation` "the first production caller of both `register` and this type's constructor". A grep says otherwise: `AdapterRuntime::new` occurs only in `#[cfg(test)]` code (`activation.rs:149`, `adapter_runtime.rs:347`). 25c closed `register`; the constructor's first production caller is 25e. The note and D40 now say so, and D40's tally stays at **two of five** — a method's caller is not a constructor's.
 
 ---
 

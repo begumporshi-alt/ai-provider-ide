@@ -18,7 +18,7 @@
 //! `app_key_id` — and the sink itself is installed on [`SharedRouterState`] by the launch. A bridge
 //! that owned a sink would be a second place a ledger row can be written from.
 //!
-//! # One thing this driver needs that does not exist yet
+//! # The three things this driver needed that did not exist yet — all three now exist
 //!
 //! `RouterBridge` compiles and is tested here (26 tests, against a real `ModelRouter` and a real
 //! `RouterStore` — the only double is the adapter), but **nothing installs it yet**. Three paths
@@ -33,17 +33,20 @@
 //!    `tauri::ipc::Channel`, so `egress.rs` carries no `cfg(feature = "app")` at all, and
 //!    `core::egress_port::EgressPort` is the production `HttpPort` implementor. `generate_text`
 //!    always streams (`router.rs:717`), so without it there is no text path at all.
-//! 3. **The ledger row — still open, and 25d.** `persist::ledger_insert` already takes a plain
-//!    `&Connection` and is nonetheless `#[cfg(feature = "app")]`. This one is durability rather
-//!    than reachability: a router with no sink attached keeps the ledger in memory and raises no
-//!    error, so the bridge can serve without it.
+//! 3. **The ledger row — closed in 25d.** `persist::ledger_insert` takes a plain `&Connection` and
+//!    is now un-gated, and `core::ledger::StoreLedgerSink` is the production `LedgerSink` the seam
+//!    was waiting for (`trait LedgerSink` at `ledger.rs:50`; every implementor before it was a
+//!    `#[cfg(test)]` double). This one was durability rather than reachability — a router with no
+//!    sink attached keeps the ledger in memory and raises no error, so the bridge could serve
+//!    without it, which is why it was the last of the three and why 25e, not this module, decides
+//!    where the sink is installed.
 //!
 //! So this module is deliberately written against seams — `Arc<RouterStore>`,
 //! `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>` — which is what lets it be tested now with the
 //! doubles the crate already has, and what fixes the interface the remaining gap must satisfy. See
 //! the module's own test section for what "tested" means here: every path below runs against a real
-//! `ModelRouter`, not a mock of it. What still stands between this and a launch is 25c (the
-//! manifest activation path) and 25e (the install itself) — including a source for
+//! `ModelRouter`, not a mock of it. What still stands between this and a launch is 25e (the
+//! install itself) — including a source for
 //! [`BridgeHost::settings`], which 25b supplied as `RouterSettings::from_store`.
 
 use std::collections::HashMap;

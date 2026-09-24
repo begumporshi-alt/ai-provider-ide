@@ -4515,3 +4515,44 @@ tell you where the newline is.
 `09-status.md`: new increment row, Tests cell **1172 → 1178** with headless **1112 → 1118**.
 `book.html`: 204 ids, **658.2 KB**, 0 `data-page-node-id`.
 
+
+## Increment 25d — the ledger sink, and the error that reaches a client (2026-09-24)
+
+**Files touched:** `core/ledger.rs`, `core/persist.rs`, `core/adapter_runtime.rs`, `core/router_bridge.rs`, `docs/07-drift-register.md`, `docs/10-headless-service.md`, `docs/09-status.md`, `docs/book.html`.
+
+### The change
+
+- **`persist::ledger_insert` → `pub` and un-gated** (was `#[cfg(feature = "app")]`). The command stays as a one-line delegate. Same shape as 25b/25c's `*_rows` split.
+- **`StoreLedgerSink`** — first production `LedgerSink` (`trait LedgerSink` had no implementor outside `#[cfg(test)]`). Writes on the store's own connection, holds `Arc<Store>` (not `&Store`) because `'static` shared state. Sanitises with `ui_db_error` because `RouterError::Ledger` → **502** (`router_bridge.rs:602`). Write is synchronous under ledger lock (`ledger → conn`, no deadlock).
+
+### The tests
+
+Four tests added to `core/ledger.rs`:
+- `the_store_sink_writes_rows_that_read_back`
+- `the_sink_is_accepted_by_the_ledger_and_writes_through_it`
+- `the_store_sink_sanitises_a_database_failure`
+- `a_row_that_violates_a_check_constraint_is_an_error_not_a_silent_drop`
+
+Rust **1178 → 1182**; headless **1118 → 1122**.
+
+### The probes
+
+| probe | change | result |
+|---|---|---|
+| swallow error | `let _ = ledger_insert(...); Ok(())` | the **2** failure tests red; 2 happy-path stay green |
+| raw error | `.map_err(|e| Box::new(e))` instead of `ui_db_error` | **only** the sanitisation test red |
+
+**The green half is the finding.** An error-free sink and one that hides its errors are indistinguishable on the happy path. Passing the raw rusqlite error through reddens only the sanitisation test, so "returns an error" and "returns a *safe* error" are separately enforced.
+
+### A correction found while writing
+
+25c's note in `adapter_runtime.rs` called `core::activation` "the first production caller of both `register` and this type's constructor". A grep says `AdapterRuntime::new` occurs only in `#[cfg(test)]` code (`activation.rs:149`, `adapter_runtime.rs:347`). 25c closed `register`; the constructor is still open for 25e. D40's tally stays at **two of five** — a method's caller is not a constructor's. Fixed in the module note and in D40.
+
+### The docs
+
+- D39 status → "All three closed" (gaps 1–3: 25a, 25b, 25d).
+- D40 verdict → "Partly fixed in 25a–25c"; D40 sentence fixed (`AdapterRuntime` is "half" closed).
+- `router_bridge.rs` header → "all three now exist".
+- `10-headless-service.md`: table row 25d landed, full increment section.
+- `09-status.md`: Tests cell **1178 → 1182**, count history extended.
+- `book.html`: 204 ids, **666.0 KB**, 0 `data-page-node-id`.

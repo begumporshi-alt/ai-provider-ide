@@ -562,8 +562,12 @@ pub struct LedgerRow {
 /// Split out of the command so the column list and the bound values can be tested *together*. A
 /// `#[tauri::command]` taking `State` cannot be called from a unit test, and an INSERT no test can
 /// reach is how 0015's column ended up present, nullable, correctly shaped — and empty.
-#[cfg(feature = "app")]
-fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result<()> {
+///
+/// **`pub` and un-gated since 25d**, for the reason D39 gave: it has always taken a plain
+/// `&Connection` and touched no Tauri type, so the `app` gate was inherited from its caller rather
+/// than earned. `core::ledger::StoreLedgerSink` is the other caller — the headless service writes
+/// ledger rows without a command to go through.
+pub fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT INTO ledger (ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
          VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",

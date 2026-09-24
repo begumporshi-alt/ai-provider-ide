@@ -64,8 +64,10 @@
 //!
 //! - **No store read.** [`AdapterRuntime::register`] takes a parsed manifest. Who reads
 //!   `manifests.body_json` and calls it is the activation path's business, and that path is now
-//!   [`crate::core::activation`] (increment 25c) — which is the first production caller of both
-//!   `register` and this type's constructor. This module makes the sandbox *reachable* from the
+//!   [`crate::core::activation`] (increment 25c) — which is **`register`'s first production
+//!   caller**, and *not* this type's constructor's: `AdapterRuntime::new` still occurs only in
+//!   `#[cfg(test)]` code (`activation.rs:149`, `adapter_runtime.rs:347`), so the first production
+//!   construction of this type is 25e's. This module makes the sandbox *reachable* from the
 //!   router, which is what the plan's Phase 4b named; wiring it into `gateway.rs` is 25e's.
 //! - **No `baseUrl`.** The reference's `forProvider` returns `{ adapter, baseUrl }` and the engine
 //!   destructures only `{ adapter }` at both call sites, so [`AdapterFactory`] refuses the field
