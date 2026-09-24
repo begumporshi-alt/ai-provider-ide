@@ -3783,3 +3783,43 @@ than counted as a pass — a probe that cannot redden proves nothing in either d
 
 fmt clean · clippy clean · **1090 tests / 0 failed** · `--no-default-features --all-targets` compiles ·
 doc links 51/127 · dev book 12 chapters · key-leak OK · TS 6.0.3 · version sync 1.0.0.
+
+## Phase 5c reconnaissance — the tool host is already Tauri-free (2026-09-24)
+
+Measured before starting increment 24, because it decides the size of the job.
+
+- `tauri/tools.rs` is **1,464 lines**; the test modules begin at `:829` and `:1462`, so the
+  implementation is **828 lines**.
+- **Before `:829` the only `tauri::` mentions are four `#[tauri::command]` attributes** — `:126`,
+  `:144`, `:157`, `:805`. No `AppHandle`, no `State`. The imports are `std::fs`,
+  `std::process::{Command, Stdio}`, `std::sync`, `std::time`, `serde`.
+- So the tool host is **Tauri-free logic wearing four attribute macros**. Phase 5c needs a
+  *relocation*, not a rewrite: move the body to `core/tools.rs` and leave four thin wrappers behind.
+  It also brings ~630 lines of existing tests into the `--no-default-features` build, where they are
+  currently not compiled at all.
+- **There is no tool-host trait in `core/`** — a Grep for `trait (ToolHost|ToolRunner|ToolDispatch)`
+  finds nothing. `core/router_bridge.rs` may not name `crate::tauri::*`, so Phase 5c needs a seam of
+  the `HttpPort` / `AdapterFactory` shape.
+- The bridge's tool path today is a **round trip through Tauri IPC**: `gateway-bridge.ts:232` is
+  `invoke("gateway_tool_run", …)`, and `:346` hands the parser's output to `sandboxTurn` as
+  `mercuryCalls` — which is why increment 23 had to land before this one.
+
+### 24a landed — what the move actually cost (2026-09-24)
+
+`git mv tauri/tools.rs core/tools.rs` and `git mv tauri/tools_agent_tests.rs core/tools_agent_tests.rs`,
+four `#[tauri::command]` deletions, and `tauri/tools_cmds.rs` holding four delegating wrappers with no
+logic. `core/mod.rs` gains `pub mod tools`; `tauri/mod.rs` trades `tools` for `tools_cmds`; the eight
+`crate::tauri::tools::` call sites split by direction — `gateway_cmds.rs` (5 call sites + 3 in tests) to
+`crate::core::tools::`, `commands.rs`'s four `generate_handler!` entries to `tools_cmds`.
+
+**Verified after: 1090 / 0 unchanged** (the no-behaviour-change acceptance), fmt clean, clippy clean.
+
+**The finding: 51 tool tests had never been compiled headless.** `lib.rs:12-13` is
+`#[cfg(feature = "app")] pub mod tauri;`, so every test in `tauri/` was excluded from
+`--no-default-features` — including the 51 that test the sandbox the headless service is meant to enforce.
+Measured after the move: `cargo test --no-default-features` → **1030 passed / 0 failed**, all 51 included
+(grep `^test core::tools::` over that run → 51). The 979 before is subtraction, not a second measurement.
+
+**A pattern worth reusing: a `#[path]` module moves with its parent but needs its own `git mv`.** The
+out-of-line `#[path = "tools_agent_tests.rs"] mod agent_tests;` kept resolving only because both files moved
+into the same directory. Moving the parent alone would have left the path pointing into `tauri/`.

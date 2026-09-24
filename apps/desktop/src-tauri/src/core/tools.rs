@@ -123,7 +123,6 @@ pub struct ToolAllowlist {
 
 /// Announce the sandbox to the UI so it can show the user what is actually permitted,
 /// rather than making them trust a checkbox.
-#[tauri::command]
 pub fn tools_policy() -> ToolAllowlist {
     let mut programs: Vec<&'static str> = allowed_programs().iter().copied().collect();
     programs.sort_unstable();
@@ -141,7 +140,6 @@ pub fn tools_policy() -> ToolAllowlist {
 /// error field, as a *blank* one, so the user saw "the tool results came back empty" with no way
 /// to tell that the path they typed simply did not exist. Judging it up front is the difference
 /// between "your workspace root is wrong" and "the agent is broken".
-#[tauri::command]
 pub fn tools_check_root(root: String) -> Result<(), String> {
     validate_root(Path::new(&root)).map(|_| ())
 }
@@ -154,7 +152,6 @@ pub fn tools_check_root(root: String) -> Result<(), String> {
 ///
 /// It is the same folder the gateway confines its own tools to (`default_workspace_root`), so a
 /// file written through the gateway is readable from the Assistant: one workspace, not two.
-#[tauri::command]
 pub fn tools_default_root() -> Result<String, String> {
     crate::core::gateway::default_workspace_root()
         .map(|p| p.to_string_lossy().into_owned())
@@ -802,7 +799,6 @@ fn arguments_object(args: &serde_json::Value) -> Result<serde_json::Value, Strin
 }
 
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
-#[tauri::command]
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
     let root = match validate_root(Path::new(&req.root)) {
         Ok(c) => c,

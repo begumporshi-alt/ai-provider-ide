@@ -60,5 +60,6 @@ pub mod store;
 pub mod template;
 pub mod tool_registry;
 pub mod tool_wire;
+pub mod tools;
 pub mod usage;
 pub mod vault;

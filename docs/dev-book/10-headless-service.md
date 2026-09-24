@@ -1995,7 +1995,8 @@ four increments, and only the last one is the deletion:
 |---|---|
 | **22 — landed** | Port `gateway-normalizer.ts` (728 lines) and `gateway-client-detector.ts` (19 lines) to `core/gateway_normalizer.rs` |
 | **23 — landed** | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
-| 24 | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
+| **24a — landed** | Move the tool host from `tauri/tools.rs` into `core/tools.rs`, where the bridge can reach it |
+| 24b | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
 | 25 | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, and switch `build_core` |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
@@ -2104,6 +2105,28 @@ fallback, `None`-on-empty, `additionalProperties`, the cross-module `MUTATING_TO
 prefix-freeness tripwire. The tenth is worth naming because it crosses a module boundary: adding `read_file`
 to `gateway::MUTATING_TOOLS` reddens the registry's own test, which proves the test reads the gateway's
 constant rather than a copy of it.
+
+**Increment 24a — the tool host moves into `core/`, and it was never coupled at all.** Phase 5c needs
+`core/router_bridge.rs` to execute tools, and `core/` may not name `crate::tauri::*`. The open question was
+whether that meant rewriting the sandbox. It did not, and the measurement is the increment's first result:
+`tauri/tools.rs` is 1,464 lines, its implementation is 828 (the test modules begin at `:829`), and **before
+that point the only `tauri::` mentions are four `#[tauri::command]` attributes** — `:126`, `:144`, `:157`,
+`:805`. No `AppHandle`, no `State`. The test region mentions neither either, the out-of-line
+`tools_agent_tests.rs` (236 lines) is glue-free too, and its one outward reach — `default_workspace_root` —
+was already in `core/gateway.rs`. So the host was glue-free logic wearing four attribute macros, and the work
+was a `git mv`, four deletions, and four thin wrappers in `tauri/tools_cmds.rs`.
+
+**Two consequences, and the second is the one worth measuring.** The obvious one is that the bridge can now
+reach the host. The measurable one is that the tool tests changed sides of a line nobody was watching:
+`lib.rs:12-13` gates `pub mod tauri` behind `#[cfg(feature = "app")]`, so **51 tool tests were never compiled
+in the headless configuration at all** — and they are the tests for the sandbox the headless service is
+supposed to enforce. After the move, `cargo test --no-default-features` reports **1030 passed / 0 failed**,
+all 51 included. Before the move the same run would have reported 979 — by subtraction rather than a second
+measurement, since the move changed nothing else. That difference is coverage the split silently did not have.
+
+**No behaviour change, and the count is the proof:** 1090 passed / 0 failed on default features, exactly the
+increment-23 number. The wrappers add no logic, and must not — if one ever grows a line, that line belongs in
+`core::tools`, or the app and the service start enforcing two slightly different sandboxes.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 

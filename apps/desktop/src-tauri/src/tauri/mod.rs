@@ -7,5 +7,5 @@ pub mod app;
 pub mod app_nap;
 pub mod commands;
 pub mod gateway_cmds;
-pub mod tools;
+pub mod tools_cmds;
 pub mod workbuddy;

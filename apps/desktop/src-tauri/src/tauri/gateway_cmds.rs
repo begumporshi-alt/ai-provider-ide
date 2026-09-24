@@ -611,7 +611,7 @@ pub(crate) fn set_gateway_workspace_root(
     // accepting a bad root was never a breach — but `gateway_get_workspace_root` reported it as
     // set, and the refusal then surfaced mid-request as a tool error the model had to interpret.
     // Storing the canonical path also freezes `..` and symlinks: what is set is what is used.
-    let canonical = crate::tauri::tools::validate_root(&path)?;
+    let canonical = crate::core::tools::validate_root(&path)?;
     state.core.set_workspace_root(canonical);
     Ok(())
 }
@@ -805,7 +805,7 @@ pub(crate) fn run_gateway_tool(
     request_id: u64,
     tool_name: String,
     arguments: serde_json::Value,
-) -> Result<crate::tauri::tools::ToolResult, String> {
+) -> Result<crate::core::tools::ToolResult, String> {
     let root = state.core.workspace_root().ok_or_else(|| {
         "workspace root not set — call gateway_set_workspace_root first".to_string()
     })?;
@@ -829,7 +829,7 @@ pub(crate) fn run_gateway_tool(
             "tool req={request_id} tool={tool_name} args={digest} -> REFUSED: {}",
             truncate_chars(&reason, 200)
         ));
-        return Ok(crate::tauri::tools::ToolResult {
+        return Ok(crate::core::tools::ToolResult {
             ok: false,
             output: String::new(),
             error: Some(reason),
@@ -845,12 +845,12 @@ pub(crate) fn run_gateway_tool(
     // was, and a bounded error.
     let log_name = tool_name.clone();
     let digest = tool_arg_digest(&tool_name, &arguments);
-    let req = crate::tauri::tools::ToolRunRequest {
+    let req = crate::core::tools::ToolRunRequest {
         name: tool_name,
         arguments,
         root: root.to_string_lossy().to_string(),
     };
-    let result = crate::tauri::tools::tool_run(req);
+    let result = crate::core::tools::tool_run(req);
     record_gateway_tool_call(
         state.store.clone(),
         request_id,
@@ -879,7 +879,7 @@ pub fn gateway_tool_run(
     request_id: u64,
     tool_name: String,
     arguments: serde_json::Value,
-) -> Result<crate::tauri::tools::ToolResult, String> {
+) -> Result<crate::core::tools::ToolResult, String> {
     let log = |line: &str| log_to_file(&app, line);
     run_gateway_tool(&state, &log, request_id, tool_name, arguments)
 }
@@ -1328,14 +1328,14 @@ mod tool_audit_tests {
     /// a root the getter reported as set while every call refused it.
     #[test]
     fn a_bad_workspace_root_is_refused_at_set_time() {
-        assert!(crate::tauri::tools::validate_root(std::path::Path::new("/")).is_err());
+        assert!(crate::core::tools::validate_root(std::path::Path::new("/")).is_err());
         let home = std::env::var("HOME").unwrap_or_default();
         if !home.is_empty() {
-            assert!(crate::tauri::tools::validate_root(std::path::Path::new(&home)).is_err());
+            assert!(crate::core::tools::validate_root(std::path::Path::new(&home)).is_err());
         }
         for d in ["/System", "/usr", "/bin", "/sbin", "/etc", "/private"] {
             assert!(
-                crate::tauri::tools::validate_root(std::path::Path::new(d)).is_err(),
+                crate::core::tools::validate_root(std::path::Path::new(d)).is_err(),
                 "{d} must be refused"
             );
         }
