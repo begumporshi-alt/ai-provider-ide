@@ -3086,6 +3086,129 @@ simply never matches"* and asserts `.toThrow()`. The assertion is right (`new Re
 `manifest-interpreter.ts:230` / `code-adapter.ts:134` return directly with no catcher upstream); the
 **name** is wrong, and the name is what a porter reads first.
 
+## Increment 18 — `core/sandbox.rs`, the engine-free half of `code-adapter.ts`
+
+1,285 lines, 43 tests, Rust **900 → 943**. The port's rules half only; `rquickjs`, the module door
+(`Module::declare` + `get("default")`), the `Ctx` job pump, the interrupt handler and the streaming
+driver are increment 19, and the wall-clock deadline is deliberately absent from `OpBudget` because
+only the interrupt handler can enforce it.
+
+### The nine constants, and where the reference keeps them
+
+| constant | value | `code-adapter.ts` |
+|---|---|---|
+| `SOURCE_LIMIT` | 64,000 | `:62` |
+| `OP_BUDGET_MS` | 45,000 | `:63` |
+| `HTTP_CALLS_PER_OP` | 20 | `:64` |
+| `EMIT_LINES_PER_OP` | 400 | `:65` |
+| `BODY_CAP` | 8,000,000 | `:66` |
+| `MEMORY_LIMIT` | 32 MiB | `:67` |
+| `STACK_LIMIT` | 512 KiB | `:68` |
+| `ERROR_BODY_CAP` | 500 | inline `slice(0, 500)`, `:489` |
+| `LOG_LINE_CAP` | 500 | inline `slice(0, 500)`, `:166` |
+
+### The lint: `\b` is ASCII in JavaScript and Unicode in Rust
+
+Twelve patterns, and the port's column differs from the reference's by exactly `\b` → `(?-u:\b)`:
+
+```
+import\s*\(   import\s+[\w{*]   require\s*\(   eval\s*\(
+new\s+Function\b   Function\s*\(   WebAssembly\b   Atomics\b
+SharedArrayBuffer\b   fetch\s*\(   XMLHttpRequest\b   import\.meta\b
+```
+
+Measured: `/\bWebAssembly\b/.test("éWebAssembly")` is **true** in JavaScript — `é` is not a word
+character there — while Rust's Unicode `\b` finds no boundary, so a guest could prefix any forbidden
+identifier with one non-ASCII letter and pass. `unicode(false)` globally cannot be the fix: it makes `.`
+byte-oriented and `RegexBuilder::new("^dall-e-.*$").unicode(false).build()` fails with *pattern can match
+invalid UTF-8*. `\w` and `\s` are left Unicode-aware, which makes the lint *stricter* on those two — the
+safe direction, and reachable only for sources that are not valid JavaScript.
+
+### `String(x)`, measured against node
+
+| input | result |
+|---|---|
+| `5`, `true` | `"5"`, `"true"` |
+| `{}` | `"[object Object]"` |
+| `[]`, `[1,2]`, `[null,1]` | `""`, `"1,2"`, `",1"` |
+| `1e20`, `1e21` | `"100000000000000000000"`, `"1e+21"` |
+
+ECMAScript switches to exponential form outside the decimal exponent range `[-7, 21)`. The exponent is
+read back out of Rust's own `{:e}` rendering rather than recomputed, because recomputing it means a
+second implementation of decimal-to-shortest-digits. Probes print the divergence exactly:
+`"0.0000001"` against `"1e-7"`.
+
+### `read_status`: `Number(v ?? 0)` narrowed to `u16`
+
+| guest value | `Number()` | port | why |
+|---|---|---|---|
+| `200`, `"200"`, `" 200 "` | 200 | 200 | a plain non-negative integer in `u16` |
+| `NaN` (network failure) | `NaN` | **0** | the reference's own "no result" value |
+| `-1`, `1.5`, `1e21` | as written | **0** | not a status |
+| `"0x10"` | 16 | **0** | a recorded divergence — `ToNumber` parses hex, `parse::<u16>` does not |
+
+### `is_auth_header`: five comparisons, 26 measured inputs
+
+`/^(authorization|x-api-key|x-goog-api-key|api-key|cookie)$/i` at `code-adapter.ts:69`. **Blocked**:
+the five names in every ASCII case variant, including `AuThOrIzAtIoN` and `X-API-KEY`. **Not blocked**:
+`authorisation`, `auth`, `x-api-keys`, `" authorization"` (leading space — the anchors reject it, so
+`trim()` must **not** be applied), `AUTHORIZATION\0`, the Turkish `AUTHORİZATION` (U+0130) and
+`authorızatıon` (U+0131), and the fullwidth `ＡUTHＯORIZATION`. All 26 verdicts agree.
+
+### Two rules measured rather than assumed
+
+- **`Object.fromEntries` dedupes a repeated key**: last value, **first** position. A manifest declaring
+  `X` twice yields one header in the reference and two in a `Vec` that pushes unconditionally.
+- **An empty auth prefix is no prefix**: `h.prefix ? \`${h.prefix} {{secret}}\` : "{{secret}}"` — `""` is
+  falsy, so the header is the bare sentinel, not `" {{secret}}"` with a leading space.
+
+### Eight probes, each reverted by its inverse edit, each verified by hash
+
+Baseline `sha256 8a76daa6253538726e5e91c9c2de4f1cfcbfde637e7d2117bfa804f6e8f58b83`, re-checked after
+every revert.
+
+| probe | reddens | count |
+|---|---|---|
+| protocol-relative clause removed from the path check | `an_absolute_or_traversing_path_is_rejected`, `the_rejection_message_quotes_and_truncates_the_path` | 2 |
+| `eq_ignore_ascii_case` → `==` | `the_auth_filter_agrees_with_the_javascript_regex_on_every_measured_input`, `a_guest_cannot_override_the_injected_credential` | 2 |
+| `>=` → `>` on `HTTP_CALLS_PER_OP` | `the_twentieth_call_is_admitted_and_the_twenty_first_is_refused`, `the_rate_limit_outranks_the_path_check` | 2 |
+| `js_utf16_len` → `chars().count()` | `the_length_filter_counts_utf16_units_not_scalars` | 1 |
+| export-default pattern anchored `^` | `the_export_default_check_tolerates_whitespace_and_leading_text` | 1 |
+| forbidden table compiles the **JS** column | `a_non_ascii_letter_cannot_smuggle_a_forbidden_construct_past_the_lint` | **1** |
+| `js_truthy` → `as_bool().unwrap_or(false)` | `ok_is_javascript_truthiness_where_the_empty_array_is_true` | 1 |
+| negative half of the exponent rule dropped | the two number-formatting tests | 2 |
+
+**The finding worth more than it cost:** compiling the JavaScript column reddens *only* the tripwire
+test — `éWebAssembly must still be flagged, got []` — while
+`the_forbidden_table_compiles_and_its_two_columns_differ_only_by_the_boundary_flag` stays **green**,
+because it reads the `FORBIDDEN` constant rather than `forbidden_patterns()`. **A drift guard is not a
+behaviour guard**; only the adversarial test sees the difference. The export-default probe shows the same
+shape one layer down: the anchored pattern reddens one test while `a_clean_source_passes` stays green.
+
+### D29 — the stale line count in §2.2
+
+`Rust host today: 25,612 lines across 25 modules` reproduced by no definition, measured 2026-09-24:
+
+| definition | lines | files |
+|---|---|---|
+| `src/**/*.rs`, all lines, `wc -l` | **42,696** | 51 |
+| `src/core/*.rs` | **37,615** | 40 |
+| `src/core/*.rs` minus every `#[cfg(test)]` block | **19,089** | 40 |
+
+It drifted without any single change making it false — increments 1–18 added ~17,000 lines — which is why
+no gate caught it. The deeper defect was the **missing basis**: a line count that does not say whether it
+includes tests is not checkable, and an uncheckable number in a row labelled "today" rots again.
+
+### Writing in `dev-book` table rows: a bare `|` silently adds columns
+
+A `|` inside a table cell splits it into another column. The convention here is to escape it `\|`, and the
+8 pre-existing escapes in `07-drift-register.md` (inside `<code>` spans, e.g.
+`cargo tree --no-default-features --edges all \| grep -ci 'webkit\|wry\|gtk'`) show the trade: **the row
+keeps its column count, but `build-dev-book.mjs` does not unescape, so the backslashes are visible in the
+rendered `book.html`.** Neither `docs:book` nor `check-doc-links` fails on a row that has gained a column,
+so this is caught by eye in the rendered book, not by a gate. Measured 2026-09-24 when a quoted regex added
+four pipes to a two-column row in `09-status.md` (3 → 7 unescaped); the fix was four `\|`.
+
 ## Relocated from MEMORY.md — facts, not rules
 
 - DB: `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (`?mode=ro`).

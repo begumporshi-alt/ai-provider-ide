@@ -353,16 +353,40 @@ probes service `http` synchronously, which is faithful to the TS test's `FakeHtt
 `AsyncContext`/`ctx.spawn`. That last one is the largest remaining unknown, and it is the natural next
 probe rather than a port-time surprise.
 
+**Update, 2026-09-24 (increment 18): the engine-free half has landed, and where the sandbox runs is still
+open.** The decision this section promotes is **not taken**. What landed is the half of `code-adapter.ts`
+that needs no JavaScript engine — `core/sandbox.rs`, the admissible-source rule, the http contract, the emit
+budget and the four coercions a guest's answer passes through — which is the split that let `manifest.rs`
+land before `interpreter.rs`. None of it decides the process question, and the module note says so in place
+rather than leaving a reader to infer it.
+
+**The candidate probe is named here so the next increment does not have to rediscover it.** S6b, S6c and S6d
+differ in exactly one respect: whether the out-of-memory is raised **before or after the guest's first
+`await`**. Before, the host dies — `SIGSEGV`, 3 of 3 runs, at 8 MB *and* at the TypeScript's own 32 MB. After,
+the same trap rejects cleanly. That is a one-variable experiment, and it is the experiment that decides whether
+the heap ceiling needs a supervisor process at all or whether the allocating entry segment can be fenced off
+in-process. **It has not been run, and nothing here claims the fence works.** Until a probe says otherwise,
+§8's subprocess fallback stays the recommended shape for the heap boundary specifically.
+
 ### 2.2 The line count
 
 ```
 Router-core TypeScript:  5,880 lines across 35 modules
-Rust host today:        25,612 lines across 25 modules
+Rust host today:        42,696 lines across 51 files
 What must move:         ~2,100 lines (execution, router, planner, compression, health, ledger)
 Adapter runtime:        ~1,100 lines (code-adapter 615 + manifest-interpreter 491) — omitted from this list until 2026-09-24
 What can be deleted:    ~300 lines (bridge, worker window, App Nap)
 Net new Rust:           ~2,500 lines (port + process manager + tests) — computed without the row above
 ```
+
+**The `Rust host today` row was stale and is corrected (D29).** It read `25,612 lines across 25 modules`
+until 2026-09-24, and no definition reproduces that pair: `apps/desktop/src-tauri/src/**/*.rs` is **42,696**
+lines across **51** files, `src/core/*.rs` alone is **37,615** across 40, and `src/core/*.rs` with every
+`#[cfg(test)]` block excluded is **19,089**. The row is a *planning snapshot* and it was written when the tree
+was smaller — increments 1–18 added ~17,000 lines to it — so the honest repair is to re-measure rather than to
+defend the old number. The basis is now stated because it was the ambiguity that let the figure rot: **all
+lines, including `#[cfg(test)]` blocks, counted by `wc -l` over `src/**/*.rs`.** A count that does not say
+whether it includes tests will drift again.
 
 The 5,880 figure includes modules that do NOT need to move: `builtin-templates.ts` (static data),
 `redaction.ts` (generator-only), `adapter-generator.ts` (generator-only), `onboarding-orchestrator.ts`

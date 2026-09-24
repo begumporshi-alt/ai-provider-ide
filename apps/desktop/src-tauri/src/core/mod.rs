@@ -49,6 +49,7 @@ pub mod persist;
 pub mod planner;
 pub mod pricing;
 pub mod router;
+pub mod sandbox;
 pub mod skills;
 pub mod store;
 pub mod template;
