@@ -1,27 +1,31 @@
 //! `aiproviderd` — the gateway as a standalone service. No Tauri, no WebView, no window.
 //!
-//! Phase 1 of the headless plan (`docs/dev-book/10-headless-service.md`). What this proves is
-//! narrow and worth stating exactly: **the HTTP server starts and binds without a Tauri app.**
-//! It does not serve completions, and it is not supposed to yet.
+//! Phase 5e of the headless plan (`docs/dev-book/10-headless-service.md`). The HTTP server
+//! starts, binds, and **serves completions** through a Rust-native `RouterBridge` that runs
+//! the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`.
 //!
-//! The router core is still TypeScript running in a hidden webview, reached through the
-//! `Bridge` trait. With no webview there is nothing to bridge to, so this binary installs
-//! `HeadlessBridge`, which discards every dispatch and reports itself **not ready** — so every
-//! completion route answers **503 core unavailable**, by design. Auth, capacity, spend and
-//! `/health` still work because none of them touch the bridge.
-//!
-//! That 503 used to arrive for the wrong reason. `is_available()` was
-//! `is_running() && beat_is_fresh()`, and no heartbeat ever arrives here, so the request was
-//! refused by a liveness gate no bridge could open. The gate is now `Bridge::ready` (D35), so
-//! this binary's answer is its own statement rather than a question the core asked of a webview
-//! that is not there. `HeadlessBridge::ready` says `false` because it genuinely cannot serve.
-//!
-//! Phase 5c replaces `HeadlessBridge` with `RouterBridge`, which answers `true`.
+//! `HeadlessBridge` (the old placeholder that answered 503) is still present in this file as
+//! a test double, but it is no longer installed: the binary now builds a full `RouterBridge`
+//! from the store's four tables (hydration, 25b), the egress port (25a), the activated adapters
+//! (25c), and the store-backed ledger sink (25d).
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use ai_provider_router_lib::core::{crash_report, gateway, store};
+use ai_provider_router_lib::core::{
+    activation,
+    adapter_runtime::AdapterRuntime,
+    crash_report,
+    egress::AllowList,
+    egress::EgressState,
+    egress_port::EgressPort,
+    gateway,
+    ledger::{StoreLedgerSink, UsageLedger},
+    router::{RouterSettings, RouterStore, SharedRouterState},
+    router_bridge::{BridgeHost, RouterBridge},
+    store,
+};
+use tokio::runtime::Handle;
 
 /// The gateway's own port. Not `gateway::DEFAULT_PORT`, which is 8787 — the value the desktop
 /// app was left with and which collides with AI Hub v2's port. The persisted setting always
@@ -59,6 +63,7 @@ fn data_dir() -> Result<PathBuf, String> {
 
 /// The bridge with nothing on the other end. See the module note: this is what makes every
 /// completion 503 until Phase 2 lands a real router core behind it.
+#[allow(dead_code)]
 struct HeadlessBridge;
 
 impl gateway::Bridge for HeadlessBridge {
@@ -79,6 +84,27 @@ impl gateway::Bridge for HeadlessBridge {
     /// gate that was never going to open. The gate is now the bridge's own statement (D35).
     fn ready(&self, _beat: gateway::Beat) -> bool {
         false
+    }
+}
+
+/// The host the headless service presents to the bridge. Reads settings from the store and
+/// returns the same defaults the desktop app builds with.
+struct HeadlessHost {
+    store: Arc<store::Store>,
+}
+
+impl BridgeHost for HeadlessHost {
+    fn settings(&self) -> RouterSettings {
+        RouterSettings::from_store(&self.store)
+    }
+    fn tools_enabled(&self) -> bool {
+        true
+    }
+    fn tools_mutation_enabled(&self) -> bool {
+        false
+    }
+    fn workspace_root(&self) -> Option<String> {
+        None
     }
 }
 
@@ -115,9 +141,52 @@ async fn main() {
 
     let port = gateway::persisted_gateway_port(&store).unwrap_or(SERVICE_DEFAULT_PORT);
 
-    // Same wiring as the desktop app builds in `gateway_cmds::manage`, minus the bridge: the
-    // key, per-app-key and spend providers are all store-backed and Tauri-free already.
-    let core = gateway::GatewayCore::new(Arc::new(HeadlessBridge), gateway::vault_key_provider())
+    // Build the egress (25a), the adapter runtime (25c), and the router store (25b).
+    let allow = Arc::new(AllowList::default());
+    let egress_state = Arc::new(EgressState::new(allow, store.clone()));
+    let egress_port = Arc::new(EgressPort::new(egress_state));
+    let runtime = AdapterRuntime::new(egress_port);
+
+    // Activate every manifest that has an active row (25c). Skip, don't abort.
+    let activation = match activation::activate(&runtime, &store) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("aiproviderd: activation failed: {e}");
+            std::process::exit(1);
+        }
+    };
+    if !activation.registered.is_empty() {
+        println!("aiproviderd: activated {} provider(s)", activation.registered.len());
+    }
+    for skipped in &activation.skipped {
+        eprintln!(
+            "aiproviderd: skipped provider {} v{}: {}",
+            skipped.provider_id, skipped.version, skipped.reason
+        );
+    }
+
+    let router_store = match RouterStore::from_store(&store) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            eprintln!("aiproviderd: router store hydration failed: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let ledger = UsageLedger::new().with_sink(Box::new(StoreLedgerSink::new(store.clone())));
+    let shared = SharedRouterState::new().with_ledger(ledger);
+    let host = Arc::new(HeadlessHost { store: store.clone() });
+    let bridge = Arc::new(RouterBridge::new(
+        router_store,
+        Arc::new(runtime),
+        shared,
+        host,
+        Handle::current(),
+    ));
+
+    // Same wiring as the desktop app builds in `gateway_cmds::manage`: the key, per-app-key
+    // and spend providers are all store-backed and Tauri-free already.
+    let core = gateway::GatewayCore::new(bridge, gateway::vault_key_provider())
         .with_store(store.clone())
         .with_app_keys(gateway::vault_app_key_provider(store.clone()))
         .with_spend(gateway::vault_spend_provider(store));
@@ -134,7 +203,7 @@ async fn main() {
     };
 
     println!("aiproviderd {version} listening on {}", handle.addr);
-    println!("GET /health is live; completion routes answer 503 until the router core is ported.");
+    println!("GET /health is live; completion routes are served by the Rust router core.");
 
     // Blocks forever. There is no `tokio::signal` feature enabled, and a service has no stdin
     // to close; termination is the supervisor's job (launchd / systemd / Ctrl-C).
@@ -143,8 +212,20 @@ async fn main() {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use ai_provider_router_lib::core::gateway::Bridge;
+
+    fn tmp_store() -> (store::Store, std::path::PathBuf) {
+        static COUNTER: AtomicUsize = AtomicUsize::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("aip-aiproviderd-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let s = store::Store::open(&dir).unwrap();
+        (s, dir)
+    }
 
     /// The service's bridge reports itself unable to serve, and that answer is what turns every
     /// completion into a fast `503 core unavailable` rather than a request parked inside the bridge
@@ -161,5 +242,40 @@ mod tests {
             !HeadlessBridge.ready(beat),
             "a bridge that discards every dispatch is not ready, however fresh the beat"
         );
+    }
+
+    #[test]
+    fn headless_host_returns_defaults_on_an_empty_store() {
+        let (store, _dir) = tmp_store();
+        let host = HeadlessHost { store: Arc::new(store) };
+        assert_eq!(host.settings(), RouterSettings::default());
+        assert!(host.tools_enabled());
+        assert!(!host.tools_mutation_enabled());
+        assert_eq!(host.workspace_root(), None);
+    }
+
+    #[test]
+    fn headless_host_reads_settings_from_the_store() {
+        let (store, _dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value_json) VALUES ('router', '{\"failoverEnabled\":true,\"systemAi\":{\"providerId\":\"openai\",\"model\":\"gpt-4\"},\"perProviderConcurrency\":8}')",
+                [],
+            )
+            .unwrap();
+        }
+        let host = HeadlessHost { store: Arc::new(store) };
+        let s = host.settings();
+        assert!(s.failover_enabled);
+        assert_eq!(
+            s.system_ai,
+            Some(ai_provider_router_lib::core::router::SystemAiPick {
+                provider_id: "openai".to_string(),
+                model: "gpt-4".to_string(),
+            })
+        );
+        // perProviderConcurrency is copied through un-clamped, so the raw Value is preserved.
+        assert_eq!(s.per_provider_concurrency, serde_json::json!(8));
     }
 }
