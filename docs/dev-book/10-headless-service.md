@@ -2136,19 +2136,41 @@ implement is a liveness subsystem that exists *only* because the worker is a web
 background-mode bounds, the re-warm on the request path, and the three `r1_*` tests. `app_nap.rs` exists for
 that reason and no other.
 
-**The hazard is concrete.** The webview beats every 2 s (`gateway-bridge.ts:130`); `beat_is_fresh()` goes
-false 6 s after the last beat; and a request arriving on a stale beat is *waited out and then answered* `503`
-(`core/gateway.rs:1373`). So deleting the worker without retiring the gate makes every request a 503 six
-seconds after the app stops beating. And `RouterBridge` cannot simply take the beat over: `ReplyHandle`
-deliberately does not hold the core — the reference cycle increment 12 designed out — so the beat has no
-source until one is chosen.
+**The hazard is concrete, and worse than a bare 503.** The webview beats every 2 s
+(`gateway-bridge.ts:130`); `beat_is_fresh()` goes false 6 s after the last beat. The gate itself is
+`if !core.is_available() && !await_core(core).await` (`core/gateway.rs:1418`), and `is_available()` is
+`is_running() && beat_is_fresh()` (`:1124`). So a request arriving on a stale beat is first **stalled for
+`CORE_RECOVERY_GRACE` = 5 s**, polled every 150 ms (`:1369-1370`), and only then answered `503`. Deleting the
+worker without retiring the gate therefore costs every client five seconds *and* a 503, permanently — nothing
+will ever beat again. And `RouterBridge` cannot simply take the beat over: `ReplyHandle` deliberately does not
+hold the core — the reference cycle increment 12 designed out — so the beat has no source until one is chosen.
 
 **So 24b-ii has a prerequisite the plan did not have.** The beat's source must be decided before the driver
-is written, and there are two shapes: the core beats itself when a Rust bridge is installed (a Rust bridge is
-always awake, so "the worker is asleep" becomes unrepresentable and the 503 branch it guards becomes dead
-code), or a narrow `Beat` seam is handed to the bridge the way `ReplyHandle` and `HttpPort` are. The first is
-smaller and truer to what a headless service is; the second keeps the gate meaningful for a mixed
-configuration. Either way it is a decision, and D35 records that it is currently unnamed.
+is written. There are two shapes, and the second is the one to take:
+
+- **The core stops asking.** When a Rust bridge is installed, `beat_is_fresh()` short-circuits true.
+  Rejected. A Rust bridge *is* always awake, so "is it awake?" is not answered — it is **bypassed by a flag**,
+  and that flag is a second spelling of state the core already holds (which bridge is installed). This project
+  has already paid twice for two spellings of one state (`NULL` vs `0`); a bypass is the same defect with a
+  different subject.
+- **A seam on the `Bridge` trait.** Sync, defaulted, so no async-in-trait machinery is needed:
+
+  ```rust
+  fn ready(&self) -> bool { true }   // a bridge in this process is always awake
+  fn warm(&self) {}                  // ask the bridge to recover, if it can
+  ```
+
+  `EventBridge` overrides both with the heartbeat and the re-composite. The other **three** impls —
+  `NoopBridge` (`core/gateway.rs:465`), `SynthBridge` (`core/gateway_tests.rs:97`) and `MinimalBridge`
+  (`:3186`) — are test doubles and inherit the defaults untouched. `await_core` stays in the core, calling
+  `bridge.ready()` / `bridge.warm()` in place of `beat_is_fresh()` / `request_warm()`.
+
+  **Why this one:** it is the shape that makes Phase 5d *safe by construction*. With `EventBridge` deleted the
+  defaults make `await_core` return true on its first poll, so the loop and the 503 branch become visibly
+  unreachable rather than silently wrong — the compiler and the tests show what is dead instead of leaving a
+  gate that fires on a condition nobody sets. The cost is one trait method pair and two overrides, paid once.
+
+Either way it is a decision, and D35 records that it is currently unnamed.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 

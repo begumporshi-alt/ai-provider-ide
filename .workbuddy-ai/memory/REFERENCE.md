@@ -3897,10 +3897,30 @@ a **liveness subsystem that exists only because the worker is a webview the OS c
 stale beat is *waited out and then 503'd* (`core/gateway.rs:1373`). So deleting the worker without retiring
 the gate makes every request a 503 six seconds after the app stops beating.
 
+**The exact gate is `core/gateway.rs:1418`** — `if !core.is_available() && !await_core(core).await` — and
+`is_available()` is `is_running() && beat_is_fresh()` (`:1124`). So the failure is not an instant 503: the
+request is *stalled* for `CORE_RECOVERY_GRACE = 5_000` (`:1369`, polled every 150 ms at `:1370`) and then
+503'd. Deleting the worker without retiring the gate costs every client 5 s and a 503, forever, because
+nothing will ever beat again.
+
 **`RouterBridge` cannot simply beat instead.** `ReplyHandle` deliberately does not hold the core — the
-reference cycle increment 12 designed out — so there is no beat source unless one is chosen. Two shapes: the
-core beats itself when a Rust bridge is installed (a Rust bridge is always awake, so "the worker is asleep"
-becomes unrepresentable and that 503 branch becomes dead code), or a narrow `Beat` seam handed to the bridge
-the way `ReplyHandle` and `HttpPort` are. The first is smaller and truer to a headless service.
+reference cycle increment 12 designed out — so there is no beat source unless one is chosen.
+
+**Two shapes, and the seam is the right one.** (a) The core stops asking: when a Rust bridge is installed
+`beat_is_fresh()` short-circuits true. Rejected — a Rust bridge *is* always awake, so "is it awake?" is not
+answered, it is **bypassed by a flag**, and the flag is a second spelling of state the core already holds
+(which bridge is installed). That is the `NULL` vs `0` defect shape this project has already paid for twice.
+(b) **A seam on the `Bridge` trait, sync, defaulted:**
+```rust
+fn ready(&self) -> bool { true }   // a bridge in this process is always awake
+fn warm(&self) {}                  // ask the bridge to recover, if it can
+```
+`EventBridge` overrides both with the heartbeat and the re-composite; the other **three** impls
+(`NoopBridge` `core/gateway.rs:465`, `SynthBridge` `core/gateway_tests.rs:97`, `MinimalBridge` `:3186`) are
+test doubles and inherit. `await_core` stays in the core, calling `bridge.ready()` / `bridge.warm()` instead
+of `beat_is_fresh()` / `request_warm()`. **No async in the trait** — the wait loop is already in the core.
+Chosen because it is the shape that makes 5d *safe by construction*: with `EventBridge` deleted the defaults
+make `await_core` a no-op on its first poll, so the loop and the 503 branch become visibly unreachable rather
+than silently wrong. Cost: one trait method pair and two overrides — small, and paid once.
 
 **Consequence for the plan: 24b-ii has a prerequisite it did not have — decide the beat's source first.**
