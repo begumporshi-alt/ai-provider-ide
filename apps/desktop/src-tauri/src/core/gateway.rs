@@ -465,6 +465,13 @@ mod core_recovery_tests {
     impl Bridge for NoopBridge {
         fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
         fn cancel(&self, _id: u64) {}
+        /// This double stands in for the webview bridge, so it answers through the same function
+        /// `EventBridge` uses. Answering `true` here would make `stale_core`'s own
+        /// `assert!(!is_available())` fail — which is the point of routing the question through the
+        /// bridge rather than the core.
+        fn ready(&self, beat: Beat) -> bool {
+            webview_ready(beat)
+        }
     }
 
     #[tokio::test]
@@ -500,6 +507,118 @@ mod core_recovery_tests {
         let core = stale_core();
         core.set_running(false);
         assert!(!core.is_running());
+        assert!(!core.is_available());
+    }
+
+    // ---------- the seam itself ----------
+    //
+    // D35's hazard, stated as tests. Before `Bridge::ready` existed the core asked
+    // `beat_is_fresh()` of every bridge, so a bridge with no webview behind it — `HeadlessBridge`
+    // today, `RouterBridge` next — looked permanently asleep: every request waited out
+    // `CORE_RECOVERY_GRACE` and then answered 503.
+
+    /// A bridge that runs in this process. It can always answer, and no heartbeat has anything to
+    /// do with it. This is what `RouterBridge` (24b-ii) will be.
+    struct AlwaysReadyBridge;
+    impl Bridge for AlwaysReadyBridge {
+        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
+        fn cancel(&self, _id: u64) {}
+        fn ready(&self, _beat: Beat) -> bool {
+            true
+        }
+    }
+
+    /// A bridge that cannot answer at all — `bin/aiproviderd.rs`'s `HeadlessBridge`.
+    struct NeverReadyBridge;
+    impl Bridge for NeverReadyBridge {
+        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
+        fn cancel(&self, _id: u64) {}
+        fn ready(&self, _beat: Beat) -> bool {
+            false
+        }
+    }
+
+    /// Records the `Beat` it was asked about, so a test can assert the core passed its own.
+    struct RecordingBridge(Arc<Mutex<Option<Beat>>>);
+    impl Bridge for RecordingBridge {
+        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
+        fn cancel(&self, _id: u64) {}
+        fn ready(&self, beat: Beat) -> bool {
+            *self.0.lock().unwrap() = Some(beat);
+            beat.is_fresh()
+        }
+    }
+
+    /// The same lapse as `stale_core`, with the bridge chosen by the caller.
+    fn stale_core_with(bridge: Arc<dyn Bridge>) -> Arc<GatewayCore> {
+        let core = Arc::new(GatewayCore::new(bridge, Arc::new(|| Some("sk-aip-test".to_string()))));
+        core.set_running(true);
+        core.set_hidden(true);
+        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_secs(60);
+        core
+    }
+
+    /// The two bounds, applied by `Beat` rather than by the core. One place decides what *fresh*
+    /// means, so the UI's `worker_awake` and the request path cannot disagree about it.
+    #[test]
+    fn the_beat_bound_follows_the_workers_visibility() {
+        assert!(
+            !Beat { age: Duration::from_millis(7_000), hidden: false }.is_fresh(),
+            "7s is past the 6s bound for a visible worker"
+        );
+        assert!(
+            Beat { age: Duration::from_millis(7_000), hidden: true }.is_fresh(),
+            "and inside the 30s bound for a hidden one"
+        );
+        assert!(!Beat { age: Duration::from_millis(31_000), hidden: true }.is_fresh());
+        assert!(Beat { age: Duration::from_millis(0), hidden: false }.is_fresh());
+    }
+
+    /// The core hands the bridge its **own** liveness view, not a placeholder. A bridge that
+    /// answers from the beat is only meaningful if the beat is the core's.
+    #[test]
+    fn the_core_hands_the_bridge_its_own_beat() {
+        let seen = Arc::new(Mutex::new(None));
+        let core = stale_core_with(Arc::new(RecordingBridge(seen.clone())));
+        assert!(!core.bridge_ready(), "the recorded bridge answers from the beat");
+
+        let beat = seen.lock().unwrap().expect("the bridge was asked");
+        assert!(beat.hidden, "the core's hidden flag reached the bridge");
+        assert!(beat.age >= Duration::from_secs(60), "and so did the age: {:?}", beat.age);
+    }
+
+    /// **The D35 hazard, pinned.** A lapsed beat plus an in-process bridge must be *available*, and
+    /// `await_core` must succeed on its first poll. The warm hook is counted rather than timed:
+    /// if the loop ever entered, it would call `request_warm`, and the count would not be zero.
+    #[tokio::test]
+    async fn an_always_ready_bridge_does_not_wait_out_a_lapsed_beat() {
+        let core = stale_core_with(Arc::new(AlwaysReadyBridge));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counted = calls.clone();
+        core.set_warm(Arc::new(move || {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }));
+
+        assert!(!core.beat_is_fresh(), "the webview beat really has lapsed");
+        assert!(core.is_available(), "but a bridge in this process can still serve");
+        assert!(await_core(&core).await, "and the wait succeeds on its first poll");
+        assert_eq!(calls.load(Ordering::SeqCst), 0, "no re-composite was ever asked for");
+    }
+
+    /// The other direction: a bridge that says it cannot serve is refused even though the core is
+    /// running and its own beat is fresh. `ready` is the bridge's statement, not a heartbeat check.
+    ///
+    /// `await_core`'s *timeout* branch is deliberately not exercised here. It would cost the whole
+    /// of `CORE_RECOVERY_GRACE` in wall-clock, and this crate has no `tokio` `test-util` feature to
+    /// fake it — so the branch was uncovered before this change too, and is recorded as uncovered
+    /// rather than paid for with five seconds on every run.
+    #[tokio::test]
+    async fn a_bridge_that_cannot_serve_is_refused_even_with_a_fresh_beat() {
+        let core = stale_core_with(Arc::new(NeverReadyBridge));
+        core.set_hidden(false);
+        core.heartbeat();
+        assert!(core.beat_is_fresh(), "the worker is beating normally");
+        assert!(!core.bridge_ready(), "and the bridge still cannot answer");
         assert!(!core.is_available());
     }
 }
@@ -563,9 +682,49 @@ mod tool_call_shape_tests {
     }
 }
 
+/// The core's view of the webview worker's heartbeat, handed to a bridge that has to care.
+///
+/// A snapshot rather than a way back to the core. The core owns the bridge (`Arc<dyn Bridge>`),
+/// so a bridge holding a reference to the core would close the reference cycle `ReplyHandle`
+/// exists to avoid — the same constraint, one layer out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Beat {
+    /// How long ago the worker last reported in.
+    pub age: Duration,
+    /// Whether the worker's window is hidden. A hidden webview is throttled by the OS, so the
+    /// bound is looser — see `HEARTBEAT_STALE_HIDDEN_MS`.
+    pub hidden: bool,
+}
+
+impl Beat {
+    /// Whether the age is inside the bound for the current visibility.
+    ///
+    /// The one place the two bounds are applied, so the UI's "worker awake" and the request path's
+    /// readiness cannot come to disagree about what *fresh* means.
+    pub fn is_fresh(&self) -> bool {
+        let bound = if self.hidden { HEARTBEAT_STALE_HIDDEN_MS } else { HEARTBEAT_STALE_MS };
+        self.age < Duration::from_millis(bound)
+    }
+}
+
+/// [`Bridge::ready`] for a bridge that dispatches into the webview worker: ready exactly when the
+/// beat is fresh.
+///
+/// **Named rather than written inline at each of its four call sites, and the reason is coverage.**
+/// The production site is `EventBridge`, which cannot be constructed in a test — it needs an
+/// `AppHandle`. So if each implementation spelled out `beat.is_fresh()` for itself, the one that
+/// actually serves production traffic would be a line no test could reach, and reverting it to
+/// `true` would reintroduce D35 with every test still green. Routing all four through this
+/// function moves the decision somewhere the tests *can* reach: the three doubles
+/// (`NoopBridge`, `SynthBridge`, `MinimalBridge`) exercise it, so the R1 heartbeat tests fail if
+/// this ever stops consulting the beat.
+pub fn webview_ready(beat: Beat) -> bool {
+    beat.is_fresh()
+}
+
 /// Hand-off surface to the router core. Production emits Tauri events; the Phase-2b
-/// integration test injects a synthetic bridge (the §3.5 entry-gate spike); Phase 2 of the
-/// headless plan will put a Rust router core here.
+/// integration test injects a synthetic bridge (the §3.5 entry-gate spike); Phase 5c of the
+/// headless plan puts a Rust router core here.
 pub trait Bridge: Send + Sync + 'static {
     /// Route one request, answering it through `replies`.
     ///
@@ -576,6 +735,23 @@ pub trait Bridge: Send + Sync + 'static {
     /// bridge a way to answer". A parameter cannot be forgotten — the call does not compile.
     fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle);
     fn cancel(&self, request_id: u64);
+
+    /// Whether this bridge can answer a request right now.
+    ///
+    /// `beat` is the core's view of the webview worker's heartbeat, passed in for the same reason
+    /// `ReplyHandle` is: a bridge that needs it receives it, and a bridge that does not cannot come
+    /// to depend on liveness state it never asked for.
+    ///
+    /// **Deliberately no default body**, because the two answers are opposites and a default cannot
+    /// know which one it is writing. `EventBridge` dispatches into a webview the OS may suspend, so
+    /// it is ready exactly when the beat is fresh. A bridge that runs in this process cannot be
+    /// suspended, so it is always ready. A default of `true` would let a *future* webview-backed
+    /// bridge silently inherit "always ready" — which is the failure this method exists to remove
+    /// (D35): a Rust bridge installed before the method existed left the core asking a question no
+    /// heartbeat could ever satisfy, so every request waited out `CORE_RECOVERY_GRACE` and then
+    /// answered 503. With no default, an implementation cannot be written without saying which kind
+    /// it is.
+    fn ready(&self, beat: Beat) -> bool;
 }
 
 /// The bridge's way back to the request that is waiting for it.
@@ -1121,8 +1297,29 @@ impl GatewayCore {
         self.worker_error.lock().unwrap().clone()
     }
 
+    /// The core's view of the webview worker's heartbeat, as a bridge sees it.
+    ///
+    /// `hidden` is read from the same field the bound has always used, so the visibility that
+    /// selects a bound and the age it is compared against cannot drift apart.
+    pub fn beat(&self) -> Beat {
+        Beat {
+            age: self.last_heartbeat.lock().unwrap().elapsed(),
+            hidden: self.hidden.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Whether the installed bridge can answer a request right now.
+    ///
+    /// The question belongs to the bridge. The core holds the heartbeat, but it does not know
+    /// whether *this* bridge's ability to serve depends on one — and assuming that it does is what
+    /// made a Rust bridge look permanently asleep (D35). Asking the bridge is what stops a bridge
+    /// in this process from being measured against a webview's liveness rule.
+    pub fn bridge_ready(&self) -> bool {
+        self.bridge.ready(self.beat())
+    }
+
     pub fn is_available(&self) -> bool {
-        self.is_running() && self.beat_is_fresh()
+        self.is_running() && self.bridge_ready()
     }
 
     /// Whether the operator asked the gateway to serve at all. Separate from `is_available`
@@ -1137,13 +1334,13 @@ impl GatewayCore {
     /// Public because "the worker is asleep" is a state the UI has to be able to name: a lapsed
     /// beat is not a stopped gateway, and reporting it as one is what made the Start button look
     /// dead. See `HEARTBEAT_STALE_HIDDEN_MS` for why a hidden worker stops beating at all.
+    ///
+    /// **This is a statement about the webview, not about the bridge**, which is why it stays here
+    /// and is not the same question as `bridge_ready`. The Control screen reports it as
+    /// `worker_awake`. For a bridge that is not a webview there is no worker to be awake, and
+    /// `bridge_ready` is the answer that decides whether a request is served.
     pub fn beat_is_fresh(&self) -> bool {
-        let bound = if self.hidden.load(Ordering::Relaxed) {
-            HEARTBEAT_STALE_HIDDEN_MS
-        } else {
-            HEARTBEAT_STALE_MS
-        };
-        self.last_heartbeat.lock().unwrap().elapsed() < Duration::from_millis(bound)
+        self.beat().is_fresh()
     }
 
     /// Ask the host to re-composite the worker window.
@@ -1370,21 +1567,26 @@ const CORE_RECOVERY_GRACE: Duration = Duration::from_millis(5_000);
 const CORE_RECOVERY_POLL: Duration = Duration::from_millis(150);
 
 /**
- * Wait out a lapsed heartbeat instead of rejecting on it.
+ * Wait out a bridge that cannot answer yet instead of rejecting on it.
  *
- * The worker lives in a hidden webview, and macOS suspends hidden webviews. When that happens
- * the bridge stops beating and every request fails until the watchdog happens to re-warm the
- * window — and the watchdog is deliberately rate-limited to once a minute, so most requests
+ * The production worker lives in a hidden webview, and macOS suspends hidden webviews. When that
+ * happens the bridge stops beating and every request fails until the watchdog happens to re-warm
+ * the window — and the watchdog is deliberately rate-limited to once a minute, so most requests
  * arriving during a lapse were simply refused. Recovery is a `show()` away, so a request can
  * ask for it directly and wait a bounded moment.
  *
+ * The question asked is `bridge_ready`, not `beat_is_fresh`. For `EventBridge` they are the same
+ * thing, so this loop behaves exactly as it always has. For a bridge that answers `true` — one
+ * running in this process — the first poll succeeds and the loop never sleeps, so a Rust bridge
+ * pays nothing for a liveness rule that was never about it (D35).
+ *
  * Returns false only when the wait was exhausted. Called at most once per request, and only
- * when the beat is already stale, so a healthy gateway pays nothing.
+ * when the bridge is already not ready, so a healthy gateway pays nothing.
  */
 async fn await_core(core: &Arc<GatewayCore>) -> bool {
     let deadline = Instant::now() + CORE_RECOVERY_GRACE;
     loop {
-        if core.beat_is_fresh() {
+        if core.bridge_ready() {
             return true;
         }
         // Called every poll rather than once: `request_warm` is rate-limited, and a warm that

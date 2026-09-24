@@ -10,7 +10,9 @@ use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, EventTarget, Manager, State, WebviewUrl, WebviewWindowBuilder};
 
-use crate::core::gateway::{self, Bridge, BridgeMsg, BridgeRequest, GatewayCore, ReplyHandle};
+use crate::core::gateway::{
+    self, webview_ready, Beat, Bridge, BridgeMsg, BridgeRequest, GatewayCore, ReplyHandle,
+};
 use crate::core::injection_log::InjectionStats;
 use crate::core::store::Store;
 
@@ -95,6 +97,21 @@ impl Bridge for EventBridge {
             "gateway-cancel",
             serde_json::json!({ "requestId": request_id }),
         );
+    }
+
+    /// Ready exactly when the worker's beat is fresh — the whole reason the question exists.
+    ///
+    /// This bridge dispatches into a webview window that macOS suspends when it is hidden, so
+    /// "can you answer?" and "has the worker reported in recently?" are the same question here.
+    /// The core cannot answer it: the beat is a fact about the webview, and the core would have to
+    /// assume that every bridge shares it. `Beat` carries the bound's inputs rather than a
+    /// pre-decided `bool` so that this stays *this bridge's* rule.
+    ///
+    /// Delegates to `webview_ready` rather than writing the comparison here, so that this — the one
+    /// implementation that serves production traffic and the only one no test can construct —
+    /// shares its answer with the doubles that *are* tested.
+    fn ready(&self, beat: Beat) -> bool {
+        webview_ready(beat)
     }
 }
 

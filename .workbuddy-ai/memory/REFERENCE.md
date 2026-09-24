@@ -3985,3 +3985,61 @@ omission, the empty-chunk guard, mercury-over-collected, and the gateway-only to
 
 **D36 opened and fixed in the same increment:** the Phase 5 reconnaissance sentence is present tense and all
 six names it says do not exist now do. Scoped to the reconnaissance and dated.
+
+## The `Bridge::ready` seam — readiness is the bridge's question (2026-09-24, increment 24c)
+
+Closes D35. Rust **1124 → 1128**; headless **1064 → 1068**. **Behaviour on the webview path is unchanged** —
+the suite was 1124/0 both before and after the refactor, and the four new tests are the only additions.
+
+```rust
+pub struct Beat { pub age: Duration, pub hidden: bool }   // the core's liveness view; a Copy snapshot
+impl Beat { pub fn is_fresh(&self) -> bool { … } }        // the ONE place the two bounds are applied
+pub fn webview_ready(beat: Beat) -> bool { beat.is_fresh() }
+
+pub trait Bridge {
+    fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle);
+    fn cancel(&self, request_id: u64);
+    fn ready(&self, beat: Beat) -> bool;   // NO default body
+}
+```
+
+- `GatewayCore::beat()` → `Beat`; `bridge_ready()` = `self.bridge.ready(self.beat())`;
+  `is_available()` = `is_running() && bridge_ready()`; `beat_is_fresh()` = `beat().is_fresh()` (kept — it is the
+  UI's `worker_awake`, a statement about the *webview*, not about the bridge).
+- `await_core` polls `bridge_ready()`. For `EventBridge` that is the old behaviour; for an in-process bridge the
+  first poll succeeds and the loop never sleeps.
+- `EventBridge::ready` → `webview_ready(beat)`. `HeadlessBridge::ready` → **`false`** (it discards every
+  dispatch, so it genuinely cannot serve — which preserves the binary's fast 503 instead of a 30 s hang).
+
+**Two departures from the shape D35 first proposed, both measured.**
+
+1. **No default body.** D35's draft said "defaulted". Wrong: the two answers are opposites, and a default of
+   `true` would let a *future* webview bridge inherit "always ready" — the hazard itself. With no default,
+   `E0046` immediately surfaced a **sixth** implementor (`core/context_scope.rs:1336`) that a Grep for
+   `impl Bridge for` had missed because it spells the path `impl crate::core::gateway::Bridge for`.
+   **Grep implementors with a pattern that allows the full path, or let the compiler find them.**
+2. **No `warm()`.** The re-warm hook (`WarmFn`) and its rate limiter (`last_warm`) are core-owned state, and
+   `request_warm` is already a no-op when no hook is installed. A bridge-side `warm` would be a second spelling
+   of state the core already holds.
+
+**`webview_ready` exists for coverage, not tidiness.** `EventBridge` is the only implementation serving
+production traffic and the only one no test can construct (it needs an `AppHandle`). If each impl spelled out
+`beat.is_fresh()`, that line would be unreachable and reverting it to `true` would reintroduce D35 with every
+test still green. One shared function moves the decision where the tests can reach it — the three doubles
+exercise it, so the R1 tests guard it.
+
+**7 probes, all red, both files byte-exact** (`a51fc89c…`, `188d8e0e…`): `webview_ready` ignoring the beat;
+`await_core` asking the beat; `is_available` asking the beat; the bound ignoring visibility; `beat()` reporting
+visible always; `NeverReadyBridge` claiming ready; `HeadlessBridge` claiming ready.
+
+**`await_core`'s timeout branch stays uncovered, deliberately** — it costs `CORE_RECOVERY_GRACE` (5 s) of wall
+clock and the crate has no `tokio` `test-util` to fake it. It was uncovered before this change too.
+
+**D37:** two doc comments named "Phase 2" as the phase that replaces `HeadlessBridge`. Phase 2 is the execution
+engine; the bridge is Phase 5c. Fixed.
+
+**A harness trap that cost a real corruption.** A probe run killed mid-flight by the foreground timeout left its
+mutation in place; the next run adopted the mutated file as "pristine" and restored it faithfully, so
+`NeverReadyBridge::ready` silently became `true` (the file was exactly one byte smaller). **Check every anchor
+before mutating anything, and abort the whole run if one is missing** — a missing anchor means the file is not
+what you think it is. The per-probe restore protects against a *failing* probe, not against the harness dying.

@@ -6,12 +6,17 @@
 //!
 //! The router core is still TypeScript running in a hidden webview, reached through the
 //! `Bridge` trait. With no webview there is nothing to bridge to, so this binary installs
-//! `HeadlessBridge`, which discards every dispatch. `GatewayCore::is_available()` is
-//! `is_running() && beat_is_fresh()`, and no heartbeat ever arrives — so every completion
-//! route answers **503 core unavailable**, by design. Auth, capacity, spend and `/health`
-//! still work because none of them touch the bridge.
+//! `HeadlessBridge`, which discards every dispatch and reports itself **not ready** — so every
+//! completion route answers **503 core unavailable**, by design. Auth, capacity, spend and
+//! `/health` still work because none of them touch the bridge.
 //!
-//! Phase 2 ports the router core to Rust and replaces `HeadlessBridge` with it.
+//! That 503 used to arrive for the wrong reason. `is_available()` was
+//! `is_running() && beat_is_fresh()`, and no heartbeat ever arrives here, so the request was
+//! refused by a liveness gate no bridge could open. The gate is now `Bridge::ready` (D35), so
+//! this binary's answer is its own statement rather than a question the core asked of a webview
+//! that is not there. `HeadlessBridge::ready` says `false` because it genuinely cannot serve.
+//!
+//! Phase 5c replaces `HeadlessBridge` with `RouterBridge`, which answers `true`.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +67,19 @@ impl gateway::Bridge for HeadlessBridge {
     /// the seam working, not a gap in it.
     fn dispatch(&self, _req: gateway::BridgeRequest, _replies: gateway::ReplyHandle) {}
     fn cancel(&self, _id: u64) {}
+
+    /// **Never ready**, and that is the honest answer rather than a placeholder: this bridge
+    /// discards every dispatch, so it cannot answer anything. Saying `true` would not make the
+    /// service work — it would only move the failure, from an immediate `503 core unavailable` to
+    /// a request that sits in the bridge until `FIRST_MSG_TIMEOUT` expires. The module note below
+    /// is unchanged by this: completions answer 503, and now they say so for the right reason.
+    ///
+    /// Note what this is *not*: a heartbeat. Before `Bridge::ready` existed the core asked
+    /// `beat_is_fresh()`, which no heartbeat could satisfy here, so the 503 came from a liveness
+    /// gate that was never going to open. The gate is now the bridge's own statement (D35).
+    fn ready(&self, _beat: gateway::Beat) -> bool {
+        false
+    }
 }
 
 #[tokio::main]
@@ -121,4 +139,27 @@ async fn main() {
     // Blocks forever. There is no `tokio::signal` feature enabled, and a service has no stdin
     // to close; termination is the supervisor's job (launchd / systemd / Ctrl-C).
     std::future::pending::<()>().await;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ai_provider_router_lib::core::gateway::Bridge;
+
+    /// The service's bridge reports itself unable to serve, and that answer is what turns every
+    /// completion into a fast `503 core unavailable` rather than a request parked inside the bridge
+    /// until `FIRST_MSG_TIMEOUT` expires.
+    ///
+    /// The fresh beat is the point: `webview_ready` would answer `true` for it, so this asserts
+    /// that the headless bridge is *not* answering as a webview bridge would. Regressing this to
+    /// `true` would not make the service work — it would only move the failure thirty seconds later.
+    #[test]
+    fn the_headless_bridge_reports_itself_unable_to_serve() {
+        let beat = gateway::Beat { age: std::time::Duration::ZERO, hidden: false };
+        assert!(beat.is_fresh(), "the beat itself is fresh");
+        assert!(
+            !HeadlessBridge.ready(beat),
+            "a bridge that discards every dispatch is not ready, however fresh the beat"
+        );
+    }
 }

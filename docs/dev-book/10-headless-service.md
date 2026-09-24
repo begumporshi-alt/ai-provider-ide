@@ -1998,6 +1998,7 @@ one is the deletion:
 | **23 — landed** | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
 | **24a — landed** | Move the tool host from `tauri/tools.rs` into `core/tools.rs`, where the bridge can reach it |
 | **24b-i — landed** | `core/bridge_policy.rs` — the bridge's decisions with no I/O: status, tool ownership, the held-prose gate, the turn outcome, call collection, the retry hint |
+| **24c — landed** | `Bridge::ready` — the seam that decides *whose* question readiness is, so a Rust bridge is not measured against a webview's liveness rule (D35). It is a prerequisite of 24b-ii, not a follow-up: installing a Rust bridge without it ships a five-second stall plus a 503 on every request |
 | 24b-ii | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle` |
 | **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
 
@@ -2212,6 +2213,40 @@ toggle order, the status-over-message precedence, last-versus-first, `discard`, 
 empty-chunk guard, mercury-over-collected, and the gateway-only tool steering. **D36 was opened and fixed in
 the same increment** — the Phase 5 reconnaissance sentence above is present tense and asserts a Grep returns
 no matches for six names that all now resolve.
+
+**Increment 24c — readiness is the bridge's question, not the core's.** D35's fix, and it is a prerequisite of
+24b-ii rather than a follow-up: installing a Rust bridge without it ships a five-second stall plus a 503 on
+every request. Rust **1124 → 1128**, headless **1064 → 1068**, and **behaviour on the webview path is
+unchanged** — 1124 / 0 both before and after the refactor, so the four new tests are the only additions.
+
+The shape: `Beat { age, hidden }` is the core's liveness view as a `Copy` snapshot, and `Beat::is_fresh()` is
+now the single place the two bounds are applied. `Bridge::ready(&self, beat: Beat) -> bool` has **no default
+body**. `GatewayCore` gains `beat()` and `bridge_ready()`; `is_available()` becomes
+`is_running() && bridge_ready()`; `beat_is_fresh()` stays, because it is the UI's `worker_awake` — a statement
+about the *webview*, not about the bridge. `await_core` polls `bridge_ready()`, so an in-process bridge succeeds
+on the first poll and the loop never sleeps. `EventBridge::ready` delegates to `webview_ready`;
+`HeadlessBridge::ready` answers `false`, which is honest (it discards every dispatch) and preserves the binary's
+fast 503 instead of turning it into a thirty-second hang.
+
+**Two departures from what D35 first proposed, both measured rather than preferred.** *No default body:* the two
+answers are opposites, and a default of `true` would let a *future* webview-backed bridge silently inherit
+"always ready" — the hazard itself. With no default, the compiler's `E0046` immediately surfaced a **sixth**
+implementor (`core/context_scope.rs:1336`) that a Grep for `impl Bridge for` had missed, because it spells the
+path in full. *No `warm()`:* the re-warm hook and its rate limiter are core-owned state, and `request_warm` is
+already a no-op with no hook installed, so a bridge-side copy would be a second spelling of state the core
+already holds.
+
+**`webview_ready` is a coverage device, not tidiness.** `EventBridge` is the only implementation that serves
+production traffic and the only one no test can construct — it needs an `AppHandle`. Spelling `beat.is_fresh()`
+at each site would leave that line unreachable, and reverting it to `true` would reintroduce D35 with every test
+still green. One shared function moves the decision where the tests can reach it: the three doubles exercise it,
+so the R1 heartbeat tests guard it.
+
+**Seven falsifications, all red, both files restored byte-exact.** `await_core`'s timeout branch stays uncovered
+on purpose — it costs `CORE_RECOVERY_GRACE` (5 s) of wall clock and the crate has no `tokio` `test-util` to fake
+it; it was uncovered before this change too. **D37 was opened and fixed here:** two doc comments named "Phase 2"
+as the phase that replaces `HeadlessBridge`, when Phase 2 is the execution engine and the bridge is Phase 5c —
+two scope-wrong claims in two consecutive increments.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 

@@ -182,6 +182,14 @@ impl Bridge for SynthBridge {
     fn cancel(&self, _id: u64) {
         self.cancels.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// This double stands in for `EventBridge`, so it answers through the same function
+    /// `EventBridge` uses — see `webview_ready` for why that indirection is load-bearing. Answering
+    /// `true` unconditionally would make every R1 test below vacuous: they assert on
+    /// `is_available()`, which now routes through this method.
+    fn ready(&self, beat: Beat) -> bool {
+        webview_ready(beat)
+    }
 }
 
 struct TestServer {
@@ -3192,6 +3200,13 @@ impl Bridge for MinimalBridge {
         replies.reply(req.request_id, BridgeMsg::Done);
     }
     fn cancel(&self, _id: u64) {}
+
+    /// Stands in for the webview bridge, as the other doubles do. These tests build a core and
+    /// use it within milliseconds, so the beat is fresh throughout; a test that wants a lapsed
+    /// beat ages `last_heartbeat` on purpose.
+    fn ready(&self, beat: Beat) -> bool {
+        webview_ready(beat)
+    }
 }
 
 fn bare_request(id: u64) -> BridgeRequest {
