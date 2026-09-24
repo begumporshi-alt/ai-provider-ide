@@ -7,15 +7,30 @@
 //! [`JsSandbox`]. The split is the TypeScript's: `CodeAdapterInstance` holds `manifest` and
 //! `opts.http`, and delegates the guest to `callOp`.
 //!
-//! **One member is knowingly incomplete: `generate_text` does not stream.** The reference is an
-//! `AsyncGenerator` that yields each `emit(chunk)` the moment the guest produces it
-//! (`code-adapter.ts:497`); this port runs the operation to completion and then hands back the
-//! collected lines. *What* the caller receives is identical; *when* it receives it is not — nothing
-//! reaches the consumer until the guest's promise settles, where the reference delivers the first
-//! chunk while the request is still open. That is a latency regression rather than a wrong answer,
-//! and it is stated here rather than in a comment at one call site because it is a property of the
-//! seam, not of a line: true streaming needs the actor to forward chunks while the operation is
-//! still running, which is increment 20b.
+//! **`generate_text` streams, and its response phase is therefore almost empty.** The reference's
+//! `generateText` is an `AsyncGenerator` (`code-adapter.ts:497`), so its body does not start until
+//! the consumer pulls — `ensure()` and the compile included. This port matches that: the future
+//! resolves as soon as the command is on the actor's channel, and the only thing that can fail in
+//! the response phase is a sandbox that is no longer there. Everything else — a guest that does
+//! not implement `generateText`, one that throws, one that overruns a budget — is discovered
+//! *after* the consumer has pulled at least once, and so arrives as a **stream item** rather than
+//! as `Err`.
+//!
+//! **Arriving as an item does not by itself make it mid-stream, and the difference is load-bearing.**
+//! The engine does not read the class off the error; it reads it off the phase, through
+//! `attempt_disposition(emitted, aborted)` (`engine.rs:448`). A failure that arrives before any
+//! chunk has been emitted is `AttemptDisposition::Next` — the loop tries the next candidate, which
+//! is what a request that never produced a byte deserves. Only once a chunk is in the consumer's
+//! hands is it `Rethrow`, and only that path reports `TextFailure::MidStream`, because re-running
+//! the attempt would show the consumer its text twice. The declarative interpreter reaches the same
+//! split by a different road (`interpreter.rs` throws before its yield loop or inside it), and
+//! `the_same_status_is_a_refusal_or_a_break_depending_on_which_phase_threw` is the engine test that
+//! pins the two together.
+//!
+//! **The chunks reach the caller as the guest emits them, not when the operation settles.** The
+//! actor forwards each round's `emit` lines down a channel before it does anything else, and the
+//! operation's terminal outcome travels the same channel as [`Chunk::End`] so that the stream can
+//! end on a value instead of on an ambiguous closed channel.
 //!
 //! **A code provider reports neither usage nor tool calls, and that is the reference's behaviour,
 //! not an omission here.** The guest is handed `messages`, `tools` and friends as JSON and the only
@@ -45,7 +60,7 @@ use crate::core::adapter::{
 use crate::core::engine::AttemptError;
 use crate::core::http_port::HttpPort;
 use crate::core::interpreter::{AdapterContext, PING_MESSAGE_LIMIT};
-use crate::core::js_host::{JsSandbox, Operation, OperationOutcome, SandboxLimits};
+use crate::core::js_host::{Chunk, JsSandbox, Operation, OperationOutcome, SandboxLimits};
 use crate::core::manifest::truncate_utf16;
 use crate::core::manifest::AuthHeader;
 use crate::core::manifest_view::{Limits, Provider};
@@ -258,15 +273,28 @@ impl AdapterInstance for CodeAdapterInstance {
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>> {
         Box::pin(async move {
             let args_json = text_args_json(&args, self.limits.as_ref());
-            let outcome = self
-                .call(Operation::GenerateText, &args_json, secret_ref, cancel)
-                .await
+            // Nothing is awaited before this: the actor has the operation and the chunks start
+            // arriving on their own. See the module note for why the response phase is empty.
+            let chunks = self
+                .sandbox
+                .stream(
+                    Operation::GenerateText,
+                    &args_json,
+                    &self.target,
+                    secret_ref,
+                    self.egress.clone(),
+                    cancel,
+                )
                 .map_err(|e| AttemptError::from(&e))?;
-            // Buffered, not streamed — see the module note. The lines are complete and in order;
-            // they simply all arrive at once.
-            let lines: Vec<Result<String, AttemptError>> =
-                outcome.emitted.into_iter().map(Ok).collect();
-            Ok(Box::pin(stream::iter(lines)) as BoxStream<'a, Result<String, AttemptError>>)
+            Ok(Box::pin(stream::unfold(chunks, |mut chunks| async move {
+                match chunks.recv().await {
+                    Some(Chunk::Line(text)) => Some((Ok(text), chunks)),
+                    // A failure is an **item**, then the stream ends. It cannot be the `Err` of
+                    // the response phase, because by now the consumer holds text.
+                    Some(Chunk::End(Err(e))) => Some((Err(AttemptError::from(&e)), chunks)),
+                    Some(Chunk::End(Ok(()))) | None => None,
+                }
+            })) as BoxStream<'a, Result<String, AttemptError>>)
         })
     }
 
@@ -708,5 +736,143 @@ mod tests {
             limits_json(Some(&Limits { max_output_tokens: Some(4096) })),
             json!({ "maxOutputTokens": 4096 })
         );
+    }
+
+    // ---- Streaming through the seam (increment 20b) -------------------------------------------
+
+    /// An egress that parks until the test releases it.
+    ///
+    /// **The only vantage point from which streaming and buffering differ**, because they differ
+    /// only in *when*: an egress that answers immediately delivers the same chunks in the same
+    /// order whether the adapter streams or buffers, and so cannot test this at all.
+    struct Gated {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl HttpPort for Gated {
+        fn request<'a>(
+            &'a self,
+            _req: HttpRequest,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<HttpResponse<'a>, HttpError>> {
+            Box::pin(async move {
+                let _ = self.entered.send(());
+                self.release.notified().await;
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: r#"{"chunks":["ignored"]}"#.to_string(),
+                    lines: None,
+                })
+            })
+        }
+    }
+
+    fn gated() -> (Arc<Gated>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (entered, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let port = Arc::new(Gated { entered, release: Arc::new(tokio::sync::Notify::new()) });
+        (port, entered_rx)
+    }
+
+    /// `TextArgs` with every optional field absent — the shape each streaming test needs.
+    fn args<'a>(model: &str) -> TextArgs<'a> {
+        TextArgs {
+            model: model.to_string(),
+            messages: &[],
+            stream: true,
+            max_tokens: None,
+            temperature: None,
+            tools: None,
+            tool_choice: None,
+            response_format: None,
+            on_tool_call: None,
+            on_usage: None,
+        }
+    }
+
+    /// **The property this increment exists for, at the seam.** The guest emits and *then* awaits,
+    /// so the first chunk reaches the consumer while the guest's request is still open.
+    ///
+    /// The response phase is asserted to have answered *before* the request was released, which is
+    /// the half of "the response phase is almost empty" that a reader would otherwise take on
+    /// trust.
+    #[tokio::test]
+    async fn a_chunk_arrives_before_the_request_that_follows_it_is_answered() {
+        let (egress, mut entered) = gated();
+        let adapter = spawn(
+            r#"
+            export default {
+              async generateText(http, emit, argsJson) {
+                emit("first");
+                await http({ path: "/chat", method: "POST", body: {} });
+                emit("second");
+              },
+            };
+            "#,
+            &manifest(),
+            egress.clone(),
+        );
+        let cancel = Cancel::new();
+        let mut stream = adapter
+            .generate_text("key-1", args("gpt-4o"), &cancel)
+            .await
+            .expect("the response phase must answer without waiting for the guest");
+
+        entered.recv().await.expect("the guest's request should be in flight");
+        assert_eq!(
+            stream.next().await,
+            Some(Ok("first".to_string())),
+            "the first chunk must be in hand while the request it precedes is still open"
+        );
+
+        egress.release.notify_one();
+        assert_eq!(stream.next().await, Some(Ok("second".to_string())));
+        assert!(stream.next().await.is_none(), "End(Ok) ends the stream");
+    }
+
+    /// A failure *after* the first chunk is an **item**, not the response phase's `Err`: the
+    /// consumer already holds text, so the attempt cannot be re-run behind its back.
+    #[tokio::test]
+    async fn a_failure_after_the_first_chunk_is_an_item_not_a_response_phase_error() {
+        let adapter = spawn(
+            r#"export default { async generateText(http, emit) { emit("a"); throw new Error("boom"); } };"#,
+            &manifest(),
+            no_egress(),
+        );
+        let cancel = Cancel::new();
+        let mut stream = adapter
+            .generate_text("key-1", args("gpt-4o"), &cancel)
+            .await
+            .expect("the response phase cannot fail for a guest that throws only later");
+        assert_eq!(stream.next().await, Some(Ok("a".to_string())));
+        assert!(
+            stream.next().await.expect("the failure must arrive as an item").is_err(),
+            "the guest's throw must be delivered to the consumer, not swallowed"
+        );
+        assert!(stream.next().await.is_none(), "the failure is terminal");
+    }
+
+    /// A guest with no `generateText` is discovered by *pulling*, not by awaiting — and because no
+    /// chunk preceded it, the engine reads it as a retryable refusal (`Next`) rather than as a
+    /// mid-stream break. Pinning both halves here is what keeps the module note above from being a
+    /// claim about the code rather than a description of it.
+    #[tokio::test]
+    async fn a_guest_without_generate_text_fails_by_pulling_not_by_awaiting() {
+        let adapter = spawn(
+            "export default { async listModels() { return []; } };",
+            &manifest(),
+            no_egress(),
+        );
+        let cancel = Cancel::new();
+        let mut stream = adapter
+            .generate_text("key-1", args("gpt-4o"), &cancel)
+            .await
+            .expect("the response phase must not fail for a method the guest never implemented");
+        assert!(
+            stream.next().await.expect("the failure must arrive as an item").is_err(),
+            "the missing method is a failure the consumer pulls, not one the future returns"
+        );
+        assert!(stream.next().await.is_none());
     }
 }

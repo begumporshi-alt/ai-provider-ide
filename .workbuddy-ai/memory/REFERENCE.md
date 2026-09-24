@@ -3399,14 +3399,15 @@ Identical fields, each rendering the same `{{secret}}` rule into a different con
 for the sandbox. Collapsing them would mean a `Vec` every caller sorts or a map that cannot express
 order, so the four-line conversion lives in `to_target_header` and the duplication is recorded.
 
-### Two gaps stated, not closed
+### One gap stated, not closed
 
-1. **`generate_text` is buffered, not streamed.** It runs the operation to completion and yields the
-   collected lines — same text, delivered late. True streaming (20b) needs a chunk channel on
-   `Command::Call` and a stream that interleaves receiving from it with awaiting the call.
-2. **A code provider reports no usage and no tool calls.** `code-adapter.ts` never calls
+1. **A code provider reports no usage and no tool calls.** `code-adapter.ts` never calls
    `args.onUsage` or `args.onToolCall`, so both `TextArgs` callbacks are dropped and every
    code-provider request reports zero tokens — the spend cap cannot bite for such a provider.
+
+**`generate_text` streams as of increment 20b** — see the streaming section below. The buffered port
+this replaced ran the operation to completion and yielded the collected lines: same text, delivered
+late, which is a latency regression rather than a wrong answer.
 
 ### Argument encoders (pinned by their own tests)
 
@@ -3416,9 +3417,82 @@ absent (passed through, so `JSON.stringify` drops them); `tools`/`toolChoice`/`r
 always present as `null`; `limits` = `null` when absent, `{}` when the block has no
 `maxOutputTokens`.
 
+## Increment 20b — true streaming for `generateText`
+
+Rust **971 → 982**; 11 new tests (8 in `js_host.rs`, 3 in `code_adapter.rs`). Gate green: `fmt
+--check` 0 bytes, `clippy --all-targets -D warnings` clean, 982/0, `--no-default-features
+--all-targets` compiles.
+
+### The shape
+
+`Chunk { Line(String), End(Result<(), SandboxError>) }`; `Command::Call` gained
+`chunks: Option<UnboundedSender<Chunk>>`. `JsSandbox::stream(..)` sends the command and returns the
+receiver **without awaiting the reply** — that is what makes it a stream rather than a future.
+
+**`End` is an item, not the reply future's `Err`.** A consumer holding a receiver *and* a reply
+future needs a `select`, and the borrow that `select` holds on the future fights the one that drops
+the sender — the drop is what closes the channel, so it cannot happen while the future is borrowed.
+One channel carries both. `End` is also always last and sent exactly once: a closed channel alone
+cannot distinguish a clean finish from an aborted guest or a dead thread.
+
+`forward(chunks, emitted)` runs once per round of the settle loop, **before** the `emit_failure`
+check (the reference yields queued chunks before it throws, `code-adapter.ts:574-577`) and before
+the settled check.
+
+### `take`, not `clone`
+
+The single most load-bearing line in the increment. Because `forward` runs once per round, a `clone`
+leaves every line in the staging buffer and the *next* round re-sends it: a guest that emits, awaits,
+then emits delivers its first chunk **twice**. Probe: `clone` reddens exactly
+`a_chunk_reaches_the_caller_before_the_request_it_precedes_is_answered`, `Line("first")` arriving
+where `Line("second")` belongs.
+
+### The emit cap was documented and not enforced (D31)
+
+`make_emit` never charged `budget.lines`, and `note_emitted_line`'s only callers were its own tests —
+so `EMIT_LINES_PER_OP` was prose for a whole increment while the http budget, the stack and the
+memory cap were all real. `make_emit` now calls it, which also deletes a verbatim copy of the limit's
+message string that had been made in `js_host.rs`.
+
+Order inside `emit`, and both halves are the reference's:
+1. `if chunk.is_empty() { return; }` — **before** the charge. 500 empties followed by one real line
+   stays under the cap only in this order (probe: moving it after the charge gives `[End(Err(Limits))]`).
+2. `note_emitted_line(&mut budget)`; on `Err`, record the message for the driver.
+3. truncate to `LOG_LINE_CAP`, push.
+
+### `CallSpec`
+
+Six values (`operation`, `args_json`, `target`, `secret_ref`, `egress`, `cancel`) were threaded
+positionally through `send` → `Command::Call` → `JsHost::call` → `JsHost::drive`. Grouped into an
+owned `CallSpec`, which removes `drive`'s `#[allow(clippy::too_many_arguments)]` and brings `send`
+and `JsHost::call` back under the lint.
+
+### The failure class is the engine's, not the adapter's
+
+The 20b module note first claimed a post-first-chunk failure "is `FailureKind::MidStream` by
+construction". **The engine never reads the class off the error** — `attempt_disposition(emitted,
+aborted)` (`engine.rs:448`) answers `Next` (retryable) until a chunk has been emitted, and only then
+`Rethrow` → `TextFailure::MidStream`. A failure arriving as an *item* before any chunk is therefore a
+retryable refusal, which is what a request that produced no byte deserves.
+
+### Test fixtures
+
+`GatedEgress` (one in each test module) parks until the test releases it. **Streaming and buffering
+deliver the same chunks in the same order and differ only in *when*** — so an egress that answers
+immediately cannot test streaming at all.
+
+### Five probes (each reverted by its inverse edit, hash-verified against `dc2089df…`)
+
+| Edit | Reddens | Reading |
+|---|---|---|
+| `take` → `clone` in `forward` | the ordering test | `Line("first")` where `Line("second")` belongs |
+| empty check moved after the charge | the 500-empty test | `[End(Err(Limits))]` |
+| failure check moved before `forward` | the cap test | **1 of 401** lines delivered |
+| the charge dropped | the cap test | **402 against 401** — the pre-20b behaviour |
+| `let _ =` → `expect` on the chunk send | the dropped-receiver test | panics the actor thread |
+
 ### What remains in Phase 4b
 
-1. True streaming `generateText` (increment 20b).
-2. `AdapterFactory` for `kind: "code"` — `adapter-runtime.ts:52-58` branches on `manifest.kind`, and
+1. `AdapterFactory` for `kind: "code"` — `adapter-runtime.ts:52-58` branches on `manifest.kind`, and
    nothing in Rust constructs a `CodeAdapterInstance` yet, so the sandbox is unreachable from the
-   router.
+   router. **This is the last item in the phase.**

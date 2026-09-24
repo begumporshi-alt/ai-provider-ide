@@ -434,9 +434,23 @@ The probe is opt-in (`SPIKE_CRASH=1`) because a size whose C stack runs out firs
 
 **Finding 4: `manifest::AuthHeader` and `sandbox::AuthHeader` are the same struct twice.** Identical fields, each rendering the same `{{secret}}` rule — into a `BTreeMap` for the interpreter, into an order-preserving `Vec` for the sandbox. They also disagree on a duplicate name. Collapsing them would mean a `Vec` every caller sorts or a map that cannot express order, so the four-line conversion lives in one function and the duplication is recorded instead.
 
-**Two things this increment states rather than fixes.** `generate_text` is **buffered, not streamed**: it runs the operation to completion and then yields the collected lines, so the text is identical but nothing reaches the consumer until the guest's promise settles. True streaming needs the actor to forward chunks mid-operation, which is increment 20b. And a code provider reports **no usage and no tool calls** — `code-adapter.ts` never calls `args.onUsage` or `args.onToolCall`, so both callbacks on `TextArgs` are dropped and every code-provider request reports zero tokens, which means the spend cap cannot bite for such a provider.
+**Two things this increment states rather than fixes.** `generate_text` is **buffered, not streamed**: it runs the operation to completion and then yields the collected lines, so the text is identical but nothing reaches the consumer until the guest's promise settles. True streaming needs the actor to forward chunks mid-operation, which is **increment 20b — landed the same day, below**. And a code provider reports **no usage and no tool calls** — `code-adapter.ts` never calls `args.onUsage` or `args.onToolCall`, so both callbacks on `TextArgs` are dropped and every code-provider request reports zero tokens, which means the spend cap cannot bite for such a provider.
 
 **Thirteen tests, one probe fired.** The base URL is trimmed and the header carries `Bearer {{secret}}` rather than a key; the lint rejects before a runtime is built; a catalogue entry with an empty `id` and a non-string are both dropped while a `name`-only entry survives; the `errorBody` cap is 500 of 900; the emitted lines arrive in order; an empty catalogue is `ok: false`/`status: 0`/`"empty model list"`; `429` is read out of the message; modality comes from the manifest's rules; and a disposed adapter reports `Host` with no flag involved. The argument encoders are pinned separately — an absent `size` leaves the key out rather than nulling it, `maxTokens`/`temperature` are omitted where the four `?? null` keys are always present, and a `limits` block with no cap is `{}` rather than `{"maxOutputTokens": null}`.
+
+**Update, 2026-09-24 (increment 20b): `generate_text` streams — and closing it found three defects that were not the streaming.**
+
+`Chunk::{Line,End}` and the chunk channel on `Command::Call` make the seventh member a real stream: the actor forwards each round's `emit` lines before it does anything else, and the operation's terminal outcome travels the same channel, so the stream ends on a value rather than on an ambiguous closed channel. `End` is an **item** rather than the reply future's `Err` because a consumer holding both would need a `select` whose borrow fights the one that drops the sender — the drop is what closes the channel, so it cannot happen while the future is borrowed.
+
+**Defect 1: the 400-line emit cap was documented and not enforced.** `sandbox::note_emitted_line` was called from nothing but its own tests, and `make_emit` never charged `budget.lines` — so a guest could emit without bound while the previous increment's doc-comment said the cap bit. `make_emit` now calls that function, which also deletes a second spelling of one limit: the message string had been copied verbatim into `js_host.rs`.
+
+**Defect 2: six values always passed together, through four layers, are a parameter object.** `JsHost::drive` carried `#[allow(clippy::too_many_arguments)]`, and adding the chunk channel pushed `send` and `JsHost::call` past the same lint. A `CallSpec` replaces the positional chain, so the allow is gone and there is one spelling of "an operation to run".
+
+**Defect 3: the module note asserted a class the engine derives.** It said a post-first-chunk failure "is `FailureKind::MidStream` by construction". The engine never reads the class off the error — `attempt_disposition(emitted, aborted)` (`engine.rs:448`) answers `Next` until a chunk has been emitted — so a failure *before* the first chunk is a retryable refusal, not a mid-stream break. The note now describes the predicate instead of naming its output.
+
+**Eleven tests, five probes.** The one worth more than it cost is `take` → `clone` in `forward`: the staging buffer is read once per round of the settle loop, so a clone leaves every line behind and the next round re-sends it — a guest that emits, awaits, then emits delivers its first chunk **twice**. The probe reddens exactly `a_chunk_reaches_the_caller_before_the_request_it_precedes_is_answered`, with `Line("first")` arriving where `Line("second")` belongs. The other four: the empty-chunk check moved *after* the charge reddens the 500-empty test with `[End(Err(Limits))]`; the failure check moved before `forward` reddens the cap test at **1 of 401** lines delivered; dropping the charge reddens it at **402 against 401**, which is the pre-20b behaviour in a single number; and `let _ =` → `expect` on the chunk send panics the actor thread. All five were reverted by their inverse edit and verified by hash against the baseline.
+
+**The property is only testable against a request that does not answer.** Every streaming test here needs an egress that parks, because streaming and buffering deliver the same chunks in the same order and differ only in *when* — a fixture that answers immediately cannot tell them apart.
 
 ### 2.2 The line count
 
@@ -1898,17 +1912,19 @@ the two divergence tests, reproducing the measurement above as a test failure, w
 shipped manifest carries has no `.` and no classes, which is the boundedness argument in a single
 observation.
 
-**What remains in this phase, in order:**
+**What remains in this phase:**
 
-1. **True streaming for `generateText`.** Increment 20a closed the other six — `listModels`,
-   `generateImage`, `pingKey`, `tagModality`, `capabilities` and `dispose` all run over `JsSandbox`,
-   `log` is wired and drainable, and `HttpTarget` renders `{{secret}}` from the manifest. What is
-   left is the one member 20a deliberately **buffered**: the actor must forward each `emit(chunk)`
-   while the operation is still running, which means a chunk channel on `Command::Call` and a
-   stream that interleaves receiving from it with awaiting the call's completion.
-2. **`AdapterFactory` for `kind: "code"`.** Nothing constructs a `CodeAdapterInstance` from a stored
+1. **`AdapterFactory` for `kind: "code"`.** Nothing constructs a `CodeAdapterInstance` from a stored
    manifest yet: `adapter-runtime.ts:52-58` branches on `manifest.kind`, and that branch has no
    Rust counterpart. This is the increment that makes the sandbox reachable from the router at all.
+
+**What has landed.** Increments 15–17 make the interpreter whole (`jsonpath.rs`, `template.rs`,
+`manifest.rs`, `http_port.rs`, `manifest_view.rs`, `interpreter.rs`, and `modality.rs`, which also
+took §10 decision 5). Increment 18 lands the engine-free half of the sandbox (`sandbox.rs`); 19a adds
+the engine and measures the seam's bound, which is D30; 19b lands the actor (`js_host.rs`); 20a the
+manifest half (`code_adapter.rs`); and 20b the last member 20a had deliberately **buffered** — true
+streaming for `generateText`. Six of the seven `AdapterInstance` members came with 20a, so the only
+work left in this phase is the factory above.
 
 ### Phase 5 — Delete the bridge (1 day)
 

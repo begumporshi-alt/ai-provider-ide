@@ -80,8 +80,8 @@ use serde_json::{Map, Value as Json};
 use crate::core::adapter::Cancel;
 use crate::core::http_port::{HttpMethod, HttpPort, HttpRequest};
 use crate::core::sandbox::{
-    plan_http_call, HttpTarget, OpBudget, PlannedCall, SandboxError, SandboxReason, BODY_CAP,
-    LOG_LINE_CAP, MEMORY_LIMIT, OP_BUDGET_MS, STACK_LIMIT,
+    note_emitted_line, plan_http_call, HttpTarget, OpBudget, PlannedCall, SandboxError,
+    SandboxReason, BODY_CAP, LOG_LINE_CAP, MEMORY_LIMIT, OP_BUDGET_MS, STACK_LIMIT,
 };
 
 /// How far the actor's settle loop may spin without the guest settling or a request parking.
@@ -188,20 +188,78 @@ pub struct OperationOutcome {
     pub http_calls: u32,
 }
 
+/// One item a streaming caller receives.
+///
+/// **`End` is always the last item and is sent exactly once**, which is what lets a consumer stop
+/// at it instead of guessing: a closed channel alone cannot say whether the guest finished
+/// cleanly, was aborted, or died with its thread.
+///
+/// The terminal outcome travels *here* rather than through the reply future so that the two never
+/// have to be interleaved. Holding a receiver and a reply future at once forces a `select` whose
+/// only job is to decide which one to poll first, and the borrow that `select` needs fights the
+/// one that drops the sender — see [`JsSandbox::stream`].
+#[derive(Debug, Clone, PartialEq)]
+pub enum Chunk {
+    /// One `emit(chunk)` the guest made, in order.
+    Line(String),
+    /// The operation finished. `Err` carries the reference's own reason.
+    End(Result<(), SandboxError>),
+}
+
+/// One operation to run, and everything a caller supplies for it that is not a reply channel.
+///
+/// **Owned, because it travels through the command channel** — `Command` must be `'static`, so the
+/// borrowed form the public API accepts is turned into this exactly once, in [`JsSandbox::send`].
+///
+/// **Six values that are always passed together, in the same order, through four layers are a
+/// parameter object rather than an argument list.** They reached `send`, `Command::Call`,
+/// `JsHost::call` and `JsHost::drive` positionally, which is the same argument-order hazard
+/// restated at every hop, and it is what pushed two of those signatures past
+/// `clippy::too_many_arguments`. One spelling of the six also removes the `#[allow]` that
+/// `JsHost::drive` needed while it was carrying them one by one.
+struct CallSpec {
+    operation: Operation,
+    args_json: String,
+    target: HttpTarget,
+    secret_ref: String,
+    egress: Arc<dyn HttpPort>,
+    cancel: Cancel,
+}
+
+impl CallSpec {
+    /// The borrowed form the public API takes, turned into the owned form the channel needs.
+    fn new(
+        operation: Operation,
+        args_json: &str,
+        target: &HttpTarget,
+        secret_ref: &str,
+        egress: Arc<dyn HttpPort>,
+        cancel: &Cancel,
+    ) -> CallSpec {
+        CallSpec {
+            operation,
+            args_json: args_json.to_string(),
+            target: target.clone(),
+            secret_ref: secret_ref.to_string(),
+            egress,
+            cancel: cancel.clone(),
+        }
+    }
+}
+
 /// A command for the actor thread.
 ///
 /// The egress travels as an `Arc<dyn HttpPort>` because `HttpPort: Send + Sync` and the request's
 /// future borrows the port for its whole life (`http_port.rs:158-164`), so the port has to outlive
 /// the await inside the actor. `Cancel` is `Arc<AtomicBool>` (`adapter.rs:54`) and is cloned per
-/// operation, which is the same sharing the interpreter uses.
+/// operation, which is the same sharing the interpreter uses. Both live in [`CallSpec`].
 enum Command {
     Call {
-        operation: Operation,
-        args_json: String,
-        target: HttpTarget,
-        secret_ref: String,
-        egress: Arc<dyn HttpPort>,
-        cancel: Cancel,
+        spec: CallSpec,
+        /// Set only when the caller wants the guest's `emit` lines **as they happen**. `None` on
+        /// the ordinary path, where the lines come back together in
+        /// [`OperationOutcome::emitted`] once the operation has settled.
+        chunks: Option<tokio::sync::mpsc::UnboundedSender<Chunk>>,
         reply: tokio::sync::oneshot::Sender<Result<OperationOutcome, SandboxError>>,
     },
     /// Drop the runtime and end the thread. Nothing is replied to: the handle's `Drop` cannot wait
@@ -286,25 +344,18 @@ impl JsSandbox {
                     while let Some(command) = rx.recv().await {
                         match command {
                             Command::Shutdown => break,
-                            Command::Call {
-                                operation,
-                                args_json,
-                                target,
-                                secret_ref,
-                                egress,
-                                cancel,
-                                reply,
-                            } => {
-                                let outcome = host
-                                    .call(
-                                        operation,
-                                        &args_json,
-                                        &target,
-                                        &secret_ref,
-                                        egress.as_ref(),
-                                        &cancel,
-                                    )
-                                    .await;
+                            Command::Call { spec, chunks, reply } => {
+                                let outcome = host.call(&spec, chunks.as_ref()).await;
+                                // `End` goes out **before** the reply, and is the last item: the
+                                // sender dies with this command, so the consumer's `recv` reports
+                                // closure immediately after it.
+                                if let Some(chunks) = chunks {
+                                    let end = match &outcome {
+                                        Ok(_) => Ok(()),
+                                        Err(e) => Err(e.clone()),
+                                    };
+                                    let _ = chunks.send(Chunk::End(end));
+                                }
                                 // A closed receiver means the caller gave up; that is not this
                                 // thread's problem and must not end the actor.
                                 let _ = reply.send(outcome);
@@ -350,21 +401,53 @@ impl JsSandbox {
         egress: Arc<dyn HttpPort>,
         cancel: &Cancel,
     ) -> Result<OperationOutcome, SandboxError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.commands
-            .send(Command::Call {
-                operation,
-                args_json: args_json.to_string(),
-                target: target.clone(),
-                secret_ref: secret_ref.to_string(),
-                egress,
-                cancel: cancel.clone(),
-                reply: reply_tx,
-            })
-            .map_err(|_| SandboxError::new(SandboxReason::Host, "the sandbox thread is gone"))?;
-        reply_rx.await.map_err(|_| {
+        let spec = CallSpec::new(operation, args_json, target, secret_ref, egress, cancel);
+        let reply = self.send(spec, None)?;
+        reply.await.map_err(|_| {
             SandboxError::new(SandboxReason::Host, "the sandbox thread dropped the request")
         })?
+    }
+
+    /// Run an operation and receive the guest's `emit` lines **as it produces them**.
+    ///
+    /// **The command is sent here and the reply is not awaited, so this is synchronous** and the
+    /// actor is already working when it returns. That is what makes the result a stream rather than
+    /// a future, and why the terminal outcome travels as [`Chunk::End`] instead of down the reply
+    /// channel: a caller holding both would need a `select` to interleave them, and the borrow that
+    /// `select` holds on the future fights the one that drops the sender — the drop is what closes
+    /// the channel, so it cannot happen while the future is borrowed. One channel carries both.
+    ///
+    /// Meaningful only for an operation that takes `emit` ([`Operation::takes_emit`]); any other
+    /// produces `End` and nothing before it.
+    pub fn stream(
+        &self,
+        operation: Operation,
+        args_json: &str,
+        target: &HttpTarget,
+        secret_ref: &str,
+        egress: Arc<dyn HttpPort>,
+        cancel: &Cancel,
+    ) -> Result<tokio::sync::mpsc::UnboundedReceiver<Chunk>, SandboxError> {
+        let (chunks_tx, chunks_rx) = tokio::sync::mpsc::unbounded_channel();
+        let spec = CallSpec::new(operation, args_json, target, secret_ref, egress, cancel);
+        self.send(spec, Some(chunks_tx))?;
+        Ok(chunks_rx)
+    }
+
+    /// Hand one operation to the actor. The only failure is a sandbox that is no longer there,
+    /// which is reported **here rather than later** — a caller that got a receiver would otherwise
+    /// wait forever on a channel nobody will ever write to.
+    fn send(
+        &self,
+        spec: CallSpec,
+        chunks: Option<tokio::sync::mpsc::UnboundedSender<Chunk>>,
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<OperationOutcome, SandboxError>>, SandboxError>
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.commands
+            .send(Command::Call { spec, chunks, reply: reply_tx })
+            .map_err(|_| SandboxError::new(SandboxReason::Host, "the sandbox thread is gone"))?;
+        Ok(reply_rx)
     }
 
     /// Take the guest's `log(...)` lines, leaving the queue empty.
@@ -519,28 +602,27 @@ impl JsHost {
     }
 
     /// One operation, start to finish. Runs on the actor thread.
+    ///
+    /// `chunks` is `Some` when the caller is streaming: the lines are handed over as they are
+    /// emitted and are therefore **absent** from the returned [`OperationOutcome::emitted`],
+    /// because they have a new owner.
     async fn call(
         &self,
-        operation: Operation,
-        args_json: &str,
-        target: &HttpTarget,
-        secret_ref: &str,
-        egress: &dyn HttpPort,
-        cancel: &Cancel,
+        spec: &CallSpec,
+        chunks: Option<&tokio::sync::mpsc::UnboundedSender<Chunk>>,
     ) -> Result<OperationOutcome, SandboxError> {
         let budget = Rc::new(RefCell::new(OpBudget::default()));
         let emitted: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let parked: Rc<RefCell<Vec<Parked>>> = Rc::new(RefCell::new(Vec::new()));
+        // The line cap cannot be enforced from inside the `emit` callback — a callback that throws
+        // surfaces *inside* the guest's own `await`, where the guest has no `catch` — so the
+        // callback records the message here and the driver is what turns it into a failure.
+        let emit_failure: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
 
         // Set the deadline for this operation only, and restore the sentinel on every exit path —
         // including an early return — so the next call cannot inherit this one's deadline.
         self.deadline_ms.store(now_ms().saturating_add(self.limits.op_budget_ms), Ordering::SeqCst);
-        let result = self
-            .drive(
-                operation, args_json, target, secret_ref, egress, cancel, &budget, &emitted,
-                &parked,
-            )
-            .await;
+        let result = self.drive(spec, &budget, &emitted, &parked, &emit_failure, chunks).await;
         self.deadline_ms.store(u64::MAX, Ordering::SeqCst);
 
         result.map(|value| OperationOutcome {
@@ -551,67 +633,72 @@ impl JsHost {
     }
 
     /// The pump/await alternation. See the module note for why it cannot be one scope.
-    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
-        operation: Operation,
-        args_json: &str,
-        target: &HttpTarget,
-        secret_ref: &str,
-        egress: &dyn HttpPort,
-        cancel: &Cancel,
+        spec: &CallSpec,
         budget: &Rc<RefCell<OpBudget>>,
         emitted: &Rc<RefCell<Vec<String>>>,
         parked: &Rc<RefCell<Vec<Parked>>>,
+        emit_failure: &Rc<RefCell<Option<String>>>,
+        chunks: Option<&tokio::sync::mpsc::UnboundedSender<Chunk>>,
     ) -> Result<Json, SandboxError> {
         // Scope 1: build the host functions, call the guest's method, keep the promise.
         let promise: Persistent<Promise<'static>> =
             self.context.with(|ctx| -> Result<Persistent<Promise<'static>>, SandboxError> {
                 let adapter = self.adapter.clone().restore(&ctx).map_err(host_lost)?;
                 let method: Value = adapter
-                    .get(operation.as_str())
+                    .get(spec.operation.as_str())
                     .map_err(|e| SandboxError::new(SandboxReason::Runtime, e.to_string()))?;
                 if !method.is_function() {
                     return Err(SandboxError::new(
                         SandboxReason::Runtime,
-                        format!("adapter does not implement {}()", operation.as_str()),
+                        format!("adapter does not implement {}()", spec.operation.as_str()),
                     ));
                 }
                 let method = method.into_function().ok_or_else(|| {
                     SandboxError::new(SandboxReason::Runtime, "the guest method is not callable")
                 })?;
 
-                let http = make_http(&ctx, target, secret_ref, budget.clone(), parked.clone())?;
+                let http = make_http(
+                    &ctx,
+                    &spec.target,
+                    &spec.secret_ref,
+                    budget.clone(),
+                    parked.clone(),
+                )?;
                 // `rquickjs::String::from_str` takes the `Ctx` **by value** and is the only way to
                 // build a JS string in 0.9.0 — there is no `Ctx::new_string`. The name is aliased
                 // at the import because an unaliased `String` would shadow `std::string::String`
                 // for the whole module.
                 // `::<_, Value>` is not decoration: nothing else pins the return type, because
                 // `into_promise()` below only constrains it *after* the match has to have one.
-                let args = match (operation.takes_emit(), operation.takes_args_json()) {
+                let args = match (spec.operation.takes_emit(), spec.operation.takes_args_json()) {
                     (true, true) => {
-                        let emit = make_emit(&ctx, emitted.clone())?;
-                        let args = JsString::from_str(ctx.clone(), args_json).map_err(host_lost)?;
+                        let emit =
+                            make_emit(&ctx, emitted.clone(), budget.clone(), emit_failure.clone())?;
+                        let args =
+                            JsString::from_str(ctx.clone(), &spec.args_json).map_err(host_lost)?;
                         method
                             .call::<_, Value>((http, emit, args))
-                            .map_err(|e| runtime_failure(operation, e))?
+                            .map_err(|e| runtime_failure(spec.operation, e))?
                     }
                     (false, true) => {
-                        let args = JsString::from_str(ctx.clone(), args_json).map_err(host_lost)?;
+                        let args =
+                            JsString::from_str(ctx.clone(), &spec.args_json).map_err(host_lost)?;
                         method
                             .call::<_, Value>((http, args))
-                            .map_err(|e| runtime_failure(operation, e))?
+                            .map_err(|e| runtime_failure(spec.operation, e))?
                     }
                     _ => method
                         .call::<_, Value>((http,))
-                        .map_err(|e| runtime_failure(operation, e))?,
+                        .map_err(|e| runtime_failure(spec.operation, e))?,
                 };
                 let promise: Promise = args.into_promise().ok_or_else(|| {
                     SandboxError::new(
                         SandboxReason::Runtime,
                         format!(
                             "{}() must be async; it returned a non-promise",
-                            operation.as_str()
+                            spec.operation.as_str()
                         ),
                     )
                 })?;
@@ -645,8 +732,17 @@ impl JsHost {
                 Ok(promise.state())
             })?;
 
+            // **Forward before deciding anything.** The reference yields every queued chunk
+            // *before* it throws the emit failure (`code-adapter.ts:574-577`), so a guest that
+            // emits to the cap and keeps going still has its first `EMIT_LINES_PER_OP` lines
+            // delivered — the cap ends the stream, it does not revoke what was already said.
+            forward(chunks, emitted);
+            if let Some(message) = emit_failure.borrow().clone() {
+                return Err(SandboxError::new(SandboxReason::Limits, message));
+            }
+
             if state != PromiseState::Pending {
-                return self.read_result(&promise, operation);
+                return self.read_result(&promise, spec.operation);
             }
 
             // Outside every scope: is there a request waiting for the egress?
@@ -656,7 +752,7 @@ impl JsHost {
             };
             if let Some(index) = waiting {
                 let call = parked.borrow()[index].call.clone();
-                let answer = self.service(&call, egress, cancel).await;
+                let answer = self.service(&call, spec.egress.as_ref(), &spec.cancel).await;
                 parked.borrow_mut()[index].answer = Some(answer);
                 continue;
             }
@@ -664,17 +760,17 @@ impl JsHost {
             // Nothing settled and nothing to await: either the guest is spinning inside a job (and
             // only the interrupt handler can stop it) or it is waiting on a promise nobody will
             // resolve. Both are terminal, and both must be reported rather than spun on.
-            if cancel.is_cancelled() {
+            if spec.cancel.is_cancelled() {
                 return Err(SandboxError::new(
                     SandboxReason::Host,
-                    format!("{}() was cancelled", operation.as_str()),
+                    format!("{}() was cancelled", spec.operation.as_str()),
                 ));
             }
             return Err(SandboxError::new(
                 SandboxReason::Timeout,
                 format!(
                     "{}() neither settled nor requested anything within {} ms",
-                    operation.as_str(),
+                    spec.operation.as_str(),
                     self.limits.op_budget_ms
                 ),
             ));
@@ -851,23 +947,74 @@ fn make_http<'js>(
 
 /// Build the guest's `emit(chunk)`, which charges the line budget and queues the text.
 ///
-/// The reference's `emit` is where the per-operation line cap is enforced, and it records the
-/// failure to throw from the driver loop rather than from the callback — because a callback that
-/// throws would surface *inside* the guest (`code-adapter.ts`). Here the callback is a host
-/// function, so the same split is achieved by ignoring the budget error in the callback and
-/// letting the driver see it; `note_emitted_line` is charged either way, which is what makes the
-/// cap bite.
+/// **Two rules live here, and streaming is what makes both observable.**
+///
+/// The per-operation line cap is enforced by *dropping* the line and recording the message for the
+/// driver, not by failing here: a host function that throws surfaces at the guest's own `await`,
+/// where the guest has no `catch`. The driver reads `failure` after it has forwarded everything
+/// already queued, which is the reference's order (`code-adapter.ts:574-577`).
+///
+/// **The cap itself is [`crate::core::sandbox::note_emitted_line`], not a rule restated here.**
+/// That function is where the boundary (`>=`, so the 401st line fails and the 400th does not) and
+/// the message both live, and its own module pins them. Charging the budget by hand here would be
+/// a second spelling of one limit — and it is how the first version of this module came to
+/// *document* the cap without enforcing it: nothing charged `budget.lines` at all, so a guest could
+/// emit without bound while the doc-comment said the cap bit.
+///
+/// **An empty chunk is neither counted nor queued.** The reference is
+/// `if (msg) { const s = getString(msg); if (s) { budget.lines += 1; queue.push(s); } }`, so
+/// `emit("")` contributes nothing — and it is tested *before* the charge, which is the reference's
+/// order. On the buffered path that was invisible — an empty string in a `Vec` of lines is a line
+/// nobody reads — but in a text stream it is a chunk the consumer sees, and a text stream that
+/// emits a blank line mid-sentence is a visible defect.
 fn make_emit<'js>(
     ctx: &Ctx<'js>,
     emitted: Rc<RefCell<Vec<String>>>,
+    budget: Rc<RefCell<OpBudget>>,
+    failure: Rc<RefCell<Option<String>>>,
 ) -> Result<Function<'js>, SandboxError> {
     Function::new(ctx.clone(), move |chunk: String| {
-        // The reference caps a logged line at 500 (`LOG_LINE_CAP`); the same cap is applied to
-        // an emitted chunk so a guest cannot push unbounded text through one call.
+        if chunk.is_empty() {
+            return;
+        }
+        let mut budget = budget.borrow_mut();
+        if let Err(over) = note_emitted_line(&mut budget) {
+            *failure.borrow_mut() = Some(over.message);
+            return;
+        }
+        // The reference caps a logged line at 500 (`LOG_LINE_CAP`); the same cap is applied to an
+        // emitted chunk so a guest cannot push unbounded text through one call.
         let text: String = chunk.chars().take(LOG_LINE_CAP).collect();
         emitted.borrow_mut().push(text);
     })
     .map_err(|e| SandboxError::new(SandboxReason::Host, format!("emit() was not built: {e}")))
+}
+
+/// Hand every line the guest has emitted since the last round to a streaming caller.
+///
+/// **`take`, not `clone`, and the reason is a defect rather than tidiness.** `forward` runs once per
+/// round of the settle loop, so a `clone` leaves every line in the staging buffer and the *next*
+/// round sends it again: a guest that emits, awaits, then emits delivers its first chunk twice.
+/// Measured — swapping in `clone` reddens exactly
+/// `a_chunk_reaches_the_caller_before_the_request_it_precedes_is_answered`, with `Line("first")`
+/// arriving where `Line("second")` belongs.
+///
+/// The empty outcome is the second consequence, and it is a contract rather than a behaviour: a
+/// caller of `JsHost::call` that passed a chunk channel finds `OperationOutcome::emitted` empty,
+/// because those lines have a new owner. Giving them a second one is the two-spellings defect this
+/// module keeps finding.
+fn forward(
+    chunks: Option<&tokio::sync::mpsc::UnboundedSender<Chunk>>,
+    emitted: &RefCell<Vec<String>>,
+) {
+    if let Some(chunks) = chunks {
+        let lines: Vec<String> = std::mem::take(&mut *emitted.borrow_mut());
+        for line in lines {
+            // A closed receiver means the consumer stopped listening. The actor must not stall on
+            // it — the operation still has to finish and release the thread.
+            let _ = chunks.send(Chunk::Line(line));
+        }
+    }
 }
 
 /// Build the global `log` function. `log` is not per-operation — it is installed once at compile
@@ -999,7 +1146,7 @@ fn runtime_failure(operation: Operation, e: rquickjs::Error) -> SandboxError {
 mod tests {
     use super::*;
     use crate::core::http_port::{HttpError, HttpResponse};
-    use crate::core::sandbox::AuthHeader;
+    use crate::core::sandbox::{AuthHeader, EMIT_LINES_PER_OP};
     use futures_util::future::BoxFuture;
     use std::collections::BTreeMap;
     use std::sync::Mutex;
@@ -1396,6 +1543,289 @@ export default {
                 "the reason must name the stack rather than something downstream of it: {}",
                 err.message
             );
+        });
+    }
+
+    // ---- Streaming (increment 20b) ------------------------------------------------------------
+
+    /// An egress that parks until the test releases it.
+    ///
+    /// **The only vantage point from which streaming and buffering are distinguishable.** Both
+    /// deliver the same text in the same order; they differ only in *when*, and *when* is visible
+    /// only while the request is still open. An egress that answers immediately cannot tell the two
+    /// apart, so it cannot test this at all — which is why the fixture exists rather than a reuse of
+    /// [`FakeEgress`].
+    struct GatedEgress {
+        entered: tokio::sync::mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Notify>,
+    }
+
+    impl HttpPort for GatedEgress {
+        fn request<'a>(
+            &'a self,
+            _req: HttpRequest,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<HttpResponse<'a>, HttpError>> {
+            Box::pin(async move {
+                let _ = self.entered.send(());
+                self.release.notified().await;
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: BTreeMap::new(),
+                    body: r#"{"chunks":["ignored"]}"#.to_string(),
+                    lines: None,
+                })
+            })
+        }
+    }
+
+    fn gated() -> (Arc<GatedEgress>, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let (entered, entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let port = Arc::new(GatedEgress { entered, release: Arc::new(tokio::sync::Notify::new()) });
+        (port, entered_rx)
+    }
+
+    fn runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap()
+    }
+
+    /// Drain a stream to its terminal item.
+    async fn drain(mut chunks: tokio::sync::mpsc::UnboundedReceiver<Chunk>) -> Vec<Chunk> {
+        let mut seen = Vec::new();
+        while let Some(chunk) = chunks.recv().await {
+            seen.push(chunk);
+        }
+        seen
+    }
+
+    /// **The property this increment exists for.** The guest emits and *then* awaits, so the first
+    /// chunk is in the caller's hand while the request that follows it is still open. A buffered
+    /// port cannot produce this: it has nothing to hand over until the promise settles.
+    ///
+    /// This is also the test that catches `forward` cloning instead of taking. A clone leaves the
+    /// first line in the staging buffer, so the next round of the settle loop sends it again and the
+    /// caller sees `first` twice.
+    #[test]
+    fn a_chunk_reaches_the_caller_before_the_request_it_precedes_is_answered() {
+        runtime().block_on(async {
+            let sandbox = spawn(
+                r#"
+                export default {
+                  async generateText(http, emit, argsJson) {
+                    emit("first");
+                    await http({ path: "/chat", method: "POST", body: {} });
+                    emit("second");
+                  },
+                };
+                "#,
+            );
+            let (egress, mut entered) = gated();
+            let cancel = Cancel::new();
+            let mut chunks = sandbox
+                .stream(Operation::GenerateText, "{}", &target(), "k1", egress.clone(), &cancel)
+                .expect("the stream should start");
+
+            entered.recv().await.expect("the guest's request should be in flight");
+            assert_eq!(
+                chunks.try_recv(),
+                Ok(Chunk::Line("first".to_string())),
+                "the first chunk must be in hand while the request it precedes is still open"
+            );
+
+            egress.release.notify_one();
+            assert_eq!(chunks.recv().await, Some(Chunk::Line("second".to_string())));
+            assert_eq!(chunks.recv().await, Some(Chunk::End(Ok(()))));
+            assert_eq!(chunks.recv().await, None, "the channel must close after End");
+        });
+    }
+
+    /// `End` is the last item and there is exactly one.
+    ///
+    /// A closed channel alone cannot say whether the guest finished cleanly, was aborted, or died
+    /// with its thread — so a consumer that stops at `None` cannot tell success from a dead actor,
+    /// which is why the terminal outcome is an item rather than the channel's closure.
+    #[test]
+    fn end_is_the_last_item_and_arrives_exactly_once() {
+        runtime().block_on(async {
+            let sandbox = spawn(
+                r#"export default { async generateText(http, emit) { for (const c of ["a","b","c"]) emit(c); } };"#,
+            );
+            let cancel = Cancel::new();
+            let chunks = sandbox
+                .stream(Operation::GenerateText, "{}", &target(), "k1", FakeEgress::new(), &cancel)
+                .expect("the stream should start");
+            assert_eq!(
+                drain(chunks).await,
+                vec![
+                    Chunk::Line("a".to_string()),
+                    Chunk::Line("b".to_string()),
+                    Chunk::Line("c".to_string()),
+                    Chunk::End(Ok(())),
+                ]
+            );
+        });
+    }
+
+    /// `emit("")` is neither delivered nor **counted**.
+    ///
+    /// The counting half is the one a "no blank chunk on the wire" test would miss: 500 empties
+    /// followed by one real line stays under the cap only if the empty check runs *before* the
+    /// charge, which is the reference's order (`if (msg) { const s = …; if (s) { budget.lines += 1;
+    /// queue.push(s); } }`).
+    #[test]
+    fn an_empty_emit_is_neither_counted_nor_delivered() {
+        runtime().block_on(async {
+            let sandbox = spawn(
+                r#"export default { async generateText(http, emit) { for (let i = 0; i < 500; i++) emit(""); emit("x"); } };"#,
+            );
+            let cancel = Cancel::new();
+            let chunks = sandbox
+                .stream(Operation::GenerateText, "{}", &target(), "k1", FakeEgress::new(), &cancel)
+                .expect("the stream should start");
+            assert_eq!(drain(chunks).await, vec![Chunk::Line("x".to_string()), Chunk::End(Ok(()))]);
+        });
+    }
+
+    /// The cap ends the stream **and keeps what was already said**: the reference yields every
+    /// queued chunk before it raises the limit failure (`code-adapter.ts:574-577`), so the cap is
+    /// what stops the stream rather than what revokes it.
+    ///
+    /// The expected failure is built by *calling* the rule rather than by quoting its message, so
+    /// this assertion cannot drift from `sandbox.rs`'s own spelling of it.
+    #[test]
+    fn the_line_cap_ends_the_stream_and_keeps_what_was_already_emitted() {
+        runtime().block_on(async {
+            // One past the cap, with the cap written once — in the source of truth rather than
+            // here, so a change to `EMIT_LINES_PER_OP` moves this test with it.
+            let source = format!(
+                r#"export default {{ async generateText(http, emit) {{ for (let i = 0; i < {}; i++) emit("L"); }} }};"#,
+                EMIT_LINES_PER_OP + 1
+            );
+            let sandbox = spawn(&source);
+            let cancel = Cancel::new();
+            let chunks = sandbox
+                .stream(Operation::GenerateText, "{}", &target(), "k1", FakeEgress::new(), &cancel)
+                .expect("the stream should start");
+            let seen = drain(chunks).await;
+
+            let mut spent = OpBudget { http_calls: 0, lines: EMIT_LINES_PER_OP };
+            let over = note_emitted_line(&mut spent).expect_err("the cap must already be reached");
+
+            assert_eq!(seen.len(), EMIT_LINES_PER_OP as usize + 1);
+            assert!(
+                seen[..EMIT_LINES_PER_OP as usize]
+                    .iter()
+                    .all(|c| *c == Chunk::Line("L".to_string())),
+                "every line under the cap must still be delivered"
+            );
+            assert_eq!(seen[EMIT_LINES_PER_OP as usize], Chunk::End(Err(over)));
+        });
+    }
+
+    /// The buffered path is untouched by all of the above: with no chunk channel, the lines belong
+    /// to the outcome. This is the guard against a `forward` that took unconditionally.
+    #[test]
+    fn a_buffered_call_still_hands_back_the_lines_in_the_outcome() {
+        runtime().block_on(async {
+            let sandbox = spawn(
+                r#"export default { async generateText(http, emit) { emit("a"); emit("b"); } };"#,
+            );
+            let outcome = sandbox
+                .call(
+                    Operation::GenerateText,
+                    "{}",
+                    &target(),
+                    "k1",
+                    FakeEgress::new(),
+                    &Cancel::new(),
+                )
+                .await
+                .expect("the call should answer");
+            assert_eq!(outcome.emitted, vec!["a".to_string(), "b".to_string()]);
+        });
+    }
+
+    /// A guest that throws *after* emitting still delivers what it said, and the reason arrives as
+    /// the stream's terminal item rather than as the response phase's `Err`.
+    #[test]
+    fn a_guest_that_throws_after_emitting_ends_the_stream_with_its_reason() {
+        runtime().block_on(async {
+            let sandbox = spawn(
+                r#"export default { async generateText(http, emit) { emit("a"); throw new Error("boom"); } };"#,
+            );
+            let cancel = Cancel::new();
+            let mut chunks = sandbox
+                .stream(Operation::GenerateText, "{}", &target(), "k1", FakeEgress::new(), &cancel)
+                .expect("the stream should start");
+
+            assert_eq!(chunks.recv().await, Some(Chunk::Line("a".to_string())));
+            match chunks.recv().await {
+                Some(Chunk::End(Err(e))) => {
+                    assert_eq!(e.reason, SandboxReason::Runtime);
+                    assert!(
+                        e.message.contains("boom"),
+                        "the reason must carry the guest's own words: {}",
+                        e.message
+                    );
+                }
+                other => panic!("the failure must be the terminal item, got {other:?}"),
+            }
+            assert_eq!(chunks.recv().await, None);
+        });
+    }
+
+    /// A consumer that stops listening must not take the actor with it.
+    ///
+    /// The receiver is dropped mid-operation, so `forward` writes to a closed channel; the actor
+    /// ignores that, finishes the operation, and goes on serving. Without the `let _ =` on the send,
+    /// this would be an actor that dies on the first consumer that walks away.
+    #[test]
+    fn a_dropped_receiver_leaves_the_actor_serving() {
+        runtime().block_on(async {
+            let sandbox = spawn(GOOD_GUEST);
+            let egress = FakeEgress::new();
+            let cancel = Cancel::new();
+            {
+                let chunks = sandbox
+                    .stream(
+                        Operation::GenerateText,
+                        r#"{"model":"text-1"}"#,
+                        &target(),
+                        "k1",
+                        egress.clone(),
+                        &cancel,
+                    )
+                    .expect("the stream should start");
+                drop(chunks);
+            }
+
+            let models = sandbox
+                .call(Operation::ListModels, "", &target(), "k1", egress, &cancel)
+                .await
+                .expect("the actor must still serve after a dropped receiver");
+            assert_eq!(models.value, serde_json::json!(["text-1", "img-2"]));
+        });
+    }
+
+    /// A stream from a sandbox that is gone fails **here**, rather than handing back a receiver
+    /// nobody will ever write to. The difference is between an error and a hang.
+    #[test]
+    fn streaming_a_disposed_sandbox_fails_here_rather_than_hanging() {
+        runtime().block_on(async {
+            let sandbox = spawn(GOOD_GUEST);
+            sandbox.dispose();
+            let err = sandbox
+                .stream(
+                    Operation::GenerateText,
+                    "{}",
+                    &target(),
+                    "k1",
+                    FakeEgress::new(),
+                    &Cancel::new(),
+                )
+                .expect_err("a disposed sandbox cannot start a stream");
+            assert_eq!(err.reason, SandboxReason::Host);
+            assert!(err.message.contains("gone"), "the reason must say so: {}", err.message);
         });
     }
 }
