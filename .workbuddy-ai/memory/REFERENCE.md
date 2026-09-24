@@ -3823,3 +3823,57 @@ Measured after the move: `cargo test --no-default-features` → **1030 passed / 
 **A pattern worth reusing: a `#[path]` module moves with its parent but needs its own `git mv`.** The
 out-of-line `#[path = "tools_agent_tests.rs"] mod agent_tests;` kept resolving only because both files moved
 into the same directory. Moving the parent alone would have left the path pointing into `tauri/`.
+
+## Phase 5c-b reconnaissance — the bridge's exact seam (2026-09-24)
+
+Read before starting 24b. Three signatures the bridge must satisfy, and one constraint that shapes it.
+
+**`Bridge::dispatch` is synchronous** (`core/gateway.rs:577`): `fn dispatch(&self, req: BridgeRequest,
+replies: ReplyHandle)` and `fn cancel(&self, request_id: u64)`. The trait is `Send + Sync + 'static`, so
+`RouterBridge::dispatch` must `tokio::spawn` the work. `tokio` is a **non-optional** dependency with
+`rt-multi-thread`, so that is available under `--no-default-features`.
+
+**`ReplyHandle::reply(id, msg) -> bool`** (`:610`). `false` means nobody is listening — the backpressure
+signal the TS gets from `gateway_chunk` failing. `Done` and `Error` are terminal and remove the registration.
+
+**`ModelRouter::generate_text` is `async` and takes a *synchronous* chunk sink** (`core/router.rs:551`):
+
+```rust
+pub async fn generate_text(
+    &mut self,
+    req: TextRequest<'_>,
+    opts: &CallOptions,
+    cancel: &Cancel,
+    on_chunk: &mut (dyn FnMut(&str) + Send),
+) -> Result<TextSuccess, RouterError>
+```
+
+The TS iterates `for await (const rawChunk of exec.chunks)`; here the loop body becomes the `on_chunk`
+closure. **That is compatible only because the TS loop body is itself synchronous** — it parses, accumulates
+`turnText` and pushes `mercuryCalls`, and every `await` in the TS (`sandboxTurn`, `flushProse`,
+`emitToolCalls`) sits *outside* the loop.
+
+**The constraint: `ModelRouter<'a>` borrows.** `store: &'a RouterStore`, `adapters: &'a dyn AdapterFactory`
+(`:444-452`), so it cannot live in a `'static` bridge. `RouterBridge` must hold `Arc<RouterStore>` +
+`Arc<dyn AdapterFactory>` and build a fresh `ModelRouter` **inside** each spawned task. `AdapterFactory:
+Send + Sync` (`adapter.rs:265`), so the `Arc<dyn>` is fine.
+
+**Status mapping has an exact source** (`gateway-bridge.ts:53-75`): `CLIENT_ATTRIBUTABLE_STATUS =
+{400,404,413,422,429}`; the status is the **last** attempt's when the error carries a chain, else the
+`/no route|not found/i` message heuristic → 404, else 502. `RouterError` (`router.rs:337`) carries
+`NoRoute`, `Text(Box<TextFailure>)`, `Image(AllAttemptsFailed)`, `SystemAiUnavailable`, `Ledger`. Note
+`SystemAiUnavailable` is deliberately **not** `NoRoute` — its message does not contain "no route", so it
+stays a 500.
+
+**24b splits in two, on the same line as every other module in this phase.**
+
+- **24b-i — `core/bridge_policy.rs`**: the pure decisions. `gateway_status`; the tool-ownership decision
+  (client tools vs the gateway registry vs off); the held-prose state machine (accumulate within a turn,
+  discard at the top of the next, flush at the end); the turn outcome (mercury-first, then no-calls →
+  finish, then pass-through → emit and finish, then gateway → sandbox and continue); the
+  `min_retry_after_ms` hint; and the tool-call dedup rule, which is subtle —
+  `if (!collected.some((c) => c.id && c.id === call.id))` pushes a call **whenever it has no id**, so
+  id-less duplicates all survive. No I/O, so it can be pinned before anything calls it.
+- **24b-ii — `core/router_bridge.rs`**: the driver. `RouterBridge` holding the `Arc`s, the
+  `request_id → Cancel` map, and the `Bridge` impl; `tokio::spawn` per dispatch; the tool call into
+  `core::tools::tool_run`; and `BridgeMsg` onto the `ReplyHandle`.
