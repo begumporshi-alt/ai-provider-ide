@@ -4795,10 +4795,13 @@ correct — the defect was in their composition. Run the first real request befo
   `tools_enabled()` was hardcoded `true` ⇒ a client declaring no tools was Gateway-owned ⇒ every delta was held
   to the turn end (`router_bridge.rs:390`). **Fixed:** `RouterSettings.gateway_tools_enabled` ← the `router`
   row's `gatewayToolsEnabled`; `HeadlessHost` reads it; **absent ⇒ `true`**, so no existing install changes.
-  With it false, ownership is `None` ⇒ `hold` false ⇒ deltas reach the client as the upstream emits them. Pinned
-  by `tools_off_streams_the_prose_as_it_arrives` and **falsified**: forcing `hold = true` reddens it and the
-  `Client` case while correctly leaving the `Gateway` case green. **The desktop app is untouched** — it answers
-  from the in-memory `HostSettings` toggle; unifying the two means the UI writes this key.
+  With it false, ownership is `None` ⇒ `hold` false ⇒ deltas reach the client as the upstream emits them.
+  **Confirmed live, end to end:** same request, same stub, only the setting differs — first content byte
+  **1,211.5 ms** with tools on (of a 1,211.6 ms total) vs **3.7 ms** with them off (of 1,213.8 ms). Total
+  unchanged, **TTFT down ~327×**. Pinned by `tools_off_streams_the_prose_as_it_arrives` and **falsified**:
+  forcing `hold = true` reddens it and the `Client` case while correctly leaving the `Gateway` case green.
+  **The desktop app is untouched** — it answers from the in-memory `HostSettings` toggle; unifying the two
+  means the UI writes this key.
 - **`/health` 200 ≠ the authenticated surface is ready.** The master-key read is bounded by `MASTER_KEY_WAIT`
   (1500 ms) and until it lands *every* authenticated route answers 503. `/health` is deliberately
   unauthenticated, so polling it and then firing a request lands inside the window — the first version of the

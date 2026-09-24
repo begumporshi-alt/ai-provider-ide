@@ -2934,6 +2934,13 @@ gate, which `passing_mode_streams_the_prose_as_it_arrives` (`Client`) and
 **falsified before it was trusted**: forcing `ProseGate::new` to hold unconditionally reddens it and the
 `Client` case while correctly leaving the `Gateway` case green.
 
+**And then confirmed live, end to end.** The same request against the same stub, the only difference
+being the setting: with gateway tools **on** the first content byte arrived at **1,211.5 ms** of a
+1,211.6 ms total, and with them **off** at **3.7 ms** of a 1,213.8 ms total. The total is unchanged —
+the upstream still takes the same time — but time-to-first-token falls by a factor of ~327. That is the
+difference between a client rendering nothing for the whole generation and rendering text immediately,
+and it is the one latency number a user actually feels.
+
 **The cost is real, which is why this is a setting and not a fix.** Gateway-owned tools are what let the
 gateway run its own tool loop, so turning them off trades that capability for streaming. The desktop app
 is untouched: it answers from `HostSettings`, a live toggle the UI flips, and unifying the two means
