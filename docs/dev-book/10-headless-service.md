@@ -2007,7 +2007,7 @@ one is the deletion:
 | **24b-ii-b — landed** | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`. **Landed against seams, not wired**: three paths it must walk are still Tauri-shaped or Tauri-gated, so nothing installs it yet (D39) |
 | **25a — landed** | `core/egress_port.rs` — `impl HttpPort for EgressPort`, the production implementor the plan's own future tense had assumed existed (D40). Un-gates `egress::stream` off `tauri::ipc::Channel` onto an `mpsc` sink, so `egress.rs` now carries **no** `cfg(feature = "app")` at all |
 | **25b — landed** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1). It also gave `RouterSettings` its first production source, a prerequisite none of D39's three gaps had named |
-| **25c** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code does today (D40) |
+| **25c — landed** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code did before this increment (D40). `core/activation.rs` is `register`'s **first production caller**. It iterates manifest rows rather than providers, because the reference's `PROVIDER_PROFILES[slug]` branch has no Rust port — harmless on this install, a divergence elsewhere (**D41**) |
 | **25d** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability |
 | **25e** | Install `RouterBridge` — hydrate, register the adapters, build the `EgressPort`, point `BridgeHost` at `GatewayCore`, and swap `HeadlessBridge` in `bin/aiproviderd.rs`, whose `ready()` answers `false` and so makes every completion a deliberate 503 |
 | **25f** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)**. Safe only once 25a–25e stand a Rust path behind it |
@@ -2659,6 +2659,42 @@ defaults too — so only the persist test guards the malformed-is-absent contrac
 `router_settings_from_store_maps_the_stored_object` green, because `6` is a valid `u64` — so only the
 corruption test guards the un-clamped contract, and a reader that coerced would pass the happy path. A
 round-trip test alone would have missed both.
+
+**Increment 25c — the activation path, and the branch the reference tries first.** With 25b landed a
+launch can build the store, but it still could not serve, because `AdapterRuntime` had **no production
+constructor at all** (D40). The module said so itself: "Who reads `manifests.body_json` and calls it is
+the activation path's business, and nothing in production calls it yet." `core/activation.rs` is that
+business, and `activate(&runtime, &store)` is the first production caller of both `AdapterRuntime::new`
+and `register`. `persist::manifests_active_rows` is the un-gated `&Store` reader underneath it, split
+from the `manifests_active` command exactly as 25b split the four row readers.
+
+**The one decision is skip, not abort.** The reference wraps the register in a `try`/`catch` whose body
+is a comment — *"corrupt manifest: leave unregistered; Phase 5 drift/repair surfaces it"*
+(`store.ts:377-379`). A launch that refused to start because one provider of three had a bad manifest
+would trade a degraded service for no service, so `activate` returns both what it registered and what
+it skipped, with the reason and the **version** for each — the version because the table holds every
+one, and "provider X" alone names three candidates. **The store read is the only failure that
+propagates**: a database this process cannot read is not a degraded launch, it is no launch.
+
+**The skip relies on a boundary that already existed.** `AdapterRuntime::register` builds before it
+swaps (D32), so a manifest that fails to build leaves the previous adapter serving. That is what makes
+re-activation safe, and `reactivating_a_provider_that_now_fails_leaves_the_previous_adapter_serving`
+pins it: the operator activates a broken v2, activation reports it skipped, and the v1 adapter is still
+in `registered()` — a bad activation is not an outage.
+
+**The divergence, and it is measured rather than assumed (D41).** The reference's loop runs over
+*providers* and tries `PROVIDER_PROFILES[slug]` before it looks at a manifest row; there is no Rust
+`PROVIDER_PROFILES`, so this iterates *manifest rows*. Against the installed database the two agree —
+**2** providers, both `type='manifest'`, both carrying an active row, and no builtin provider
+installed. They would not agree on a machine that had an OpenRouter provider with no manifest row.
+
+**Six tests, two probes, one at a time, file byte-exact after each revert.** Rust **1172 → 1178**;
+headless **1112 → 1118**, so every new test is reachable with no Tauri in the graph. Dropping
+`WHERE is_active = 1` reddens `activation_reads_only_the_active_version` and `reactivating_...`
+**alone**, and that four of six stay green is the finding: the filter is only observable through a
+fixture that carries a superseded version, so a suite of nothing but well-formed active rows would
+have passed with no filter at all. Making activation abort on the first failure reddens exactly the
+three tests that exercise a failure, and none of the three that do not.
 
 ---
 

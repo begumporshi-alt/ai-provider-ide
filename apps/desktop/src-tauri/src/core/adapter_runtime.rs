@@ -63,9 +63,10 @@
 //! # What is deliberately absent
 //!
 //! - **No store read.** [`AdapterRuntime::register`] takes a parsed manifest. Who reads
-//!   `manifests.body_json` and calls it is the activation path's business, and nothing in
-//!   production calls it yet — this module makes the sandbox *reachable* from the router, which is
-//!   what the plan's Phase 4b named; wiring it into `gateway.rs` is Phase 5's.
+//!   `manifests.body_json` and calls it is the activation path's business, and that path is now
+//!   [`crate::core::activation`] (increment 25c) — which is the first production caller of both
+//!   `register` and this type's constructor. This module makes the sandbox *reachable* from the
+//!   router, which is what the plan's Phase 4b named; wiring it into `gateway.rs` is 25e's.
 //! - **No `baseUrl`.** The reference's `forProvider` returns `{ adapter, baseUrl }` and the engine
 //!   destructures only `{ adapter }` at both call sites, so [`AdapterFactory`] refuses the field
 //!   (`adapter.rs:261-264`). Adding it here would be a second spelling of a value nobody reads.

@@ -4446,3 +4446,72 @@ closed, and a fourth prerequisite this cell did not name" (the settings). D40 st
 landed, full increment section. `09-status.md`: new increment row, Tests cell **1165 → 1172** with
 headless **1105 → 1112**. `book.html`: 204 ids, **648.4 KB**, 0 `data-page-node-id`.
 
+## Increment 25c — the manifest activation path, and the branch the reference tries first (2026-09-24)
+
+### The gap
+
+`AdapterRuntime` had **no production constructor** (D40), and its own header said so: "Who reads
+`manifests.body_json` and calls it is the activation path's business, and nothing in production calls
+it yet." 25b let a launch build the `RouterStore`; it still could not serve.
+
+### What changed
+
+- `persist::manifests_active_rows(store: &Store) -> Result<Vec<ManifestRow>, CommandError>` —
+  un-gated; `manifests_active` becomes a one-line delegate (the 25b split, applied to a fifth reader).
+  **The `WHERE is_active = 1` filter is the whole function**: `manifests` holds one row per *version*
+  and only one is live, so a caller that forgot it would be handed every version ever staged and let
+  an old one win by iteration order — a silent rollback of the operator's activation.
+- `core/activation.rs` — `activate(&AdapterRuntime, &Store) -> Result<Activation, CommandError>`;
+  `Activation { registered: Vec<String>, skipped: Vec<Skipped> }`;
+  `Skipped { provider_id, version, reason }`; `is_complete()`. First production caller of both
+  `AdapterRuntime::new` and `register`.
+- `core/mod.rs` — `pub mod activation;`. **rustfmt sorts `pub mod` alphabetically, so `activation`
+  goes before `adapter`.**
+- `adapter_runtime.rs` — the "No store read" bullet now points at `core::activation`, because
+  "nothing in production calls it yet" went stale the moment 25c landed.
+
+### The reference, and the one decision
+
+`store.ts:367-381`: loop over **providers**, try `PROVIDER_PROFILES[slug]` first, fall back to the
+active manifest row, and wrap the register in a `try`/`catch` whose body is *"corrupt manifest: leave
+unregistered; Phase 5 drift/repair surfaces it"*. So: **skip, not abort**. The store read is the only
+failure that propagates — an unreadable database is no launch, not a degraded one.
+
+`Skipped.version` is carried because the table holds every version and "provider X" names three rows.
+
+### The divergence (D41)
+
+There is **no Rust `PROVIDER_PROFILES`** — the name occurs nowhere in `src-tauri/src`, and
+`manifest_view.rs:284` / `:349` (`openai_compat`, `anthropic_compat`) are `#[cfg(test)]` fixtures. So
+activation iterates **manifest rows**, not providers.
+
+**Measured against the installed database (2026-09-24):** 2 providers (`agnes`, `cline`), both
+`type='manifest'`, both with an active row, **no builtin provider installed** → the two agree here.
+They would not agree on a machine with an OpenRouter provider that has no manifest row: served by its
+profile in the reference, unregistered here. Live DB is at
+`~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (read with `?mode=ro`).
+
+### The probes
+
+| probe | change | result |
+|---|---|---|
+| the active filter | drop `WHERE is_active = 1` | `activation_reads_only_the_active_version` and `reactivating_...` **red**; 4 of 6 stay green |
+| skip vs abort | `return Err(..)` on first failure | the **3** tests that exercise a failure red; the 3 that do not stay green |
+
+**The green half is the finding.** The filter is only observable through a fixture carrying a
+superseded version — the inactive v1 is **malformed JSON on purpose**, so "was the row read?" has an
+observable answer. A suite of nothing but well-formed active rows would have passed with no filter.
+
+### Trap: an anchor can span a line wrap
+
+Two doc edits failed with "String to replace not found" because the anchor text was wrapped across two
+lines in the source ("…happy path. A" / "round-trip test alone…"). Grep found the phrase only as one
+continuous string. **Read the region back and copy the wrapped text verbatim** — a Grep hit does not
+tell you where the newline is.
+
+### The docs
+
+**D41** added to the register. `10-headless-service.md`: table row 25c landed, full increment section.
+`09-status.md`: new increment row, Tests cell **1172 → 1178** with headless **1112 → 1118**.
+`book.html`: 204 ids, **658.2 KB**, 0 `data-page-node-id`.
+

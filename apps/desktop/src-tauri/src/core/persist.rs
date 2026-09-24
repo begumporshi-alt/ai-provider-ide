@@ -305,9 +305,18 @@ pub struct ManifestRow {
     pub is_active: bool,
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>, CommandError> {
+/// Every **active** manifest row — at most one per provider, which
+/// `uq_manifests_one_active` enforces.
+///
+/// **The `is_active = 1` filter is the whole function, and it is why this is a reader rather than a
+/// query the caller writes.** The table keeps one row per *version* and only one of them is live, so
+/// a caller that forgot the filter would be handed every version ever staged and would let an old
+/// one win by iteration order — a silent rollback of the operator's activation, which is exactly
+/// the mistake `manifest_activate` exists to make impossible.
+///
+/// The headless split, for the reason the section note at the top of this file gives: the body never
+/// needed the `State`, so this reads a `&Store` and the command below is a one-line delegate.
+pub fn manifests_active_rows(store: &Store) -> Result<Vec<ManifestRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
         "SELECT id, provider_id, version, origin, body_json, contract_result_json, created_at, is_active FROM manifests WHERE is_active = 1",
@@ -325,6 +334,12 @@ pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>, CommandError> {
+    manifests_active_rows(&store)
 }
 
 #[cfg(feature = "app")]

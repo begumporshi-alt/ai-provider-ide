@@ -25,6 +25,7 @@
 //! `cargo build --bin aiproviderd` (tests are not compiled) and harmless for `cargo test` (the
 //! whole crate is), and it is recorded rather than hidden.
 
+pub mod activation;
 pub mod adapter;
 pub mod adapter_runtime;
 pub mod assistant_stream;
