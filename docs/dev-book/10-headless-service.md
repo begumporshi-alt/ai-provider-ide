@@ -74,7 +74,7 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 | **Route planner** (`route-planner.ts:173`) | TypeScript — candidate ordering | **Ported** — `core/planner.rs` (increment 11b) | Done |
 | **Model router** (`model-router.ts:557`) | TypeScript — facade, registry, catalog | **Ported** — `core/router.rs` (increment 13) | Done |
 | **Context compression** (`context-compress.ts:271`) | TypeScript — Tier 1 trim, Tier 2 summary | **Ported** — `core/compress.rs` (increment 14a); the wiring is outstanding | **Medium** — the port is done; what is left is calling it, and Tier 2's summarizer must arrive as a seam rather than a closure (D24) |
-| **Adapter runtime** (`adapter-runtime.ts:60`) | TypeScript — manifest interpreter + sandbox | **The one module still unported** | **High** — 60 lines, but it is the only part of the port with **no phase assigned to it**, and §12's open question is whether `rquickjs`/`boa` can run the existing sandbox |
+| **Adapter runtime** (`adapter-runtime.ts:60`, `manifest-interpreter.ts:491`, `code-adapter.ts:615`) | TypeScript — manifest interpreter + QuickJS sandbox | **The one module still unported** | **High** — and the unit of work is not the 60-line dispatch this row used to cite but the **24,820-byte** sandbox beside it. **Spiked 2026-09-24: it is a port, not a reimplementation** — see §2.1.3 |
 | **Health tracker** (`health-tracker.ts:78`) | TypeScript — cooldowns, circuit breakers | **Ported** — `HealthTracker` in `core/engine.rs` (increments 1–10) | Done |
 | **Concurrency limiter** (`concurrency.ts:91`) | TypeScript — per-provider in-flight caps | **Ported** — `core/limiter.rs` (increment 5) | Done |
 | **Usage ledger** (`usage-ledger.ts:114`) | TypeScript — cost attribution | **Ported** — `core/ledger.rs` (increment 12) | Done |
@@ -101,6 +101,14 @@ Two things follow, and the second is the one that matters:
   modules rather than one increment's worth. So the fix is not only to correct the rows: the missing phase
   has to be decided, and §12's open question (`rquickjs`/`boa` versus a native reimplementation) is what
   decides it. Logged as D25.
+
+**One more thing this table got wrong, and it is why the module looked cheap.** The row cited
+`adapter-runtime.ts:60` — the 60-line dispatch — as the unit of work, when the work is
+`code-adapter.ts` (**24,820 bytes**, 615 lines) and `manifest-interpreter.ts` (**21,903 bytes**, 491
+lines). A module described as "60 lines" needs no phase; a module described as 24.8 KB of QuickJS host
+plumbing obviously does. The wrong citation is what made the absent phase look acceptable, so it is
+logged separately as D26 rather than folded into D25 — and §2.2's "what must move" list omitted the
+same ~1,100 lines for the same reason.
 
 ### 2.1.1 The module split as built (Phase 1, 2026-09-23)
 
@@ -238,20 +246,133 @@ instrument was wrong** — the opposite of the four earlier cases, and the reaso
 pattern that produced it. A near-miss worth keeping: the previous four corrections make a fifth one *plausible*,
 and plausibility is not evidence.
 
+### 2.1.3 The adapter-runtime spike, answered (2026-09-24)
+
+**Verdict: it is a port, not a reimplementation — with one caveat that changes where the sandbox runs.**
+
+The question §12 has carried since this plan was written — can `rquickjs` (or `boa`) run the existing
+Tier-2 sandbox? — is answered by running the sandbox's own guest contract through `rquickjs` and
+checking the values `code-adapter.test.ts` asserts. It was framed as a spike because the answer decides
+whether this phase is a port or a rewrite, and the framing held up: the answer is "port", but three
+primitives arrive in a shape the TypeScript does not have, and one of them is a containment failure
+rather than an inconvenience.
+
+**The harness.** A standalone crate, 723 lines, 13 probes, at `.workbuddy-ai/spikes/js-engine/`
+(`cargo run --release`; `SPIKE_CRASH=1` for the two that are expected to kill the process). Every probe
+states one claim the TypeScript design depends on, and the money probe copies `GOOD_GUEST`
+**verbatim** out of `code-adapter.test.ts:21-37` — not adapted, not reformatted, not re-indented. It
+passes:
+
+```
+S8  GOOD_GUEST verbatim: all three guest operations ran verbatim:
+    listModels=[text-1,img-2], generateText=[Al,pha], generateImage={ok,200,QUJD}
+```
+
+Those are the three values the TypeScript test asserts (`code-adapter.test.ts:113`, `:148`, `:154`),
+produced by the same guest source, against a Rust host that reproduces `makeHttp`'s deferred-promise
+bridge and `callOp`'s job pump. **Same engine, same guest, same answers.**
+
+**What maps one-to-one.** `rquickjs` binds the same QuickJS C engine that
+`@jitl/quickjs-singlefile-mjs-release-sync` compiles to WASM, so the language semantics are identical
+by construction. Every host primitive the sandbox uses has a direct counterpart:
+
+| `code-adapter.ts` | `rquickjs` | probe |
+|---|---|---|
+| `newRuntime({ memoryLimitBytes, maxStackSizeBytes, interruptHandler })` | `set_memory_limit`, `set_max_stack_size`, `set_interrupt_handler` | S5, S6 |
+| `ctx.newPromise()` + `deferred.resolve/reject` | `Ctx::promise() -> (Promise, resolve, reject)` | S3 |
+| `runtime.hasPendingJob()` / `executePendingJobs()` | `Ctx::execute_pending_job()` — **not** `Runtime::*` | S3 |
+| `evalCode(source, "adapter.mjs", { type: "module" })` | `Module::declare(...)?.eval()?` — **not** `eval_with_options` | S2, S2b |
+| `ctx.getProp(namespace, "default")` | `Module::get("default")` | S2b |
+
+`AdapterInstance: Send + Sync` (`core/adapter.rs`) is satisfiable, but only conditionally: `rquickjs`
+declares `Send`/`Sync` for `Runtime` and `Context` **under its `parallel` feature only**
+(`runtime/base.rs:187-197`, `context/base.rs:144-149`). Without it both are `!Send` and no
+`Arc<dyn AdapterInstance>` can hold one.
+
+**Three traps, each measured rather than reasoned about.**
+
+1. **The module door is not the obvious one.** `EvalOptions::default()` is `global: true` — *script*
+   mode — so the natural `ctx.eval(source)` rejects the guest's `export default {` on its first
+   character. Clearing `global` does select `JS_EVAL_TYPE_MODULE`, but `eval_with_options` then returns
+   the module's *evaluation promise*, which resolves to **`undefined`**: the namespace is unreachable
+   from that entry point at all. `Module::declare(...)?.eval()?` plus `get("default")` is the door that
+   works — S2 fails to find a `default`, S2b finds one. It also compiles *without running*, which is
+   what `compile()` (`code-adapter.ts:202`) exists to do, so one door covers both the compile gate and
+   the call path.
+
+2. **The job pump must be the `Ctx` one, and under `parallel` the `Runtime` one deadlocks.**
+   `Context::with` holds the runtime's global lock for the whole closure (`context/base.rs:109`), and
+   with `parallel` enabled `Runtime::is_job_pending` and `Runtime::execute_pending_job` each take that
+   same non-reentrant lock (`runtime/base.rs:162,170`). Calling either inside a context scope hangs the
+   thread. This was measured the hard way: the first S3 run wedged with the probe's own diagnostic line
+   printed and the `is_job_pending` line never reached. `Ctx::execute_pending_job`
+   (`context/ctx.rs:375`) calls `JS_ExecutePendingJob` directly with no lock, so it is the only pump
+   available in this shape — **the `parallel` feature, which the seam's bounds require, is exactly what
+   makes the obvious pump illegal.** One cost, stated: the `Ctx` variant returns `bool` and folds "a job
+   ran" together with "a job threw", so a caller that needs to see a job's exception must inspect the
+   promise instead of the return value.
+
+3. **The memory limit is not a containment boundary in-process.** This is the finding that changes the
+   plan. `MEMORY_LIMIT` is 32 MB (`code-adapter.ts:67`) and the TS suite has **no test for it** — it
+   covers lint, wall-clock timeout, http and emit rate limits, path traversal, disposal and recovery,
+   but never an over-allocating guest. Measured here, each variant its own run because a crash takes the
+   process with it:
+
+   | Probe | Guest | Result |
+   |---|---|---|
+   | S6a | allocates ~60 MB, **no limit** | resolves normally — so the limit, not the allocation, is the cause |
+   | S6b | allocates ~60 MB, 8 MB limit | **SIGSEGV**, 3 of 3 runs, inside `m.call` |
+   | S6c | allocates ~60 MB, **32 MB limit** | **SIGSEGV** — the TS's own value behaves identically |
+   | S6d | allocates ~60 MB *after an `await`*, 8 MB limit | rejects cleanly, no crash |
+   | S6e | `throw new Error("boom")` at entry | rejects cleanly |
+   | S6f | runaway recursion against the 512 KB stack limit | rejects cleanly |
+
+   The trap is therefore specific: an out-of-memory raised while the guest executes **directly inside
+   the call** — before its first `await` — kills the process with `SIGSEGV`, while the same trap inside
+   a job is contained, and neither the stack limit nor an ordinary throw is fatal. A guest whose first
+   act is a large allocation takes the app down with it. **A containment limit that aborts the host is
+   not a containment limit**, and the contract suite cannot see the difference because it never tests
+   one.
+
+**What this decides, and what it leaves open.** The port is real work but it is not a rewrite: the guest
+contract, the deferred-promise bridge, the pump, the interrupt handler and the stack limit all map, and
+S5 aborted a spinning guest at 300.7 ms and 301.2 ms on two runs against a 300 ms budget. What trap 3
+decides is *where* the sandbox runs. §8's risk register already names the fallback — "keep Tier-2
+adapters in a sandboxed subprocess" — and the spike promotes it from fallback to the recommended shape
+for the heap boundary specifically: in-process the sandbox can enforce a wall-clock deadline, the http
+and emit budgets, path containment and stack depth, but it cannot enforce a heap ceiling without the
+power to kill the host. Whether the whole adapter runtime moves out-of-process, or only the heap ceiling
+is enforced by a supervisor, is the next decision — and it is now a decision with evidence under it
+rather than a preference.
+
+**What the spike did not test**, stated so the gaps are not mistaken for coverage: the `log` global
+(`code-adapter.ts:166`); `dispose()` and the hot-swap path (`adapter-runtime.ts`); the
+`ManifestInterpreter` half of the dispatch, which needs no JS engine at all and was never in question;
+and the async-host shape, where the host must `await` a real `reqwest` fetch *between* job pumps. The
+probes service `http` synchronously, which is faithful to the TS test's `FakeHttp` but does not exercise
+`AsyncContext`/`ctx.spawn`. That last one is the largest remaining unknown, and it is the natural next
+probe rather than a port-time surprise.
+
 ### 2.2 The line count
 
 ```
 Router-core TypeScript:  5,880 lines across 35 modules
 Rust host today:        25,612 lines across 25 modules
 What must move:         ~2,100 lines (execution, router, planner, compression, health, ledger)
+Adapter runtime:        ~1,100 lines (code-adapter 615 + manifest-interpreter 491) — omitted from this list until 2026-09-24
 What can be deleted:    ~300 lines (bridge, worker window, App Nap)
-Net new Rust:           ~2,500 lines (port + process manager + tests)
+Net new Rust:           ~2,500 lines (port + process manager + tests) — computed without the row above
 ```
 
 The 5,880 figure includes modules that do NOT need to move: `builtin-templates.ts` (static data),
 `redaction.ts` (generator-only), `adapter-generator.ts` (generator-only), `onboarding-orchestrator.ts`
 (UI-only), `drift-monitor.ts` (UI-only), `repair-orchestrator.ts` (UI-only). The gateway path touches
 only a subset.
+
+**Both arithmetic lines above were derived from a module list that omitted the adapter runtime**, which
+is the same omission that left that module without a phase (§2.1.3, D26). "What must move" is short by
+about the 1,100 lines now itemised, and "net new Rust" was computed from it. A module absent from the
+table was absent from the total.
 
 ### 2.3 What does NOT need to move
 
@@ -1516,7 +1637,7 @@ webview. No Tauri events. No heartbeat.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | **Execution engine port introduces bugs** | High | Critical | Port tests first; keep JS implementation behind a feature flag; run both in parallel for one release |
-| **Adapter runtime (QuickJS-WASM) is hard to port** | Medium | High | Evaluate `rquickjs` or `boa` crates; fallback: keep Tier-2 adapters in a sandboxed subprocess |
+| **Adapter runtime (QuickJS-WASM) is hard to port** | **Resolved 2026-09-24** | High | **Spiked and answered: it is a port.** `rquickjs` runs `GOOD_GUEST` verbatim to the same three values the TS suite asserts, and every host primitive maps (§2.1.3). The residual risk is narrower and named: the **32 MB heap limit is not containment** — an OOM raised during the synchronous part of the call `SIGSEGV`s the host — so that ceiling needs a supervisor or a subprocess |
 | **SQLite concurrent access deadlocks** | Low | High | WAL mode is already on; add connection pooling; test with `cargo test` under `tokio::task::spawn` |
 | ** launchd plist gets out of sync with binary path** | Medium | Medium | The template above points `ProgramArguments` at an absolute path **inside** the bundle (`/Applications/AI-Provider Router.app/Contents/MacOS/aiproviderd`), so anything that moves the bundle — a versioned install path, an atomic directory swap — leaves the job pointing at a path that no longer exists. Remedies, in order of preference: (1) put the binary at a fixed path **outside** the bundle, or behind a stable symlink, and point the plist there; (2) have the updater run `launchctl bootout` before the swap and `launchctl bootstrap` after it. "Check the path and rewrite the plist if the bundle moved" is the weakest of the three, because it only helps once the app is running again. Note that `KeepAlive` **throttles**, and can leave the job disabled after repeated failed execs, so a path that is briefly missing during a swap is not self-healing |
 | **UI → service discovery fails on first install** | Medium | Medium | Graceful degradation: UI shows "service not running" with manual start instructions |
@@ -1570,10 +1691,15 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
 ## 10. Decisions needed
 
 1. **Do we port the adapter runtime (QuickJS-WASM) to Rust, or sandbox it in a subprocess?**
-   - Port: single binary, simpler deployment, but `rquickjs` is immature.
-   - Subprocess: keep JS adapters in a worker, but add IPC overhead.
-   - *Recommendation:* evaluate `rquickjs` in a spike (1 day). If it passes the contract suite, port.
-   If not, subprocess.
+   - ~~Port: single binary, simpler deployment, but `rquickjs` is immature.~~
+   - ~~Subprocess: keep JS adapters in a worker, but add IPC overhead.~~
+   - ~~*Recommendation:* evaluate `rquickjs` in a spike (1 day). If it passes the contract suite, port.
+   If not, subprocess.~~
+   - **Answered 2026-09-24 by the spike in §2.1.3.** The spike was run and the contract suite passes
+   verbatim, so **port**. Note the premise: "`rquickjs` is immature" was never tested, and it is now
+   contradicted for every primitive this sandbox actually uses. One sub-decision survives and the spike
+   does *not* answer it — the 32 MB heap ceiling cannot be enforced in-process without the power to kill
+   the host, so either the whole adapter runtime runs under a supervisor or that one limit does.
 
 2. **Do we keep the Tauri app as a pure HTTP client, or keep a subset of IPC for performance?**
    - Pure HTTP: simpler, consistent, no special cases.
@@ -1608,16 +1734,30 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
 
 **Total: 3-4 weeks of focused development.**
 
-This is an all-at-once change, not an incremental one. The bridge is the boundary, and the router
+~~This is an all-at-once change, not an incremental one. The bridge is the boundary, and the router
 core is on one side of it. You cannot move it piecemeal — half the engine in Rust and half in JS
-would need a second bridge between them.
+would need a second bridge between them.~~
+
+**This paragraph was false when it was written and the work since has proved it false.** It was
+measured wrong the only way that counts: **fourteen increments have moved it piecemeal.** Increments
+1–10 ported the execution engine into `core/engine.rs`, 11b the planner, 12 the ledger, 13 the router
+glue and 14a the pure half of compression — each a self-contained Rust module, each with its own
+tests, none of them needing a second bridge, because a *ported module with no caller* is not a half of
+anything. What the paragraph got right is narrower than it claimed: the **switchover** is
+all-at-once — the day the gateway stops dispatching through the bridge, both halves must exist. That
+is a statement about the last step, not about the whole change, and it is why Phase 5 exists. The
+distinction matters because the paragraph as written argues against the strategy that actually
+worked, and a reader could have taken it as a reason not to start.
 
 ---
 
 ## 12. What we know we do not know
 
-- Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
-the test; until it is run, this is an open question.
+- ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
+the test; until it is run, this is an open question.~~ **Answered 2026-09-24: yes, it can.** `rquickjs`
+runs `GOOD_GUEST` verbatim to the values `code-adapter.test.ts` asserts. The contract suite *was* the
+test and it passed — but it does not test the memory limit, and that is precisely where the port's one
+real containment failure lives. See §2.1.3.
 - ~~Whether the summarization call in context compression (Tier 2) works correctly when the engine
   calls itself recursively.~~ **Answered 2026-09-24, and the question was mis-framed.** Rust does not
   permit the recursive shape at all — a callback that re-enters the same `&mut self` is `E0501` — so
@@ -1635,4 +1775,9 @@ This is a plan, not a specification. When implementation starts, each phase gets
 document in `docs/` and its own branch. This chapter is updated as decisions are made and
 assumptions are tested.
 
-**Next action:** answer the four decisions in §10, then begin Phase 1 (extract core library).
+**Next action:** decide the sub-question the adapter-runtime spike left open — in-process with a
+supervised heap ceiling, or out-of-process — and then give that module a phase in §7, which it has never
+had. The other three decisions in §10 still stand. (This line read "answer the four decisions in §10,
+then begin Phase 1" until 2026-09-24, by which point Phase 1 and twelve increments had landed; it is
+recorded here rather than silently overwritten because a stale "next action" is the cheapest way for a
+plan to stop describing its own project.)
