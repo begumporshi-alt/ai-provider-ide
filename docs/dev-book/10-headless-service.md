@@ -70,19 +70,37 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 | **SQLite store** (`store.rs`, `persist.rs`) | Rust — `rusqlite` | Same code, same DB path | None |
 | **Egress** (`egress.rs`) | Rust — reqwest with credential injection | Same code | None |
 | **Model adapters** (`gateway_anthropic.rs`, `gateway_gemini.rs`, `gateway_responses.rs`) | Rust, but dispatch through bridge | Call providers directly, no bridge | Medium — remove bridge indirection |
-| **Execution engine** (`execution-engine.ts:228`) | TypeScript — attempt loop, failover, SSE | Must be ported to Rust | **High** — 228 lines, but the logic is load-bearing |
-| **Route planner** (`route-planner.ts:173`) | TypeScript — candidate ordering | Must be ported to Rust | **High** — 173 lines, heuristic-heavy |
-| **Model router** (`model-router.ts:557`) | TypeScript — facade, registry, catalog | Must be ported to Rust | **High** — 557 lines, the public API |
-| **Context compression** (`context-compress.ts:271`) | TypeScript — Tier 1 trim, Tier 2 summary | **Tier 1 and Tier 2 ported** — `core/compress.rs` (increment 14a); the wiring is outstanding | **Medium** — the port is done; what is left is calling it, and Tier 2's summarizer must arrive as a seam rather than a closure (D24) |
-| **Adapter runtime** (`adapter-runtime.ts:60`) | TypeScript — manifest interpreter + sandbox | Must be ported to Rust | **High** — 60 lines, but pulls in QuickJS-WASM |
-| **Health tracker** (`health-tracker.ts:78`) | TypeScript — cooldowns, circuit breakers | Must be ported to Rust | Medium |
-| **Concurrency limiter** (`concurrency.ts:91`) | TypeScript — per-provider in-flight caps | Must be ported to Rust | Low |
-| **Usage ledger** (`usage-ledger.ts:114`) | TypeScript — cost attribution | Must be ported to Rust | Medium — already mirrored in `persist.rs` |
+| **Execution engine** (`execution-engine.ts:228`) | TypeScript — attempt loop, failover, SSE | **Ported** — `core/engine.rs` (increments 1–10) | Done |
+| **Route planner** (`route-planner.ts:173`) | TypeScript — candidate ordering | **Ported** — `core/planner.rs` (increment 11b) | Done |
+| **Model router** (`model-router.ts:557`) | TypeScript — facade, registry, catalog | **Ported** — `core/router.rs` (increment 13) | Done |
+| **Context compression** (`context-compress.ts:271`) | TypeScript — Tier 1 trim, Tier 2 summary | **Ported** — `core/compress.rs` (increment 14a); the wiring is outstanding | **Medium** — the port is done; what is left is calling it, and Tier 2's summarizer must arrive as a seam rather than a closure (D24) |
+| **Adapter runtime** (`adapter-runtime.ts:60`) | TypeScript — manifest interpreter + sandbox | **The one module still unported** | **High** — 60 lines, but it is the only part of the port with **no phase assigned to it**, and §12's open question is whether `rquickjs`/`boa` can run the existing sandbox |
+| **Health tracker** (`health-tracker.ts:78`) | TypeScript — cooldowns, circuit breakers | **Ported** — `HealthTracker` in `core/engine.rs` (increments 1–10) | Done |
+| **Concurrency limiter** (`concurrency.ts:91`) | TypeScript — per-provider in-flight caps | **Ported** — `core/limiter.rs` (increment 5) | Done |
+| **Usage ledger** (`usage-ledger.ts:114`) | TypeScript — cost attribution | **Ported** — `core/ledger.rs` (increment 12) | Done |
 | **Gateway bridge** (`gateway_cmds.rs:73-94`) | Rust — Tauri events to webview | **Deleted** — no webview to talk to | Negative effort |
 | **Gateway worker window** (`gateway-worker.ts`, `gateway.html`) | Hidden webview | **Deleted** | Negative effort |
 | **App Nap suppression** (`app_nap.rs`) | Native heartbeat to keep JS alive | **Deleted** — no JS to keep alive | Negative effort |
 | **Process manager** | None | New: launchd plist, start/stop/lifecycle | Medium |
 | **UI → service discovery** | Tauri IPC (`invoke`) | New: HTTP client, health probe | Medium |
+
+**This table was seven rows out of date until 2026-09-24, and the reason is worth stating.** It was written
+when the table was a *plan*, and every increment since updated the prose section it belonged to — the
+per-increment headings below, and the parked row in [09](09-status.md) — while this table kept saying
+"Must be ported to Rust" for six modules that had already landed. A reader planning the remaining work
+would have concluded that the execution engine, the planner, the router, the health tracker, the limiter
+and the ledger were all still outstanding, when only the **adapter runtime** is.
+
+Two things follow, and the second is the one that matters:
+
+- **The staleness is invisible to the gates.** `build-dev-book` checks structure and links, not whether a
+  claim is still true, so nothing could have failed. Only reading the table against the tree catches it.
+- **The table's shape hid a gap in the plan.** The adapter runtime is the one module with no phase
+  assigned to it — the phases are numbered 1–6 and none of them is "port the manifest interpreter and its
+  sandbox". It stayed visible here precisely because this table was the only place that listed *all* the
+  modules rather than one increment's worth. So the fix is not only to correct the rows: the missing phase
+  has to be decided, and §12's open question (`rquickjs`/`boa` versus a native reimplementation) is what
+  decides it. Logged as D25.
 
 ### 2.1.1 The module split as built (Phase 1, 2026-09-23)
 
