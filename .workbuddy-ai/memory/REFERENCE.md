@@ -2773,3 +2773,47 @@ tracked directories such as `.workbuddy-ai/` — is **outside the guard**. Widen
 security-policy decision (false-positive risk on files that quote code and paths), not a mechanical
 edit, so the check is manual until that decision is made.
 
+---
+
+## A lock file is not a dependency graph, and `-e normal` is the whole of the fix (2026-09-24)
+
+`Cargo.lock` lists every crate in the package's graph, **build-dependencies included**. So a crate
+present in the lock may still be absent from the runtime graph, and "it's already in the lock" is not
+evidence that adding it is free.
+
+```
+cargo tree -i regex                                  # shows it — via tauri-build → tauri-utils
+cargo tree -e normal -i regex --no-default-features   # "nothing to print"  ← the answer
+```
+
+Measured 2026-09-24: `regex 1.13.1` is in `apps/desktop/src-tauri/Cargo.lock` and reaches the package
+only through `tauri-build`'s **build** graph (and, with the `app` feature, through `tauri-macros`, a
+proc-macro). It is *downloadable*, not *linked*. Adding it to `[dependencies]` would therefore have
+added a genuinely new runtime crate to `aiproviderd` — a real cost disguised as a no-op.
+
+**Generalisation:** when the question is "is this dependency already paid for?", the lock file answers
+"was it fetched?" and `cargo tree -e <kind> -i` answers "is it linked?". Two different questions, and
+the first is the tempting one to accept.
+
+## JavaScript semantics this port has to reproduce, and where each was pinned
+
+| JavaScript | Rust | where |
+|---|---|---|
+| `\s` — WhiteSpace + LineTerminator | **not** `char::is_whitespace`; differs on U+0085 and U+FEFF | `template::is_js_whitespace` |
+| `String.length` / `slice()` count UTF-16 code units | `encode_utf16().count()`; a slice cannot split a surrogate | `manifest::truncate_for_message`, `compress::estimate_message_tokens` |
+| `typeof [] === "object"`, and `[]` is truthy | an array passes an "is an object" guard | `manifest::is_js_object` |
+| `a ?? b` is nullish, not falsy | `""` is a value and stops the fallback | `manifest::emit_tool_calls` |
+| `h.prefix ?` and `&& o.id` are falsy tests | an empty string counts as absent | `manifest::auth_headers`, `collect_tool_call_deltas` |
+| a `Map` iterates in insertion order | `BTreeMap` iterates sorted | `jsonpath::children`, `manifest::PendingCalls` |
+
+The last row is the one with no local fix: it is `serde_json`'s `preserve_order` feature, and enabling
+it changes key order in **every** serialised body the gateway writes — a crate-wide decision, so it is
+recorded as latent in the `jsonpath.rs` module note rather than taken at one call site. Measured latent
+rather than live: the two active manifests use seven distinct selectors and both `[*]` uses are on
+arrays.
+
+**The recurring shape across all six:** a JavaScript behaviour that Rust's nearest-looking equivalent
+gets *almost* right, where the difference fails silently (a placeholder sent as literal text, a ledger
+count lost, a tool call reordered). The nearest-looking equivalent is the trap; the check is whether
+the source's own operator was `??` or `||`, `typeof` or truthiness, `.length` or `.count()`.
+

@@ -1613,6 +1613,67 @@ increment 14a.** `context_scope.rs` estimates tokens, sizes a budget and drops w
 but it compresses *recalled memory* into a system message and never touches the conversation. What
 was missing was a second input to an existing path, not a missing module. See D20.
 
+### Phase 4b — Port the adapter runtime, and the module D26 left unphased
+
+**Numbered 4b rather than 5 deliberately.** Renumbering would desync
+[11](11-cross-platform-tech-choice.md), whose Phase 5 is the same "delete the bridge" step and whose
+numbering this plan shares — so the adapter runtime is inserted where it belongs in the *order*
+without moving a number that two documents depend on.
+
+**Goal:** port the adapter layer — the two implementors of the `adapter.rs` seam.
+
+This module has never had a phase, and **D26 is why**: the port table described the work as
+`adapter-runtime.ts:60` — "60 lines" — when it is `code-adapter.ts` (615 lines / 24,820 bytes) plus
+`manifest-interpreter.ts` (492 lines / 21,903 bytes). A module described as 60 lines needs no phase.
+
+**The two implementors are not equally load-bearing, and that was measured on 2026-09-24 rather than
+assumed.** `adapter-runtime.ts:52-58` branches on `manifest.kind === "code"`: a code manifest runs in
+the QuickJS sandbox, anything else through the `ManifestInterpreter`. Against the installed database:
+
+| implementor | live manifests | what it serves |
+|---|---|---|
+| `ManifestInterpreter` (`kind: "declarative"`) | **3 of 3** | every installed provider, and every builtin template |
+| `CodeAdapterInstance` (`kind: "code"`) | **0 of 3** | reachable only as Tier 2 |
+
+Tier 2 is reachable but human-gated: `Onboarding.tsx:240-242` offers it "only when the declarative
+grammar cannot express this provider. It is an explicit human action, never an automatic fallback."
+So the interpreter is the critical path and the sandbox is the exception path — which is why the
+sandbox's `SIGSEGV` finding (§2.1.3) is a recorded residual risk rather than a blocker, and why
+`adapter.rs:29-30` is right that "a subprocess-backed adapter is simply another implementor, so
+in-process or out-of-process is not a question this trait has to answer."
+
+**Increment 15 landed 2026-09-24 — the I/O-free half.** Three modules, 66 tests:
+
+| module | ports | what it holds |
+|---|---|---|
+| `core/jsonpath.rs` | `jsonpath.ts` (77 lines) | `parse_path` / `select_all` / `select_one` — the subset has no `..`, no filters and no expressions, so a selector cannot carry code |
+| `core/template.rs` | `template.ts` (41 lines) | the `{{x}}` required / `{{x?}}` omit-when-absent grammar — the §2.6 frozen rule |
+| `core/manifest.rs` | the I/O-free half of `manifest-interpreter.ts` | header rendering and the `{{secret}}` sentinel, streaming tool-call reassembly, `read_cached_tokens`, `join_url`, `ManifestHttpError` |
+
+Three states were **not** redefined, because the crate already has them: the sentinel is
+`egress::SENTINEL`, `"response" | "mid-stream"` is `engine::FailureKind`, and a real tool call is
+`adapter::ToolCall`. The TypeScript has one class in one file; Rust splits the same state across a
+seam, and a seam is only worth having if both sides agree on the vocabulary.
+
+**A dependency decision the interpreter forced, recorded rather than taken quietly.** `modality.ts`
+is **deferred**, and the blocker is a dependency: a modality rule's `modelIdPattern` is a regular
+expression, and this crate has no `regex` in its **runtime** graph. `Cargo.lock` lists
+`regex 1.13.1`, which is exactly the trap — it arrives only through `tauri-build`'s **build** graph,
+and `cargo tree -e normal -i regex --no-default-features` prints *nothing to print*. Adding it would
+be a genuinely new runtime dependency of `aiproviderd`, which this port's own rule
+(`adapter.rs:51-52`) forbids. See §10 decision 5.
+
+**What remains in this phase, in order:**
+
+1. **The I/O half of the interpreter** — `ManifestInterpreter` over the `HttpPort` seam: `listModels`,
+   the streaming `generateText` loop, `generateImage`, `pingKey`. This is what makes the adapter layer
+   serve real traffic, and it is the last thing standing between here and Phase 5.
+2. **`modality.rs`**, once decision 5 is made. The text and image paths do not call `tagModality` —
+   the planner and the catalog do — so the I/O half is not blocked waiting on it.
+3. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
+   §2.1.3 lists as untested belongs here, because the probes service `http` synchronously and
+   production does not.
+
 ### Phase 5 — Delete the bridge (1 day)
 
 **Goal:** remove `gateway_cmds.rs` bridge code, `gateway-worker.ts`, `gateway.html`, and `app_nap.rs`.
@@ -1718,6 +1779,19 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
    - *Recommendation:* full port. A hybrid still has a JS process that can crash, and the whole
    point is to eliminate the webview as a failure mode.
 
+5. **Does the adapter layer get a regex engine, or does `modelIdPattern` wait?**
+   - **Add `regex` as a direct dependency.** `modality.rs` ports faithfully and modality rules work
+     as written. Cost: a genuinely new **runtime** dependency of `aiproviderd`. `Cargo.lock` already
+     lists `regex 1.13.1`, which makes this look free and is not — it arrives through `tauri-build`'s
+     **build** graph, and `cargo tree -e normal -i regex --no-default-features` prints *nothing to
+     print*. Also a syntax gap: Rust's `regex` has no backreferences or lookaround, so a pattern the
+     JavaScript accepts could fail to compile here.
+   - **Defer `modality.rs`.** No new dependency. Cost: `tagModality` has no Rust counterpart, so a
+     ported adapter cannot classify a model's modality and every model would read as `text`.
+   - *Recommendation:* **decide when the I/O half lands, not before.** The interpreter's text and
+     image paths do not call `tagModality` — the planner and the model catalog do — so the I/O half
+     is not blocked by this, and the measurement above is the whole of what the decision needs.
+
 ---
 
 ## 11. Effort estimate
@@ -1728,11 +1802,19 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
 | 2 — Port execution engine | 3-5 | 7 |
 | 3 — Port router + planner | 2-3 | 10 |
 | 4 — Port context compression | 2-3 | 13 |
-| 5 — Delete bridge | 1 | 14 |
-| 6 — Process manager + UI | 2-3 | 17 |
-| **Buffer (testing, edge cases)** | 3 | **20** |
+| **4b — Port the adapter runtime** | **3-4** | **17** |
+| 5 — Delete bridge | 1 | 18 |
+| 6 — Process manager + UI | 2-3 | 21 |
+| **Buffer (testing, edge cases)** | 3 | **24** |
 
-**Total: 3-4 weeks of focused development.**
+**Total: 4-5 weeks of focused development.**
+
+**The 4b row is new on 2026-09-24, and its absence is the estimate's own defect.** Every other line
+here was derived from the port table's module list, and that list omitted the adapter runtime — the
+same omission D26 records, where the module was described as "60 lines" and therefore needed neither
+a phase nor a line in this table. The two figures that were wrong as a result are corrected in §2.2;
+this row is the third. An estimate that omits the highest-risk module is not optimistic, it is
+incomplete, and the distinction is why the row is added rather than folded into Phase 2's range.
 
 ~~This is an all-at-once change, not an incremental one. The bridge is the boundary, and the router
 core is on one side of it. You cannot move it piecemeal — half the engine in Rust and half in JS
