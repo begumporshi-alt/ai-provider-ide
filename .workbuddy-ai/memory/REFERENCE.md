@@ -3877,3 +3877,30 @@ stays a 500.
 - **24b-ii — `core/router_bridge.rs`**: the driver. `RouterBridge` holding the `Arc`s, the
   `request_id → Cancel` map, and the `Bridge` impl; `tokio::spawn` per dispatch; the tool call into
   `core::tools::tool_run`; and `BridgeMsg` onto the `ReplyHandle`.
+
+## Phase 5d is bigger than its row — the webview-liveness subsystem (2026-09-24, D35)
+
+Found while scoping 24b-ii. The plan's Phase 5d row names four files to delete. What those files implement is
+a **liveness subsystem that exists only because the worker is a webview the OS can suspend**:
+
+- `HEARTBEAT_STALE_MS = 6_000` and `HEARTBEAT_STALE_HIDDEN_MS = 30_000` (`core/gateway.rs:44`, `:65`)
+- `beat_is_fresh()` (`:1140`), `is_available()` (`:1124`), `is_running()` (`:1131`)
+- `FIRST_MSG_TIMEOUT = 30s` (`:1299`) and `first_msg_timeout: Mutex<Duration>` (`:817`)
+- the `gateway_heartbeat` command (`tauri/gateway_cmds.rs:889`); the webview beats every 2 s
+  (`gateway-bridge.ts:130`)
+- `ensure_bridge_window` (`:105`) with its worker-warmup window; `GATEWAY_WINDOW` (`:20`)
+- the background-mode bounds (`core/gateway.rs:1192-1211`) and the re-warm on the request path
+- `tauri/app_nap.rs` — whose entire reason to exist is that a hidden webview's JS stops beating
+- the three `r1_*` tests in `core/gateway_tests.rs`
+
+**The hazard, measured:** `beat_is_fresh()` is false 6 s after the last beat, and a request arriving on a
+stale beat is *waited out and then 503'd* (`core/gateway.rs:1373`). So deleting the worker without retiring
+the gate makes every request a 503 six seconds after the app stops beating.
+
+**`RouterBridge` cannot simply beat instead.** `ReplyHandle` deliberately does not hold the core — the
+reference cycle increment 12 designed out — so there is no beat source unless one is chosen. Two shapes: the
+core beats itself when a Rust bridge is installed (a Rust bridge is always awake, so "the worker is asleep"
+becomes unrepresentable and that 503 branch becomes dead code), or a narrow `Beat` seam handed to the bridge
+the way `ReplyHandle` and `HttpPort` are. The first is smaller and truer to a headless service.
+
+**Consequence for the plan: 24b-ii has a prerequisite it did not have — decide the beat's source first.**

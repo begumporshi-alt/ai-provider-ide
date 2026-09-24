@@ -1997,7 +1997,7 @@ four increments, and only the last one is the deletion:
 | **23 — landed** | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
 | **24a — landed** | Move the tool host from `tauri/tools.rs` into `core/tools.rs`, where the bridge can reach it |
 | 24b | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
-| 25 | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, and switch `build_core` |
+| **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
 clock, no network, which is what lets it be pinned before anything calls it. 53 tests, Rust
@@ -2127,6 +2127,28 @@ measurement, since the move changed nothing else. That difference is coverage th
 **No behaviour change, and the count is the proof:** 1090 passed / 0 failed on default features, exactly the
 increment-23 number. The wrappers add no logic, and must not — if one ever grows a line, that line belongs in
 `core::tools`, or the app and the service start enforcing two slightly different sandboxes.
+
+**Phase 5d is bigger than its row, and the gap is measured (D35).** The row names four files. What those files
+implement is a liveness subsystem that exists *only* because the worker is a webview the OS can suspend:
+`HEARTBEAT_STALE_MS` = 6 s and `HEARTBEAT_STALE_HIDDEN_MS` = 30 s (`core/gateway.rs:44`, `:65`),
+`beat_is_fresh()` (`:1140`), `FIRST_MSG_TIMEOUT` = 30 s (`:1299`), the `gateway_heartbeat` command
+(`tauri/gateway_cmds.rs:889`), `ensure_bridge_window` (`:105`) with its worker-warmup window, the
+background-mode bounds, the re-warm on the request path, and the three `r1_*` tests. `app_nap.rs` exists for
+that reason and no other.
+
+**The hazard is concrete.** The webview beats every 2 s (`gateway-bridge.ts:130`); `beat_is_fresh()` goes
+false 6 s after the last beat; and a request arriving on a stale beat is *waited out and then answered* `503`
+(`core/gateway.rs:1373`). So deleting the worker without retiring the gate makes every request a 503 six
+seconds after the app stops beating. And `RouterBridge` cannot simply take the beat over: `ReplyHandle`
+deliberately does not hold the core — the reference cycle increment 12 designed out — so the beat has no
+source until one is chosen.
+
+**So 24b-ii has a prerequisite the plan did not have.** The beat's source must be decided before the driver
+is written, and there are two shapes: the core beats itself when a Rust bridge is installed (a Rust bridge is
+always awake, so "the worker is asleep" becomes unrepresentable and the 503 branch it guards becomes dead
+code), or a narrow `Beat` seam is handed to the bridge the way `ReplyHandle` and `HttpPort` are. The first is
+smaller and truer to what a headless service is; the second keeps the gate meaningful for a mixed
+configuration. Either way it is a decision, and D35 records that it is currently unnamed.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 
