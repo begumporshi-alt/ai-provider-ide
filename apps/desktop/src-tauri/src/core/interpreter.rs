@@ -363,7 +363,7 @@ impl ManifestInterpreter {
                 cancel,
             )
             .await
-            .map_err(|_| AttemptError::Transport)?;
+            .map_err(attempt_error_from)?;
 
         // **A `>= 400` is a refusal, not a failed call** — returned, not thrown, so the status
         // survives to the engine's classification. `adapter.rs`'s `ImageReply` note is about exactly
@@ -485,7 +485,7 @@ impl ManifestInterpreter {
                     cancel,
                 )
                 .await
-                .map_err(|_| AttemptError::Transport)?;
+                .map_err(attempt_error_from)?;
 
             if res.status >= 400 {
                 let err = ManifestHttpError::new(
@@ -696,6 +696,28 @@ impl Stream for UnaryTextStream<'_> {
             cb(usage);
         }
         Poll::Ready(None)
+    }
+}
+
+/// **The interpreter's one mapping from a port failure to an attempt failure.**
+///
+/// A refusal by the egress policy is not a transport failure. Nothing left this process, so the
+/// provider is not the party to blame and its key is not evidence — and reporting it as `NETWORK` is
+/// what made D46's divergence arrive as a 502 naming the upstream, measured 2026-09-24 at **56 of
+/// 56** requests with the upstream's own counter unmoved.
+///
+/// The reason travels with the error so the class can be `EGRESS_DENIED` *and* the specific host
+/// stay recoverable: `engine::attempt_outcome` logs it where the attempt is recorded, which is the
+/// last point at which it is still in hand.
+///
+/// **Every other port failure stays `Transport`.** Widening this to "any failure the egress raised"
+/// would make a missing secret or a malformed URL look like our policy too, which is the same
+/// misattribution pointing the other way.
+fn attempt_error_from(e: HttpError) -> AttemptError {
+    if e.is_denied() {
+        AttemptError::Blocked { reason: e.message }
+    } else {
+        AttemptError::Transport
     }
 }
 
@@ -2266,31 +2288,64 @@ mod tests {
         assert!(http.only_request().stream, "it was asked for as a stream");
     }
 
-    /// A host failure — no answer at all — is a transport failure, not an HTTP one.
+    /// **The kind decides, not the message.** A port failure is a transport failure unless the port
+    /// says it was a refusal — and the middle case below is the falsification: a transport-kind
+    /// error whose message *reads* like a refusal must still classify as `Transport`, because
+    /// sniffing the text is exactly what this mapping replaced.
+    ///
+    /// The last case is the divergence in one line: nothing was dialled, so the class is
+    /// `EGRESS_DENIED` rather than `NETWORK`, and the egress's own words survive on the variant so
+    /// the specific host stays recoverable at the one point it is still in hand.
     #[tokio::test]
-    async fn a_port_failure_is_a_transport_failure() {
-        struct Dead;
-        impl HttpPort for Dead {
-            fn request<'a>(
-                &'a self,
-                _req: HttpRequest,
-                _cancel: &'a Cancel,
-            ) -> BoxFuture<'a, Result<HttpResponse<'a>, HttpError>> {
-                Box::pin(async { Err(HttpError::new("host not allowlisted")) })
+    async fn a_port_failure_is_a_transport_failure_and_a_refusal_is_egress_denied() {
+        async fn failure_from(err: HttpError) -> AttemptError {
+            struct Port(HttpError);
+            impl HttpPort for Port {
+                fn request<'a>(
+                    &'a self,
+                    _req: HttpRequest,
+                    _cancel: &'a Cancel,
+                ) -> BoxFuture<'a, Result<HttpResponse<'a>, HttpError>> {
+                    let e = self.0.clone();
+                    Box::pin(async move { Err(e) })
+                }
             }
+
+            let interp = ManifestInterpreter::new(
+                &openai_manifest(),
+                AdapterContext { http: Arc::new(Port(err)), vars: Map::new() },
+            )
+            .unwrap();
+
+            // Bound to a local rather than returned as the tail expression: the `Ok` arm's
+            // `BoxStream` borrows `interp`, so as a tail expression the temporary outlives it.
+            let err = match interp.generate_text("key:k1", text_args("m"), &Cancel::new()).await {
+                Ok(_) => panic!("a dead port must not produce a stream"),
+                Err(e) => e,
+            };
+            err
         }
 
-        let interp = ManifestInterpreter::new(
-            &openai_manifest(),
-            AdapterContext { http: Arc::new(Dead), vars: Map::new() },
-        )
-        .unwrap();
+        // A genuine host failure: no answer, and a message naming nothing in particular.
+        assert_eq!(
+            failure_from(HttpError::new("connection reset by peer")).await,
+            AttemptError::Transport
+        );
 
-        let err = match interp.generate_text("key:k1", text_args("m"), &Cancel::new()).await {
-            Ok(_) => panic!("a dead port must not produce a stream"),
-            Err(e) => e,
-        };
-        assert_eq!(err, AttemptError::Transport);
+        // **The discriminating input.** This message is the exact string the previous spelling of
+        // this test passed, but the kind is `Transport` — so under message-sniffing it would read as
+        // a policy refusal, and under the kind it does not. If the mapping ever reverts to looking
+        // at the text, this is the assertion that reddens.
+        assert_eq!(
+            failure_from(HttpError::new("host not allowlisted")).await,
+            AttemptError::Transport
+        );
+
+        // The refusal — and the reason travels with it rather than being flattened into the class.
+        assert_eq!(
+            failure_from(HttpError::denied("host api.example.test is not allowlisted")).await,
+            AttemptError::Blocked { reason: "host api.example.test is not allowlisted".into() }
+        );
     }
 
     /* ------------------------------------------------------------ construction */

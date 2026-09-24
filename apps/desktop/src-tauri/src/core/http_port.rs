@@ -132,17 +132,50 @@ pub struct HttpResponse<'a> {
 
 /// The call did not complete.
 ///
-/// A newtype over the host's own message, matching `core::error::CommandError`'s shape: the
-/// interpreter does not read this, it only decides *that* there was no HTTP answer and classifies
-/// the attempt as a transport failure — which is what the TypeScript's `instanceof
-/// ManifestHttpError` test does by failing (`manifest-interpreter.ts:480-482`).
+/// The TypeScript carries this as a bare `Error` and the interpreter only asks *that* there was no
+/// HTTP answer, which is what the `instanceof ManifestHttpError` test does by failing
+/// (`manifest-interpreter.ts:480-482`). **The port needs one bit more**, and [`HttpErrorKind`] is
+/// it: a refusal by the egress allowlist also produces "no HTTP answer", but it is *our* policy
+/// rather than the provider's reachability, and folding the two together is what made a local
+/// refusal surface as `NETWORK` — a 502 blaming the upstream for a decision taken here (D46).
+///
+/// **`kind` is not a second message.** The message stays the host's own words; the kind is the one
+/// question the interpreter has to answer differently, and it is a field rather than a prefix on
+/// the string because sniffing a message for a marker is how two halves of a port stop agreeing
+/// about what they are saying.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[error("{0}")]
-pub struct HttpError(pub String);
+#[error("{message}")]
+pub struct HttpError {
+    pub message: String,
+    pub kind: HttpErrorKind,
+}
+
+/// Which of the two ways there was no answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpErrorKind {
+    /// The host was dialled and did not answer usefully, or the request never got that far for a
+    /// reason that is not a policy of ours — a timeout, a DNS failure, a broken stream.
+    Transport,
+    /// **The egress refused the request before anything was dialled**: the destination host is not
+    /// in the allowlist, or a `secret_ref` was pointed at a host it is not paired with. Nothing
+    /// left this process, so the provider is not the party to blame and its health is not evidence.
+    Denied,
+}
 
 impl HttpError {
+    /// A transport failure — the default, because most of them are.
     pub fn new(message: impl Into<String>) -> Self {
-        Self(message.into())
+        Self { message: message.into(), kind: HttpErrorKind::Transport }
+    }
+
+    /// A refusal by the egress policy. See [`HttpErrorKind::Denied`].
+    pub fn denied(message: impl Into<String>) -> Self {
+        Self { message: message.into(), kind: HttpErrorKind::Denied }
+    }
+
+    /// Whether this was a local refusal rather than a failure to reach the host.
+    pub fn is_denied(&self) -> bool {
+        self.kind == HttpErrorKind::Denied
     }
 }
 
@@ -179,6 +212,19 @@ mod tests {
     fn an_http_error_carries_the_hosts_own_message() {
         let e = HttpError::new("upstream went silent for 120s");
         assert_eq!(e.to_string(), "upstream went silent for 120s");
-        assert_eq!(e, HttpError("upstream went silent for 120s".to_string()));
+        assert_eq!(e, HttpError::new("upstream went silent for 120s"));
+        assert!(!e.is_denied(), "a silent upstream is not a policy refusal");
+    }
+
+    /// **The two kinds are different answers, and the default is the safe one.** A constructor
+    /// defaulting to `Denied` would make every unclassified failure look like our own policy —
+    /// the misattribution this field exists to end, pointing the other way.
+    #[test]
+    fn only_a_denied_error_says_so() {
+        assert!(HttpError::denied("host refused").is_denied());
+        assert_eq!(HttpError::new("timed out").kind, HttpErrorKind::Transport);
+        // Same message, different answer: the kind is not derivable from the text, which is the
+        // whole reason it is a field rather than a prefix.
+        assert_ne!(HttpError::new("x"), HttpError::denied("x"));
     }
 }

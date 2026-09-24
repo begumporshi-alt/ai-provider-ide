@@ -89,6 +89,18 @@ pub enum ErrorClass {
     Timeout,
     /// No usable status: a transport failure, or a status this taxonomy does not name.
     Network,
+    /// **Refused by this process before anything was dialled.** See [`AttemptError::Blocked`].
+    ///
+    /// Its own class because the alternative is a lie with a direction: folded into `Network`, it
+    /// tells the operator the provider is unreachable when the provider was never asked, and points
+    /// them at the wrong system. It is **not** drift (nothing about the provider changed), **not**
+    /// retryable with the next key (every key of a provider shares its host, so the next key fails
+    /// identically), and **not** evidence against the key.
+    ///
+    /// **A deliberate divergence from the TypeScript union**, which has no such member because it
+    /// has no allowlist to be refused by. `ALL_CLASSES` is walked against that union verbatim, so
+    /// this appears there as a named exception rather than an oversight.
+    EgressDenied,
     /// 2xx.
     Ok,
 }
@@ -111,7 +123,7 @@ pub enum BodyHint {
 /// union spelled out verbatim. A variant added without a spelling fails there — which is the
 /// point: the wire spellings are a cross-language contract, and a new class that quietly
 /// rendered as `{:?}` would be a spelling nobody agreed to.
-pub const ALL_CLASSES: [ErrorClass; 9] = [
+pub const ALL_CLASSES: [ErrorClass; 10] = [
     ErrorClass::AuthFailed,
     ErrorClass::RateLimited,
     ErrorClass::NotFound,
@@ -120,6 +132,7 @@ pub const ALL_CLASSES: [ErrorClass; 9] = [
     ErrorClass::ServerError,
     ErrorClass::Timeout,
     ErrorClass::Network,
+    ErrorClass::EgressDenied,
     ErrorClass::Ok,
 ];
 
@@ -155,6 +168,8 @@ impl ErrorClass {
             ErrorClass::ServerError => "SERVER_ERROR",
             ErrorClass::Timeout => "TIMEOUT",
             ErrorClass::Network => "NETWORK",
+            // The one spelling the TypeScript union does not have — see `ErrorClass::EgressDenied`.
+            ErrorClass::EgressDenied => "EGRESS_DENIED",
             ErrorClass::Ok => "OK",
         }
     }
@@ -367,6 +382,19 @@ pub enum AttemptError {
     },
     /// No HTTP answer: a transport failure, a timeout, or an adapter fault.
     Transport,
+    /// **No HTTP answer because this process refused to ask.** The egress allowlist does not contain
+    /// the destination host, or a `secret_ref` was pointed at a host it is not paired with.
+    ///
+    /// A third variant rather than a `Transport` with a flag on it, and the enum's own note is the
+    /// invitation: *"a new failure shape cannot join the port without a decision about which side it
+    /// belongs on."* This one belongs on **neither** of the TypeScript's two sides, because the
+    /// TypeScript has no allowlist — the host does — so it is a deliberate divergence, recorded
+    /// rather than smuggled in as a transport failure with a friendlier message.
+    ///
+    /// `reason` is the egress's own words, carried so the specific host stays recoverable:
+    /// [`attempt_outcome`] logs it where the attempt is recorded. It is deliberately *not* part of
+    /// the client-facing class token, which stays a single word.
+    Blocked { reason: String },
 }
 
 impl AttemptError {
@@ -378,7 +406,7 @@ impl AttemptError {
     pub fn status_or_zero(&self) -> u16 {
         match self {
             AttemptError::Http { status, .. } => *status,
-            AttemptError::Transport => 0,
+            AttemptError::Transport | AttemptError::Blocked { .. } => 0,
         }
     }
 
@@ -386,7 +414,7 @@ impl AttemptError {
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
             AttemptError::Http { retry_after_ms, .. } => *retry_after_ms,
-            AttemptError::Transport => None,
+            AttemptError::Transport | AttemptError::Blocked { .. } => None,
         }
     }
 }
@@ -415,6 +443,10 @@ impl AttemptError {
 pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
     match e {
         AttemptError::Transport => ErrorClass::Network,
+        // The third case, and the one the TypeScript cannot have: a refusal by our own egress. It is
+        // not `Network` — nothing was dialled — and it is not any status class, because there was no
+        // status. See `AttemptError::Blocked`.
+        AttemptError::Blocked { .. } => ErrorClass::EgressDenied,
         AttemptError::Http { status, kind, .. } => {
             if *kind == FailureKind::MidStream {
                 return ErrorClass::ParseError;
@@ -463,6 +495,15 @@ pub fn attempt_disposition(emitted: bool, aborted: bool) -> AttemptDisposition {
 /// so by omission (`execution-engine.ts:114` pushes `{candidate, cls, status}` with no
 /// `retryAfterMs`), while both other paths carry it (`:122-130`).
 pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> AttemptOutcome {
+    // **The last point at which the reason is in hand.** `AttemptError::Blocked` carries the
+    // egress's own words — which host, and that the refusal was ours — and nothing downstream can
+    // see them: the class token is a single word, and `AttemptOutcome` deliberately has no message
+    // field (its own note records why the chain carries two names and not a candidate). So the
+    // reason is logged rather than dropped, which is what makes the class *and* the host both
+    // recoverable: the client gets `EGRESS_DENIED`, the operator gets the host from the log.
+    if let AttemptError::Blocked { reason } = e {
+        tracing::warn!("egress refused the request before dialling: {reason}");
+    }
     AttemptOutcome {
         cls: classify_attempt_error(e),
         status: e.status_or_zero(),
@@ -1202,7 +1243,10 @@ impl HealthTracker {
             | ErrorClass::ParseError
             | ErrorClass::ServerError
             | ErrorClass::Timeout
-            | ErrorClass::Network => {}
+            | ErrorClass::Network
+            // A refusal by our own egress says nothing about the key — every key of a provider dials
+            // the same host, so cooling this one would burn a good credential for a policy decision.
+            | ErrorClass::EgressDenied => {}
         }
     }
 
@@ -1671,16 +1715,41 @@ mod tests {
         "OK",
     ];
 
+    /// **The one class the TypeScript union does not have, named so that it stays one.**
+    ///
+    /// `EGRESS_DENIED` describes something the TypeScript cannot see: the egress allowlist lives in
+    /// the host, so a refusal by it has no counterpart on the other side of the port. Adding it was
+    /// a deliberate divergence (D46) — and this constant is what keeps it *deliberate*, because a
+    /// second unagreed spelling has to be added here by name, in a diff a reviewer reads, instead of
+    /// being absorbed by an assertion someone loosened.
+    const RUST_ONLY_SPELLINGS: [&str; 1] = ["EGRESS_DENIED"];
+
+    /// **The cross-language contract, with its one named exception.**
+    ///
+    /// Two assertions rather than one set-equality, because they are two different claims:
+    /// "the port has not lost a class the TypeScript can send" and "it has gained exactly the
+    /// recorded ones". A set-equality would have had to be *loosened* to accommodate the
+    /// divergence, and a loosened assertion is how a second divergence arrives unnoticed.
     #[test]
     fn every_class_has_the_spelling_the_typescript_uses() {
         let mut got: Vec<&str> = ALL_CLASSES.iter().map(|c| c.as_str()).collect();
         got.sort_unstable();
         let mut want = TS_SPELLINGS.to_vec();
         want.sort_unstable();
-        // Comparing the sorted vectors covers three things at once, which is why there is no
-        // separate length or uniqueness test: a missing variant shortens `got`, an extra one
-        // lengthens it, and two classes sharing a spelling duplicates an entry. Each fails here.
-        assert_eq!(got, want, "the wire spellings are a cross-language contract");
+
+        for ts in &want {
+            assert!(got.contains(ts), "the port lost a TypeScript class: {ts}");
+        }
+
+        let mut extra: Vec<&str> = got.iter().copied().filter(|c| !want.contains(c)).collect();
+        extra.sort_unstable();
+        let mut recorded = RUST_ONLY_SPELLINGS.to_vec();
+        recorded.sort_unstable();
+        assert_eq!(extra, recorded, "an unrecorded class joined the wire vocabulary");
+
+        // Two classes sharing a spelling would satisfy both assertions above, so it is asked
+        // separately — and it is the one property the old set-equality got for free.
+        assert_eq!(got.len(), ALL_CLASSES.len(), "two classes share a wire spelling");
     }
 
     #[test]
@@ -1822,6 +1891,27 @@ mod tests {
         assert_eq!(classify_attempt_error(&AttemptError::Transport), ErrorClass::Network);
         assert_eq!(AttemptError::Transport.status_or_zero(), 0);
         assert_eq!(AttemptError::Transport.retry_after_ms(), None);
+    }
+
+    #[test]
+    fn a_policy_refusal_is_egress_denied_rather_than_network() {
+        // The mapping D46 turned on, and the reason `EGRESS_DENIED` exists at all. `Blocked` is the
+        // one variant the TypeScript has no counterpart for, so the token it maps to is the one
+        // spelling the union lacks — and this asserts the token is a *decision*, not decoration:
+        // point `classify_attempt_error`'s `Blocked` arm at `Network` and this reddens.
+        let blocked =
+            AttemptError::Blocked { reason: "host api.example.test is not allowlisted".into() };
+        assert_eq!(classify_attempt_error(&blocked), ErrorClass::EgressDenied);
+        assert_eq!(blocked.status_or_zero(), 0);
+        assert_eq!(blocked.retry_after_ms(), None);
+
+        // Not drift, so `record_result` must leave the key alone. The property is the same one the
+        // drift test pins, asked of the class that carries no status: a refusal by our own policy
+        // says nothing about a credential whose provider was never dialled.
+        let t = HealthTracker::new();
+        t.record_result("k1", classify_attempt_error(&blocked), blocked.retry_after_ms(), NOW);
+        assert_eq!(t.keys()["k1"].cooldown_until_ms, 0, "a policy refusal is not the key's fault");
+        assert!(t.is_key_usable(&key_row("k1", "enabled", None), NOW));
     }
 
     #[test]

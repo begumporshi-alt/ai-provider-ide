@@ -52,6 +52,25 @@ pub enum EgressError {
     ImageFetch(String),
 }
 
+impl EgressError {
+    /// **Was this a refusal by this process, or a failure to reach the host?** — the one predicate.
+    ///
+    /// `HostDenied` is the allowlist; `KeyHostMismatch` is a `secret_ref` pointed at a host it is
+    /// not paired with. Neither dialled anything, so neither is evidence about the provider, and
+    /// reporting either as a network failure blames the upstream for a decision taken here (D46).
+    ///
+    /// **Named once because two surfaces ask the same question** — [`StreamEvent::from_egress_error`]
+    /// and `egress_port`'s mapping to `HttpError`. Two spellings of "is this our policy" is how a
+    /// stream and a unary request come to disagree about what the same refusal was.
+    ///
+    /// Everything else stays a transport failure: `BadUrl` and `SentinelMissing` are manifest bugs,
+    /// `SecretMissing` is missing configuration, and `Http`/`Store`/`Vault`/`ImageFetch` are real
+    /// failures. Widening this is a decision, not a tidy-up.
+    pub fn is_policy_refusal(&self) -> bool {
+        matches!(self, EgressError::HostDenied(_) | EgressError::KeyHostMismatch { .. })
+    }
+}
+
 /// In-memory allowlist of provider hosts. Mutated ONLY by provider CRUD commands host-side
 /// (never by the webview).
 #[derive(Default)]
@@ -134,10 +153,51 @@ pub struct ImageFetchResponse {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum StreamEvent {
-    Headers { status: u16, headers: std::collections::BTreeMap<String, String> },
-    Line { text: String },
+    Headers {
+        status: u16,
+        headers: std::collections::BTreeMap<String, String>,
+    },
+    Line {
+        text: String,
+    },
     Done,
-    Error { message: String },
+    Error {
+        message: String,
+        /// **`true` when the egress refused the request rather than failing to reach the host.**
+        ///
+        /// Serialised only when set, so every payload this type puts on the Tauri channel is
+        /// byte-identical to before for every failure that is not a refusal — an additive change,
+        /// not a wire change. See [`crate::core::http_port::HttpErrorKind::Denied`] for why the
+        /// distinction has to survive this far.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        denied: bool,
+    },
+}
+
+impl StreamEvent {
+    /// A stream error that is not a policy refusal.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::Error { message: message.into(), denied: false }
+    }
+
+    /// A stream error that is one. See [`crate::core::http_port::HttpErrorKind::Denied`].
+    pub fn denied(message: impl Into<String>) -> Self {
+        Self::Error { message: message.into(), denied: true }
+    }
+
+    /// Classify an egress failure — **the one place the policy family is named.**
+    ///
+    /// `HostDenied` and `KeyHostMismatch` are refusals *by this process*: the destination is not in
+    /// the allowlist, or a `secret_ref` is pointed at a host it is not paired with. Neither dialled
+    /// anything, so neither is evidence about the provider. Every other `EgressError` is a genuine
+    /// failure to reach or read the host.
+    pub fn from_egress_error(e: &EgressError) -> Self {
+        if e.is_policy_refusal() {
+            Self::denied(e.to_string())
+        } else {
+            Self::error(e.to_string())
+        }
+    }
 }
 
 /// May the egress dial `host`? — **the one predicate**, so an assertion about it cannot drift.
@@ -373,7 +433,22 @@ pub async fn stream(
     req: EgressRequest,
     sink: tokio::sync::mpsc::UnboundedSender<StreamEvent>,
 ) -> Result<(), EgressError> {
-    let b = build(state, req).await?;
+    // **Send before returning, because the caller does not read the `Err` as an event.** `build` is
+    // where the allowlist refusal happens, and *both* consumers of this function treat the `Err` as
+    // the command's own failure rather than as something the stream said —
+    // `tauri::commands::egress_stream` forwards only what arrives on the sink, and
+    // `egress_port`'s driver is spawned with its result dropped. So a denied host sent **nothing at
+    // all**, and the consumer reported the one thing that was certainly false: that the egress
+    // "ended before reporting response headers". Measured 2026-09-24, found while giving the
+    // refusal its own class (D46); the module comment above `egress_port`'s `None` arm claimed that
+    // path was unreachable, and it was reachable for exactly this case.
+    let b = match build(state, req).await {
+        Ok(b) => b,
+        Err(e) => {
+            let _ = sink.send(StreamEvent::from_egress_error(&e));
+            return Err(e);
+        }
+    };
     // Bounded the same way as the chunks below: headers are progress too, and a server that
     // completes the handshake and then never answers is indistinguishable from a stall.
     let sent = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, b.send()).await;
@@ -390,12 +465,10 @@ pub async fn stream(
             }
             if status >= 400 {
                 let body = res.text().await.unwrap_or_default();
-                let _ = sink.send(StreamEvent::Error {
-                    message: format!(
-                        "http {status}: {}",
-                        body.chars().take(2000).collect::<String>()
-                    ),
-                });
+                let _ = sink.send(StreamEvent::error(format!(
+                    "http {status}: {}",
+                    body.chars().take(2000).collect::<String>()
+                )));
                 return Ok(());
             }
             let mut stream = res.bytes_stream();
@@ -408,12 +481,10 @@ pub async fn stream(
                     Ok(Some(c)) => c,
                     Ok(None) => break, // upstream closed the stream
                     Err(_) => {
-                        let _ = sink.send(StreamEvent::Error {
-                            message: format!(
-                                "upstream went silent for {}s — abandoning the stream",
-                                UPSTREAM_IDLE_TIMEOUT.as_secs()
-                            ),
-                        });
+                        let _ = sink.send(StreamEvent::error(format!(
+                            "upstream went silent for {}s — abandoning the stream",
+                            UPSTREAM_IDLE_TIMEOUT.as_secs()
+                        )));
                         return Ok(());
                     }
                 };
@@ -429,7 +500,7 @@ pub async fn stream(
                         }
                     }
                     Err(e) => {
-                        let _ = sink.send(StreamEvent::Error { message: e.to_string() });
+                        let _ = sink.send(StreamEvent::error(e.to_string()));
                         return Ok(());
                     }
                 }
@@ -441,16 +512,14 @@ pub async fn stream(
             Ok(())
         }
         Ok(Err(e)) => {
-            let _ = sink.send(StreamEvent::Error { message: e.to_string() });
+            let _ = sink.send(StreamEvent::error(e.to_string()));
             Err(e.into())
         }
         Err(_) => {
-            let _ = sink.send(StreamEvent::Error {
-                message: format!(
-                    "upstream sent no response headers for {}s — abandoning the request",
-                    UPSTREAM_IDLE_TIMEOUT.as_secs()
-                ),
-            });
+            let _ = sink.send(StreamEvent::error(format!(
+                "upstream sent no response headers for {}s — abandoning the request",
+                UPSTREAM_IDLE_TIMEOUT.as_secs()
+            )));
             Ok(())
         }
     }

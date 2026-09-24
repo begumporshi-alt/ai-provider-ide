@@ -3078,6 +3078,61 @@ property the allowlist exists to hold.
 **Measured:** `cargo test` lib **1175 → 1178**, binary **5 → 5** — the D46 test was rewritten rather than added,
 because the old one asserted the behaviour the fix removes.
 
+**25i — the egress refusal gets its own class, and `EGRESS_DENIED` enters the contract.** 25h closed D46 at the
+boot path and named the half it left open: a provider edited *after* launch does not re-activate, so a mismatch
+created at runtime still reaches `check_url` and is still reported as `NETWORK`. Closing that is not a change of
+policy — the refusal already happened — it is a change of **what the refusal is called**, which is why this is a
+taxonomy increment rather than an egress one.
+
+**The misattribution has a direction, and that is what makes it worth a class.** Folded into `NETWORK`, a local
+policy refusal tells the operator the *provider* is unreachable when the provider was never asked, and sends them
+to the wrong system — the wrong turn D45's first diagnosis took, and the one D46's 56-of-56 run measured. So
+`AttemptError::Blocked { reason }` and `ErrorClass::EGRESS_DENIED` are added, and the interpreter's **one**
+mapping asks the *kind* rather than reading the message: `HttpError` became a struct with `message` +
+`kind: HttpErrorKind::{Transport, Denied}`, and `attempt_error_from` is `if e.is_denied() { Blocked { reason } }
+else { Transport }`.
+
+**The reason travels with the error and is logged where the attempt is recorded.** `AttemptOutcome`
+deliberately has no message field — its own note records why the chain carries two names and not a candidate — so
+the egress's words would otherwise be dropped at exactly the boundary where they stop being recoverable.
+`attempt_outcome` logs them before building the outcome, which is the last point at which they are still in hand.
+The client-facing token stays a single word.
+
+**Why the message could not decide it, and the test that says so.** The previous spelling of
+`a_port_failure_is_a_transport_failure` passed `HttpError::new("host not allowlisted")` — a *transport*-kind
+error whose message reads like a refusal. Under message-sniffing that input classifies as a policy refusal; the
+rewritten test keeps it as the discriminating **middle** case and asserts it is still `Transport`, so a revert to
+text-matching reddens on the assertion that names it. Two probes, one at a time: reverting the mapping to
+always-`Transport` reddens the denied case **alone**, and making it match on `message.contains("not allowlisted")`
+reddens the middle case **alone**. The two halves are load-bearing separately, which is what a single assertion
+could not have shown.
+
+**`EGRESS_DENIED` is a deliberate cross-language divergence, and the union test records it as one.** `ALL_CLASSES`
+is walked against the TypeScript union spelled out verbatim (`errors.ts:5-14`), so a Rust-only member makes that
+test fail — which it did, and the failure was the point rather than an obstacle. Rather than loosening the
+assertion, it was split into two directional claims ("the port has not lost a class the TypeScript can send", "it
+has gained exactly the recorded ones") plus a uniqueness claim the old set-equality got for free, and the extra
+token is named in `RUST_ONLY_SPELLINGS`. A second divergence now has to be added there **by name**, in a diff a
+reviewer reads, instead of being absorbed by an assertion someone widened. `EGRESS_DENIED` is not drift, not
+retryable with the next key — every key of a provider shares its host, so the next key fails identically — and
+not recorded against the key; all three are asserted, and the key-health arm is an explicit no-op so the omission
+is visible rather than implied.
+
+**A fourth route to the same misattribution, found by writing the class.** `egress::stream` calls `build` — which
+is where `check_url` refuses — **before** its send loop, so a denied host on the *streaming* path emitted no
+event at all: the sender dropped, `streaming`'s first `recv()` returned `None`, and the consumer reported
+`"the egress ended before reporting response headers"` from the arm whose own comment claimed to be the
+unreachable residue. Nothing was dialled, so nothing could have ended — the report was certainly false, and it was
+the third message in this family to name the wrong party. The fix is that `egress::stream` sends its
+classification *before* returning;
+`a_streaming_refusal_is_reported_as_a_refusal_not_as_headers_that_never_came` pins it, and removing the send
+reddens it with that exact sentence as the failure text. Recorded as **D48**.
+
+**Measured:** `cargo test` lib **1178 → 1181**, binary **5 → 5** — three tests added, one per file: the class
+mapping (`engine.rs`), the two-kind contract (`http_port.rs`), and the streaming refusal (`egress_port.rs`). The
+interpreter test was rewritten rather than added. Gates: `fmt` clean, `clippy --all-targets -D warnings` clean,
+`--no-default-features --all-targets` clean, lib **1181/0**, binary **5/0**.
+
 ---
 
 ## 12. What we know we do not know

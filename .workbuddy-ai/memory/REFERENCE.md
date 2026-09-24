@@ -4889,11 +4889,65 @@ changes *when and how* it is reported, not what works. That is what makes it saf
 `register` at all — so a re-activation keeps the previous adapter serving. A test about launch behaviour must
 build a **fresh** `AdapterRuntime`, which is why the `Harness` keeps the `EgressState`.
 
-**Still open:** a provider edited at runtime does not re-activate, so a runtime-created mismatch still reaches
-`check_url` and still reports `NETWORK`. Closing it needs `AttemptError`/`ErrorClass` to carry a local-refusal
-class — and `ALL_CLASSES` is walked against the **TypeScript union spelled out verbatim**
-(`every_class_has_the_spelling_the_typescript_uses`), so a Rust-only class is a cross-language divergence and a
-separate decision, not a local edit.
+**Closed by 25i, on the terms this paragraph set.** A provider edited at runtime does not re-activate, so a
+runtime-created mismatch still reaches `check_url` — but it no longer reports `NETWORK`. 25i took the
+cross-language divergence deliberately rather than deferring it. See below.
+
+---
+
+## Increment 25i — the refusal gets its own class, and `EGRESS_DENIED` enters the contract (2026-09-24)
+
+**The misattribution has a direction.** A local policy refusal folded into `NETWORK` tells the operator the
+*provider* is unreachable when the provider was never asked — it sends them to the wrong system. That is D45's
+first wrong turn, and D46's 56-of-56 run measured it.
+
+**`HttpError` is a struct now**: `message` + `kind: HttpErrorKind::{Transport, Denied}`, with `is_denied()`.
+`egress::EgressError::is_policy_refusal` is the one predicate naming the policy family
+(`HostDenied | KeyHostMismatch`); `egress_port::http_error_from` and `StreamEvent::from_egress_error` both ask
+it. **`interpreter::attempt_error_from` is the interpreter's *one* port-failure → attempt-failure mapping**, and
+it asks the **kind, never the message**: `if e.is_denied() { Blocked { reason } } else { Transport }`.
+`AttemptError::Blocked { reason }` → `ErrorClass::EGRESS_DENIED` (`as_str` = `"EGRESS_DENIED"`).
+
+**The reason is logged, not dropped.** `AttemptOutcome` deliberately has no message field, so `attempt_outcome`
+logs `reason` before building the outcome — the last point where the specific host is still in hand. The
+client-facing token stays one word. `status_or_zero()` and `retry_after_ms()` both degenerate for `Blocked`
+(`0` / `None`).
+
+**The union test, and how a divergence is recorded.** Adding `EGRESS_DENIED` made
+`every_class_has_the_spelling_the_typescript_uses` fail — the point, not an obstacle. It is now **two
+directional assertions** ("the port has not lost a TS class" / "it has gained exactly the recorded ones") **plus
+a uniqueness assertion** the old set-equality got for free, with the extra token in
+`RUST_ONLY_SPELLINGS: [&str; 1]`. **A second divergence must be added there by name**, in a reviewed diff —
+never absorbed by loosening an assertion. `EGRESS_DENIED` is **not** drift, **not** retryable-with-next-key
+(every key of a provider shares its host), **not** recorded against the key; the `HealthTracker::record_result`
+arm is an explicit no-op so the omission is visible. That match arm was the **only** non-exhaustive site — a
+useful measurement of the blast radius.
+
+**D48 — a fourth route to the same misattribution.** `egress::stream` calls `build` (where `check_url` refuses)
+**before** its send loop, and used to return on that error **without sending anything**. So a denied host on the
+*streaming* path emitted **no event at all**: the sender dropped → the consumer's first `recv()` returned `None`
+→ it reported *"the egress ended before reporting response headers"*, from the arm whose comment claimed to be
+the unreachable residue. Nothing was dialled, so nothing could have ended. Fixed: `egress::stream` sends
+`StreamEvent::from_egress_error(&e)` **before** returning. `StreamEvent::Error` gained `denied: bool` with
+`#[serde(default, skip_serializing_if = "std::ops::Not::not")]` — **additive on the IPC wire**, so
+`tauri::commands::egress_stream` (which never names `HttpError`) is undisturbed.
+
+**Four probes, one at a time, each reddening exactly its own assertion.** (1) Point the `Blocked` arm at
+`Network` → reddens `a_policy_refusal_is_egress_denied_rather_than_network` alone. (2) `attempt_error_from` →
+always `Transport` → reddens the **denied** case of the interpreter test alone. (3) `attempt_error_from` → match
+on `message.contains("not allowlisted")` → reddens the **middle** case alone. That middle case is the old test's
+own input — `HttpError::new("host not allowlisted")`, a **transport**-kind error whose message *reads* like a
+refusal — and keeping it `Transport` is the anti-message-sniffing assertion. (4) Remove the send in
+`egress::stream` → reddens the streaming test alone, with the false sentence itself as the failure text.
+
+**Trap: the interpreter test's tail expression.** `match interp.generate_text(..).await { .. }` as an `async fn`'s
+tail keeps the `Ok` arm's `BoxStream` temporary alive past `interp` → `E0597`. Bind it to a local first.
+
+**Measured:** lib **1178 → 1181** (three tests, one per file: `engine.rs` the class mapping, `http_port.rs`
+`only_a_denied_error_says_so`, `egress_port.rs` the streaming refusal; the interpreter test was rewritten, not
+added). Binary 5 → 5. fmt clean, clippy `--all-targets -D warnings` clean,
+`--no-default-features --all-targets` clean, check-doc-links 51 files / 127 links, book **738.2 KB** / 204 ids,
+`data-page-node-id` 0. D46 moved from **Fixed at the boot path** to **Closed**; **D48** added.
 
 
 

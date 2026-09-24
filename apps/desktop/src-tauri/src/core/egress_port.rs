@@ -118,9 +118,8 @@ impl HttpPort for EgressPort {
                 timeout_ms: None,
             };
             if !stream {
-                let res = egress::request(&self.state, req)
-                    .await
-                    .map_err(|e| HttpError::new(e.to_string()))?;
+                let res =
+                    egress::request(&self.state, req).await.map_err(|e| http_error_from(&e))?;
                 return Ok(HttpResponse {
                     status: res.status,
                     headers: res.headers,
@@ -130,6 +129,21 @@ impl HttpPort for EgressPort {
             }
             streaming(self.state.clone(), req, cancel).await
         })
+    }
+}
+
+/// An egress failure, as the interpreter's port sees it.
+///
+/// **The kind is the whole point of the function.** A refusal by the allowlist and a failure to
+/// reach the host both produce "no HTTP answer", and the interpreter has to answer them differently:
+/// one is our policy, the other is evidence about the provider. Asking
+/// [`egress::EgressError::is_policy_refusal`] rather than matching here keeps that one predicate in
+/// one place — the same reason `egress::host_is_permitted` exists.
+fn http_error_from(e: &egress::EgressError) -> HttpError {
+    if e.is_policy_refusal() {
+        HttpError::denied(e.to_string())
+    } else {
+        HttpError::new(e.to_string())
     }
 }
 
@@ -171,7 +185,13 @@ async fn streaming<'a>(
     // Out of band: see the module note. The response's status is a field, not a stream item.
     let (status, headers) = match rx.recv().await {
         Some(StreamEvent::Headers { status, headers }) => (status, headers),
-        Some(StreamEvent::Error { message }) => return Err(HttpError::new(message)),
+        // **This arm is reachable, and the `None` arm below is not the only way in.** A `build`
+        // failure — an allowlisted-host refusal, which is the common one — arrives here as an
+        // `Error` with no `Headers` before it, because `egress::stream` sends before it returns.
+        // That is the fix for a denial that used to report "ended before reporting headers".
+        Some(StreamEvent::Error { message, denied }) => {
+            return Err(if denied { HttpError::denied(message) } else { HttpError::new(message) });
+        }
         // The sender dropped with nothing sent: the driver failed before it could classify. The
         // egress sends an `Error` on every path it can reach, so this is the unreachable residue —
         // reported as a transport failure rather than as a status the provider never gave.
@@ -186,7 +206,7 @@ async fn streaming<'a>(
         // The documented contract: a failed streaming request carries its words in `body` and has
         // no stream. The egress's next event is the one holding the provider's response.
         let body = match rx.recv().await {
-            Some(StreamEvent::Error { message }) => message,
+            Some(StreamEvent::Error { message, .. }) => message,
             // A `>= 400` with no error event behind it would be a provider that answered an error
             // status and then a clean stream. The status is still the truth and is what the caller
             // classifies on, so the body stays empty rather than being invented.
@@ -202,8 +222,12 @@ async fn streaming<'a>(
                 StreamEvent::Done => break,
                 // A break mid-stream travels as an item, not as an end: the interpreter must be
                 // able to tell "the provider stopped talking" from "the answer is complete".
-                StreamEvent::Error { message } => {
-                    yield Err(HttpError::new(message));
+                StreamEvent::Error { message, denied } => {
+                    yield Err(if denied {
+                        HttpError::denied(message)
+                    } else {
+                        HttpError::new(message)
+                    });
                     break;
                 }
                 // Not a shape the egress produces after the first event.
@@ -470,7 +494,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_host_outside_the_allowlist_is_refused_before_any_connection() {
         // The un-gating must not have widened the egress: a remote host still needs an allowlist
-        // entry, and the refusal is a transport failure rather than a fabricated status.
+        // entry, and the refusal is **ours** rather than a fabricated status.
         let egress = port();
         let cancel = Cancel::new();
         // Not `expect_err`: `HttpResponse` holds a `dyn Stream` and so implements no `Debug`, and
@@ -485,6 +509,44 @@ mod tests {
         assert!(
             err.to_string().contains("attacker.example"),
             "the refusal names the host it refused: {err}"
+        );
+        // And it is *our* refusal rather than a failure to reach the host — the distinction the
+        // class `EGRESS_DENIED` is built on. Before the kind existed, every refusal on this path was
+        // indistinguishable from an unreachable provider.
+        assert!(err.is_denied(), "a policy refusal is not a transport failure: {err}");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_streaming_refusal_is_reported_as_a_refusal_not_as_headers_that_never_came() {
+        // **The fourth route to the same misattribution, and the one with no status to hide behind.**
+        // `egress::stream` calls `build` — which is where `check_url` refuses — *before* its send
+        // loop, so a denied host on the streaming path produced **no event at all**: the sender
+        // dropped, `streaming`'s first `recv()` returned `None`, and the consumer reported the one
+        // thing certainly false — "the egress ended before reporting response headers" — from the
+        // arm whose own comment claimed to be the unreachable residue. Nothing was dialled, so
+        // nothing could have ended.
+        //
+        // The fix is that `egress::stream` sends its classification *before* returning. Remove that
+        // send and this fails on the third assertion; fold the refusal back into a transport failure
+        // and it fails on the first.
+        let egress = port();
+        let cancel = Cancel::new();
+        let err =
+            match egress.request(request("http://attacker.example", "/sse", true), &cancel).await {
+                Ok(_) => panic!("an unregistered remote host is denied"),
+                Err(e) => e,
+            };
+        assert!(
+            err.is_denied(),
+            "a streaming refusal is still our refusal, not a transport failure: {err}"
+        );
+        assert!(
+            err.to_string().contains("attacker.example"),
+            "the refusal names the host it refused: {err}"
+        );
+        assert!(
+            !err.to_string().contains("before reporting response headers"),
+            "the refusal must not be reported as a stream that ended: {err}"
         );
     }
 }
