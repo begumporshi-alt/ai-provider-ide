@@ -26,6 +26,7 @@
 //! whole crate is), and it is recorded rather than hidden.
 
 pub mod adapter;
+pub mod adapter_runtime;
 pub mod capture;
 pub mod code_adapter;
 pub mod compress;

@@ -1912,19 +1912,69 @@ the two divergence tests, reproducing the measurement above as a test failure, w
 shipped manifest carries has no `.` and no classes, which is the boundedness argument in a single
 observation.
 
-**What remains in this phase:**
-
-1. **`AdapterFactory` for `kind: "code"`.** Nothing constructs a `CodeAdapterInstance` from a stored
-   manifest yet: `adapter-runtime.ts:52-58` branches on `manifest.kind`, and that branch has no
-   Rust counterpart. This is the increment that makes the sandbox reachable from the router at all.
+**Nothing remains in this phase.**
 
 **What has landed.** Increments 15–17 make the interpreter whole (`jsonpath.rs`, `template.rs`,
 `manifest.rs`, `http_port.rs`, `manifest_view.rs`, `interpreter.rs`, and `modality.rs`, which also
 took §10 decision 5). Increment 18 lands the engine-free half of the sandbox (`sandbox.rs`); 19a adds
 the engine and measures the seam's bound, which is D30; 19b lands the actor (`js_host.rs`); 20a the
-manifest half (`code_adapter.rs`); and 20b the last member 20a had deliberately **buffered** — true
-streaming for `generateText`. Six of the seven `AdapterInstance` members came with 20a, so the only
-work left in this phase is the factory above.
+manifest half (`code_adapter.rs`); 20b the last member 20a had deliberately **buffered** — true
+streaming for `generateText`; and **21 closes the phase** with the registry that chooses between the
+two implementors (`adapter_runtime.rs`). Six of the seven `AdapterInstance` members came with 20a and
+the seventh with 20b, so the only thing left after those was the branch, and it is the branch that
+makes the sandbox reachable from the router at all.
+
+**Increment 21 — the adapter runtime, and the last module of the phase.** `AdapterRuntime` is the
+port of `adapter-runtime.ts`, and the honest description of that file is a **registry**, not the
+factory the plan named: `register`, `unregister`, `for_provider` and `dispose` over one
+`RwLock<HashMap<String, Arc<dyn AdapterInstance>>>`, with a private `build` that reads `kind`. The
+registry half is not bookkeeping — a `kind: "code"` adapter owns a thread and a QuickJS context
+(D30), and `JsSandbox::spawn` compiles the guest source and blocks until the actor reports ready, so
+a `for_provider` that constructed instead of looking up would spawn a thread and compile a module per
+request. Fourteen tests; Rust **982 → 996**.
+
+**The one divergence, and why it is not a preference.** The reference disposes the superseded adapter
+before it builds the replacement:
+
+```text
+const superseded = this.byProvider.get(providerId);
+if (superseded) void superseded.dispose?.();            // :30 — void-ed, so it does not wait
+this.byProvider.set(providerId, this.build(manifest));  // :31 — throws before the set runs
+```
+
+Because `build` is evaluated as the argument to `set`, a manifest that fails to build throws *before*
+`set` runs — so the map keeps the old adapter, now disposed, and every later `forProvider` returns it
+and fails with `"adapter disposed"`. The provider is dead until something re-registers it. The `void`
+also means the teardown races the construction rather than preceding it, so the ordering is an
+artifact of a discarded promise rather than a stated policy. On this side `dispose` is synchronous
+and **joins the actor thread**, so porting the order would pay a join on a path that then fails *and*
+reproduce the dead-adapter state. The port builds first, swaps, then disposes; a failed `register`
+leaves the previous adapter serving and says so in its `Err`. Recorded as **D32**, pinned by
+`a_manifest_that_fails_to_build_leaves_the_previous_adapter_serving`, and the probe that restores the
+reference's order reddens exactly that test.
+
+**`appUrl` is the increment's one hidden dependency.** The reference's declarative branch passes
+`vars: { appUrl: this.vars.appUrl ?? "https://aiprovider.router" }` (`:57`), which reads like a
+courtesy default and is not: the OpenRouter template's `generateText` carries
+`"HTTP-Referer": "{{appUrl}}"` (`manifest_view.rs:302`), and an **unbound** host variable renders as
+the empty string rather than being omitted (`manifest.rs:294` — the `?? ""` rule, which is the
+opposite of the request template's). A runtime that supplied no vars would therefore send an empty
+`HTTP-Referer` on every OpenRouter request. The test asserts on the header the egress was handed, not
+on the field, and the probe that empties the context's map reddens it with `left: Some("")`.
+
+**A false pass, caught by a probe rather than by review.** The first version of
+`a_superseded_sandbox_is_disposed` observed disposal through `generateImage`. The fixture guest
+implements `listModels` and nothing else, so that call failed with `AttemptError::Transport` because
+the method was missing — the *same* error a disposed sandbox produces — and the assertion could never
+fail. The probe that removed the `superseded.dispose()` call left it green, which is what exposed it.
+It now probes `listModels`, the operation the guest answers, and asserts the replacement works beside
+the superseded adapter failing. The general form is the one this register keeps rediscovering: **an
+assertion whose expected failure has more than one cause is not an assertion.**
+
+**What is deliberately not here.** No store read: `register` takes a parsed manifest, and who reads
+`manifests.body_json` and calls it is the activation path's business. Nothing in production calls
+`AdapterRuntime` yet, which is the same position `code_adapter.rs` has been in since 20a — this phase
+makes the sandbox *reachable*, and Phase 5 is what reaches it.
 
 ### Phase 5 — Delete the bridge (1 day)
 

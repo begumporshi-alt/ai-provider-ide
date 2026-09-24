@@ -755,7 +755,9 @@ is not one. Cost two full 4-minute runs on 2026-09-21.
 app-key principal's thirteen → 408 → 414 after the injection ring buffer's six →
 **420 after the gateway.log reader's six**, **426 after the `generator_audit` reader's six**, **433 after the
 drift history reader's seven**, **466 after the external-agent ingress + `count_tokens` + Retry-After stage 2**,
-**470 after the cooldown-reporting tests' four**.
+**470 after the cooldown-reporting tests' four**. **The headless port then took Rust 470 → 996 across
+increments 1–21 (2026-09-24)** — the per-increment figures are in the sections above rather than in
+this chain; `cargo test --lib` at increment 21 is **996**, and the 20b/21 splits are 971 → 982 → 996.
 Desktop vitest 163 → 169 (retention) → 170 → 177 (the settings-merge spec's seven) → 181 after the
 trail-writes spec's four → **183 after the generation producer's two** → **186 after the lost-ending specs'
 three** → **190 after the run-omission specs' four** → **193 after the stranded-repair specs' three**.
@@ -3491,8 +3493,95 @@ immediately cannot test streaming at all.
 | the charge dropped | the cap test | **402 against 401** — the pre-20b behaviour |
 | `let _ =` → `expect` on the chunk send | the dropped-receiver test | panics the actor thread |
 
-### What remains in Phase 4b
+### Phase 4b closed 2026-09-24 by increment 21 (below)
 
-1. `AdapterFactory` for `kind: "code"` — `adapter-runtime.ts:52-58` branches on `manifest.kind`, and
-   nothing in Rust constructs a `CodeAdapterInstance` yet, so the sandbox is unreachable from the
-   router. **This is the last item in the phase.**
+## Increment 21 — `core/adapter_runtime.rs`, and Phase 4b closes (2026-09-24)
+
+Rust **982 → 996**; 14 new tests. Gate green: `fmt --check` 0 bytes, `clippy --all-targets -D
+warnings` clean, 996/0, `--no-default-features --all-targets` compiles, `check-doc-links` 51/127,
+`docs:book` 12 chapters / 204 ids / 535.0 KB, `key-leak-grep` OK.
+
+**Also closed the `tauri build` verification gap** (the D14 failure mode): `tauri build --bundles app`
+succeeds on the 20b tree, 3m04s, bundle at
+`apps/desktop/src-tauri/target/release/bundle/macos/AI-Provider Router.app`. Run with
+`beforeBuildCommand` overridden to `true` (`--config '{"build":{"beforeBuildCommand":"true"}}'`)
+because `pnpm build` is unusable here; the frontend was built directly (`tsc` 0 lines, `vite build`
+exit 0). **What that verifies is the Rust bundling path** — main-binary disambiguation, the bundle,
+the `[[bin]]` table — and not `pnpm build`.
+
+### The shape
+
+`AdapterRuntime` is the port of `adapter-runtime.ts` and it is a **registry**, not only a factory:
+`register` / `unregister` / `for_provider` / `dispose` / `registered` over one
+`RwLock<HashMap<String, Arc<dyn AdapterInstance>>>`, plus a private `build` that reads `kind`.
+`AdapterFactory` is implemented for it — the trait is unchanged.
+
+**Why the registry half is not bookkeeping:** a `kind: "code"` adapter owns a thread and a QuickJS
+context (D30), and `JsSandbox::spawn` compiles the guest and blocks until the actor reports ready. A
+`for_provider` that constructed would spawn a thread and compile a module **per request**.
+
+`build` reads `kind` with the grammar's own default (`manifest.ts:130`) — an absent field is
+declarative, and anything other than the exact string `"code"` is declarative, matching the
+reference's `===`.
+
+### The divergence: build first, then swap, then dispose (D32)
+
+The reference (`adapter-runtime.ts:29-31`) disposes the superseded adapter **before** building the
+replacement. Two facts make that order a defect rather than a policy:
+
+1. `void superseded.dispose?.()` — the promise is discarded, so the teardown **races** the
+   construction instead of preceding it.
+2. `this.build(manifest)` is evaluated as the **argument** to `set`, so a manifest that fails to
+   build throws before `set` runs: the map keeps the old adapter, now disposed, and every later
+   `forProvider` returns it and fails with `"adapter disposed"`. The provider is dead until
+   something re-registers it.
+
+On this side `dispose` is synchronous and **joins the actor thread** (`js_host.rs:473-479`), so
+porting the order would pay a join on a path that then fails *and* reproduce the dead-adapter state.
+The port builds first, swaps, then disposes; a failed `register` leaves the previous adapter serving
+and says so in its `Err`. **The lock is released before `dispose()` runs** — the join may wait on an
+in-flight operation, and holding the write lock across it would block every `for_provider`.
+
+### `appUrl` is load-bearing, not decoration
+
+The reference's declarative branch passes `vars: { appUrl: … ?? "https://aiprovider.router" }`. The
+OpenRouter template's `generateText` carries `"HTTP-Referer": "{{appUrl}}"` (`manifest_view.rs:302`,
+asserted `:430`), and an **unbound** host variable renders as the **empty string** rather than being
+omitted (`manifest.rs:294` — the `?? ""` rule, the opposite of the request template's). So a runtime
+that supplied no vars would send an empty `HTTP-Referer` on every OpenRouter request.
+`DEFAULT_APP_URL` is that literal, and the test asserts on the header the egress was handed — not on
+the field.
+
+### The false pass a probe caught
+
+The first `a_superseded_sandbox_is_disposed` observed disposal through `generateImage`. The fixture
+guest implements `listModels` and nothing else, so that call failed with `AttemptError::Transport`
+because **the method was missing** — the same error a disposed sandbox produces — and the assertion
+could never fail. The probe that removed the `superseded.dispose()` call left it **green**. It now
+probes `listModels` and asserts the replacement works beside the superseded adapter failing.
+
+**Generalised:** an assertion whose expected failure has more than one cause is not an assertion. A
+probe that stays green is the finding, not a wasted run.
+
+### Five probes (each reverted by its inverse edit, hash-verified `0423f082…`)
+
+The hash is of the **committed** revision. The first pass ran before `cargo fmt`, whose baseline
+(`15596ef9…`) matched no bytes checkable against `HEAD`; `cargo fmt` is semantically a no-op and moves
+the hash anyway. Re-run against the committed bytes, with the `register` anchors updated to the
+post-`fmt` single-line form.
+
+| Edit | Reddens | Reading |
+|---|---|---|
+| `== Some("code")` → `== Some("declarative")` | the sandbox-branch test | `left: []`, the interpreter answered |
+| absent `kind` → code | the default-kind test | the code manifest is read as declarative |
+| `context()` supplies no vars | the appUrl test | `left: Some("")` |
+| the reference's swap order restored | the failed-register test | the old adapter is disposed |
+| `superseded.dispose()` dropped | the disposal test | — **stayed green**, which is the false pass above |
+
+The fifth probe reddened only after the test was rewritten to use the operation the guest answers.
+
+### What is deliberately not here
+
+No store read — `register` takes a parsed manifest, and nothing in production calls `AdapterRuntime`
+yet (the same position `code_adapter.rs` has held since 20a). This increment makes the sandbox
+*reachable*; **Phase 5 is what reaches it.**
