@@ -7,7 +7,7 @@ use std::sync::{Arc, RwLock};
 use tauri::Manager;
 
 use crate::core::{crash_report, egress, gateway, store, vault};
-use crate::tauri::{app_nap, commands, gateway_cmds};
+use crate::tauri::{commands, gateway_cmds};
 
 /// Seed the egress allowlist from registered provider base URLs. Only statuses that can
 /// actually serve (pending/enabled/repairing) are allowed (invariant 9: no stale grants).
@@ -97,9 +97,6 @@ fn show_window(app: &tauri::AppHandle) {
         let _ = w.unminimize();
         let _ = w.set_focus();
     }
-    // Deliberately does NOT clear the core's hidden flag: that flag describes the *bridge
-    // host* window, which is the permanently-hidden gateway worker. Restoring the UI has no
-    // bearing on whether the worker renderer is throttled.
 }
 
 /// The decision `hide_on_close` makes, split from the `AppHandle` so it can be tested without a
@@ -139,11 +136,6 @@ pub fn run() {
         .with_max_level(tracing::Level::INFO)
         .with_env_filter(std::env::var("GW_LOG").unwrap_or_else(|_| "info".to_string()))
         .try_init();
-
-    // macOS must not nap this process: the gateway's worker is a hidden webview, and a napped
-    // process is a worker that cannot answer, whatever the watchdog does afterwards. Runs after
-    // tracing is installed so the confirmation is actually recorded.
-    app_nap::suppress_app_nap();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -241,8 +233,8 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
         .run(|app, event| match event {
-            // R1: closing the UI window must not end the process. The gateway's renderer is a
-            // separate hidden window, so it keeps serving regardless.
+            // R1: closing the UI window must not end the process. The gateway is a socket in
+            // this process, not a renderer, so it keeps serving regardless.
             tauri::RunEvent::WindowEvent {
                 label,
                 event: tauri::WindowEvent::CloseRequested { api, .. },

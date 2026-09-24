@@ -11,19 +11,28 @@
 //! **The crate's other usage shape carries two of these three fields (D23).** `BridgeMsg::Usage`
 //! (`gateway.rs:365-368`) is `{prompt_tokens: u64, completion_tokens: u64}` and has no
 //! `cached_tokens`, so the gateway's client-facing `usage` object cannot report a cache count in any
-//! of its four dialects. **Two channels, and only one of them is lossy.** The webview's `onUsage`
-//! forwards two fields to `gateway_usage` (`gateway-bridge.ts:299-305`) and that is what reaches the
-//! response body; the *ledger* row is written on the webview side by the router, which reads
-//! `exec.usage()?.cached_tokens` in process (`model-router.ts:435`, `:519`) and never crosses the
-//! bridge — so `cached_tokens` does reach the column for gateway traffic.
+//! of its four dialects. **Two channels, and only one of them was lossy.** The webview's `onUsage`
+//! forwarded two fields to `gateway_usage` (`gateway-bridge.ts:299-305`, both deleted in 25f) and
+//! that was what reached the response body; the *ledger* row was written on the webview side by the
+//! router, which read `exec.usage()?.cached_tokens` in process (`model-router.ts:435`, `:519`) and
+//! never crossed the bridge — so `cached_tokens` did reach the column for gateway traffic.
+//!
+//! **The split survived the port, and `BridgeMsg::Usage` is still the lossy side.**
+//! `router_bridge.rs:344` builds `BridgeMsg::Usage` from a full [`UsageTokens`] and copies two of
+//! its three fields, so the client-facing channel is exactly as lossy as the webview's `onUsage`
+//! was — while `on_usage` still hands the ledger the whole shape. D23's warning is therefore a
+//! description of the tree rather than a projection: the port avoided the mistake for the ledger
+//! and reproduced it for the client.
 //!
 //! **The client-facing half is already recorded in full** (`09-status.md:179`, with the same
 //! citations and with §8.2 as the reason its fix is deferred), so D23 does not re-find it. What D23
-//! records is the **port-planning** consequence, which no entry held: today's routing is TypeScript,
-//! so the lossy channel costs a client a field it cannot derive. Move routing into Rust and there is
-//! no webview holding the third value — the ledger row must then be built here, and the obvious
-//! move, reuse the crate's only usage type, silently stops recording the measurement migration 0015
-//! exists to take. That is why the shape was settled before the text half rather than alongside it.
+//! records is the **port-planning** consequence, which no entry held: routing was TypeScript when
+//! this was written, so the lossy channel cost a client a field it could not derive, and the risk
+//! was that moving routing into Rust would leave no webview holding the third value — so the ledger
+//! row would have to be built here, and the obvious move, reusing the crate's only usage type,
+//! would silently stop recording the measurement migration 0015 exists to take. **25e moved the
+//! routing and the risk did not land:** `on_usage` carries the three-field shape, so the ledger
+//! still sees it. That is why the shape was settled before the text half rather than alongside it.
 //! `on_usage` hands over **this** type instead.
 //!
 //! **This is the shape the text half of the adapter seam was waiting for.** `adapter.rs` records

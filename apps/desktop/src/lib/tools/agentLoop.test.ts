@@ -267,18 +267,22 @@ describe("the tool-step ceiling has one source", () => {
   // constants kept in step by a comment — the kind of duplication that survives exactly until
   // someone edits one of them, at which point the gateway and the Assistant disagree about how
   // much a turn may spend and nothing fails.
-  const bridge = readFileSync(new URL("../../gateway-bridge.ts", import.meta.url), "utf8");
+  //
+  // **Retargeted in 25f.** The gateway loop used to be `gateway-bridge.ts`, which imported
+  // `DEFAULT_MAX_ITERATIONS` and so could not drift. 25f moved the loop into Rust
+  // (`core/router_bridge.rs`, bounded by `core/bridge_policy.rs`), and a Rust `const` cannot
+  // import a TypeScript one — so the guard becomes the comparison the import used to make for
+  // free: read the Rust literal and require it to equal the Assistant's.
+  const bridgePolicy = readFileSync(
+    new URL("../../../src-tauri/src/core/bridge_policy.rs", import.meta.url),
+    "utf8",
+  );
 
-  it("gateway-bridge derives its bound instead of restating it", () => {
-    const declared = [...bridge.matchAll(/const MAX_TOOL_ITERATIONS\s*=\s*([^;]+);/g)].map(
-      (m) => m[1].trim(),
-    );
+  it("the Rust gateway's tool-step ceiling equals the Assistant's default", () => {
+    const declared = [
+      ...bridgePolicy.matchAll(/const MAX_TOOL_ITERATIONS\s*:\s*usize\s*=\s*(\d+);/g),
+    ].map((m) => Number(m[1]));
     expect(declared).toHaveLength(1);
-    expect(declared[0]).toBe("DEFAULT_MAX_ITERATIONS");
-  });
-
-  it("gateway-bridge imports that default rather than re-declaring a literal", () => {
-    expect(bridge).toMatch(/import \{[^}]*DEFAULT_MAX_ITERATIONS[^}]*\} from "\.\/lib\/tools\/agentLoop"/);
-    expect(bridge).not.toMatch(/const MAX_TOOL_ITERATIONS\s*=\s*\d/);
+    expect(declared[0]).toBe(DEFAULT_MAX_ITERATIONS);
   });
 });

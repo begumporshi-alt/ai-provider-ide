@@ -218,11 +218,6 @@ export function GatewayScreen() {
         <div className="mb-3 flex items-center gap-3">
           <span className={`inline-block h-2.5 w-2.5 rounded-full ${running ? "dot-healthy" : "dot-disabled"}`} />
           <span className="text-[14px] font-semibold">{running ? "Running" : "Stopped"}</span>
-          {status?.workerError && (
-            <span className="text-[11px]" style={{ color: "var(--danger)" }}>
-              · the worker failed to start — the error is on Control
-            </span>
-          )}
           <span className="ml-auto text-[11px]" style={{ color: "var(--text-faint)" }}>
             Start, stop and port are on <b>Control → Gateway</b>
           </span>
@@ -284,11 +279,6 @@ export function GatewayScreen() {
             {hideOnClose ? "On" : "Off"}
           </Button>
         </div>
-        {status?.background && (
-          <p className="mt-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-            Serving in the background right now.
-          </p>
-        )}
       </section>
 
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>

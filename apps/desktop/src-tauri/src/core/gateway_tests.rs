@@ -182,14 +182,6 @@ impl Bridge for SynthBridge {
     fn cancel(&self, _id: u64) {
         self.cancels.fetch_add(1, Ordering::Relaxed);
     }
-
-    /// This double stands in for `EventBridge`, so it answers through the same function
-    /// `EventBridge` uses — see `webview_ready` for why that indirection is load-bearing. Answering
-    /// `true` unconditionally would make every R1 test below vacuous: they assert on
-    /// `is_available()`, which now routes through this method.
-    fn ready(&self, beat: Beat) -> bool {
-        webview_ready(beat)
-    }
 }
 
 struct TestServer {
@@ -1562,48 +1554,72 @@ async fn the_gate_is_asked_about_the_caller_that_authenticated() {
     );
 }
 
-// ---------- audit R1: background mode liveness ----------
+// ---------- the request gate (25f) ----------
 
-/// R1: a hidden window's heartbeat is throttled by the OS, so the liveness bound must
-/// relax — 6s would drop every request while the app sits in the background.
-#[test]
-fn r1_hidden_loosens_the_heartbeat_bound() {
-    let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
-    core.set_running(true);
-    assert!(core.is_available());
+/// **The R1 liveness suite is gone, and this is what replaced it.**
+///
+/// Three tests used to sit here — `r1_hidden_loosens_the_heartbeat_bound`,
+/// `r1_entering_background_stamps_the_heartbeat` and `r1_leaving_background_restores_the_tight_bound`.
+/// All three measured the webview worker's heartbeat against two bounds, and 25f deleted the webview.
+///
+/// What is left is one gate — whether the operator asked the gateway to serve — and **two** refusals
+/// that answer it. They are not the same refusal, and the difference was measured rather than
+/// assumed:
+///
+/// - `check_gateway_key` (`gateway.rs:1389`) refuses a stopped gateway first, before any handler
+///   reaches `try_slot`. That is what a client actually experiences.
+/// - `try_slot` (`gateway.rs:1280`) refuses again. In production that one is reachable only through
+///   a race — the auth gate reads `running`, the operator presses Stop, the slot gate reads it
+///   again — which is narrow but real: the alternative to refusing there is dispatching into a
+///   gateway the operator just stopped.
+///
+/// **A probe is why there are two tests rather than one.** Inserting `sleep(5s)` before `try_slot`'s
+/// refusal left the end-to-end test below green in 0.02 s, because the auth gate answered first. A
+/// timing assertion taken only through the request path therefore pins the auth gate and says
+/// nothing at all about the slot gate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_gateway_is_refused_without_waiting_for_a_bridge() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.core.set_running(false);
 
-    // Age the heartbeat past the visible bound (6s) but inside the hidden one (30s).
-    *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(7_000);
-    assert!(!core.is_available(), "stale beat must fail while visible");
+    let started = std::time::Instant::now();
+    let res = post_chat(&s, "sk-aip-test").await;
+    let elapsed = started.elapsed();
 
-    core.set_hidden(true);
-    assert!(core.is_available(), "hidden mode must tolerate a throttled beat");
-    assert!(core.is_hidden());
+    assert_eq!(res.status(), 503);
+    assert_eq!(
+        res.headers().get("retry-after").and_then(|v| v.to_str().ok()),
+        Some("1"),
+        "a stopped gateway is retryable, and the hint says so"
+    );
+    // The deleted path waited out `CORE_RECOVERY_GRACE` (5s) before answering. One second is a
+    // generous ceiling for a local refusal and still an order of magnitude below it.
+    assert!(elapsed < Duration::from_secs(1), "refused in {elapsed:?}, not waited out");
 }
 
-/// R1: entering background stamps the heartbeat. Without this, hiding right before the
-/// beat was due would trip the short bound during the first throttled interval.
-#[test]
-fn r1_entering_background_stamps_the_heartbeat() {
-    let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
-    core.set_running(true);
-    *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(10_000);
-    assert!(!core.is_available());
-    core.set_hidden(true);
-    assert!(core.is_available(), "set_hidden must refresh the beat");
-}
+/// The slot gate's own refusal, driven directly — the half the request path cannot see.
+///
+/// Without this, `try_slot`'s stopped-branch would be asserted only indirectly, by a test the auth
+/// gate answers first. This calls `try_slot` with nothing in front of it, so the refusal under test
+/// is unambiguous. (It is callable from here because `gateway_tests.rs` is included as a child
+/// module of `gateway` via `#[path]`.)
+///
+/// Falsified before it was trusted: `sleep(5s)` inserted before the refusal reddens this test, and
+/// leaves the end-to-end test above green — which is the measurement the note above records.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_slot_gate_refuses_a_stopped_core_without_waiting() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.core.set_running(false);
 
-/// R1: leaving background restores the tight bound, so a renderer that died while hidden
-/// is detected again instead of being trusted forever.
-#[test]
-fn r1_leaving_background_restores_the_tight_bound() {
-    let core = GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("k".into())));
-    core.set_running(true);
-    core.set_hidden(true);
-    *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(10_000);
-    assert!(core.is_available());
-    core.set_hidden(false);
-    assert!(!core.is_available(), "visible mode must re-apply the 6s bound");
+    let started = std::time::Instant::now();
+    let refused = try_slot(&s.core).await;
+    let elapsed = started.elapsed();
+
+    let resp = refused.err().expect("a stopped core is refused by the slot gate");
+    assert_eq!(resp.status(), 503);
+    assert!(elapsed < Duration::from_secs(1), "refused in {elapsed:?}, not waited out");
 }
 
 /// R4(b): no provider attached == uncapped. Guards the builder contract that every
@@ -1943,15 +1959,13 @@ fn the_refusal_message_tells_the_model_what_to_do() {
 
 #[cfg(feature = "app")]
 /// A bound socket and a gateway that is meant to be serving are different states — but the
-/// difference that matters is *operator intent*, not whether the worker happens to be awake.
+/// difference that matters is *operator intent*, and after 25f that is the only input there is.
 ///
-/// This test used to assert the opposite for the lapsed case, because a lapsed beat was the
-/// only signal available and tearing the listener down was how Start recovered from it. That
-/// is no longer true: a hidden worker sleeps after ~8 idle minutes (see
-/// `HEARTBEAT_STALE_HIDDEN_MS`), so calling that "stale" meant destroying a healthy listener
-/// every time the gateway went quiet — and `await_core` revives the worker from the request
-/// that needs it anyway. The state that genuinely needs rebuilding is a listener that
-/// outlived the operator's intent, because nothing else will ever tear it down.
+/// This test used to assert the opposite for the lapsed case, because a lapsed beat was the only
+/// signal available and tearing the listener down was how Start recovered from it. Two later changes
+/// removed the middle case entirely: the watchdog stopped pre-warming, and 25f deleted the webview
+/// whose heartbeat "lapsed" described. What is left is the state that genuinely needs rebuilding —
+/// a listener that outlived the operator's intent, because nothing else will ever tear it down.
 #[test]
 fn a_bound_listener_is_stale_only_when_serving_was_never_asked_for() {
     use crate::tauri::gateway_cmds::GatewayState;
@@ -1967,49 +1981,22 @@ fn a_bound_listener_is_stale_only_when_serving_was_never_asked_for() {
     *state.server.lock().unwrap() =
         Some(ServerHandle { shutdown: tx, addr: "127.0.0.1:0".parse().unwrap() });
     core.set_running(true);
-    core.heartbeat();
-    assert!(!state.has_stale_server(), "a healthy listener is not stale");
-
-    // The beat lapses while the socket stays bound. The worker is asleep, not broken: the
-    // listener is fine and the next request wakes the worker, so this must not be torn down.
-    core.set_hidden(false);
-    *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(7_000);
-    assert!(!core.is_available(), "the beat really has lapsed");
-    assert!(!state.has_stale_server(), "a sleeping worker under a bound listener is not stale");
+    assert!(!state.has_stale_server(), "a listener the operator asked for is not stale");
 
     // A listener that outlived the operator's intent is the case that needs rebuilding.
     core.set_running(false);
     assert!(state.has_stale_server(), "bound but not running is stale");
 }
 
-/// `running` (operator intent) and `worker_awake` (the beat) are separable, and a sleeping
-/// worker must never read as a stopped gateway.
+/// A bridge that stops answering must fail the request, not hold the socket open.
 ///
-/// These are exactly the two fields `gateway_status` reports, and conflating them is what
-/// made the UI say "Stopped — last heard from the worker 31s ago" about a gateway that was
-/// bound, serving, and would have answered the next request.
-#[test]
-fn a_sleeping_worker_is_still_running() {
-    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
-    let (core, _bridge) = test_core(key);
-    core.set_hidden(true);
-    core.set_running(true);
-    core.heartbeat();
-    assert!(core.is_running() && core.beat_is_fresh());
-
-    // ~8 idle minutes later the hidden worker's timer has stopped. 31s clears the 30s bound.
-    *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_millis(31_000);
-    assert!(core.is_running(), "operator intent survives a sleeping worker");
-    assert!(!core.beat_is_fresh(), "the beat is the part that went stale");
-    assert!(!core.is_available(), "and is_available is the conjunction of the two");
-}
-
-/// A worker that stops answering must fail the request, not hold the socket open.
-///
-/// This is what an OS-suspended worker webview looks like from here: the beat was fresh when
-/// the request was admitted, so nothing is stale yet — the reply simply never arrives. Until
-/// the first message had a bound, the handler waited forever with a socket open and nothing
-/// logged, which presents as a mysterious hang rather than an error.
+/// This was written for an OS-suspended webview: the beat was fresh when the request was admitted,
+/// so nothing looked stale — the reply simply never arrived. 25f deleted the webview and the
+/// `FIRST_MSG_TIMEOUT` bound survived it, because the property it pins is not about a webview: a
+/// bridge that accepts a dispatch and never writes to its `ReplyHandle` would otherwise hold the
+/// socket open with nothing logged, which presents as a mysterious hang rather than an error. The
+/// suspected cause is now a bug in the router loop, and the client-visible message says what was
+/// observed rather than guessing at which.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_silent_worker_fails_the_request_instead_of_hanging() {
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
@@ -3200,13 +3187,6 @@ impl Bridge for MinimalBridge {
         replies.reply(req.request_id, BridgeMsg::Done);
     }
     fn cancel(&self, _id: u64) {}
-
-    /// Stands in for the webview bridge, as the other doubles do. These tests build a core and
-    /// use it within milliseconds, so the beat is fresh throughout; a test that wants a lapsed
-    /// beat ages `last_heartbeat` on purpose.
-    fn ready(&self, beat: Beat) -> bool {
-        webview_ready(beat)
-    }
 }
 
 fn bare_request(id: u64) -> BridgeRequest {

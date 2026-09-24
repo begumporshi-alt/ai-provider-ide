@@ -1341,14 +1341,6 @@ mod context_scope_tests {
         ) {
         }
         fn cancel(&self, _request_id: u64) {}
-
-        /// These tests call `inject_context` directly rather than going through the request path,
-        /// so this is never consulted. It answers as the other doubles do — through the same
-        /// `webview_ready` the production `EventBridge` uses — rather than claiming a readiness the
-        /// double has not earned.
-        fn ready(&self, beat: crate::core::gateway::Beat) -> bool {
-            crate::core::gateway::webview_ready(beat)
-        }
     }
 
     /// A core with no store and no workspace root: the default state, and the state the

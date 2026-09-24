@@ -13,17 +13,6 @@ export default defineConfig(() => ({
   //
   // 1. prevent Vite from obscuring rust errors
   clearScreen: false,
-  // R1: second entry point for the gateway worker window. Vite only emits index.html by
-  // default, so the worker page has to be declared or the production build omits it and the
-  // dedicated window loads a 404.
-  build: {
-    rollupOptions: {
-      input: {
-        main: "index.html",
-        gateway: "gateway.html",
-      },
-    },
-  },
   // 2. tauri expects a fixed port, fail if that port is not available
   server: {
     port: 1420,

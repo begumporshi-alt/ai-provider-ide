@@ -1,9 +1,12 @@
 //! The driver: a Rust-native [`Bridge`] that answers gateway requests in this process.
 //!
-//! This is the port of `apps/desktop/src/gateway-bridge.ts` (421 lines), and it is the last piece
-//! of Phase 5c. Everything it *decides* is already in [`crate::core::bridge_policy`]; what is left
-//! here is the I/O that carries those decisions out — the tool loop, the spawned task, and the
-//! writes to [`ReplyHandle`].
+//! This is the port of `apps/desktop/src/gateway-bridge.ts` (421 lines), and **that file was
+//! deleted in 25f** along with the webview it ran in. That is worth stating plainly rather than
+//! quietly: the TS file was the reference every fidelity claim in this module was measured against,
+//! so those claims are now historical, and the tests below are the authority. This module is the
+//! last piece of Phase 5c — everything it *decides* is already in [`crate::core::bridge_policy`];
+//! what is left here is the I/O that carries those decisions out: the tool loop, the spawned task,
+//! and the writes to [`ReplyHandle`].
 //!
 //! # What this module does not own
 //!
@@ -41,13 +44,14 @@
 //!    without it, which is why it was the last of the three and why 25e, not this module, decides
 //!    where the sink is installed.
 //!
-//! So this module is deliberately written against seams — `Arc<RouterStore>`,
-//! `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>` — which is what lets it be tested now with the
-//! doubles the crate already has, and what fixes the interface the remaining gap must satisfy. See
-//! the module's own test section for what "tested" means here: every path below runs against a real
-//! `ModelRouter`, not a mock of it. What still stands between this and a launch is 25e (the
-//! install itself) — including a source for
-//! [`BridgeHost::settings`], which 25b supplied as `RouterSettings::from_store`.
+//! **Installed since 25e, and now the only path a completion takes.** `bin/aiproviderd.rs` builds
+//! this bridge at boot; `tauri/gateway_cmds.rs::build_core` builds it for the desktop app. The seams
+//! it was written against are what made that a wiring step rather than a rewrite — `Arc<RouterStore>`,
+//! `Arc<dyn AdapterFactory>`, `Arc<dyn BridgeHost>` — plus a source for [`BridgeHost::settings`],
+//! which 25b supplied as `RouterSettings::from_store`.
+//!
+//! Every path below runs against a real `ModelRouter`, not a mock of it: see this module's own test
+//! section for what "tested" means here.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -63,9 +67,7 @@ use crate::core::bridge_policy::{
     TurnOutcome, MAX_TOOL_ITERATIONS,
 };
 use crate::core::engine::TextFailure;
-use crate::core::gateway::{
-    gateway_tool_refusal, Beat, Bridge, BridgeMsg, BridgeRequest, ReplyHandle,
-};
+use crate::core::gateway::{gateway_tool_refusal, Bridge, BridgeMsg, BridgeRequest, ReplyHandle};
 use crate::core::gateway_normalizer::{detect_client, normalize_gateway_request, NormalizeOptions};
 use crate::core::router::{
     CallOptions, ImageRequest, ModelRouter, RouterError, RouterSettings, RouterStore,
@@ -74,9 +76,9 @@ use crate::core::tool_registry::{agent_tools, registry_to_openai};
 use crate::core::tool_wire::to_wire_tool_calls;
 use crate::core::tools::{tool_run, ToolRunRequest};
 
-/// The ledger source every row this bridge writes is attributed to. The reference passes the same
-/// literal (`gateway-bridge.ts:309`), and it is what makes a gateway request distinguishable from
-/// a UI one in the ledger rather than merely countable.
+/// The ledger source every row this bridge writes is attributed to. The reference passed the same
+/// literal (`gateway-bridge.ts:309`, deleted in 25f), and it is what makes a gateway request
+/// distinguishable from a UI one in the ledger rather than merely countable.
 const LEDGER_SOURCE: &str = "gateway";
 
 /// What the bridge must ask its host, rather than keep a second copy of.
@@ -84,12 +86,15 @@ const LEDGER_SOURCE: &str = "gateway";
 /// Four questions, all of them facts the core already owns. This is a trait rather than a struct of
 /// `Arc`s because the answers have four different shapes and only the host knows how to read them
 /// — and because the *wiring* is then free to point at the core's own accessors without the bridge
-/// ever naming `GatewayCore`.
+/// ever naming `GatewayCore`. `AppHost` in `tauri/gateway_cmds.rs` is that wiring.
 ///
 /// **It cannot be `GatewayCore` itself.** The core owns the bridge (`Arc<dyn Bridge>`), so a bridge
-/// holding the core would close the reference cycle [`ReplyHandle`] exists to avoid — the same
-/// constraint `Beat`'s note records one layer out. The host must be a narrow handle over the values,
-/// not the whole core.
+/// holding the core would close the reference cycle [`ReplyHandle`] exists to avoid. The host must be
+/// a narrow handle over the values, not the whole core — and since 25f the three of them live in
+/// [`crate::core::gateway::HostSettings`], one `Arc`-backed copy the core writes through and this
+/// host reads through. A `Weak<GatewayCore>` would also break the cycle; it was rejected because it
+/// makes "not wired yet" a state the host must answer for, and every answer is a default the operator
+/// never chose.
 pub trait BridgeHost: Send + Sync {
     /// The router settings to serve this request with, read per request rather than captured, so a
     /// cap the operator changes reaches the next request instead of the next launch.
@@ -200,16 +205,6 @@ impl Bridge for RouterBridge {
         if let Some(cancel) = self.active.lock().unwrap().remove(&request_id) {
             cancel.cancel();
         }
-    }
-
-    /// Always ready, because this bridge runs in this process.
-    ///
-    /// The opposite of [`crate::core::gateway::webview_ready`], and deliberately so: a webview can
-    /// be suspended by the OS, so its readiness is a question about a heartbeat. Nothing suspends a
-    /// task in this process, so the question does not arise — which is exactly why `Bridge::ready`
-    /// has no default body and each implementation has to say which kind it is (D35).
-    fn ready(&self, _beat: Beat) -> bool {
-        true
     }
 }
 
@@ -1251,18 +1246,6 @@ mod tests {
         assert_eq!(failure_retry_hint(&RouterError::SystemAiUnavailable), None);
     }
 
-    // ---------- readiness ----------
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn the_rust_bridge_is_ready_for_any_beat_because_nothing_suspends_it() {
-        let bridge = bridge_with(Scripted::text(vec![]), Host::off());
-        // The opposite of `webview_ready`: a stale, hidden beat is exactly what a suspended webview
-        // reports, and this bridge does not run in one.
-        assert!(bridge.ready(Beat { age: Duration::ZERO, hidden: false }));
-        assert!(bridge.ready(Beat { age: Duration::from_secs(600), hidden: false }));
-        assert!(bridge.ready(Beat { age: Duration::from_secs(600), hidden: true }));
-    }
-
     // ---------- the route kinds ----------
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1346,6 +1329,28 @@ mod tests {
 
         assert_eq!(delta_text(&msgs), "hello");
         assert_eq!(delta_count(&msgs), 2, "nothing is held, so nothing is batched");
+        assert_eq!(adapter.text_calls(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn tools_off_streams_the_prose_as_it_arrives() {
+        // The third corner of the gate, and the one the headless service actually occupies.
+        // `passing_mode_streams_the_prose_as_it_arrives` covers `ToolOwnership::Client`; this covers
+        // `None`, which is what `aiproviderd` reaches once `gatewayToolsEnabled` is false — the
+        // service has no client tools to declare, so the toggle is its only route out of holding.
+        //
+        // Two chunks in, **two** deltas out. Before that setting existed the host answered `true`
+        // unconditionally, so this corner was unreachable in production and a streaming client saw
+        // its first content byte only at the end of the upstream's stream — measured at 1,209 ms
+        // against an upstream that had started emitting immediately.
+        let adapter = Scripted::text(vec![ScriptedTurn::saying(&["hel", "lo"])]);
+        let bridge = bridge_with(adapter.clone(), Host::off());
+
+        let msgs = drain(&bridge, chat("m1")).await;
+
+        assert_eq!(delta_text(&msgs), "hello");
+        assert_eq!(delta_count(&msgs), 2, "ownership `None` never holds, so nothing is batched");
+        assert!(matches!(msgs.last(), Some(BridgeMsg::Done)));
         assert_eq!(adapter.text_calls(), 1);
     }
 

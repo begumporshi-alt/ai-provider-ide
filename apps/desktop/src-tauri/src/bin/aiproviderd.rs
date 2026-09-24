@@ -4,10 +4,11 @@
 //! starts, binds, and **serves completions** through a Rust-native `RouterBridge` that runs
 //! the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle`.
 //!
-//! `HeadlessBridge` (the old placeholder that answered 503) is still present in this file as
-//! a test double, but it is no longer installed: the binary now builds a full `RouterBridge`
-//! from the store's four tables (hydration, 25b), the egress port (25a), the activated adapters
-//! (25c), and the store-backed ledger sink (25d).
+//! The binary builds that bridge from the store's four tables (hydration, 25b), the egress port
+//! (25a), the activated adapters (25c), and the store-backed ledger sink (25d). The placeholder
+//! `HeadlessBridge` that used to live here — a bridge that discarded every dispatch and answered
+//! 503 — was deleted in 25f along with `Bridge::ready`, the seam it existed to exercise: with no
+//! webview left in the tree, there is no bridge whose readiness can change.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ use ai_provider_router_lib::core::{
     egress_port::EgressPort,
     gateway,
     ledger::{StoreLedgerSink, UsageLedger},
+    persist,
     router::{RouterSettings, RouterStore, SharedRouterState},
     router_bridge::{BridgeHost, RouterBridge},
     store,
@@ -61,32 +63,6 @@ fn data_dir() -> Result<PathBuf, String> {
     }
 }
 
-/// The bridge with nothing on the other end. See the module note: this is what makes every
-/// completion 503 until Phase 2 lands a real router core behind it.
-#[allow(dead_code)]
-struct HeadlessBridge;
-
-impl gateway::Bridge for HeadlessBridge {
-    /// Discards the request *and* the reply handle. Every completion route therefore answers
-    /// 503 by design — see the module note — and the handle being dropped rather than stored is
-    /// the seam working, not a gap in it.
-    fn dispatch(&self, _req: gateway::BridgeRequest, _replies: gateway::ReplyHandle) {}
-    fn cancel(&self, _id: u64) {}
-
-    /// **Never ready**, and that is the honest answer rather than a placeholder: this bridge
-    /// discards every dispatch, so it cannot answer anything. Saying `true` would not make the
-    /// service work — it would only move the failure, from an immediate `503 core unavailable` to
-    /// a request that sits in the bridge until `FIRST_MSG_TIMEOUT` expires. The module note below
-    /// is unchanged by this: completions answer 503, and now they say so for the right reason.
-    ///
-    /// Note what this is *not*: a heartbeat. Before `Bridge::ready` existed the core asked
-    /// `beat_is_fresh()`, which no heartbeat could satisfy here, so the 503 came from a liveness
-    /// gate that was never going to open. The gate is now the bridge's own statement (D35).
-    fn ready(&self, _beat: gateway::Beat) -> bool {
-        false
-    }
-}
-
 /// The host the headless service presents to the bridge. Reads settings from the store and
 /// returns the same defaults the desktop app builds with.
 struct HeadlessHost {
@@ -97,8 +73,20 @@ impl BridgeHost for HeadlessHost {
     fn settings(&self) -> RouterSettings {
         RouterSettings::from_store(&self.store)
     }
+    /// Read from the store, not hardcoded.
+    ///
+    /// **This used to return `true` unconditionally, and that had a latency cost nothing named.**
+    /// Gateway-owned tools are what make `ProseGate` hold prose back (`hold = (ownership ==
+    /// Gateway)`), so a service that always supplies tools buffers every streaming answer: the
+    /// first content byte arrived at the *end* of the upstream's stream — measured 1,209 ms
+    /// against an upstream that had started emitting immediately. The desktop app was never
+    /// affected because it answers from `HostSettings`, a live toggle the UI flips; a service has
+    /// no UI, so hardcoding `true` removed the operator's only lever.
+    ///
+    /// Read per request, like `settings`, so flipping the row reaches the next request rather than
+    /// the next restart.
     fn tools_enabled(&self) -> bool {
-        true
+        RouterSettings::from_store(&self.store).gateway_tools_enabled
     }
     fn tools_mutation_enabled(&self) -> bool {
         false
@@ -142,8 +130,21 @@ async fn main() {
     let port = gateway::persisted_gateway_port(&store).unwrap_or(SERVICE_DEFAULT_PORT);
 
     // Build the egress (25a), the adapter runtime (25c), and the router store (25b).
+    //
+    // **The allowlist must be populated here, and nothing did it.** `AllowList::default()` is an
+    // empty set — `egress.rs`'s own tests assert that it denies `https://attacker.example/v1` — and
+    // `check_url` refuses every non-local host not in it. The app fills it from provider CRUD
+    // (`persist::recompute_allow`, called on create/update/delete); a service has no CRUD path, so
+    // without this line every outbound provider call is `HostDenied`, which the attempt layer
+    // reports as `NETWORK`. The visible symptom is a `502` whose message blames the upstream
+    // (`all attempts failed … :NETWORK`) when the refusal is local policy.
+    //
+    // Found by the first end-to-end run against a real provider, and invisible to every test: each
+    // constructor below did have a production caller (D40), and `AllowList::default()` being empty
+    // is intended behaviour rather than a defect. See D45.
     let allow = Arc::new(AllowList::default());
     let egress_state = Arc::new(EgressState::new(allow, store.clone()));
+    persist::recompute_allow(&egress_state, &store);
     let egress_port = Arc::new(EgressPort::new(egress_state));
     let runtime = AdapterRuntime::new(egress_port);
 
@@ -215,7 +216,6 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use super::*;
-    use ai_provider_router_lib::core::gateway::Bridge;
 
     fn tmp_store() -> (store::Store, std::path::PathBuf) {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -227,23 +227,6 @@ mod tests {
         (s, dir)
     }
 
-    /// The service's bridge reports itself unable to serve, and that answer is what turns every
-    /// completion into a fast `503 core unavailable` rather than a request parked inside the bridge
-    /// until `FIRST_MSG_TIMEOUT` expires.
-    ///
-    /// The fresh beat is the point: `webview_ready` would answer `true` for it, so this asserts
-    /// that the headless bridge is *not* answering as a webview bridge would. Regressing this to
-    /// `true` would not make the service work — it would only move the failure thirty seconds later.
-    #[test]
-    fn the_headless_bridge_reports_itself_unable_to_serve() {
-        let beat = gateway::Beat { age: std::time::Duration::ZERO, hidden: false };
-        assert!(beat.is_fresh(), "the beat itself is fresh");
-        assert!(
-            !HeadlessBridge.ready(beat),
-            "a bridge that discards every dispatch is not ready, however fresh the beat"
-        );
-    }
-
     #[test]
     fn headless_host_returns_defaults_on_an_empty_store() {
         let (store, _dir) = tmp_store();
@@ -252,6 +235,28 @@ mod tests {
         assert!(host.tools_enabled());
         assert!(!host.tools_mutation_enabled());
         assert_eq!(host.workspace_root(), None);
+    }
+
+    #[test]
+    fn headless_host_reads_the_gateway_tools_toggle_from_the_store() {
+        let (store, _dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key, value_json) VALUES ('router', '{\"gatewayToolsEnabled\":false}')",
+                [],
+            )
+            .unwrap();
+        }
+        let host = HeadlessHost { store: Arc::new(store) };
+        // The host's answer is what decides `ToolOwnership`, and ownership is what decides whether
+        // `ProseGate` holds prose back. If this read regressed to `true`, streaming would silently
+        // go back to buffering the whole answer with every test still green.
+        assert!(
+            !host.tools_enabled(),
+            "a stored false must reach the host, or incremental streaming is unreachable"
+        );
+        assert!(!host.settings().gateway_tools_enabled);
     }
 
     #[test]

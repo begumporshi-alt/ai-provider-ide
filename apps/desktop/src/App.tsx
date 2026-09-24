@@ -26,10 +26,9 @@ export default function App() {
   const [ready, setReady] = useState(false);
   const [bootError, setBootError] = useState<string | null>(null);
 
-  // R1: the gateway bridge no longer runs here. It lives in its own hidden window
-  // (gateway.html -> src/gateway-worker.ts), so UI render work and UI HMR reloads cannot
-  // affect in-flight gateway requests. Rust targets that window explicitly — see
-  // GATEWAY_WINDOW in gateway_cmds.rs.
+  // R1: the gateway bridge no longer runs here, and since 25f it is not a webview at all — it is
+  // Rust (`core/router_bridge.rs`), so UI render work and UI HMR reloads cannot touch in-flight
+  // gateway requests. There is no worker window and no `GATEWAY_WINDOW` to target.
   useEffect(() => {
     bootstrap().then(
       () => setReady(true),

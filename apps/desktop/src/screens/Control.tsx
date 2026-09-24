@@ -82,15 +82,6 @@ interface Finding {
   title: string;
   /** Names the **evidence**. A blocker without evidence is a state, not a reason to act. */
   evidence: string;
-  /**
-   * Raw evidence that needs its own formatting — a stack trace, say.
-   *
-   * Kept apart from `evidence` so the plain sentence stays plain: `evidence` is what the reader acts
-   * on, and this is what they hand to whoever fixes it. It exists because the alternative was a
-   * second copy of the same failure further down the tab, which is the mirroring this screen is
-   * built to avoid — and it made `/failed to start/` match two elements.
-   */
-  detail?: string;
   tab: TabId;
 }
 
@@ -99,16 +90,6 @@ function findings(d: ControlData): Finding[] {
   const g = d.gateway;
 
   // Blockers are things that *failed*, not things that are switched off.
-  if (g?.workerError) {
-    out.push({
-      id: "worker-boot",
-      severity: "blocker",
-      tab: "gateway",
-      title: "The gateway worker failed to start",
-      evidence: "Nothing is served while it is down, and flipping the switch again will not fix it.",
-      detail: g.workerError,
-    });
-  }
   if (g?.running && !g.hasKey) {
     out.push({
       id: "no-master-key",
@@ -158,16 +139,6 @@ function findings(d: ControlData): Finding[] {
 }
 
 // ---------- formatting ----------
-
-function ago(ms: number | null | undefined): string {
-  if (ms === null || ms === undefined) return "never";
-  if (ms < 1_000) return "just now";
-  const s = Math.round(ms / 1_000);
-  if (s < 60) return `${s}s ago`;
-  const m = Math.round(s / 60);
-  if (m < 60) return `${m}m ago`;
-  return `${Math.round(m / 60)}h ago`;
-}
 
 function clock(tsMs: number): string {
   return new Date(tsMs).toLocaleTimeString(undefined, { hour12: false });
@@ -413,11 +384,6 @@ function Findings({ list, onGo }: { list: Finding[]; onGo: (t: TabId) => void })
           <div className="min-w-0">
             <div className="text-[13px]">{f.title}</div>
             <div className="mt-0.5 text-[11px]" style={{ color: "var(--text-dim)" }}>{f.evidence}</div>
-            {f.detail && (
-              <pre className="mono mt-1.5 max-h-32 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-faint)" }}>
-                {f.detail}
-              </pre>
-            )}
           </div>
           <button
             className="ml-auto shrink-0 text-[11px]"
@@ -551,21 +517,11 @@ function GatewayTab({
     }
   }
 
-  const health: Health = !g
-    ? "unknown"
-    : g.workerError
-      ? "unavailable"
-      : g.running
-        ? "healthy"
-        : "disabled";
+  const health: Health = !g ? "unknown" : g.running ? "healthy" : "disabled";
 
-  // A hidden worker's beat stops after ~8 idle minutes and revives on demand, so "asleep" is a routine
-  // state, not a fault. Reporting it as degraded is what once made the UI contradict itself.
-  const serving = g?.running
-    ? g.workerAwake
-      ? "serving · worker awake"
-      : "serving · worker asleep (wakes on the next request)"
-    : "stopped";
+  // "Serving" is the whole state now. It used to be qualified by the worker's beat — awake or
+  // asleep — which is how the UI ended up describing a healthy gateway as degraded.
+  const serving = g?.running ? "serving" : "stopped";
 
   return (
     <div>
@@ -623,26 +579,6 @@ function GatewayTab({
             </span>
           </div>
         </div>
-
-        {/*
-          A worker that failed to boot is a §4.4 **blocker**, and it already renders at the top of
-          this tab from `findings()`, carrying the raw error as its `detail`. It is deliberately not
-          repeated here: the same failure twice on one screen is the mirroring this screen exists to
-          avoid, and it made the spec's `/failed to start/` resolve to two elements.
-        */}
-
-        {running && g && !g.workerAwake && !g.workerError && (
-          <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Running — the worker is asleep. macOS suspends a hidden page after roughly eight idle
-            minutes; the next request wakes it and is served normally. Nothing is lost.
-          </p>
-        )}
-
-        {!running && g && !g.workerError && g.heartbeatAgeMs > 0 && (
-          <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Stopped — last heard from the worker {Math.round(g.heartbeatAgeMs / 1000)}s ago.
-          </p>
-        )}
 
         {switchError !== null && /cannot bind/.test(switchError) && (
           <p className="mt-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
@@ -704,9 +640,7 @@ function GatewayTab({
       <div className="mt-3">
         <Card title="Gateway state">
           <div className="text-[12px]">
-            <KeyValue k="Worker last seen" v={ago(g?.heartbeatAgeMs)} />
             <KeyValue k="Master key" v={g?.hasKey ? "present" : "missing"} />
-            <KeyValue k="Serving while the window is closed" v={g?.background ? "on" : "off"} />
           </div>
           <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
             The master key, the per-app keys, the endpoint URL and the copy-paste presets stay on{" "}

@@ -235,6 +235,26 @@ pub struct RouterSettings {
     pub failover_enabled: bool,
     pub system_ai: Option<SystemAiPick>,
     pub per_provider_concurrency: Value,
+    /// Whether the gateway supplies its own tools on a request that declared none.
+    ///
+    /// **Load-bearing for latency, not just for capability.** Gateway-owned tools are what make
+    /// [`crate::core::bridge_policy::ProseGate`] hold text back: `hold = (ownership == Gateway)`,
+    /// and ownership is `Gateway` exactly when the client declared no tools *and* this is on. So
+    /// turning it off is the one lever that restores incremental streaming — with ownership `None`
+    /// the gate never holds, and deltas reach the client as the upstream emits them instead of
+    /// arriving as a single frame once the turn resolves. Measured 2026-09-24: a streaming client
+    /// saw its first content byte at **1,209 ms** with this on (the full upstream time) against a
+    /// stream that had started immediately; `scripts/measure-gateway-latency.mjs` reports which.
+    ///
+    /// **Defaults to `true`, which is the behaviour that predates the field.** A settings row
+    /// without the key is not a request for a different behaviour.
+    ///
+    /// The desktop app does **not** read this — it answers `tools_enabled` from
+    /// [`crate::core::gateway::HostSettings`], a live in-memory toggle the UI flips without a
+    /// restart. That divergence is deliberate and bounded: the app has a UI to flip it, a service
+    /// does not, so the service needs a persisted value and the app does not. Unifying them means
+    /// making the app's toggle write this key too, which is a UI change rather than a host one.
+    pub gateway_tools_enabled: bool,
 }
 
 impl Default for RouterSettings {
@@ -243,17 +263,18 @@ impl Default for RouterSettings {
             failover_enabled: true,
             system_ai: None,
             per_provider_concurrency: Value::from(PER_PROVIDER_DEFAULT),
+            gateway_tools_enabled: true,
         }
     }
 }
 
-/// The `settings` row the three settings live in. The webview owns the key — it writes it in
+/// The `settings` row the router settings live in. The webview owns the key — it writes it in
 /// `store.ts` and reads it back through the generic `settings_get` command — so this constant is
 /// a second declaration of a string the TypeScript also holds, and the two must agree.
 pub const ROUTER_SETTINGS_KEY: &str = "router";
 
 impl RouterSettings {
-    /// The three settings as the webview stored them, or the defaults.
+    /// The settings as the webview stored them, or the defaults.
     ///
     /// **Absent or unreadable is the default, not an error.** The webview applies the same row
     /// with `Object.assign` inside a `try`/`catch` that keeps the defaults on a parse failure
@@ -291,6 +312,13 @@ impl RouterSettings {
                 .get("perProviderConcurrency")
                 .cloned()
                 .unwrap_or(default.per_provider_concurrency),
+            // `gatewayToolsEnabled` is the fourth key, and the only one the webview does not yet
+            // write. A row that lacks it keeps the pre-existing behaviour (tools on) rather than
+            // reading the absence as "off", so this field cannot change an existing install.
+            gateway_tools_enabled: v
+                .get("gatewayToolsEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(default.gateway_tools_enabled),
         }
     }
 }
@@ -1503,6 +1531,44 @@ mod tests {
             Some(SystemAiPick { provider_id: "p2".into(), model: "oracle-mini".into() })
         );
         assert_eq!(s.per_provider_concurrency, json!(6));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fourth key, and the only one the webview does not write yet.
+    ///
+    /// Two things have to hold and only one is obvious. A stored `false` must be **read** — that is
+    /// the lever that restores incremental streaming, and a mapping that dropped it would leave the
+    /// capability unreachable while every test stayed green. A row that **lacks** the key must still
+    /// mean `true`, because reading absence as "off" would silently disable gateway tools on every
+    /// existing install the moment this field was added.
+    #[test]
+    fn router_settings_read_the_gateway_tools_toggle_and_default_it_on() {
+        let (store, dir) = tmp_store();
+        assert!(
+            RouterSettings::from_store(&store).gateway_tools_enabled,
+            "no row at all: tools stay on, the behaviour that predates the field"
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO settings (key,value_json) VALUES ('router','{\"failoverEnabled\":true}')",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            RouterSettings::from_store(&store).gateway_tools_enabled,
+            "a row that predates the key must not be read as off"
+        );
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE settings SET value_json='{\"gatewayToolsEnabled\":false}' WHERE key='router'",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(!RouterSettings::from_store(&store).gateway_tools_enabled, "the stored value wins");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

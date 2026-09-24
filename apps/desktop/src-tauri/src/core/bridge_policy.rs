@@ -1,9 +1,10 @@
 //! The gateway bridge's decisions, separated from the I/O that carries them out.
 //!
-//! `router_bridge.rs` will be the driver: it owns the router, spawns each request, and writes to
+//! `router_bridge.rs` is the driver: it owns the router, spawns each request, and writes to
 //! `ReplyHandle`. This module holds what the driver *decides* — the parts that are easy to get
-//! wrong and cheap to pin — so the driver is left with wiring. The reference is
-//! `apps/desktop/src/gateway-bridge.ts` (421 lines).
+//! wrong and cheap to pin — so the driver is left with wiring. The reference was
+//! `apps/desktop/src/gateway-bridge.ts` (421 lines), **deleted in 25f** along with the webview it
+//! ran in; this module and `router_bridge.rs` are now the only copy of that behaviour (D42).
 //!
 //! # Tool ownership is decided, never guessed
 //!
@@ -33,10 +34,11 @@
 //!
 //! # What is deliberately not here
 //!
-//! - **The heartbeat and the pre-turn liveness probe.** The reference probes `gateway_chunk` before
-//!   every turn, because a webview can be suspended and silence has to be told apart from a slow
-//!   turn. A Rust bridge runs in this process and cannot be suspended, so the probe has no
-//!   counterpart — and neither does the `503` it feeds. See D35 in the drift register.
+//! - **The heartbeat and the pre-turn liveness probe.** The reference probed `gateway_chunk` before
+//!   every turn, because a webview could be suspended and silence had to be told apart from a slow
+//!   turn. A Rust bridge runs in this process and cannot be suspended, so the probe had no
+//!   counterpart — and neither did the `503` it fed. Both the probe and the webview are gone as of
+//!   25f. See D35 and D42 in the drift register.
 //! - **Response shaping.** The `models` list and the `image` body are pure mappings with no decision
 //!   in them, so they belong where the JSON is built, in the driver.
 //! - **The chunk parser.** [`ProseGate`] takes text that has already been through

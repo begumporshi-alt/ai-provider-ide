@@ -1,5 +1,7 @@
-//! local-gateway (L0, Phase 2b): OpenAI-compatible HTTP endpoint (axum) bridging external
-//! apps into the webview-hosted router core (§3.3, §3.4, §3.5).
+//! local-gateway (L0, Phase 2b): OpenAI-compatible HTTP endpoint (axum) routing into a Rust-native
+//! router core in this process (§3.3, §3.4, §3.5). Phase 5c put the router here; 25f deleted the
+//! webview bridge it used to cross into, and with it the heartbeat, the worker window and the
+//! `ready` seam that existed to describe them.
 //!
 //! Security posture (invariants 10, 11, 15, 16):
 //! - binds 127.0.0.1 only;
@@ -8,10 +10,10 @@
 //! - the master key lives only in the OS keychain (account `masterkey`); reveal is a
 //!   Rust-side copy-to-clipboard (§14) — it never enters webview-observable state;
 //!   rotation overwrites the account, so the old key dies on the NEXT request read (§3.3);
-//! - core unavailable (stale heartbeat): 503 + Retry-After: 1, nothing queued (§3.5);
+//! - gateway stopped: 503 + Retry-After: 1, nothing queued (§3.5);
 //! - capacity: 8 concurrent + 32 queued -> 429 + Retry-After;
-//! - cancellation: client disconnect drops the Slot -> bridge.cancel(id) -> the webview
-//!   aborts the router call -> the provider stream closes.
+//! - cancellation: client disconnect drops the Slot -> bridge.cancel(id) -> the router loop
+//!   aborts the call -> the provider stream closes.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -41,28 +43,6 @@ pub const MAX_CONCURRENT: usize = 8;
 pub const MAX_QUEUED: usize = 32;
 /// Admission ceiling. Not a concurrency limit — see `dispatch`.
 const MAX_TOTAL: usize = MAX_CONCURRENT + MAX_QUEUED;
-const HEARTBEAT_STALE_MS: u64 = 6_000;
-/// R1: liveness bound while the window is hidden. A looser bound keeps the gateway serving in
-/// the background; the cost is that a truly dead renderer is detected after 30s instead of 6s
-/// (and only while hidden).
-///
-/// This bound is a *detector*, not a promise that the beat keeps coming. Measured against the
-/// live gateway log (38 lapses over 11h of uptime), a hidden worker's 2s timer does not merely
-/// throttle — it stops outright, and does not resume until something re-composites the window:
-///
-/// - Healthy windows are pinned at 484-486s. 18 of 33 land there exactly; every window longer
-///   than 500s contains a `gateway_enable` (which calls `warm_bridge_window`) inside it.
-/// - Recovery follows a re-composite within 20-50ms, all 38 times — so the *stop* is the event,
-///   and the re-warm is what ends it.
-/// - Load prevents it entirely: 25,367 requests at ~28/s ran 899s with zero lapses and a p50 of
-///   6.3ms. The stop is triggered by idleness, not by being hidden as such.
-///
-/// So a stale beat here means "the worker is asleep", not "the worker is broken" — and the two
-/// need different answers. `await_core` revives a sleeping worker on demand, which is why the
-/// watchdog no longer pre-warms on its own (that was a visible window flash every ~8.5 idle
-/// minutes). An unbounded bound would still be the real hazard: a suspended webview would then
-/// look alive forever, and nothing would ever notice a genuinely dead one.
-const HEARTBEAT_STALE_HIDDEN_MS: u64 = 30_000;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
 /// OS keychain. Production passes the vault-backed closure.
@@ -84,6 +64,69 @@ pub struct AppKey {
 /// R4: active per-app keys (keychain-backed). Returns only NON-revoked keys, so
 /// revocation takes effect on the very next request without rotating anything else.
 pub type AppKeyProvider = Arc<dyn Fn() -> Vec<AppKey> + Send + Sync + 'static>;
+
+/// The three settings a [`BridgeHost`](crate::core::router_bridge::BridgeHost) reads, shared with
+/// the core rather than copied.
+///
+/// **One copy, two holders.** The core owns the bridge (`Arc<dyn Bridge>`), so the bridge cannot
+/// own the core — the cycle [`ReplyHandle`] exists to avoid, and `router_bridge`'s own note records
+/// the same constraint one layer out. What the bridge actually needs is not the core but these
+/// three answers (plus the store), so they live here, behind `Arc`s the core writes through and the
+/// host reads through.
+///
+/// **Why not a `Weak<GatewayCore>`.** That breaks the cycle too, and it was the first shape
+/// considered. It makes "the core is not wired yet" a state the host has to answer for, and every
+/// answer it could give is a default the operator never chose — the `NULL` vs `0` defect with a
+/// different subject. Sharing the fields removes the state instead of defaulting it.
+///
+/// This is what replaced the webview liveness subsystem (25f). It is deliberately *not* a
+/// heartbeat: nothing here goes stale, because nothing here can be suspended.
+#[derive(Clone)]
+pub struct HostSettings {
+    tools_enabled: Arc<AtomicBool>,
+    tools_mutation_enabled: Arc<AtomicBool>,
+    workspace_root: Arc<Mutex<Option<std::path::PathBuf>>>,
+}
+
+impl Default for HostSettings {
+    fn default() -> Self {
+        Self {
+            // Both defaults are the ones `GatewayCore` has always had, moved rather than changed:
+            // tools on (a client that brings its own is passed through; one that brings none gets
+            // the gateway's sandboxed registry), mutation off (it executes code with no human in
+            // the loop — see `tools_mutation_enabled`).
+            tools_enabled: Arc::new(AtomicBool::new(true)),
+            tools_mutation_enabled: Arc::new(AtomicBool::new(false)),
+            workspace_root: Arc::new(Mutex::new(default_workspace_root())),
+        }
+    }
+}
+
+impl HostSettings {
+    pub fn tools_enabled(&self) -> bool {
+        self.tools_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tools_enabled(&self, on: bool) {
+        self.tools_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn tools_mutation_enabled(&self) -> bool {
+        self.tools_mutation_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_tools_mutation_enabled(&self, on: bool) {
+        self.tools_mutation_enabled.store(on, Ordering::Relaxed);
+    }
+
+    pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
+        self.workspace_root.lock().unwrap().clone()
+    }
+
+    pub fn set_workspace_root(&self, root: std::path::PathBuf) {
+        *self.workspace_root.lock().unwrap() = Some(root);
+    }
+}
 
 pub fn vault_key_provider() -> KeyProvider {
     Arc::new(|| vault::get(MASTER_ACCOUNT).ok().flatten())
@@ -444,186 +487,6 @@ pub fn normalize_tool_calls(calls: Value) -> Value {
 }
 
 #[cfg(test)]
-mod core_recovery_tests {
-    use super::*;
-
-    /// A core whose worker window has gone quiet, which is what a suspended hidden webview
-    /// looks like from here.
-    fn stale_core() -> Arc<GatewayCore> {
-        let core = Arc::new(GatewayCore::new(
-            Arc::new(NoopBridge),
-            Arc::new(|| Some("sk-aip-test".to_string())),
-        ));
-        core.set_running(true);
-        core.set_hidden(true);
-        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_secs(60);
-        assert!(!core.is_available());
-        core
-    }
-
-    struct NoopBridge;
-    impl Bridge for NoopBridge {
-        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
-        fn cancel(&self, _id: u64) {}
-        /// This double stands in for the webview bridge, so it answers through the same function
-        /// `EventBridge` uses. Answering `true` here would make `stale_core`'s own
-        /// `assert!(!is_available())` fail — which is the point of routing the question through the
-        /// bridge rather than the core.
-        fn ready(&self, beat: Beat) -> bool {
-            webview_ready(beat)
-        }
-    }
-
-    #[tokio::test]
-    async fn a_request_waits_out_a_lapsed_heartbeat_and_asks_for_a_re_warm() {
-        let core = stale_core();
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = calls.clone();
-        // The real hook re-composites the window that hosts this very core, so it has to be
-        // able to refer back to it — hence `set_warm` rather than the consuming builder.
-        let weak = Arc::downgrade(&core);
-        core.set_warm(Arc::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-            if let Some(core) = weak.upgrade() {
-                core.heartbeat(); // stand in for the resumed webview beating again
-            }
-        }));
-
-        assert!(await_core(&core).await, "a lapsed beat must be waited out, not refused");
-        assert!(core.is_available());
-        assert_eq!(calls.load(Ordering::SeqCst), 1, "asked for recovery exactly once");
-    }
-
-    #[test]
-    fn a_core_with_no_host_hook_is_simply_not_warmed() {
-        // `new()` attaches no hook, so tests and harnesses cannot be made to depend on one.
-        let core = stale_core();
-        core.request_warm();
-        assert!(!core.is_available());
-    }
-
-    #[test]
-    fn stopped_is_terminal_and_does_not_look_like_a_lapsed_beat() {
-        let core = stale_core();
-        core.set_running(false);
-        assert!(!core.is_running());
-        assert!(!core.is_available());
-    }
-
-    // ---------- the seam itself ----------
-    //
-    // D35's hazard, stated as tests. Before `Bridge::ready` existed the core asked
-    // `beat_is_fresh()` of every bridge, so a bridge with no webview behind it — `HeadlessBridge`
-    // today, `RouterBridge` next — looked permanently asleep: every request waited out
-    // `CORE_RECOVERY_GRACE` and then answered 503.
-
-    /// A bridge that runs in this process. It can always answer, and no heartbeat has anything to
-    /// do with it. This is what `RouterBridge` (24b-ii) will be.
-    struct AlwaysReadyBridge;
-    impl Bridge for AlwaysReadyBridge {
-        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
-        fn cancel(&self, _id: u64) {}
-        fn ready(&self, _beat: Beat) -> bool {
-            true
-        }
-    }
-
-    /// A bridge that cannot answer at all — `bin/aiproviderd.rs`'s `HeadlessBridge`.
-    struct NeverReadyBridge;
-    impl Bridge for NeverReadyBridge {
-        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
-        fn cancel(&self, _id: u64) {}
-        fn ready(&self, _beat: Beat) -> bool {
-            false
-        }
-    }
-
-    /// Records the `Beat` it was asked about, so a test can assert the core passed its own.
-    struct RecordingBridge(Arc<Mutex<Option<Beat>>>);
-    impl Bridge for RecordingBridge {
-        fn dispatch(&self, _req: BridgeRequest, _replies: ReplyHandle) {}
-        fn cancel(&self, _id: u64) {}
-        fn ready(&self, beat: Beat) -> bool {
-            *self.0.lock().unwrap() = Some(beat);
-            beat.is_fresh()
-        }
-    }
-
-    /// The same lapse as `stale_core`, with the bridge chosen by the caller.
-    fn stale_core_with(bridge: Arc<dyn Bridge>) -> Arc<GatewayCore> {
-        let core = Arc::new(GatewayCore::new(bridge, Arc::new(|| Some("sk-aip-test".to_string()))));
-        core.set_running(true);
-        core.set_hidden(true);
-        *core.last_heartbeat.lock().unwrap() = Instant::now() - Duration::from_secs(60);
-        core
-    }
-
-    /// The two bounds, applied by `Beat` rather than by the core. One place decides what *fresh*
-    /// means, so the UI's `worker_awake` and the request path cannot disagree about it.
-    #[test]
-    fn the_beat_bound_follows_the_workers_visibility() {
-        assert!(
-            !Beat { age: Duration::from_millis(7_000), hidden: false }.is_fresh(),
-            "7s is past the 6s bound for a visible worker"
-        );
-        assert!(
-            Beat { age: Duration::from_millis(7_000), hidden: true }.is_fresh(),
-            "and inside the 30s bound for a hidden one"
-        );
-        assert!(!Beat { age: Duration::from_millis(31_000), hidden: true }.is_fresh());
-        assert!(Beat { age: Duration::from_millis(0), hidden: false }.is_fresh());
-    }
-
-    /// The core hands the bridge its **own** liveness view, not a placeholder. A bridge that
-    /// answers from the beat is only meaningful if the beat is the core's.
-    #[test]
-    fn the_core_hands_the_bridge_its_own_beat() {
-        let seen = Arc::new(Mutex::new(None));
-        let core = stale_core_with(Arc::new(RecordingBridge(seen.clone())));
-        assert!(!core.bridge_ready(), "the recorded bridge answers from the beat");
-
-        let beat = seen.lock().unwrap().expect("the bridge was asked");
-        assert!(beat.hidden, "the core's hidden flag reached the bridge");
-        assert!(beat.age >= Duration::from_secs(60), "and so did the age: {:?}", beat.age);
-    }
-
-    /// **The D35 hazard, pinned.** A lapsed beat plus an in-process bridge must be *available*, and
-    /// `await_core` must succeed on its first poll. The warm hook is counted rather than timed:
-    /// if the loop ever entered, it would call `request_warm`, and the count would not be zero.
-    #[tokio::test]
-    async fn an_always_ready_bridge_does_not_wait_out_a_lapsed_beat() {
-        let core = stale_core_with(Arc::new(AlwaysReadyBridge));
-        let calls = Arc::new(AtomicUsize::new(0));
-        let counted = calls.clone();
-        core.set_warm(Arc::new(move || {
-            counted.fetch_add(1, Ordering::SeqCst);
-        }));
-
-        assert!(!core.beat_is_fresh(), "the webview beat really has lapsed");
-        assert!(core.is_available(), "but a bridge in this process can still serve");
-        assert!(await_core(&core).await, "and the wait succeeds on its first poll");
-        assert_eq!(calls.load(Ordering::SeqCst), 0, "no re-composite was ever asked for");
-    }
-
-    /// The other direction: a bridge that says it cannot serve is refused even though the core is
-    /// running and its own beat is fresh. `ready` is the bridge's statement, not a heartbeat check.
-    ///
-    /// `await_core`'s *timeout* branch is deliberately not exercised here. It would cost the whole
-    /// of `CORE_RECOVERY_GRACE` in wall-clock, and this crate has no `tokio` `test-util` feature to
-    /// fake it — so the branch was uncovered before this change too, and is recorded as uncovered
-    /// rather than paid for with five seconds on every run.
-    #[tokio::test]
-    async fn a_bridge_that_cannot_serve_is_refused_even_with_a_fresh_beat() {
-        let core = stale_core_with(Arc::new(NeverReadyBridge));
-        core.set_hidden(false);
-        core.heartbeat();
-        assert!(core.beat_is_fresh(), "the worker is beating normally");
-        assert!(!core.bridge_ready(), "and the bridge still cannot answer");
-        assert!(!core.is_available());
-    }
-}
-
-#[cfg(test)]
 mod assistant_text_tests {
     use super::clean_assistant_text;
 
@@ -682,49 +545,9 @@ mod tool_call_shape_tests {
     }
 }
 
-/// The core's view of the webview worker's heartbeat, handed to a bridge that has to care.
-///
-/// A snapshot rather than a way back to the core. The core owns the bridge (`Arc<dyn Bridge>`),
-/// so a bridge holding a reference to the core would close the reference cycle `ReplyHandle`
-/// exists to avoid — the same constraint, one layer out.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Beat {
-    /// How long ago the worker last reported in.
-    pub age: Duration,
-    /// Whether the worker's window is hidden. A hidden webview is throttled by the OS, so the
-    /// bound is looser — see `HEARTBEAT_STALE_HIDDEN_MS`.
-    pub hidden: bool,
-}
-
-impl Beat {
-    /// Whether the age is inside the bound for the current visibility.
-    ///
-    /// The one place the two bounds are applied, so the UI's "worker awake" and the request path's
-    /// readiness cannot come to disagree about what *fresh* means.
-    pub fn is_fresh(&self) -> bool {
-        let bound = if self.hidden { HEARTBEAT_STALE_HIDDEN_MS } else { HEARTBEAT_STALE_MS };
-        self.age < Duration::from_millis(bound)
-    }
-}
-
-/// [`Bridge::ready`] for a bridge that dispatches into the webview worker: ready exactly when the
-/// beat is fresh.
-///
-/// **Named rather than written inline at each of its four call sites, and the reason is coverage.**
-/// The production site is `EventBridge`, which cannot be constructed in a test — it needs an
-/// `AppHandle`. So if each implementation spelled out `beat.is_fresh()` for itself, the one that
-/// actually serves production traffic would be a line no test could reach, and reverting it to
-/// `true` would reintroduce D35 with every test still green. Routing all four through this
-/// function moves the decision somewhere the tests *can* reach: the three doubles
-/// (`NoopBridge`, `SynthBridge`, `MinimalBridge`) exercise it, so the R1 heartbeat tests fail if
-/// this ever stops consulting the beat.
-pub fn webview_ready(beat: Beat) -> bool {
-    beat.is_fresh()
-}
-
-/// Hand-off surface to the router core. Production emits Tauri events; the Phase-2b
-/// integration test injects a synthetic bridge (the §3.5 entry-gate spike); Phase 5c of the
-/// headless plan puts a Rust router core here.
+/// Hand-off surface to the router core. Phase 5c put a Rust router core here: the production
+/// implementation is `RouterBridge`, which runs the tool loop in this process. The synthetic
+/// bridges in `gateway_tests` remain for the §3.5 entry-gate spike.
 pub trait Bridge: Send + Sync + 'static {
     /// Route one request, answering it through `replies`.
     ///
@@ -735,24 +558,24 @@ pub trait Bridge: Send + Sync + 'static {
     /// bridge a way to answer". A parameter cannot be forgotten — the call does not compile.
     fn dispatch(&self, req: BridgeRequest, replies: ReplyHandle);
     fn cancel(&self, request_id: u64);
-
-    /// Whether this bridge can answer a request right now.
-    ///
-    /// `beat` is the core's view of the webview worker's heartbeat, passed in for the same reason
-    /// `ReplyHandle` is: a bridge that needs it receives it, and a bridge that does not cannot come
-    /// to depend on liveness state it never asked for.
-    ///
-    /// **Deliberately no default body**, because the two answers are opposites and a default cannot
-    /// know which one it is writing. `EventBridge` dispatches into a webview the OS may suspend, so
-    /// it is ready exactly when the beat is fresh. A bridge that runs in this process cannot be
-    /// suspended, so it is always ready. A default of `true` would let a *future* webview-backed
-    /// bridge silently inherit "always ready" — which is the failure this method exists to remove
-    /// (D35): a Rust bridge installed before the method existed left the core asking a question no
-    /// heartbeat could ever satisfy, so every request waited out `CORE_RECOVERY_GRACE` and then
-    /// answered 503. With no default, an implementation cannot be written without saying which kind
-    /// it is.
-    fn ready(&self, beat: Beat) -> bool;
 }
+
+// **`ready` used to be here, and its absence is the 25f result rather than an omission.**
+//
+// Increment 24c added `fn ready(&self, beat: Beat) -> bool` so the core would stop asking every
+// bridge whether a *webview* was awake (D35). It was the right seam for the transition and it is
+// the wrong one afterwards: with `EventBridge` deleted, the only bridge that ever answers is
+// `RouterBridge`, which runs in this process and is therefore always ready. Every remaining
+// implementor would answer `true`, so the method would be a constant, and `try_slot`'s
+// "core unavailable" branch would be reachable only from a test double — a branch that cannot
+// fire in production is the defect class this register keeps recording.
+//
+// The question that survives is `is_running()`: whether the operator asked the gateway to serve.
+// `Beat` went with it, because its whole content was the webview's heartbeat.
+//
+// This is a `//` note and not a `///` one on purpose: there is no item here for it to document,
+// and as a doc comment it attached itself to `ReplyHandle` below (clippy:
+// `empty_line_after_doc_comments`), which is a different type with a different job.
 
 /// The bridge's way back to the request that is waiting for it.
 ///
@@ -829,7 +652,6 @@ pub struct GatewayCore {
     /// single 40-permit pool was missing — acquiring `permits` used to dispatch immediately, so
     /// 40 upstream calls could go out together.
     dispatch: Arc<Semaphore>,
-    last_heartbeat: Mutex<Instant>,
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     bridge: Arc<dyn Bridge>,
     /// Bounded, cached, single-flight wrapper around the injected master-key lookup. Request paths
@@ -843,23 +665,16 @@ pub struct GatewayCore {
     app_key_cache: Mutex<AppKeyCache>,
     /// R4: optional monthly spend gate. `None` = uncapped (all existing tests).
     spend_provider: Mutex<Option<SpendProvider>>,
-    /// R1: window hidden (background mode). Loosens the heartbeat bound — see
-    /// `HEARTBEAT_STALE_HIDDEN_MS`.
-    hidden: AtomicBool,
     running: AtomicBool,
     port: Mutex<u16>,
-    tools_enabled: AtomicBool,
-    /// Audit H1b: whether gateway-side tools may MUTATE (`write_file`, `run_command`).
+    /// The three settings a `BridgeHost` reads: whether gateway-supplied tools are on, whether they
+    /// may mutate, and the workspace root they execute against.
     ///
-    /// Distinct from `tools_enabled`. Read-only tools are safe to leave on because the worst a
-    /// misled model can do is read inside the workspace; the mutating ones execute code and write
-    /// files with no human in the loop — the Assistant path has a per-call Allow/Deny modal, the
-    /// gateway path has none. Default off: enabling it is a deliberate act, and it is enforced
-    /// host-side in `gateway_tool_run` so no caller can talk its way past it.
-    tools_mutation_enabled: AtomicBool,
-    /// Workspace root for local tool execution (write_file, mkdir, run_command).
-    /// Set via `gateway_set_workspace_root` Tauri command before first tool use.
-    workspace_root: Mutex<Option<std::path::PathBuf>>,
+    /// A shared handle rather than three fields on the core and a copy on the host. The core owns
+    /// the bridge, so the bridge cannot own the core, and a second copy of these is how the operator
+    /// flips a switch, the core updates, and the bridge keeps serving the old answer with nothing to
+    /// report it. See [`HostSettings`].
+    settings: HostSettings,
     /// The store, so the memory/context layer can be reached from the request path.
     ///
     /// `Option` and `None` by default for the same reason `app_key_provider` is: every existing test
@@ -871,15 +686,7 @@ pub struct GatewayCore {
     /// client and is invisible at a layer with no review step, which is exactly why skills were kept
     /// frontend-only. Off means `inject_context` strips `metadata.aip` and does nothing else.
     memory_enabled: AtomicBool,
-    /// Why the worker page failed to start, if it did. It runs in a window nobody can see, so
-    /// without a channel back to the host its failures were unobservable.
-    worker_error: Mutex<Option<String>>,
-    /// Host hook that re-composites the worker window. `None` in tests, which never suspend
-    /// anything; see `request_warm`.
-    warm: Mutex<Option<WarmFn>>,
-    /// When the hook last actually fired, for rate limiting.
-    last_warm: Mutex<Option<Instant>>,
-    /// Bound on the worker's first response to a request; see `FIRST_MSG_TIMEOUT`.
+    /// Bound on the bridge's first response to a request; see `FIRST_MSG_TIMEOUT`.
     first_msg_timeout: Mutex<Duration>,
     /// §5.5: composed memory blocks frozen per `(scope, session)`, so the bytes at system position 0
     /// stop changing between requests and the provider's prefix cache can actually hit. See
@@ -934,25 +741,17 @@ pub const MEMORY_FREEZE_TTL: Duration = Duration::from_secs(600);
 /// accumulates one entry per session for ever.
 const MAX_FROZEN_BLOCKS: usize = 256;
 
-/// Minimum gap between re-warms from the request path.
-///
-/// Every warm briefly puts the worker window on screen, which is precisely why the watchdog is
-/// limited to once a minute. The request path needs to be able to recover faster than that, but
-/// not so fast that a run of requests during one lapse turns into a flickering window.
-const WARM_MIN_INTERVAL: Duration = Duration::from_secs(2);
-
 /// Gateway-side tools that can change the workspace. Everything else only reads it.
 pub const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "mkdir", "run_command"];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///
 /// **A free function rather than a method, because two callers need the same answer and only one of
-/// them has a `GatewayCore`.** The webview bridge's command reads it through the core; the
+/// them has a `GatewayCore`.** The `gateway_tool_run` command reads it through the core; the
 /// Rust-native bridge ([`crate::core::router_bridge::RouterBridge`]) cannot, because the core owns
 /// the bridge and a bridge holding the core would close the reference cycle `ReplyHandle` exists to
 /// avoid. It asks its host for the *toggle* and calls this for the *rule*, so the message the model
-/// reads is written once. This is the same split, for the same reason, that `webview_ready` took
-/// out of `EventBridge::ready`.
+/// reads is written once.
 ///
 /// The message is written for the model that will read it: it says what is disabled, why, and what
 /// to do instead — a bare "forbidden" sends the model retrying.
@@ -967,9 +766,6 @@ pub fn gateway_tool_refusal(tool: &str, mutation_enabled: bool) -> Option<String
         None
     }
 }
-
-/// Re-composites the worker window. Provided by the host, since only it can touch windows.
-pub type WarmFn = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Where the sandboxed tools may write before the user picks a workspace.
 ///
@@ -1002,31 +798,19 @@ impl GatewayCore {
             replies: ReplyHandle::default(),
             permits: Arc::new(Semaphore::new(MAX_TOTAL)),
             dispatch: Arc::new(Semaphore::new(MAX_CONCURRENT)),
-            last_heartbeat: Mutex::new(Instant::now()),
             failures: Mutex::new(HashMap::new()),
             bridge,
             master_key: MasterKeyCache::new(key_provider, key_wait),
             app_key_provider: Mutex::new(None),
             app_key_cache: Mutex::new(AppKeyCache::default()),
             spend_provider: Mutex::new(None),
-            hidden: AtomicBool::new(false),
             running: AtomicBool::new(false),
             port: Mutex::new(DEFAULT_PORT),
-            // On by default. Two things hang off this flag, and both are safe with it on:
-            // a client that brings its own tools is passed through (the client runs them),
-            // and a client that brings none gets the gateway's sandboxed registry instead —
-            // confined to `default_workspace_root()`. Off means tool parameters are stripped
-            // before the request ever leaves, which breaks coding agents, so off is opt-in.
-            tools_enabled: AtomicBool::new(true),
-            // Off by default: see the field. `tools_enabled` stays on so read-only tools and
-            // pass-through of a client's own tools keep working unchanged.
-            tools_mutation_enabled: AtomicBool::new(false),
-            workspace_root: Mutex::new(default_workspace_root()),
+            // The defaults `GatewayCore` has always had, now owned by a handle that can be shared
+            // with a `BridgeHost` — see `with_host_settings` and `HostSettings`.
+            settings: HostSettings::default(),
             store: None,
             memory_enabled: AtomicBool::new(false),
-            worker_error: Mutex::new(None),
-            warm: Mutex::new(None),
-            last_warm: Mutex::new(None),
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
             memory_freeze: Mutex::new(HashMap::new()),
             memory_freeze_ttl: Mutex::new(MEMORY_FREEZE_TTL),
@@ -1312,151 +1096,45 @@ impl GatewayCore {
         self
     }
 
-    pub fn heartbeat(&self) {
-        *self.last_heartbeat.lock().unwrap() = Instant::now();
-    }
-
-    /// Age of the last beat, for diagnostics: "stopped" is ambiguous on its own, because a
-    /// lapsed heartbeat looks identical to an operator pressing Stop.
-    pub fn heartbeat_age_ms(&self) -> u64 {
-        self.last_heartbeat.lock().unwrap().elapsed().as_millis() as u64
-    }
-
-    /// Recorded by the worker page when it fails. Cleared when it reports in healthy.
-    pub fn set_worker_error(&self, message: Option<String>) {
-        if let Some(m) = &message {
-            tracing::error!("gateway worker: {m}");
-        }
-        *self.worker_error.lock().unwrap() = message;
-    }
-
-    pub fn worker_error(&self) -> Option<String> {
-        self.worker_error.lock().unwrap().clone()
-    }
-
-    /// The core's view of the webview worker's heartbeat, as a bridge sees it.
+    /// Attach the settings handle a `BridgeHost` reads, so the bridge and the core share one copy.
     ///
-    /// `hidden` is read from the same field the bound has always used, so the visibility that
-    /// selects a bound and the age it is compared against cannot drift apart.
-    pub fn beat(&self) -> Beat {
-        Beat {
-            age: self.last_heartbeat.lock().unwrap().elapsed(),
-            hidden: self.hidden.load(Ordering::Relaxed),
-        }
+    /// A builder, like `with_app_keys`. The default it replaces is dropped rather than kept, so
+    /// there is one live copy from the moment this returns — see [`HostSettings`] for why the two
+    /// must not be two.
+    pub fn with_host_settings(mut self, settings: HostSettings) -> Self {
+        self.settings = settings;
+        self
     }
 
-    /// Whether the installed bridge can answer a request right now.
+    /// Whether the operator asked the gateway to serve at all.
     ///
-    /// The question belongs to the bridge. The core holds the heartbeat, but it does not know
-    /// whether *this* bridge's ability to serve depends on one — and assuming that it does is what
-    /// made a Rust bridge look permanently asleep (D35). Asking the bridge is what stops a bridge
-    /// in this process from being measured against a webview's liveness rule.
-    pub fn bridge_ready(&self) -> bool {
-        self.bridge.ready(self.beat())
-    }
-
-    pub fn is_available(&self) -> bool {
-        self.is_running() && self.bridge_ready()
-    }
-
-    /// Whether the operator asked the gateway to serve at all. Separate from `is_available`
-    /// because "stopped" and "heartbeat lapsed" need different answers: the first is terminal,
-    /// the second is worth waiting out.
+    /// **This is the only liveness question the request path asks.** Increment 24c split it from a
+    /// second one — `bridge_ready` — so that a Rust bridge would not be measured against a webview's
+    /// heartbeat (D35); 25f deleted the webview, and with it the second question. See the note under
+    /// `Bridge` for why the seam went rather than being kept with a constant answer.
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Relaxed)
     }
 
-    /// Whether the worker's beat is inside the bound for its current visibility.
-    ///
-    /// Public because "the worker is asleep" is a state the UI has to be able to name: a lapsed
-    /// beat is not a stopped gateway, and reporting it as one is what made the Start button look
-    /// dead. See `HEARTBEAT_STALE_HIDDEN_MS` for why a hidden worker stops beating at all.
-    ///
-    /// **This is a statement about the webview, not about the bridge**, which is why it stays here
-    /// and is not the same question as `bridge_ready`. The Control screen reports it as
-    /// `worker_awake`. For a bridge that is not a webview there is no worker to be awake, and
-    /// `bridge_ready` is the answer that decides whether a request is served.
-    pub fn beat_is_fresh(&self) -> bool {
-        self.beat().is_fresh()
-    }
-
-    /// Ask the host to re-composite the worker window.
-    ///
-    /// A hidden webview's JS can be suspended by the OS, and showing the window again is what
-    /// resumes it. The watchdog does this too, but it is rate-limited to once a minute so it
-    /// cannot become a pacemaker — which leaves a request that arrives inside its cooldown with
-    /// nothing to do but fail. Letting the request path ask for the same recovery is what turns
-    /// that hard 503 into a short wait.
-    /// Rate-limited, so a burst of requests during one lapse produces one re-composite rather
-    /// than one each. Safe to call on every poll of `await_core`.
-    pub fn request_warm(&self) {
-        {
-            let Ok(mut last) = self.last_warm.lock() else { return };
-            if last.is_some_and(|t| t.elapsed() < WARM_MIN_INTERVAL) {
-                return;
-            }
-            *last = Some(Instant::now());
-        }
-        // Clone the Arc out of the lock first — never hold a mutex across a callback that
-        // touches windows, which can re-enter the host.
-        let f = self.warm.lock().ok().and_then(|g| g.clone());
-        if let Some(f) = f {
-            f();
-        }
-    }
-
-    /// Attach the host's re-warm hook. A builder, like `with_app_keys`, so `new()` — and every
-    /// existing test — keeps working with no hook at all.
-    pub fn with_warm(mut self, warm: WarmFn) -> Self {
-        self.warm = Mutex::new(Some(warm));
-        self
-    }
-
-    /// Same hook, attached later. Unlike the key/spend providers there is no reason this cannot
-    /// change: it holds no state that could go stale, and a hook that wants to reference its own
-    /// core (the real one re-composites the window that hosts it) can only be installed after
-    /// the core exists.
-    #[cfg(test)]
-    pub fn set_warm(&self, warm: WarmFn) {
-        if let Ok(mut g) = self.warm.lock() {
-            *g = Some(warm);
-        }
-    }
-
-    /// R1: flip background mode. Entering it stamps the heartbeat so the (longer) grace window
-    /// starts now rather than part-way through — otherwise a window hidden immediately after
-    /// the last beat would trip the short bound before the renderer's next throttled tick.
-    pub fn set_hidden(&self, hidden: bool) {
-        // Collapsed from a nested `if` (clippy::collapsible_if). The collapse is safe *because*
-        // `swap` is the left operand of `&&`, so it still runs on every call — the store is the
-        // point of this function and must not become conditional on `hidden`.
-        if self.hidden.swap(hidden, Ordering::Relaxed) != hidden && hidden {
-            self.heartbeat();
-        }
-    }
-
-    pub fn is_hidden(&self) -> bool {
-        self.hidden.load(Ordering::Relaxed)
-    }
-
     pub fn set_running(&self, on: bool) {
         self.running.store(on, Ordering::Relaxed);
-        if on {
-            self.heartbeat();
-        }
     }
 
     pub fn port(&self) -> u16 {
         *self.port.lock().unwrap()
     }
 
-    /// Webview bridge replies land here (gateway_chunk / gateway_result / gateway_done /
-    /// gateway_error commands). Unknown/stale id = client already gone -> idempotent no-op.
+    /// Deliver one bridge message to the request waiting for it. Unknown/stale id = the client is
+    /// already gone -> idempotent no-op.
     ///
-    /// Delegates to the core's own `ReplyHandle` rather than keeping a second copy of the map,
-    /// so the map has one owner and one authority: a bridge holding a handle and the core
-    /// receiving a Tauri command are two doors onto the same room, not two rooms that must be
-    /// kept in step. `ReplyHandle::reply` documents what the return value means.
+    /// **No production caller, and that is the 25f result rather than a gap.** The eight
+    /// `gateway_*` commands that used to be the webview's way back are deleted; the Rust bridge
+    /// holds the `ReplyHandle` it was dispatched with and writes to it directly. What remains are
+    /// the tests that pin `ReplyHandle`'s contract (`a_reply_for_a_finished_request_is_a_no_op`
+    /// and friends), which reach it through this method.
+    ///
+    /// Delegates to the core's own `ReplyHandle` rather than keeping a second copy of the map, so
+    /// the map has one owner and one authority. `ReplyHandle::reply` documents the return value.
     pub fn reply(&self, id: u64, msg: BridgeMsg) -> bool {
         self.replies.reply(id, msg)
     }
@@ -1474,18 +1152,20 @@ impl GatewayCore {
         self.replies.close(id);
     }
 
+    /// Whether gateway-supplied tools are on. Delegates to the shared handle — the same copy the
+    /// bridge's host reads, so a toggle flipped on the Control screen reaches the request path.
     pub fn is_tools_enabled(&self) -> bool {
-        self.tools_enabled.load(Ordering::Relaxed)
+        self.settings.tools_enabled()
     }
 
     pub fn set_tools_enabled(&self, enabled: bool) {
-        self.tools_enabled.store(enabled, Ordering::Relaxed);
+        self.settings.set_tools_enabled(enabled);
     }
 
-    /// Audit H1b: may gateway-side tools mutate the workspace? See the field for why this is
+    /// Audit H1b: may gateway-side tools mutate the workspace? See [`HostSettings`] for why this is
     /// separate from `tools_enabled` and why it defaults to false.
     pub fn is_tools_mutation_enabled(&self) -> bool {
-        self.tools_mutation_enabled.load(Ordering::Relaxed)
+        self.settings.tools_mutation_enabled()
     }
 
     /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
@@ -1497,29 +1177,31 @@ impl GatewayCore {
     }
 
     pub fn set_tools_mutation_enabled(&self, enabled: bool) {
-        self.tools_mutation_enabled.store(enabled, Ordering::Relaxed);
+        self.settings.set_tools_mutation_enabled(enabled);
     }
 
     /// Set the workspace root for local tool execution. Must be set before any tool calls.
     pub fn set_workspace_root(&self, root: std::path::PathBuf) {
-        *self.workspace_root.lock().unwrap() = Some(root);
+        self.settings.set_workspace_root(root);
     }
 
-    /// Get the current workspace root. Returns None if not set.
+    /// Get the current workspace root. `None` only if it was explicitly cleared — `new()` starts at
+    /// `default_workspace_root()`, which is what a gateway tool call executes against by default.
     pub fn workspace_root(&self) -> Option<std::path::PathBuf> {
-        self.workspace_root.lock().unwrap().clone()
+        self.settings.workspace_root()
     }
 }
 
-/// How long a request waits for the worker to say ANYTHING before giving up.
+/// How long a request waits for the bridge to say ANYTHING before giving up.
 ///
-/// The router core lives in a hidden webview whose JS the OS may suspend. When that happens
-/// after a request has already been admitted — the beat looked fresh at `try_slot` — the event
-/// sits in a queue nobody is draining, and the handler would otherwise wait forever with a
-/// socket open and nothing logged. Failing with an error the client can retry is strictly
-/// better than a hang: the retry re-enters `try_slot`, which now re-warms the window.
+/// This was written for a suspended webview and it survives the webview because the property it
+/// bounds is not about one: a bridge that accepts a dispatch and then never writes to its
+/// `ReplyHandle` would otherwise hold the socket open forever with nothing logged. Failing with an
+/// error the client can retry is strictly better than a hang. The suspected cause is now a bug in
+/// the router loop rather than a napping renderer, and the message says what was observed rather
+/// than guessing at which.
 ///
-/// Only the FIRST message is bounded. Once the worker is demonstrably working on the request, a
+/// Only the FIRST message is bounded. Once the bridge is demonstrably working on the request, a
 /// slow stream is a slow stream, and cutting it off would break long answers.
 pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -1533,7 +1215,7 @@ struct Slot {
     _dispatch: OwnedSemaphorePermit,
     id: u64,
     rx: mpsc::UnboundedReceiver<BridgeMsg>,
-    /// Set once the worker has produced its first message; only that wait is bounded.
+    /// Set once the bridge has produced its first message; only that wait is bounded.
     started: bool,
 }
 
@@ -1557,7 +1239,7 @@ impl Slot {
                 self.started = true; // already failed once; don't wait again
                 tracing::warn!(
                     request_id = self.id,
-                    "worker produced nothing for {}ms — failing the request instead of hanging",
+                    "bridge produced nothing for {}ms — failing the request instead of hanging",
                     bound.as_millis()
                 );
                 Some(BridgeMsg::Error {
@@ -1568,7 +1250,7 @@ impl Slot {
                     // merely slow on a large prompt was reported to the client as a dead
                     // window, and the search went after suspension instead of latency.
                     message: format!(
-                        "the router worker produced no response within {}ms — the request was abandoned; retry",
+                        "the router produced no response within {}ms — the request was abandoned; retry",
                         bound.as_millis()
                     ),
                     // No upstream was contacted, so there is no real cooldown to report.
@@ -1586,47 +1268,6 @@ impl Drop for Slot {
     }
 }
 
-/// How long a request will wait for the worker window to come back before giving up.
-///
-/// Long enough to cover a re-composite — the watchdog logs show one landing in well under a
-/// second — and short enough that a genuinely dead worker costs a client one bad request, not a
-/// hanging one.
-const CORE_RECOVERY_GRACE: Duration = Duration::from_millis(5_000);
-const CORE_RECOVERY_POLL: Duration = Duration::from_millis(150);
-
-/**
- * Wait out a bridge that cannot answer yet instead of rejecting on it.
- *
- * The production worker lives in a hidden webview, and macOS suspends hidden webviews. When that
- * happens the bridge stops beating and every request fails until the watchdog happens to re-warm
- * the window — and the watchdog is deliberately rate-limited to once a minute, so most requests
- * arriving during a lapse were simply refused. Recovery is a `show()` away, so a request can
- * ask for it directly and wait a bounded moment.
- *
- * The question asked is `bridge_ready`, not `beat_is_fresh`. For `EventBridge` they are the same
- * thing, so this loop behaves exactly as it always has. For a bridge that answers `true` — one
- * running in this process — the first poll succeeds and the loop never sleeps, so a Rust bridge
- * pays nothing for a liveness rule that was never about it (D35).
- *
- * Returns false only when the wait was exhausted. Called at most once per request, and only
- * when the bridge is already not ready, so a healthy gateway pays nothing.
- */
-async fn await_core(core: &Arc<GatewayCore>) -> bool {
-    let deadline = Instant::now() + CORE_RECOVERY_GRACE;
-    loop {
-        if core.bridge_ready() {
-            return true;
-        }
-        // Called every poll rather than once: `request_warm` is rate-limited, and a warm that
-        // lands while the window is still coming up may not resume the beat first time.
-        core.request_warm();
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(CORE_RECOVERY_POLL).await;
-    }
-}
-
 /// 503 if the core is unreachable, 429 if over capacity, otherwise the Slot.
 ///
 /// The `Err` is a whole `Response`, which `clippy::result_large_err` flags. Boxing it would be
@@ -1637,23 +1278,18 @@ async fn await_core(core: &Arc<GatewayCore>) -> bool {
 /// the lint's premise (a large `Err` paid on the happy path) does not hold here.
 #[allow(clippy::result_large_err)]
 async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
-    // Stopped is terminal — waiting would only delay the same answer. A lapsed beat is not.
+    // Stopped is terminal, and it is now the *only* refusal here.
+    //
+    // There used to be a second gate below this one — `!is_available() && !await_core(core).await`
+    // — which waited out a bridge that could not answer yet. It existed because the bridge was a
+    // webview the OS could suspend. 25f deleted the webview, and with it the wait: nothing that can
+    // become ready by waiting is left in the process, so a second gate could only ever fire from a
+    // test double. See the note under `Bridge`.
     if !core.is_running() {
         return Err(err_ra(
             StatusCode::SERVICE_UNAVAILABLE,
             "1",
             openai_error("AI-Provider Router gateway is stopped", "service_unavailable", None),
-        ));
-    }
-    if !core.is_available() && !await_core(core).await {
-        return Err(err_ra(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "1",
-            openai_error(
-                "AI-Provider Router core unavailable — is the app open?",
-                "service_unavailable",
-                None,
-            ),
         ));
     }
     // Admission first: the 41st request is refused outright, before it can occupy a socket.
@@ -1954,11 +1590,12 @@ fn err(status: StatusCode, body: Value) -> Response {
     (status, axum::Json(body)).into_response()
 }
 
-/// Map the status the worker decided onto the status we answer with.
+/// Map the status the bridge decided onto the status we answer with.
 ///
-/// The worker has already applied a deliberate whitelist (`gatewayStatus()` in
-/// `gateway-bridge.ts`): it passes through only client-attributable upstream codes
-/// (400/404/413/422/429), maps a missing route to 404, and maps everything else to 502.
+/// The bridge applied a deliberate whitelist (`gatewayStatus()` in `gateway-bridge.ts`, deleted in
+/// 25f and ported to Rust as `bridge_policy::gateway_status`): it passes through only
+/// client-attributable upstream codes (400/404/413/422/429), maps a missing route to 404, and maps
+/// everything else to 502.
 ///
 /// Re-deciding here with a second, narrower list silently threw most of that away. The OpenAI chat
 /// path knew only 404/429/401/503, so a 400 became 502; the Anthropic, Responses, models and Gemini
@@ -1966,7 +1603,7 @@ fn err(status: StatusCode, body: Value) -> Response {
 /// client its request had hit a broken gateway when the request itself could never succeed —
 /// inviting retries that can never work.
 ///
-/// So trust the worker's decision, and reject only a value that cannot be a real HTTP error status.
+/// So trust the bridge's decision, and reject only a value that cannot be a real HTTP error status.
 pub(crate) fn worker_status(status: u16) -> StatusCode {
     StatusCode::from_u16(status)
         .ok()

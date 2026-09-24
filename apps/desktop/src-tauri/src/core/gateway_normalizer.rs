@@ -9,13 +9,13 @@
 //!
 //! # Why this is not a formality
 //!
-//! `core/gateway.rs` today forwards a client's body to a Tauri WebView, where the TypeScript
-//! normalizer runs (`gateway-bridge.ts` → `packages/router-core`). Deleting that seam means the
-//! normalizer has to exist on this side, and a Grep for `normalize_gateway_request` over
-//! `src-tauri/src` found nothing before this file — the Rust gateway has never normalized a request.
-//! Without it, every client-specific quirk the reference learned (Claude Code's lowercase tool
-//! names, Codex's `input`/`reasoning_effort` shape, GLM and Ernie's missing system role) would
-//! silently regress the moment the bridge is removed.
+//! `core/gateway.rs` used to forward a client's body to a Tauri WebView, where the TypeScript
+//! normalizer ran (`gateway-bridge.ts` → `packages/router-core`); 25f deleted that seam. Removing
+//! it meant the normalizer had to exist on this side, and a Grep for `normalize_gateway_request`
+//! over `src-tauri/src` found nothing before this file — the Rust gateway had never normalized a
+//! request. Without it, every client-specific quirk the reference learned (Claude Code's lowercase
+//! tool names, Codex's `input`/`reasoning_effort` shape, GLM and Ernie's missing system role) would
+//! have regressed silently the moment the bridge came out.
 //!
 //! # Deliberate divergences, each with its reason
 //!

@@ -96,21 +96,17 @@ const agentSteps: Row[] = [];
 const memories: Row[] = [];
 
 /**
- * Gateway status is host-owned — the Rust side owns the listener and the worker window, so there
- * is nothing in this page to derive it from. The shim models it as plain settable state and specs
- * drive it through `__webTest.gatewayStatus`. Until this existed, `gateway_status` was not in the
- * table at all, so the command threw, `status` stayed null and the Gateway screen rendered in its
- * "Stopped" branch whatever the host would have said — which made the screen's own copy untestable.
+ * Gateway status is host-owned — the Rust side owns the listener, so there is nothing in this page
+ * to derive it from. The shim models it as plain settable state and specs drive it through
+ * `__webTest.gatewayStatus`. Until this existed, `gateway_status` was not in the table at all, so
+ * the command threw, `status` stayed null and the Gateway screen rendered in its "Stopped" branch
+ * whatever the host would have said — which made the screen's own copy untestable.
  */
 const gatewayStatus = {
   running: false,
   port: 8787,
   hasKey: false,
   endpointUrl: "http://127.0.0.1:8787/v1",
-  background: false,
-  workerAwake: true,
-  heartbeatAgeMs: 0,
-  workerError: null as string | null,
 };
 
 /**
@@ -839,14 +835,6 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     // ---- gateway status: host-reported, since the host owns the listener and the worker ----
     case "gateway_status":
       return { ...gatewayStatus };
-
-    // ---- gateway bridge: the webview calls these; the real Rust gateway consumes them ----
-    case "gateway_heartbeat":
-    case "gateway_done":
-    case "gateway_chunk":
-    case "gateway_result":
-    case "gateway_error":
-      return null;
 
     // ---- events ----
     case "plugin:event|listen": {
@@ -1668,8 +1656,6 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "set_tools_mutation_enabled":
       toolsState.mutationEnabled = Boolean(args.enabled);
       return null;
-    case "gateway_tool_calls":
-      return null;
     case "gateway_tool_run":
       return { ...toolRunResult };
     /**
@@ -1683,14 +1669,6 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const limit = Math.min(Math.max(Number.isFinite(asked) ? asked : 200, 1), 1000);
       return logLines.slice(-limit);
     }
-    case "gateway_usage":
-      return null;
-    // Reported host-side because the worker window is never visible — without this the only
-    // symptom of a dead worker is a gateway that stops answering.
-    case "gateway_worker_error":
-      gatewayStatus.workerError = String(args.message ?? "");
-      return null;
-
     // ---- workbuddy: the client the router publishes models into ----
     case "workbuddy_status":
       return {

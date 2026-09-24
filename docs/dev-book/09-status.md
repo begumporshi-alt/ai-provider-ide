@@ -211,8 +211,9 @@ of an inline closure is a borrow of a temporary. Three divergences are provably 
 | **Increment 25d — the store-backed `LedgerSink`** (`core/ledger.rs`, `core/persist.rs`) (2026-09-24) | Closes **D39's gap 3** — the ledger row. `persist::ledger_insert` was `#[cfg(feature = "app")]` for no reason of its own: it takes a plain `&rusqlite::Connection` and touches no Tauri type, and the gate was inherited from its caller, the `ledger_append` command. It is now `pub` and un-gated, with the command left as a one-line delegate. `StoreLedgerSink` is the **first production `LedgerSink`** (`trait LedgerSink` at `ledger.rs:50` had no implementor outside `#[cfg(test)]`), installed on `SharedRouterState` and reached through `UsageLedger::with_sink`. It holds `Arc<Store>` rather than `&Store` because the ledger outlives any borrow once installed in `'static` shared state. **The error is sanitised** because `UsageLedger::append` returns the sink's error, the router turns it into `RouterError::Ledger`, and `router_bridge.rs:602` answers that with **502** — so `e.to_string()` here would put SQL text and an absolute database path on the wire. The write is synchronous under the ledger's own lock (`ledger → conn`, which cannot deadlock because nothing in `persist` reaches back for the ledger). **Four tests, two probes, one at a time, file byte-exact after each revert.** Rust **1178 → 1182**; headless **1118 → 1122**, so all four run with no Tauri in the graph. Swallowing the error reddens the two failure-exercising tests **alone**; passing the raw rusqlite error through instead of `ui_db_error` reddens **only** the sanitisation test, so "returns an error" and "returns a *safe* error" are separately enforced. A correction 25d found while writing: 25c's note in `adapter_runtime.rs` overclaimed — `activate` is `register`'s first production caller, but `AdapterRuntime::new` is still `#[cfg(test)]`-only. D40's tally therefore stays at **two of five** — a method's caller is not a constructor's |
 
 | **Increment 25e — install `RouterBridge`** (`bin/aiproviderd.rs`) (2026-09-24) | Hydrate (`RouterStore::from_store`, 25b), activate adapters (`activation::activate`, 25c), build the egress (`EgressPort`, 25a) and the store-backed ledger sink (`StoreLedgerSink`, 25d), then swap `HeadlessBridge` for `RouterBridge` in the headless binary. `HeadlessHost` implements `BridgeHost`: `settings()` reads from the store via `RouterSettings::from_store`, `tools_enabled()` defaults to `true` (matching `GatewayCore`), `tools_mutation_enabled()` defaults to `false`, and `workspace_root()` returns `None`. The binary logs activation results (registered count and skipped providers with versions) at boot. **D40 is closed**: all five constructors (`HttpPort`, `RouterStore::hydrate`, `AdapterRuntime`, `ModelRouter::new`, `RouterBridge`) now have production callers. Three binary tests: the original `HeadlessBridge` readiness test (kept as a test double), and two `HeadlessHost` tests — defaults on empty store, and reading a `router` settings row back. One probe: hardcoding `settings()` to `RouterSettings::default()` reddens the read-back test alone |
+| **Increment 25f — delete the webview bridge and retire its liveness subsystem** (`core/gateway.rs`, `tauri/gateway_cmds.rs`, `core/router_bridge.rs`, `bin/aiproviderd.rs`, `core/gateway_tests.rs`, `core/context_scope.rs`, `tauri/app.rs`, `tauri/commands.rs`, and the TS surface) (2026-09-24) | The last row of Phase 5, and the one **D35** had already measured as larger than it read. Run as **two passes** — the deletions that need no compilation change, then the wiring. **Pass one** deletes `gateway.html`, `gateway-worker.ts`, `gateway-bridge.ts` (421 lines) and its 420-line test, `app_nap.rs`, `capabilities/gateway.json` and two idle-lapse scripts. **Pass two** retires the subsystem those files implemented, because it is the machinery and not the files that would have 503'd every request six seconds after the app stopped beating: `HEARTBEAT_STALE_MS`/`_HIDDEN_MS`, `Beat`, `webview_ready`, `Bridge::ready`, `await_core`, the warm hooks, the whole `core_recovery_tests` module (`gateway.rs:446-625`), `EventBridge`, the watchdog, and the eight `gateway_*` reply commands. **`Bridge::ready` was deleted rather than kept**: with `EventBridge` gone every implementor would answer `true`, so `try_slot`'s second gate could only fire from a test double — the "branch that cannot fire in production" class (D31/D33/D34). **`HostSettings`** replaces the liveness state as one shared copy behind `Arc<AtomicBool>`/`Arc<Mutex<Option<PathBuf>>>`, because the core owns the bridge and so the bridge cannot own the core; `Weak<GatewayCore>` was rejected because it makes "not wired yet" a state every answer to which is a default the operator never chose — the `NULL` vs `0` defect with a different subject. **`GatewayStatus` drops 8 fields to 4**, and Control.tsx/Gateway.tsx stop deriving facts about a renderer that no longer exists (`Finding.detail` became dead with its only producer; the background paragraph was a second spelling of the row above it). The cross-language tool-ceiling guard was retargeted from the deleted `gateway-bridge.ts` to `core/bridge_policy.rs` — **Probe A: not vacuous** (`8`→`9` reddens it alone, revert byte-exact). **A probe that did not falsify is the finding:** the end-to-end gate test was asserting `check_gateway_key`'s answer, not `try_slot`'s, because all **six** `try_slot` call sites are preceded by the auth gate — fixed by adding a direct `try_slot` test. **Clippy caught what `cargo test` (1171/0) and `cargo check` did not**: a doc block left floating before `ReplyHandle` (`empty_line_after_doc_comments`). **Rust lib 1182 → 1172, `aiproviderd` 3 → 2; headless lib 1122 → 1112** — checked against a `git worktree` at `4d33cfc`, because the attribute count and the suite count disagreed by one and the disagreement was the evidence |
 
-**One row left: 25f.** **rustfmt adoption** moved to "Working and verified" — it is now a
+**Phase 5 is complete: 25f landed, and it was the last row.** **rustfmt adoption** moved to "Working and verified" — it is now a
 gate. **`IDE/`** was removed: a file count showed it held none at all, only an empty `IDE/.workbuddy-ai/memory/`
 skeleton from a session that ran with the wrong working directory, so `rmdir` closed it with nothing at risk.
 The hesitation on that row was about the directory's *name*, and the measurement retired it.
@@ -233,12 +234,14 @@ available.
 
 Not gaps — things that work but carry a cost worth stating.
 
-**The gateway's availability is bound to the webview's *process*, not to its window.** It bridges into the
-TypeScript core, so a reloading or crashed renderer means `503` for every client, and quitting the app takes
-the gateway with it. What closing the window does *not* do is stop it: `hideOnClose` defaults on, so the window
-hides and the gateway keeps serving, with the tray as the way back. Headless service mode — the gateway
-detached from any window *and* from the app process — is [under way: Phase 1 landed 2026-09-23](10-headless-service.md),
-and `aiproviderd` starts and serves `GET /health` with no window and no Tauri app.
+**The desktop gateway's availability is bound to the app *process*, not to its window.** As of 25f the bridge
+is Rust (`core/router_bridge.rs`) and there is no renderer in the request path, so the old failure mode — a
+reloading or crashed webview meaning `503` for every client while the socket stayed bound — is gone. What
+remains is the process: `Cmd+Q` still takes the gateway with it. What closing the window does *not* do is stop
+it: `hideOnClose` defaults on, so the window hides and the gateway keeps serving, with the tray as the way back.
+Headless service mode is the detachment, and it is [complete: Phase 5 landed 2026-09-24](10-headless-service.md) —
+`aiproviderd` builds the whole Rust stack (hydrate → activate adapters → `EgressPort` → store-backed ledger →
+`RouterBridge`) and answers `ready() == true`. **It has now been run end-to-end against a real provider, and the run found a real bug (D45).** `POST /v1/chat/completions` answered `502` with a message that blamed the upstream, because the service built an **empty egress allowlist** and never called `persist::recompute_allow` — so every provider host was refused and the refusal was reported as `NETWORK`. Fixed and re-verified: **200**, `"pong"`, and a durable `ledger` row (id 1532, both token counts, `key_id` set). The lesson is that "every link now has a production caller" (D40) is a **structural** claim, and only a request can make a **behavioural** one — the register draws the same distinction at D8.
 
 **The dependency half of the split closed on 2026-09-23, and it is a stronger claim than the source
 half.** Phase 1 originally made `core/` Tauri-free in *source* only: `persist` still carried 28
@@ -252,14 +255,18 @@ linked); `cargo check --no-default-features` is warning-free; `cargo test` still
 The Linux job builds with `--no-default-features` and installs no GTK/WebKit. Two things this does
 **not** do: `tauri-build` still compiles, because Cargo has no optional build-dependencies, so
 `[build-dependencies]` cannot be feature-gated even though `build.rs` no longer calls
-`tauri_build::build()` without the feature; and the `Bridge` trait itself is untouched — `aiproviderd`
-still installs `HeadlessBridge`, which discards every dispatch, so the 503 contract is unchanged.
+`tauri_build::build()` without the feature; and the `Bridge` trait itself was untouched *at that point* —
+`aiproviderd` then still installed `HeadlessBridge`, which discarded every dispatch, so the 503 contract was
+unchanged. **25e replaced it with `RouterBridge` and 25f deleted `HeadlessBridge`**, so the 503 contract no
+longer describes the headless service.
 
-**This row stays, and Phase 1 is why.** What Phase 1 does not do is serve completions. The router core is
-still TypeScript in a hidden webview, reached through the `Bridge` trait, and the standalone service has
-nothing to bridge to — so it installs a bridge that discards every dispatch and every completion route answers
-503. The gateway's availability is still bound to a webview until Phase 2 ports the router core to Rust. The
-503 contract mitigates it; it does not solve it.
+**This row is now closed, and the measurements above are what closed it.** When it was written the router
+core was TypeScript in a hidden webview reached through the `Bridge` trait, and the standalone service had
+nothing to bridge to — it installed a bridge that discarded every dispatch, so every completion route answered
+`503`. Phases 2–5 ported the core (`core/engine.rs`, `planner.rs`, `router.rs`, `limiter.rs`, `ledger.rs`,
+`router_bridge.rs`), 25e installed `RouterBridge` in the binary, and 25f deleted the webview and its liveness
+subsystem. The paragraph is kept rather than deleted because the *shape* of the original problem — availability
+bound to something the operator does not control — is what Phase 6's process manager exists to finish.
 
 **The two recall paths differ on exactly one axis, and it reads as a bug.** Gateway recall is scoped and
 excludes unscoped atoms; Assistant recall passes `None`. Every atom is born unscoped, so gateway recall returns

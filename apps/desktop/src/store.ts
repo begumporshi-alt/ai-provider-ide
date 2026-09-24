@@ -1111,23 +1111,16 @@ export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean
 
 /**
  * `gateway_status`. Defined once and imported by both the Local Gateway screen and Control — two
- * copies of a ten-field DTO drift, and then the switchboard lies about the system state.
+ * copies of a four-field DTO drift, and then the switchboard lies about the system state.
  */
 export interface GatewayStatus {
-  /** Operator intent — the gateway is supposed to be serving. Deliberately *not* "the worker is
-   *  awake": a hidden worker's beat stops after ~8 idle minutes and revives on demand. */
+  /** Operator intent — the gateway is supposed to be serving. 25f made this the whole story: the
+   *  bridge is Rust and nothing suspends it, so there is no beat to narrow it against. It used to
+   *  be `is_available()`, which also went false when a hidden worker's beat lapsed. */
   running: boolean;
   port: number;
   hasKey: boolean;
   endpointUrl: string;
-  /** R1: the window is hidden and the gateway is serving in the background. */
-  background: boolean;
-  /** The worker is awake right now rather than merely reachable. False here is routine. */
-  workerAwake: boolean;
-  /** Age of the worker's last heartbeat. Distinguishes "you stopped it" from "it lapsed". */
-  heartbeatAgeMs: number;
-  /** Why the worker page failed to boot, if it did. It runs in an invisible window. */
-  workerError: string | null;
 }
 
 /** Month-to-date spend vs. the cap, both in micro-USD (cap 0 = disabled). */

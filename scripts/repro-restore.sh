@@ -2,9 +2,11 @@
 # Measure how often the gateway fails to auto-restore on launch, and where it stops.
 #
 # Observed: the app comes up (DB opened, process alive) but `gateway_enable` never finishes —
-# no socket, no "enabled on port" line. It happened on 3 of 5 launches. The new staged logging
-# ("enable: starting" / "worker window ready in Nms" / "listener bound in Nms") says which step
-# never completed, and the auto-restore marker says whether the task ran at all.
+# no socket, no "enabled on port" line. It happened on 3 of 5 launches. The staged logging
+# ("enable: starting" / "enable: listener bound in Nms") says which step never completed, and the
+# auto-restore marker says whether the task ran at all. **25f removed the middle stage** — the
+# "worker window ready in Nms" line went with the worker window — so a stalled run now stalls
+# between those two lines rather than at a window bring-up.
 set -u
 unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy ALL_PROXY all_proxy
 D="$HOME/Library/Application Support/dev.aiprovider.router"

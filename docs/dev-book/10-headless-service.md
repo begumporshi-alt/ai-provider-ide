@@ -27,6 +27,11 @@ launchd registration, the UI falling back to HTTP — is wiring around that chan
 
 ### 1.1 What already works (R1 background mode)
 
+> **Dated — this section is the pre-Phase-1 reconnaissance, and 25f deleted the machinery it
+> describes.** The worker window, the 6 s/30 s heartbeat bounds and `app_nap.rs` were all removed on
+> 2026-09-24 (Phase 5, increment 25f), so read the lines below as the measurement that justified the
+> plan rather than as a description of the tree; §7's Phase 5 is what replaced them. Logged as D44.
+
 Closing the main window hides it instead of quitting (`lib.rs:277-284`). The gateway worker window
 stays alive. The heartbeat bound relaxes from 6s to 30s (`gateway.rs:65`). App Nap is fought with
 a native heartbeat (`app_nap.rs`).
@@ -2009,8 +2014,8 @@ one is the deletion:
 | **25b — landed** | Hydration readers — split `providers_list` / `api_keys_list` / `models_cache_list` / `aliases_list` into un-gated `&Store` functions plus thin `#[tauri::command]` wrappers, so a headless launch can build the `RouterStore` (D39, gap 1). It also gave `RouterSettings` its first production source, a prerequisite none of D39's three gaps had named |
 | **25c — landed** | The manifest activation path — read `manifests.body_json` and call `AdapterRuntime::register`, which no production code did before this increment (D40). `core/activation.rs` is `register`'s **first production caller**. It iterates manifest rows rather than providers, because the reference's `PROVIDER_PROFILES[slug]` branch has no Rust port — harmless on this install, a divergence elsewhere (**D41**) |
 | **25d — landed** | A store-backed `LedgerSink` over `persist::ledger_insert` (D39, gap 3). Not required to *serve*: a router with no sink attached keeps the ledger in memory and raises no error, so this is durability rather than reachability. `core::ledger::StoreLedgerSink` is the **first production `LedgerSink`**, and `persist::ledger_insert` is `pub` and un-gated, so the headless service writes ledger rows with no command in the path |
-| **25e — landed** | Install `RouterBridge` — hydrate (`RouterStore::from_store`, 25b), register the adapters (`activation::activate`, 25c), build the `EgressPort` (25a) and the store-backed ledger sink (`StoreLedgerSink`, 25d), and swap `HeadlessBridge` for `RouterBridge` in `bin/aiproviderd.rs`. The binary now answers `ready() == true` and serves completions through the Rust-native router core |
-| **25f** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)**. Safe only once 25a–25e stand a Rust path behind it |
+| **25e — landed** | Install `RouterBridge` — hydrate (`RouterStore::from_store`, 25b), register the adapters (`activation::activate`, 25c), build the `EgressPort` (25a) and the store-backed ledger sink (`StoreLedgerSink`, 25d), and swap `HeadlessBridge` for `RouterBridge` in `bin/aiproviderd.rs`. The binary answers `ready() == true`. **The "serves completions" half of this row was not true when it was written** — the first end-to-end run, during 25f verification, found the egress allowlist empty and every provider call refused (**D45**) |
+| **25f — landed** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)**. Safe only once 25a–25e stand a Rust path behind it. Landed in the two passes the row's own risk implies: the deletions first, then the wiring |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
 clock, no network, which is what lets it be pinned before anything calls it. 53 tests, Rust
@@ -2717,6 +2722,222 @@ The binary builds the full stack in sequence: `AllowList` → `EgressState` → 
 Three tests on the binary: the original `HeadlessBridge` readiness test (kept as a test double), and two `HeadlessHost` tests — defaults on an empty store, and reading a `router` settings row back. One probe: hardcoding `settings()` to `RouterSettings::default()` reddens the read-back test alone.
 
 D40: **Fixed in 25a–25e** — all five constructors now have production callers. The note in `adapter_runtime.rs` is updated; the tally in the register is updated.
+
+**Increment 25f — the deletion, and the subsystem the row had not named.** The last row of Phase 5,
+and the one the whole phase exists to make safe: with 25a–25e standing a Rust path behind the
+gateway, the webview can be removed without removing the only working text path. D35 had already
+measured that the row was larger than it read — the four files are the *visible* half of a liveness
+subsystem that exists only because the worker is a webview the OS can suspend — so the increment ran
+as **two passes: the deletions that need no compilation change, then the wiring.**
+
+**Pass one, the files.** `gateway.html`, `gateway-worker.ts`, `gateway-bridge.ts` (421 lines) and
+its 420-line test, `app_nap.rs` — whose entire reason to exist is that a hidden webview's JS stops
+beating — `capabilities/gateway.json`, and two scripts (`idle-lapse-test.sh`,
+`verify-heartbeat-fix.sh`) that reproduce the idle lapse the deleted code was built to survive.
+`pub mod app_nap;` goes with them.
+
+**Pass two, the subsystem.** Deleting the files leaves the machinery that *measured* the webview
+still in the core, and it is the machinery, not the files, that would have turned every request into
+a 503 six seconds after the app stopped beating. `core/gateway.rs` loses `HEARTBEAT_STALE_MS` (6 s)
+and `HEARTBEAT_STALE_HIDDEN_MS` (30 s), `Beat` and `Beat::is_fresh`, `webview_ready`,
+`Bridge::ready`, `WARM_MIN_INTERVAL` / `WarmFn` / `await_core`, `CORE_RECOVERY_GRACE` /
+`CORE_RECOVERY_POLL`, the `last_heartbeat` / `hidden` / `worker_error` / `warm` / `last_warm`
+fields with their accessors, and the whole `core_recovery_tests` module (`gateway.rs:446-625`, 180
+lines, seven tests). `tauri/gateway_cmds.rs` loses `EventBridge`, `ensure_bridge_window`,
+`warm_bridge_window`, `hide_worker_after_warmup`, `GATEWAY_WINDOW`, the watchdog with its
+`WATCHDOG_STARTED` guard, and the eight `gateway_*` reply commands (`gateway_heartbeat`,
+`gateway_worker_error`, `gateway_chunk`, `gateway_result`, `gateway_done`, `gateway_error`,
+`gateway_tool_calls`, `gateway_usage`), which leave `commands.rs`'s handler list with them. 23 files,
+**−1,841 lines against +506**.
+
+**The one design decision: `Bridge::ready` was deleted rather than kept.** 24c introduced it as a
+seam so a Rust bridge would not be measured against a webview's liveness rule (D35), and with
+`EventBridge` gone **every** remaining implementor would answer `true` — `RouterBridge`, the
+headless bridge, and the three doubles. The seam's whole content was the *difference* between the
+two answers, and the difference left with the webview. Keeping it with a constant answer would have
+left `try_slot`'s "core unavailable" branch reachable only from a test double, which is the defect
+class this register keeps recording (D31, D33, D34): **a branch that cannot fire in production.** So
+`try_slot` (`gateway.rs:1280`) now has exactly one refusal — `!core.is_running()`, which is terminal
+— and the second gate, the wait, and the 503 behind them are gone.
+
+**`HostSettings` is what replaced the liveness subsystem, and it is deliberately not a heartbeat.**
+`BridgeHost::settings` needs three answers (tools on, mutation on, workspace root) and `RouterBridge`
+must not hold a second copy: the operator flips a switch, the core updates, and the bridge serves the
+old answer with nothing to report it. The core owns the bridge (`Arc<dyn Bridge>`), so the bridge
+cannot own the core — the cycle `ReplyHandle` exists to avoid — so the three live behind
+`Arc<AtomicBool>` / `Arc<Mutex<Option<PathBuf>>>` the core writes through and the host reads through,
+and `with_host_settings` *drops* the default it replaces rather than keeping it, so there is one live
+copy from the moment it returns. **`Weak<GatewayCore>` was considered first and rejected:** it breaks
+the cycle too, but it makes "the core is not wired yet" a state the host has to answer for, and every
+answer it could give is a default the operator never chose — the `NULL` vs `0` defect with a
+different subject. Sharing the fields removes the state instead of defaulting it.
+
+**The webview's answers leave the wire, and the screen stops deriving them.** `GatewayStatus` goes
+from eight fields to four (`running`, `port`, `has_key`, `endpoint_url`); `workerError`, `background`
+and the asleep/serving distinction are facts about a renderer that no longer exists. Control.tsx
+loses both `Gateway state` rows, the `worker-boot` finding and `Finding.detail` — whose only producer
+was that finding, so the field became dead and `noUnusedLocals` would have flagged it — and
+Gateway.tsx loses the "Serving in the background right now" paragraph, which was the *second*
+spelling of the background-mode preference already rendered directly above it: one screen carrying
+two sources of truth for one fact. `gateway-status.spec.ts` goes from four worker tests to two.
+
+**The cross-language guard was retargeted rather than deleted.** `agentLoop.test.ts`'s "the tool-step
+ceiling has one source" read `gateway-bridge.ts` to compare its `MAX_TOOL_ITERATIONS` against the
+Assistant's `DEFAULT_MAX_ITERATIONS`. The reference file is gone but the property is not, so it now
+reads `core/bridge_policy.rs`'s `const MAX_TOOL_ITERATIONS: usize`. **Probe A confirmed it is not
+vacuous** — mutating `8` to `9` reddens it alone (`expected 8, got 9`), and the revert is byte-exact.
+
+**The probe that did not falsify, and the test it corrected.** The gate's end-to-end test asserts a
+stopped gateway is refused with `503` and `retry-after: 1` without waiting. Inserting a five-second
+sleep before `try_slot`'s refusal should have reddened it; it **passed in 0.02 s**. The reason is a
+property of the request path rather than of the gate: **all six call sites of `try_slot`**
+(`gateway_handlers.rs:72`, `:282`, `:384`; `gateway_anthropic.rs:351`; `gateway_gemini.rs:208`;
+`gateway_responses.rs:256`) are preceded by `check_gateway_key` (`gateway.rs:1389`), which refuses a
+stopped gateway at `:1394` *before* `try_slot` runs. The test was therefore asserting the **auth**
+gate's answer while its comment claimed it guarded the slot gate — an over-claim of exactly the kind
+this register exists to catch. Fixed by keeping the end-to-end test, with its comment now recording
+the measurement, and adding a **direct** `try_slot(&s.core)` test, which is reachable because
+`gateway_tests.rs` is `#[path]`-included as a child module of `gateway`.
+
+**Two gates caught what the others could not.** `cargo test` was green at 1171 / 0 and `cargo check
+--all-targets` clean while `cargo clippy -- -D warnings` was **red**: deleting the webview's doc
+block left it *floating* before `ReplyHandle`, and clippy attaches a detached doc comment to the next
+item (`empty_line_after_doc_comments`). rustfmt tolerates it and the compiler does not care — only
+the lint gate saw it, which is the argument for running all three. The block is now a `//` note with
+the reason in place.
+
+**Measured: Rust lib 1182 → 1172, `aiproviderd` 3 → 2; headless lib 1122 → 1112.** Thirteen test
+attributes go and two arrive. Twelve leave the lib target — the whole `core_recovery_tests` module
+(seven, including 24c's four `Bridge::ready` tests), the three `r1_*` background-mode tests,
+`a_sleeping_worker_is_still_running` and
+`the_rust_bridge_is_ready_for_any_beat_because_nothing_suspends_it` — and one leaves the binary
+(`the_headless_bridge_reports_itself_unable_to_serve`). The two arrivals are the split gate pair.
+That the lib delta is **ten** and not eleven is the arithmetic that says the removed binary test
+never counted in the lib target, and it was checked against a `git worktree` at `4d33cfc` rather
+than inferred: the attribute count and the suite count disagreed by one, and the disagreement was
+the evidence that one of the thirteen belonged to a different target.
+
+**25f verification — the first end-to-end run, and the bug it found.** 25f's own numbers were all
+green, and D40 was closed on the claim that every constructor had a production caller. That claim
+asks whether the chain is **assembled**; it does not ask whether the chain **conducts**. So the
+increment was finished by running the service against a real provider: `cargo build --bin
+aiproviderd --release --no-default-features`, then the binary on its persisted port 8800 with the
+keychain master key.
+
+**The first completion failed, and the failure message pointed the wrong way.**
+
+```
+POST /v1/chat/completions   {"model":"agnes-2.5-flash", …}
+→ 502  {"error":{"message":"all attempts failed for agnes-2.5-flash
+              [agnes/key-01:NETWORK -> agnes/Key-02:NETWORK]"}}
+```
+
+Everything *upstream* of the egress had worked: auth passed, the request was normalized, the router
+planned two attempts and tried both keys round-robin, and the memory layer was consulted
+(`aip-memory: injected=0;reason=disabled`). The message blamed the provider — and the provider was
+demonstrably reachable, because the app's gateway had served `agnes-2.5-flash` successfully minutes
+earlier (ledger row 1528). The refusal was local.
+
+**The cause is one line.** `bin/aiproviderd.rs` built `AllowList::default()`. `AllowList` is
+`#[derive(Default)]` over a `HashSet` (`egress.rs:57-58`), so the default is **empty**, and
+`check_url` (`:148`) refuses every non-local host that is not in it — the module's own tests assert
+exactly that (`:631`). The app populates the list from provider CRUD
+(`persist::recompute_allow`, called at `persist.rs:137` and `:166`); the service called it
+**nowhere**. Every outbound call was therefore `HostDenied`, which the attempt layer reports as
+`NETWORK` — a 502 that blames the upstream for a local policy refusal. Fixed by calling
+`persist::recompute_allow(&egress_state, &store)` at boot, before the adapter runtime is built.
+
+**Re-verified, and the response body is not the evidence — the row is.** After the fix the same
+request returned **200** with `{"content":"\n\npong"}` and
+`usage {prompt_tokens: 1721, completion_tokens: 19}`, and a **durable `ledger` row** was re-read
+from the store: id **1532**, `source=gateway`, `provider_id=8234f8af…`, `status=ok`,
+`tokens_in=1721`, `tokens_out=19`, `key_id=2f4b37eb…`, `latency_ms=10448`. A 200 alone would prove
+the bridge answered; only the row proves the store-backed sink was reached, which is the half 25d
+existed for.
+
+**The full matrix, measured on the running service:**
+
+| Probe | Result |
+|---|---|
+| `GET /health` | 200 `{"status":"ok"}` |
+| `GET /v1/models` (master key) | 200 — **467** models, **2** providers |
+| `POST /v1/chat/completions` | 200, `"pong"`, 1721 in / 19 out |
+| ledger row after the completion | id 1532, `status=ok`, both token counts, `key_id` set |
+| bad key | **401** `invalid_api_key` |
+| no `Authorization` header | **429** `too many failed auth attempts — backing off` |
+
+**One observed behaviour that is *not* a defect, recorded so it is not re-diagnosed.** The first two
+completion attempts answered `503 master key unavailable` at **1.505 s** each, and the third
+succeeded. That is `MASTER_KEY_WAIT` (`gateway.rs:143`) — an explicit 1500 ms bound on the keychain
+read, which exists because an ACL mismatch after a reinstall makes the Security framework raise a
+prompt and block *indefinitely*, and unbounded that wedges the whole HTTP surface rather than failing
+one request. The failure is not cached: `MasterKeyCache::get` returns `Unavailable` at the deadline
+*without* storing it (`:238-239`) while the abandoned thread keeps loading, so the next request
+answers `Ready`. The contract is the `retry-after: 5` on the 503. **The operational consequence
+belongs to Phase 6:** a supervisor that health-checks an *authenticated* route will see 503s for the
+first seconds after every install or upgrade, and must retry rather than declare the service dead.
+`/health` is unauthenticated precisely so it is not subject to this.
+
+**Why no test could have found it.** Every constructor had a production caller — D40's claim was
+true. `AllowList::default()` being empty is *intended*, and its tests depend on it. And the app
+populates the list on a path (`persist`'s CRUD commands) that the service does not use. The defect
+is in the **composition** of two correct pieces, which is the class D40 named and could not test.
+The lesson is the increment's: **"every link has a production caller" is a structural claim, and only
+a request can make a behavioural one.** Logged as **D45**.
+
+**The latency characterisation, measured 2026-09-24.** The same question as the run above — does the
+service actually serve? — asked in numbers. Method: an isolated store (`AIP_DATA_DIR`) whose provider
+`base_url` **and** active manifest endpoint both point at a local stub on `127.0.0.1:8799` (`check_url`
+permits localhost unconditionally), ledger cleared, service on 8801. The same request then goes two
+ways against the same stub — through the gateway, and straight at it — so the difference is the
+gateway's own cost rather than the upstream's.
+
+**Overhead: ~11 ms.** Median 11.2 ms on one run and 10.4 ms on another (n = 15 each); the spread
+across runs is 10.4–12.0 ms. Where it goes: `/health` (no auth) **0.2 ms** → `/v1/models` (auth +
+store) **1.8 ms** → `/v1/chat/completions` (auth + router + ledger + dispatch) **11.6 ms**. The
+router's own ledger corroborates it — 32 rows land in the 0–99 ms bucket, matching the harness phase
+exactly. The whole thing is reproducible: `scripts/measure-gateway-latency.mjs` builds the isolated
+store, starts the stub, and refuses to print numbers if the stub received nothing.
+
+**Two measurement caveats, both of which changed the answer.** The first pass at the decomposition was
+taken with `curl`, which reported `/v1/models` at **6.1 ms** against node's **1.8 ms** for the same
+request; node reuses its connection where `curl` opens a fresh one per invocation, so `curl`'s figure
+carries connection setup. The node numbers are the ones above. Separately, `curl`'s
+`%{time_starttransfer}` counts response **headers** (0.5 ms) while node's first `res.on("data")` counts
+the first **body** byte (1,209 ms) — same request, two "TTFB"s, both correct. **The configuration is
+part of the claim**, and this pair is the same lesson as the `cargo tree` feature unification.
+
+Put against the real ledger (**n = 1,053** successful gateway requests, p50 **4,588 ms**, p90 15,356 ms,
+p99 39,395 ms, p50 prompt **22,084 tokens**), the overhead is **0.25 %** of the real-world p50: **the
+gateway is not the bottleneck and the upstream is.** Concurrency is shed rather than queued —
+`perProviderConcurrency: 4` binds before `MAX_CONCURRENT`, so 24 simultaneous requests returned 4–5×200
+and 19–20×429 `RATE_LIMITED` in 30 ms of wall time.
+
+**Streaming was the one real latency weakness — and it is now an operator setting rather than a
+defect.** Response headers return in **0.5 ms**, but the first *content* chunk arrived only once the
+upstream had finished: measured **1,209 ms** against an upstream that streamed over 1,200 ms, and
+1,814 ms against 1,800 ms. The whole answer arrived as a single delta frame, then a finish frame, then
+`[DONE]`. The cause is `ProseGate` (`bridge_policy.rs:236`), which sets
+`hold = (ownership == ToolOwnership::Gateway)`, combined with a `HeadlessHost::tools_enabled()` that
+returned `true` unconditionally: a client declaring no tools was therefore `Gateway`-owned, so every
+delta was held until the turn resolved (`router_bridge.rs:390`). The holding is deliberate — a turn
+that goes on to call a tool must not leak its preamble — but hardcoding the toggle meant a service
+could never reach the corner where the gate *does not* hold, and an interactive client paid the **full
+generation time before the first token** where a relaying gateway shows text at ~0.5 s.
+
+`RouterSettings` now carries **`gatewayToolsEnabled`** and `HeadlessHost` reads it instead of answering
+`true` (`core/router.rs`, `bin/aiproviderd.rs`). An absent key means `true`, so no existing install
+changes behaviour. With it `false`, ownership is `None`, `hold` is false, and deltas reach the client as
+the upstream emits them. Pinned by `tools_off_streams_the_prose_as_it_arrives` — the third corner of the
+gate, which `passing_mode_streams_the_prose_as_it_arrives` (`Client`) and
+`gateway_mode_holds_the_prose_and_releases_it_once_at_the_end` (`Gateway`) had left open — and
+**falsified before it was trusted**: forcing `ProseGate::new` to hold unconditionally reddens it and the
+`Client` case while correctly leaving the `Gateway` case green.
+
+**The cost is real, which is why this is a setting and not a fix.** Gateway-owned tools are what let the
+gateway run its own tool loop, so turning them off trades that capability for streaming. The desktop app
+is untouched: it answers from `HostSettings`, a live toggle the UI flips, and unifying the two means
+making that toggle write this key — a UI change, not a host one.
 
 ---
 
