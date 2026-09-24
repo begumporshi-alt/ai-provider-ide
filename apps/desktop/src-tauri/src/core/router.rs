@@ -57,6 +57,7 @@
 //! carries (D20) — the port is not merely missing the call, it has no compression path at all.
 
 use std::collections::HashMap;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -432,22 +433,103 @@ impl PlanContext for PlanView<'_> {
 
 // ---------- the router ----------
 
-/// The facade. Wires the store, the adapter seam, the health tracker, the limiter and the ledger.
+/// The state every request must see the same copy of: the circuit breaker, the key cursors, the
+/// ledger and the concurrency limiter.
 ///
-/// **The ledger is owned, where the TypeScript is handed one.** The source takes a `UsageLedger`
-/// so the Usage screen and the router share a single instance. Owning it here avoids a lifetime
-/// that would outlive every caller's borrow — `generate_text` needs `&mut` on the ledger for the
-/// length of the request, and a router holding `&'a mut UsageLedger` could not be queried by
-/// whoever built it. [`ModelRouter::ledger`] hands it back out. A wiring layer that needs two
-/// owners wraps this in an `Arc<Mutex<_>>`, which is the same shape the TypeScript gets from
-/// object identity.
+/// **One type rather than four fields, because a constructor can forget one of four and cannot
+/// forget one of one.** The same argument `ReplyHandle`'s note makes for arriving with the
+/// dispatch rather than being installed on the bridge: a wiring step somebody can skip produces a
+/// failure that is silent and looks like something else. Four separate `with_*` calls would leave
+/// a caller able to share the health tracker and the limiter while quietly giving each request its
+/// own cursors — which is not a smaller version of sharing, it is a different behaviour: every
+/// request would start on key zero, and the round-robin that spreads load across a provider's keys
+/// would stop existing while every test still passed.
+///
+/// **Cheap to clone, and that is the point.** Three of the four are `Arc`s and the fourth
+/// ([`ProviderLimiter`]) is documented as sharing one budget across its clones, so the bridge
+/// clones this once per request and no state is copied.
+///
+/// [`SharedRouterState::ledger`] hands out a guard rather than a reference, because the ledger is
+/// appended to from the request path. `ModelRouter::ledger_mut` — which used to hand out
+/// `&mut UsageLedger` — is deliberately gone: a mutable borrow escaping the lock is the exact
+/// thing the sharing exists to prevent.
+#[derive(Clone)]
+pub struct SharedRouterState {
+    health: Arc<HealthTracker>,
+    cursors: Arc<Mutex<HashMap<String, i64>>>,
+    ledger: Arc<Mutex<UsageLedger>>,
+    limiter: ProviderLimiter,
+}
+
+impl Default for SharedRouterState {
+    fn default() -> Self {
+        Self {
+            health: Arc::new(HealthTracker::new()),
+            cursors: Arc::new(Mutex::new(HashMap::new())),
+            ledger: Arc::new(Mutex::new(UsageLedger::new())),
+            limiter: ProviderLimiter::new(PER_PROVIDER_DEFAULT),
+        }
+    }
+}
+
+impl SharedRouterState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn health(&self) -> &HealthTracker {
+        &self.health
+    }
+
+    pub fn limiter(&self) -> &ProviderLimiter {
+        &self.limiter
+    }
+
+    /// The ledger, locked. Held only for the append or the query, never across an `await` — every
+    /// caller in this module is a synchronous function.
+    pub fn ledger(&self) -> MutexGuard<'_, UsageLedger> {
+        self.ledger.lock().unwrap()
+    }
+
+    /// The cursor map, locked. [`ModelRouter::plan`] holds this for the length of one planning
+    /// call, which does no I/O.
+    pub fn cursors(&self) -> MutexGuard<'_, HashMap<String, i64>> {
+        self.cursors.lock().unwrap()
+    }
+
+    /// The round-robin cursor for a provider: how many times it has served, or `0`.
+    pub fn cursor(&self, provider_id: &str) -> i64 {
+        self.cursors.lock().unwrap().get(provider_id).copied().unwrap_or(0)
+    }
+
+    /// Advance a provider's cursor after it served. See [`ModelRouter::advance_cursor`].
+    pub fn advance(&self, provider_id: &str) {
+        let mut cursors = self.cursors.lock().unwrap();
+        let next = cursors.get(provider_id).copied().unwrap_or(0) + 1;
+        cursors.insert(provider_id.to_string(), next);
+    }
+
+    /// Replace the ledger with one built elsewhere — a test that wants a spy sink, or a launch that
+    /// wants a store-backed one.
+    pub fn with_ledger(mut self, ledger: UsageLedger) -> Self {
+        self.ledger = Arc::new(Mutex::new(ledger));
+        self
+    }
+}
+
+/// The facade. Wires the store, the adapter seam and the shared request state.
+///
+/// **The ledger is owned rather than borrowed, and the reason changed with the sharing.** The
+/// TypeScript takes a `UsageLedger` so the Usage screen and the router share one instance, and the
+/// port originally owned it to avoid a `&'a mut` that would outlive every caller's borrow. It now
+/// lives in [`SharedRouterState`] behind an `Arc<Mutex<_>>`, which is the shape the original note
+/// said a wiring layer needing two owners would have to build for itself — built once, here,
+/// because a bridge with one router per request is exactly that wiring layer.
 pub struct ModelRouter<'a> {
     store: &'a RouterStore,
     adapters: &'a dyn AdapterFactory,
-    health: HealthTracker,
-    ledger: UsageLedger,
-    limiter: ProviderLimiter,
-    cursors: HashMap<String, i64>,
+    /// One field rather than four — see [`SharedRouterState`].
+    shared: SharedRouterState,
     pub settings: RouterSettings,
 }
 
@@ -456,12 +538,22 @@ impl<'a> ModelRouter<'a> {
         Self {
             store,
             adapters,
-            health: HealthTracker::new(),
-            ledger: UsageLedger::new(),
-            limiter: ProviderLimiter::new(PER_PROVIDER_DEFAULT),
-            cursors: HashMap::new(),
+            shared: SharedRouterState::new(),
             settings: RouterSettings::default(),
         }
+    }
+
+    /// Serve from state built elsewhere rather than from a fresh set.
+    ///
+    /// **The constructor a concurrent caller wants, and the difference is not an optimisation.**
+    /// `new` gives the router its own breaker, its own cursors and its own ledger — right for one
+    /// request and wrong for two: two routers built that way would each cool a private copy of a
+    /// key, so neither would ever see the other's failures, and each would start on key zero, so
+    /// the round-robin would never advance. A bridge builds one `SharedRouterState` and one router
+    /// per request from it.
+    pub fn with_shared(mut self, shared: SharedRouterState) -> Self {
+        self.shared = shared;
+        self
     }
 
     /// Replace the settings, as `Object.assign(router.settings, persisted)` does at startup. The
@@ -472,25 +564,23 @@ impl<'a> ModelRouter<'a> {
         self
     }
 
+    /// Replace the ledger, keeping every other piece of shared state.
     pub fn with_ledger(mut self, ledger: UsageLedger) -> Self {
-        self.ledger = ledger;
+        self.shared = self.shared.with_ledger(ledger);
         self
     }
 
     pub fn health(&self) -> &HealthTracker {
-        &self.health
+        self.shared.health()
     }
 
-    pub fn ledger(&self) -> &UsageLedger {
-        &self.ledger
-    }
-
-    pub fn ledger_mut(&mut self) -> &mut UsageLedger {
-        &mut self.ledger
+    /// The ledger, locked. A guard rather than a reference — see [`SharedRouterState`].
+    pub fn ledger(&self) -> MutexGuard<'_, UsageLedger> {
+        self.shared.ledger()
     }
 
     pub fn limiter(&self) -> &ProviderLimiter {
-        &self.limiter
+        self.shared.limiter()
     }
 
     /// Apply `settings.per_provider_concurrency` to the live limiter. The port of `syncConcurrency`
@@ -506,7 +596,8 @@ impl<'a> ModelRouter<'a> {
     /// settings change reaches the Generator only on the next UI or gateway request. Kept, and
     /// pinned by `complete_uses_whatever_cap_is_live_rather_than_syncing_it`.
     pub fn sync_concurrency(&self) {
-        self.limiter
+        self.shared
+            .limiter()
             .set_max_per_provider(clamp_concurrency(&self.settings.per_provider_concurrency));
     }
 
@@ -519,7 +610,11 @@ impl<'a> ModelRouter<'a> {
     /// provider is a retry rather than a failover.
     fn plan(&self, model: &str, modality: &str, exclude_provider_ids: &[String]) -> Vec<Candidate> {
         let input = PlanInput { model, modality, exclude_provider_ids };
-        let view = PlanView { store: self.store, health: &self.health, cursors: &self.cursors };
+        // The cursor guard is held for this call and no longer: `build_plan` reads the cursors and
+        // does no I/O, so the lock is never held across an `await`. It is a named binding rather
+        // than an inline temporary because `PlanView` borrows it for the length of the call.
+        let cursors = self.shared.cursors();
+        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors };
         let plan = build_plan(&input, &view, now_ms());
         if self.settings.failover_enabled {
             return plan;
@@ -631,8 +726,8 @@ impl<'a> ModelRouter<'a> {
             };
             execute_text(
                 self.adapters,
-                &mut self.health,
-                Some(&self.limiter),
+                self.shared.health(),
+                Some(self.shared.limiter()),
                 args,
                 cancel,
                 &mut counting,
@@ -694,7 +789,7 @@ impl<'a> ModelRouter<'a> {
                 .unwrap_or(0);
                 row.fallback_chain_json = chain_json(&success.attempts);
                 let provider = success.candidate.provider.id.clone();
-                self.ledger.append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
+                self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
                 self.advance_cursor(&provider);
                 return Ok(());
             }
@@ -747,7 +842,7 @@ impl<'a> ModelRouter<'a> {
             .map(|c| c.model.native_id.clone())
             .unwrap_or_else(|| requested_model.to_string());
         row.fallback_chain_json = chain_json(attempts);
-        self.ledger.append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
+        self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
         Ok(())
     }
 
@@ -783,10 +878,15 @@ impl<'a> ModelRouter<'a> {
             size: None,
             max_attempts: None,
         };
-        let served =
-            execute_image(self.adapters, &mut self.health, Some(&self.limiter), args, cancel)
-                .await
-                .map_err(RouterError::Image)?;
+        let served = execute_image(
+            self.adapters,
+            self.shared.health(),
+            Some(self.shared.limiter()),
+            args,
+            cancel,
+        )
+        .await
+        .map_err(RouterError::Image)?;
 
         let now = now_ms();
         let mut row = ledger_row(now, IMAGE, opts.source());
@@ -797,7 +897,7 @@ impl<'a> ModelRouter<'a> {
         row.model = served.candidate.model.native_id.clone();
         row.latency_ms = Some(now - t0);
         row.fallback_chain_json = chain_json(&served.attempts);
-        self.ledger.append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
+        self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
         self.advance_cursor(&served.candidate.provider.id);
 
         Ok(ImageResult { url: served.url, base64: served.base64 })
@@ -861,7 +961,10 @@ impl<'a> ModelRouter<'a> {
     pub fn system_ai_available(&self) -> SystemAiHealth {
         let now = now_ms();
         let active = |provider_id: &str| {
-            self.store.keys_of(provider_id).iter().any(|k| self.health.is_key_usable(k, now))
+            self.store
+                .keys_of(provider_id)
+                .iter()
+                .any(|k| self.shared.health().is_key_usable(k, now))
         };
         let usable = |provider_id: &str| {
             self.store.get_provider(provider_id).is_some_and(HealthTracker::is_provider_usable)
@@ -968,8 +1071,8 @@ impl<'a> ModelRouter<'a> {
                 let mut sink = |chunk: &str| text.push_str(chunk);
                 execute_text(
                     self.adapters,
-                    &mut self.health,
-                    Some(&self.limiter),
+                    self.shared.health(),
+                    Some(self.shared.limiter()),
                     args,
                     &cancel,
                     &mut sink,
@@ -992,7 +1095,7 @@ impl<'a> ModelRouter<'a> {
             // Zero, and the source passes zero explicitly (`:318`) — this row measures that a
             // completion happened, not how long it took.
             row.latency_ms = Some(0);
-            self.ledger.append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
+            self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
             timer.abort();
             return Ok(text);
         }
@@ -1004,16 +1107,20 @@ impl<'a> ModelRouter<'a> {
     // ---------- cursors and attribution ----------
 
     pub fn next_key_cursor(&self, provider_id: &str) -> i64 {
-        self.cursors.get(provider_id).copied().unwrap_or(0)
+        self.shared.cursor(provider_id)
     }
 
     /// Advance the round-robin cursor for a provider after it served. The source's `advanceCursor`
     /// (`model-router.ts:344-346`) increments rather than wrapping; `order_keys` reduces it modulo
     /// the usable key count, so an unbounded cursor is fine and an `i64` will not overflow in any
     /// life of this process.
-    pub fn advance_cursor(&mut self, provider_id: &str) {
-        let next = self.next_key_cursor(provider_id) + 1;
-        self.cursors.insert(provider_id.to_string(), next);
+    ///
+    /// **`&self`, where it used to be `&mut self`, and the sharing is why.** The cursor map lives
+    /// in [`SharedRouterState`] behind its own lock, so advancing a cursor is a change to shared
+    /// state rather than a change to this router — and two concurrent requests must both be able
+    /// to advance it, which a `&mut self` borrow forbids.
+    pub fn advance_cursor(&self, provider_id: &str) {
+        self.shared.advance(provider_id);
     }
 
     /// R2: normalized pricing for a catalog model (`None` = unknown, NOT free).
@@ -1049,7 +1156,7 @@ impl<'a> ModelRouter<'a> {
         row.error_class = Some(NO_ROUTE.to_string());
         row.latency_ms = Some(now - t0);
         row.fallback_chain_json = chain_json(&[]);
-        self.ledger.append(row).map_err(|e| RouterError::Ledger(e.to_string()))
+        self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))
     }
 }
 
@@ -1539,7 +1646,7 @@ mod tests {
         assert_eq!(served.candidate.key.id, "k1");
         assert_eq!(router.next_key_cursor("p1"), 1, "a served provider advances its cursor");
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "ok");
         assert_eq!(row.source, "gateway");
         assert_eq!(row.provider_id.as_deref(), Some("p1"));
@@ -1568,7 +1675,7 @@ mod tests {
             .expect("the engine reports Ok — nothing threw");
 
         assert_eq!(served.candidate.provider.id, "p1", "the engine's own answer is unchanged");
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "error");
         assert_eq!(row.error_class.as_deref(), Some("PARSE_ERROR"));
         assert_eq!(row.provider_id, None, "no provider produced a token, so none is named");
@@ -1598,7 +1705,7 @@ mod tests {
 
         assert!(matches!(text_failure(&error), TextFailure::AllAttemptsFailed { .. }));
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "error");
         assert_eq!(row.error_class.as_deref(), Some("NETWORK"), "the last attempt's class");
         assert_eq!(
@@ -1632,7 +1739,7 @@ mod tests {
             .await
             .expect("the second key serves");
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "ok", "the request as a whole succeeded");
         assert_eq!(row.http_status, None, "the ok row names no status — the source's shape");
         assert_eq!(
@@ -1661,7 +1768,7 @@ mod tests {
             .expect_err("cancelled before the first candidate");
 
         assert!(matches!(text_failure(&error), TextFailure::Cancelled { .. }));
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.error_class.as_deref(), Some("CANCELLED"));
         assert_eq!(row.provider_id, None);
         assert_eq!(adapter.calls().len(), 0, "a cancelled request takes no slot and no call");
@@ -1687,7 +1794,7 @@ mod tests {
             other => panic!("expected NoRoute, got {other:?}"),
         }
         assert_eq!(adapter.calls().len(), 0);
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "error");
         assert_eq!(row.error_class.as_deref(), Some("NO_ROUTE"));
         assert_eq!(row.model, "ghost");
@@ -1713,7 +1820,7 @@ mod tests {
             )
             .await;
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.app_key_id.as_deref(), Some("app-7"));
         assert_eq!(row.source, "gateway");
     }
@@ -1735,7 +1842,7 @@ mod tests {
             .await
             .expect("served");
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.source, "gateway");
         assert_eq!(row.app_key_id.as_deref(), Some("app-9"));
     }
@@ -1752,7 +1859,7 @@ mod tests {
             .await
             .expect("served");
 
-        assert_eq!(rows(router.ledger())[0].source, DEFAULT_SOURCE);
+        assert_eq!(rows(&router.ledger())[0].source, DEFAULT_SOURCE);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1776,7 +1883,7 @@ mod tests {
 
         // 1M in at 150_000 micros + 1M out at 600_000 = 750_000 micros. If the router read the
         // cache shape with the raw-catalog reader this would be 750_000_000_000_000.
-        assert_eq!(rows(router.ledger())[0].cost_estimate_micros, 750_000);
+        assert_eq!(rows(&router.ledger())[0].cost_estimate_micros, 750_000);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -1792,7 +1899,7 @@ mod tests {
             .await
             .expect("served");
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.cost_estimate_micros, 0, "unknown pricing is 0 in the column");
         assert_eq!(
             router.pricing_for(&model("p1", "m1", TEXT)),
@@ -1911,7 +2018,7 @@ mod tests {
         assert_eq!(result.base64.as_deref(), Some("AAAA"));
         assert_eq!(result.url, None);
         assert_eq!(router.next_key_cursor("p1"), 1);
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.modality, IMAGE);
         assert_eq!(row.status, "ok");
         assert_eq!(row.provider_id.as_deref(), Some("p1"));
@@ -1941,7 +2048,7 @@ mod tests {
             .await
             .expect("the second key serves");
 
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.status, "ok");
         assert_eq!(row.key_id.as_deref(), Some("k2"));
         let entries = chain(row);
@@ -2085,7 +2192,7 @@ mod tests {
         // *something* and failed leaves no trace, while a text request in the same position
         // leaves one. Pinned here because it is the kind of asymmetry a later reader "fixes".
         assert_eq!(
-            rows(router.ledger()).len(),
+            rows(&router.ledger()).len(),
             0,
             "a failed image plan writes nothing — only the empty-plan path records a no-route row"
         );
@@ -2128,7 +2235,7 @@ mod tests {
             vec!["text:key:k2|good".to_string()],
             "the configured pick is tried first, so no other candidate is reached"
         );
-        let row = &rows(router.ledger())[0];
+        let row = &rows(&router.ledger())[0];
         assert_eq!(row.source, GENERATOR_SOURCE);
         assert_eq!(row.provider_id.as_deref(), Some("p2"));
         assert_eq!(row.latency_ms, Some(0), "the source writes zero here, not a measurement");
@@ -2207,7 +2314,7 @@ mod tests {
             vec!["text:key:k1|m1".to_string(), "text:key:k3|m2".to_string()],
             "p1's second key is never tried — the engine saw an empty stream as served"
         );
-        assert_eq!(rows(router.ledger()).len(), 1, "only the successful attempt is recorded");
+        assert_eq!(rows(&router.ledger()).len(), 1, "only the successful attempt is recorded");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2240,7 +2347,7 @@ mod tests {
         // The engine's own message count is the observable: two messages with a system prompt,
         // one without. Asserted through the router rather than by reaching into the engine.
         assert_eq!(adapter.calls().len(), 2);
-        assert_eq!(rows(router.ledger()).len(), 2);
+        assert_eq!(rows(&router.ledger()).len(), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2266,7 +2373,7 @@ mod tests {
             "not NoRoute: the source's message has no \"no route\" phrase, so the gateway answers \
              500 rather than 404"
         );
-        assert!(rows(router.ledger()).is_empty(), "a request that never planned writes no row");
+        assert!(rows(&router.ledger()).is_empty(), "a request that never planned writes no row");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2288,7 +2395,7 @@ mod tests {
             .expect_err("the timeout ends it");
 
         assert_eq!(error.message(), "system AI: no healthy text provider available");
-        assert!(rows(router.ledger()).is_empty());
+        assert!(rows(&router.ledger()).is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -2536,10 +2643,10 @@ mod tests {
         // check that only read `key.status` would say "available" while every request failed.
         let store = one_provider();
         let adapters = Always(Scripted::new(vec![]));
-        let mut router = ModelRouter::new(&store, &adapters);
+        let router = ModelRouter::new(&store, &adapters);
         assert!(router.system_ai_available().available, "usable to start with");
 
-        router.health.record_result("k1", ErrorClass::RateLimited, Some(60_000), now_ms());
+        router.health().record_result("k1", ErrorClass::RateLimited, Some(60_000), now_ms());
         assert!(
             !router.system_ai_available().available,
             "cooled for a minute, so not available now"
@@ -2693,5 +2800,128 @@ mod tests {
              than a factor of two — the decision is now also about `generate_text`, and the note on \
              `RouterError` needs re-arguing rather than extending"
         );
+    }
+
+    // ---------- shared request state ----------
+
+    /// **The property, stated end to end and through the engine rather than around it.** A request
+    /// that fails with a `429` on one router cools the key for a request served by another.
+    ///
+    /// The tests below assert that a *tracker* is shared. This asserts that a *request* changes what
+    /// the next request does, which is what the bridge actually needs — and it is the one that fails
+    /// if `generate_text` ever hands the engine a tracker of its own rather than the shared one, a
+    /// mistake that leaves every mechanism-level test in this section green.
+    #[tokio::test]
+    async fn a_rate_limited_request_on_one_router_cools_the_key_for_the_next() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![Err(refusal(429))]));
+        let shared = SharedRouterState::new();
+        let mut a = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+        let b = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+
+        assert!(b.system_ai_available().available, "usable to start with");
+        let result =
+            a.generate_text(text_req("m1"), &opts("gateway"), &Cancel::new(), &mut |_| {}).await;
+        assert!(result.is_err(), "a 429 on the provider's only key is a failed request");
+
+        assert!(
+            !b.system_ai_available().available,
+            "the cooldown A's request recorded must reach B, or every concurrent request retries a \
+             key the previous one already proved is rate limited"
+        );
+    }
+
+    /// Two routers built from one [`SharedRouterState`] share one circuit breaker.
+    ///
+    /// This is the property a concurrent bridge depends on. The cooldown one request records has to
+    /// reach the next request, or every request retries a key the previous one already proved is
+    /// rate limited — which is the whole reason the breaker exists.
+    #[test]
+    fn two_routers_from_one_shared_state_share_the_circuit_breaker() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![]));
+        let shared = SharedRouterState::new();
+        let a = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+        let b = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+
+        assert!(b.system_ai_available().available, "usable to start with");
+        a.health().record_result("k1", ErrorClass::RateLimited, Some(60_000), now_ms());
+        assert!(
+            !b.system_ai_available().available,
+            "the cooldown A recorded must reach B, or B retries a key that is already cooled"
+        );
+    }
+
+    /// **The control, and without it the test above proves nothing.** If the breaker were process
+    /// state rather than router state, `two_routers_from_one_shared_state_share_the_circuit_breaker`
+    /// would pass for a reason that has nothing to do with sharing. This pins that `new()` really
+    /// does give each router its own, so the pair says "sharing happens *because* the state was
+    /// shared" rather than merely "sharing happens".
+    #[test]
+    fn two_routers_without_shared_state_keep_their_own_breaker() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![]));
+        let a = ModelRouter::new(&store, &adapters);
+        let b = ModelRouter::new(&store, &adapters);
+
+        a.health().record_result("k1", ErrorClass::RateLimited, Some(60_000), now_ms());
+        assert!(b.system_ai_available().available, "B never saw A's cooldown");
+    }
+
+    /// The key cursor is shared, which is what keeps the round-robin rotating across requests.
+    ///
+    /// **This is the piece a per-request router would lose silently.** Every request starting on
+    /// key zero is not a smaller version of round-robin — it is no round-robin at all, and no
+    /// existing test would notice, because every one of them builds a single router and never asks
+    /// a second one where it would start.
+    #[test]
+    fn two_routers_from_one_shared_state_share_the_key_cursor() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![]));
+        let shared = SharedRouterState::new();
+        let a = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+        let b = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+
+        assert_eq!(a.next_key_cursor("p1"), 0, "a fresh cursor starts at zero");
+        a.advance_cursor("p1");
+        assert_eq!(b.next_key_cursor("p1"), 1, "B starts where A left off, not at zero");
+
+        let private = ModelRouter::new(&store, &adapters);
+        assert_eq!(private.next_key_cursor("p1"), 0, "an unshared router keeps its own");
+    }
+
+    /// The ledger is shared, so a row written through one router is readable through another.
+    #[test]
+    fn two_routers_from_one_shared_state_share_one_ledger() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![]));
+        let shared = SharedRouterState::new();
+        let a = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+        let b = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+
+        assert!(rows(&b.ledger()).is_empty());
+        a.ledger().append(ledger_row(now_ms(), TEXT, "gateway")).unwrap();
+        assert_eq!(rows(&b.ledger()).len(), 1, "A's row is in B's ledger");
+        assert_eq!(rows(&b.ledger())[0].source, "gateway");
+    }
+
+    /// The limiter is shared through the state, which is what makes a settings change reach every
+    /// request rather than only the router that applied it.
+    ///
+    /// `ProviderLimiter` is documented as sharing one budget across its clones, so what this pins is
+    /// that `SharedRouterState` clones the *handle* rather than building a second limiter — the
+    /// failure mode of a `Clone` that copied a non-`Arc` field instead of sharing it.
+    #[test]
+    fn a_settings_change_on_one_router_reaches_the_other_through_the_limiter() {
+        let store = one_provider();
+        let adapters = Always(Scripted::new(vec![]));
+        let shared = SharedRouterState::new();
+        let a = ModelRouter::new(&store, &adapters).with_shared(shared.clone()).with_settings(
+            RouterSettings { per_provider_concurrency: json!(3), ..Default::default() },
+        );
+        let b = ModelRouter::new(&store, &adapters).with_shared(shared.clone());
+
+        a.sync_concurrency();
+        assert_eq!(b.limiter().max_per_provider(), 3, "the cap A applied is the cap B reads");
     }
 }

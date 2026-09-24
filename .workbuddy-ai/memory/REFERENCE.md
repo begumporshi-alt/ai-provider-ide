@@ -836,6 +836,26 @@ before concluding it hung — and note `ps` is **not permitted** in this sandbox
 available as a liveness check. Redirect the gate to a file rather than piping it: a pipeline's exit status is the
 last command's, so `| tail` reports `tail`'s status and buffers until exit.
 
+### Two ways the gate's answer disagrees with the tree (2026-09-24)
+
+**`cargo fmt --check` colours its diff even when redirected.** A `> /tmp/fmt.txt` capture is therefore not a
+clean capture, and a `^[-+]` line count is neither zero on a dirty tree nor obviously non-zero — the SGR
+escapes sit *before* the `+`. Pass `-- --color=never` (the block above omits it), and treat "the output was
+empty" as the signal rather than a line count.
+
+**A restore that preserves mtime leaves the build stale, and the stale binary keeps the mutation.** The probe
+harness reverts a mutation by writing the saved bytes back, and a copy that preserves timestamps
+(`shutil.copy2`, `os.utime`) restores the *old* mtime too. Cargo's freshness check is mtime-based: an artifact
+compiled from the mutated source at 17:35 still looks newer than a source restored to 17:30, cargo does not
+relink, and `cargo test` goes on running the mutation. Measured on 2026-09-24 — `engine.rs` **17:30:17** and
+`router.rs` **17:31:13** against a test binary built **17:35:53**, with the source byte-correct (`md5` identical
+before and after the fix) and **15 tests red**, every one of them in the key-health family — precisely probe
+P6's blast radius (`record_result` writing to a copy).
+
+**`touch` the sources after any probe run**, and read a red gate as "which binary am I running?" before "what
+did I break?". The tell is that `--lib` and `--test-threads=1` fail *identically*: a parallelism artifact goes
+green single-threaded, a stale build does not.
+
 ## CI runs again — the billing block was a *private*-repo artefact (corrected 2026-09-22)
 **This section previously claimed CI was dead. That was wrong, and the way it was wrong cost four
 runs of misdiagnosis.** GitHub Actions bills minutes for *private* repos; the account's block
@@ -2033,6 +2053,21 @@ Both timeouts this session came from all six proxy vars pointing at `http://127.
 and **502** the next, which proves the proxy. **A proxy `502` satisfies a "status != 000" readiness loop**, so
 the loop exits instantly and every probe after it measures the proxy. The trap is that the *symptom* — a 60 s
 `webServer` timeout — is identical to the bulk-delete guard's.
+
+**The discriminator is `DEBUG=pw:webserver`.** It prints the child's own output, so `ECONNREFUSED` means nothing
+is listening, while a non-2xx means something *is* answering (usually the proxy). Without it the two causes are
+indistinguishable from the outside, and the 60 s number invites the wrong conclusion.
+
+**The guard's own route into a `webServer` timeout is vite's dev server.** It removes
+`node_modules/.vite/deps` at startup (`loadCachedDepOptimizationMetadata`); the guard refuses (count **285** vs
+threshold 50); vite exits 1 with `error when starting dev server` — a message Playwright never shows, only the
+prefixed 60 s timeout. `web-test:clean` therefore moves `node_modules/.vite` aside too, and it must run
+**after** `pnpm build`, because `vite build` writes the very dep cache the dev server then removes. An
+out-of-band `mv .vite` by hand does not stick, for exactly that reason. Cost of the cold start: **303 ms**.
+
+*(A previous `MEMORY.md` line also claimed "`npm`'s prune hits it too — test `-L`, not `-e`". No record of that
+measurement exists in this project's notes, and the two flag names mix `find` and `test` semantics, so the claim
+was dropped rather than carried forward. Re-derive it before trusting it.)*
 
 ## Releasing — the self-verifying pipeline (2026-09-23)
 
@@ -4043,3 +4078,117 @@ mutation in place; the next run adopted the mutated file as "pristine" and resto
 `NeverReadyBridge::ready` silently became `true` (the file was exactly one byte smaller). **Check every anchor
 before mutating anything, and abort the whole run if one is missing** — a missing anchor means the file is not
 what you think it is. The per-probe restore protects against a *failing* probe, not against the harness dying.
+
+## Increment 24b-ii-a — the state a concurrent bridge has to share (2026-09-24)
+
+24b-ii was the plan's next step and could not be taken as written: reconnaissance found the driver's own
+prerequisite missing, so the increment split. **24b-ii-a** is the shared router state (this section);
+**24b-ii-b** is `core/router_bridge.rs`. Register **D38** — the plan row names one deliverable and no
+prerequisite.
+
+### The blocker: `ModelRouter` cannot serve two requests at once
+
+`Bridge` must be `'static` and serve concurrently. Three measurements say `ModelRouter` cannot:
+
+1. `execute_text` / `execute_image` took `health: &mut HealthTracker` and held it for the **whole request**
+   (`engine.rs:894`, `:614`).
+2. `generate_text` / `generate_image` took `&mut self` (`router.rs:551`, `:760`).
+3. The breaker, the cursors and the ledger were **private fields** of a router that would therefore have to be
+   rebuilt per request.
+
+### Both obvious driver shapes are defects, not compromises
+
+| Shape | What breaks |
+|---|---|
+| `Mutex<ModelRouter>` | Serialises **every** model call — §3.5's two semaphores and their 40 permits become decorative |
+| One router per request | Each request gets a private breaker and ledger, and a cursor that never advances past zero — the round-robin stops existing, **silently** |
+
+The second is the dangerous one: **no existing test would notice, because every one of them builds a single
+router.** A shape that deletes a feature and keeps the suite green is the shape to reject.
+
+### The shape taken: `ProviderLimiter`'s
+
+`limiter.rs:135` already solved this — `#[derive(Clone)]` over an `Arc`, interiorly mutable, "shared between
+the router (which changes the cap at runtime) and the engine (which consults it per candidate)". The new state
+follows it exactly.
+
+```rust
+#[derive(Clone, Default)]
+pub struct SharedRouterState {
+    health: Arc<HealthTracker>,
+    cursors: Arc<Mutex<HashMap<String, i64>>>,
+    ledger: Arc<Mutex<UsageLedger>>,
+    limiter: ProviderLimiter,
+}
+```
+
+`new()`, `health()`, `limiter()`, `ledger() -> MutexGuard<'_, UsageLedger>`, `cursors()`, `cursor(&str)`,
+`advance(&str)`, `with_ledger(UsageLedger)`. Three fields are `Arc`s and `ProviderLimiter` is itself an `Arc`
+wrapper, so **cloning per request copies no state** — which is the point of one type rather than four `with_*`
+calls a caller can half-forget.
+
+### The two supporting changes
+
+- **`HealthTracker`** now holds `keys: Mutex<HashMap<String, KeyHealth>>`; `record_result` and `reset_key` are
+  `&self`. The lock is held per *record*, never across an `await`, and it is never poisoned because
+  `panic = "abort"` — no poison handling is written, deliberately. New `key_health(&self, key_id) ->
+  Option<KeyHealth>` (documented: `None` ≠ `Some(KeyHealth::default())`) plus a `#[cfg(test)] keys()` guard
+  accessor for the 14 existing `t.keys[…]` assertions.
+- **`ModelRouter<'a>`** now holds `store`, `adapters`, `shared: SharedRouterState`, `pub settings`. `new()`
+  builds its own shared state; `with_shared(SharedRouterState)` is the concurrent constructor; `with_ledger`
+  replaces only the ledger. **`ledger_mut()` is deleted** — no callers, and a `&mut UsageLedger` escaping the
+  lock is exactly what sharing prevents. `advance_cursor` is now `&self`.
+
+### Counts and gates
+
+Rust **1128 → 1134**, headless **1068 → 1074**; **no behaviour change**, and the count is the proof — 1128/0
+before the refactor, 1133/0 after the five mechanism tests, 1134/0 with the end-to-end one. `cargo fmt --check`
+clean (after one `cargo fmt`), `cargo clippy --all-targets -- -D warnings` clean, `cargo check
+--no-default-features --all-targets` clean.
+
+Six tests: five mechanism-level (shared breaker; *unshared* breaker; shared cursor; one ledger; a settings
+change reaching the other router through the limiter) plus one end-to-end — a rate-limited `generate_text` on
+router A cooling the key for router B.
+
+### Six probes, all red, both files byte-exact
+
+`1b5ac27f…` router, `fd01c1f7…` engine.
+
+| # | Mutation | Result |
+|---|---|---|
+| P1 | `with_shared` ignores its argument | 5 expected red / 5 red / 0 expected-green failures |
+| P2 | the cursor never advances | red |
+| P3 | `new()` hands out one process-wide instance | red |
+| P4 | `Clone` rebuilds the limiter | red |
+| P5 | `generate_text` passes a private tracker | **exactly one test red — the end-to-end one** |
+| P6 | `record_result` writes to a copy | red |
+
+**P5 is the finding.** Every mechanism-level test stayed green while the request path passed a private copy, so
+no test of the *state* would have caught it. That is the argument for pinning a concurrency property
+end-to-end, not only at the seam.
+
+### Two instrument notes
+
+- **The probe harness's compile detector was too broad.** `"error: " in out` matches `error: test failed`,
+  which `cargo test` prints for an ordinary assertion failure — so all six probes reported `INVALID` on the
+  first run despite the transcript showing real reds. A compile check must be `"could not compile" in out or
+  re.search(r"^error\[E\d+\]", out, re.M)`.
+- **Counting entries is not identifying them.** `grep -c "^| \*\*D3[5-9]\*\*"` returned 3 then 4 and could not
+  say *which*; the register had to be checked by name.
+
+### What is deliberately left to 24b-ii-b
+
+Three questions the driver must answer, recorded rather than guessed:
+
+1. **The operator's gateway-tools toggle.** `GatewayCore` owns `tools_enabled` privately and the bridge may not
+   hold the core (cycle avoidance). Either the wiring shares one `Arc<AtomicBool>`, or the bridge reads the
+   persisted setting from the store. The *handlers* already strip client `tools`/`tool_choice`/
+   `response_format` when it is off (`gateway_handlers.rs:64`, `gateway_anthropic.rs:343`,
+   `gateway_responses.rs:248`) — so the bridge's use of `decide_tool_ownership` governs its **own supplied
+   registry** only.
+2. **No production `LedgerSink` impl exists.** `UsageLedger` has `with_sink(Box<dyn LedgerSink + Send +
+   Sync>)` and the trait is defined (`ledger.rs:50`), but nothing implements it. The driver must supply the
+   store-backed one, and `ledger_insert` is `#[cfg(feature = "app")]` (`persist.rs:505`) — so the split needs a
+   decision.
+3. **`get_tools_enabled` and the router settings must not become a second spelling of state the core already
+   holds.**

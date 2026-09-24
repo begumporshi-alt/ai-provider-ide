@@ -1999,7 +1999,8 @@ one is the deletion:
 | **24a — landed** | Move the tool host from `tauri/tools.rs` into `core/tools.rs`, where the bridge can reach it |
 | **24b-i — landed** | `core/bridge_policy.rs` — the bridge's decisions with no I/O: status, tool ownership, the held-prose gate, the turn outcome, call collection, the retry hint |
 | **24c — landed** | `Bridge::ready` — the seam that decides *whose* question readiness is, so a Rust bridge is not measured against a webview's liveness rule (D35). It is a prerequisite of 24b-ii, not a follow-up: installing a Rust bridge without it ships a five-second stall plus a 503 on every request |
-| 24b-ii | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle` |
+| **24b-ii-a — landed** | `SharedRouterState` — the state every request must see one copy of: the circuit breaker, the key cursors, the ledger and the limiter. A prerequisite of 24b-ii, not a follow-up: `execute_text`'s `&mut HealthTracker` and `ModelRouter`'s `&mut self` made "two requests at once" unrepresentable, so the driver could only have been written serialising or with per-request state (D38) |
+| 24b-ii-b | `core/router_bridge.rs` — the driver: a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime`, writing to `ReplyHandle` |
 | **25** | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, switch `build_core` — **and retire the webview-liveness subsystem, which this row had not named (D35)** |
 
 **Increment 22 — the request normalizer.** `core/gateway_normalizer.rs` is a pure module: no I/O, no
@@ -2412,6 +2413,74 @@ all-at-once — the day the gateway stops dispatching through the bridge, both h
 is a statement about the last step, not about the whole change, and it is why Phase 5 exists. The
 distinction matters because the paragraph as written argues against the strategy that actually
 worked, and a reader could have taken it as a reason not to start.
+
+**Increment 24b-ii-a — the state a concurrent bridge has to share.** 24b-ii was the plan's next step, and
+reconnaissance found it could not be taken as written (D38). The row says the driver runs the tool loop
+"against `ModelRouter` and `AdapterRuntime`" — and `ModelRouter` cannot serve two requests at once. Three
+measurements, each a line of code rather than a reading of it: `execute_text` and `execute_image` take
+`health: &mut HealthTracker` and hold it for the whole request (`engine.rs:894`, `:614`);
+`generate_text` and `generate_image` take `&mut self` (`router.rs:551`, `:760`); and the three pieces that
+must be process-wide — the circuit breaker, the key cursors, the ledger — are private fields of a router
+that would have to be rebuilt per request.
+
+**Both shapes the driver could have been written in are defects, and neither is loud.** A
+`Mutex<ModelRouter>` serialises every model call in the process, which makes §3.5's two semaphores and
+their 40 permits decorative — the tests stay green because none of them measures throughput. One router
+per request is worse, because it is silent in a way a lock is not: each request would cool its own copy of
+a key, write to its own ledger, and start on key zero, so the round-robin that spreads load across a
+provider's keys would stop existing, and **no existing test would notice, because every one of them builds
+a single router**.
+
+**The shape is `ProviderLimiter`'s, applied to the rest of the state.** That type already solved this exact
+problem — `#[derive(Clone)]` over an `Arc`, "shared between the router (which changes the cap at runtime)
+and the engine (which consults it per candidate), so it is `Send + Sync` and interiorly mutable" — so the
+port is a precedent rather than an invention. `HealthTracker` gains a `Mutex` *inside* it and its methods
+become `&self`, which is what lets the engine's parameter become `&HealthTracker`; the lock is taken per
+**record**, never across an `await`, because every method on the type is synchronous. `SharedRouterState`
+then bundles the four pieces behind one `Arc`-backed handle, and `ModelRouter::with_shared` builds a
+request-scoped router from it.
+
+**One type rather than four `with_*` calls, and the reason is the one `ReplyHandle` already records.** A
+wiring step somebody can skip produces a failure that is silent and looks like something else; four setters
+would leave a caller able to share the breaker and the limiter while quietly giving each request its own
+cursors — which is not a smaller version of sharing, it is a different behaviour. `ModelRouter::ledger_mut`
+is **deleted** rather than ported: a `&mut UsageLedger` escaping the lock is the exact thing the sharing
+exists to prevent, and it had no callers.
+
+**Six tests, and the pair is what makes them a claim.**
+`two_routers_from_one_shared_state_share_the_*` assert the sharing;
+`two_routers_without_shared_state_keep_their_own_breaker` asserts that `new()` gives each router its own —
+without it, the sharing tests would pass for a reason that has nothing to do with sharing. The first test
+is deliberately **end to end**: it drives `generate_text` to a `429` on one router and asserts the cooldown
+reaches the next, because the mechanism-level tests would all stay green if `generate_text` handed the
+engine a tracker of its own. That is not hypothetical — P5 below is exactly that mutation, and it reddens
+**one** test: the end-to-end one.
+
+**No behaviour change, and the count is the proof: 1128 / 0 before and 1133 / 0 after** the five
+mechanism-level tests, so every pre-existing test still passes untouched. Rust **1128 → 1134**, headless
+**1068 → 1074** — every new test reachable without the `app` feature. The diff is 440 insertions against 164
+deletions across two files, and the deletions are almost all mechanical: 31 `&mut health` argument sites,
+27 `let mut health` bindings and 14 `t.keys[…]` reads in `engine.rs`, plus 19 `rows(router.ledger())` calls
+in `router.rs` that gain a `&` because `ledger()` now hands out a guard.
+
+**Six falsification probes, all red, both files byte-exact** (`1b5ac27f…`, `fd01c1f7…`): `with_shared`
+ignoring its argument, the cursor never advancing, `new()` handing out one process-wide instance, `Clone`
+rebuilding the limiter instead of sharing it, `generate_text` passing a private tracker, and
+`record_result` writing to a copy of the map. **The first probe's tally is the interesting one** — 5
+expected red, 5 red, 0 expected-green failures — because it shows the control and the sharing tests measure
+different things rather than the same thing twice.
+
+**A red gate that was the build, not the code.** The first full `cargo test` after this increment returned
+**1119 passed / 15 failed**, every failure in the key-health family, and the first one examined asserted that
+`record_result` had inserted a key and found `0` — probe P6's mutation exactly. So the first reading was a
+revert that had not landed. It had. The source was byte-correct (`md5` identical before and after the fix) and
+the **artifact** was stale: the harness restores a mutation by writing the saved bytes back, and a restore that
+preserves timestamps restores the *old* mtime too, so cargo's mtime-based freshness check saw a source older
+than a binary compiled from the mutated text and declined to relink. `touch`ing the two files gave **1134 / 0**,
+and **1074 / 0** without the `app` feature. The tell is that `--lib` alone and `--test-threads=1` fail
+*identically* — a parallelism artifact goes green single-threaded, a stale build cannot. **`touch` the sources
+after a probe run, and read a red gate as "which binary am I running?" before "what did I break?"** Every gate
+was then re-run against the fresh build, because a stale cache discredits the earlier results too.
 
 ---
 

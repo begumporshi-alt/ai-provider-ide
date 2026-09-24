@@ -41,6 +41,7 @@
 //! `the_enforced_floor_and_the_reported_floor_agree` is what keeps it that way.
 
 use std::collections::HashMap;
+use std::sync::Mutex;
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -611,7 +612,7 @@ pub struct ImageSuccess {
 /// as D22; `an_image_refusal_cools_its_key_by_the_floor_not_the_named_wait` pins it.
 pub async fn execute_image(
     adapters: &dyn AdapterFactory,
-    health: &mut HealthTracker,
+    health: &HealthTracker,
     limiter: Option<&ProviderLimiter>,
     args: ExecuteImageArgs,
     cancel: &Cancel,
@@ -891,7 +892,7 @@ pub enum TextFailure {
 #[allow(clippy::result_large_err)]
 pub async fn execute_text(
     adapters: &dyn AdapterFactory,
-    health: &mut HealthTracker,
+    health: &HealthTracker,
     limiter: Option<&ProviderLimiter>,
     mut args: ExecuteTextArgs<'_>,
     cancel: &Cancel,
@@ -1104,9 +1105,21 @@ pub struct KeyHealth {
 
 /// Per-key and per-provider circuit state, kept free of I/O so failover ordering can be tested
 /// against it (TS `health-tracker.ts`).
+///
+/// **Interiorly mutable, and that is what makes a concurrent bridge possible.** This tracker is
+/// process-wide state — one breaker, one cooldown per key — so every request must see the same one.
+/// The engine used to take `&mut HealthTracker` and hold it for the whole of a request, which made
+/// "two requests at once" unrepresentable: the borrow checker forced the caller to serialise, and
+/// the serialisation stayed invisible until something tried to serve two clients. A `Mutex` inside
+/// the type, rather than a `&mut` at the boundary, keeps the sharing honest — and the lock is taken
+/// per *record*, never across an `await`, because every method here is synchronous.
+///
+/// The `Mutex` is never observed poisoned: `panic = "abort"` (`Cargo.toml`), so a panic that held
+/// this lock does not unwind past it. `.lock().unwrap()` is therefore this crate's existing
+/// convention rather than a new bet.
 #[derive(Debug, Default)]
 pub struct HealthTracker {
-    keys: HashMap<String, KeyHealth>,
+    keys: Mutex<HashMap<String, KeyHealth>>,
 }
 
 impl HealthTracker {
@@ -1127,7 +1140,7 @@ impl HealthTracker {
         // A read must not create an entry. The TypeScript `health()` inserts on read, which grows
         // the map for every key ever *considered*; the answer is identical either way, because an
         // absent entry means default health.
-        if let Some(h) = self.keys.get(&key.id) {
+        if let Some(h) = self.keys.lock().unwrap().get(&key.id) {
             if h.breaker_open || h.cooldown_until_ms > now_ms {
                 return false;
             }
@@ -1150,14 +1163,18 @@ impl HealthTracker {
     /// `retry_after_ms` is what the provider asked us to wait, and the cooldown is floored at
     /// [`COOLDOWN_FLOOR_MS`] — the same constant [`min_retry_after_ms`] uses, so the wait enforced
     /// and the wait reported are one number rather than two 1000s free to drift apart.
+    ///
+    /// `&self`, not `&mut self`: the tracker is shared, so a request records through it rather than
+    /// owning it. See the type's note for why that is the shape a concurrent bridge needs.
     pub fn record_result(
-        &mut self,
+        &self,
         key_id: &str,
         cls: ErrorClass,
         retry_after_ms: Option<u64>,
         now_ms: i64,
     ) {
-        let h = self.keys.entry(key_id.to_string()).or_default();
+        let mut keys = self.keys.lock().unwrap();
+        let h = keys.entry(key_id.to_string()).or_default();
         match cls {
             ErrorClass::Ok => {
                 h.consecutive_auth_failures = 0;
@@ -1190,8 +1207,33 @@ impl HealthTracker {
     }
 
     /// Forget everything known about a key.
-    pub fn reset_key(&mut self, key_id: &str) {
-        self.keys.remove(key_id);
+    pub fn reset_key(&self, key_id: &str) {
+        self.keys.lock().unwrap().remove(key_id);
+    }
+
+    /// What is recorded about one key, or `None` when nothing has been.
+    ///
+    /// **`None` is not `Some(KeyHealth::default())`, and the distinction is the reason this returns
+    /// an `Option`.** An absent entry and an entry whose every field sits at its default are
+    /// different findings: the first means no attempt has touched this key, the second means
+    /// attempts were recorded and changed nothing. [`HealthTracker::record_result`] inserts an entry
+    /// even for the classes that leave health alone, so both states are reachable — and a caller
+    /// that flattened them could not tell "never tried" from "tried, no effect".
+    pub fn key_health(&self, key_id: &str) -> Option<KeyHealth> {
+        self.keys.lock().unwrap().get(key_id).copied()
+    }
+
+    /// The raw map, for tests that assert on the shape of what was recorded.
+    ///
+    /// **Test-only on purpose.** Production readers want [`HealthTracker::key_health`], which
+    /// answers the only question that exists outside a test — "what is recorded about this key?" —
+    /// and does not hand out the map's own type. This exists because fourteen assertions in this
+    /// module compare a whole `KeyHealth` or read one field off it, and rewriting each of them
+    /// through `key_health(..).unwrap()` would be fourteen chances to change what is being asserted
+    /// while claiming only to have moved it.
+    #[cfg(test)]
+    pub(crate) fn keys(&self) -> std::sync::MutexGuard<'_, HashMap<String, KeyHealth>> {
+        self.keys.lock().unwrap()
     }
 }
 
@@ -1404,16 +1446,20 @@ mod tests {
 
     #[test]
     fn a_rate_limited_key_is_cooled_for_at_least_the_floor() {
-        let mut asked = HealthTracker::new();
+        let asked = HealthTracker::new();
         asked.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
-        assert_eq!(asked.keys["k1"].cooldown_until_ms, NOW + 60_000, "the provider's wait is kept");
+        assert_eq!(
+            asked.keys()["k1"].cooldown_until_ms,
+            NOW + 60_000,
+            "the provider's wait is kept"
+        );
 
         // A sub-second wait, and no wait at all, both land on the floor.
         for wait in [Some(400u64), Some(0), None] {
-            let mut t = HealthTracker::new();
+            let t = HealthTracker::new();
             t.record_result("k1", ErrorClass::RateLimited, wait, NOW);
             assert_eq!(
-                t.keys["k1"].cooldown_until_ms,
+                t.keys()["k1"].cooldown_until_ms,
                 NOW + COOLDOWN_FLOOR_MS as i64,
                 "wait {wait:?} must be floored, not honoured as-is"
             );
@@ -1426,9 +1472,9 @@ mod tests {
         // tracker *enforces* must equal the wait the client is *told*. Two hardcoded 1000s would
         // be free to drift apart; here one constant backs both, and this is what keeps it so.
         for ms in [1u64, 400, 999, 1000, 1001, 30_000, 60_000] {
-            let mut t = HealthTracker::new();
+            let t = HealthTracker::new();
             t.record_result("k1", ErrorClass::RateLimited, Some(ms), NOW);
-            let enforced = t.keys["k1"].cooldown_until_ms - NOW;
+            let enforced = t.keys()["k1"].cooldown_until_ms - NOW;
             let reported = min_retry_after_ms(&[outcome(ErrorClass::RateLimited, 429, Some(ms))]);
             assert_eq!(enforced, reported as i64, "provider named {ms}ms");
         }
@@ -1440,42 +1486,42 @@ mod tests {
         // for the floor; the report returns 0, which means *omit the header*, after which the
         // middleware's own floor applies. Both end up telling the client to wait — only the
         // reporting path defers. Pinned so the divergence is a decision rather than a surprise.
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         t.record_result("k1", ErrorClass::RateLimited, Some(0), NOW);
-        assert_eq!(t.keys["k1"].cooldown_until_ms - NOW, COOLDOWN_FLOOR_MS as i64);
+        assert_eq!(t.keys()["k1"].cooldown_until_ms - NOW, COOLDOWN_FLOOR_MS as i64);
         assert_eq!(min_retry_after_ms(&[outcome(ErrorClass::RateLimited, 429, Some(0))]), 0);
     }
 
     #[test]
     fn three_consecutive_auth_failures_open_the_breaker_and_an_ok_closes_it() {
         let key = key_row("k1", "active", None);
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
 
         for i in 1..AUTH_BREAKER_THRESHOLD {
             t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
-            assert!(!t.keys["k1"].breaker_open, "still closed after {i} failure(s)");
+            assert!(!t.keys()["k1"].breaker_open, "still closed after {i} failure(s)");
             assert!(t.is_key_usable(&key, NOW));
         }
         t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
-        assert!(t.keys["k1"].breaker_open, "opens on failure {AUTH_BREAKER_THRESHOLD}");
+        assert!(t.keys()["k1"].breaker_open, "opens on failure {AUTH_BREAKER_THRESHOLD}");
         assert!(!t.is_key_usable(&key, NOW));
 
         // One success clears it: the breaker counts *consecutive* failures, so the count resets
         // too rather than merely closing.
         t.record_result("k1", ErrorClass::Ok, None, NOW);
-        assert!(!t.keys["k1"].breaker_open);
-        assert_eq!(t.keys["k1"].consecutive_auth_failures, 0);
+        assert!(!t.keys()["k1"].breaker_open);
+        assert_eq!(t.keys()["k1"].consecutive_auth_failures, 0);
         assert!(t.is_key_usable(&key, NOW));
     }
 
     #[test]
     fn an_ok_result_clears_the_cooldown_the_breaker_and_the_failure_count() {
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         for _ in 0..AUTH_BREAKER_THRESHOLD {
             t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
         }
         t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
-        let before = t.keys["k1"];
+        let before = t.keys()["k1"];
         assert!(
             before.breaker_open
                 && before.cooldown_until_ms > NOW
@@ -1483,7 +1529,7 @@ mod tests {
         );
 
         t.record_result("k1", ErrorClass::Ok, None, NOW);
-        assert_eq!(t.keys["k1"], KeyHealth::default(), "an Ok leaves nothing behind");
+        assert_eq!(t.keys()["k1"], KeyHealth::default(), "an Ok leaves nothing behind");
         assert!(t.is_key_usable(&key_row("k1", "active", None), NOW));
     }
 
@@ -1549,9 +1595,9 @@ mod tests {
         // NOT_FOUND, BAD_REQUEST_SCHEMA and PARSE_ERROR are provider/manifest problems, not key
         // problems. Burning a good key for them is the bug this prevents.
         for cls in [ErrorClass::NotFound, ErrorClass::BadRequestSchema, ErrorClass::ParseError] {
-            let mut t = HealthTracker::new();
+            let t = HealthTracker::new();
             t.record_result("k1", cls, None, NOW);
-            assert_eq!(t.keys["k1"], KeyHealth::default(), "{cls:?} changed key health");
+            assert_eq!(t.keys()["k1"], KeyHealth::default(), "{cls:?} changed key health");
         }
     }
 
@@ -1562,16 +1608,16 @@ mod tests {
         // attached, so that if the port ever grows a backoff for them it is a deliberate change
         // rather than a silent one — `retry_after_ms` is ignored for every class but RATE_LIMITED.
         for cls in [ErrorClass::ServerError, ErrorClass::Network, ErrorClass::Timeout] {
-            let mut t = HealthTracker::new();
+            let t = HealthTracker::new();
             t.record_result("k1", cls, Some(60_000), NOW);
-            assert_eq!(t.keys["k1"], KeyHealth::default(), "{cls:?} changed key health");
+            assert_eq!(t.keys()["k1"], KeyHealth::default(), "{cls:?} changed key health");
         }
     }
 
     #[test]
     fn resetting_a_key_forgets_its_cooldown_and_its_breaker() {
         let key = key_row("k1", "active", None);
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         for _ in 0..AUTH_BREAKER_THRESHOLD {
             t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
         }
@@ -1580,7 +1626,7 @@ mod tests {
         t.reset_key("k1");
         assert!(t.is_key_usable(&key, NOW));
         // A reset key starts from nothing, not from "cooldown cleared but breaker open".
-        assert!(!t.keys.contains_key("k1"));
+        assert!(!t.keys().contains_key("k1"));
     }
 
     #[test]
@@ -1590,7 +1636,7 @@ mod tests {
         // keys does not grow the map.
         let t = HealthTracker::new();
         assert!(t.is_key_usable(&key_row("never-seen", "active", None), NOW));
-        assert!(t.keys.is_empty(), "a read must not insert");
+        assert!(t.keys().is_empty(), "a read must not insert");
     }
 
     #[test]
@@ -1598,13 +1644,13 @@ mod tests {
         // The companion to the test above: `is_empty()` there is only evidence if the map *is*
         // populated when it should be. Without this, a tracker whose `record_result` silently did
         // nothing would make the non-inserting read look correct for the wrong reason.
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
-        assert_eq!(t.keys.len(), 1);
+        assert_eq!(t.keys().len(), 1);
         t.record_result("k2", ErrorClass::AuthFailed, None, NOW);
-        assert_eq!(t.keys.len(), 2);
+        assert_eq!(t.keys().len(), 2);
         t.reset_key("k1");
-        assert_eq!(t.keys.len(), 1);
+        assert_eq!(t.keys().len(), 1);
     }
 
     // ---------- increment 4: the attempt budget and the terminal error ----------
@@ -1869,18 +1915,18 @@ mod tests {
             let cls = classify_attempt_error(&e);
             assert!(cls.is_drift(), "a mid-stream {status} classified as {}", cls.as_str());
 
-            let mut t = HealthTracker::new();
+            let t = HealthTracker::new();
             t.record_result("k1", cls, e.retry_after_ms(), NOW);
             assert!(
                 t.is_key_usable(&key_row("k1", "enabled", None), NOW),
                 "a drift class must not cool the key"
             );
-            assert_eq!(t.keys["k1"].cooldown_until_ms, 0);
+            assert_eq!(t.keys()["k1"].cooldown_until_ms, 0);
         }
 
         // The contrast that makes the rule non-vacuous: a class that is *not* drift does cool it,
         // so "skipping health" is a real omission rather than a no-op for every class.
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
         assert!(!t.is_key_usable(&key_row("k1", "enabled", None), NOW));
     }
@@ -1950,7 +1996,7 @@ mod tests {
         // RATE_LIMITED *would* cool a key if it were recorded, so the skip being absent from
         // `record_result` is a decision rather than a no-op. This is the contrast that proves it —
         // and the reason the loop must not record it: the provider is busy, not the key bad.
-        let mut t = HealthTracker::new();
+        let t = HealthTracker::new();
         t.record_result("k1", o.cls, o.retry_after_ms, NOW);
         assert!(
             !t.is_key_usable(&key_row("k1", "enabled", None), NOW),
@@ -2154,11 +2200,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_first_candidate_that_answers_serves_and_the_rest_are_never_tried() {
         let adapter = Scripted::new(vec![ok_reply("AAAA")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let served = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2177,11 +2223,11 @@ mod tests {
         // `:176` sends `c.model.nativeId`; `args.model` is only ever used to *name* the failure.
         // A port that sent the requested name would pass every other test in this block.
         let adapter = Scripted::new(vec![ok_reply("AAAA")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "gpt-image-1")]),
             &Cancel::new(),
@@ -2199,11 +2245,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_refusal_advances_to_the_next_candidate_and_is_recorded_with_its_status() {
         let adapter = Scripted::new(vec![refusal(429), ok_reply("BBBB")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let served = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2220,11 +2266,11 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_whole_chain_of_failures_reports_every_attempt_in_order() {
         let adapter = Scripted::new(vec![refusal(404), refusal(500), refusal(429)]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![
                 candidate("p1", "k1", "m1"),
@@ -2263,11 +2309,11 @@ mod tests {
         // this the Rust chain could produce only the third. The status is *not* part of what the
         // ledger renders, which is why the assertion is on the label rather than on the whole row.
         let adapter = Scripted::new(vec![refusal(404), refusal(429)]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2299,11 +2345,11 @@ mod tests {
     async fn an_empty_plan_fails_rather_than_succeeding_with_nothing() {
         // `:193` throws unconditionally once the loop ends, so zero candidates is a failure.
         let adapter = Scripted::new(vec![]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![]),
             &Cancel::new(),
@@ -2321,11 +2367,11 @@ mod tests {
         // `Some(0)` is zero, not "unset". `attempt_budget` exists to keep that distinction, and
         // this is the loop's half of it: the adapter must never be reached.
         let adapter = Scripted::new(vec![ok_reply("AAAA")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let mut args = image_args(vec![candidate("p1", "k1", "m1")]);
         args.max_attempts = Some(0);
 
-        let err = execute_image(&Always(adapter.clone()), &mut health, None, args, &Cancel::new())
+        let err = execute_image(&Always(adapter.clone()), &health, None, args, &Cancel::new())
             .await
             .expect_err("a budget of zero cannot serve");
 
@@ -2339,7 +2385,7 @@ mod tests {
         // saturated too, so a port that checked the cap first would record a RATE_LIMITED skip.
         // Breaking first leaves the chain empty.
         let adapter = Scripted::new(vec![ok_reply("AAAA")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let limiter = ProviderLimiter::new(1);
         let _held = limiter.acquire("p1").expect("the slot is free to start with");
 
@@ -2348,7 +2394,7 @@ mod tests {
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             Some(&limiter),
             image_args(vec![candidate("p1", "k1", "m1")]),
             &cancel,
@@ -2364,13 +2410,13 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_saturated_provider_is_skipped_and_recorded_as_rate_limited_429() {
         let adapter = Scripted::new(vec![ok_reply("AAAA")]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let limiter = ProviderLimiter::new(1);
         let _held = limiter.acquire("p1").expect("free to start with");
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             Some(&limiter),
             image_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m2")]),
             &Cancel::new(),
@@ -2392,11 +2438,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_factory_that_resolves_nothing_is_a_transport_failure() {
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let err = execute_image(
             &NoneResolved,
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1")]),
             &Cancel::new(),
@@ -2421,11 +2467,11 @@ mod tests {
             kind: FailureKind::Response,
             retry_after_ms: Some(30_000),
         })]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let err = execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1")]),
             &Cancel::new(),
@@ -2450,11 +2496,11 @@ mod tests {
         // (`record_result`'s `now` parameter is the port of the TypeScript's `Date.now()` default).
         // The bound is the point: had a named wait survived, the cooldown would be ~30 s out.
         let adapter = Scripted::new(vec![refusal(429)]);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         execute_image(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             image_args(vec![candidate("p1", "k1", "m1")]),
             &Cancel::new(),
@@ -2462,7 +2508,7 @@ mod tests {
         .await
         .expect_err("refused");
 
-        let cooled_until = health.keys["k1"].cooldown_until_ms;
+        let cooled_until = health.keys()["k1"].cooldown_until_ms;
         assert!(cooled_until > 0, "a 429 refusal must cool the key at all");
         assert!(
             cooled_until <= now_ms() + COOLDOWN_FLOOR_MS as i64,
@@ -2476,12 +2522,12 @@ mod tests {
         // that the slot is free afterwards on *both* paths — a port that released only on success
         // would leak a slot per failure until the provider stopped being admitted.
         let limiter = ProviderLimiter::new(1);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
 
         let served_adapter = Scripted::new(vec![ok_reply("AAAA")]);
         execute_image(
             &Always(served_adapter),
-            &mut health,
+            &health,
             Some(&limiter),
             image_args(vec![candidate("p1", "k1", "m1")]),
             &Cancel::new(),
@@ -2493,7 +2539,7 @@ mod tests {
         let failed_adapter = Scripted::new(vec![refusal(500)]);
         execute_image(
             &Always(failed_adapter),
-            &mut health,
+            &health,
             Some(&limiter),
             image_args(vec![candidate("p1", "k1", "m1")]),
             &Cancel::new(),
@@ -2723,12 +2769,12 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn the_first_candidate_that_streams_serves_and_the_rest_are_never_tried() {
         let adapter = TextScripted::new(vec![chunks_of(&["Hel", "lo"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
         let served = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2750,12 +2796,12 @@ mod tests {
         // only ever used to *name* the failure. A port that sent the requested name would pass every
         // other test in this block.
         let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
 
         execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "gpt-4o")]),
             &Cancel::new(),
@@ -2782,12 +2828,12 @@ mod tests {
             chunks_of(&["ok"]),
         ])
         .shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
         let served = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2810,12 +2856,12 @@ mod tests {
         // would serve from `p2` and report no failure at all.
         let adapter =
             TextScripted::new(vec![Ok(vec![Ok("half".to_string()), broke(200)])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
         let failure = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2850,12 +2896,12 @@ mod tests {
         // identical `AttemptError` values, opposite handling. A port that classified by status alone
         // would retry the second and show the consumer its text twice.
         let response = TextScripted::new(vec![refused(429), chunks_of(&["second"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
         let served = execute_text(
             &Always(response),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2867,12 +2913,12 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["second".to_string()]);
 
         let mid = TextScripted::new(vec![Ok(vec![Ok("first".to_string()), broke(429)])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
         let failure = execute_text(
             &Always(mid.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
             &Cancel::new(),
@@ -2894,7 +2940,7 @@ mod tests {
         // anonymous, and nothing else in this module would notice: the classes and the statuses
         // are all still right.
         let adapter = TextScripted::new(vec![refused(503), chunks_of(&["served"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let limiter = ProviderLimiter::new(1);
         // Hold p0's only slot so its candidate is skipped rather than called.
         let _held = limiter.acquire("p0").expect("free to start with");
@@ -2902,7 +2948,7 @@ mod tests {
 
         let served = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(vec![
                 candidate("p0", "skipped", "m0"),
@@ -2936,14 +2982,14 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_saturated_provider_is_skipped_on_the_text_path_and_recorded_rate_limited() {
         let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let limiter = ProviderLimiter::new(1);
         let _held = limiter.acquire("p1").expect("free to start with");
         let (_seen, mut on_chunk) = sink();
 
         let failure = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(vec![candidate("p1", "k1", "m1"), candidate("p1", "k2", "m2")]),
             &Cancel::new(),
@@ -2970,14 +3016,14 @@ mod tests {
     async fn a_zero_budget_tries_nothing_on_the_text_path_either() {
         // `Some(0)` is zero, not "unset" — the loop's half of what `attempt_budget` pins.
         let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
         let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
         args.max_attempts = Some(0);
 
         let failure = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             args,
             &Cancel::new(),
@@ -2999,14 +3045,14 @@ mod tests {
         // raised, and the caller writes a different ledger row for each (`:451`). Collapsing the two
         // would make "cancelled" indistinguishable from "tried and lost".
         let adapter = TextScripted::new(vec![chunks_of(&["x"])]).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
         let cancel = Cancel::new();
         cancel.cancel();
 
         let failure = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![candidate("p1", "k1", "m1")]),
             &cancel,
@@ -3031,12 +3077,12 @@ mod tests {
             }),
         ])
         .shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
 
         let failure = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             text_args(vec![
                 candidate("p1", "k1", "m1"),
@@ -3075,14 +3121,14 @@ mod tests {
         // The text loop has more exits than the image one — served, exhausted, mid-stream,
         // cancelled — so the `Drop` that releases the slot has more ways to leak.
         let limiter = ProviderLimiter::new(1);
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
         let plan = || vec![candidate("p1", "k1", "m1")];
 
         let served = TextScripted::new(vec![chunks_of(&["x"])]).shared();
         execute_text(
             &Always(served),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(plan()),
             &Cancel::new(),
@@ -3095,7 +3141,7 @@ mod tests {
         let exhausted = TextScripted::new(vec![Err(AttemptError::Transport)]).shared();
         execute_text(
             &Always(exhausted),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(plan()),
             &Cancel::new(),
@@ -3108,7 +3154,7 @@ mod tests {
         let broke = TextScripted::new(vec![Ok(vec![broke(200)])]).shared();
         execute_text(
             &Always(broke),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(plan()),
             &Cancel::new(),
@@ -3124,7 +3170,7 @@ mod tests {
         let never = TextScripted::new(vec![chunks_of(&["x"])]).shared();
         execute_text(
             &Always(never),
-            &mut health,
+            &health,
             Some(&limiter),
             text_args(plan()),
             &cancel,
@@ -3145,7 +3191,7 @@ mod tests {
         // asserted rather than only the one the ledger happens to read.
         let reported = UsageTokens::new(120, 34, Some(64));
         let adapter = TextScripted::new(vec![chunks_of(&["x"])]).reporting_usage(reported).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
         let (forwarded, mut on_usage) = usage_sink();
         let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
@@ -3153,7 +3199,7 @@ mod tests {
 
         let served = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             args,
             &Cancel::new(),
@@ -3181,7 +3227,7 @@ mod tests {
             raw: None,
         };
         let adapter = TextScripted::new(vec![Ok(vec![])]).calling_tool(call.clone()).shared();
-        let mut health = HealthTracker::new();
+        let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
         let (tool_calls, mut on_tool_call) = tool_sink();
         let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
@@ -3189,7 +3235,7 @@ mod tests {
 
         let served = execute_text(
             &Always(adapter.clone()),
-            &mut health,
+            &health,
             None,
             args,
             &Cancel::new(),
