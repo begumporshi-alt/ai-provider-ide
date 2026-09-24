@@ -91,8 +91,9 @@ use regex::Regex;
 use serde_json::{Map, Value};
 
 use crate::core::adapter::ImageReply;
+use crate::core::adapter::ModelEntry;
 use crate::core::egress::SENTINEL;
-use crate::core::interpreter::ModelEntry;
+use crate::core::engine::AttemptError;
 
 /// 64 KB. The manifest grammar also bounds it; this is defence in depth.
 pub const SOURCE_LIMIT: usize = 64_000;
@@ -195,6 +196,21 @@ pub struct SandboxError {
 impl SandboxError {
     pub fn new(reason: SandboxReason, message: impl Into<String>) -> Self {
         SandboxError { reason, message: message.into() }
+    }
+}
+
+/// To the engine, a sandbox failure is a transport failure — and it loses its reason on the way.
+///
+/// **The loss is the reference's behaviour, not a shortcut here.**
+/// `execution-engine.ts:114` reads `e instanceof ManifestHttpError ? e.status : 0`, so anything
+/// that is *not* a `ManifestHttpError` — a `SandboxError` included — is recorded with status `0`
+/// and nothing else. `AttemptError` has nowhere to carry a message, so the faithful mapping is the
+/// one that discards it. A variant added to preserve the reason would be a second spelling of "the
+/// call did not complete", and the reason itself is still where a caller can read it: every
+/// producer hands the [`SandboxError`] back before it crosses this conversion.
+impl From<&SandboxError> for AttemptError {
+    fn from(_: &SandboxError) -> Self {
+        AttemptError::Transport
     }
 }
 

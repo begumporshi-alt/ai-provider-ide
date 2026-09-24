@@ -42,6 +42,7 @@ use futures_util::stream::BoxStream;
 use serde_json::Value;
 
 use crate::core::engine::AttemptError;
+pub use crate::core::manifest_view::Capabilities;
 use crate::core::usage::UsageTokens;
 
 /// An abort flag — the port of `AbortSignal`.
@@ -160,6 +161,28 @@ pub struct TextArgs<'a> {
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
 }
 
+/// One model as the catalogue reported it — the port of `ModelEntry`
+/// (`manifest-interpreter.ts:65-68`).
+///
+/// Moved here from `interpreter.rs` because it is a seam type: both `AdapterInstance`
+/// implementors (declarative and sandbox) return it, and `sandbox.rs` parses it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelEntry {
+    pub native_id: String,
+    pub raw: Value,
+}
+
+/// A ping's verdict — the port of `pingKey`'s return (`manifest-interpreter.ts:474`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PingResult {
+    pub ok: bool,
+    pub status: u16,
+    pub rate_limited: bool,
+    /// The provider's own words, when it refused. `None` on success, matching the source's
+    /// `undefined`.
+    pub message: Option<String>,
+}
+
 /// One provider's adapter.
 ///
 /// **Neither method has a default body, and that is the point.** A default would let an implementor
@@ -204,6 +227,29 @@ pub trait AdapterInstance: Send + Sync {
         args: TextArgs<'a>,
         cancel: &'a Cancel,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>;
+
+    /// What the manifest says the provider can do — a declaration, not a measurement.
+    fn capabilities(&self) -> Capabilities;
+
+    /// Classify a model entry as text or image, using the provider's modality rules.
+    fn tag_modality(&self, entry: &ModelEntry) -> &'static str;
+
+    /// The models the provider's catalogue lists. A provider with no endpoint answers `[]`.
+    fn list_models<'a>(
+        &'a self,
+        secret_ref: &'a str,
+        cancel: &'a Cancel,
+    ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>>;
+
+    /// A cheap validity check — one catalogue call.
+    fn ping_key<'a>(&'a self, secret_ref: &'a str, cancel: &'a Cancel)
+        -> BoxFuture<'a, PingResult>;
+
+    /// Optional teardown. The default is a no-op, because not every adapter holds resources
+    /// (the declarative interpreter does not), and a trait that forces every implementor to write
+    /// an empty body forfeits the same guard the comment above defends. `dispose` is the one
+    /// exception: a missing teardown is safe, while a missing `generate_image` is not.
+    fn dispose(&self) {}
 }
 
 /// Resolve a provider id to the adapter that serves it.
@@ -363,6 +409,32 @@ mod tests {
                         }
                     }));
                 Ok(stream)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
             })
         }
     }

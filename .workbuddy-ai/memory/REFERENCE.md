@@ -3340,3 +3340,85 @@ explicit `.stack_size` makes containment a property of the code, not of the envi
 
 `listModels`, `generateImage`, `generateText`, `pingKey`, `tagModality`, `capabilities`, `dispose`.
 Plus wiring `log` and the `{{secret}}`-substituting `HttpTarget`.
+
+---
+
+## Increment 20a — `core/code_adapter.rs` (2026-09-24)
+
+Rust **957 → 971**; 13 new tests. Gate: `cargo fmt --check` exit 0 / 0 bytes,
+`clippy --all-targets -- -D warnings` 0 findings, 971 pass,
+`cargo check --no-default-features --all-targets` clean.
+
+### The shape
+
+`CodeAdapterInstance { sandbox: JsSandbox, target: HttpTarget, egress: Arc<dyn HttpPort>,
+capabilities, modality_rules: Option<ModalityRules>, limits: Option<Limits> }`.
+`HttpTarget` is built **once at spawn** from `provider.baseUrl` + `provider.auth.headers`; the
+reference renders it per call but nothing about it can change between calls.
+
+Its read model is `CodeManifest { provider, capabilities, limits }` — **not** `ManifestView`. A code
+manifest satisfies `ManifestView` only by accident (`endpoints: {}`, every field optional,
+`code-candidate.ts:254`).
+
+### Finding 1 — `dispose(&self)` is forced by the seam
+
+`AdapterInstance::dispose(&self)` cannot call a `&mut self` join. Wrapping the sandbox in a lock
+does not work either: `call` is async, so a `std::sync::MutexGuard` held across an await is a `Send`
+error, and a `tokio::sync::Mutex` cannot be locked from a synchronous `dispose`. So
+`JsSandbox.thread` became `Mutex<Option<JoinHandle<()>>>` and `dispose(&self)` locks only for the
+join; `take` keeps it idempotent, and `Drop` still calls it.
+
+*Generalisation:* a seam method that takes `&self` cannot hand out a resource that needs ownership.
+Put the slot in `Mutex<Option<_>>` and `take` it — do not lock the whole object.
+
+### Finding 2 — state created inside a thread nothing else can name has no reader
+
+The `log` line buffer was first created inside `JsHost::compile`. `JsHost` never leaves the actor
+thread and is never named from outside it, so the field had no reader and clippy (`-D warnings`)
+would have failed it. The `Arc` is now created in `spawn`, cloned into the actor, and kept on
+`JsSandbox`. `drain_log_lines` is **copy-and-clear**, because `log` is a global the guest may call
+between two operations — a read would either lose a line or hand the same one out twice.
+
+### Finding 3 — the two adapters disagree about "rate limited", and both are the reference
+
+| | rule |
+|---|---|
+| `interpreter::ping_key` | `status == 429` |
+| `code_adapter::run_ping_key` | `/429/.test(msg)` — a **substring** of the rejection message |
+
+`code-adapter.ts:610`. A guest that throws `"upstream said 429"` is reported `429` / `rate_limited`
+with no HTTP status anywhere in the pipeline. Probe: hard-wiring `rate_limited = false` reddens
+`ping_key_reads_429_out_of_the_message` with `left: 0, right: 429`, so the test measures the rule
+and not a status that leaked through.
+
+### Finding 4 — `manifest::AuthHeader` and `sandbox::AuthHeader` are the same struct twice
+
+Identical fields, each rendering the same `{{secret}}` rule into a different container:
+`manifest::auth_headers` → `BTreeMap` (sorted, last duplicate wins) for the interpreter;
+`HttpTarget::new` → `Vec` (manifest order preserved, last value at the **first** name's position)
+for the sandbox. Collapsing them would mean a `Vec` every caller sorts or a map that cannot express
+order, so the four-line conversion lives in `to_target_header` and the duplication is recorded.
+
+### Two gaps stated, not closed
+
+1. **`generate_text` is buffered, not streamed.** It runs the operation to completion and yields the
+   collected lines — same text, delivered late. True streaming (20b) needs a chunk channel on
+   `Command::Call` and a stream that interleaves receiving from it with awaiting the call.
+2. **A code provider reports no usage and no tool calls.** `code-adapter.ts` never calls
+   `args.onUsage` or `args.onToolCall`, so both `TextArgs` callbacks are dropped and every
+   code-provider request reports zero tokens — the spend cap cannot bite for such a provider.
+
+### Argument encoders (pinned by their own tests)
+
+`image_args_json`: `{model, prompt, size?}` — an absent `size` leaves the key **out**, not `null`.
+`text_args_json`: `model`/`messages`/`stream` always; `maxTokens`/`temperature` **omitted** when
+absent (passed through, so `JSON.stringify` drops them); `tools`/`toolChoice`/`responseFormat`
+always present as `null`; `limits` = `null` when absent, `{}` when the block has no
+`maxOutputTokens`.
+
+### What remains in Phase 4b
+
+1. True streaming `generateText` (increment 20b).
+2. `AdapterFactory` for `kind: "code"` — `adapter-runtime.ts:52-58` branches on `manifest.kind`, and
+   nothing in Rust constructs a `CodeAdapterInstance` yet, so the sandbox is unreachable from the
+   router.

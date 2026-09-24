@@ -422,6 +422,22 @@ resolve/reject functions are restored into the next scope — is increment 19b's
 
 The probe is opt-in (`SPIKE_CRASH=1`) because a size whose C stack runs out first kills the process. `ACTOR_STACK_BYTES` keeps the measured 4× margin and derives the number from `STACK_LIMIT` so the two cannot drift apart.
 
+**Update, 2026-09-24 (increment 20a): `core/code_adapter.rs` lands — the manifest half of the sandbox, and three findings about the seam it had to satisfy.**
+
+`js_host.rs` is the guest's engine and knows nothing about manifests. `code_adapter.rs` is the other half: it reads the two blocks of a `kind: "code"` manifest it needs, builds one `HttpTarget`, and implements all seven `AdapterInstance` members over a `JsSandbox`. Four findings came out of writing it.
+
+**Finding 1: `dispose(&self)` is forced by the seam, and the cost is one mutex.** `AdapterInstance::dispose` takes `&self`, but joining a thread needs *ownership* of its `JoinHandle`, which needs `&mut`. The alternative — wrapping the whole sandbox in a lock — cannot work: `call` is async, so a `std::sync::MutexGuard` across an await is a `Send` error, and a `tokio::sync::Mutex` cannot be locked from a synchronous `dispose`. So `JsSandbox`'s thread slot became `Mutex<Option<JoinHandle<()>>>` and `dispose` takes `&self`, locking only for the join. `Drop` still calls it, and `take` keeps it idempotent.
+
+**Finding 2: a queue on the actor thread has no reader.** The first draft created the `log` line buffer inside `JsHost::compile`. But `JsHost` never leaves the actor thread and is never named from outside it, so the `Arc` it held could never be drained — and the field was dead code, which clippy would have failed. The `Arc` is now created in `spawn`, cloned into the actor, and kept on `JsSandbox`; `drain_log_lines` is copy-and-clear, because `log` is a global the guest may call between two operations. `the_guest_log_reaches_the_caller_and_a_drain_empties_the_queue` asserts the reachability rather than the logging.
+
+**Finding 3: the two adapters disagree about what "rate limited" means, and both are right.** The interpreter's `ping_key` tests `status == 429`; the code adapter's tests `/429/.test(msg)` — a **substring** of the rejection message (`code-adapter.ts:610`). A guest that throws `"upstream said 429"` is reported `429`/`rate_limited` with no HTTP status anywhere. The reference's rule is kept, and the divergence is written down at the one place both can be read side by side. A probe that hard-wires `rate_limited = false` reddens the test, so it is the rule that is measured and not a status that leaked through.
+
+**Finding 4: `manifest::AuthHeader` and `sandbox::AuthHeader` are the same struct twice.** Identical fields, each rendering the same `{{secret}}` rule — into a `BTreeMap` for the interpreter, into an order-preserving `Vec` for the sandbox. They also disagree on a duplicate name. Collapsing them would mean a `Vec` every caller sorts or a map that cannot express order, so the four-line conversion lives in one function and the duplication is recorded instead.
+
+**Two things this increment states rather than fixes.** `generate_text` is **buffered, not streamed**: it runs the operation to completion and then yields the collected lines, so the text is identical but nothing reaches the consumer until the guest's promise settles. True streaming needs the actor to forward chunks mid-operation, which is increment 20b. And a code provider reports **no usage and no tool calls** — `code-adapter.ts` never calls `args.onUsage` or `args.onToolCall`, so both callbacks on `TextArgs` are dropped and every code-provider request reports zero tokens, which means the spend cap cannot bite for such a provider.
+
+**Thirteen tests, one probe fired.** The base URL is trimmed and the header carries `Bearer {{secret}}` rather than a key; the lint rejects before a runtime is built; a catalogue entry with an empty `id` and a non-string are both dropped while a `name`-only entry survives; the `errorBody` cap is 500 of 900; the emitted lines arrive in order; an empty catalogue is `ok: false`/`status: 0`/`"empty model list"`; `429` is read out of the message; modality comes from the manifest's rules; and a disposed adapter reports `Host` with no flag involved. The argument encoders are pinned separately — an absent `size` leaves the key out rather than nulling it, `maxTokens`/`temperature` are omitted where the four `?? null` keys are always present, and a `limits` block with no cap is `{}` rather than `{"maxOutputTokens": null}`.
+
 ### 2.2 The line count
 
 ```
@@ -1884,13 +1900,15 @@ observation.
 
 **What remains in this phase, in order:**
 
-1. **The six `AdapterInstance` operations on `JsSandbox`.** `spawn`, `call` and `dispose` are done;
-   what is left is the thin layer that translates each `AdapterInstance` method into the right
-   `Operation` and `args_json` — `listModels`, `generateImage`, `generateText`, `pingKey`,
-   `tagModality`, `capabilities`, and `dispose`. Plus wiring `log` and the `{{secret}}`-substituting
-   `HttpTarget`. The async-host shape §2.1.3 named as the largest unknown is now answered: the
-   pump and the egress `await` are a sequence of short synchronous scopes separated by awaits,
-   with parked resolvers crossing boundaries as `Persistent<Function>`.
+1. **True streaming for `generateText`.** Increment 20a closed the other six — `listModels`,
+   `generateImage`, `pingKey`, `tagModality`, `capabilities` and `dispose` all run over `JsSandbox`,
+   `log` is wired and drainable, and `HttpTarget` renders `{{secret}}` from the manifest. What is
+   left is the one member 20a deliberately **buffered**: the actor must forward each `emit(chunk)`
+   while the operation is still running, which means a chunk channel on `Command::Call` and a
+   stream that interleaves receiving from it with awaiting the call's completion.
+2. **`AdapterFactory` for `kind: "code"`.** Nothing constructs a `CodeAdapterInstance` from a stored
+   manifest yet: `adapter-runtime.ts:52-58` branches on `manifest.kind`, and that branch has no
+   Rust counterpart. This is the increment that makes the sandbox reachable from the router at all.
 
 ### Phase 5 — Delete the bridge (1 day)
 

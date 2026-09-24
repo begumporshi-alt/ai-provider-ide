@@ -68,7 +68,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rquickjs::{
@@ -216,12 +216,26 @@ enum Command {
 /// boundary (see the module note).
 pub struct JsSandbox {
     commands: tokio::sync::mpsc::UnboundedSender<Command>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    /// Behind a mutex so teardown can take `&self`. [`crate::core::adapter::AdapterInstance`]'s
+    /// `dispose` is `&self`, and a caller holding an adapter behind a shared reference — the only
+    /// shape a registry of live adapters can hand out — has no way to obtain a `&mut`. Joining
+    /// needs *ownership* of the handle, so the slot is `Option` inside the lock and `take` is what
+    /// makes a second `dispose` a no-op rather than a second join.
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// The guest's `log(...)` lines, shared with the actor.
+    ///
+    /// **Created here, not inside `JsHost`, because a queue on the actor thread has no reader.**
+    /// `JsHost` never leaves that thread and is never named from outside it, so an `Arc` it alone
+    /// held would be a buffer nothing could ever drain — and the field would be dead code, which
+    /// is how this was first written. One `Arc`, cloned into the actor and kept on the handle, is
+    /// the whole difference.
+    log_lines: Arc<Mutex<Vec<String>>>,
 }
 
 impl std::fmt::Debug for JsSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("JsSandbox").field("alive", &self.thread.is_some()).finish()
+        let alive = self.thread.lock().unwrap().is_some();
+        f.debug_struct("JsSandbox").field("alive", &alive).finish()
     }
 }
 
@@ -236,6 +250,10 @@ impl JsSandbox {
         let source = source.to_string();
         let (commands, mut rx) = tokio::sync::mpsc::unbounded_channel::<Command>();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), SandboxError>>();
+        // Shared before the thread starts, so the actor's half can move into it while this half
+        // stays readable from any thread. See the field's note for why it cannot be the actor's.
+        let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let actor_log_lines = log_lines.clone();
 
         let thread = std::thread::Builder::new()
             .name("js-sandbox".to_string())
@@ -255,7 +273,7 @@ impl JsSandbox {
                     }
                 };
                 rt.block_on(async move {
-                    let host = match JsHost::compile(&source, limits) {
+                    let host = match JsHost::compile(&source, limits, actor_log_lines) {
                         Ok(host) => {
                             let _ = ready_tx.send(Ok(()));
                             host
@@ -303,7 +321,7 @@ impl JsSandbox {
             })?;
 
         match ready_rx.recv() {
-            Ok(Ok(())) => Ok(JsSandbox { commands, thread: Some(thread) }),
+            Ok(Ok(())) => Ok(JsSandbox { commands, thread: Mutex::new(Some(thread)), log_lines }),
             Ok(Err(e)) => {
                 let _ = thread.join();
                 Err(e)
@@ -349,14 +367,30 @@ impl JsSandbox {
         })?
     }
 
+    /// Take the guest's `log(...)` lines, leaving the queue empty.
+    ///
+    /// **Drain, not read.** `log` is a global the guest may call at any moment, including between
+    /// two operations, so copy-and-clear is the only shape that can neither lose a line nor hand
+    /// the same one out twice.
+    pub fn drain_log_lines(&self) -> Vec<String> {
+        std::mem::take(&mut *self.log_lines.lock().unwrap())
+    }
+
     /// Stop the actor and wait for its thread.
     ///
     /// Idempotent, and safe to call from `Drop`. The reference's `dispose()` (`code-adapter.ts`)
     /// also marks every in-flight deferred so a guest parked on a promise is not left waiting; here
     /// the parked resolvers die with the context, which is the same outcome by a shorter road.
-    pub fn dispose(&mut self) {
+    ///
+    /// **`&self`, not `&mut self`, because the seam demands it.** `AdapterInstance::dispose` takes
+    /// `&self`, so a `&mut` here would force every adapter to wrap the sandbox in a lock it then
+    /// has to hold across an await — which is either a `Send` error or a serialization of every
+    /// operation. Taking `&self` and locking only for the join costs one mutex on a path that runs
+    /// once.
+    pub fn dispose(&self) {
         let _ = self.commands.send(Command::Shutdown);
-        if let Some(thread) = self.thread.take() {
+        let thread = self.thread.lock().unwrap().take();
+        if let Some(thread) = thread {
             let _ = thread.join();
         }
     }
@@ -407,7 +441,13 @@ struct JsHost {
 }
 
 impl JsHost {
-    fn compile(source: &str, limits: SandboxLimits) -> Result<JsHost, SandboxError> {
+    /// `log_lines` is the shared queue from [`JsSandbox::spawn`]; `compile` only hands a clone of
+    /// it to the `log` closure and does not keep one.
+    fn compile(
+        source: &str,
+        limits: SandboxLimits,
+        log_lines: Arc<Mutex<Vec<String>>>,
+    ) -> Result<JsHost, SandboxError> {
         let runtime = Runtime::new().map_err(|e| {
             SandboxError::new(SandboxReason::Host, format!("QuickJS did not start: {e}"))
         })?;
@@ -434,6 +474,15 @@ impl JsHost {
 
         let context = rquickjs::Context::full(&runtime).map_err(|e| {
             SandboxError::new(SandboxReason::Host, format!("the guest context failed: {e}"))
+        })?;
+
+        // Install the global `log` function before compiling the guest, so the guest can use it
+        // during top-level evaluation. `log` is not per-operation — it persists across calls.
+        context.with(|ctx| -> Result<(), SandboxError> {
+            let log_fn = make_log(&ctx, log_lines.clone())?;
+            let global: Object = ctx.globals();
+            global.set("log", log_fn).map_err(host_lost)?;
+            Ok(())
         })?;
 
         let adapter = context.with(|ctx| -> Result<Persistent<Object<'static>>, SandboxError> {
@@ -821,6 +870,19 @@ fn make_emit<'js>(
     .map_err(|e| SandboxError::new(SandboxReason::Host, format!("emit() was not built: {e}")))
 }
 
+/// Build the global `log` function. `log` is not per-operation — it is installed once at compile
+/// time and persists across calls — so its queue lives on the host, not on the operation closure.
+fn make_log<'js>(
+    ctx: &Ctx<'js>,
+    lines: Arc<Mutex<Vec<String>>>,
+) -> Result<Function<'js>, SandboxError> {
+    Function::new(ctx.clone(), move |msg: String| {
+        let text: String = msg.chars().take(LOG_LINE_CAP).collect();
+        lines.lock().unwrap().push(text);
+    })
+    .map_err(|e| SandboxError::new(SandboxReason::Host, format!("log() was not built: {e}")))
+}
+
 /// `String(x)` for a thrown value, for the message a rejection carries.
 fn describe<'js>(error: &Value<'js>) -> String {
     if let Some(message) = error.as_exception().and_then(|e| e.message()) {
@@ -1191,9 +1253,43 @@ export default {
         });
     }
 
+    /// The `log` global reaches a caller, and a drain is a drain.
+    ///
+    /// **This is the test the field's note exists for.** The first draft put the queue on `JsHost`,
+    /// which never leaves the actor thread and is never named from outside it — so no caller could
+    /// ever read a line, and the field was dead code. The assertion is therefore not "log works"
+    /// but "log is reachable from a thread that is not the actor's".
+    #[test]
+    fn the_guest_log_reaches_the_caller_and_a_drain_empties_the_queue() {
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(async {
+            let sandbox = spawn(
+                r#"
+                export default {
+                  async listModels() { log("first"); log("x".repeat(900)); return []; },
+                };
+                "#,
+            );
+            let cancel = Cancel::new();
+            sandbox
+                .call(Operation::ListModels, "", &target(), "k1", FakeEgress::new(), &cancel)
+                .await
+                .expect("listModels");
+            let lines = sandbox.drain_log_lines();
+            assert_eq!(lines.len(), 2);
+            assert_eq!(lines[0], "first");
+            // `LOG_LINE_CAP`, applied by `make_log`: 500 chars, not the 900 the guest pushed.
+            assert_eq!(lines[1].len(), LOG_LINE_CAP);
+            // A drain, not a read: the second call is empty rather than a repeat of the first.
+            assert!(sandbox.drain_log_lines().is_empty());
+        });
+    }
+
     #[test]
     fn disposing_a_sandbox_twice_is_safe_and_the_thread_ends() {
-        let mut sandbox = spawn("export default { async listModels() { return []; } };");
+        // Not `mut`: `dispose` takes `&self` so that the seam can call it through a shared
+        // reference — see the method's own note.
+        let sandbox = spawn("export default { async listModels() { return []; } };");
         sandbox.dispose();
         sandbox.dispose();
         // A call after disposal is a host failure, not a hang.
@@ -1270,7 +1366,8 @@ export default {
             stack_bytes: 256 * 1024,
             op_budget_ms: 1_000,
         };
-        let host = JsHost::compile("export default {};", limits).expect("compiles");
+        let host = JsHost::compile("export default {};", limits, Arc::new(Mutex::new(Vec::new())))
+            .expect("compiles");
         assert_eq!(host.limits, limits);
     }
 

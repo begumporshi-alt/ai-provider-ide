@@ -1144,7 +1144,9 @@ mod tests {
     use futures_util::stream::{self, BoxStream};
     use serde_json::json;
 
-    use crate::core::adapter::{AdapterInstance, ImageArgs, ImageReply, TextArgs};
+    use crate::core::adapter::{
+        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs,
+    };
     use crate::core::engine::{AttemptError, ErrorClass, FailureKind};
     use crate::core::ledger::{LedgerFilter, LedgerSink};
 
@@ -1279,6 +1281,32 @@ mod tests {
                             as BoxStream<'a, Result<String, AttemptError>>)
                     }
                 }
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: true }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
             })
         }
     }
@@ -2339,6 +2367,32 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
                 Err(AttemptError::Transport)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
             })
         }
     }

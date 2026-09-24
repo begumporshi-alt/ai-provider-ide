@@ -82,7 +82,9 @@ use futures_util::stream::BoxStream;
 use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value};
 
-use crate::core::adapter::{AdapterInstance, Cancel, ImageArgs, ImageReply, TextArgs, ToolCall};
+use crate::core::adapter::{
+    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs, ToolCall,
+};
 use crate::core::engine::{AttemptError, FailureKind};
 use crate::core::http_port::{HttpError, HttpMethod, HttpPort, HttpRequest, HttpResponse};
 use crate::core::jsonpath::{select_all, select_one, JsonPathError};
@@ -92,8 +94,9 @@ use crate::core::manifest::{
     PendingCalls,
 };
 use crate::core::manifest_view::{
-    Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallStream,
+    Capabilities, Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallStream,
 };
+use crate::core::modality;
 use crate::core::template::{is_js_whitespace, render_template};
 use crate::core::usage::UsageTokens;
 
@@ -121,29 +124,6 @@ pub struct AdapterContext {
     /// built-in values, so a host variable of the same name wins, which is the source's
     /// `...this.ctx.vars` ordering.
     pub vars: Map<String, Value>,
-}
-
-/// One model as the catalogue reported it — the port of `ModelEntry`
-/// (`manifest-interpreter.ts:65-68`).
-///
-/// `raw` is the provider's own object, kept because modality classification and pricing read fields
-/// this shape does not model. It is a `Value` rather than an `Option` because the source always has
-/// one: the id item itself stands in when `map.raw` is absent or misaligned.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ModelEntry {
-    pub native_id: String,
-    pub raw: Value,
-}
-
-/// A ping's verdict — the port of `pingKey`'s return (`manifest-interpreter.ts:474`).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PingResult {
-    pub ok: bool,
-    pub status: u16,
-    pub rate_limited: bool,
-    /// The provider's own words, when it refused. `None` on success, matching the source's
-    /// `undefined`.
-    pub message: Option<String>,
 }
 
 /// Why an interpreter call did not produce an answer — the port of the source's
@@ -207,6 +187,7 @@ pub enum ManifestShapeError {
 pub struct ManifestInterpreter {
     view: ManifestView,
     ctx: AdapterContext,
+    modality_rules: Option<modality::ModalityRules>,
 }
 
 impl ManifestInterpreter {
@@ -217,7 +198,11 @@ impl ManifestInterpreter {
     /// request.
     pub fn new(manifest: &Value, ctx: AdapterContext) -> Result<Self, ManifestShapeError> {
         let view = serde_json::from_value(manifest.clone())?;
-        Ok(Self { view, ctx })
+        // Modality rules are not part of ManifestView because they are read-model-only: the
+        // grammar validates them, but the interpreter's read model ignores unknown fields, and
+        // `ModalityRules` is a separate shape with its own parsing.
+        let modality_rules = modality::rules_from_manifest(manifest).ok().flatten();
+        Ok(Self { view, ctx, modality_rules })
     }
 
     /// What the manifest says the provider can do — a declaration, not a measurement.
@@ -552,6 +537,35 @@ impl AdapterInstance for ManifestInterpreter {
         cancel: &'a Cancel,
     ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>> {
         self.run_text(secret_ref, args, cancel)
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.capabilities()
+    }
+
+    fn tag_modality(&self, entry: &ModelEntry) -> &'static str {
+        let input = modality::ModalityInput { native_id: &entry.native_id, raw: Some(&entry.raw) };
+        // A stored manifest has already passed the grammar, so an error here is the unreachable
+        // third variant (`ModalityError::Unreadable`) and "text" is the safe fallback.
+        modality::tag_modality(self.modality_rules.as_ref(), &input)
+            .map(|m| m.as_str())
+            .unwrap_or("text")
+    }
+
+    fn list_models<'a>(
+        &'a self,
+        secret_ref: &'a str,
+        cancel: &'a Cancel,
+    ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+        Box::pin(async move { self.list_models(secret_ref, cancel).await.map_err(|e| (&e).into()) })
+    }
+
+    fn ping_key<'a>(
+        &'a self,
+        secret_ref: &'a str,
+        cancel: &'a Cancel,
+    ) -> BoxFuture<'a, PingResult> {
+        Box::pin(self.ping_key(secret_ref, cancel))
     }
 }
 
