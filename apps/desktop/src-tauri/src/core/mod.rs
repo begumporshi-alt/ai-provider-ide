@@ -30,6 +30,7 @@ pub mod adapter;
 pub mod adapter_runtime;
 pub mod assistant_stream;
 pub mod bridge_policy;
+pub mod builtin_templates;
 pub mod capture;
 pub mod code_adapter;
 pub mod compress;

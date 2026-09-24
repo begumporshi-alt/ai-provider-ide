@@ -27,38 +27,56 @@
 //! launch is the last moment at which the problem can be reported once, with a name, instead of once
 //! per request with the wrong one.
 //!
-//! # What activation is not: the builtin profiles
+//! # The builtin profiles, and which of the two sources wins
 //!
-//! The reference's loop runs **over providers**, and for each one it first tries
-//! `PROVIDER_PROFILES[slug]` — three builtin manifests (`openrouter`, `opencode`, `b.ai`) built from
-//! the two ported templates — falling back to that provider's active manifest row. **There is no
-//! Rust `PROVIDER_PROFILES`**: the `openai_compat` / `anthropic_compat` values in
-//! `core::manifest_view` are test fixtures, and no production type holds the three profiles.
+//! The loop runs **over providers**, and for each one it first tries
+//! [`crate::core::builtin_templates::provider_profile`] by **slug** — three builtin manifests
+//! (`openrouter`, `opencode`, `b.ai`) built from the two ported templates — falling back to that
+//! provider's active manifest row. That is the reference's `store.ts:367-381` verbatim, and the
+//! branch's absence was **D41**, measured 2026-09-24 and closed 2026-09-25.
 //!
-//! This module therefore iterates **manifest rows** rather than providers. That is the honest
-//! subset, and it is not a guess — measured against the installed database on 2026-09-24, there are
-//! **two** providers, both `type='manifest'`, both carrying an active row, and **no builtin provider
-//! is installed**, so the two agree on this machine. They would not agree on one that had an
-//! OpenRouter provider whose slug has no manifest row: that provider is served by its profile in
-//! the reference and would go unregistered here. Recorded in the drift register rather than left for
-//! increment 25e to discover.
+//! Two facets, only the first of which D41 recorded:
+//!
+//! 1. **A builtin provider with no manifest row went unregistered.** `addProvider` writes the
+//!    provider row *before* the manifest row (`store.ts:495-502`), and its `catch` rolls back
+//!    in-memory state only — so a failure between the two leaves a row-less provider permanently.
+//! 2. **A builtin provider with a row was served the *stale* stored one.** The row is written once,
+//!    at creation, with `version: 1`; nothing re-seeds it on upgrade. The reference ignores that
+//!    row for a builtin slug and serves the *current* profile, so any template change between
+//!    releases is served by the reference and not by the old port. This facet needs no failure to
+//!    reach — it holds for every builtin provider from the second release onwards.
+//!
+//! **The slug is the key, not `type`.** `store.ts:368` is `PROVIDER_PROFILES[p.slug]`, so a provider
+//! typed `manifest` whose slug is `openrouter` is served by its profile in the reference. Keying on
+//! `type` would diverge in the other direction, and the divergence would be invisible for the same
+//! reason this one was: no builtin provider is installed on the machine anyone has measured.
+//!
+//! **On the profile path the destination is `providers.base_url`**, which is the column the
+//! allowlist is derived from — so a builtin provider cannot trip D46. See
+//! [`crate::core::builtin_templates`] for why that is a property of the composition and not of the
+//! check.
+
+use std::collections::HashMap;
 
 use serde_json::Value;
 
 use crate::core::adapter_runtime::AdapterRuntime;
+use crate::core::builtin_templates;
 use crate::core::egress::{host_is_permitted, AllowList};
 use crate::core::error::CommandError;
-use crate::core::persist::{manifests_active_rows, ManifestRow};
+use crate::core::persist::{manifests_active_rows, providers_rows, ManifestRow, ProviderRow};
 use crate::core::store::Store;
 
-/// One manifest that was read and could not become an adapter.
+/// One provider that could not be made to serve.
 ///
-/// `version` is carried because the table holds every version and an operator reading a skip needs
-/// to know *which* row failed — "provider X" alone names three candidates.
+/// `version` is `Some` only when a **manifest row** was the thing that failed: the table holds every
+/// version and an operator reading a skip needs to know *which* row it was — "provider X" alone
+/// names three candidates. It is `None` for a provider with no row at all, and for one served from
+/// a builtin profile, where there is no version because there is no row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Skipped {
     pub provider_id: String,
-    pub version: i64,
+    pub version: Option<i64>,
     pub reason: String,
 }
 
@@ -82,8 +100,8 @@ impl Activation {
     }
 }
 
-/// Register every active manifest into the runtime, skipping the ones that cannot be built or
-/// cannot be reached.
+/// Register every provider into the runtime, skipping the ones that cannot be built or cannot be
+/// reached.
 ///
 /// **The store read is the only failure that propagates**, and that is the one asymmetry worth
 /// naming: a database this process cannot read is not a degraded launch, it is no launch, so it is
@@ -97,15 +115,25 @@ pub fn activate(
     store: &Store,
     allow: &AllowList,
 ) -> Result<Activation, CommandError> {
+    let providers = providers_rows(store)?;
     let rows = manifests_active_rows(store)?;
+
+    // The reference's `manifests.find(x => x.providerId === p.id)` (`store.ts:373`). The unique
+    // index `uq_manifests_one_active` makes the lookup unambiguous; `or_insert` keeps the first row
+    // should that index ever be violated, which is what `find` does.
+    let mut by_provider: HashMap<&str, &ManifestRow> = HashMap::new();
+    for row in &rows {
+        by_provider.entry(row.provider_id.as_str()).or_insert(row);
+    }
+
     let mut out = Activation::default();
-    for row in rows {
-        match register_row(runtime, allow, &row) {
-            Ok(()) => out.registered.push(row.provider_id),
-            Err(reason) => out.skipped.push(Skipped {
-                provider_id: row.provider_id,
-                version: row.version,
-                reason,
+    for p in &providers {
+        match register_provider(runtime, allow, p, by_provider.get(p.id.as_str()).copied()) {
+            Ok(()) => out.registered.push(p.id.clone()),
+            Err(skip) => out.skipped.push(Skipped {
+                provider_id: p.id.clone(),
+                version: skip.version,
+                reason: skip.reason,
             }),
         }
     }
@@ -113,21 +141,68 @@ pub fn activate(
     Ok(out)
 }
 
-/// One row: parse, check the destination, then register.
+/// What went wrong for one provider, before its id is attached by [`activate`].
 ///
-/// The three failures collapse into one `Err` because the caller treats them identically, but the
-/// reason says which it was — "is not JSON" names a corrupt row, the allowlist message names a
-/// destination the egress will refuse, and anything else names a manifest that parsed and could not
-/// be built.
-fn register_row(
+/// Carrying `version` here as well is what keeps the two `None`s apart: "the profile failed" and
+/// "there was no row" are both versionless for entirely different reasons, and only the reason
+/// string says which.
+struct Skip {
+    version: Option<i64>,
+    reason: String,
+}
+
+/// One provider: its builtin profile if its slug has one, otherwise its active manifest row.
+///
+/// **The profile is tried first, and the row is the fallback** — `store.ts:368-372`, then `:373-380`.
+/// A provider whose slug has a profile therefore *ignores* its stored row, which is the second
+/// facet of D41: the row is a snapshot from creation time and the profile is current code.
+fn register_provider(
     runtime: &AdapterRuntime,
     allow: &AllowList,
-    row: &ManifestRow,
-) -> Result<(), String> {
-    let body: Value =
-        serde_json::from_str(&row.body_json).map_err(|e| format!("body_json is not JSON: {e}"))?;
-    check_destination(allow, &body)?;
-    runtime.register(&row.provider_id, &body)
+    p: &ProviderRow,
+    row: Option<&ManifestRow>,
+) -> Result<(), Skip> {
+    if let Some(body) = builtin_templates::provider_profile(&p.slug, &p.base_url) {
+        check_destination(allow, &body).map_err(|reason| Skip { version: None, reason })?;
+        return runtime.register(&p.id, &body).map_err(|reason| Skip { version: None, reason });
+    }
+
+    // An unknown slug with no row: nothing will serve this provider.
+    //
+    // **This is reported, and that is a deliberate, additive divergence** — the reference's loop
+    // falls off the end silently (`store.ts:373` finds nothing and the body is skipped). Silence is
+    // what made D41 invisible: the symptom arrives later as `no active manifest for provider …` on
+    // every request, from a different module, with no mention of the launch that could have named
+    // it. Reporting it here is the same argument as D46's — say it once, at boot, with a name.
+    let Some(row) = row else {
+        return Err(Skip { version: None, reason: no_row_reason(&p.slug) });
+    };
+
+    // The three row failures collapse into one `Err` because the caller treats them identically,
+    // but the reason says which it was — "is not JSON" names a corrupt row, the allowlist message
+    // names a destination the egress will refuse, and anything else names a manifest that parsed
+    // and could not be built.
+    let body: Value = serde_json::from_str(&row.body_json).map_err(|e| Skip {
+        version: Some(row.version),
+        reason: format!("body_json is not JSON: {e}"),
+    })?;
+    check_destination(allow, &body)
+        .map_err(|reason| Skip { version: Some(row.version), reason })?;
+    runtime.register(&p.id, &body).map_err(|reason| Skip { version: Some(row.version), reason })
+}
+
+/// The reason for a provider that has neither a profile nor a row.
+///
+/// It names the slug, because the slug is what decided there was no profile — and it names the
+/// write order, because a provider in this state is usually a half-finished `addProvider` rather
+/// than a manifest the operator deleted.
+fn no_row_reason(slug: &str) -> String {
+    format!(
+        "no builtin profile for slug `{slug}` and no active manifest row — nothing will serve this \
+         provider, and every request for it will answer `no active manifest for provider …`. \
+         `addProvider` writes the provider row before the manifest row (`store.ts:495-502`), so a \
+         failure between the two leaves exactly this state; re-creating the provider writes both"
+    )
 }
 
 /// Refuse a manifest whose destination the egress will not dial — **D46, closed at the boot path**.
@@ -190,7 +265,7 @@ mod tests {
     use rusqlite::params;
     use serde_json::json;
 
-    use crate::core::adapter::Cancel;
+    use crate::core::adapter::{AdapterFactory, Cancel};
     use crate::core::http_port::{HttpError, HttpPort, HttpRequest, HttpResponse};
 
     use super::*;
@@ -385,7 +460,7 @@ mod tests {
         assert_eq!(act.registered, vec!["good".to_string()], "the healthy provider still serves");
         assert_eq!(act.skipped.len(), 1, "one row was skipped");
         assert_eq!(act.skipped[0].provider_id, "bad");
-        assert_eq!(act.skipped[0].version, 1);
+        assert_eq!(act.skipped[0].version, Some(1));
         assert!(act.skipped[0].reason.contains("is not JSON"), "{}", act.skipped[0].reason);
         assert!(!act.is_complete());
         let _ = std::fs::remove_dir_all(&dir);
@@ -549,5 +624,205 @@ mod tests {
             "the destination check has no host to judge and must stay out of the way: {reason}"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- the builtin profiles (D41) ----------
+
+    /// Insert a provider with a **chosen slug and base URL**.
+    ///
+    /// The existing `insert` helper ties slug and base URL to the provider id, which is right for
+    /// the row-fallback tests and useless for the profiles: the profile branch is keyed on the slug
+    /// and dials `base_url`, so a test that could not choose either would exercise neither.
+    fn insert_provider(conn: &rusqlite::Connection, provider_id: &str, slug: &str, base_url: &str) {
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, rotation_strategy, created_at, updated_at)
+             VALUES (?1, ?2, ?2, ?3, 'enabled', 'round_robin', 1, 1)",
+            params![provider_id, slug, base_url],
+        )
+        .unwrap();
+    }
+
+    /// **The profile wins over the stored row.** This is the second facet of D41, and the one that
+    /// needs no failure to reach.
+    ///
+    /// The stored row is deliberately a `kind: "code"` manifest with no `code.source`, which
+    /// **cannot be built into an adapter**. So the outcome names the winner without any accessor:
+    /// if the row were used, `register` would fail and the provider would land in `skipped`; if the
+    /// profile is used, it registers. A test that read a field off the built adapter would be able
+    /// to pass on a copy the request path never sees — this cannot, because there is no adapter
+    /// unless the profile won.
+    #[test]
+    fn a_builtin_provider_is_served_by_its_profile_not_its_stored_row() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "openrouter", "https://one.test/v1");
+            insert(&conn, "p1", 1, &code_without_source(), true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a readable store activates");
+        assert_eq!(act.registered, vec!["p1".to_string()], "the profile won");
+        assert!(act.skipped.is_empty(), "the unusable row was never consulted: {:?}", act.skipped);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The first facet of D41, inverted: a builtin provider with no manifest row is served.**
+    ///
+    /// `addProvider` writes the provider row before the manifest row (`store.ts:495-502`), so a
+    /// failure between the two leaves a provider that the reference serves from its profile and the
+    /// old port served from nothing. The assertion is the symptom itself: `for_provider` used to
+    /// answer `Err("no active manifest for provider p1")` for every request.
+    #[tokio::test]
+    async fn a_builtin_provider_with_no_manifest_row_is_still_served() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "openrouter", "https://one.test/v1");
+            // No manifest row at all.
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a readable store activates");
+        assert_eq!(act.registered, vec!["p1".to_string()]);
+        assert!(act.skipped.is_empty(), "{:?}", act.skipped);
+        // The symptom, named: this is what a request used to get.
+        let adapter = rt.for_provider("p1").await.expect("the provider serves");
+        assert!(adapter.capabilities().text, "the profile's own declaration");
+        // And the OpenRouter profile declares images, which the stored-row path could not have
+        // supplied — there is no stored row.
+        assert!(adapter.capabilities().image, "the profile declares an image endpoint");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The profile dials the provider row's base URL**, not the template's own default.
+    ///
+    /// The observable is `check_destination`, which is the same predicate production uses. The row
+    /// is allowlisted and the *provider row* is not, so the only way this can be skipped is if the
+    /// base URL came from the provider row — the reference's `withBaseUrl`.
+    #[test]
+    fn a_builtin_profile_dials_the_provider_rows_base_url() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "openrouter", "https://not-allowlisted.example/v1");
+            insert(&conn, "p1", 1, &declarative("https://one.test/v1"), true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a refusal is not a store failure");
+        assert!(act.registered.is_empty(), "nothing was registered");
+        assert_eq!(act.skipped.len(), 1);
+        let reason = &act.skipped[0].reason;
+        assert!(
+            reason.contains("not-allowlisted.example"),
+            "the profile dials providers.base_url, not the row's: {reason}"
+        );
+        assert_eq!(act.skipped[0].version, None, "no row was involved");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The converse, and the half that proves the row's base URL is **not** consulted at all.
+    #[test]
+    fn a_builtin_profile_ignores_the_stored_rows_base_url() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "openrouter", "https://one.test/v1");
+            insert(&conn, "p1", 1, &declarative("https://not-allowlisted.example/v1"), true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a readable store activates");
+        assert_eq!(
+            act.registered,
+            vec!["p1".to_string()],
+            "the row's refused host never reached the check: {:?}",
+            act.skipped
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A provider with neither a profile nor a row is reported**, which the reference does not do.
+    ///
+    /// Silence is what made D41 invisible: the symptom surfaced later, from a different module, as
+    /// `no active manifest for provider …` on every request. The reason names the slug, because the
+    /// slug is what decided there was no profile, and names the write order, because a provider in
+    /// this state is usually a half-finished `addProvider`.
+    #[test]
+    fn a_provider_with_no_profile_and_no_row_is_reported_by_slug() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "custom-thing", "https://one.test/v1");
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a readable store activates");
+        assert!(act.registered.is_empty());
+        assert_eq!(act.skipped.len(), 1);
+        assert_eq!(act.skipped[0].provider_id, "p1");
+        assert_eq!(act.skipped[0].version, None, "there is no row to name a version of");
+        let reason = &act.skipped[0].reason;
+        assert!(reason.contains("custom-thing"), "the reason names the slug: {reason}");
+        assert!(
+            reason.contains("no active manifest for provider"),
+            "the reason names the symptom the operator would otherwise see: {reason}"
+        );
+        assert!(!act.is_complete(), "a provider nothing serves is not a complete activation");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Every profile is reachable through activation**, not just the one the fixtures favour.
+    ///
+    /// `PROFILE_SLUGS` exists so a test can walk the table instead of trusting a sample; a `b.ai`
+    /// arm that were dropped would leave every other test green, because they all use
+    /// `openrouter`. The observable is `capabilities`: only OpenRouter declares an image endpoint.
+    #[tokio::test]
+    async fn every_builtin_slug_registers_without_a_manifest_row() {
+        for slug in crate::core::builtin_templates::PROFILE_SLUGS {
+            let (store, dir) = tmp_store();
+            {
+                let conn = store.conn.lock().unwrap();
+                insert_provider(&conn, "p1", slug, "https://one.test/v1");
+            }
+            let rt = runtime();
+            let act =
+                activate(&rt, &store, &allow()).unwrap_or_else(|e| panic!("{slug} activates: {e}"));
+            assert_eq!(act.registered, vec!["p1".to_string()], "slug {slug}");
+            let adapter =
+                rt.for_provider("p1").await.unwrap_or_else(|e| panic!("{slug} serves: {e}"));
+            assert_eq!(
+                adapter.capabilities().image,
+                slug == "openrouter",
+                "{slug} declares image: {}",
+                adapter.capabilities().image
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+    }
+
+    /// **The fallback is unchanged for a provider with no profile**: the stored row still supplies
+    /// the manifest, and its own declaration is what gets registered.
+    ///
+    /// This is the contrast that makes the profile tests mean something — without it, "the profile
+    /// won" would be indistinguishable from "nothing ever reads the row".
+    #[tokio::test]
+    async fn a_provider_with_no_profile_is_still_served_from_its_stored_row() {
+        let (store, dir) = tmp_store();
+        {
+            let conn = store.conn.lock().unwrap();
+            insert_provider(&conn, "p1", "custom-thing", "https://one.test/v1");
+            insert(&conn, "p1", 1, &declarative_with_images("https://one.test/v1"), true);
+        }
+        let rt = runtime();
+        let act = activate(&rt, &store, &allow()).expect("a readable store activates");
+        assert_eq!(act.registered, vec!["p1".to_string()]);
+        let adapter = rt.for_provider("p1").await.expect("the provider serves");
+        assert!(adapter.capabilities().image, "the row's own declaration is what was registered");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declarative manifest that declares an image capability — the contrast fixture for the
+    /// capability assertions above, which need a row whose declaration differs from the profile's.
+    fn declarative_with_images(base_url: &str) -> String {
+        let mut v: serde_json::Value = serde_json::from_str(&declarative(base_url)).unwrap();
+        v["capabilities"]["image"] = serde_json::Value::Bool(true);
+        v.to_string()
     }
 }

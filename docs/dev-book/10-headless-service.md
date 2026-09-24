@@ -3133,6 +3133,63 @@ mapping (`engine.rs`), the two-kind contract (`http_port.rs`), and the streaming
 interpreter test was rewritten rather than added. Gates: `fmt` clean, `clippy --all-targets -D warnings` clean,
 `--no-default-features --all-targets` clean, lib **1181/0**, binary **5/0**.
 
+**25j — the builtin profiles, and D41's second facet.** D41 was recorded as *"a builtin provider with no manifest
+row would go unregistered"*. Porting the branch turned up a second facet that needs no failure to reach, and showed
+the first to be narrower than the entry claimed.
+
+**The reference's loop, and what the port was missing.** `store.ts:367-381` runs **over providers**, and for each
+one tries `PROVIDER_PROFILES[p.slug]` **first**, registering `withBaseUrl(profile(), p.baseUrl)` and `continue`ing —
+only falling back to that provider's active manifest row. `core::activation` iterated *manifest rows*, so a provider
+with no row was never visited at all, and a provider with one was always served the row.
+
+**Facet 1 — the no-row case is reachable, not hypothetical.** `addProvider` writes the provider row
+(`store.ts:495`) **before** the manifest row (`:497-502`), and its `catch` rolls back in-memory state only:
+`adapters.unregister` and `refreshFromHost`. Nothing deletes the provider row. So a failure between the two writes
+leaves a provider that serves nothing, permanently — and `Providers.tsx:298` creating a builtin provider is the
+ordinary way to get there.
+
+**Facet 2, which D41 does not mention — a builtin provider *with* a row was served the stale one.** The row is
+written once, at creation, with `version: 1`, and nothing re-seeds it on upgrade: no migration and no boot path
+rewrites a `builtin-template` row. The reference ignores that row for a builtin slug and serves the *current*
+profile. So every template change between releases is served by the reference and not by the port, for every builtin
+provider, from the second release onwards. **Facet 1 needs a failure; facet 2 needs only time.**
+
+**`core/builtin_templates.rs` is the port** — `openai_compat`, `anthropic_compat`, and
+`provider_profile(slug, base_url)`. The base URL is a **parameter**, which is `withBaseUrl` composed rather than
+applied: the profile supplies the dialect and its quirks, the provider row supplies the destination. Two
+consequences worth stating. The profile path dials `providers.base_url` — the column `recompute_allow` derives the
+allowlist from — so a builtin provider **cannot trip D46**, the divergence 25h closed. And the reference's pinned
+default URLs are deliberately **not** duplicated in Rust: nothing here consumes them, and a copy would be a second
+answer to "where does OpenRouter live".
+
+**The slug is the key, not `type`.** `store.ts:368` is `PROVIDER_PROFILES[p.slug]`. Keying on `type` would have
+diverged in the other direction, and invisibly, for the same reason this one was — no builtin provider is installed
+on the only database anyone has measured.
+
+**An omitted key is not a null one.** `opencode` passes `{ imageEndpoint: false }`, so `headers: extra?.textHeaders`
+is `undefined` and `JSON.stringify` drops it. A port that always emitted `headers` would generate a manifest the
+reference never would; `a_profile_without_overrides_omits_the_optional_keys_entirely` pins it, and the
+transcription tests pin both templates field by field against `builtin-templates.ts`.
+
+**Activation now iterates providers.** `Skipped.version` became `Option<i64>` — `None` for *no row involved* rather
+than a `0` sentinel, because two spellings of one state is the defect this register keeps finding. Both log
+consumers were updated.
+
+**One additive divergence, taken deliberately.** A provider with neither a profile nor a row is **reported**, naming
+the slug and the write order. The reference's loop falls off the end silently, and that silence is what made D41
+invisible: the symptom arrives later, from `adapter_runtime`, as `no active manifest for provider …` on every
+request, with no mention of the launch that could have named it.
+
+**Four probes, one at a time.** Removing the profile branch reddens the 5 profile tests **alone**. Making
+`provider_profile` ignore its `base_url` argument reddens 8 across both modules. Removing the no-row report reddens
+its own test **alone**. Inverting precedence reddens the 2 tests that are about precedence — and the 2 further
+failures there were artefacts of the probe's own simplified row path rather than of precedence, which is recorded
+rather than claimed.
+
+**Measured:** `cargo test` lib **1181 → 1197**, binary **5 → 5** — 9 tests in the new module, 7 in activation.
+Gates: `fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean, lib
+**1197/0**, binary **5/0**.
+
 ---
 
 ## 12. What we know we do not know

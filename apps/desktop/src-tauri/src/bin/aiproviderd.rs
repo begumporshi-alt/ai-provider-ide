@@ -165,10 +165,18 @@ async fn main() {
         println!("aiproviderd: activated {} provider(s)", activation.registered.len());
     }
     for skipped in &activation.skipped {
-        eprintln!(
-            "aiproviderd: skipped provider {} v{}: {}",
-            skipped.provider_id, skipped.version, skipped.reason
-        );
+        // A versionless skip is a provider with no manifest row at all — a builtin profile that
+        // failed, or a provider left half-written by `addProvider`. There is no "v?" to print.
+        match skipped.version {
+            Some(v) => eprintln!(
+                "aiproviderd: skipped provider {} v{v}: {}",
+                skipped.provider_id, skipped.reason
+            ),
+            None => eprintln!(
+                "aiproviderd: skipped provider {}: {}",
+                skipped.provider_id, skipped.reason
+            ),
+        }
     }
 
     let router_store = match RouterStore::from_store(&store) {

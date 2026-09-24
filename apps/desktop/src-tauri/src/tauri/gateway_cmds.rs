@@ -107,13 +107,18 @@ pub fn build_core(app: &AppHandle) -> Result<Arc<GatewayCore>, String> {
         );
     }
     for skipped in &activation.skipped {
-        log_to_file(
-            app,
-            &format!(
-                "gateway: skipped provider {} v{}: {}",
-                skipped.provider_id, skipped.version, skipped.reason
+        // A versionless skip is a provider with no manifest row at all — a builtin profile that
+        // failed, or a provider left half-written by `addProvider`. There is no "v?" to print.
+        let line = match skipped.version {
+            Some(v) => format!(
+                "gateway: skipped provider {} v{v}: {}",
+                skipped.provider_id, skipped.reason
             ),
-        );
+            None => {
+                format!("gateway: skipped provider {}: {}", skipped.provider_id, skipped.reason)
+            }
+        };
+        log_to_file(app, &line);
     }
 
     let router_store = Arc::new(RouterStore::from_store(&store).map_err(|e| e.to_string())?);

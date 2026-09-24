@@ -4949,5 +4949,58 @@ added). Binary 5 → 5. fmt clean, clippy `--all-targets -D warnings` clean,
 `--no-default-features --all-targets` clean, check-doc-links 51 files / 127 links, book **738.2 KB** / 204 ids,
 `data-page-node-id` 0. D46 moved from **Fixed at the boot path** to **Closed**; **D48** added.
 
+---
+
+## Increment 25j — the builtin profiles, and D41's second facet (2026-09-25)
+
+**The reference's loop, `store.ts:367-381.** Iterates **providers**; per provider it tries
+`PROVIDER_PROFILES[p.slug]` **first**, registers `withBaseUrl(profile(), p.baseUrl)`, `continue`s, and only then
+falls back to that provider's active manifest row. `core::activation` used to iterate *manifest rows*.
+
+**Two facets; the register recorded only the first.**
+
+1. **No row → unregistered.** `addProvider` writes the provider row (`store.ts:495`) **before** the manifest row
+   (`:497-502`), and its `catch` rolls back in-memory state only. Nothing deletes the provider row, so a failure
+   between the writes leaves a row-less provider permanently.
+2. **Row present → served the *stale* row.** Written once at creation with `version: 1`; nothing re-seeds a
+   `builtin-template` row on upgrade. The reference ignores that row for a builtin slug and serves the current
+   profile. **Facet 2 needs no failure — only a second release.** Broader than facet 1 and not in the D41 text.
+
+**`core/builtin_templates.rs`.** `openai_compat(base_url, extras)`, `anthropic_compat(base_url)`,
+`provider_profile(slug, base_url)`, `PROFILE_SLUGS`. **The base URL is a parameter** — `withBaseUrl` composed,
+not applied. So the profile path dials `providers.base_url`, the column `recompute_allow` fills the allowlist
+from — **a builtin provider cannot trip D46**. The pinned default URLs are deliberately **not** duplicated in
+Rust (nothing consumes them; a copy would be a second answer to "where does OpenRouter live").
+
+**Rules that cost care here.**
+- **The slug is the key, not `type`.** `store.ts:368` is `PROVIDER_PROFILES[p.slug]`. Keying on `type` diverges
+  in the other direction and invisibly.
+- **An omitted key is not a null one.** `opencode` passes `{ imageEndpoint: false }`, so
+  `headers: extra?.textHeaders` is `undefined` and `JSON.stringify` drops it. Emitting `"headers": null` yields
+  a manifest the reference never generates; same for `modalityRules`.
+- `BUILTIN_TEMPLATES` deliberately unported — both callers are TypeScript, so the id enum would have no selector.
+- `PROFILE_SLUGS` exists **so a test can walk every profile**; an `openrouter`-only test passes with `b.ai` dropped.
+- `Skipped.version` is now `Option<i64>` — `None` = no row involved, never a `0` sentinel.
+- **Additive divergence:** a provider with neither a profile nor a row is reported (slug + write order). The
+  reference is silent, and that silence is what hid D41 — the symptom arrives later from `adapter_runtime` as
+  `no active manifest for provider …`.
+
+**Observables that needed no new accessor.** `AdapterRuntime::registered()` (ids), `AdapterFactory::for_provider`
+(→ `Arc<dyn AdapterInstance>`, whose `capabilities()` distinguishes the profiles: only OpenRouter declares
+`image`), and `check_destination`'s allowlist skip reason (proves *which* base URL was used). The decisive
+fixture: a stored row that **cannot be built** (`kind: "code"`, no `source`) — then "registered" can only mean
+the profile won, with no field to read.
+
+**Four probes.** Remove the profile branch → 5 profile tests redden alone. `provider_profile` ignores
+`base_url` → 8 redden across both modules. Remove the no-row report → its own test alone. Invert precedence →
+the 2 precedence tests redden; **2 further failures there were artefacts of the probe's simplified row path, not
+of precedence**, and are recorded as such.
+
+**Measured:** lib **1181 → 1197** (9 + 7), binary 5 → 5. book **745.9 KB** / 204 ids. D41 → **Closed**.
+
+**Doc-write hazard met:** the 25i narrative in `10-headless-service.md` came back **rewrapped and reworded** from
+what was written, so a later edit anchored on the written text failed to match. **Anchor doc edits on text
+re-read from the file**, not on text remembered from the edit.
+
 
 
