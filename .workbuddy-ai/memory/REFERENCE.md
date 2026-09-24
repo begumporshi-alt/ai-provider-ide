@@ -5002,5 +5002,32 @@ of precedence**, and are recorded as such.
 what was written, so a later edit anchored on the written text failed to match. **Anchor doc edits on text
 re-read from the file**, not on text remembered from the edit.
 
+---
 
+## Increment 25k — one authority for "which manifest serves this provider" (D49)
+
+**The stated rationale was false.** 25j already made activation read the *profile*, not the row, so
+"seed builtin providers at boot" would not have closed any drift. What *did* diverge was the second
+consumer: `workbuddy::tool_support` still read `manifests.body_json` directly, so a builtin provider
+was **served** by its current profile and **reported on** from its snapshot row — two answers to one
+question, produced by one increment.
+
+**`activation::serving_manifest` is the one function.** Returns `Result<Option<Serving>, UnreadableRow>`;
+`register_provider` and `tool_support` both read it. `Serving` carries `body: Value` and
+`version: Option<i64>` (`None` = profile, no row; `Some` = row so a failure can name which one).
+`UnreadableRow` carries `version` and `detail` for the parse-error report.
+
+**`tool_support` now LEFT JOINs `manifests`.** Load-bearing: a builtin provider may have no row and
+still be served by its profile. An inner join would answer "unknown" → false for a provider that is
+serving and forwarding tools right now.
+
+**`manifest_forwards_tools` now takes `&Value`.** Re-serializing after `serving_manifest` returns a
+`Value` would be a second parse for no reason.
+
+**Four tests, three probes.** Remove profile branch → reddens 2 new builtin tests + 5 existing D41
+tests **alone**. Outer join → inner → reddens no-row test **alone**. `manifest_forwards_tools` always
+`true` → reddens negative-direction test + existing predicate test **alone**.
+
+**Measured:** lib **1197 → 1201** (4 new in `workbuddy.rs`), binary 5 → 5. book **749.9 KB** / 204 ids.
+D41 register line updated with D49 note.
 

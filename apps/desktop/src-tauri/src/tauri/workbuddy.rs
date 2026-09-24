@@ -16,6 +16,7 @@
  * user's other providers — is left byte-for-byte alone, and a file we cannot parse is an error,
  * never something to overwrite.
  */
+use crate::core::activation;
 use crate::core::store::Store;
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
@@ -139,24 +140,19 @@ fn catalog_facts(store: &Store, native_id: &str) -> (Option<i64>, Option<bool>, 
  * `requestTemplate` has no `tools` field drops every tool definition silently — the model then
  * imitates tool calls as raw text and, given a tool-shaped system prompt, can loop until the
  * user cancels. Claiming `supportsToolCall: true` on such a model is exactly what causes that.
+ *
+ * It takes a parsed manifest rather than a row's text because **the question is about the manifest
+ * that serves the provider, and that is not always the row** — see [`tool_support`].
  */
-fn manifest_forwards_tools(body_json: &str) -> bool {
-    serde_json::from_str::<Value>(body_json)
-        .ok()
-        .and_then(|m| m.get("endpoints").cloned())
-        .and_then(|e| e.get("generateText").cloned())
-        .and_then(|g| g.get("requestTemplate").cloned())
-        .and_then(|t| t.get("tools").cloned())
+fn manifest_forwards_tools(manifest: &Value) -> bool {
+    manifest
+        .get("endpoints")
+        .and_then(|e| e.get("generateText"))
+        .and_then(|g| g.get("requestTemplate"))
+        .and_then(|t| t.get("tools"))
         .is_some()
 }
 
-/**
- * Tool support for one model, read from the ACTIVE manifest of a provider that carries it.
- *
- * `None` means unknown, and the caller must treat unknown as false: a client acts on this flag,
- * and promising tool calls that will be dropped on the floor is far worse than not offering
- * them. (Same rule as `supportsReasoning`.)
- */
 /// Manifests are per-provider, not per-model, so a provider's text manifest says nothing about
 /// its image models. Without the modality guard an image model inherits `supportsToolCall: true`
 /// from a sibling text manifest and a client then offers it tools it cannot call.
@@ -166,6 +162,21 @@ fn id_marks_non_text(native_id: &str) -> bool {
     ["-image", "/image", "-video", "/video"].iter().any(|m| lower.contains(m))
 }
 
+/**
+ * Tool support for one model, read from the manifest that **serves** its provider.
+ *
+ * `None` means unknown, and the caller must treat unknown as false: a client acts on this flag,
+ * and promising tool calls that will be dropped on the floor is far worse than not offering them.
+ * (Same rule as `supportsReasoning`.)
+ *
+ * # The manifest is the serving one, not the stored row
+ *
+ * For most providers those are the same document. For a builtin slug they are not: activation
+ * registers the *profile* and ignores the row (D41, facet 2), so a row without a `tools` field
+ * would have this answer `false` about an adapter that in fact forwards tools. Both halves of the
+ * question "which manifest serves this provider" therefore come from
+ * `activation::serving_manifest` — the same function that decides what gets registered (**D49**).
+ */
 fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
     // A provider's catalog is not always honest about modality: Agnes publishes its image and
     // video models as `text`, so the modality guard below cannot see them. The id can. Offering
@@ -175,16 +186,34 @@ fn tool_support(store: &Store, native_id: &str) -> Option<bool> {
         return Some(false);
     }
     let conn = store.conn.lock().ok()?;
-    conn.query_row(
-        "SELECT m.body_json FROM models_cache c
-         JOIN manifests m ON m.provider_id = c.provider_id AND m.is_active = 1
-         WHERE c.native_id = ?1 AND c.modality = 'text'
-         ORDER BY (c.context_window IS NULL), (c.capabilities_json IS NULL) LIMIT 1",
-        rusqlite::params![native_id],
-        |r| r.get::<_, String>(0),
+    // The manifest row is OUTER-joined rather than inner: a builtin provider may have no row at
+    // all and still be served by its profile, and an inner join would answer "unknown" — which
+    // the caller reads as false — for a provider that is serving and forwarding tools right now.
+    let (slug, base_url, row) = conn
+        .query_row(
+            "SELECT p.slug, p.base_url, m.version, m.body_json
+             FROM models_cache c
+             JOIN providers p ON p.id = c.provider_id
+             LEFT JOIN manifests m ON m.provider_id = c.provider_id AND m.is_active = 1
+             WHERE c.native_id = ?1 AND c.modality = 'text'
+             ORDER BY (c.context_window IS NULL), (c.capabilities_json IS NULL) LIMIT 1",
+            rusqlite::params![native_id],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<i64>>(2)?.zip(r.get::<_, Option<String>>(3)?),
+                ))
+            },
+        )
+        .ok()?;
+    let serving = activation::serving_manifest(
+        &slug,
+        &base_url,
+        row.as_ref().map(|(version, body_json)| (body_json.as_str(), *version)),
     )
-    .ok()
-    .map(|body| manifest_forwards_tools(&body))
+    .ok()??;
+    Some(manifest_forwards_tools(&serving.body))
 }
 
 /**
@@ -550,6 +579,47 @@ mod tests {
         (crate::core::store::Store::open(&dir).unwrap(), dir)
     }
 
+    /// One provider with one cached text model, and an active manifest row only if `body_json`
+    /// is `Some`.
+    ///
+    /// `None` is not a degenerate fixture: `addProvider` writes the provider row before the
+    /// manifest row (`store.ts:495-502`) and its `catch` rolls back in-memory state only, so a
+    /// builtin provider can be served by its profile with no row in the table at all.
+    fn store_with(
+        tag: &str,
+        slug: &str,
+        base_url: &str,
+        body_json: Option<&str>,
+    ) -> (crate::core::store::Store, std::path::PathBuf) {
+        let (store, dir) = tmp_store(tag);
+        {
+            let conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id, slug, name, base_url, status, rotation_strategy,
+                                        created_at, updated_at)
+                 VALUES ('p1', ?1, 'P', ?2, 'enabled', 'round_robin', 0, 0)",
+                rusqlite::params![slug, base_url],
+            )
+            .unwrap();
+            if let Some(body) = body_json {
+                conn.execute(
+                    "INSERT INTO manifests (id, provider_id, version, origin, body_json,
+                                            created_at, is_active)
+                     VALUES ('m1', 'p1', 1, 'builtin-template', ?1, 0, 1)",
+                    rusqlite::params![body],
+                )
+                .unwrap();
+            }
+            conn.execute(
+                "INSERT INTO models_cache (id, provider_id, native_id, modality, fetched_at, raw_json)
+                 VALUES ('c1', 'p1', 'openai/gpt-4o-mini', 'text', 0, '{}')",
+                [],
+            )
+            .unwrap();
+        }
+        (store, dir)
+    }
+
     const EP: &str = "http://127.0.0.1:8787/v1/chat/completions";
 
     #[test]
@@ -603,10 +673,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    fn manifest_with_template(tpl: &str) -> String {
-        format!(
-            r#"{{"manifestVersion":1,"endpoints":{{"generateText":{{"requestTemplate":{tpl}}}}}}}"#
-        )
+    fn manifest_with_template(tpl: &str) -> Value {
+        let template: Value = serde_json::from_str(tpl).unwrap();
+        json!({ "manifestVersion": 1, "endpoints": { "generateText": { "requestTemplate": template } } })
     }
 
     #[test]
@@ -619,9 +688,74 @@ mod tests {
         assert!(!manifest_forwards_tools(&manifest_with_template(
             r#"{"model":"{{model}}","messages":"{{messages}}"}"#
         )));
-        // A manifest that is not declarative text, or is unparseable, is unknown — never true.
-        assert!(!manifest_forwards_tools("not json"));
-        assert!(!manifest_forwards_tools("{}"));
+        // A manifest that declares no endpoints at all says nothing either way — never true.
+        assert!(!manifest_forwards_tools(&json!({})));
+    }
+
+    #[test]
+    fn a_builtin_provider_reports_tool_support_from_its_profile_not_its_row() {
+        // D49. Activation registers the profile and ignores the row for a builtin slug, so a row
+        // that drops `tools` used to make this answer `false` about an adapter that forwards them.
+        // The row here is the discriminating fixture: it is a perfectly valid manifest that simply
+        // does not forward tools, so `true` can only have come from the profile.
+        let (store, dir) = store_with(
+            "profile-wins",
+            "openrouter",
+            "https://openrouter.ai/api/v1",
+            Some(&manifest_with_template(r#"{"model":"{{model}}"}"#).to_string()),
+        );
+        assert_eq!(
+            tool_support(&store, "openai/gpt-4o-mini"),
+            Some(true),
+            "the profile is what is registered, so it is what must be reported"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_builtin_provider_with_no_manifest_row_still_reports_tool_support() {
+        // Same question, reachable without any failure: `addProvider` writes the provider row
+        // first. An inner join to `manifests` answers "unknown" here, which the caller reads as
+        // false — the outer join is load-bearing, not cosmetic.
+        let (store, dir) = store_with("no-row", "b.ai", "https://api.b.ai", None);
+        assert_eq!(tool_support(&store, "openai/gpt-4o-mini"), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_provider_without_a_profile_still_answers_from_its_row_in_both_directions() {
+        // The guard against the fix being "a builtin is always true": everyone else is still
+        // decided by their stored manifest, and it can say no.
+        let (store, dir) = store_with(
+            "row-only-yes",
+            "agnes",
+            "https://api.agnes.test",
+            Some(
+                &manifest_with_template(r#"{"model":"{{model}}","tools":"{{tools?}}"}"#)
+                    .to_string(),
+            ),
+        );
+        assert_eq!(tool_support(&store, "openai/gpt-4o-mini"), Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let (store, dir) = store_with(
+            "row-only-no",
+            "agnes",
+            "https://api.agnes.test",
+            Some(&manifest_with_template(r#"{"model":"{{model}}"}"#).to_string()),
+        );
+        assert_eq!(tool_support(&store, "openai/gpt-4o-mini"), Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_row_that_is_not_json_is_unknown_rather_than_either_answer() {
+        // Unknown is what the caller turns into `false`; a panic or a `true` here would both be
+        // claims this gateway has not earned.
+        let (store, dir) =
+            store_with("corrupt", "agnes", "https://api.agnes.test", Some("not json"));
+        assert_eq!(tool_support(&store, "openai/gpt-4o-mini"), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

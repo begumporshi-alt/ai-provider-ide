@@ -3190,6 +3190,41 @@ rather than claimed.
 Gates: `fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean, lib
 **1197/0**, binary **5/0**.
 
+**25k — one authority for "which manifest serves this provider".**
+
+**The stated rationale was false, and the work is the residual.** The recommendation that opened 25k was
+"seed builtin providers at boot, or the port will drift again on the next template change". That drift was
+already closed: 25j made activation read the *profile*, not the row, so serving no longer diverged. What
+*did* diverge was the second consumer of the same question: `workbuddy::tool_support` still read the row,
+so a builtin provider was **served** by its current profile and **reported on** from its snapshot row — two
+answers to one question, produced by one increment (**D49**).
+
+**`activation::serving_manifest` is the one function.** It takes a slug, a base URL, and an optional
+`(body_json, version)` — the stored row — and returns the manifest that serves the provider, with the
+version it came from (`None` for a profile, `Some` for a row). Both `register_provider` and `tool_support`
+read it. The function is the authority; the two callers are the consumers.
+
+**`tool_support` now outer-joins `manifests`.** The join is load-bearing, not cosmetic: a builtin provider
+may have no row and still be served by its profile, and an inner join would answer "unknown" — which the
+caller reads as `false` — for a provider that is serving and forwarding tools right now.
+
+**`manifest_forwards_tools` now takes `&Value`.** It used to take `&str` and parse, which assumed the
+caller had a JSON string. After `serving_manifest` returns a `Value`, re-serializing and re-parsing would
+be a second parse for no reason, and it would make the "not JSON" case unrepresentable — which is fine,
+because that case is now `serving_manifest`'s `Err` arm, not the predicate's.
+
+**Four tests, four claims.** `a_builtin_provider_reports_tool_support_from_its_profile_not_its_row` — the
+row has no `tools` field, so `true` can only have come from the profile. `a_builtin_provider_with_no_manifest_row_still_reports_tool_support` — the outer join is load-bearing. `a_provider_without_a_profile_still_answers_from_its_row_in_both_directions` — the fix is not "builtins are always true". `a_row_that_is_not_json_is_unknown_rather_than_either_answer` — a corrupt row yields `None`, not a panic or a false claim.
+
+**Three probes, one at a time.** Removing the profile branch from `serving_manifest` reddens the two builtin
+tests and the five existing D41 tests **alone**. Changing the outer join to an inner one reddens the no-row
+test **alone**. Making `manifest_forwards_tools` always `true` reddens the negative-direction test and the
+existing predicate test **alone**.
+
+**Measured:** `cargo test` lib **1197 → 1201**, binary **5 → 5** — 4 new tests in `workbuddy.rs`. Gates:
+`fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean, lib
+**1201/0**, binary **5/0**.
+
 ---
 
 ## 12. What we know we do not know

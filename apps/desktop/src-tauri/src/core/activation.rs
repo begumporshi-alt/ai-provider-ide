@@ -55,6 +55,15 @@
 //! allowlist is derived from — so a builtin provider cannot trip D46. See
 //! [`crate::core::builtin_templates`] for why that is a property of the composition and not of the
 //! check.
+//!
+//! # The precedence lives in one function, because two things have to ask
+//!
+//! [`serving_manifest`] is the only answer to "which manifest serves this provider".
+//! [`register_provider`] registers what it returns, and `workbuddy::tool_support` answers "does this
+//! model support tools *through us*" from it — which is why it was extracted. The latter used to
+//! read `manifests.body_json` on its own, so from D41 onwards a builtin provider was **served** by
+//! its current profile and **reported on** from its snapshot row: one question, two answers, both
+//! written by the same increment (**D49**).
 
 use std::collections::HashMap;
 
@@ -151,44 +160,94 @@ struct Skip {
     reason: String,
 }
 
-/// One provider: its builtin profile if its slug has one, otherwise its active manifest row.
+/// Which manifest serves one provider: its builtin profile if its slug has one, otherwise its
+/// stored active row.
 ///
-/// **The profile is tried first, and the row is the fallback** — `store.ts:368-372`, then `:373-380`.
-/// A provider whose slug has a profile therefore *ignores* its stored row, which is the second
-/// facet of D41: the row is a snapshot from creation time and the profile is current code.
+/// **One authority for one question, and it has two consumers.** [`register_provider`] registers
+/// what this returns; `workbuddy::tool_support` answers "does this model support tools through us"
+/// from it. Before this existed the latter read `manifests.body_json` itself, so from D41 onwards a
+/// builtin provider was *served* by its current profile and *reported on* from its snapshot row —
+/// two answers to one question, both produced by one increment (**D49**).
+///
+/// The profile wins **unconditionally** for a slug that has one — facet 2 of D41. The row is a
+/// snapshot written once at creation; the profile is current code, and it is what the reference
+/// serves.
+///
+/// `row` is `Some((body_json, version))`, and it is `None` for a provider with **no** active row —
+/// which is a reachable state for a builtin slug (`addProvider` writes the provider row first, see
+/// `no_row_reason`). A caller that needs the profile-first half must therefore reach this function
+/// with `row: None` rather than never reaching it at all, which is why the join that finds a row
+/// has to be an outer one.
+pub fn serving_manifest(
+    slug: &str,
+    base_url: &str,
+    row: Option<(&str, i64)>,
+) -> Result<Option<Serving>, UnreadableRow> {
+    if let Some(body) = builtin_templates::provider_profile(slug, base_url) {
+        return Ok(Some(Serving { body, version: None }));
+    }
+    let Some((body_json, version)) = row else {
+        return Ok(None);
+    };
+    let body: Value = serde_json::from_str(body_json)
+        .map_err(|e| UnreadableRow { version, detail: e.to_string() })?;
+    Ok(Some(Serving { body, version: Some(version) }))
+}
+
+/// The manifest that serves a provider, with the row it was read from.
+///
+/// `version` is `None` exactly when [`Serving::body`] is a builtin profile: there is no row, so
+/// there is no version to name. It is `Some` for a row-served provider on **every** outcome,
+/// including a successful one, because a later failure has to say which row it was.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Serving {
+    pub body: Value,
+    pub version: Option<i64>,
+}
+
+/// A stored manifest row whose `body_json` is not JSON.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreadableRow {
+    pub version: i64,
+    pub detail: String,
+}
+
+/// One provider: take what [`serving_manifest`] says serves it and put it in the runtime.
 fn register_provider(
     runtime: &AdapterRuntime,
     allow: &AllowList,
     p: &ProviderRow,
     row: Option<&ManifestRow>,
 ) -> Result<(), Skip> {
-    if let Some(body) = builtin_templates::provider_profile(&p.slug, &p.base_url) {
-        check_destination(allow, &body).map_err(|reason| Skip { version: None, reason })?;
-        return runtime.register(&p.id, &body).map_err(|reason| Skip { version: None, reason });
-    }
-
-    // An unknown slug with no row: nothing will serve this provider.
-    //
-    // **This is reported, and that is a deliberate, additive divergence** — the reference's loop
-    // falls off the end silently (`store.ts:373` finds nothing and the body is skipped). Silence is
-    // what made D41 invisible: the symptom arrives later as `no active manifest for provider …` on
-    // every request, from a different module, with no mention of the launch that could have named
-    // it. Reporting it here is the same argument as D46's — say it once, at boot, with a name.
-    let Some(row) = row else {
-        return Err(Skip { version: None, reason: no_row_reason(&p.slug) });
+    let serving = match serving_manifest(
+        &p.slug,
+        &p.base_url,
+        row.map(|r| (r.body_json.as_str(), r.version)),
+    ) {
+        Ok(Some(s)) => s,
+        // Neither a profile nor a row: nothing will serve this provider.
+        //
+        // **This is reported, and that is a deliberate, additive divergence** — the reference's loop
+        // falls off the end silently (`store.ts:373` finds nothing and the body is skipped). Silence
+        // is what made D41 invisible: the symptom arrives later as `no active manifest for provider
+        // …` on every request, from a different module, with no mention of the launch that could
+        // have named it. Reporting it here is the same argument as D46's — say it once, at boot,
+        // with a name.
+        Ok(None) => return Err(Skip { version: None, reason: no_row_reason(&p.slug) }),
+        Err(e) => {
+            return Err(Skip {
+                version: Some(e.version),
+                reason: format!("body_json is not JSON: {}", e.detail),
+            })
+        }
     };
 
-    // The three row failures collapse into one `Err` because the caller treats them identically,
-    // but the reason says which it was — "is not JSON" names a corrupt row, the allowlist message
-    // names a destination the egress will refuse, and anything else names a manifest that parsed
-    // and could not be built.
-    let body: Value = serde_json::from_str(&row.body_json).map_err(|e| Skip {
-        version: Some(row.version),
-        reason: format!("body_json is not JSON: {e}"),
-    })?;
-    check_destination(allow, &body)
-        .map_err(|reason| Skip { version: Some(row.version), reason })?;
-    runtime.register(&p.id, &body).map_err(|reason| Skip { version: Some(row.version), reason })
+    // The two remaining failures collapse into one `Err` because the caller treats them
+    // identically, but the reason says which it was — the allowlist message names a destination the
+    // egress will refuse, and anything else names a manifest that parsed and could not be built.
+    let version = serving.version;
+    check_destination(allow, &serving.body).map_err(|reason| Skip { version, reason })?;
+    runtime.register(&p.id, &serving.body).map_err(|reason| Skip { version, reason })
 }
 
 /// The reason for a provider that has neither a profile nor a row.
