@@ -3282,3 +3282,61 @@ properties and maps `NaN`/`Infinity` to `null`, where the reference's `ctx.dump(
 - Recall corpus, measured: **0 gateway vs 14 assistant**; L0 denied on both.
 - Playground is `screens/Assistant.tsx`; skills are frontend-only (SQLite `skills`, `store.rs:230`).
 
+
+## Increment 19b
+
+### `Promise::result` on rejection
+
+`Promise::result<T>()` on a rejected promise **re-throws** the rejected value onto the context and
+returns `Err(Error::Exception)` (`value/promise.rs:107-113`). The reason is **not** in the `Err`;
+it must be read with `Ctx::catch()`. Treating the `Err` as the reason reports every rejection as
+the literal string "exception".
+
+### `Ctx::catch()`
+
+`Ctx::catch(&self) -> Value<'js>` takes the pending exception and clears it. Called after
+`Promise::result` returns `Err` to get the thrown value.
+
+### `rquickjs::String::from_str`
+
+`rquickjs::String::from_str(ctx: Ctx<'js>, s: &str) -> Result<String<'js>>` is the only way to
+build a JS string in 0.9.0. `Ctx` is taken **by value**, not by reference. There is no
+`Ctx::new_string`.
+
+### `Value::is_object()` is a raw tag check
+
+`Value::is_object()` checks `JS_TAG_OBJECT == JS_VALUE_GET_TAG` (`value.rs:332`). A function carries
+that tag, so `is_function` must be checked **before** `is_object` or functions dump as `{}`.
+
+### `dump` needs no `Ctx` parameter
+
+In 0.9.0 a `Value<'js>` carries its own context internally. `dump` only reads; it never creates.
+Clippy's `only_used_in_recursion` caught the vestigial parameter.
+
+### `Runtime` has no getters for memory/stack limits
+
+`set_memory_limit`/`set_max_stack_size` exist; no `memory_limit()`/`max_stack_size()` getters.
+The only observable consequence of the memory limit is the `SIGSEGV` of §2.1.3 trap 3.
+
+### The `armed` flag was a second spelling of one state
+
+`deadline_ms == u64::MAX` already means "no deadline" and makes `now_ms() > deadline_ms` false for
+every clock reading. An `AtomicBool` checked before the comparison added a second spelling with no
+new information. Proved redundant by a probe: the whole module suite passes with the guard deleted.
+
+### `ACTOR_STACK_BYTES = STACK_LIMIT * 4`
+
+Measured floor: 512 KB thread stack contains a 512 KB JS limit; 256 KB SIGSEGVs. Rust's default
+(2 MB) is 4× above the floor, but it is **not a contract**: `RUST_MIN_STACK` overrides it. The
+explicit `.stack_size` makes containment a property of the code, not of the environment.
+
+### S6g table
+
+| thread C stack | 256 KB | 512 KB | 768 KB | 1 MB | 2 MB |
+|---|---|---|---|---|---|
+| result | `SIGABRT` | contained | contained | contained | contained |
+
+### The six `AdapterInstance` operations remaining
+
+`listModels`, `generateImage`, `generateText`, `pingKey`, `tagModality`, `capabilities`, `dispose`.
+Plus wiring `log` and the `{{secret}}`-substituting `HttpTarget`.

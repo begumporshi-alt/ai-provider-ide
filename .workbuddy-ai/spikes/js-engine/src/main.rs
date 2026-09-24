@@ -225,6 +225,9 @@ fn main() {
         ("S6d OOM inside a job (after an await) under an 8 MB limit", || mem_probe(Some(8 * 1024 * 1024), true), false),
         ("S6e control: a plain throw at entry is contained", probe_throw_at_entry, false),
         ("S6f control: runaway recursion vs the 512 KB stack limit", probe_stack_limit, false),
+        // Opt-in, like S6b/S6c, and for the same reason: a size whose C stack runs out first kills
+        // the process. One size per run, from `SPIKE_THREAD_STACK`; the default is `std::thread`'s.
+        ("S6g containment off the main thread (SPIKE_THREAD_STACK bytes)", probe_thread_stack, true),
         ("S7  Runtime/Context are Send+Sync (feature `parallel`)", probe_send_sync, false),
         ("S8  GOOD_GUEST verbatim: listModels/generateText/generateImage", probe_good_guest, false),
     ];
@@ -640,6 +643,57 @@ fn probe_stack_limit() -> Probe {
             },
         }
     })
+}
+
+/// S6g — **does S6f's containment transfer off the main thread?**
+///
+/// S6f found runaway recursion contained under a 512 KB JS stack limit. But it ran on the **main**
+/// thread, where macOS gives 8 MB of C stack. The actor that hosts a guest in `core/js_host.rs`
+/// runs on a `std::thread`, whose Rust default is **2 MB** (`std::thread::Builder`'s
+/// `DEFAULT_STACK_SIZE`) — so S6f's result does not automatically transfer, and the question "is
+/// the JS limit reached *before* the C stack runs out?" has never been asked. The failure mode is
+/// the bad one: a blown C stack is a `SIGSEGV`, not a catchable error, and it looks exactly like
+/// S6b's OOM crash while having a completely different cause.
+///
+/// The thread stack size therefore comes from the **environment**, one size per process, because a
+/// probe that crashes the process can only report the size that crashed it by dying at that line:
+/// `SPIKE_THREAD_STACK=2097152 jsengine-spike S6g`.
+fn probe_thread_stack() -> Probe {
+    let bytes: usize = std::env::var("SPIKE_THREAD_STACK")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        // `std::thread`'s own default, which is what `JsSandbox::spawn` gets today.
+        .unwrap_or(2 * 1024 * 1024);
+    let handle = std::thread::Builder::new()
+        .stack_size(bytes)
+        .spawn(move || -> Probe {
+            let rt = Runtime::new().map_err(|e| format!("Runtime::new: {e}"))?;
+            rt.set_max_stack_size(512 * 1024);
+            let ctx = rquickjs::Context::full(&rt).map_err(|e| format!("Context::full: {e}"))?;
+            ctx.with(|ctx| -> Probe {
+                let def = default_export(
+                    &ctx,
+                    "export default { async listModels() { const f = (n) => f(n + 1); return f(0); } };",
+                )?;
+                let m: Function = def.get("listModels").map_err(|e| format!("get: {e}"))?;
+                match m.call::<_, Value>(()) {
+                    Err(e) => Ok(format!("call error before any promise: {e}")),
+                    Ok(v) => match v.into_promise() {
+                        Some(p) if p.state() == PromiseState::Rejected => Ok(format!(
+                            "CONTAINED: the 512 KB JS limit fired before the {bytes}-byte C stack"
+                        )),
+                        Some(p) if p.state() == PromiseState::Pending => {
+                            let ran = pump(&ctx, 1000);
+                            Ok(format!("pending after the guard; {ran} job(s) drained"))
+                        }
+                        Some(p) => Err(format!("unexpected state {:?}", p.state())),
+                        None => Err("the guest did not return a promise".to_string()),
+                    },
+                }
+            })
+        })
+        .map_err(|e| format!("thread spawn: {e}"))?;
+    handle.join().unwrap_or_else(|_| Err("the guest thread panicked".to_string()))
 }
 
 // ---------------------------------------------------------------------------------------------

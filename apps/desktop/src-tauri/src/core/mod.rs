@@ -37,6 +37,7 @@ pub mod gateway;
 pub mod http_port;
 pub mod injection_log;
 pub mod interpreter;
+pub mod js_host;
 pub mod jsonpath;
 pub mod ledger;
 pub mod limiter;

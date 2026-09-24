@@ -396,6 +396,32 @@ awaits on the actor thread**, with every value that must survive a scope boundar
 `Persistent` or as a dumped `serde_json::Value`. The remaining half — how the parked request's
 resolve/reject functions are restored into the next scope — is increment 19b's first question.
 
+**Update, 2026-09-24 (increment 19b): the actor lands, and six findings change the code that was written.**
+
+`core/js_host.rs` (~1,100 lines / 14 tests) is the `rquickjs` host as an **actor**: `JsSandbox` is a `Send + Sync` handle that sends commands to a thread owning the `Runtime`, `Context`, and `Persistent` values. The thread is named `js-sandbox`, its stack is `ACTOR_STACK_BYTES = STACK_LIMIT * 4` (2 MB), and its async runtime is a tokio `current_thread` builder. `compile()` uses `Module::declare(...)?` then `.eval()?` then `get("default")` — the door from trap 1. `call()` sets the interrupt deadline, calls the guest method in scope 1, then alternates `resolve_answered` → `pump` → `await egress` in a loop until the promise settles.
+
+**Finding 1: `resolve_answered` must run before `pump`.** Reversing the order makes the verbatim guest timeout, because resolving a parked request queues the guest's continuation as a job, and a pump that ran *before* the resolve leaves that job undrained until the next round — but by then `parked` is empty and the driver reports timeout. Probe A proved this by reversing the order and watching the verbatim test fail with the predicted `Timeout`.
+
+**Finding 2: `Promise::result` on rejection does not carry the reason.** It re-throws the rejected value onto the context and returns `Err(Error::Exception)` (`value/promise.rs:107-113`), so the reason must be read back with `Ctx::catch()`. Treating the `Err` as the reason reports every rejection as the literal string "exception" — the message is what a caller diagnoses from, so this is not cosmetic.
+
+**Finding 3: `is_object` is a raw `JS_TAG_OBJECT` check that a function also satisfies.** Without an `is_function` guard before the object branch, a guest returning `f: () => 1` dumps as `{}` rather than `null`. The test `the_dump_walks_rather_than_stringifies` caught this.
+
+**Finding 4 (the simplification): `armed` is a second spelling of one state.** The interrupt handler checked `armed` before reading `deadline_ms`, but `deadline_ms == u64::MAX` already means "no deadline" and makes the comparison false for every clock reading. A probe removed the `armed` check and the whole module suite — including the spinning-guest abort test — passed identically. The flag, its two `store` calls, and the `AtomicBool` import were all removed.
+
+**Finding 5: `Runtime` has no `memory_limit()` or `max_stack_size()` getters in 0.9.0.** The only observable consequence of the memory limit is the `SIGSEGV` of trap 3, which cannot be tested in-process; the stack limit is observable, and `runaway_recursion_is_contained_on_the_actor_thread` asserts it on the actor's own thread — the condition S6f never measured, because S6f ran on the main thread with 8 MB of C stack.
+
+**Finding 6: `std::thread`'s default stack is not a contract.** `RUST_MIN_STACK` overrides it, and a probe showed that without an explicit `.stack_size` the actor thread gets whatever the environment says. With `RUST_MIN_STACK=262144` the recursion test `SIGABRT`s on `js-sandbox`; with `.stack_size(ACTOR_STACK_BYTES)` the same environment passes. The explicit size is therefore load-bearing, not decorative.
+
+**Two API details that differ from the spike's expectations.** `Ctx` has no `new_string` method in 0.9.0 — `rquickjs::String::from_str(ctx, &str)` is the construction path, and it takes `Ctx` by value. And `dump` needs no `&Ctx` parameter at all: a `Value` carries its own context in 0.9, and clippy's `only_used_in_recursion` caught the vestigial parameter.
+
+**S6g — containment off the main thread.** The spike's S6f measured runaway recursion against a 512 KB JS stack limit and found it contained, but it ran on the **main** thread (8 MB C stack on macOS). The actor runs on a `std::thread` whose default is **2 MB**, so S6f's result does not automatically transfer. Probe S6g (`.workbuddy-ai/spikes/js-engine`, added for this increment) varies the thread stack size with the JS limit fixed at `STACK_LIMIT`:
+
+| thread C stack | 256 KB | 512 KB | 768 KB | 1 MB | 2 MB |
+|---|---|---|---|---|---|
+| result | `SIGABRT` | contained | contained | contained | contained |
+
+The probe is opt-in (`SPIKE_CRASH=1`) because a size whose C stack runs out first kills the process. `ACTOR_STACK_BYTES` keeps the measured 4× margin and derives the number from `STACK_LIMIT` so the two cannot drift apart.
+
 ### 2.2 The line count
 
 ```
@@ -1858,10 +1884,13 @@ observation.
 
 **What remains in this phase, in order:**
 
-1. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
-   §2.1.3 lists as untested belongs here, because the probes service `http` synchronously and
-   production does not. It is now the only module in Phase 4b without a Rust counterpart, and
-   `modality.rs` was the last of the two that decision 5 was holding.
+1. **The six `AdapterInstance` operations on `JsSandbox`.** `spawn`, `call` and `dispose` are done;
+   what is left is the thin layer that translates each `AdapterInstance` method into the right
+   `Operation` and `args_json` — `listModels`, `generateImage`, `generateText`, `pingKey`,
+   `tagModality`, `capabilities`, and `dispose`. Plus wiring `log` and the `{{secret}}`-substituting
+   `HttpTarget`. The async-host shape §2.1.3 named as the largest unknown is now answered: the
+   pump and the egress `await` are a sequence of short synchronous scopes separated by awaits,
+   with parked resolvers crossing boundaries as `Persistent<Function>`.
 
 ### Phase 5 — Delete the bridge (1 day)
 
