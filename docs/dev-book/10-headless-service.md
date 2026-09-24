@@ -2267,8 +2267,16 @@ two scope-wrong claims in two consecutive increments.
 
 **Goal:** launchd plist, service binary bundling, UI HTTP client.
 
-1. Write the plist template and the install logic.
+1. ~~Write the plist template and the install logic.~~ **Landed 2026-09-25 as increment 26a** —
+   `core/service.rs` (plist, install, uninstall, status over an injectable `launchctl`) plus
+   `tauri/service_cmds.rs` and its shim cases. **Not called from anywhere in production, by
+   design:** with `RunAtLoad` set, the agent and the app both bind the same port, so installing
+   it is a bind conflict until step 3 lands. See the 26a note in §11.
 2. Bundle `aiproviderd` into the `.app` (Tauri's `bundle.externalBin` or manual copy).
+   **Half-done already, and not by this plan:** `tauri build` copies every `[[bin]]` next to the
+   main binary, so the service is in `Contents/MacOS/` undeclared. What is missing is declaring
+   it, and deciding whether the copy is the default-features build (measured 4,454,336 B, links
+   Tauri) or the Tauri-free one (4,073,968 B).
 3. Change the UI from `invoke` to `fetch()` for gateway operations.
 4. Add CORS headers to the gateway for `tauri://localhost`.
 5. Update `09-status.md` and the drift register.
@@ -3227,6 +3235,65 @@ existing predicate test **alone**.
 
 ---
 
+### Increment 26a — the LaunchAgent, and the port it has not taken over yet
+
+**Phase 6 step 1, and the first increment of the phase.** Phases 1–5 made the gateway a Rust service that
+needs no webview; what none of them did is let it outlive the app *process*. `Cmd+Q` still takes the gateway
+with it, because the only thing that ever started it was the app. `core/service.rs` is the other half: a
+launchd `LaunchAgent` launchd owns, so the gateway comes up at login and stays up whether or not a window is
+open.
+
+**The binary is copied out of the bundle, and that is the risk register's own remedy.** A plist points
+`ProgramArguments` at an absolute path, and the obvious one —
+`/Applications/AI-Provider Router.app/Contents/MacOS/aiproviderd` — moves every time the bundle is versioned
+or atomically swapped. `KeepAlive` **throttles** on repeated failed execs and can leave the job disabled, so a
+path briefly missing during an update is not self-healing. Install therefore copies the bundled binary to
+`{data_dir}/bin/aiproviderd` and points the plist there.
+
+`tauri build` does put `aiproviderd` in `Contents/MacOS/` — measured 2026-09-25 on the bundle in
+`target/release/bundle/macos`, **4,454,336 B** alongside the 11,074,960 B app binary. **It is the
+default-features build**, i.e. the one that still links Tauri: the Tauri-free release binary measures
+**4,073,968 B**, 380 KB smaller. So the binary an installed agent would exec is not the binary §2.1.1's
+dependency split is about. Nothing in 26a depends on which one it is, and 26a does not close it — but a
+later increment that cares about what the service links has to say which build gets bundled.
+
+**The seam is one `&impl Fn`.** `install`, `uninstall` and `status` take the runner as an argument, so every
+branch is reachable from a test with no launchd and no root. This is `HttpPort`'s and `BridgeHost`'s shape,
+for the same reason: the alternative is a module whose only coverage is the machine it happens to run on.
+
+**The `bootout` before `bootstrap` is not tidiness.** `bootstrap` of an already-loaded label fails, so a
+re-install — the shape an update takes, and the only way a new binary reaches a running agent — would
+otherwise be a no-op reporting success while launchd keeps exec'ing the old path.
+
+**No `cfg` gate, deliberately.** A `#[cfg(target_os = "macos")]` module is a module no non-macOS build ever
+compiles, which is the shape D17 recorded as a blind spot. Only `read_uid` and `run_launchctl` name the
+outside world, and on a machine without `/bin/launchctl` they fail with a message rather than at compile
+time — so all 15 tests run on all three CI platforms.
+
+**Three commands, and the shim cases the same day.** `service_install`, `service_uninstall`,
+`service_status` in `tauri/service_cmds.rs`, with `web-test/shim.ts` cases: status answers the honest
+`{plistPresent: false, loaded: false, pid: null}`, and install/uninstall throw naming the missing launchd.
+A shim that reported `loaded: true` would show a running service with no process behind it.
+
+**What 26a does not close, stated rather than implied — and this one is a live hazard, not a note.** With
+`RunAtLoad` and `KeepAlive` both set, the agent starts the gateway at install time and at every login, and
+the desktop app *also* starts a gateway when it runs. Both bind the same persisted port, so **until the UI
+stops starting its own (Phase 6 step 3), installing the agent and launching the app is a bind conflict, not a
+handover.** Nothing detects or resolves it, and nothing calls `install` in production yet — it is a
+capability with a command in front of it and the operator starts it. Uninstall likewise cannot guarantee the
+job stopped: a `bootout` that fails while the job is running leaves the process up until logout.
+
+**Three falsification probes, one at a time.** Dropping `RunAtLoad` from the plist reddens
+`the_plist_asks_to_be_started_at_load_and_kept_alive` **alone**; swapping `bootout` after `bootstrap` reddens
+`install_bootouts_before_it_bootstraps` **alone**; pointing `parse_pid` at a prefix that never matches reddens
+`status_reports_the_pid_of_a_running_job` **alone**, leaving the "loaded but not up" and "launchd does not
+have it" tests green — which is what separates the three status states from one another.
+
+**Measured:** `cargo test` lib **1201 → 1216**, binary **5 → 5** — 15 new tests in `core/service.rs`. Gates:
+`fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean.
+
+---
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3251,9 +3318,15 @@ This is a plan, not a specification. When implementation starts, each phase gets
 document in `docs/` and its own branch. This chapter is updated as decisions are made and
 assumptions are tested.
 
-**Next action:** decide the sub-question the adapter-runtime spike left open — in-process with a
-supervised heap ceiling, or out-of-process — and then give that module a phase in §7, which it has never
-had. The other three decisions in §10 still stand. (This line read "answer the four decisions in §10,
-then begin Phase 1" until 2026-09-24, by which point Phase 1 and twelve increments had landed; it is
-recorded here rather than silently overwritten because a stale "next action" is the cheapest way for a
-plan to stop describing its own project.)
+**Next action:** settle §10 decision 2 — pure HTTP or hybrid HTTP+IPC — and then take Phase 6 step 3,
+the UI migration. Step 1 is landed as 26a but is deliberately inert until step 3 exists: with
+`RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only usable
+once the app stops starting its own gateway. The other decisions in §10 still stand.
+
+(This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
+point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
+adapter-runtime spike left open — in-process with a supervised heap ceiling, or out-of-process — and
+then give that module a phase in §7" until 2026-09-25, by which point Phase 4b had given that module
+its phase and the spike's residual was recorded in the risk register instead. It is rewritten here
+rather than silently overwritten because a stale "next action" is the cheapest way for a plan to stop
+describing its own project.)

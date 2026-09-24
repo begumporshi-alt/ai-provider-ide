@@ -726,6 +726,11 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::tauri::commands::crash_read,
         crate::tauri::commands::crash_clear,
         crate::tauri::commands::crash_clear_all,
+        // The login-item service (Phase 6): install, remove and report the launchd agent that
+        // runs `aiproviderd` without the app.
+        crate::tauri::service_cmds::service_install,
+        crate::tauri::service_cmds::service_uninstall,
+        crate::tauri::service_cmds::service_status,
     ]
 }
 

@@ -6,5 +6,6 @@
 pub mod app;
 pub mod commands;
 pub mod gateway_cmds;
+pub mod service_cmds;
 pub mod tools_cmds;
 pub mod workbuddy;

@@ -60,6 +60,7 @@ pub mod pricing;
 pub mod router;
 pub mod router_bridge;
 pub mod sandbox;
+pub mod service;
 pub mod skills;
 pub mod store;
 pub mod template;

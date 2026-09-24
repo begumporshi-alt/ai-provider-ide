@@ -1567,6 +1567,19 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "gateway_prune_live_context":
       return { turns_by_count: 0, turns_by_age: 0, sessions_reaped: 0 };
 
+    // ---- the login-item service (Phase 6) ----
+    //
+    // The harness has no launchd, no uid and no `aiproviderd` to install, so these answer the
+    // honest shape of "nothing is installed" rather than a plausible-looking one. `service_status`
+    // in particular must not report `loaded: true`: a screen that believed it would show a
+    // running service with no process behind it, and nothing here could contradict that.
+    case "service_status":
+      return { plistPresent: false, loaded: false, pid: null };
+    case "service_install":
+      throw new Error("service_install: the browser harness has no launchd to install into");
+    case "service_uninstall":
+      throw new Error("service_uninstall: the browser harness has no launchd to remove from");
+
     // ---- gateway listener and its keys (R4) ----
     case "gateway_enable": {
       const port = Number(args.port) || 8787;
