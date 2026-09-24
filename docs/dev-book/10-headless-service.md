@@ -1994,7 +1994,7 @@ four increments, and only the last one is the deletion:
 | Increment | Work |
 |---|---|
 | **22 — landed** | Port `gateway-normalizer.ts` (728 lines) and `gateway-client-detector.ts` (19 lines) to `core/gateway_normalizer.rs` |
-| 23 | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
+| **23 — landed** | Port `parseAssistantStream`, `toWireToolCalls` and the tool registry's OpenAI schemas |
 | 24 | `core/router_bridge.rs` — a Rust-native `Bridge` running the tool loop against `ModelRouter` and `AdapterRuntime` |
 | 25 | Delete `EventBridge`, the worker, `gateway.html` and `app_nap.rs`, and switch `build_core` |
 
@@ -2044,6 +2044,66 @@ repaired tool result, the open-schema rule, and the 9-character id padding. One 
 the one existing test has a single message, so "after the declaring turn" and "at the end" are the same
 index — and the rule had therefore been unpinned. `inserts_a_missing_tool_result_directly_after_its_assistant_turn`
 now separates the two, which is what makes the probe able to redden.
+
+**Increment 23 — the stream parser, the tool wire and the tool registry.** Three modules, 41 tests, Rust
+**1049 → 1090**, and the count was measured rather than projected: the plan said 42, the tree says
+18 + 12 + 11. All three are pure — no I/O, no clock, no network — which is the same reason increment 22
+could be pinned before anything calls it.
+
+`core/assistant_stream.rs` ports `assistant-stream.ts` (171 lines). **The one structural subtlety is a
+split the port keeps rather than smooths.** The seven marker families are matched as **literal,
+case-sensitive** substrings, exactly as `String.indexOf` does, while the `function=` and `parameter=` tags
+inside a block are matched by a **case-insensitive regex** that tolerates an optional pipe and arbitrary
+spacing. So `<|tool_call_start>` one character short is prose, while `<FUNCTION = Bash>` is a tag. Two
+functions carry the split — `literal_index_of` and `match_marker_at` — and the tests pin opposite sides of
+it, so collapsing the two would redden one of them.
+
+Two more rules are ported rather than approximated. `\s` is **JavaScript's**, not Unicode's: the two
+disagree on `U+FEFF`, which JS counts as whitespace and `char::is_whitespace` does not, so `is_js_space`
+is hand-written and the test asserts the disagreement itself rather than only the membership. And the
+streaming hold-back has a **floor of 2** and a **ceiling of `len - 1`** — a lone `<` in prose survives, a
+half-typed marker is held back, and a *complete* token is never eaten because by the time the hold-back
+runs such a token has already been consumed as a marker.
+
+`core/tool_wire.rs` ports `tools/wire.ts` (82 lines) and exists because of one defect. An absent tool-call
+id used to become the empty string on the assistant turn and the tool *name* on the result turn, so the
+two could never match and every continuation died with a provider `400` — which is what "the router stops
+after a tool call" was. The fix is structural: `to_wire_tool_calls` returns the wire entries **and** the
+ids it chose, so both halves are derived from one decision and are index-aligned by construction. That
+alignment is the property to preserve, and `the_ids_and_the_entries_are_index_aligned` pins it. The module
+reuses `gateway_normalizer::to_base36` rather than inventing a second spelling of the same conversion,
+which is the only reason `to_base36` became `pub(crate)`.
+
+`core/tool_registry.rs` ports `tools/registry.ts` (168 lines): eight tools with OpenAI JSON schemas, built
+once behind a `OnceLock`. A `const` is impossible for a `Value`-carrying registry, so the alternative would
+have been a `static` that cannot be built — worth stating because the obvious wrong answer is the one that
+looks simplest. `registry_to_openai` returns **`None`** for an empty registry rather than an empty array:
+some providers reject an empty `tools` list with a `400`, so "omit the key" and "send nothing" are
+different requests.
+
+**One finding, and it is D34.** The `MARKERS` array order was documented — in the port's own doc comment —
+as load-bearing: "the order is the tie-break". A tie requires two families to match at one offset, which
+requires one start token to be a prefix of another, and **no start token is** — 0 prefix pairs over all 7,
+measured. The strict `at < s` comparison is therefore a tie-break for a tie that cannot occur, and `at <= s`
+behaves identically. The *reachable* half of the same loop — the **earliest** match wins, not the last — is
+real and was already pinned by `handles_several_blocks_in_one_response`, so the defect is narrow and
+precise: a documented rule about a state that cannot be entered. It is D33's signature one step further
+out — a mechanism whose only evidence is prose — except that here the prose is the port's own, which is
+what made it checkable at all.
+
+**The correction is a guard, not a rewording.** `the_marker_order_is_not_load_bearing` asserts the
+prefix-freeness of the seven start tokens, so the day a family is added that *can* tie, the test goes red
+and the tie-break becomes live again — at which point the comment is wrong and must be rewritten. A comment
+saying "this is not load-bearing" is unverifiable; a test saying so is falsifiable, and the probe that adds
+a prefix-pair family (`<|tool_call`) reddens it with a message naming the two tokens.
+
+**Eleven falsifications, all red** (baselines `faaf88e8…` for the parser, `99489982…` for the wire,
+`ebdb1df3…` for the registry; tree byte-identical after restoration): the hold-back floor, the tag
+case-fold, the closing-tag strip, the `U+FEFF` membership, id synthesis, the `arguments` default, the name
+fallback, `None`-on-empty, `additionalProperties`, the cross-module `MUTATING_TOOLS` guard, and the new
+prefix-freeness tripwire. The tenth is worth naming because it crosses a module boundary: adding `read_file`
+to `gateway::MUTATING_TOOLS` reddens the registry's own test, which proves the test reads the gateway's
+constant rather than a copy of it.
 
 ### Phase 6 — Process manager and UI changes (2-3 days)
 

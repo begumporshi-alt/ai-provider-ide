@@ -387,7 +387,12 @@ fn simple_hash(s: &str) -> i64 {
     (h as i64).abs()
 }
 
-fn to_base36(mut n: u64) -> String {
+/// Base-36 of a non-negative integer: lowercase digits, no leading zeros, `0` for zero.
+///
+/// Shared with [`crate::core::tool_wire`], which synthesises tool-call ids in the same alphabet. A
+/// second spelling would be a second thing to keep in step, and the two must agree byte-for-byte
+/// because the id is matched literally across two turns.
+pub(crate) fn to_base36(mut n: u64) -> String {
     const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
     if n == 0 {
         return "0".to_string();

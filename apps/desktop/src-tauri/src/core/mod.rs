@@ -27,6 +27,7 @@
 
 pub mod adapter;
 pub mod adapter_runtime;
+pub mod assistant_stream;
 pub mod capture;
 pub mod code_adapter;
 pub mod compress;
@@ -57,5 +58,7 @@ pub mod sandbox;
 pub mod skills;
 pub mod store;
 pub mod template;
+pub mod tool_registry;
+pub mod tool_wire;
 pub mod usage;
 pub mod vault;

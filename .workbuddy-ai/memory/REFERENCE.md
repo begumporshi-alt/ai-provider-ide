@@ -3697,3 +3697,89 @@ increment adds a module with no production caller — the same position `adapter
 fmt clean · clippy clean · **1049 tests / 0 failed** · `--no-default-features --all-targets` compiles ·
 doc links 51/127 · dev book 12 chapters / 204 ids / 548.9 KB · key-leak OK · TS 6.0.3 · version sync
 1.0.0.
+
+## Increment 23 — `assistant_stream.rs`, `tool_wire.rs`, `tool_registry.rs` (2026-09-24)
+
+Phase 5b: the last three modules the bridge owns that had no Rust counterpart. A Grep for
+`parse_assistant_stream`, `to_wire_tool_calls`, `registry_to_openai` and `AGENT_TOOLS` over
+`src-tauri/src` found **nothing** before this. 41 tests — **measured** 18 + 12 + 11, where the plan said
+42. Rust **1049 → 1090**. All three are pure, which is what lets them be pinned before anything calls them.
+
+### The split the port keeps
+
+`assistant_stream.rs` ports `assistant-stream.ts` (171 lines). The seven marker families are matched as
+**literal, case-sensitive** substrings (`String.indexOf`), while the `function=` / `parameter=` tags are
+matched by **case-insensitive regex** with an optional `|` and arbitrary whitespace. So `<|tool_call_start>`
+one character short is prose, and `<FUNCTION = Bash>` is a tag. `literal_index_of` and `match_marker_at`
+are the two halves; `a_near_miss_marker_is_not_a_marker` and
+`the_tags_are_case_insensitive_and_tolerate_spacing` pin opposite sides. **Collapsing them would redden one
+of the two** — that is what makes the split a specification rather than an accident.
+
+Two more rules ported rather than approximated:
+
+- `\s` is **JavaScript's**, not Unicode's. The two disagree on `U+FEFF`; `is_js_space` is hand-written and
+  the test asserts the *disagreement* (`!('\u{feff}').is_whitespace()`) rather than only the membership.
+- The streaming hold-back has a floor of **2** (a lone `<` in prose survives) and a ceiling of `len - 1`
+  (a *complete* token is never eaten — by then the main loop has consumed it as a marker).
+
+### `to_base36` is now shared, deliberately
+
+`tool_wire.rs` synthesises ids as `call_${n.toString(36)}` and imports `gateway_normalizer::to_base36`
+rather than writing a second spelling. That is the only reason `to_base36` became `pub(crate)`. **Two
+spellings of one conversion is two things to keep in step**, and this id is matched literally across two
+turns.
+
+### The defect `tool_wire.rs` exists to close
+
+An absent tool-call id became `""` on the assistant turn and the tool *name* on the result turn, so the two
+could never match and every continuation died with a provider `400` — which is what the reported "router
+stops after a tool call" was. `to_wire_tool_calls` returns the wire entries **and** the ids it chose, so
+both halves come from one decision. **Index alignment is the property to preserve**, pinned by
+`the_ids_and_the_entries_are_index_aligned`.
+
+### `None`, not `[]`
+
+`registry_to_openai` returns `None` for an empty registry. Some providers 400 on an empty `tools` list, so
+"omit the key" and "send nothing" are different requests. `agent_tools()` is a `OnceLock` because the
+schemas are `serde_json::Value` and cannot be `const` — a `static` would not build.
+
+### D34 — a tie-break for a tie that cannot happen
+
+The `MARKERS` order was documented **in the port's own doc comment** as load-bearing ("the order is the
+tie-break"). A tie needs two families to match at one offset, which needs one start token to be a prefix of
+another. **Measured over all 7 start tokens: 0 prefix pairs.** So `at < s` and `at <= s` are
+indistinguishable. The reachable half — the *earliest* match wins, not the last — is real and was already
+pinned.
+
+**A comment that says "not load-bearing" is unverifiable; a test that says so is falsifiable.**
+`the_marker_order_is_not_load_bearing` asserts the prefix-freeness, so a future family that *can* tie
+reddens it and the tie-break becomes live again. Same signature as D33 — a mechanism whose only evidence is
+prose — except that here the prose was the port's own, which is why it was checkable at all.
+
+### Eleven falsification probes, all red
+
+Baselines `faaf88e8…` (parser), `99489982…` (wire), `ebdb1df3…` (registry); tree byte-identical after
+restoration.
+
+1. hold-back floor `while n >= 2` → `while n >= 1`
+2. tag case-fold `eq_ignore_ascii_case` → `==`
+3. closing-tag strip disabled with `.filter(|_| false)`
+4. `'\u{feff}'` removed from `is_js_space`
+5. `_ => synthesized_id()` → `String::new()`
+6. `unwrap_or_else(|| "{}")` → `unwrap_or_default()`
+7. name fallback `"tool"` → `""`
+8. the `registry.is_empty()` guard deleted
+9. `"additionalProperties": false` → `true`
+10. **cross-module**: `read_file` added to `gateway::MUTATING_TOOLS` — reddens the *registry's* test, which
+    proves that test reads the gateway's constant rather than a copy of it
+11. prefix-pair family added to `MARKERS` (`<|tool_call`) — reddens the new tripwire
+
+**The harness is the reusable part.** A script applies each inverse edit, asserts the *named* test is the
+one that failed (not merely that something failed), restores from a pristine copy, and prints a final
+sha256 comparison for every file touched. A probe whose named test does not run is reported INVALID rather
+than counted as a pass — a probe that cannot redden proves nothing in either direction.
+
+### Gate
+
+fmt clean · clippy clean · **1090 tests / 0 failed** · `--no-default-features --all-targets` compiles ·
+doc links 51/127 · dev book 12 chapters · key-leak OK · TS 6.0.3 · version sync 1.0.0.
