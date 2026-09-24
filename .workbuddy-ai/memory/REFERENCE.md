@@ -2817,3 +2817,157 @@ gets *almost* right, where the difference fails silently (a placeholder sent as 
 count lost, a tool call reordered). The nearest-looking equivalent is the trap; the check is whether
 the source's own operator was `??` or `||`, `typeof` or truthiness, `.length` or `.count()`.
 
+---
+
+## Increment 16 — the `HttpPort` seam, the manifest read model, and `ManifestInterpreter`
+
+Landed 2026-09-24. `core/http_port.rs` (184 lines, 2 tests), `core/manifest_view.rs` (551, 6),
+`core/interpreter.rs` (2,258, 44), and `parse_retry_after` / `retry_after_from` added to
+`core/manifest.rs` (6 tests). 58 tests, Rust **812 → 870**.
+
+### The response shape is not the TypeScript's, and the asymmetry is the design
+
+The TS returns one object carrying both `text()` and `lines`, so a caller can reach for either.
+`HttpResponse<'a>` cannot do that honestly, because the two are not both available in every case:
+
+| the request said | what happened | `body` | `lines` |
+|---|---|---|---|
+| `stream: false` | answered | filled | `None` |
+| `stream: true` | answered | empty | `Some` |
+| `stream: true` | refused (`>= 400`) | filled | `None` |
+
+The third row is the whole point. `manifest-interpreter.ts:304` throws on a `>= 400` **before** it ever
+looks at the stream, so on the stream path the body is the only thing there is to read — and it is the
+error text the caller needs. A port that keyed the response shape off the *request's* `stream` flag
+would hand back an empty body and an empty stream for every refused streaming request, which is the
+failure mode where a provider's error message disappears. `interpreter::send` therefore names its
+lifetime — `send<'a>(&'a self, req, cancel: &'a Cancel) -> Result<HttpResponse<'a>, _>` — because the
+port ties both arguments to `'a` and an anonymous `'_` return does not compile.
+
+### The `finally`, and why `flush` carries two properties
+
+`generateText` ends in a `finally` (`manifest-interpreter.ts:421-437`) that fires on **every** exit:
+it reassembles and reports the pending tool calls, then reports the usage. Three reasons the port could
+not use the obvious Rust equivalents:
+
+- **No `finally`.** Rust has no such construct.
+- **`Drop` cannot stand in.** The callbacks are `&'a mut dyn FnMut(...)`, so a consumer that drops the
+  stream mid-flight leaves `Drop` with nothing it is allowed to call; the borrow does not outlive the
+  value either.
+- **The stream is pull-based.** A `BoxStream` is driven by the consumer, so "every exit" is a set of
+  places *in the poll loop*, not a scope the compiler tracks.
+
+So `TextStream::flush()` is called at every exit the loop can reach, is idempotent (`flushed`), and is
+guarded by cancellation (`cancel.is_cancelled()` is the source's `!signal?.aborted`).
+
+**What was missed when it was written: `flush` sets `finished`, so it is also the termination.** Every
+call site therefore ends the stream. That is *correct* — the source's `throw` unwinds its generator, so
+the `finally` runs and nothing after the failing line is read — but it meant two of the call sites
+carried two properties each while only one was named in a test:
+
+| call site | report ordering | termination |
+|---|---|---|
+| `end_after_emit` | yes | yes (returns `None` anyway) |
+| line stream exhausted | yes | yes (returns `None` anyway) |
+| **transport break** | **yes** | yes, but the inner stream is already exhausted — so the flush's *only* job here is the ordering |
+| `LineStep::End` (`[DONE]` / `finish` / `stopWhen`) | yes | yes (returns `None` anyway) |
+| **`LineStep::Fail` (mid-stream error)** | **yes** | **yes, and load-bearing** |
+
+**The measurement that found it.** Removing `this.flush()` from the `Fail` arm failed the ordering test
+**and** pushed `a_mid_stream_error_arrives_as_an_item_with_the_sources_status_and_kind`'s item count
+from 2 to 3 — the `Err` item was handed over and the loop then read the next line. That test's
+`assert_eq!(out.len(), 2)` was pinning termination **without saying so**: an unnamed dependency, which
+is the same shape as D18's defect (a test whose claim is narrower or broader than its check). The fix
+was a sibling test that names it —
+`a_mid_stream_error_ends_the_stream_so_a_later_line_is_never_read` — plus a `flush` doc-comment that
+states both properties. Re-running the probe now fails three tests, each naming one.
+
+**The transport-break arm is not symmetric**, and that is worth knowing before "fixing" either one: there
+the flush's only contribution is the ordering, because the inner stream is already exhausted and would
+return `None` on the next poll regardless.
+
+### The read model is not the grammar, and the two want opposite strictness
+
+`adapter-spec/src/manifest.ts` is 193 lines of zod: it validates, applies defaults (`kind`,
+`pagination.style`), and enforces `superRefine` rules. It is the **gate an AI-generated manifest
+passes**. `core/manifest_view.rs` reads a manifest that has *already* passed that gate.
+
+So the two want opposite things:
+
+| | the grammar (`manifest.ts`) | the read model (`manifest_view.rs`) |
+|---|---|---|
+| unknown field | rejected | **ignored** |
+| absent optional | defaulted | `None`, distinct from the default |
+| purpose | decide whether to *store* this manifest | read one that is already stored |
+
+This is the **opposite** of the repo's `deny_unknown_fields` rule for boundary payloads (see the
+"Tauri boundary" index entry), and the reason is structural rather than a preference: a *payload* is a
+contract, so an unknown key means the two sides disagree; a *stored manifest* is a superset, so an
+unknown key means this reader is older than the writer. Applying `deny_unknown_fields` here would make
+every future manifest addition a breaking change for the interpreter. The guard against read-model drift
+is that `manifest_view.rs` parses both builtin templates **character for character** in its tests.
+
+### Counting tests: `#[test]` attributes undercount, and by a knowable amount
+
+`cargo test` reports **870** in the lib; a `#[test]`-attribute count gives **732**. The gap is exactly
+the flavoured async form:
+
+| form | count |
+|---|---|
+| `#[test]` | 674 |
+| `#[tokio::test(flavor = "multi_thread")]` | **136** |
+| `#[tokio::test]` | 58 |
+| **total** | **868** |
+
+A `#\[(tokio::)?test\]` pattern matches the first and third and misses every one of the 136, because the
+arguments sit before the closing bracket. The count reconciles to the digit once the full form is
+matched, so **there is no macro or generator involved** — the tree has no `rstest`, no `#[case]`, no
+`tests/` directory, and no `macro_rules!` producing tests. Verified.
+
+**The same method reproduced the 812 baseline independently.** A detached worktree of `b1fe249` gives
+676 + 136 = **812**, matching what the dev-book recorded — so the baseline was measured rather than
+quoted. `git worktree add --detach /tmp/base-check HEAD` plus a Grep-tool count is cheap enough to be the
+default whenever a "before" figure is needed.
+
+### The probe protocol, and the mistake that produced it
+
+**Reverting a probe by restoring a snapshot deletes every accepted change made after that snapshot was
+taken.** This happened on 2026-09-24: probe 3 had already been followed by a rewritten test, the file was
+restored from the pre-rewrite snapshot, and the rewrite was gone — silently, with `grep -c` returning `0`
+as the only evidence.
+
+Two protocols, in order of preference:
+
+1. **Revert a probe by applying its inverse edit.** The accepted work never enters the revert path, so it
+   cannot be lost. Preferred.
+2. **If snapshots are the mechanism, re-snapshot in the same command that verifies an accepted change** —
+   `cargo test … && cp src/core/x.rs /tmp/snap/x.rs && shasum -a 256 src/core/x.rs`. The hash printed
+   beside the snapshot is what makes the next restore verifiable.
+
+Either way the snapshot must be **hash-verified after every restore**, because a restore that silently
+did nothing looks exactly like a probe that changed nothing.
+
+### The two falsification findings, in full
+
+**1. A test named for the dialect default did not test it.** `wants_usage` is
+`ep.stream?.requestUsage ?? (dialect === "openai-chat-v1" && Boolean(responseMap.usage))` — a **nullish**
+default, so an explicit `false` beats the dialect rule and only an *absent* flag falls through. Deleting
+the dialect default (`None => false`) left **all 42 interpreter tests green**, because `openai_manifest()`
+sets `requestUsage: true`, which satisfies the first branch and never reaches the second. The test was
+misnamed and non-load-bearing — **D18's defect class** — and nothing but running the probe *against the
+test* could have shown it. The fix has two parts:
+
+- the test now removes the key and **asserts the removal** (`assert!(stream.remove("requestUsage").is_some(), …)`),
+  so a fixture that stopped carrying the flag fails loudly instead of turning the test into a test of
+  nothing;
+- a companion test pins the conjunction's **second** conjunct, since `openai-chat-v1` alone is not the
+  rule — a manifest with no `usage` selector asks for a block it could not read.
+
+Re-run: removing either conjunct now fails exactly the test that names it, and nothing else.
+
+**2. `flush` carries two properties, and only one was named** — see the section above. The generalisable
+rule: **when a helper is called from several exits, ask which of its effects each caller depends on.**
+Here one line (`self.finished = true`) meant the report helper was also the terminator, and only the
+report was tested. The signature of the defect is a probe that fails **more tests than it should** — the
+second failure is not noise, it is an unnamed dependency.
+

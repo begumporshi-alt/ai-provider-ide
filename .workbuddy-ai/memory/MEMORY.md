@@ -4,12 +4,12 @@
 
 ## Non-negotiables
 - A tool result is not evidence. **A `Write`/`Edit` can report success while the file keeps its old bytes *and* mtime** — `Read` serves the *unwritten* text. Verify by `stat` mtime + **Grep tool**, retrying until it moves.
-- Falsify **one** probe at a time; measure before recording a cause. **A reason is a claim too** — "cannot be tested" needs the same evidence as "is not tested".
+- Falsify **one** probe at a time; measure before recording a cause. **A reason is a claim too** — "cannot be tested" needs the same evidence as "is not tested". **Re-snapshot after every accepted change** — a probe reverted from a stale snapshot deletes the fix.
 - Unset **all six** proxy vars on probe *and* app — else `502`; partial → curl `000` (reads as a crash). **A proxy `502` satisfies a "status != 000" readiness loop** — it exits instantly; later probes measure it.
 - `./node_modules/.bin/tsc`, never `npx tsc`. JS tests: managed Node 22 first on PATH. Gate needs `PATH="$HOME/.cargo/bin:$PATH"`. **Shell is bash 3.2 here** — no `mapfile`. Commit msgs via `-F <file>` — backticks in a quoted `-m` are substitution and vanish.
 - **One edit per file per batch** — the 2nd lands on a stale snapshot and clobbers the 1st; both report success.
 - Absence claims: **Grep tool** (bash `grep` shim lies) — **skips dot-dirs** (`.github/`, `.workbuddy-ai/` → `cat <dir>/* | grep`). A hit ≠ completeness; count via node, not `find | grep -c` (→ `0`). **`cargo fmt --check` colours even redirected** — counting `^[-+]` → **0** = "no changes"; pass `-- --color=never`.
-- **The bulk-delete guard is sandbox-only and camouflaged.** A Playwright `webServer` timeout is a guard symptom **or a proxy `502`**: vite removes `node_modules/.vite/deps` at startup, the guard refuses, only the 60s timeout surfaces. Clean in `web-test:clean`, *after* `pnpm build`. `DEBUG=pw:webserver` separates `ECONNREFUSED` from a non-2xx answer. **`npm`'s prune hits it too** — `.name-hash` staging; test with `-L`, not `-e`.
+- **The bulk-delete guard is sandbox-only.** A Playwright `webServer` timeout is a guard symptom **or a proxy `502`** (vite removes `node_modules/.vite/deps`; the guard refuses; only the 60s timeout surfaces). Clean in `web-test:clean`, *after* `pnpm build`. `DEBUG=pw:webserver` separates `ECONNREFUSED` from a non-2xx. **`npm`'s prune hits it too** — test with `-L`, not `-e`.
 
 ## Where things are
 - `ARCHITECTURE.md` is a *spec*, not the app. `dev-book/` = rules/contracts + drift register. `pnpm docs:book` → `book.html`; `check-doc-links` is a gate step. Counts/gates: `dev-book/09-status.md`, `05-workflow.md`.
@@ -17,7 +17,7 @@
 - DB `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db` (`?mode=ro`); version in `schema_version`, not `PRAGMA user_version`.
 - Ports: gateway **8800**; AI Hub v2 **8787**; `DEFAULT_PORT` stale.
 - Identity = **two** strings, either may deny: `AIP-Agent`, `key:<id>`. Use `core.app_keys()`, never `AppKeyProvider`.
-- **Clippy and rustfmt are gates** (`--all-targets -- -D warnings`; `cargo fmt --check`); triage clippy by lint *kind* — count ≠ signal (64 → 2 real). **Snapshot before `--fix`**: it *moves* code. **A `-D warnings` gate on floating `stable` goes red with no code change** — 1.88 clean, 1.98 found 4 more; `rustup update stable` before believing the code.
+- **Clippy and rustfmt are gates** (`--all-targets -- -D warnings`; `cargo fmt --check`); triage clippy by lint *kind* — count ≠ signal (64 → 2 real). **Snapshot before `--fix`**: it *moves* code. **A `-D warnings` gate on floating `stable` goes red with no code change** — `rustup update stable` before believing the code.
 
 ## Recall & scope
 - Paths differ on **one axis: scope** — gateway `recall_scoped`+`RecallScope` (excludes `Unscoped`) vs Assistant `recall(..., None)`. Corpus **0 vs 14**; L0 denied both.

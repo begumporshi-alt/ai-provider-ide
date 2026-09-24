@@ -1663,14 +1663,88 @@ and `cargo tree -e normal -i regex --no-default-features` prints *nothing to pri
 be a genuinely new runtime dependency of `aiproviderd`, which this port's own rule
 (`adapter.rs:51-52`) forbids. See §10 decision 5.
 
+**Increment 16 landed 2026-09-24 — the I/O half, and the module is now whole.** Rust **812 → 870**,
+**58 tests** across four files:
+
+| module | lines | tests | what it holds |
+|---|---|---|---|
+| `core/http_port.rs` | 184 | 2 | the host seam — `HttpRequest` / `HttpMethod` / `HttpResponse<'a>` / `HttpError` / `trait HttpPort` |
+| `core/manifest_view.rs` | 551 | 6 | the typed read model of a stored manifest — `ManifestView` and its sub-shapes |
+| `core/interpreter.rs` | 2,258 | 44 | `ManifestInterpreter` — `list_models`, `ping_key`, `run_image`, and the streaming `run_text` loop |
+| `core/manifest.rs` | — | +6 | `parse_retry_after` / `retry_after_from`, which increment 15's note claimed were already there |
+
+**`HttpPort` is its own module for the same one-way-edge reason `adapter.rs` is.** `egress.rs` will
+implement it and `interpreter.rs` consumes it; putting the trait on either side would make the other
+depend on the whole of it. `stream: bool` on the request replaces `ipc-client.ts:41`'s sniffing — the
+host should not have to infer a request's shape from its URL — and there is deliberately no timeout
+field and no third method: the seam carries what the caller decided, not what the host might like to
+do about it.
+
+**The response shape is not the TypeScript's, and the asymmetry is the point.** The TS returns one
+object carrying both `text()` and `lines`; `HttpResponse` fills `body` for a unary request *and for a
+streaming request that failed*, and `lines` only for a streaming request that succeeded. The single
+case where the request's choice (`stream: true`) differs from the caller's need is a `>= 400` on the
+stream path (`manifest-interpreter.ts:304`), where the body is the only thing there is to read.
+
+**The `finally` was the whole design problem.** `generateText` ends in a `finally` (`:421-437`) that
+fires on *every* exit — reporting the reassembled tool calls and then the usage. Rust has no
+`finally`, and `Drop` cannot stand in: the callbacks are `&'a mut dyn FnMut`, so a consumer that drops
+the stream mid-flight would leave `Drop` with nothing callable, and the borrow would not outlive the
+value regardless. What the port has instead is `TextStream::flush()` — idempotent, guarded by
+cancellation, called at every exit the loop can reach, and called **before** a mid-stream error is
+handed over, which is what makes the report arrive ahead of the failure.
+
+**The read model is not the grammar, and the two want opposite strictness.**
+`adapter-spec/src/manifest.ts` is 193 lines of zod that validates, applies defaults (`kind`,
+`pagination.style`) and enforces `superRefine` rules — it is the gate an AI-generated manifest passes.
+The interpreter reads a manifest that has *already* passed that gate, and must therefore **ignore
+unknown fields** — the exact opposite of this repo's `deny_unknown_fields` rule for boundary payloads.
+A stored manifest is a superset; a payload is a contract. `manifest_view.rs` parses both builtin
+templates character for character in its tests, which is the guard against read-model drift.
+
+**Increment 15's own scope note was wrong, and it is recorded rather than quietly patched.**
+`parse_retry_after` / `retry_after_from` (`manifest-interpreter.ts:191-204`) are pure functions the
+class calls, and they were never ported — although that note said every pure function the class calls
+was present. They landed here with six tests, and the note was rewritten to *enumerate* what the
+module holds rather than summarise it. **The date branch of `Retry-After` is a recorded absence:** the
+source's second branch is `Date.parse(v)`, which accepts a superset of RFC 9110 and for which this
+crate has no parser, so an unreadable value returns `None` and the caller falls back to
+`engine.rs:1168`'s cooldown floor. A wrong date would set a cooldown nobody chose; asking for nothing
+is the safe direction.
+
+**Ten falsification probes, every one a red test, and two of them found more than they confirmed.**
+
+1. **A test named for the dialect default did not test it.** Deleting the dialect default from
+   `wants_usage` left **all 42 interpreter tests green**. The fixture sets `requestUsage: true`, which
+   satisfies the *first* branch of the nullish chain, so the rule the test is named for was never
+   reached. This is D18's defect class — a test whose claim is broader than its check — and it
+   surfaced only because the probe was run *against the test* rather than trusted. The test now
+   removes the key and **asserts the removal**, so a fixture that stopped carrying the flag would fail
+   loudly instead of testing nothing, and a companion test pins the conjunction's second conjunct
+   (`openai-chat-v1` **and** a `usage` selector to read). Re-run: removing either conjunct now fails
+   exactly the test that names it.
+2. **`flush()` carries two properties, and only one of them was named.** Removing the flush from the
+   `Fail` arm failed the ordering test *and* pushed a second test's item count from 2 to 3 — because
+   `flush` sets `finished`, so it is also the **termination** for every path that calls it. That is
+   faithful (the source's `throw` unwinds its generator, so the `finally` runs and nothing after the
+   failing line is read) but it was an *unnamed dependency*: the item-count assertion was pinning
+   termination without saying so. A sibling test now names it
+   (`a_mid_stream_error_ends_the_stream_so_a_later_line_is_never_read`), the `flush` doc-comment
+   states both properties, and re-running the same probe now fails three tests, each naming one. The
+   transport-break arm is **not** symmetric: there the flush's only job is the ordering, because the
+   inner stream is already exhausted.
+
+**A counting rule this increment needed.** `cargo test` reports **870** in the lib while a
+`#[test]`-attribute count gives 732. The difference is exactly the `#[tokio::test(flavor =
+"multi_thread")]` sites — **136** of them — which a `#\[(tokio::)?test\]` pattern silently misses.
+`674 + 136 + 58 = 868` before the two tests added while falsifying. Count attributes by their full
+form, or count what cargo prints.
+
 **What remains in this phase, in order:**
 
-1. **The I/O half of the interpreter** — `ManifestInterpreter` over the `HttpPort` seam: `listModels`,
-   the streaming `generateText` loop, `generateImage`, `pingKey`. This is what makes the adapter layer
-   serve real traffic, and it is the last thing standing between here and Phase 5.
-2. **`modality.rs`**, once decision 5 is made. The text and image paths do not call `tagModality` —
-   the planner and the catalog do — so the I/O half is not blocked waiting on it.
-3. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
+1. **`modality.rs`**, once decision 5 is made. The text and image paths do not call `tagModality` —
+   the planner and the catalog do — so nothing above is blocked waiting on it.
+2. **The sandbox** (`code-adapter.ts`), on the measured exception path. The async-host shape that
    §2.1.3 lists as untested belongs here, because the probes service `http` synchronously and
    production does not.
 

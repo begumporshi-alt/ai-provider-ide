@@ -5,8 +5,26 @@
 //! `generateText` (a streaming loop), `generateImage`, `pingKey` — and it is **not** here: it needs
 //! the `HttpPort` seam and an async streaming shape that a later increment owns. What is here is
 //! everything the class calls that is a pure function of its arguments: the header layer, the
-//! streaming tool-call reassembly, the cached-token reader, the URL join, and the error the class
-//! throws.
+//! streaming tool-call reassembly, the cached-token reader, the URL join, the `Retry-After` parser,
+//! and the error the class throws.
+//!
+//! **That list was one entry short when this module landed, and the correction is recorded rather
+//! than quietly applied.** Increment 15's scope note claimed every pure function the class calls was
+//! here, and [`parse_retry_after`] / [`retry_after_from`] were not — they were skipped, and nothing
+//! noticed because nothing called them. The omission surfaced on 2026-09-24 when the interpreter
+//! became their first consumer and had no way to build an `AttemptError::Http` with a wait attached.
+//! A module that claims completeness it does not have is worse than one that lists what it holds,
+//! which is why the claim is now the enumeration above rather than a summary.
+//!
+//! **What is still absent from the parser, and why that is a decision.** [`parse_retry_after`]
+//! implements the delta-seconds form of RFC 9110 and **not** the HTTP-date form. The source's second
+//! branch is `Date.parse(v)`, which accepts a superset of RFC 9110 — ISO 8601 among others — and this
+//! crate has no date parser in its runtime graph (the same constraint that defers `modality.rs`).
+//! Hand-rolling one would be a guess at which of `Date.parse`'s grammars a provider meant, and the
+//! branch is unreachable in practice: a `Retry-After` from an AI provider is a number of seconds.
+//! The failure direction is what makes this safe rather than merely convenient — an unreadable value
+//! returns `None`, and `None` makes the caller fall back to its own cooldown floor
+//! (`engine.rs:1168`), where a wrong date would set a cooldown nobody chose.
 //!
 //! The split is the one `engine.rs` and `compress.rs` took before it — pure core first, the I/O
 //! shell after — and for the same reason: the decisions that are easy to get wrong are pinned while
@@ -66,6 +84,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
+use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::adapter::ToolCall;
@@ -78,7 +97,12 @@ pub const MESSAGE_BODY_LIMIT: usize = 400;
 
 /// One auth header a manifest declares, as [`auth_headers`] needs it — `provider.auth.headers`
 /// without the manifest around it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Deserialize` because this is also the shape the interpreter's manifest view reads them into:
+/// one spelling of one header, rather than a view-local twin that would have to be kept in step.
+/// The grammar's only rule about the pair is that `name` is non-empty (`manifest.ts:35`), and a
+/// missing `prefix` is absent rather than empty — a distinction [`auth_headers`] acts on.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct AuthHeader {
     pub name: String,
     /// e.g. `"Bearer"`. A falsy prefix is treated as absent, matching the source's `h.prefix ? …`.
@@ -140,22 +164,33 @@ fn kind_label(kind: FailureKind) -> &'static str {
     }
 }
 
-/// The first [`MESSAGE_BODY_LIMIT`] UTF-16 code units of `body`, whole characters only.
+/// The first `limit` UTF-16 code units of `body`, whole characters only.
 ///
 /// Stops *before* a character that would cross the limit rather than splitting it — see the module
 /// note. A body shorter than the limit is returned unchanged, so the common case allocates once.
-pub fn truncate_for_message(body: &str) -> String {
+///
+/// **A parameter rather than a constant because the interpreter truncates at two different
+/// lengths**, and they are the source's two: `ManifestHttpError`'s message keeps 400 units
+/// (`:214`) and `pingKey`'s keeps 300 (`:482`). One function with the count passed in is one
+/// spelling of the rule; two copies of the loop would be two chances to get the unit counting
+/// wrong in a way only an astral character notices.
+pub fn truncate_utf16(body: &str, limit: usize) -> String {
     let mut units = 0usize;
     let mut out = String::new();
     for ch in body.chars() {
         let width = ch.len_utf16();
-        if units + width > MESSAGE_BODY_LIMIT {
+        if units + width > limit {
             break;
         }
         units += width;
         out.push(ch);
     }
     out
+}
+
+/// The first [`MESSAGE_BODY_LIMIT`] UTF-16 code units of `body` — what reaches an error message.
+pub fn truncate_for_message(body: &str) -> String {
+    truncate_utf16(body, MESSAGE_BODY_LIMIT)
 }
 
 impl fmt::Display for ManifestHttpError {
@@ -233,12 +268,14 @@ fn parse_header_placeholder(s: &str) -> Option<&str> {
     Some(inner)
 }
 
-/// `String(vars[key] ?? "")` for the value types a host variable can hold.
+/// `String(vars[key] ?? "")` for the value types a host variable can hold — and, since the
+/// interpreter reads a model id the same way (`manifest-interpreter.ts:253`), for the value types a
+/// catalogue entry can hold.
 ///
 /// Absent and `null` both become the empty string — the source's `??` — so a header never renders
 /// as the text `null`. Numbers and booleans take their JavaScript spellings, which is what a host
 /// variable interpolated into a header would produce there.
-fn js_string_coerce(value: Option<&Value>) -> String {
+pub(crate) fn js_string_coerce(value: Option<&Value>) -> String {
     match value {
         None | Some(Value::Null) => String::new(),
         Some(Value::String(s)) => s.clone(),
@@ -284,6 +321,51 @@ pub fn header_value<'a>(headers: &'a BTreeMap<String, String>, name: &str) -> Op
     }
     let want = name.to_lowercase();
     headers.iter().find(|(k, _)| k.to_lowercase() == want).map(|(_, v)| v.as_str())
+}
+
+/// A `Retry-After` header value as a delay in milliseconds — the port of `parseRetryAfter`
+/// (`manifest-interpreter.ts:191-199`).
+///
+/// RFC 9110 allows either a delay in seconds or an HTTP-date. **Only the seconds form is
+/// implemented**; see the module note for why the date branch is a recorded absence rather than a
+/// half-done one. Anything unreadable is `None` so the caller falls back to its own floor —
+/// guessing here would produce a cooldown that is either uselessly short or absurdly long.
+///
+/// **The source's `now` parameter is gone, not defaulted.** It exists only to measure an HTTP-date
+/// against, and with that branch unported it would be an argument no caller reads — the shape
+/// `ManifestHttpError::new` refuses for its own `kind` parameter.
+///
+/// **`Number(v)` is JavaScript's coercion, and this is narrower than it.** A hex or binary literal
+/// (`"0x1f"`) is a number to JavaScript and not to `f64::from_str`, so such a value falls through to
+/// the unported date branch and returns `None` where the source would have returned a wait. It is
+/// not a header any provider sends, and the direction of the difference is the safe one.
+pub fn parse_retry_after(raw: Option<&str>) -> Option<u64> {
+    // `raw?.trim()` — an absent header and a whitespace-only one are both "said nothing".
+    let value = raw?.trim_matches(is_js_whitespace);
+    if value.is_empty() {
+        return None;
+    }
+    // `Number.isFinite(secs) && secs >= 0` — `f64` parses `"inf"` and `"NaN"`, so the finiteness
+    // test is load-bearing rather than decorative.
+    let secs: f64 = value.parse().ok()?;
+    if !secs.is_finite() || secs < 0.0 {
+        return None;
+    }
+    // `Math.round(secs * 1000)`. A wait beyond `u64::MAX` milliseconds saturates rather than
+    // wrapping, which keeps an absurd value absurd instead of turning it into a short one.
+    let ms = (secs * 1000.0).round();
+    if ms >= u64::MAX as f64 {
+        return Some(u64::MAX);
+    }
+    Some(ms as u64)
+}
+
+/// The delay a response asks us to wait, in ms, or `None` when it asks for nothing.
+///
+/// The lookup is case-insensitive because providers disagree about how they capitalise the header —
+/// see [`header_value`], which exists for exactly this.
+pub fn retry_after_from(headers: &BTreeMap<String, String>) -> Option<u64> {
+    parse_retry_after(header_value(headers, "retry-after"))
 }
 
 /// Read a usage block's cached-prompt-token count, in whichever dialect reports it.
@@ -557,6 +639,64 @@ mod tests {
     #[test]
     fn header_lookup_on_an_empty_map_is_none() {
         assert_eq!(header_value(&BTreeMap::new(), "retry-after"), None);
+    }
+
+    // ---------- parse_retry_after / retry_after_from ----------
+
+    #[test]
+    fn a_delta_seconds_header_becomes_milliseconds() {
+        assert_eq!(parse_retry_after(Some("30")), Some(30_000));
+        assert_eq!(parse_retry_after(Some("0")), Some(0));
+        assert_eq!(parse_retry_after(Some("1.5")), Some(1_500), "RFC 9110 allows a decimal");
+    }
+
+    /// The source's `raw?.trim()` and `if (!v)`: an absent header, an empty one and a
+    /// whitespace-only one are the same input — "the provider said nothing".
+    #[test]
+    fn an_absent_or_blank_header_names_no_wait() {
+        assert_eq!(parse_retry_after(None), None);
+        assert_eq!(parse_retry_after(Some("")), None);
+        assert_eq!(parse_retry_after(Some("   ")), None);
+        assert_eq!(parse_retry_after(Some("\t\n")), None);
+    }
+
+    /// **The unported branch, pinned as a value rather than left in prose.** An HTTP-date is
+    /// well-formed per RFC 9110 and the source would measure it against `now`; here it is `None`, so
+    /// the caller falls back to its own cooldown floor. If someone ports the date branch, this test
+    /// is the one that has to change — which is the point of writing it down.
+    #[test]
+    fn an_http_date_names_no_wait_because_that_branch_is_not_ported() {
+        assert_eq!(parse_retry_after(Some("Sun, 06 Nov 1994 08:49:37 GMT")), None);
+        assert_eq!(parse_retry_after(Some("2026-09-24T10:00:00Z")), None);
+    }
+
+    /// A negative wait is not a wait. `Number("-1")` is finite and negative, so the source's
+    /// `secs >= 0` test rejects it and so does this — a negative cooldown would read as "retry now".
+    #[test]
+    fn a_negative_delay_is_not_a_wait() {
+        assert_eq!(parse_retry_after(Some("-1")), None);
+        assert_eq!(parse_retry_after(Some("-0.5")), None);
+    }
+
+    /// Unreadable text names no wait, and so does a non-finite number — `f64` parses both `"inf"`
+    /// and `"NaN"`, so the finiteness test is doing real work.
+    #[test]
+    fn unreadable_or_non_finite_values_name_no_wait() {
+        assert_eq!(parse_retry_after(Some("soon")), None);
+        assert_eq!(parse_retry_after(Some("30s")), None);
+        assert_eq!(parse_retry_after(Some("inf")), None);
+        assert_eq!(parse_retry_after(Some("NaN")), None);
+        // The one narrowing the doc comment records: JavaScript reads this as 31.
+        assert_eq!(parse_retry_after(Some("0x1f")), None);
+    }
+
+    #[test]
+    fn the_lookup_finds_the_header_whatever_its_capitalisation() {
+        for spelling in ["Retry-After", "retry-after", "RETRY-AFTER"] {
+            let headers = BTreeMap::from([(spelling.to_string(), "45".to_string())]);
+            assert_eq!(retry_after_from(&headers), Some(45_000), "spelling {spelling}");
+        }
+        assert_eq!(retry_after_from(&BTreeMap::new()), None);
     }
 
     // ---------- read_cached_tokens ----------
