@@ -2664,3 +2664,15 @@ delta. Triage by lint *kind* and count, not by the error total.
 **A marker-list check proves only that the markers are absent.** The derived state was verified by searching for a handful of strings the newer increment had introduced — all absent, so the derivation was called correct. But the newer increment had also changed a phrase (*"then wire it in"*) that was not on the list, so it survived into the earlier commit. **The honest check is a diff of the derived file against the intended one**, or a marker list built by enumerating *every* edit the newer increment made rather than the memorable ones.
 
 **Splitting an uncommitted pair of increments needs the intermediate state reconstructed, and it is worth stating that cost before starting.** When two increments share a working tree, the earlier one's file state is not recoverable from git — it only ever existed on disk. Deriving it is feasible (reverse the later edits) but it is a real, fallible operation on live files, and the failure mode is silent: the tree ends up in a state neither increment produced. Verify the earlier commit's tree by *running its gate*, not by trusting the derivation.
+
+**A generated artefact is only consistent with a tree if it is rebuilt from that tree.** `book.html` was regenerated for the earlier commit while the working directory held the later increment's version of two *other* chapters, so the committed book described code the commit did not contain — and nothing about the commit looked wrong. The check is cheap and should be routine for any committed build output:
+
+```
+git worktree add /tmp/wt <rev>
+cd /tmp/wt && node scripts/build-dev-book.mjs
+git diff --stat          # expect: no changes
+```
+
+The worktree is the mechanism, not the point: it gives a clean checkout of the revision without disturbing the working directory, so the artefact can be reproduced from exactly what the commit contains. Run it for **every** commit that includes generated output, not just the tip — a stale artefact is invisible in review and wrong for everyone who reads it later.
+
+**Restoring a file from a reconstruction is verifiable, and the hash is the proof.** After the in-place rewriter destroyed four files, the reconstruction was accepted only once each file's sha256 matched the value recorded before the loss. Two matched exactly; the other two differed only by the new prose deliberately added. **Record hashes of the files you are about to operate on** — a byte-identical restore is then a measurement rather than a claim.
