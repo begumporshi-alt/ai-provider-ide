@@ -8,6 +8,7 @@
  */
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { fetchAdmin } from "../lib/gateway-client";
 import {
   OnboardingOrchestrator,
   generateCandidates,
@@ -298,13 +299,11 @@ export function OnboardingScreen() {
     setError(null);
     try {
       adapters.register(r.providerId, c.manifest);
-      await invoke("manifest_upsert_active", {
-        m: {
-          id: crypto.randomUUID(), providerId: r.providerId, version: 1, origin: "ai-generated",
-          bodyJson: JSON.stringify(c.manifest),
-          contractResultJson: JSON.stringify(c.contract),
-          createdAt: Date.now(), isActive: true,
-        },
+      await fetchAdmin("POST", "/admin/manifests", {
+        id: crypto.randomUUID(), providerId: r.providerId, version: 1, origin: "ai-generated",
+        bodyJson: JSON.stringify(c.manifest),
+        contractResultJson: JSON.stringify(c.contract),
+        createdAt: Date.now(), isActive: true,
       });
       await orch.adoptGeneratedManifest(c.manifest);
       setPicked(c);
@@ -350,12 +349,10 @@ export function OnboardingScreen() {
       }
       // register the template manifest on the pending provider, then free contract checks
       adapters.register(providerId, fp.template);
-      await invoke("manifest_upsert_active", {
-        m: {
-          id: crypto.randomUUID(), providerId, version: 1, origin: "builtin-template",
-          bodyJson: JSON.stringify(fp.template), contractResultJson: null,
-          createdAt: Date.now(), isActive: true,
-        },
+      await fetchAdmin("POST", "/admin/manifests", {
+        id: crypto.randomUUID(), providerId, version: 1, origin: "builtin-template",
+        bodyJson: JSON.stringify(fp.template), contractResultJson: null,
+        createdAt: Date.now(), isActive: true,
       });
       setStep(3);
       const { adapter } = await adapters.forProvider(providerId);

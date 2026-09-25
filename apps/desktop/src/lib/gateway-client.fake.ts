@@ -58,7 +58,7 @@ export function adminBodies(method: string, path: string): unknown[] {
 }
 
 /**
- * Shape-only fallbacks. Every `GET` in the admin surface returns a collection except the three
+ * Shape-only fallbacks. Every `GET` in the admin surface returns a collection except the ones
  * named here, and every write returns either `{ ok: true }` or — for the batch capture — a count.
  */
 function defaultResponse(method: string, path: string): unknown {
@@ -68,6 +68,11 @@ function defaultResponse(method: string, path: string): unknown {
     }
     if (path.startsWith("/admin/memory/stats")) return { total: 0, byLayer: {}, injectable: 0 };
     if (path.startsWith("/admin/context")) return { nodes: [], edges: [] };
+    // A settings row is an **object**, not a collection: `GET /admin/settings` owns the `gateway`
+    // row and the keyed form reaches every other row (`router`, `assistant`, `background`). The
+    // fallback below answers `[]`, and `Object.assign(x, [])` is a silent no-op — which is how a
+    // wrong shape here would look like a passing spec.
+    if (path.startsWith("/admin/settings")) return {};
     return [];
   }
   if (path.startsWith("/admin/memory/batch")) return { captured: 0 };

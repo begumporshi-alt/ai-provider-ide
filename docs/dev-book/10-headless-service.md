@@ -682,10 +682,15 @@ surface. Three design points that differ from a literal port of the commands:
    knows erases the rest. The merge moved server-side, which makes it atomic instead of a
    read-modify-write across the network. `POST /admin/settings` therefore takes a **patch**, and
    answers with the merged object.
-2. **`POST /admin/keys` returns the secret once.** The IPC command copied it to the clipboard and
-   returned metadata only. A headless process has no clipboard, so the secret is returned in the
-   response and the UI copies it — one behaviour for both cases, and the clipboard stays a UI
-   concern.
+2. **`POST /admin/keys` returns the secret once — and the in-app UI therefore does *not* use it.**
+   The IPC command generated the secret host-side, copied it to the clipboard, and returned metadata
+   only: `ARCHITECTURE_AUDIT.md` R4 says *"The webview only ever receives `{id, label}`"*, and
+   `AUDIT_REPORT.md` H5's fix requires *"a Rust-side native dialog/copy that never enters the webview
+   DOM"*. A headless process has no clipboard, so the route **must** be able to return the secret —
+   for curl, AI Hub, and any client that has nowhere to copy it to. But that also means the secret
+   crosses the webview in the response, so **`gateway_app_key_create` stays on IPC and the app-key
+   screen is deliberately excluded from the migration**; the route exists for clients without a host
+   clipboard. See the scope correction under §10 decision 2.
 3. **A core with no store answers 503, naming the route.** `GatewayCore::store()` is `None` for
    every core built without `with_store`, which is most of the test suite. Refusing loudly beats
    answering an empty list that reads as "nothing is configured".
@@ -693,7 +698,7 @@ surface. Three design points that differ from a literal port of the commands:
 **Not tested: the happy path of `POST /admin/keys`.** `vault::put` writes to the real OS keychain,
 which a CI runner has no access to, so only the validation path (a missing `label` → 400) is
 pinned. The rest of the surface has 9 tests covering auth, the 503, the settings merge, the empty
-list and the spend shape. reveal).
+list and the spend shape.
 
 ---
 
@@ -2435,10 +2440,12 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
      system notifications, and master-key retrieval from the keychain (needed once at startup to
      authenticate HTTP requests). "Pure HTTP" means "no custom `invoke` commands for data access,"
      not "no Tauri at all."
-   - **Authentication model:** the UI becomes an authenticated client of the gateway, sending the
-     master key with each request (per §5.3). The key is retrieved from the keychain at startup via
-     the Tauri vault API (a platform API, not a custom command) and held in UI memory for the
-     session. This is consistent with how external clients work.
+   - **Authentication model:** the UI becomes an authenticated client of the gateway — but **not by
+     sending the master key**, which it never holds (D51). 26i resolved this with a host-minted,
+     revocable session credential (`ak-ui`): the host caches it in a `let` and sends it as
+     `Authorization: Bearer`, and the master key is read from the keychain **host-side** and never
+     crosses into the webview. See §5.3 and `core/ui_session.rs`. This is consistent with how
+     external clients work — they present a credential; they simply present a different one.
    - **Migration scope, corrected 2026-09-25 by measurement — as first written this was
      over-scoped.** It said "no custom `invoke` commands for data access remain." The production
      UI calls **107** distinct commands, and roughly a third are not gateway data at all:
@@ -2453,6 +2460,25 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
      **This is not the hybrid the decision rejected.** That one kept IPC for *performance* (hot
      paths), producing two spellings of the same fact. This keeps IPC for *ownership* — each side
      serves its own data, so there is still one authority per fact.
+   - **Second scope correction, 2026-09-25 (26n): the app-key group stays on IPC, and not for
+     ownership — for a security reason.** `gateway_app_keys`, `gateway_app_key_create`,
+     `gateway_app_key_revoke`, `gateway_app_key_delete` and `gateway_app_key_cap_set` are *gateway
+     data* by the ownership test, so the bullet above says they migrate. They must not:
+     `POST /admin/keys` returns the secret in the response body, and R4/H5 require that an app-key
+     secret **never enters the webview** — `ARCHITECTURE_AUDIT.md` R4: *"The webview only ever
+     receives `{id, label}`"*; `AUDIT_REPORT.md` H5's fix: reveal via *"a Rust-side native dialog/copy
+     that never enters the webview DOM"*. Migrating that screen would trade a documented security
+     property for transport uniformity. **The route still exists** — a headless client has no host
+     clipboard to copy into — but the in-app UI does not call it. This is a **third admissible reason
+     for IPC**, alongside ownership and app-state: *a route whose response carries a secret the
+     webview must not hold.*
+   - **Measured 2026-09-25 after 26l and 26n:** 73 `invoke` commands remain, against 39 `fetchAdmin`
+     call sites over 30 `/admin/*` templates. The "~34" above is close to the measured **~39**
+     app-owned; the gateway-data remainder is **~10** — three whose routes already existed
+     (`manifest_upsert_active`; `settings_get`/`settings_set` for non-`gateway` rows — migrated in
+     26n) and seven that need one (`manifest_stage`, `manifests_history`, `gateway_spend_cap_set`,
+     `gateway_memory_enabled`, `gateway_set_memory_enabled`, `gateway_prune_live_context`,
+     `ledger_append`).
    - `gateway_enable/disable` and `gateway_worker_error` are deleted (service is always on).
    - **Revisit if:** a real performance bottleneck appears that HTTP cannot serve — unlikely on
      localhost, but the hybrid door stays open if measured.
@@ -3632,6 +3658,55 @@ write down what it now is *and* how it was measured.
 **Measured:** no code changed, so no test count moves. Doc gates re-run clean: `check-doc-links` 52 files
 / 127 links, book rebuilt.
 
+---
+
+## Increment 26n — the gateway-data commands whose routes already existed
+
+**The first half of the migration's remainder, and one scope correction that shrank it.** 26l measured
+73 `invoke` commands against 39 `fetchAdmin` call sites. Three already had a route and needed only the
+client moved:
+
+- **`manifest_upsert_active`** — two call sites in `Onboarding.tsx`, now `POST /admin/manifests`. The
+  body is the row itself: `manifest_upsert_active_h` takes `Json<persist::ManifestRow>`, and
+  `ManifestRow` is `rename_all = "camelCase"` — the shape the wizard was already building.
+- **`settings_get` / `settings_set` for non-`gateway` rows** — `Assistant.tsx` (`assistant`) and
+  `Gateway.tsx` (`background`), now the keyed route 26l added. Two shape changes came with it and both
+  are improvements: the keyed route answers an **object** where the IPC command answered a JSON
+  *string* (so the `JSON.parse` is gone rather than kept as a no-op), and it **merges** where
+  `settings_set` was a whole-row UPSERT.
+- **The `gateway` row stays on IPC**, unchanged from 26l — it is the listener's own config, and the
+  disable path writes *after* `gateway_disable`.
+
+**The scope correction: the app-key group is excluded, and for a security reason.** The plan's
+corrected scope calls the app-key commands gateway data, and by the ownership test they are, so they
+should migrate. They must not. `POST /admin/keys` returns the secret in the response body (§5.3 design
+point 2, because a headless client has no host clipboard), and R4/H5 require that an app-key secret
+**never enters the webview** — `ARCHITECTURE_AUDIT.md` R4: *"The webview only ever receives
+`{id, label}`"*; `AUDIT_REPORT.md` H5's fix: reveal via *"a Rust-side native dialog/copy that never
+enters the webview DOM"*. Migrating that screen would trade a documented security property for
+transport uniformity, so **the route exists for clients without a clipboard and the in-app UI does not
+call it.** That makes a **third admissible reason for IPC**, alongside ownership and app-state: *a
+route whose response carries a secret the webview must not hold.*
+
+**The fourth instance of the claim 26m fixed.** 26m swept three places that said the UI holds the
+master key. It missed one — §10 decision 2's own *Authentication model* bullet still read "the UI
+becomes an authenticated client of the gateway, sending the master key with each request … held in UI
+memory for the session". **A fix's sweep must cover every place the falsified claim appears, not the
+places the fix touched**: the lesson the register already records for deletions (D44), arriving here
+*inside the fix for that very class*. It now names `ak-ui` and points at §5.3.
+
+**Measured.** No Rust changed. Browser suite **108 passed / 0 failed** (2.9 m), vitest **181/181**,
+`pnpm typecheck` clean. After: **72 `invoke` commands and 43 `fetchAdmin` call sites** (was 73 / 39).
+
+**Falsified, one probe.** Pointing the manifest write at `/admin/manifests__probe` reddened
+`ui.spec.ts:55` (the zero-config wizard) — which is what proves the suite exercises the new transport
+rather than merely tolerating it. Probe reverted.
+
+**One more thing the migration fixed on the way.** `gateway-client.fake.ts` answered `[]` to every
+unmatched `GET`, and `Object.assign(x, [])` is a silent no-op — so a settings read through the fake
+would have looked like a passing spec while returning nothing. It now answers `{}` for
+`/admin/settings`, which is the shape the real route has.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3682,15 +3757,15 @@ state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admi
 `gatewayToolsEnabled` in the `router` row) because writing only one would be a toggle that lies.
 ~~the TypeScript migration~~ **landed 26i** — D51 resolved with a host-mediated session credential
 (`ak-ui`). **The sentence that followed read "~12 `invoke` calls remain", and 26l measured it wrong on
-both readings: 73 `invoke` commands remain, against 39 `fetchAdmin` call sites over 30 `/admin/*`
-templates.** ~39 stay on IPC by ownership (§10 decision 2 — skills, crash, capture, agent trails,
-service, egress, vault, onboarding, history, config, workbuddy, `gateway_key_*`), and **~13 are
-gateway data still on IPC**: 5 whose routes already exist (`gateway_app_keys` / `_create` / `_revoke`
-against `GET`/`POST /admin/keys` and `DELETE /admin/keys/{id}`; `manifest_stage` /
-`manifest_upsert_active` against `POST /admin/manifests`; and the keyed settings route 26l added) and
-8 that need one (`gateway_spend_cap_set`, `gateway_memory_enabled` / `_set`,
-`gateway_prune_live_context`, `ledger_append`, `manifests_history`, `gateway_app_key_cap_set`,
-`gateway_app_key_delete`). ~~the browser
+both readings: 73 `invoke` commands remained, against 39 `fetchAdmin` call sites over 30 `/admin/*`
+templates.** **26n** then migrated the three whose routes already existed — `manifest_upsert_active`
+(`POST /admin/manifests`) and `settings_get` / `settings_set` for non-`gateway` rows (26l's keyed
+route) — taking it to **72 / 43**. What remains is **not** the ~12 the old sentence implied: ~44 stay
+on IPC by ownership *or security* (§10 decision 2 — skills, crash, capture, agent trails, service,
+egress, vault, onboarding, history, config, workbuddy, `gateway_key_*`, and the **app-key group**,
+which R4/H5 keep off HTTP because `POST /admin/keys` returns the secret), and **7 are gateway data
+that still need a route**: `manifest_stage`, `manifests_history`, `gateway_spend_cap_set`,
+`gateway_memory_enabled`, `gateway_set_memory_enabled`, `gateway_prune_live_context`, `ledger_append`. ~~the browser
 harness~~ **landed 26k** — `web-test/shim.ts` intercepts `fetch` to `127.0.0.1:<port>/admin/*` and
 dispatches to the same in-memory store the `invoke` cases use, so the suite runs as a gate again:
 **106/106**, from red at test 18. It found one live bug on the way (`persistAliases` sent `{ rows }`

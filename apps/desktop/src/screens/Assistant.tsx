@@ -8,6 +8,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { catalog, listSkills, registry, router } from "../store";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
+import { fetchAdmin } from "../lib/gateway-client";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
@@ -342,9 +343,10 @@ const ASSISTANT_SETTINGS_KEY = "assistant";
 
 async function loadAssistantSettings(): Promise<AssistantSettings> {
   try {
-    const raw = await invoke<string | null>("settings_get", { key: ASSISTANT_SETTINGS_KEY });
-    if (!raw) return {};
-    const parsed: unknown = JSON.parse(raw);
+    // The keyed route answers an **object**; the IPC command answered a JSON *string*. The
+    // `JSON.parse` that used to sit here is gone with the transport rather than kept as a no-op —
+    // parsing an object would throw, and the `catch` below would turn that into "no settings".
+    const parsed: unknown = await fetchAdmin("GET", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`);
     return parsed && typeof parsed === "object" ? (parsed as AssistantSettings) : {};
   } catch {
     return {}; // no stored settings is not an error — it is the first run
@@ -353,9 +355,11 @@ async function loadAssistantSettings(): Promise<AssistantSettings> {
 
 function saveAssistantSettings(s: AssistantSettings): void {
   // Fire and forget: a failed write must not stop the user from using the screen.
-  void invoke("settings_set", { key: ASSISTANT_SETTINGS_KEY, valueJson: JSON.stringify(s) }).catch(
-    () => undefined,
-  );
+  //
+  // A **merge** now, where the IPC command was a whole-row UPSERT: a key another writer added
+  // between this call and the write survives. Nothing else writes the `assistant` row today, so the
+  // difference is invisible here — and it is the direction that cannot lose data.
+  void fetchAdmin("POST", `/admin/settings/${ASSISTANT_SETTINGS_KEY}`, s).catch(() => undefined);
 }
 
 export function AssistantScreen() {

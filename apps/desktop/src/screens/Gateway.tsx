@@ -8,6 +8,7 @@ import { useCallback, useEffect, useState } from "react";
 import { Button, Field, inputCls, inputStyle } from "../components/atoms";
 import { usd } from "../lib/format";
 import { readGatewaySettings, type GatewayStatus } from "../store";
+import { fetchAdmin } from "../lib/gateway-client";
 
 /**
  * Audit R4: metadata only — the secret lives in the keychain and is never returned here.
@@ -91,8 +92,11 @@ export function GatewayScreen() {
     readGatewaySettings()
       .then((s) => setPort(s.port ?? 8787))
       .catch(() => setPort(8787));
-    invoke<string | null>("settings_get", { key: "background" })
-      .then((v) => setHideOnClose(v ? (JSON.parse(v) as { hideOnClose?: boolean }).hideOnClose ?? true : true))
+    // The keyed route answers an object, so there is no `JSON.parse` and no null case to special
+    // case: a missing row answers `{}`, and `{}.hideOnClose ?? true` is the default the old
+    // ternary produced. The host still reads this row directly at close time (`hide_on_close`).
+    fetchAdmin("GET", "/admin/settings/background")
+      .then((v) => setHideOnClose((v as { hideOnClose?: boolean } | null)?.hideOnClose ?? true))
       .catch(() => setHideOnClose(true));
     const t = window.setInterval(refresh, 2500);
     return () => window.clearInterval(t);
@@ -179,7 +183,7 @@ export function GatewayScreen() {
   async function setBackground(on: boolean) {
     setError(null);
     try {
-      await invoke("settings_set", { key: "background", valueJson: JSON.stringify({ hideOnClose: on }) });
+      await fetchAdmin("POST", "/admin/settings/background", { hideOnClose: on });
       setHideOnClose(on);
     } catch (e) {
       setError(String(e));
