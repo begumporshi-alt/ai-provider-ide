@@ -30,6 +30,9 @@ import {
   persistRouterSettings,
   readGatewaySettings,
   router,
+  serviceInstall,
+  serviceStatus,
+  serviceUninstall,
   setGatewayMutationEnabled,
   setGatewayToolsEnabled,
   type GatewayLogLine,
@@ -38,6 +41,7 @@ import {
   type InjectionEvent,
   type InjectionStats,
   type MemoryStats,
+  type ServiceStatus,
 } from "../store";
 import { usd } from "../lib/format";
 import { useUi } from "../ui-state";
@@ -167,6 +171,7 @@ interface ControlData {
   mutation: boolean | null;
   injection: InjectionStats | null;
   facts: MemoryStats | null;
+  service: ServiceStatus | null;
   /** Set only when the *host itself* did not answer — a per-switch failure is reported per row. */
   hostError: string | null;
 }
@@ -179,6 +184,7 @@ const EMPTY: ControlData = {
   mutation: null,
   injection: null,
   facts: null,
+  service: null,
   hostError: null,
 };
 
@@ -194,7 +200,7 @@ function useControlData(tick: number) {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    const [gateway, spend, memory, tools, mutation, injection, facts] = await Promise.all([
+    const [gateway, spend, memory, tools, mutation, injection, facts, service] = await Promise.all([
       gatewayStatus().catch(() => null),
       gatewaySpendStatus().catch(() => null),
       gatewayMemoryEnabled().catch(() => null),
@@ -202,6 +208,7 @@ function useControlData(tick: number) {
       gatewayMutationEnabled().catch(() => null),
       gatewayInjectionStats().catch(() => null),
       memoryStats().catch(() => null),
+      serviceStatus().catch(() => null),
     ]);
     setData({
       gateway,
@@ -211,6 +218,7 @@ function useControlData(tick: number) {
       mutation,
       injection,
       facts,
+      service,
       hostError:
         gateway === null && memory === null
           ? "The app's host process did not answer. Switches are disabled until it does."
@@ -447,6 +455,8 @@ function GatewayTab({
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [capInput, setCapInput] = useState("");
   const [capError, setCapError] = useState<string | null>(null);
+  const [serviceBusy, setServiceBusy] = useState(false);
+  const [serviceError, setServiceError] = useState<string | null>(null);
 
   /**
    * The gateway's own clock. This tab mounts only while it is the selected one, so the interval
@@ -588,6 +598,79 @@ function GatewayTab({
           </p>
         )}
       </Card>
+
+      <div className="mt-3">
+        <Card title="Login-item service">
+          <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+            Runs the gateway as a system service, so it stays up after you quit the app. The service
+            and the in-app gateway bind the same port — only one can run at a time. Installing the
+            service while the app gateway is running is a bind conflict, not a handover.
+          </p>
+          {(() => {
+            const s = d.service;
+            const installed = s?.plistPresent ?? false;
+            const loaded = s?.loaded ?? false;
+            const pid = s?.pid ?? null;
+            return (
+              <div className="mt-2">
+                <div className="flex items-center gap-3 text-[13px]">
+                  <StatusDot health={loaded ? "healthy" : installed ? "degraded" : "unavailable"} />
+                  <span>
+                    {s === null
+                      ? "—"
+                      : loaded
+                        ? `Running${pid !== null ? ` (pid ${pid})` : ""}`
+                        : installed
+                          ? "Installed, not running"
+                          : "Not installed"}
+                  </span>
+                </div>
+                {running && installed && !loaded && (
+                  <p className="mt-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
+                    The app gateway is running and owns the port. Stop it before starting the service,
+                    or the service will fail to bind.
+                  </p>
+                )}
+                {serviceError && (
+                  <p className="mt-1.5 text-[11px]" style={{ color: "var(--danger)" }}>{serviceError}</p>
+                )}
+                <div className="mt-2 flex items-center gap-2">
+                  {!installed ? (
+                    <Button
+                      disabled={serviceBusy || d.hostError !== null}
+                      onClick={() => {
+                        setServiceError(null);
+                        setServiceBusy(true);
+                        serviceInstall()
+                          .then(() => refreshGateway())
+                          .catch((e) => setServiceError(String(e)))
+                          .finally(() => setServiceBusy(false));
+                      }}
+                    >
+                      {serviceBusy ? "Installing…" : "Install"}
+                    </Button>
+                  ) : (
+                    <Button
+                      variant="danger"
+                      disabled={serviceBusy || d.hostError !== null}
+                      onClick={() => {
+                        setServiceError(null);
+                        setServiceBusy(true);
+                        serviceUninstall()
+                          .then(() => refreshGateway())
+                          .catch((e) => setServiceError(String(e)))
+                          .finally(() => setServiceBusy(false));
+                      }}
+                    >
+                      {serviceBusy ? "Removing…" : "Remove"}
+                    </Button>
+                  )}
+                </div>
+              </div>
+            );
+          })()}
+        </Card>
+      </div>
 
       <div className="mt-3">
         <Card title="Monthly spend cap">

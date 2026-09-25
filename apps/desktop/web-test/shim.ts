@@ -109,6 +109,12 @@ const gatewayStatus = {
   endpointUrl: "http://127.0.0.1:8787/v1",
 };
 
+const serviceStatus = {
+  plistPresent: false,
+  loaded: false,
+  pid: null as number | null,
+};
+
 /**
  * The capture queue is host-owned exactly like gateway status: the UI reads it and cannot derive
  * it. Settable here so a spec can arrange the one branch it could never otherwise produce — rows
@@ -576,6 +582,13 @@ let eventSeq = 0;
    */
   gatewayStatus: (next: Partial<typeof gatewayStatus>): void => {
     Object.assign(gatewayStatus, next);
+  },
+  /**
+   * Set what `service_status` reports. The harness has no launchd, so the only way to reach the
+   * "installed and running" branch is to arrange it here.
+   */
+  serviceStatus: (next: Partial<typeof serviceStatus>): void => {
+    Object.assign(serviceStatus, next);
   },
 };
 
@@ -1574,7 +1587,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     // in particular must not report `loaded: true`: a screen that believed it would show a
     // running service with no process behind it, and nothing here could contradict that.
     case "service_status":
-      return { plistPresent: false, loaded: false, pid: null };
+      return { ...serviceStatus };
     case "service_install":
       throw new Error("service_install: the browser harness has no launchd to install into");
     case "service_uninstall":

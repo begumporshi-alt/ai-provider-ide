@@ -2277,9 +2277,14 @@ two scope-wrong claims in two consecutive increments.
    main binary, so the service is in `Contents/MacOS/` undeclared. What is missing is declaring
    it, and deciding whether the copy is the default-features build (measured 4,454,336 B, links
    Tauri) or the Tauri-free one (4,073,968 B).
-3. Change the UI from `invoke` to `fetch()` for gateway operations.
-4. Add CORS headers to the gateway for `tauri://localhost`.
-5. Update `09-status.md` and the drift register.
+3. ~~Add the UI control for the service.~~ **Landed 2026-09-25 as increment 26b** — a "Login-item
+   service" card on Control → Gateway with status, Install/Remove, and a port-conflict warning.
+   See the 26b note in §11.
+4. Change the UI from `invoke` to `fetch()` for gateway operations. **Not started.** This is the
+   remaining Phase 6 work, and it needs §10 decision 2 settled first (pure HTTP vs hybrid).
+5. Add CORS headers to the gateway for `tauri://localhost`. **Not started.** A prerequisite for
+   step 4, but on its own it changes nothing a user can see.
+6. Update `09-status.md` and the drift register. **Done for 26a–26b.**
 
 ---
 
@@ -3320,6 +3325,38 @@ no job in `gui/501`.
 
 ---
 
+### Increment 26b — the UI control, and the session that verifies it
+
+**Phase 6 step 3, and the increment that pays 26a's debt.** 26a built the launchd agent but could not
+verify it: a shell with no Aqua session cannot mutate `gui/<uid>`, and every attempt returned error 5.
+26b is the UI control that calls `install` from a process that *does* have a session — the Tauri app
+itself.
+
+**Three commands, one screen.** `service_status`, `service_install`, `service_uninstall` in
+`tauri/service_cmds.rs`, with wrappers in `store.ts` (`serviceStatus`, `serviceInstall`,
+`serviceUninstall`). The Control screen's Gateway tab gains a "Login-item service" card: a status line
+(Not installed / Installed, not running / Running (pid N)), Install/Remove buttons, and a warning when
+the app gateway is running and the service is installed but not up — because both bind the same port.
+
+**The shim got a `serviceStatus` helper.** `__webTest.serviceStatus` arranges the state, and
+`service_status` reads it — the same pattern `gatewayStatus` uses. Four web-tests:
+- not installed → "Not installed" + Install button
+- installed, not running → "Installed, not running" + Remove button
+- running (pid 12345) → "Running (pid 12345)" + Remove button
+- app gateway running + service installed but not up → the port-conflict warning
+
+**The port-conflict warning is honest, not cautious.** With `RunAtLoad` set, installing the agent starts
+the gateway immediately, and if the app gateway is already running, both bind the same port. The warning
+tells the operator to stop the app gateway first. Nothing auto-stops it — that would be a side effect the
+operator did not ask for.
+
+**Measured:** `cargo test` lib **1216** (unchanged — no Rust changes), binary **5** (unchanged). TS
+typecheck clean. Web-tests **104 → 106** (4 new in `service-status.spec.ts`). Playwright pass: all 4 in
+~19 s. vitest **181** passed. fmt, clippy, `--no-default-features --all-targets`, check-doc-links,
+docs:book, key-leak-grep all clean.
+
+---
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3351,10 +3388,11 @@ This is a plan, not a specification. When implementation starts, each phase gets
 document in `docs/` and its own branch. This chapter is updated as decisions are made and
 assumptions are tested.
 
-**Next action:** settle §10 decision 2 — pure HTTP or hybrid HTTP+IPC — and then take Phase 6 step 3,
-the UI migration. Step 1 is landed as 26a but is deliberately inert until step 3 exists: with
-`RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only usable
-once the app stops starting its own gateway. The other decisions in §10 still stand.
+**Next action:** settle §10 decision 2 — pure HTTP or hybrid HTTP+IPC — and then take Phase 6 step 4,
+the UI migration from `invoke` to `fetch()`. Steps 1 and 3 are landed (26a and 26b); step 2 is
+half-done (the binary is bundled undeclared); step 4 is the remaining UI work. With `RunAtLoad` set,
+the agent and the app both bind the same persisted port, so the agent is only usable once the app
+stops starting its own gateway — which is what step 4 does. The other decisions in §10 still stand.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the

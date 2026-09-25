@@ -1138,6 +1138,31 @@ export async function gatewaySpendStatus(): Promise<GatewaySpendStatus> {
   return invoke<GatewaySpendStatus>("gateway_spend_status");
 }
 
+/** The login-item service: launchd's word on whether the agent is installed and up. */
+export interface ServiceStatus {
+  plistPresent: boolean;
+  loaded: boolean;
+  pid: number | null;
+}
+
+export interface ServicePaths {
+  plist: string;
+  binary: string;
+  outLog: string;
+  errLog: string;
+}
+
+export async function serviceStatus(): Promise<ServiceStatus> {
+  return invoke<ServiceStatus>("service_status");
+}
+
+export async function serviceInstall(): Promise<ServicePaths> {
+  return invoke<ServicePaths>("service_install");
+}
+
+export async function serviceUninstall(): Promise<void> {
+  return invoke("service_uninstall");
+}
 
 /**
  * One request's memory outcome, as reported by `gateway_injection_stats`.
