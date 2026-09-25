@@ -24,10 +24,10 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
-use axum::http::{header, HeaderMap, HeaderValue, Request, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use rand::Rng as _;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -681,6 +681,11 @@ pub struct GatewayCore {
     /// builds a core with `new()`, and none of them have a store. It is attached in production by
     /// `with_store`. Nothing on the request path touches it until the memory toggle is on.
     store: Option<Arc<crate::core::store::Store>>,
+    /// The egress allowlist, so admin provider CRUD can keep it in step with `providers.base_url`
+    /// (invariant 9). `Option` and `None` by default for the same reason `store` is: every existing
+    /// test builds a core with `new()` and none of them have one. See `with_allowlist` for why the
+    /// HTTP routes need it.
+    allowlist: Option<Arc<crate::core::egress::AllowList>>,
     /// Host-side kill switch for the memory/context layer. **Off by default** — see
     /// `GATEWAY_MEMORY_LAYER.md` §0: injecting memory bills tokens on every request from every
     /// client and is invisible at a layer with no review step, which is exactly why skills were kept
@@ -810,6 +815,7 @@ impl GatewayCore {
             // with a `BridgeHost` — see `with_host_settings` and `HostSettings`.
             settings: HostSettings::default(),
             store: None,
+            allowlist: None,
             memory_enabled: AtomicBool::new(false),
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
             memory_freeze: Mutex::new(HashMap::new()),
@@ -964,6 +970,25 @@ impl GatewayCore {
     #[allow(dead_code)] // Phase 2: the recall path reads through this.
     pub fn store(&self) -> Option<&Arc<crate::core::store::Store>> {
         self.store.as_ref()
+    }
+
+    /// Attach the egress allowlist so admin provider CRUD can keep it in step with
+    /// `providers.base_url`. Builder, same as `with_store`.
+    ///
+    /// Without this, a provider created over HTTP would get a row and no grant: the allowlist
+    /// derives from that column, so the adapter would dial a host `check_url` refuses and every
+    /// request to it would fail — D46, created by the CRUD path rather than by a bad manifest.
+    /// `aiproviderd` has no CRUD path of its own today (it computes the list once at boot), which
+    /// is exactly why the routes need this handle.
+    pub fn with_allowlist(mut self, allow: Arc<crate::core::egress::AllowList>) -> Self {
+        self.allowlist = Some(allow);
+        self
+    }
+
+    /// The allowlist, when one was attached.
+    #[allow(dead_code)] // wired by the admin provider routes; the binary attaches it at boot.
+    pub fn allowlist(&self) -> Option<&Arc<crate::core::egress::AllowList>> {
+        self.allowlist.as_ref()
     }
 
     /// Whether the memory/context layer may recall and inject. Off by default; see the field.
@@ -1706,6 +1731,14 @@ fn forwarded_headers(headers: &HeaderMap) -> HashMap<String, String> {
 // paths. What stays here is the part they all share: core state, the bridge protocol, auth,
 // capacity, and the shared error/response helpers.
 
+/// Admin HTTP routes for the UI (dev-book §10 §5.3 + Phase 6 step 4).
+///
+/// A child of `gateway` for the same reason `handlers` is: these routes need the request-path
+/// helpers (`check_gateway_key`, `peer_ip`) without widening them to the whole crate. Declared
+/// `pub` so the headless binary can name the surface in its own docs, but the routes themselves
+/// are registered by `spawn` below, which every caller goes through.
+#[path = "gateway_admin.rs"]
+pub mod admin;
 #[path = "gateway_anthropic.rs"]
 mod anthropic;
 #[path = "context_scope.rs"]
@@ -1838,6 +1871,57 @@ async fn ensure_retry_after(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
+/// CORS middleware for the gateway (dev-book §10, step 5).
+///
+/// The UI runs on `tauri://localhost` (production) or `http://localhost:<vite-port>` (dev),
+/// while the gateway listens on `http://127.0.0.1:<port>`. Without CORS headers the browser's
+/// same-origin policy blocks every `fetch()` the UI makes.
+///
+/// Allowed origins: `tauri://localhost`, `http://localhost*`, `http://127.0.0.1*`. External
+/// clients (curl, AI Hub) send no `Origin` header and are unaffected — CORS is a browser-only
+/// mechanism.
+///
+/// `OPTIONS` preflight is answered here (204 No Content) before any route or auth check, so an
+/// unauthenticated preflight never reaches `check_gateway_key`. This is correct: a preflight
+/// carries no credentials and must not be gated by the master key.
+async fn cors_headers(req: Request<Body>, next: Next) -> Response {
+    let origin = req.headers().get(header::ORIGIN).cloned();
+    if req.method() == Method::OPTIONS {
+        let mut resp = Response::new(Body::empty());
+        *resp.status_mut() = StatusCode::NO_CONTENT;
+        apply_cors(&mut resp, origin.as_ref());
+        return resp;
+    }
+    let mut resp = next.run(req).await;
+    apply_cors(&mut resp, origin.as_ref());
+    resp
+}
+
+/// Set CORS headers on a response, allowing the request's origin if it is local.
+fn apply_cors(resp: &mut Response, origin: Option<&HeaderValue>) {
+    let Some(origin) = origin else { return };
+    let Ok(s) = origin.to_str() else { return };
+    let allowed = s == "tauri://localhost"
+        || s.starts_with("http://localhost")
+        || s.starts_with("http://127.0.0.1");
+    if !allowed {
+        return;
+    }
+    let h = resp.headers_mut();
+    h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, origin.clone());
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_METHODS,
+        HeaderValue::from_static("GET, POST, PUT, DELETE, OPTIONS"),
+    );
+    h.insert(
+        header::ACCESS_CONTROL_ALLOW_HEADERS,
+        HeaderValue::from_static(
+            "Authorization, Content-Type, x-api-key, x-goog-api-key, AIP-Agent, AIP-Memory",
+        ),
+    );
+    h.insert(header::ACCESS_CONTROL_MAX_AGE, HeaderValue::from_static("86400"));
+}
+
 /// Liveness probe for the standalone service (`aiproviderd`) and for the UI's service
 /// discovery (dev-book §10 4.2).
 ///
@@ -1868,11 +1952,36 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/messages/count_tokens", post(count_tokens_h))
         .route("/v1/responses", post(responses_h))
         .route("/v1beta/models/{*tail}", post(gemini_h))
+        // Admin surface for the UI (dev-book §10 §5.3). The `PUT`-less set is deliberate: a
+        // settings write is a *merge*, so `POST /admin/settings` is the only one there is — see
+        // `gateway_admin`. Declared here rather than in the headless binary so the in-app gateway
+        // serves the identical surface, which is the whole point of the pure-HTTP decision: one
+        // contract, whichever process is listening on the port.
+        .route("/admin/settings", get(admin::settings_get_h).post(admin::settings_set_h))
+        .route("/admin/keys", get(admin::keys_list_h).post(admin::key_create_h))
+        .route("/admin/keys/{id}", delete(admin::key_revoke_h))
+        .route("/admin/spend", get(admin::spend_h))
+        .route("/admin/providers", get(admin::providers_list_h).post(admin::provider_upsert_h))
+        .route("/admin/providers/{id}", delete(admin::provider_delete_h))
+        .route("/admin/api-keys", get(admin::api_keys_list_h).post(admin::api_key_upsert_h))
+        .route("/admin/api-keys/{id}", delete(admin::api_key_delete_h))
+        .route(
+            "/admin/manifests",
+            get(admin::manifests_list_h).post(admin::manifest_upsert_active_h),
+        )
+        .route("/admin/manifests/{id}/activate", post(admin::manifest_activate_h))
+        .route(
+            "/admin/models-cache",
+            get(admin::models_cache_list_h).post(admin::models_cache_replace_h),
+        )
+        .route("/admin/aliases", get(admin::aliases_list_h).post(admin::aliases_replace_h))
+        .route("/admin/ledger", get(admin::ledger_recent_h))
         // Both refusals authenticate first, for the same reason `unknown_route` does: an
         // unauthenticated 404 or 405 is a statement that the route exists.
         .method_not_allowed_fallback(method_not_allowed)
         .fallback(unknown_route)
         .layer(middleware::from_fn(ensure_retry_after))
+        .layer(middleware::from_fn(cors_headers))
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {

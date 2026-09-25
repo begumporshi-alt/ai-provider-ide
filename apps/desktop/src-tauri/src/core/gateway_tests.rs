@@ -2,6 +2,7 @@
 //! rather than per dialect (declared as `gateway::tests` via #[path]).
 
 use super::*;
+use crate::core::persist;
 use futures_util::StreamExt as _;
 
 /// One outbound bridge request as the worker saw it: kind, body, headers.
@@ -3282,4 +3283,761 @@ fn the_bridge_and_the_core_answer_into_the_same_place() {
         !core.reply(7, BridgeMsg::Done),
         "a terminal reply through the bridge's handle must retire the registration the core made"
     );
+}
+
+// ── CORS (dev-book §10, step 5) ─────────────────────────────────────────────
+
+/// Build a minimal 200 response for CORS header testing.
+fn cors_response() -> Response {
+    StatusCode::OK.into_response()
+}
+
+#[test]
+fn cors_allows_tauri_localhost_origin() {
+    let mut resp = cors_response();
+    let origin = HeaderValue::from_static("tauri://localhost");
+    apply_cors(&mut resp, Some(&origin));
+    assert_eq!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&origin),
+        "tauri://localhost is the production UI origin and must be allowed"
+    );
+    assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_METHODS).is_some());
+}
+
+#[test]
+fn cors_allows_dev_server_origin() {
+    let mut resp = cors_response();
+    let origin = HeaderValue::from_static("http://localhost:1420");
+    apply_cors(&mut resp, Some(&origin));
+    assert_eq!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+        Some(&origin),
+        "http://localhost:<port> is the Vite dev-server origin and must be allowed"
+    );
+}
+
+#[test]
+fn cors_allows_127_0_0_1_origin() {
+    let mut resp = cors_response();
+    let origin = HeaderValue::from_static("http://127.0.0.1:1420");
+    apply_cors(&mut resp, Some(&origin));
+    assert!(resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_some());
+}
+
+#[test]
+fn cors_rejects_non_local_origin() {
+    let mut resp = cors_response();
+    let origin = HeaderValue::from_static("https://evil.example.com");
+    apply_cors(&mut resp, Some(&origin));
+    assert!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "a non-local origin must not get CORS headers"
+    );
+}
+
+#[test]
+fn cors_adds_nothing_without_an_origin() {
+    let mut resp = cors_response();
+    apply_cors(&mut resp, None);
+    assert!(
+        resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+        "external clients (curl, AI Hub) send no Origin header and must be unaffected"
+    );
+}
+
+// ── Admin routes (dev-book §10 §5.3) ───────────────────────────────────────
+
+/// Counter for admin-store temp dirs. A `AtomicUsize`, not `pid + timestamp`: two parallel
+/// tests that land in the same millisecond would otherwise open the same SQLite file and one
+/// would fail with `DatabaseBusy`.
+static ADMIN_STORE_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// A real store on a temp dir for the admin routes. **Not** app-gated, unlike
+/// `gateway_test_store`: the admin surface lives in `core/` and is served by the headless binary
+/// too, so these tests must run under `--no-default-features` as well.
+fn admin_test_store() -> Arc<crate::core::store::Store> {
+    let n = ADMIN_STORE_N.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!("aip-admin-{n}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    Arc::new(crate::core::store::Store::open(&dir).unwrap())
+}
+
+/// A server whose core carries a store — the state the admin routes need.
+async fn start_with_store() -> TestServer {
+    let store = admin_test_store();
+    let bridge = Arc::new(SynthBridge::new());
+    let core = Arc::new(
+        GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".to_string())))
+            .with_store(store),
+    );
+    core.set_running(true);
+    let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+    TestServer {
+        client: reqwest::Client::new(),
+        base: format!("http://{}", handle.addr),
+        core,
+        bridge,
+        _handle: handle,
+    }
+}
+
+/// A server whose core carries a store **and** the egress allowlist — the state provider CRUD
+/// needs. Returns the list so a test can assert on the grant, not just on the row.
+async fn start_with_store_and_allowlist() -> (TestServer, Arc<crate::core::egress::AllowList>) {
+    let store = admin_test_store();
+    let allow = Arc::new(crate::core::egress::AllowList::default());
+    let bridge = Arc::new(SynthBridge::new());
+    let core = Arc::new(
+        GatewayCore::new(bridge.clone(), Arc::new(|| Some("sk-aip-test".to_string())))
+            .with_store(store)
+            .with_allowlist(allow.clone()),
+    );
+    core.set_running(true);
+    let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+    (
+        TestServer {
+            client: reqwest::Client::new(),
+            base: format!("http://{}", handle.addr),
+            core,
+            bridge,
+            _handle: handle,
+        },
+        allow,
+    )
+}
+
+fn provider_json(id: &str, host: &str) -> Value {
+    json!({
+        "id": id,
+        "slug": "stub",
+        "name": "Stub",
+        "baseUrl": host,
+        "status": "enabled",
+        "rotationStrategy": "priority",
+        "createdAt": 1,
+        "updatedAt": 1,
+    })
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_providers_lists_an_empty_array_on_a_fresh_store() {
+    let (s, _allow) = start_with_store_and_allowlist().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+/// **The one that matters for D46.** The allowlist derives from `providers.base_url`, so a
+/// provider written over HTTP without updating it gets a row the gateway will refuse to dial —
+/// the divergence this route exists to prevent, created by the CRUD path itself.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_provider_upsert_grants_its_host_on_the_allowlist() {
+    let (s, allow) = start_with_store_and_allowlist().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://provider.example/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    assert!(
+        allow.contains("provider.example"),
+        "the host must be granted, or every request to this provider is refused"
+    );
+
+    // And the row is readable back through the same surface.
+    let res = s
+        .client
+        .get(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "the row must persist: {rows}");
+}
+
+/// A stale grant must not survive the row it came from (invariant 9).
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_provider_delete_withdraws_the_grant() {
+    let (s, allow) = start_with_store_and_allowlist().await;
+    s.client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://provider.example/v1"))
+        .send()
+        .await
+        .unwrap();
+    assert!(allow.contains("provider.example"), "precondition: the grant exists");
+
+    let res = s
+        .client
+        .delete(format!("{}/admin/providers/p1", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert!(
+        !allow.contains("provider.example"),
+        "the grant must go with the row, or a deleted provider can still be dialled"
+    );
+}
+
+/// Every admin route authenticates, and an unauthenticated answer is a statement that the route
+/// exists — the reason the 404 and 405 refusals authenticate too.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_routes_refuse_without_the_master_key() {
+    for (method, path, body) in [
+        ("GET", "/admin/settings", json!(null)),
+        ("POST", "/admin/settings", json!({})),
+        ("GET", "/admin/keys", json!(null)),
+        ("POST", "/admin/keys", json!({ "label": "x" })),
+        ("DELETE", "/admin/keys/ak-1", json!(null)),
+        ("GET", "/admin/spend", json!(null)),
+        ("GET", "/admin/providers", json!(null)),
+        ("POST", "/admin/providers", provider_json("p1", "https://x.test/v1")),
+        ("DELETE", "/admin/providers/p1", json!(null)),
+        ("GET", "/admin/api-keys", json!(null)),
+        ("POST", "/admin/api-keys", json!(null)), // 422 is fine — auth ran first
+        ("DELETE", "/admin/api-keys/k1", json!(null)),
+        ("GET", "/admin/manifests", json!(null)),
+        ("POST", "/admin/manifests", json!(null)), // 422 is fine — auth ran first
+        ("POST", "/admin/manifests/p1/activate", json!(null)), // 422 is fine
+        ("GET", "/admin/models-cache", json!(null)),
+        ("POST", "/admin/models-cache", json!(null)), // 422 is fine
+        ("GET", "/admin/aliases", json!(null)),
+        ("POST", "/admin/aliases", json!(null)), // 422 is fine
+        ("GET", "/admin/ledger", json!(null)),
+    ] {
+        let s = start_with_store().await;
+        let res = match method {
+            "GET" => s.client.get(format!("{}{}", s.base, path)).send().await.unwrap(),
+            "POST" => {
+                s.client.post(format!("{}{}", s.base, path)).json(&body).send().await.unwrap()
+            }
+            _ => s.client.delete(format!("{}{}", s.base, path)).send().await.unwrap(),
+        };
+        let status = res.status();
+        assert!(
+            status == 401 || status == 422,
+            "{method} {path} must refuse unauthenticated (401) or malformed (422) before success, got {status}"
+        );
+    }
+}
+
+/// The backoff itself, pinned because it is what made an earlier draft of the loop above fail:
+/// six unauthenticated requests against one core do not produce six 401s. Anyone writing an
+/// auth test over multiple routes has to know this.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_auth_failures_back_off_rather_than_repeating_401() {
+    let s = start_with_store().await;
+    let url = format!("{}/admin/spend", s.base);
+    let first = s.client.get(&url).send().await.unwrap();
+    assert_eq!(first.status(), 401, "the first unauthenticated request is a plain 401");
+    let second = s.client.get(&url).send().await.unwrap();
+    assert_eq!(second.status(), 429, "and the next one is backed off, not another 401");
+}
+
+/// A core with no store attached says so, rather than answering an empty list that reads as
+/// "nothing is configured".
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_routes_answer_503_when_the_core_has_no_store() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await; // no `.with_store`, unlike `start_with_store`
+    let res = s
+        .client
+        .get(format!("{}/admin/spend", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 503);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").contains("without a store"),
+        "the refusal must name its cause, got {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_settings_reads_back_an_empty_object_when_there_is_no_row() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/settings", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!({}));
+}
+
+/// The merge, and it is the reason the write is a `PATCH`-shaped POST rather than a PUT: the row
+/// is one object shared by the listener and the tool switches, and a writer that serialises only
+/// the keys it knows erases the rest.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_settings_write_merges_rather_than_replacing() {
+    let s = start_with_store().await;
+    let auth = |r: reqwest::RequestBuilder| r.header("authorization", "Bearer sk-aip-test");
+
+    // Fill the row with two unrelated concerns.
+    let res = auth(s.client.post(format!("{}/admin/settings", s.base)))
+        .json(&json!({ "port": 8800, "toolsEnabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // A patch that knows only about the tool switch must not lose the port.
+    let res = auth(s.client.post(format!("{}/admin/settings", s.base)))
+        .json(&json!({ "mutationEnabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let merged: Value = res.json().await.unwrap();
+    assert_eq!(
+        merged,
+        json!({ "port": 8800, "toolsEnabled": true, "mutationEnabled": false }),
+        "an unmentioned key must survive a patch"
+    );
+
+    // And the row itself, not just the response — a merge that wrote the patch alone would still
+    // have answered correctly.
+    let res = auth(s.client.get(format!("{}/admin/settings", s.base))).send().await.unwrap();
+    assert_eq!(res.json::<Value>().await.unwrap(), merged);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_settings_write_refuses_a_non_object() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/settings", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!([1, 2, 3]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_keys_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+/// Validation runs before the keychain, so this is reachable without one. The happy path is not
+/// tested here: `vault::put` writes to the real OS keychain, which a CI runner has no access to.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_key_create_refuses_a_missing_label() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"].as_str().unwrap_or("").contains("label"),
+        "the refusal must name the missing field, got {body}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_spend_reports_month_cap_and_capped() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/spend", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    // camelCase is the contract `store.ts` reads; a rename here would render `undefined`.
+    assert_eq!(body, json!({ "monthMicros": 0, "capMicros": 0, "capped": false }));
+}
+
+// ── api-keys ───────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_keys_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/api-keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_api_key_upsert_and_delete_round_trip() {
+    let s = start_with_store().await;
+    // api_keys has a foreign key to providers
+    s.client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://x.test/v1"))
+        .send()
+        .await
+        .unwrap();
+    let key = json!({
+        "id": "k1",
+        "providerId": "p1",
+        "label": "test",
+        "secretRef": "ref",
+        "status": "active",
+        "priority": 1,
+        "addedAt": 1,
+    });
+
+    // upsert
+    let res = s
+        .client
+        .post(format!("{}/admin/api-keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // read back
+    let res = s
+        .client
+        .get(format!("{}/admin/api-keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "the row must persist: {rows}");
+
+    // delete
+    let res = s
+        .client
+        .delete(format!("{}/admin/api-keys/k1", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // empty again
+    let res = s
+        .client
+        .get(format!("{}/admin/api-keys", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+// ── manifests ──────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_manifests_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/manifests", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_manifest_upsert_active_and_activate_round_trip() {
+    let s = start_with_store().await;
+    // seed a provider row (manifests reference it)
+    s.client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://x.test/v1"))
+        .send()
+        .await
+        .unwrap();
+
+    let manifest = json!({
+        "id": "m1",
+        "providerId": "p1",
+        "version": 1,
+        "origin": "builtin-template",
+        "bodyJson": "{}",
+        "createdAt": 1,
+        "isActive": true,
+    });
+
+    // upsert active
+    let res = s
+        .client
+        .post(format!("{}/admin/manifests", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // read back
+    let res = s
+        .client
+        .get(format!("{}/admin/manifests", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "the manifest must persist: {rows}");
+
+    // stage v2 directly in SQL
+    {
+        let conn = s.core.store().unwrap().conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO manifests (id, provider_id, version, origin, body_json, created_at, is_active) VALUES (?1,?2,?3,?4,?5,?6,0)",
+            rusqlite::params!["m2", "p1", 2i64, "ai-patched", "{}", 2i64],
+        ).unwrap();
+    }
+
+    // activate v2
+    let res = s
+        .client
+        .post(format!("{}/admin/manifests/p1/activate", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "version": 2 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["previousVersion"], 1, "activation must return the previous version: {body}");
+}
+
+// ── models cache ───────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_models_cache_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/models-cache", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_models_cache_replace_and_read_round_trip() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://x.test/v1"))
+        .send()
+        .await
+        .unwrap();
+    let body = json!({
+        "providerId": "p1",
+        "rows": [{
+            "providerId": "p1",
+            "nativeId": "gpt-4o",
+            "modality": "text",
+            "fetchedAt": 1,
+        }],
+    });
+
+    let res = s
+        .client
+        .post(format!("{}/admin/models-cache", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/models-cache", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(1), "the row must persist: {rows}");
+}
+
+// ── aliases ────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_aliases_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/aliases", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_aliases_replace_and_read_round_trip() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&provider_json("p1", "https://x.test/v1"))
+        .send()
+        .await
+        .unwrap();
+    let rows = json!([{
+        "alias": "fast",
+        "providerId": "p1",
+        "nativeModelId": "gpt-4o",
+        "priority": 1,
+    }]);
+
+    let res = s
+        .client
+        .post(format!("{}/admin/aliases", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&rows)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/aliases", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body.as_array().map(|a| a.len()), Some(1), "the alias must persist: {body}");
+}
+
+// ── ledger ─────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_ledger_lists_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/ledger", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_ledger_read_honours_limit() {
+    let s = start_with_store().await;
+    // insert three rows directly
+    {
+        let conn = s.core.store().unwrap().conn.lock().unwrap();
+        for i in 1..=3 {
+            persist::ledger_insert(
+                &conn,
+                &persist::LedgerRow {
+                    ts: i,
+                    modality: "text".into(),
+                    source: "gateway".into(),
+                    provider_id: None,
+                    key_id: None,
+                    app_key_id: None,
+                    requested_model: None,
+                    model: "gpt-4o".into(),
+                    status: "ok".into(),
+                    http_status: None,
+                    error_class: None,
+                    latency_ms: None,
+                    tokens_in: 1,
+                    tokens_out: 1,
+                    cost_estimate_micros: 1,
+                    cached_tokens: None,
+                    fallback_chain_json: None,
+                },
+            )
+            .unwrap();
+        }
+    }
+
+    let res = s
+        .client
+        .get(format!("{}/admin/ledger?limit=2", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(2), "limit=2 must return two rows: {rows}");
+}
+
+#[test]
+fn cors_headers_include_the_gateway_auth_headers() {
+    let mut resp = cors_response();
+    let origin = HeaderValue::from_static("tauri://localhost");
+    apply_cors(&mut resp, Some(&origin));
+    let allowed = resp
+        .headers()
+        .get(header::ACCESS_CONTROL_ALLOW_HEADERS)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    for needed in ["Authorization", "x-api-key", "x-goog-api-key", "AIP-Agent", "AIP-Memory"] {
+        assert!(
+            allowed.contains(needed),
+            "CORS must allow the `{needed}` header — the UI sends it to authenticate"
+        );
+    }
 }

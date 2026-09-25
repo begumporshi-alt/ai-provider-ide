@@ -959,3 +959,30 @@ afterwards; 35/35 liveness samples and 6/6 chats over 3 idle minutes with zero w
 **Revisit if:** another client needs the same treatment (the module is one file and the merge is
 pure — the port-specific part is only `models_path` and the entry shape), or if a client starts
 validating the configured id against `/v1/models`, which advertises qualified ids only.
+
+## 2026-09-25 — §10 decision 2: pure HTTP (not hybrid HTTP+IPC)
+
+- **Decision:** the Tauri UI becomes a **pure HTTP client** of the gateway. Every data-access
+  operation goes through `fetch()`. No custom `invoke` commands for data access remain. The Tauri
+  app shell retains only platform APIs (window, tray, dialogs, notifications, keychain).
+- **Options rejected:** hybrid HTTP+IPC — keep IPC for hot paths (settings read), HTTP for gateway
+  operations.
+- **Rationale (six reasons):**
+  1. Two contracts is this project's documented failure mode ("A switch in two places drifts" —
+     MEMORY.md). Hybrid creates exactly this.
+  2. The latency is imperceptible (~1-2ms HTTP vs ~0.1ms IPC — §5.2).
+  3. The gateway already serves external clients over HTTP (curl, AI Hub, WorkBuddy). The UI going
+     through HTTP makes it "just another client."
+  4. §6.1 says the service owns the database. If the UI keeps writing via IPC, it races. Pure HTTP
+     makes the service the sole writer.
+  5. The transition is seamless — the UI code is identical whether the backend is the in-process
+     gateway or the headless service.
+  6. CORS is the only new cost, and it's one middleware.
+- **Authentication:** the UI becomes an authenticated client, sending the master key with each
+  request (per §5.3). The key is retrieved from the keychain at startup via the Tauri vault API
+  and held in UI memory for the session.
+- **Migration scope:** gateway request routes (already HTTP), §5.3 admin routes (settings, keys,
+  spend), and ~15 new admin route groups for CRUD operations. `gateway_enable/disable` and
+  `gateway_worker_error` are deleted.
+- **Revisit if:** a real performance bottleneck appears that HTTP cannot serve — unlikely on
+  localhost.

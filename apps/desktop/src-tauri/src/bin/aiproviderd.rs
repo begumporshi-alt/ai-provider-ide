@@ -147,7 +147,7 @@ async fn main() {
     // handle sees what `recompute_allow` writes below and can be handed to activation as the same
     // list the request path will consult. A second `AllowList` here would be the defect D46 is.
     let egress_state = Arc::new(EgressState::new(allow.clone(), store.clone()));
-    persist::recompute_allow(&egress_state, &store);
+    persist::recompute_allow(&egress_state.allow, &store);
     let egress_port = Arc::new(EgressPort::new(egress_state));
     let runtime = AdapterRuntime::new(egress_port);
 
@@ -202,6 +202,9 @@ async fn main() {
     // and spend providers are all store-backed and Tauri-free already.
     let core = gateway::GatewayCore::new(bridge, gateway::vault_key_provider())
         .with_store(store.clone())
+        // The allowlist, so admin provider CRUD can keep it in step with `providers.base_url`.
+        // Without this a provider created over HTTP gets a row and no grant — D46 by the CRUD path.
+        .with_allowlist(allow.clone())
         .with_app_keys(gateway::vault_app_key_provider(store.clone()))
         .with_spend(gateway::vault_spend_provider(store));
 
@@ -512,7 +515,7 @@ mod tests {
             store.clone(),
             Arc::new(|_: &str| Ok(Some("sk-stub".to_string()))),
         ));
-        persist::recompute_allow(&egress_state, &store);
+        persist::recompute_allow(&egress_state.allow, &store);
 
         let runtime =
             Arc::new(AdapterRuntime::new(Arc::new(EgressPort::new(egress_state.clone()))));

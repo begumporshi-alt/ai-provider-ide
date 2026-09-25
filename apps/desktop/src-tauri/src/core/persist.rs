@@ -92,6 +92,23 @@ pub fn providers_list(store: State<'_, Arc<Store>>) -> Result<Vec<ProviderRow>, 
     providers_rows(&store)
 }
 
+/// The provider row write, split out of the command so the admin HTTP route runs the same
+/// statement.
+///
+/// **Not app-gated.** The headless service serves `POST /admin/providers`, and a
+/// `#[cfg(feature = "app")]` function does not exist in its build. The command keeps the gating
+/// because it takes Tauri `State`; the statement does not need to.
+pub fn provider_upsert_row(store: &Store, p: &ProviderRow) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO providers (id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+         ON CONFLICT(id) DO UPDATE SET slug=?2, name=?3, type=?4, base_url=?5, status=?6, rotation_strategy=?7, updated_at=?9",
+        params![p.id, p.slug, p.name, p.r#type, p.base_url, p.status, p.rotation_strategy, p.created_at, p.updated_at],
+    )?;
+    Ok(())
+}
+
 #[cfg(feature = "app")]
 #[tauri::command]
 pub fn provider_upsert(
@@ -99,17 +116,26 @@ pub fn provider_upsert(
     egress: State<'_, Arc<crate::core::egress::EgressState>>,
     p: ProviderRow,
 ) -> Result<(), CommandError> {
-    {
-        let conn = store.conn.lock().unwrap();
-        conn.execute(
-            "INSERT INTO providers (id, slug, name, type, base_url, status, rotation_strategy, created_at, updated_at)
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
-             ON CONFLICT(id) DO UPDATE SET slug=?2, name=?3, type=?4, base_url=?5, status=?6, rotation_strategy=?7, updated_at=?9",
-            params![p.id, p.slug, p.name, p.r#type, p.base_url, p.status, p.rotation_strategy, p.created_at, p.updated_at],
-        )?;
-    }
-    sync_allow_for_provider(&egress, &store, &p.id);
+    provider_upsert_row(&store, &p)?;
+    sync_allow_for_provider(&egress.allow, &store, &p.id);
     Ok(())
+}
+
+/// Delete the provider row and return the keychain accounts its keys used.
+///
+/// The secrets are **returned, not deleted**: §7 hygiene says they go with the rows, but doing it
+/// here would make the caller unable to distinguish "no keys" from "cleanup failed", and the HTTP
+/// route needs the same behaviour. Not app-gated, for the same reason as `provider_upsert_row`.
+pub fn provider_delete_row(store: &Store, id: &str) -> Result<Vec<String>, CommandError> {
+    let secret_refs: Vec<String> = {
+        let conn = store.conn.lock().unwrap();
+        let mut stmt = conn.prepare("SELECT secret_ref FROM api_keys WHERE provider_id = ?1")?;
+        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
+        rows.flatten().collect()
+    };
+    let conn = store.conn.lock().unwrap();
+    conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?; // cascades (§7)
+    Ok(secret_refs)
 }
 
 #[cfg(feature = "app")]
@@ -119,29 +145,23 @@ pub fn provider_delete(
     egress: State<'_, Arc<crate::core::egress::EgressState>>,
     id: String,
 ) -> Result<(), CommandError> {
-    // §7 hygiene: the SQL cascade removes key ROWS; the keychain entries must go too,
-    // in the same operation.
-    let secret_refs: Vec<String> = {
-        let conn = store.conn.lock().unwrap();
-        let mut stmt = conn.prepare("SELECT secret_ref FROM api_keys WHERE provider_id = ?1")?;
-        let rows = stmt.query_map(params![id], |r| r.get::<_, String>(0))?;
-        rows.flatten().collect()
-    };
-    {
-        let conn = store.conn.lock().unwrap();
-        conn.execute("DELETE FROM providers WHERE id = ?1", params![id])?; // cascades (§7)
-    }
-    for account in secret_refs {
+    for account in provider_delete_row(&store, &id)? {
         let _ = crate::core::vault::delete(&account);
     }
-    recompute_allow(&egress, &store);
+    recompute_allow(&egress.allow, &store);
     Ok(())
 }
 
 /// Recompute the allowlist entry for one provider (host allowed only while its status is
 /// pending/enabled/repairing).
+///
+/// **Takes `&AllowList`, not `&EgressState`.** The only thing either function touches is
+/// `egress.allow`, and the admin HTTP routes (dev-book §10 step 4) need to keep the allowlist in
+/// step with provider CRUD from a core that holds the list but not the whole egress state. A
+/// signature that demanded an `EgressState` would have made a provider added over HTTP
+/// unreachable — a row with no grant — which is D46's divergence created by the CRUD path itself.
 pub fn sync_allow_for_provider(
-    egress: &crate::core::egress::EgressState,
+    allow: &crate::core::egress::AllowList,
     store: &Store,
     provider_id: &str,
 ) {
@@ -159,11 +179,11 @@ pub fn sync_allow_for_provider(
             reqwest::Url::parse(&base_url).ok().and_then(|u| u.host_str().map(str::to_lowercase))
         {
             if matches!(status.as_str(), "pending" | "enabled" | "repairing") {
-                egress.allow.allow(&host);
+                allow.allow(&host);
             } else {
                 // disabled/draft: stop permitting egress to it once other live providers
                 // don't share the host.
-                recompute_allow(egress, store);
+                recompute_allow(allow, store);
             }
         }
     }
@@ -171,7 +191,7 @@ pub fn sync_allow_for_provider(
 
 /// Full allowlist recompute from current provider rows (authoritative; called after deletes
 /// and status changes so no stale grant survives — invariant 9).
-pub fn recompute_allow(egress: &crate::core::egress::EgressState, store: &Store) {
+pub fn recompute_allow(allow: &crate::core::egress::AllowList, store: &Store) {
     let desired: std::collections::HashSet<String> = {
         let conn = store.conn.lock().unwrap();
         let hosts: Vec<String> = conn
@@ -191,7 +211,7 @@ pub fn recompute_allow(egress: &crate::core::egress::EgressState, store: &Store)
             })
             .collect()
     }; // conn dropped here before touching the allowlist lock (no deadlock, no borrow)
-    let mut cur = egress.allow.0.write().unwrap();
+    let mut cur = allow.0.write().unwrap();
     *cur = desired;
 }
 
@@ -260,9 +280,7 @@ pub fn api_keys_list(
     api_keys_rows(&store, provider_id.as_deref())
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn api_key_upsert(store: State<'_, Arc<Store>>, k: ApiKeyRow) -> Result<(), CommandError> {
+pub fn api_key_upsert_row(store: &Store, k: &ApiKeyRow) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
         "INSERT INTO api_keys (id, provider_id, label, secret_ref, secret_hint, status, priority, cooldown_until, added_at, last_used_at, last_tested_at)
@@ -275,15 +293,27 @@ pub fn api_key_upsert(store: State<'_, Arc<Store>>, k: ApiKeyRow) -> Result<(), 
 
 #[cfg(feature = "app")]
 #[tauri::command]
-pub fn api_key_delete(store: State<'_, Arc<Store>>, id: String) -> Result<(), CommandError> {
-    // Deleting a key removes its keychain entry in the same operation (§7 hygiene).
+pub fn api_key_upsert(store: State<'_, Arc<Store>>, k: ApiKeyRow) -> Result<(), CommandError> {
+    api_key_upsert_row(&store, &k)
+}
+
+/// Delete the api key row and return the secret_ref for §7 hygiene.
+///
+/// The secret is **returned, not deleted**: the HTTP route needs the same behaviour.
+/// Not app-gated, for the same reason as `provider_upsert_row`.
+pub fn api_key_delete_row(store: &Store, id: &str) -> Result<Option<String>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let secret_ref: Option<String> = conn
         .query_row("SELECT secret_ref FROM api_keys WHERE id = ?1", params![id], |r| r.get(0))
         .ok();
     conn.execute("DELETE FROM api_keys WHERE id = ?1", params![id])?;
-    drop(conn);
-    if let Some(account) = secret_ref {
+    Ok(secret_ref)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn api_key_delete(store: State<'_, Arc<Store>>, id: String) -> Result<(), CommandError> {
+    if let Some(account) = api_key_delete_row(&store, &id)? {
         let _ = crate::core::vault::delete(&account);
     }
     Ok(())
@@ -342,12 +372,7 @@ pub fn manifests_active(store: State<'_, Arc<Store>>) -> Result<Vec<ManifestRow>
     manifests_active_rows(&store)
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn manifest_upsert_active(
-    store: State<'_, Arc<Store>>,
-    m: ManifestRow,
-) -> Result<(), CommandError> {
+pub fn manifest_upsert_active_row(store: &Store, m: &ManifestRow) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
     // One transaction: deactivation + activation must be atomic, or a mid-way failure
     // could leave zero active manifests despite uq_manifests_one_active.
@@ -364,6 +389,15 @@ pub fn manifest_upsert_active(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn manifest_upsert_active(
+    store: State<'_, Arc<Store>>,
+    m: ManifestRow,
+) -> Result<(), CommandError> {
+    manifest_upsert_active_row(&store, &m)
 }
 
 // ---------- model catalog + aliases ----------
@@ -390,6 +424,15 @@ pub struct ModelRow {
     pub capabilities_json: Option<String>,
 }
 
+pub fn models_cache_replace_rows(
+    store: &Store,
+    provider_id: &str,
+    rows: &[ModelRow],
+) -> Result<(), CommandError> {
+    let mut conn = store.conn.lock().unwrap();
+    replace_models(&mut conn, provider_id, rows).map_err(Into::into)
+}
+
 #[cfg(feature = "app")]
 #[tauri::command]
 pub fn models_cache_replace(
@@ -397,8 +440,7 @@ pub fn models_cache_replace(
     provider_id: String,
     rows: Vec<ModelRow>,
 ) -> Result<(), CommandError> {
-    let mut conn = store.conn.lock().unwrap();
-    replace_models(&mut conn, &provider_id, &rows).map_err(Into::into)
+    models_cache_replace_rows(&store, &provider_id, &rows)
 }
 
 /// Every cached model row. See the section note above.
@@ -420,7 +462,6 @@ pub fn models_cache_list(store: State<'_, Arc<Store>>) -> Result<Vec<ModelRow>, 
 /// `pricing_json` rides along because the catalog is re-fetched only once per 24h: a launch
 /// that hydrates from this table and finds no price will price every request as unknown,
 /// which zeroes cost and leaves the monthly spend cap unable to fire.
-#[cfg(feature = "app")]
 fn replace_models(
     conn: &mut rusqlite::Connection,
     provider_id: &str,
@@ -464,12 +505,7 @@ pub struct AliasRow {
     pub priority: i64,
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn aliases_replace(
-    store: State<'_, Arc<Store>>,
-    rows: Vec<AliasRow>,
-) -> Result<(), CommandError> {
+pub fn aliases_replace_rows(store: &Store, rows: &[AliasRow]) -> Result<(), CommandError> {
     let mut conn = store.conn.lock().unwrap();
     // Transaction: a half-applied replace would wipe the failover map (§4).
     let tx = conn.transaction()?;
@@ -482,6 +518,15 @@ pub fn aliases_replace(
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn aliases_replace(
+    store: State<'_, Arc<Store>>,
+    rows: Vec<AliasRow>,
+) -> Result<(), CommandError> {
+    aliases_replace_rows(&store, &rows)
 }
 
 /// Every model alias. See the section note above.
@@ -586,7 +631,6 @@ pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), C
 
 /// The ledger's read statement. It lives next to the mapper below and is used by the command *and*
 /// by the round-trip test, so the test drives the real statement rather than a copy that can drift.
-#[cfg(feature = "app")]
 const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
          FROM ledger ORDER BY ts DESC LIMIT ?1";
 
@@ -595,7 +639,6 @@ const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, a
 /// Split out of the command so the mapping can be tested. `r.get(5)` is a *position*, not a name:
 /// adding `app_key_id` to the SELECT without shifting every index after it would have returned the
 /// requested model in the app-key field, and the compiler would have been perfectly happy about it.
-#[cfg(feature = "app")]
 fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
     Ok(LedgerRow {
         ts: r.get(0)?,
@@ -618,10 +661,8 @@ fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
     })
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn ledger_recent(
-    store: State<'_, Arc<Store>>,
+pub fn ledger_recent_rows(
+    store: &Store,
     limit: Option<i64>,
 ) -> Result<Vec<LedgerRow>, CommandError> {
     let limit = limit.unwrap_or(100).clamp(1, 1000);
@@ -629,6 +670,15 @@ pub fn ledger_recent(
     let mut stmt = conn.prepare(LEDGER_SELECT)?;
     let rows = stmt.query_map(params![limit], ledger_row_from)?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn ledger_recent(
+    store: State<'_, Arc<Store>>,
+    limit: Option<i64>,
+) -> Result<Vec<LedgerRow>, CommandError> {
+    ledger_recent_rows(&store, limit)
 }
 
 /// Nightly/on-start rollup job (§4): aggregate complete months into ledger_rollups
@@ -966,11 +1016,9 @@ pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i6
 }
 
 /// Activate a staged manifest; returns the previously-active version for one-click rollback.
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn manifest_activate(
-    store: State<'_, Arc<Store>>,
-    provider_id: String,
+pub fn manifest_activate_row(
+    store: &Store,
+    provider_id: &str,
     version: i64,
 ) -> Result<Option<i64>, CommandError> {
     let mut conn = store.conn.lock().unwrap();
@@ -994,6 +1042,16 @@ pub fn manifest_activate(
     }
     tx.commit()?;
     Ok(previous)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn manifest_activate(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+    version: i64,
+) -> Result<Option<i64>, CommandError> {
+    manifest_activate_row(&store, &provider_id, version)
 }
 
 // ---------- audit R4: per-app gateway keys + monthly spend cap ----------

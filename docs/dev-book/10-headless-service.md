@@ -641,19 +641,41 @@ This means:
 
 The UI needs some operations that today go through `invoke`:
 
-| Today (`invoke`) | Headless (HTTP) |
-|---|---|
-| `gateway_settings_get` | `GET /admin/settings` |
-| `gateway_settings_set` | `POST /admin/settings` |
-| `gateway_app_keys` | `GET /admin/keys` |
-| `gateway_app_key_create` | `POST /admin/keys` |
-| `gateway_app_key_revoke` | `DELETE /admin/keys/:id` |
-| `gateway_spend_status` | `GET /admin/spend` |
-| `gateway_enable` / `gateway_disable` | **Deleted** — service is always on |
-| `gateway_worker_error` | **Deleted** — no worker window |
+| Today (`invoke`) | Headless (HTTP) | State |
+|---|---|---|
+| `gateway_settings_get` | `GET /admin/settings` | **Landed 2026-09-25** |
+| `gateway_settings_set` | `POST /admin/settings` | **Landed 2026-09-25** — **a merge, not a replace** |
+| `gateway_app_keys` | `GET /admin/keys` | **Landed 2026-09-25** |
+| `gateway_app_key_create` | `POST /admin/keys` | **Landed 2026-09-25** — returns the secret once |
+| `gateway_app_key_revoke` | `DELETE /admin/keys/:id` | **Landed 2026-09-25** |
+| `gateway_spend_status` | `GET /admin/spend` | **Landed 2026-09-25** |
+| `gateway_enable` / `gateway_disable` | **Deleted** — service is always on | — |
+| `gateway_worker_error` | **Deleted** — no worker window | — |
 
 These routes are authenticated with the same master-key mechanism as the external surface. The UI
 holds the master key in memory (it already does, for the one-shot reveal).
+
+**Landed 2026-09-25 as increment 26d**, in `core/gateway_admin.rs` — a `#[path]` submodule of
+`gateway.rs`, registered by `spawn`, so the in-app gateway and `aiproviderd` serve the identical
+surface. Three design points that differ from a literal port of the commands:
+
+1. **The settings write merges.** The IPC path merged in TypeScript (`patchGatewaySettings`)
+   because `settings_set` is a whole-row UPSERT and a writer that serialises only the keys it
+   knows erases the rest. The merge moved server-side, which makes it atomic instead of a
+   read-modify-write across the network. `POST /admin/settings` therefore takes a **patch**, and
+   answers with the merged object.
+2. **`POST /admin/keys` returns the secret once.** The IPC command copied it to the clipboard and
+   returned metadata only. A headless process has no clipboard, so the secret is returned in the
+   response and the UI copies it — one behaviour for both cases, and the clipboard stays a UI
+   concern.
+3. **A core with no store answers 503, naming the route.** `GatewayCore::store()` is `None` for
+   every core built without `with_store`, which is most of the test suite. Refusing loudly beats
+   answering an empty list that reads as "nothing is configured".
+
+**Not tested: the happy path of `POST /admin/keys`.** `vault::put` writes to the real OS keychain,
+which a CI runner has no access to, so only the validation path (a missing `label` → 400) is
+pinned. The rest of the surface has 9 tests covering auth, the 503, the settings merge, the empty
+list and the spend shape. reveal).
 
 ---
 
@@ -2280,10 +2302,12 @@ two scope-wrong claims in two consecutive increments.
 3. ~~Add the UI control for the service.~~ **Landed 2026-09-25 as increment 26b** — a "Login-item
    service" card on Control → Gateway with status, Install/Remove, and a port-conflict warning.
    See the 26b note in §11.
-4. Change the UI from `invoke` to `fetch()` for gateway operations. **Not started.** This is the
-   remaining Phase 6 work, and it needs §10 decision 2 settled first (pure HTTP vs hybrid).
-5. Add CORS headers to the gateway for `tauri://localhost`. **Not started.** A prerequisite for
-   step 4, but on its own it changes nothing a user can see.
+4. Change the UI from `invoke` to `fetch()` for gateway operations. **In progress (2026-09-25).**
+   §10 decision 2 is settled: **pure HTTP**. The migration covers gateway request routes (already
+   HTTP), the §5.3 admin routes, and ~15 new admin route groups for CRUD operations. See the
+   decision entry in §10.
+5. Add CORS headers to the gateway for `tauri://localhost`. **In progress (2026-09-25).** A
+   prerequisite for step 4, now unblocked by the pure-HTTP decision.
 6. Update `09-status.md` and the drift register. **Done for 26a–26b.**
 
 ---
@@ -2358,10 +2382,59 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
    the host, so either the whole adapter runtime runs under a supervisor or that one limit does.
 
 2. **Do we keep the Tauri app as a pure HTTP client, or keep a subset of IPC for performance?**
-   - Pure HTTP: simpler, consistent, no special cases.
-   - Hybrid HTTP+IPC: keep IPC for hot paths (settings read), HTTP for gateway operations.
-   - *Recommendation:* pure HTTP. The latency difference is not perceptible, and hybrid creates two
-   contracts to maintain.
+   — **RESOLVED 2026-09-25: pure HTTP.**
+   - ~~Pure HTTP: simpler, consistent, no special cases.~~
+   - ~~Hybrid HTTP+IPC: keep IPC for hot paths (settings read), HTTP for gateway operations.~~
+   - ~~*Recommendation:* pure HTTP. The latency difference is not perceptible, and hybrid creates two
+   contracts to maintain.~~
+   - **Decision: pure HTTP.** Six reasons, each grounded in this project's own documented hazards:
+     1. **Two contracts is this project's documented failure mode.** MEMORY.md: "A switch in two
+        places drifts." Hybrid creates exactly this — every operation has two transports, and this
+        project has been bitten by the pattern repeatedly (Control switch drift, `settings_set`
+        UPSERT vs `patchGatewaySettings` merge, the four `COOLDOWN_FLOOR_MS` literals across two
+        languages).
+     2. **The latency is imperceptible.** ~1-2ms HTTP vs ~0.1ms IPC — "Measurable but not
+        perceptible for UI operations" (§5.2). Settings reads can be cached client-side after the
+        first fetch.
+     3. **The gateway already serves external clients over HTTP.** Curl, AI Hub, and WorkBuddy
+        already use the HTTP surface for completions, streaming, models, and images. The UI going
+        through HTTP makes it "just another client" — the same code path, the same tests, the same
+        proven transport.
+     4. **The data ownership model requires it.** §6.1 says the service owns the database. If the
+        UI keeps writing to SQLite via IPC, it races with the service. Pure HTTP makes the service
+        the sole writer.
+     5. **The transition is seamless.** Under pure HTTP, the UI code is identical whether the
+        backend is the in-process gateway or the headless service — same
+        `fetch("http://127.0.0.1:8800/...")`. Under hybrid, you need conditional logic ("is the
+        service running? use HTTP; otherwise use IPC") — a switch in two places that drifts.
+     6. **CORS is the only new cost, and it's trivial.** One middleware adding
+        `Access-Control-Allow-Origin: tauri://localhost` (or `*` in dev). Already prescribed as
+        step 5.
+   - **What stays as Tauri APIs (not custom `invoke`):** window/tray management, file dialogs,
+     system notifications, and master-key retrieval from the keychain (needed once at startup to
+     authenticate HTTP requests). "Pure HTTP" means "no custom `invoke` commands for data access,"
+     not "no Tauri at all."
+   - **Authentication model:** the UI becomes an authenticated client of the gateway, sending the
+     master key with each request (per §5.3). The key is retrieved from the keychain at startup via
+     the Tauri vault API (a platform API, not a custom command) and held in UI memory for the
+     session. This is consistent with how external clients work.
+   - **Migration scope, corrected 2026-09-25 by measurement — as first written this was
+     over-scoped.** It said "no custom `invoke` commands for data access remain." The production
+     UI calls **107** distinct commands, and roughly a third are not gateway data at all:
+     `skills_*` is **documented frontend-only** ("skills are frontend-only, gateway blind to them"
+     — MEMORY.md), and ~34 more are *about the app* rather than the gateway (crash reports,
+     diagnostics bundle, onboarding state, history, config import/export, agent step trails, drift
+     events, router model context). A headless service has no UI crash reports to serve.
+   - **Corrected scope: HTTP serves the gateway and the data the service owns (~75 commands)** —
+     `gateway_*`/`egress_*`, config CRUD, the memory/context layer, ledger, settings, vault,
+     service management, tool toggles. **IPC stays for app-owned UI state (~34)** — skills, crash
+     viewer, diagnostics, onboarding, history, config export, agent trails, drift, workbuddy.
+     **This is not the hybrid the decision rejected.** That one kept IPC for *performance* (hot
+     paths), producing two spellings of the same fact. This keeps IPC for *ownership* — each side
+     serves its own data, so there is still one authority per fact.
+   - `gateway_enable/disable` and `gateway_worker_error` are deleted (service is always on).
+   - **Revisit if:** a real performance bottleneck appears that HTTP cannot serve — unlikely on
+     localhost, but the hybrid door stays open if measured.
 
 3. **Do we ship the service as a separate downloadable, or bundle it inside the `.app`?**
    - Separate: smaller app bundle, but two downloads to manage.
@@ -3388,11 +3461,17 @@ This is a plan, not a specification. When implementation starts, each phase gets
 document in `docs/` and its own branch. This chapter is updated as decisions are made and
 assumptions are tested.
 
-**Next action:** settle §10 decision 2 — pure HTTP or hybrid HTTP+IPC — and then take Phase 6 step 4,
-the UI migration from `invoke` to `fetch()`. Steps 1 and 3 are landed (26a and 26b); step 2 is
-half-done (the binary is bundled undeclared); step 4 is the remaining UI work. With `RunAtLoad` set,
-the agent and the app both bind the same persisted port, so the agent is only usable once the app
-stops starting its own gateway — which is what step 4 does. The other decisions in §10 still stand.
+**Next action:** ~~settle §10 decision 2 — pure HTTP or hybrid HTTP+IPC~~ — **settled 2026-09-25:
+pure HTTP**, and its scope **corrected by measurement** (107 commands, narrowed to the ~75 the
+service owns — see the decision entry); ~~add CORS~~ **landed 26c**; ~~add the §5.3 admin routes~~
+**landed 26d**; ~~provider CRUD~~ **landed 26e**, which also added the allowlist seam the routes
+need. Remaining CRUD routes — **api-keys, manifests (+ activate), models cache, aliases, ledger
+read** — follow the same mechanical pattern 26e established: extract a store-only core from the
+app-gated command, then register the route. After that, the memory/context routes (~25), the tool
+toggles and service management, and finally the TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
+binary is bundled undeclared). With `RunAtLoad` set, the agent and the app both bind the same
+persisted port, so the agent is only usable once the app stops starting its own gateway — which is
+what step 4 does. The other decisions in §10 still stand.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
