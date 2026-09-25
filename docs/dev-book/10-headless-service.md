@@ -633,9 +633,11 @@ This means:
   operations.
 - **No shared memory:** Large payloads (image generations, long chat histories) cross the HTTP
   boundary as JSON instead of being passed by reference.
-- **CORS:** The UI runs on `tauri://localhost` (or the dev server). The gateway is on
-  `http://127.0.0.1:8800`. The gateway must add `Access-Control-Allow-Origin: tauri://localhost`
-  (or `*` in dev) to its responses, or the UI's `fetch()` will be blocked.
+- **CORS:** The UI runs on `tauri://localhost` (or the dev server). The **in-app** gateway is on
+  `http://127.0.0.1:8787` (`gateway::DEFAULT_PORT`) — **not** 8800, which is `aiproviderd`'s port and
+  is deliberately different, because 8787 collides with AI Hub v2 (§2.1.1). The gateway must add
+  `Access-Control-Allow-Origin: tauri://localhost` (or `*` in dev) to its responses, or the UI's
+  `fetch()` will be blocked.
 
 ### 5.3 New internal routes for the UI
 
@@ -652,8 +654,24 @@ The UI needs some operations that today go through `invoke`:
 | `gateway_enable` / `gateway_disable` | **Deleted** — service is always on | — |
 | `gateway_worker_error` | **Deleted** — no worker window | — |
 
-These routes are authenticated with the same master-key mechanism as the external surface. The UI
-holds the master key in memory (it already does, for the one-shot reveal).
+These routes are authenticated with the same mechanism as the external surface — but **not with the
+master key, which the UI never holds.** This paragraph originally said the UI "holds the master key in
+memory (it already does, for the one-shot reveal)"; **D51 measured that false.** TypeScript is
+key-blind by construction (invariant 2) — it holds `secretRef`, never a secret — and the Gateway screen
+says so in the operator's own words: the key is *never rendered in this window*. So every route below
+answered **401 to the only client the pure-HTTP decision was written for**, and no test could see it,
+because the harness supplied the credential the UI cannot.
+
+**Resolved 2026-09-25 in 26i.** The host mints a local, revocable session credential — an ordinary app
+key with the reserved id **`ak-ui`** (`core/ui_session.rs`) — and hands it to the webview through
+`ui_session_key`. The webview caches it in a `let` and sends it as `Authorization: Bearer`; it is
+**never** in `localStorage`, `sessionStorage` or a cookie, so it vanishes on reload and a fresh one is
+minted next call — a secret that survives a reload is one a compromised webview can extract, which is
+the whole of invariant 2. It works in **both** processes that can serve the port, because both install
+`vault_app_key_provider` against the same keychain and the same database, and **no auth path was
+widened** to make it work. It carries no provider credential, so invariant 2 still binds where it was
+meant to. It is filtered out of `GET /admin/keys` (`is_ui_session`) so an operator cannot revoke the
+UI's own credential and break every screen with no visible cause. See D51.
 
 **Landed 2026-09-25 as increment 26d**, in `core/gateway_admin.rs` — a `#[path]` submodule of
 `gateway.rs`, registered by `spawn`, so the in-app gateway and `aiproviderd` serve the identical
@@ -2406,7 +2424,9 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
         the sole writer.
      5. **The transition is seamless.** Under pure HTTP, the UI code is identical whether the
         backend is the in-process gateway or the headless service — same
-        `fetch("http://127.0.0.1:8800/...")`. Under hybrid, you need conditional logic ("is the
+        `fetch("http://127.0.0.1:<port>/...")`, with the port read from `gateway_status` rather than
+        hardcoded (the in-app gateway defaults to **8787**, `aiproviderd` to **8800**; see §5.2). Under
+        hybrid, you need conditional logic ("is the
         service running? use HTTP; otherwise use IPC") — a switch in two places that drifts.
      6. **CORS is the only new cost, and it's trivial.** One middleware adding
         `Access-Control-Allow-Origin: tauri://localhost` (or `*` in dev). Already prescribed as
@@ -3581,6 +3601,37 @@ with `On(8787)` against `Off`.
 `0` twice over code that was present. The host-side Grep tool is the authority for an absence claim; a
 shell `grep` with alternation is not.
 
+---
+
+## Increment 26m — three claims the code had already outgrown
+
+**A documentation increment, and it is D52.** 26l's measurement surfaced three statements in this
+document that the code had already left behind. None of them is a file 26l edited, which is exactly why
+they survived.
+
+- **§5.3: "The UI holds the master key in memory (it already does, for the one-shot reveal)."** Already
+  known false — D51 measured it, and 26i *replaced the premise* with the `ak-ui` host-minted session
+  credential. The paragraph asserting the old premise survived the fix, so this document described the
+  defect and its solution in the same chapter. It now states the `ak-ui` model and **quotes the sentence
+  it replaces** rather than silently overwriting it.
+- **§5.2 and §10 decision 2: "the gateway is on `http://127.0.0.1:8800`."** `gateway.rs:38` is
+  `DEFAULT_PORT = 8787`, and §2.1.1 of this same document explains the split — `aiproviderd` binds 8800
+  *deliberately*, because 8787 collides with AI Hub v2. Two places described a single-port world that
+  never shipped, and a reader of §5.2 alone would dial a closed port. §5.2 now names 8787; §10.2 reads
+  the port from `gateway_status` instead of hardcoding one.
+- **§13: "~12 `invoke` calls remain."** Measured with a node script over `apps/desktop/src`: **73**
+  distinct `invoke` commands and **39** `fetchAdmin` call sites over **30** `/admin/*` templates — against
+  §10's own corrected target of ~75 HTTP / ~34 IPC. Off by 6×. The line now carries the measured numbers
+  and the ~13 split: 5 whose routes already exist, 8 that need one.
+
+**Why this is its own increment rather than a line inside 26l.** All three claims were correct when
+written and aged — D50's class exactly, and D50 was closed at 1216 earlier in the *same session* and went
+stale again before it ended. **A prose claim cannot be kept current by fixing it once**, so the fix is to
+write down what it now is *and* how it was measured.
+
+**Measured:** no code changed, so no test count moves. Doc gates re-run clean: `check-doc-links` 52 files
+/ 127 links, book rebuilt.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3630,8 +3681,16 @@ state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admi
 `PUT /admin/tools/workspace-root`; the toggle writes **both** authorities (the in-memory flag and
 `gatewayToolsEnabled` in the `router` row) because writing only one would be a toggle that lies.
 ~~the TypeScript migration~~ **landed 26i** — D51 resolved with a host-mediated session credential
-(`ak-ui`), and the provider/key/memory/context/tools groups are migrated from `invoke` to
-`fetchAdmin`. ~12 `invoke` calls remain for app-owned UI state and commands with no HTTP route. ~~the browser
+(`ak-ui`). **The sentence that followed read "~12 `invoke` calls remain", and 26l measured it wrong on
+both readings: 73 `invoke` commands remain, against 39 `fetchAdmin` call sites over 30 `/admin/*`
+templates.** ~39 stay on IPC by ownership (§10 decision 2 — skills, crash, capture, agent trails,
+service, egress, vault, onboarding, history, config, workbuddy, `gateway_key_*`), and **~13 are
+gateway data still on IPC**: 5 whose routes already exist (`gateway_app_keys` / `_create` / `_revoke`
+against `GET`/`POST /admin/keys` and `DELETE /admin/keys/{id}`; `manifest_stage` /
+`manifest_upsert_active` against `POST /admin/manifests`; and the keyed settings route 26l added) and
+8 that need one (`gateway_spend_cap_set`, `gateway_memory_enabled` / `_set`,
+`gateway_prune_live_context`, `ledger_append`, `manifests_history`, `gateway_app_key_cap_set`,
+`gateway_app_key_delete`). ~~the browser
 harness~~ **landed 26k** — `web-test/shim.ts` intercepts `fetch` to `127.0.0.1:<port>/admin/*` and
 dispatches to the same in-memory store the `invoke` cases use, so the suite runs as a gate again:
 **106/106**, from red at test 18. It found one live bug on the way (`persistAliases` sent `{ rows }`
