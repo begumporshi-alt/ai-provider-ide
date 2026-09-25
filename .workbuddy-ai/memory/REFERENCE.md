@@ -5112,4 +5112,75 @@ applied at a coarser granularity than a rule, or the cap governs a representatio
 byte count. **Do not treat 8,237 as proof the cap is imaginary, and do not treat 8,000 as a measured
 cliff.** The file was trimmed back under the cap on 26n — the tighter index is worth having either way.
 
+## 26o — the gateway-data remainder closes, and two harnesses fail the same way (2026-09-25)
+
+**The seven commands §13 listed as gateway data still needing a route all have one.** Six are
+database state (`POST /admin/manifests/stage`, `GET /admin/manifests/{id}/history`,
+`POST /admin/spend/cap`, `POST /admin/context/prune`, `POST /admin/ledger`, and the memory switch at
+`GET`/`POST /admin/memory/enabled`). The seventh is **process state**, and routing it is a decision
+rather than a defect fix: the switch is an `AtomicBool` on `GatewayCore` read per request, so its
+authority is *whichever process serves the listener*. `invoke` reached the **app's own** core — and in
+the default install that is the same core, because the app starts and serves its own listener (26l)
+and `gatewayBaseUrl()` reads `gateway_status`, which reports that same core's port. So the route
+changes nothing observable today; the draft claim that it fixed a live bug was **falsified before it
+was written**, and the route exists for the headless case, where the two cores differ.
+
+**Two store functions were extracted rather than duplicated.** `manifest_stage` and
+`manifests_history` held their SQL inline in `#[tauri::command]` bodies, so there was no `persist::*`
+function for a route to call. They are now un-gated `pub fn`s (`manifest_stage_row`,
+`list_manifest_history`) for the reason D39 gave and `ledger_insert` already paid for: a plain
+`&Store`, no Tauri type, so the `app` gate was inherited from the caller rather than earned.
+`ledger_append` gained `ledger_append_row`. **A route that re-issues the SQL is a second
+implementation free to drift from the first**, and the headless build is the one that would drift
+silently.
+
+**Both harnesses failed the same way, and the browser one failed first.** `web-test/shim.ts` answered
+`gateway_memory_enabled` with a literal `false` and `gateway_set_memory_enabled` with its own
+argument, storing nothing — a POST followed by a GET disagreed with itself, so no spec could have
+caught a route that failed to write. Both now read and write a `memoryEnabled` variable defaulting to
+`false` (what the stub returned, so read-only specs are unaffected).
+
+The **vitest** transport, `src/lib/gateway-client.fake.ts`, failed more subtly and was caught by a red
+spec rather than by reading it. Its `defaultResponse` returns `{ ok: true }` for any `POST` a spec has
+not seeded. That is right for most writes and *silently wrong* for the two 26o added: `store.ts`
+destructures `{ version }` out of `POST /admin/manifests/stage` and reads `.enabled` off
+`POST /admin/memory/enabled`, so the fallback produced `undefined` rather than an error. The symptom
+was `store.trail-writes.test.ts` failing with `expected undefined to be 2` — **in a spec about
+`approveRepair`'s trail bookkeeping, which is not the property that broke.** Both paths are now listed
+in a `NON_OK_WRITES` table and a call to either **throws** unless the spec seeds it with `seedAdmin`,
+because neither value is the fake's to invent (the host computes the manifest version from
+`MAX(version)`; the switch reads its own flag back). **Rule: a fabricated response is a claim about
+the wire, and a wrong claim is worse than a loud failure.** Two dead `case`s in the same spec's
+`invoke` mock went with it — `manifest_stage` and `manifest_activate` are on HTTP now, and a stub for
+a command nothing issues reads as coverage. The `{ m }` / `{ e }` wrappers those cases modelled are
+`toRustArgs`'s doing, not the structs' shape: **on the route the row itself is the body**, so the
+spec now asserts `adminBodies(...)` has `providerId` at the top level and no `m` — the version alone
+cannot tell the two wire shapes apart, since both would destructure a seeded `version`.
+
+**Two environment traps, both of which look like a broken suite.** (1) `Timed out waiting 30000ms from
+config.webServer` — the four `http_proxy`/`https_proxy` variables point at `127.0.0.1:53585`, so
+Playwright's readiness probe for the mock provider on `127.0.0.1:18901` went through the proxy, got a
+`502`, and never saw the server as up. **The suite's own readiness check is one of the loops a proxy
+`502` satisfies-looking failure**, so unset all six proxy vars for `web-test` as well as for probes.
+(2) `SAFE_DELETE_BULK_CONFIRM_REQUIRED` — the sandbox's bulk-delete guard refuses Playwright's
+cleanup of `test-results` (4,102 files after a bad run), and it fires on the **failure artifacts of a
+single-test run too**, so `pnpm web-test:clean` must precede *any* `playwright test`, including a
+`--grep` run. A stale `test-results` is also read back as evidence of a run that did not happen.
+
+**The headless suite hangs at full parallelism, and it is the keychain.** 1,220 tests completed and
+two `ui_session` specs hung; both pass in isolation in 4.12 s, and the whole suite finishes in 9.84 s
+with `-- --test-threads=4`. Neither spec's source was touched by 26o.
+
+**Gates after 26o:** app lib **1284/0**, binary **5/0**, headless **1220/0**, clippy clean under
+`--all-targets -- -D warnings` on rustc **1.98.1**, fmt clean, headless `--all-targets` check clean,
+vitest **181/181**, `pnpm typecheck` clean, `web-test:types` clean, browser suite **108/108**,
+`key-leak-grep` OK, `check-doc-links` 52 files / 127 links, `docs:book` 210 ids.
+
+**Falsified with one probe.** `gatewayMemoryEnabled`'s path pointed at
+`/admin/memory/PROBE-WRONG-PATH`; `web-test/memory.spec.ts:128` — *"the master switch is live, proving
+the screen's host load succeeded"* — went red at line 134 (its assertion about the screen's load),
+because the shim answers an unrouted `/admin/*` path with `404 unknown_route`. Reverted, the same spec
+passed in 16.8 s. **A route that is not wired is a failure, not a silent `undefined`** — which is what
+makes the suite evidence rather than decoration.
+
 
