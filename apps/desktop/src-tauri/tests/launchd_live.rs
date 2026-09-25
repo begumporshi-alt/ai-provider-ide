@@ -81,8 +81,12 @@ fn payload(dir: &Path) -> PathBuf {
 
 /// A scratch install. Deliberately **not** the real `~/Library/LaunchAgents`: this must not be able
 /// to clobber an agent someone is actually running.
-fn scratch() -> (Paths, PathBuf) {
-    let root = std::env::temp_dir().join("aip-launchd-live");
+///
+/// `tag` distinguishes each test's scratch tree so parallel runs do not wipe each other's
+/// installed binaries. Without it, test B's `remove_dir_all` fires while test A's launchd
+/// job is still running, and test A's binary is gone before it can exec.
+fn scratch(tag: &str) -> (Paths, PathBuf) {
+    let root = std::env::temp_dir().join(format!("aip-launchd-live-{tag}"));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
     let home = root.join("home");
@@ -101,7 +105,7 @@ fn no_aqua_session(message: &str) -> bool {
 #[test]
 #[ignore = "needs a process with an Aqua session; run from Terminal.app with --ignored"]
 fn install_produces_a_job_launchd_actually_runs() {
-    let (paths, root) = scratch();
+    let (paths, root) = scratch("install");
     let uid = service::read_uid().expect("`id -u` must answer");
     let domain = service::domain(uid);
     let src = payload(&root);
@@ -193,7 +197,7 @@ fn agent_serves_health_and_app_delegates() {
         return;
     }
 
-    let (mut paths, root) = scratch();
+    let (mut paths, root) = scratch("agent");
     // Point the agent at a scratch store so it never touches the user's real application data.
     // `Store::open` creates the SQLite file and runs migrations on first use.
     paths.environment.insert("AIP_DATA_DIR".into(), paths.data_dir.display().to_string());
@@ -219,7 +223,7 @@ fn agent_serves_health_and_app_delegates() {
     // Wait for launchd to spawn the agent and for the gateway to be up.
     // `aiproviderd`'s `main` blocks on `pending()` after `gateway::spawn`, so the pid is
     // present the moment launchd execs it — before the tokio runtime has finished binding.
-    // The `/health` assertion below is what pins the bind; the pid poll pins the exec.
+    // The port poll below is what pins the bind; the pid poll pins the exec.
     let deadline = Instant::now() + SPAWN_BUDGET;
     let mut last = service::status(&paths, &domain, &service::run_launchctl)
         .expect("`launchctl print` must be answerable once the job is loaded");
@@ -247,8 +251,21 @@ fn agent_serves_health_and_app_delegates() {
     // **The 26t assertion against a live agent, not a seam.** The agent's port is the one the
     // `aiproviderd` binary read from `persisted_gateway_port` (or fell back to `SERVICE_DEFAULT_PORT`
     // = 8800 when no setting row exists yet — which is the shape of a fresh scratch store).
-    // Probe it, and the delegate decision must read `Some(port)`, not `None`.
-    let probe = probe_port(8800, Duration::from_secs(3));
+    //
+    // Polling rather than a single probe: `pid` is present the moment `tokio::main` starts running,
+    // but `gateway::spawn` (the async `TcpListener::bind`) can complete up to several seconds after
+    // that. One probe against a not-yet-bound socket is `ECONNREFUSED` — a false negative that makes
+    // the test assert the gateway is down while it is still coming up.
+    const PORT_POLL_INTERVAL: Duration = Duration::from_millis(200);
+    const PORT_POLL_BUDGET: Duration = Duration::from_secs(30);
+    let port_deadline = Instant::now() + PORT_POLL_BUDGET;
+    let probe = loop {
+        let p = probe_port(8800, PORT_POLL_INTERVAL);
+        if p.is_ok() || Instant::now() >= port_deadline {
+            break p;
+        }
+        std::thread::sleep(PORT_POLL_INTERVAL);
+    };
     let action = app_listener_action(&probe, 8800);
     println!("probe: {probe:?}");
     println!("app_listener_action: {action:?}");
