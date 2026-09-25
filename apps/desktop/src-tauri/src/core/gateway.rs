@@ -1149,6 +1149,17 @@ impl GatewayCore {
         *self.port.lock().unwrap()
     }
 
+    /// Record the port the gateway is serving on without binding it.
+    ///
+    /// `spawn` writes this after a successful bind; Phase 6 step 4's delegate
+    /// path writes it when the app *delegates* to the launchd agent, so the
+    /// UI's discovery surface (`gateway_status` → `core.port()`) reports the
+    /// port the agent is already serving rather than the default the core
+    /// booted with.
+    pub fn set_port(&self, port: u16) {
+        *self.port.lock().unwrap() = port;
+    }
+
     /// Deliver one bridge message to the request waiting for it. Unknown/stale id = the client is
     /// already gone -> idempotent no-op.
     ///
@@ -1908,6 +1919,90 @@ pub fn persisted_gateway_port(store: &crate::core::store::Store) -> Option<u16> 
     } else {
         None
     }
+}
+
+/// Probe whether a TCP port on loopback is accepting connections.
+///
+/// The connect is the detection: a `TcpStream::connect` to a port that
+/// nothing is listening on fails with `ECONNREFUSED` on the loopback, which
+/// is the "free" answer. The probe is short-lived and never holds the socket
+/// open — a stray `connect` that is not closed is exactly the kind of
+/// "something is squatting the port" that this function exists to detect.
+///
+/// A bounded wait keeps a wedged network stack from stalling the launch:
+/// `DEFAULT_PORT` is loopback-only, so a healthy probe resolves in
+/// microseconds; the bound is there so the failure path is a fast `Err` rather
+/// than a hang, which is the difference between "the app is up without a
+/// gateway" and "the app never came up at all".
+///
+/// Returns `Ok(())` when something is accepting on the port; `Err` when the
+/// probe could not confirm it. The `Err` cases (ECONNREFUSED, a wedged
+/// socket, a timeout) are treated as "the port is free", which is the safe
+/// side of the asymmetry: a broken probe must never leave the app with no
+/// listener, because the agent may well be down too.
+pub fn probe_port(port: u16, wait: std::time::Duration) -> Result<(), std::io::Error> {
+    use std::net::{Ipv4Addr, SocketAddr, TcpStream};
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+    // The connect is the detection. A loopback port with no listener answers
+    // ECONNREFUSED immediately; one that is serving accepts in microseconds.
+    // A bounded wait keeps a wedged stack from stalling launch — the failure
+    // is a fast Err, not a hang. Drop the socket on return: a probe that
+    // leaves an accepted connection open is the squatting this exists to catch.
+    let stream = TcpStream::connect_timeout(&addr, wait)?;
+    drop(stream);
+    Ok(())
+}
+
+/// Whether the app should start its own listener on `port`, given the
+/// probe's result.
+///
+/// This is the whole of Phase 6 step 4: the launchd agent (`aiproviderd`,
+/// `RunAtLoad`) and the desktop app both reach for the persisted port at
+/// launch, and whichever binds second silently loses — the app's bind fails
+/// with `Address in use` and the app ends up with no listener, or the agent
+/// exits 1 and `KeepAlive` throttles it. Neither process knows the other is
+/// there. **The fix is to ask first, and only bind when the port is free.**
+///
+/// Split out from `app.rs` the way `hide_on_close_from` was: the `AppHandle`
+/// half is the `probe_port` call; the decision is this function, and it is
+/// the half that carries the policy. A test can reach it without a Tauri app
+/// and without a real socket, by passing the probe's result directly.
+///
+/// `Ok(())` → delegate (the agent is already accepting on the port).
+/// `Err(_)` → bind (the port is free, so the app owns it). The asymmetry is
+/// deliberate: **only a confirmed "in use" is a reason not to bind.** A probe
+/// that failed because the network stack is wedged must not leave the app
+/// with no listener — the agent may well be down too, and a dead agent and a
+/// dead app is the worse of the two states.
+pub fn app_bind_decision(probe: &Result<(), std::io::Error>) -> bool {
+    probe.is_ok()
+}
+
+/// What the app should do with its listener, given the probe's result and the
+/// port it would bind.
+///
+/// This is the seam `app.rs` calls: it hands over the port and the probe's
+/// result. The return is the decision, not the side effect — binding is
+/// `app.rs`'s responsibility, which keeps the probe testable and the launch
+/// path readable.
+///
+/// `Some(port)` means "the port is taken; the agent is already serving it, so
+/// delegate". The caller points the UI at `port` and skips its own bind.
+/// `None` means "the port is free; bind it".
+///
+/// **The probe is the only source of truth.** A `launchctl` read of "the
+/// service is installed" is a *different* fact — a loaded job that is between
+/// restarts has no pid, and a job that crashed at `launchd`'s `KeepAlive`
+/// backoff may not have re-spawned yet. Two listeners cannot share a port,
+/// so the question that matters is the socket's, not the job's: *is someone
+/// accepting right now?* The `connect` is the only check that answers it
+/// honestly. Asking `launchctl` first and then binding anyway is the race
+/// this function exists to end.
+pub fn app_listener_action(probe: &Result<(), std::io::Error>, port: u16) -> Option<u16> {
+    if app_bind_decision(probe) {
+        return Some(port);
+    }
+    None
 }
 
 pub struct ServerHandle {

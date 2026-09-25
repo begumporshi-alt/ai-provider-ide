@@ -213,6 +213,36 @@ pub fn run() {
                         &handle,
                         &format!("auto-start: requested port {port}"),
                     );
+
+                    // Phase 6 step 4: the launchd agent (`aiproviderd`, `RunAtLoad`) may already be
+                    // serving this very port. Both processes read `persisted_gateway_port` and
+                    // bind it at launch, so whichever binds second silently loses. Ask first:
+                    // probe the socket, and only bind when it is free. A taken port is delegated
+                    // to the agent — record that port on the core and skip the bind.
+                    let probe = gateway::probe_port(port, std::time::Duration::from_secs(2));
+                    match gateway::app_listener_action(&probe, port) {
+                        Some(taken) => {
+                            // The agent is already accepting on `taken`. Point the UI's discovery
+                            // surface at it without binding a second listener.
+                            if let Some(state) = handle
+                                .try_state::<std::sync::Arc<crate::tauri::gateway_cmds::GatewayState>>()
+                            {
+                                state.core.set_running(true);
+                                state.core.set_port(taken);
+                            }
+                            crate::tauri::gateway_cmds::log_to_file(
+                                &handle,
+                                &format!(
+                                    "auto-start: port {taken} already serving (agent), delegating — not binding"
+                                ),
+                            );
+                            return;
+                        }
+                        None => {
+                            // Port free: fall through and bind it ourselves.
+                        }
+                    }
+
                     // A listener with no master key refuses *everything* with 401 —
                     // `check_gateway_key` tests the master key before it ever looks at an app key,
                     // so even the UI's own session credential cannot get in. Starting one without

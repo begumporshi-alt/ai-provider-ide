@@ -4,6 +4,70 @@
 use super::*;
 use crate::core::persist;
 use futures_util::StreamExt as _;
+use std::io::Error as IoError;
+use std::io::ErrorKind;
+
+// Phase 6 step 4: the probe-and-delegate decision, tested at the seam that reaches it
+// without a Tauri app and without a real socket. `app_bind_decision` is the policy — the
+// whole of "don't start a second listener when the agent already serves the port" — and it
+// is the half that carries the answer, which is why it is the one pinned.
+
+/// A failed probe — any io error — must be read as "port free", so the app binds.
+/// Only a confirmed "in use" (`Ok`) is a reason not to bind.
+#[test]
+fn step4_failed_probe_delegates_false_app_binds() {
+    // A wedged socket, a refused connect, a timeout — all land here, and all mean bind.
+    let refused = Err(IoError::new(ErrorKind::ConnectionRefused, "connection refused"));
+    assert!(!app_bind_decision(&refused));
+    let wedged = Err(IoError::other("socket wedged"));
+    assert!(!app_bind_decision(&wedged));
+}
+
+/// A successful probe — someone is accepting on the port — must read as "delegate".
+#[test]
+fn step4_ok_probe_delegates_true_app_skips_bind() {
+    let taken = Ok(());
+    assert!(app_bind_decision(&taken));
+}
+
+/// `app_listener_action` is the seam `app.rs` calls: `Some(port)` = delegate to the agent,
+/// `None` = bind it ourselves. It composes `app_bind_decision` with the port the caller
+/// would bind, so both arms are pinned against a real port value.
+#[test]
+fn step4_listener_action_some_on_taken_none_on_free() {
+    // Taken: return the port so the UI's discovery surface points at the agent.
+    let taken = Ok(());
+    assert_eq!(app_listener_action(&taken, 18080), Some(18080));
+    // Free: return None so the app falls through and binds.
+    let free = Err(IoError::new(ErrorKind::ConnectionRefused, "connection refused"));
+    assert_eq!(app_listener_action(&free, 18080), None);
+}
+
+/// `probe_port` against a loopback port that nothing is listening on must report the port
+/// free. This is the falsifying probe: a function that answered `Ok` unconditionally would
+/// delegate on *every* launch and the app would never start its own gateway, which is the
+/// silent regression this whole increment exists to prevent.
+#[test]
+fn step4_probe_port_free_reports_err() {
+    use std::time::Duration;
+    // A port nothing else touches in CI. A refused connect is the "free" answer.
+    let res = probe_port(1, Duration::from_millis(200));
+    assert!(
+        res.is_err(),
+        "probe_port must report a free port as Err — an unconditional Ok would delegate every launch"
+    );
+}
+
+/// `set_port` records the port the gateway serves on without binding it — the delegate path
+/// writes it so `gateway_status` reports the agent's port rather than the boot default.
+#[test]
+fn step4_set_port_records_serving_port() {
+    let core =
+        GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("sk-aip-master".into())));
+    assert_eq!(core.port(), DEFAULT_PORT);
+    core.set_port(19000);
+    assert_eq!(core.port(), 19000);
+}
 
 /// One outbound bridge request as the worker saw it: kind, body, headers.
 ///

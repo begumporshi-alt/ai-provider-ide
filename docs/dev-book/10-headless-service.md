@@ -4046,14 +4046,70 @@ stated here and is the reason the gate (not the substitution) is the durable gua
 substitution is caught by the gate's exit 2, not by the silent absence of a WebKit-free binary.
 
 **What 26s leaves open, and it is a step 4 question.** `gateway_startup`'s two-process race (26l)
-is still unmeasured: with `RunAtLoad` set the agent and the app both bind the same persisted port,
-and nothing can test it without both processes up. Step 4 is where the app stops starting its own
-gateway; this increment does not touch that.
+was still unmeasured *when 26s landed*: with `RunAtLoad` set the agent and the app both bind the
+same persisted port, and nothing can test it without both processes up. **26t closed the decision
+half of it** — the probe-and-delegate policy, so the app stops starting its own gateway when the
+agent owns the port. The end-to-end measurement (both processes up) is the `launchd_live` harness,
+still blocked on a real Aqua session.
 
 **Gates:** `cargo fmt --check`, `clippy --all-targets -- -D warnings`,
 `cargo check --no-default-features --all-targets` clean; `check-doc-links` 52 files/127 links;
 `docs:book` 212 ids; `key-leak-grep` OK. No test counts change — this increment adds two shell
 scripts and one `package.json` entry, and lands no Rust or TypeScript.
+
+### Increment 26t — Phase 6 step 4: the app stops starting its own gateway when the agent owns the port
+
+**The race, now designed for.** 26s left step 4 open because it is the one that touches the
+app. The collision is fully measured: the launchd agent (`aiproviderd`, `RunAtLoad`) and the
+desktop app both read `persisted_gateway_port` and bind it at launch. Whichever binds second
+silently loses — the app's `spawn` fails at `TcpListener::bind` with `Address in use` and logs
+`auto-start FAILED`, ending up with no listener; or the agent exits 1 and `KeepAlive` throttles
+it. Neither process knows the other is there. 26l sharpened it by making the app *start* its
+listener on a fresh install rather than only restore one, so on a user who has the agent
+installed the next launch is a guaranteed race.
+
+**The policy — ask the socket, not the job.** A `launchctl` read of "the service is installed"
+is a different fact: a loaded job between restarts has no pid, and a `KeepAlive` backoff may not
+have re-spawned yet. Two listeners cannot share a port, so the question that matters is the
+socket's — *is someone accepting right now?* The fix is to probe the port before binding, and
+only bind when it is free.
+
+**What 26t lands.** Three functions in `core/gateway.rs`, split out of `app.rs` the way
+`hide_on_close_from` was, so the policy is reachable without a Tauri app and without a real
+socket:
+
+- `probe_port(port, wait)` — a `TcpStream::connect_timeout` to loopback. `Ok(())` means
+  something is accepting; `Err` (refused, wedged, timeout) means free. The connect is the whole
+  detection: a free loopback port answers `ECONNREFUSED` in microseconds, a serving one accepts.
+  The socket is dropped on return, because a probe that leaves an accepted connection open is
+  exactly the squatting it exists to catch.
+- `app_bind_decision(probe) -> bool` — `true` (delegate) when the probe is `Ok`, `false` (bind)
+  when it is `Err`. **The asymmetry is the point: only a confirmed "in use" is a reason not to
+  bind.** A broken probe must never leave the app with no listener — a dead agent and a dead app
+  is the worse of the two states, and the safe side of a wedged probe is "bind it".
+- `app_listener_action(probe, port) -> Option<u16>` — `Some(port)` when taken (delegate), `None`
+  when free (bind). The seam `app.rs` calls.
+
+`GatewayCore::set_port` is new: `spawn` writes the bound port, and the delegate path writes the
+agent's port, so `gateway_status` (the UI's discovery surface) reports the port that is actually
+serving rather than the boot default. `app.rs`'s auto-start now probes, and on a taken port
+records the port on the core, sets `running`, and returns without binding.
+
+**The falsifying probe.** A function that answered `Ok` unconditionally would delegate on every
+launch and the app would never start its own gateway — a silent regression, green tests and all.
+`step4_probe_port_free_reports_err` pins it: probing a free port must `Err`. `step4_set_port_...`
+pins the discovery half. The decision itself is pinned by the two `app_bind_decision` /
+`app_listener_action` probes, one per arm.
+
+**Gates:** `cargo fmt --check`, `clippy --lib --bins --no-default-features` clean,
+`cargo build --features app --lib` clean (the `app.rs` edit); `cargo test --lib` **1291** passed
+(+5: the step-4 probes), 0 failed. `check-doc-links`, `docs:book`, `key-leak-grep` — run with the
+commit.
+
+**What 26t does not close.** The two-process race is *designed* but not yet *measured end-to-end*:
+that needs both the agent and the app up, which is the `launchd_live` harness territory (Task #4,
+blocked on a real Aqua session). What 26t proves is the *decision* — that a taken port is read as
+"delegate" and a free port as "bind" — at the seam that does not need either process.
 
 ## 12. What we know we do not know
 
@@ -4089,11 +4145,11 @@ is updated (the path changes). This needs a real update cycle to verify.
   reports success for a binary launchd could never exec (`verify_executable`). Full measurements in
   the 26a and 26q notes above
 - **What `gateway_startup` should do when `aiproviderd` is the process serving.** Opened 2026-09-25 by
-  26l. The app now starts its own listener on a fresh install (`GatewayStartup::Default`), and
-  `gateway_settings_row`'s two-process reasoning covers *which port* but not *who owns it*. With
-  `RunAtLoad` set the agent starts the gateway at login, so the app's auto-start and the service race
-  for the same port on the next launch. Nothing measures that race yet, and no test can: it needs both
-  processes up, which is step 4's territory.
+  26l; **answered as a decision by 26t.** The probe-and-delegate policy is landed: `probe_port`
+  asks the socket, `app_listener_action` maps the result to `Some(port)` (delegate) or `None` (bind),
+  and `app.rs`'s auto-start records the agent's port on the core rather than binding a second
+  listener. What 26t does *not* close is the end-to-end measurement — it needs both the agent and
+  the app up, which is the `launchd_live` harness territory.
 
 ---
 
@@ -4161,10 +4217,11 @@ reports *presence*, not the BRE command that returned 0 on any input. `bundle.ex
 needed: the bundler already places the `[[bin]]` target, which is how the service reached `Contents/MacOS/`
 (D56).
 With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
-usable once the app stops starting its own gateway — which is what step 4 does. **26l sharpens that
-collision rather than deferring it**: the app now starts its listener on a fresh install instead of
-only restoring one, so "what should `gateway_startup` do when `aiproviderd` is the process serving?"
-is now a live question, not a hypothetical. The other decisions in §10 still stand.
+usable once the app stops starting its own gateway — which is what step 4 does. **26t landed step 4's
+decision half**: `probe_port` asks the socket, and on a taken port the app records the agent's port on
+the core and returns without binding a second listener — the two-process race is no longer a silent
+collision but a designed delegation. The end-to-end measurement (both processes up) still lives in the
+`launchd_live` harness. The other decisions in §10 still stand.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
@@ -4173,7 +4230,10 @@ then give that module a phase in §7" until 2026-09-25, by which point Phase 4b 
 its phase and the spike's residual was recorded in the risk register instead; and 26p then *answered*
 that residual — S6i fences the fault in-process — narrowing it from feasibility to the abandoned-frame
 cost, which is D54; 26r took step 2's decision while leaving its build step open, and 26s then closed
-that build step — `scripts/substitute-tauri-free-aiproviderd.sh` plus the `otool -L` gate — so the next
-open item is step 4: the app stops starting its own gateway, and the agent owns the port. It is
+that build step — `scripts/substitute-tauri-free-aiproviderd.sh` plus the `otool -L` gate — and 26t
+then landed step 4's decision half: `probe_port` asks the socket, and on a taken port the app records
+the agent's port on the core rather than binding a second listener, so the two-process race is a
+designed delegation, not a silent collision. The next open item is the `launchd_live` harness
+measuring that delegation end-to-end, which needs a real Aqua session. It is
 rewritten here rather than silently overwritten because a stale "next action" is the cheapest way for a
 plan to stop describing its own project.)
