@@ -2718,7 +2718,8 @@ The worktree is the mechanism, not the point: it gives a clean checkout of the r
 
 ## The Tier-2 sandbox in Rust: what `rquickjs` gives you, and the four places it bites (2026-09-24)
 
-Harness: `.workbuddy-ai/spikes/js-engine/` — a standalone crate, 723 lines, 13 probes.
+Harness: `.workbuddy-ai/spikes/js-engine/` — a standalone crate; **723 lines / 13 probes** on
+2026-09-24, **988 / 17** after 26p.
 `cargo run --release`; `SPIKE_CRASH=1` opts into the two probes that are expected to kill the process.
 Verdict of the spike: **the Tier-2 QuickJS sandbox is a port, not a reimplementation** — `GOOD_GUEST`
 from `code-adapter.test.ts:21-37` runs verbatim and produces the same three values that file asserts.
@@ -2748,15 +2749,28 @@ declared `Send + Sync` cannot hold one. With it, bite 2 applies. **The feature a
 requires is what makes the obvious job-pump API illegal** — the two constraints are coupled, and
 neither is visible from the other.
 
-**4. The memory limit is not a containment boundary in-process.** With `set_memory_limit` in force, an
-out-of-memory raised while the guest executes **directly inside the call — before its first `await` —
-`SIGSEGV`s the host process** (deterministic, 3/3 runs, at both 8 MB and 32 MB). The *same* trap
-inside a job (allocation after an `await`) rejects cleanly, and neither the stack limit (512 KB,
-runaway recursion) nor an ordinary `throw` is fatal. With no limit set the same allocation resolves
-normally, so the limit is the cause. **The TypeScript sandbox never tests the memory limit** — its
-suite covers lint, wall-clock timeout, http/emit rate limits, path traversal, disposal and recovery —
-so the contract suite cannot see this. What survives in-process: deadline, http/emit budgets, path
-containment, stack depth. What does not: a heap ceiling.
+**4. The memory limit fires; QuickJS's OOM *path* is what faults — and it is fenceable.** With
+`set_memory_limit` in force, an out-of-memory raised while the guest executes **directly inside the
+call — before its first `await` — `SIGSEGV`s the host process** (deterministic, 3/3 runs, at both 8 MB
+and 32 MB). The *same* trap inside a job (allocation after an `await`) rejects cleanly, and neither the
+stack limit (512 KB, runaway recursion) nor an ordinary `throw` is fatal. With no limit set the same
+allocation resolves normally, so the limit is the cause. **The TypeScript sandbox never tests the memory
+limit** — its suite covers lint, wall-clock timeout, http/emit rate limits, path traversal, disposal and
+recovery — so the contract suite cannot see this.
+
+**The cause, measured 2026-09-25 (S6h/S6i/S6j, increment 26p).** Not the guest's allocation, and not a
+stack overflow: a **NULL dereference at `+0x20`** inside QuickJS's own `build_backtrace`
+(`si_addr = 0x20`, `si_code = 2`), at the `JS_DefinePropertyValue(…, JS_ATOM_stack, …)` that closes it
+(`quickjs.c:6792`), reached from `JS_CallInternal`'s `exception:` label (`:17439`). S6i is S6h's guest
+with `siglongjmp` armed — one variable — and the process **survives**, a fresh `Runtime` still
+evaluating `1+1` afterwards. S6j calibrates `si_addr`: a deliberate read of `0x1234` reads back
+`0x1234`, so the number is the faulting address and not a mis-read field. **A heap ceiling therefore
+*can* be enforced in-process** — the earlier "what does not survive in-process: a heap ceiling" was the
+inference, and it was never measured. Open, each needing its own probe: the abandoned frame's leak
+(size unmeasured; `libc 0.2.189` exports no `task_info`, so a number costs a hand-declared ABI), the
+abandoned `Runtime`'s never-released global lock (the fresh runtime working implies the lock is
+per-instance rather than process-global — inference, not measurement), and whether the fence holds on a
+2 MB actor thread rather than the 8 MB main thread.
 
 ### `rquickjs` API notes that cost a compile round
 
@@ -3353,7 +3367,9 @@ Clippy's `only_used_in_recursion` caught the vestigial parameter.
 ### `Runtime` has no getters for memory/stack limits
 
 `set_memory_limit`/`set_max_stack_size` exist; no `memory_limit()`/`max_stack_size()` getters.
-The only observable consequence of the memory limit is the `SIGSEGV` of §2.1.3 trap 3.
+The only observable consequence of the memory limit is the `SIGSEGV` of §2.1.3 trap 3 — and that
+**is** observable in-process (26p): a `sigaction` handler with `SA_SIGINFO` reads `si_addr`/`si_code`.
+What is not observable is the limit *as a number*.
 
 ### The `armed` flag was a second spelling of one state
 
