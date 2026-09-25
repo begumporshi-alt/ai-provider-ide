@@ -260,10 +260,17 @@ half.** Phase 1 originally made `core/` Tauri-free in *source* only: `persist` s
 `#[tauri::command]` attributes, `egress::stream` still took a `tauri::ipc::Channel`, and `Cargo.toml`
 kept `tauri` unconditional — so `cargo build --bin aiproviderd` compiled Tauri, and the Linux CI job
 had to install WebKitGTK to let it. The package now declares `default = ["app"]`, both Tauri crates are
-`optional`, and every `tauri` mention in `core/` sits behind `#[cfg(feature = "app")]`. Measured:
-`cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → **0**; the feature-less
-release binary is **380 KB smaller** (4,073,968 B vs 4,454,336 B, the difference being Tauri not
-linked); `cargo check --no-default-features` is warning-free; `cargo test` still 489 passed / 0 failed.
+`optional`, and every `tauri` mention in `core/` sits behind `#[cfg(feature = "app")]`. **Re-measured
+2026-09-25 (26r), because the command this row cited as evidence could not fail:** it read
+`cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → **0** — and in BSD BRE the
+`|` is **literal**, so that pattern searches for the string `webkit|wry|gtk` and returns 0 on *any*
+input; run against the default-features tree, which holds **34** real matches, it printed **0** as well
+(D56). The claim is true and the instrument was null. Measured correctly, one variable, 2026-09-25:
+`-iE` gives **34** nodes with the `app` feature and **0** without; the release binary **links
+`WebKit.framework`** with it (12 dylibs) and **does not** without (8); and the size delta is **16,896 B**,
+not the **380 KB** this row used to claim (8,586,864 vs 8,603,760 — WebKit is linked *dynamically*, so
+it costs no file size). `cargo check --no-default-features` is warning-free; `cargo test` was 489/0 when
+this was written and is **1286/0** now.
 The Linux job builds with `--no-default-features` and installs no GTK/WebKit. Two things this does
 **not** do: `tauri-build` still compiles, because Cargo has no optional build-dependencies, so
 `[build-dependencies]` cannot be feature-gated even though `build.rs` no longer calls

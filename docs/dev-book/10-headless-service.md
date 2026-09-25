@@ -2372,11 +2372,24 @@ two scope-wrong claims in two consecutive increments.
    `tauri/service_cmds.rs` and its shim cases. **Not called from anywhere in production, by
    design:** with `RunAtLoad` set, the agent and the app both bind the same port, so installing
    it is a bind conflict until step 3 lands. See the 26a note in §11.
-2. Bundle `aiproviderd` into the `.app` (Tauri's `bundle.externalBin` or manual copy).
-   **Half-done already, and not by this plan:** `tauri build` copies every `[[bin]]` next to the
-   main binary, so the service is in `Contents/MacOS/` undeclared. What is missing is declaring
-   it, and deciding whether the copy is the default-features build (measured 4,454,336 B, links
-   Tauri) or the Tauri-free one (4,073,968 B).
+2. Bundle `aiproviderd` into the `.app`. **Half-done already, and not by this plan:** `tauri build`
+   copies every `[[bin]]` next to the main binary, so the service is in `Contents/MacOS/` with
+   `bundle.externalBin` unset and nothing in this repository naming it (no script, no `resources`).
+   **`externalBin` is not the fix and is not needed** — it wants a `<path>-<target-triple>` source that
+   nothing produces, and it targets the same destination the `[[bin]]` handling already fills. §2.1.1's
+   "no sidecar config is needed" was checked and confirmed on 2026-09-25; step 2's "what is missing is
+   declaring it" was the wrong half of the sentence.
+   **What this step actually decides is which build gets bundled, and the reason is the dependency
+   invariant, not size.** Measured 2026-09-25, same session, same profile, one variable: the
+   default-features binary **links `WebKit.framework`** (12 dylibs; 34 `wry`/`webkit`/`gtk` nodes in
+   `cargo tree`) and the `--no-default-features` one **does not** (8 dylibs; 0 nodes) — but the
+   Tauri-free binary is only **16,896 B smaller** (8,586,864 vs 8,603,760), because WebKit is a system
+   framework linked *dynamically* and so contributes no file size at all. A size argument would be
+   nearly vacuous, and the figure this step used to carry was wrong by 22× (D56).
+   **So: bundle the Tauri-free build — and note that `tauri build` cannot produce it.** It builds the
+   default-features target, so the copy it places today is the WebKit-linking one (verified: the
+   bundled binary links WebKit). Producing the Tauri-free one and substituting it into the bundle is a
+   build step, and that is the real remaining work here.
 3. ~~Add the UI control for the service.~~ **Landed 2026-09-25 as increment 26b** — a "Login-item
    service" card on Control → Gateway with status, Install/Remove, and a port-conflict warning.
    See the 26b note in §11.
@@ -3441,12 +3454,20 @@ or atomically swapped. `KeepAlive` **throttles** on repeated failed execs and ca
 path briefly missing during an update is not self-healing. Install therefore copies the bundled binary to
 `{data_dir}/bin/aiproviderd` and points the plist there.
 
-`tauri build` does put `aiproviderd` in `Contents/MacOS/` — measured 2026-09-25 on the bundle in
-`target/release/bundle/macos`, **4,454,336 B** alongside the 11,074,960 B app binary. **It is the
-default-features build**, i.e. the one that still links Tauri: the Tauri-free release binary measures
-**4,073,968 B**, 380 KB smaller. So the binary an installed agent would exec is not the binary §2.1.1's
-dependency split is about. Nothing in 26a depends on which one it is, and 26a does not close it — but a
-later increment that cares about what the service links has to say which build gets bundled.
+`tauri build` does put `aiproviderd` in `Contents/MacOS/` — measured on the bundle in
+`target/release/bundle/macos`, **4,454,336 B** alongside the 11,074,960 B app binary (both dated
+2026-09-24). **It is the default-features build**, and that half is confirmed by linkage rather than by
+size: `otool -L` on the bundled copy lists **12 dylibs including `WebKit.framework`**, matching a fresh
+default-features release build exactly. So the binary an installed agent would exec is not the binary
+§2.1.1's dependency split is about.
+**The size half of this paragraph was wrong, and 26r corrected it (D56).** It read "the Tauri-free
+release binary measures **4,073,968 B**, 380 KB smaller" — wrong by **22×** in magnitude, and computed
+from a build that no longer exists: the current release binaries are ~8.6 MB, and the true delta is
+**16,896 B** (8,586,864 Tauri-free vs 8,603,760 default-features), because WebKit is linked
+*dynamically* and costs no file size. The direction happened to be right and the reason was not.
+Nothing in 26a depends on which build gets bundled, and 26a does not close it — but a later increment
+that cares about what the service links has to say which one it is, and **26r did: the Tauri-free one,
+for the linkage, not for the 16.5 KB.**
 
 **The seam is one `&impl Fn`.** `install`, `uninstall` and `status` take the runner as an argument, so every
 branch is reachable from a test with no launchd and no root. This is `HttpPort`'s and `BridgeHost`'s shape,
@@ -3937,6 +3958,54 @@ in `core/service.rs`, both reachable without the app feature, plus one `#[ignore
 target. Gates: `cargo fmt --check` clean; `clippy --all-targets -- -D warnings` clean; `cargo check
 --no-default-features --all-targets` clean; lib **1286/0**; headless **1222/0**.
 
+### Increment 26r — Phase 6 step 2, and the size argument that was the wrong argument
+
+**Step 2 asked a question with two candidate answers and a false premise.** It read: the service ships
+undeclared, "what is missing is declaring it, and deciding whether the copy is the default-features
+build (measured 4,454,336 B, links Tauri) or the Tauri-free one (4,073,968 B)". Three claims, and
+reconnaissance falsified two of them.
+
+**`externalBin` is not missing, it is unnecessary.** The binary is already in `Contents/MacOS/` with
+`bundle.externalBin` unset, no `resources` entry and no script naming it — so the bundler's `[[bin]]`
+handling is what places it, which is §2.1.1's claim, now checked rather than assumed. Declaring
+`externalBin` would want a `<path>-<target-triple>` source that nothing produces, and would target the
+same destination the `[[bin]]` handling already fills. §2.1.1 said "no sidecar config is needed" and
+step 2 said "what is missing is declaring it". **§2.1.1 was right.**
+
+**The size argument was wrong by 22×, and it was the wrong argument to make.** Re-measured 2026-09-25,
+same session, same profile, one variable — the feature set:
+
+| Measurement | default features | `--no-default-features` |
+|---|---|---|
+| release binary | **8,603,760 B** | **8,586,864 B** |
+| `otool -L` dylibs | 12, **includes `WebKit.framework`** | 8, no WebKit |
+| `cargo tree` nodes matching `webkit`/`wry`/`gtk` | **34** | **0** |
+
+The Tauri-free binary is **16,896 B smaller** — not the 380 KB the docs claimed. **WebKit is a system
+framework linked *dynamically*, so it costs no file size at all**; the whole delta is Tauri's own Rust
+code. That is why the old figure was plausible when written and wrong now: it was measured before
+Phases 2–5 moved the engine into `aiproviderd`, when Tauri's Rust code was a large fraction of a much
+smaller binary. **The direction was right and the reason was not, and a reason is what a decision
+needs** — "16.5 KB" cannot carry a decision that "does not link WebKit" carries easily.
+
+**The finding that matters most: the evidence for the dependency invariant could not fail.** The status
+row cited `cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → **0**. In BSD
+BRE the `|` is **literal**, so that pattern searches for the string `webkit|wry|gtk` and returns 0 on
+*any* input. Run against the default-features tree — which holds **34** real matches — it printed **0**
+as well. The conclusion was true and the instrument was null, which is D54's lesson with a different
+mechanism: not a hedge that lost its condition, but a command that **cannot report the failure it
+exists to detect**.
+
+**So step 2's decision, taken:** bundle the **Tauri-free** build, for the linkage — and note that
+`tauri build` **cannot produce it**, because it builds the default-features target, so the copy it
+places today is the WebKit-linking one (verified: the bundled binary links WebKit). Producing the
+Tauri-free binary and substituting it into the bundle is a **build step**. That, not a config key, is
+what remains in step 2.
+
+**Measured.** No test counts change — this increment is measurement and documentation, and it adds no
+code. Gates: `cargo fmt --check`, `clippy --all-targets -- -D warnings`,
+`cargo check --no-default-features --all-targets`, `check-doc-links` and `docs:book`, all green.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -4031,7 +4100,11 @@ and it generates the first master key when there is none; `bootstrap()` degrades
 surface instead of reporting the database as corrupt; the keyed `GET/POST /admin/settings/{key}`
 route closes the last gap the TypeScript migration had; and `gatewayBaseUrl()`'s fallback stopped
 naming 8800. Browser suite **108/108**.
-Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the binary is bundled undeclared).
+Steps 1 and 3 are landed (26a and 26b); **26r took step 2's decision and left its build step open** —
+bundle the **Tauri-free** build, because it does not link WebKit (the size difference is 16.5 KB and is
+not the reason), but `tauri build` builds the default-features target, so producing the right binary and
+substituting it into the bundle is still to do. `bundle.externalBin` is **not** needed: the bundler
+already places the `[[bin]]` target, which is how the service reached `Contents/MacOS/` (D56).
 With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
 usable once the app stops starting its own gateway — which is what step 4 does. **26l sharpens that
 collision rather than deferring it**: the app now starts its listener on a fresh install instead of
@@ -4044,5 +4117,6 @@ adapter-runtime spike left open — in-process with a supervised heap ceiling, o
 then give that module a phase in §7" until 2026-09-25, by which point Phase 4b had given that module
 its phase and the spike's residual was recorded in the risk register instead; and 26p then *answered*
 that residual — S6i fences the fault in-process — narrowing it from feasibility to the abandoned-frame
-cost, which is D54. It is rewritten here rather than silently overwritten because a stale "next action"
-is the cheapest way for a plan to stop describing its own project.)
+cost, which is D54; and 26r then took step 2's decision while leaving its build step open. It is
+rewritten here rather than silently overwritten because a stale "next action" is the cheapest way for a
+plan to stop describing its own project.)
