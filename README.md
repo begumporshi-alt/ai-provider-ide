@@ -74,20 +74,33 @@ skipped unless `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` are set.
 tag and attaches it to a **draft** GitHub Release, so the artefacts can be checked before anyone can
 download them.
 
-Signing and notarization come entirely from the environment — never from `tauri.conf.json`, because
-no job outside that workflow runs a full `tauri build`, so an identity pinned in the config would be
-invisible to every other check here. Repository secrets needed:
+**Signing is optional and works in two modes**, determined by which secrets are set in the repository:
+
+| Mode | Secrets | Result |
+|---|---|---|
+| Ad-hoc (default) | None of the five below | The bundle is ad-hoc signed. Works on the machine that built it. macOS Gatekeeper refuses to launch it on any other Mac. Suitable for self-distribution on your own hardware. |
+| Developer ID + notarization | All five | The bundle is signed with a Developer ID Application certificate and notarized. A draft release other Macs can launch. |
+
+The five secrets needed for the full path:
 
 | Secret | What it is |
 |---|---|
 | `APPLE_CERTIFICATE` | Developer ID Application certificate (`.p12`), base64-encoded |
 | `APPLE_CERTIFICATE_PASSWORD` | The password set when exporting that `.p12` |
-| `APPLE_SIGNING_IDENTITY` | Optional — the certificate's keychain name; derived from the certificate if unset |
-| `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` | Notarization credentials (`APPLE_PASSWORD` is an app-specific password) |
+| `APPLE_ID` | The Apple ID email used for notarization |
+| `APPLE_PASSWORD` | An **app-specific** password for that Apple ID (`APPLE_PASSWORD` at <https://appleid.apple.com>) |
+| `APPLE_TEAM_ID` | The 10-character team identifier from the Apple Developer portal |
 
-Without a certificate the build still succeeds, but it is **ad-hoc signed**. That is fine locally and
-not fine for a download: macOS refuses to launch an unnotarized app from an unidentified developer,
-so the user sees "the developer cannot be verified" instead of your app.
+`APPLE_SIGNING_IDENTITY` is optional — Tauri derives it from the certificate. Set it only to
+disambiguate when the `.p12` holds more than one identity.
+
+A half-configured state (some secrets, others missing) is caught by `scripts/release-preflight.sh`
+before the build starts; the job fails fast with the list of missing names. See `CONTRIBUTING.md`,
+"Releasing", for how to obtain the secrets and run the full path by hand.
+
+> **Trust model.** For an open-source project, the trust path is building from source — not code
+> signing. An ad-hoc signed release is perfectly valid on your own machine; the notarized path
+> exists for users who download the release rather than building it themselves.
 
 **There is no auto-updater — updates are manual.** The user downloads the new release and replaces
 the app. `UPDATER.md`, `SIGNING.md` and the two updater scripts were removed in 1.0.0 because they

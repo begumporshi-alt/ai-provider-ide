@@ -57,7 +57,23 @@ A release is a `v*` tag. `.github/workflows/release.yml` then runs the preflight
 **universal** (`aarch64` + `x86_64`) build, and the artefact verification, and attaches the result to a
 **draft** GitHub Release. Nothing is publicly downloadable until someone publishes the draft.
 
-### The one-time provisioning
+The release pipeline supports two modes:
+
+| Mode | Secrets | What happens |
+|---|---|---|
+| **Ad-hoc** (default, no secrets) | None of the five required secrets set | The bundle is ad-hoc signed. `scripts/verify-release-signature.sh` is skipped (there is no stapled ticket to verify). Works on the machine that built it; macOS Gatekeeper blocks it on other Macs. Fine for development and self-distribution. |
+| **Developer ID + notarization** | All five required secrets set | Full Developer ID signing and notarization. The verify step asserts the seal, the authority chain, hardened runtime, and the stapled ticket. Produces a draft release other Macs can launch. |
+
+A half-configured state — some secrets present, others missing — is a **defect**. The preflight
+script fails fast with the names of the missing secrets, and no build starts. This is deliberate:
+the previous behaviour (before the two-modes model) was to refuse any build without all five; the
+current model allows the no-secrets path while still catching the half-configured case that would
+produce a green job and a broken draft.
+
+### The one-time provisioning (full mode only)
+
+These steps are required only if you want a **notarized, publicly distributable** release.
+For local development and self-distribution on your own machine, the ad-hoc mode needs nothing.
 
 This needs an **Apple Developer Program membership** (paid — **$99/year**, checked 2026-09-23) and a
 **Developer ID Application** certificate. Neither can be created by a script, and neither is in the repository
@@ -65,8 +81,7 @@ This needs an **Apple Developer Program membership** (paid — **$99/year**, che
 exactly this reason.
 
 **Without the membership there is no path to a notarized release, and none of the steps below can start.** This
-is a purchase, not a task. Local builds are unaffected — see `docs/dev-book/09-status.md`, which records this as
-blocked rather than pending.
+is a purchase, not a task. Local builds and ad-hoc releases are unaffected.
 
 1. Create a **Developer ID Application** certificate (Xcode → Settings → Accounts → Manage Certificates, or
    the Developer portal), then export it from Keychain Access as a `.p12` **with a password**.
@@ -93,17 +108,26 @@ blocked rather than pending.
 
 Both live in `scripts/`, and both exist because of the same defect: **`tauri build` succeeds with no Apple
 secrets at all**, emitting an *ad-hoc signed* app. That build launches fine locally — where Gatekeeper does
-not assess it — and is refused on a user's machine. A pipeline that does not check for this ships a green
-job and a broken download.
+not assess it — and is refused on a user's machine.
 
-- **`release-preflight.sh`** runs first, before the toolchain download, and costs about a second. It fails
-  when a required secret is absent or empty, decodes the `.p12` and opens it with the given password (which
-  catches a truncated paste or a mismatched password before a 20-minute build), and asserts that
-  `bundle.macOS.signingIdentity` is **not** pinned in `tauri.conf.json`. That last one is the rule no other
-  check can catch: nothing outside this workflow runs a full `tauri build`, so a pinned identity is invisible
-  to every other job and a green push would prove nothing about signing.
-- **`verify-release-signature.sh`** runs after the build and reads the artefacts back. Run it by hand the
-  same way:
+- **`release-preflight.sh`** runs first, before the toolchain download, and costs about a second. It detects
+  three states:
+
+  | State | Action |
+  |---|---|
+  | No secrets | Prints informational lines about ad-hoc mode. Exits 0. |
+  | All five secrets present | Validates the `.p12` is valid base64 and opens with the password, checks `tauri.conf.json` has no pinned identity. Exits 0. |
+  | Some but not all | Fails with the list of missing secrets. Exits 1. |
+
+  The "no pinned identity in `tauri.conf.json`" check runs in both ad-hoc and full modes: a pinned
+  identity is invisible to every other check, because no job outside `release.yml` runs a full `tauri build`,
+  and a green push would prove nothing about signing.
+
+- **`verify-release-signature.sh`** runs after the build, **only when all five secrets are present**.
+  In the no-secrets (ad-hoc) path there is no stapled ticket to verify; the WebKit-link check
+  (`scripts/check-bundled-aiproviderd-links.sh`) is the meaningful gate for that state.
+
+  Run it by hand the same way:
 
   ```bash
   ./scripts/verify-release-signature.sh                       # discovers bundles under target/
@@ -122,18 +146,20 @@ job and a broken download.
   (`0x2(adhoc)` vs `0x12a00(…,runtime)`), and the `Authority=` chain. A verifier that stops at `codesign`
   is decoration.
 
-If verification fails, the job goes red **and** the draft release is deleted, so a bad artefact cannot be
-published by someone who only sees that a release exists. **Do not publish a draft whose verification step
-is not green.**
+If the verify step fails in the full path, the job goes red **and** the draft release is deleted, so a bad
+artefact cannot be published by someone who only sees that a release exists. **Do not publish a draft whose
+verification step is not green.**
 
-### Without the secrets
+### Ad-hoc mode (no secrets)
 
-The preflight fails in about a second with the names of the missing secrets, and no build starts. This is
-deliberate: the previous behaviour was a successful build and an unsigned draft. If you only want a local
-build, skip the workflow entirely — `pnpm --filter ai-provider-router-desktop tauri build` produces an
-ad-hoc signed app, which is correct for local use and useless as a download. Note that on this machine the
-DMG step of a local build fails (`hdiutil`); the `.app` is already complete by then, so take the `.app` and
-ignore the DMG error.
+The preflight prints informational lines and exits 0 — no build is blocked. The `tauri-action` step
+produces an ad-hoc signed bundle. `verify-release-signature.sh` is skipped (its `if:` condition is
+false when no secrets are set). The only meaningful gate in that path is the WebKit-link check.
+
+**Trust model.** For an open-source project, the trust path is building from source, not downloading
+an unidentified-developer app from GitHub. An ad-hoc release is valid for the person who built it;
+a notarized release is what you ship when you want other Macs to launch the downloaded file without
+Gatekeeper blocking it.
 
 ## What CI enforces
 

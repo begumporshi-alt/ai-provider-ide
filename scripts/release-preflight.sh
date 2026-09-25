@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
-# Release preflight — refuses to start a release build that cannot produce a signed,
-# notarized artifact.
+# Release preflight — validates the Apple credential state before starting the build.
 #
-# Why this exists: `tauri build` succeeds with no Apple secrets at all, and emits an
-# ad-hoc signed app. Before this guard, a tag push with unprovisioned secrets produced a
-# green job and a draft Release containing something macOS refuses to launch. The failure
-# surfaced on a user's machine, not in CI. `docs/dev-book/05-workflow.md` warned about it
-# in prose; nothing enforced it.
+# Two valid states:
+#   1. No Apple secrets set → the build will be ad-hoc signed. macOS Gatekeeper
+#      will refuse to launch an ad-hoc app from an unidentified developer, so a
+#      release without secrets is useful for development and self-distribution
+#      on your own machine only. It is NOT a publicly distributable artefact.
+#   2. All Apple secrets set → full Developer ID signing + notarization.
+#      A draft Release that macOS will launch on other Macs.
 #
-# This runs BEFORE the build, so a missing or malformed credential costs seconds instead
-# of a 20-minute universal build. It never prints a secret value — only names and shapes.
+# A half-configured state (some secrets present, others missing) is a defect:
+# the build would sign with whatever is available and fail at notarization
+# (the one step that actually proves the artefact is safe), producing a
+# green job and a broken draft. This script catches that.
+#
+# This runs BEFORE the build, so a missing credential costs seconds instead
+# of a 20-minute universal build. It never prints a secret value — only names
+# and shapes.
 #
 # Usage: scripts/release-preflight.sh
 set -euo pipefail
@@ -20,36 +27,56 @@ CONF="$REPO_ROOT/apps/desktop/src-tauri/tauri.conf.json"
 FAILURES=0
 ok()  { printf '  \033[32mPASS\033[0m  %s\n' "$1"; }
 bad() { printf '  \033[31mFAIL\033[0m  %s\n' "$1"; FAILURES=$((FAILURES + 1)); }
+info(){ printf '  \033[33mINFO\033[0m  %s\n' "$1"; }
 
 echo "== Release preflight"
 
 # ---------------------------------------------------------------------------
-# 1. Required secrets are present and non-empty.
+# 1. Determine the credential state: ad-hoc or full.
 #
-# APPLE_SIGNING_IDENTITY is deliberately NOT required: tauri derives it from the
-# certificate. Requiring it would fail a correct setup.
+# APPLE_SIGNING_IDENTITY is deliberately not counted in "all present": tauri
+# derives it from the certificate, so requiring it would fail a correct setup.
+# The five that matter are the ones without a derivation path.
 # ---------------------------------------------------------------------------
 REQUIRED=(APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID)
+PRESENT=()
 MISSING=()
 for name in "${REQUIRED[@]}"; do
-  if [ -z "${!name:-}" ]; then
+  if [ -n "${!name:-}" ]; then
+    PRESENT+=("$name")
+  else
     MISSING+=("$name")
   fi
 done
 
-if [ "${#MISSING[@]}" -eq 0 ]; then
-  ok "all ${#REQUIRED[@]} required secrets are set"
+if [ "${#PRESENT[@]}" -eq 0 ]; then
+  info "No Apple credentials detected — the build will be ad-hoc signed."
+  info "macOS Gatekeeper will refuse to launch an ad-hoc app from an unidentified developer."
+  info "This is fine for self-distribution on your own machine; it is not a publicly distributable release."
+  info "To produce a notarized, distributable release, set all five required secrets:"
+  info "  ${REQUIRED[*]}"
+  info "  (See CONTRIBUTING.md, 'Releasing' for how to obtain them.)"
+elif [ "${#PRESENT[@]}" -eq "${#REQUIRED[@]}" ]; then
+  ok "all ${#REQUIRED[@]} required secrets are set — full Developer ID signing + notarization will be attempted"
 else
-  bad "${#MISSING[@]} required secret(s) missing: ${MISSING[*]}"
-  echo "        Set them with: gh secret set <NAME>   (see CONTRIBUTING.md, 'Releasing')"
+  bad "${#PRESENT[@]}/${#REQUIRED[@]} required secrets present: ${PRESENT[*]}"
+  echo "        Missing: ${MISSING[*]}"
+  echo "        All five required for notarization: ${REQUIRED[*]}"
+  echo "        Either set them all (for a distributable release) or clear them all (for ad-hoc)."
+  echo "        Half-configured credentials produce a build that signs but cannot notarize —"
+  echo "        a green job and a broken draft release. See CONTRIBUTING.md, 'Releasing'."
 fi
 
 # ---------------------------------------------------------------------------
-# 2. The certificate actually decodes and opens with the given password.
+# 2. Validate the certificate, but only when both cert and password are present.
 #
-# Catches the two mistakes that a presence check cannot: a truncated paste, and a
-# certificate/password mismatch. Both would otherwise survive until the build's
-# signing step and fail there, far from the cause.
+# In ad-hoc mode (no secrets) there is nothing to validate — the build will
+# be ad-hoc signed and there is no certificate to check.
+#
+# In full mode, catch the two mistakes that a presence check cannot: a
+# truncated base64 paste, and a certificate/password mismatch. Both would
+# otherwise survive until the build's signing step and fail there, far
+# from the cause.
 # ---------------------------------------------------------------------------
 if [ -n "${APPLE_CERTIFICATE:-}" ] && [ -n "${APPLE_CERTIFICATE_PASSWORD:-}" ]; then
   P12_TMP="$(mktemp -t aip-provider-cert)"
@@ -73,9 +100,10 @@ fi
 # ---------------------------------------------------------------------------
 # 3. No signing identity is pinned in tauri.conf.json.
 #
-# This is the rule that CI cannot otherwise catch: no job outside release.yml runs a
-# full `tauri build`, so a pinned identity is invisible to every other check and a
-# green push would prove nothing about signing. Enforced here, mechanically.
+# This rule holds in both ad-hoc and full modes: signing must come from the
+# environment, never from the config. A pinned identity would be invisible
+# to every check except this one, because no job outside release.yml runs a
+# full `tauri build`.
 # ---------------------------------------------------------------------------
 if [ -f "$CONF" ]; then
   PINNED=$(node -e '
@@ -99,8 +127,12 @@ fi
 
 echo
 if [ "$FAILURES" -eq 0 ]; then
-  echo "release-preflight: OK — the release can be signed and notarized."
+  if [ "${#PRESENT[@]}" -eq "${#REQUIRED[@]}" ]; then
+    echo "release-preflight: OK — full Developer ID signing + notarization will be attempted."
+  else
+    echo "release-preflight: OK — ad-hoc signed build (no notarization)."
+  fi
   exit 0
 fi
-echo "release-preflight: $FAILURES check(s) FAILED — refusing to build an unsigned release." >&2
+echo "release-preflight: $FAILURES check(s) FAILED — refusing to build with half-configured credentials." >&2
 exit 1
