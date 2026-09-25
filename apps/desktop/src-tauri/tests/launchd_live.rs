@@ -95,6 +95,16 @@ fn scratch(tag: &str) -> (Paths, PathBuf) {
     (service::paths(&home, &data), root)
 }
 
+/// Boot out any job a previous run left behind under the shared label.
+///
+/// Both tests use the same label (`dev.aiprovider.router`) in the same gui domain.
+/// If a prior run panicked before its `uninstall`, the old job is still tracked by launchd
+/// and `launchctl print` will report its (now-stale) pid. Booting out first makes
+/// `bootstrap` the only source of the pid we assert on.
+fn clean_stale(domain: &str) {
+    let _ = service::run_launchctl(&["bootout", &format!("{domain}/{}", service::LABEL)]);
+}
+
 /// `launchctl`'s own words for "this process may not mutate that domain". Matching on the message
 /// rather than on the exit code, because 5 is also what a malformed plist produces and those need
 /// different responses: one is environmental and skips, the other is a defect and fails.
@@ -108,6 +118,7 @@ fn install_produces_a_job_launchd_actually_runs() {
     let (paths, root) = scratch("install");
     let uid = service::read_uid().expect("`id -u` must answer");
     let domain = service::domain(uid);
+    clean_stale(&domain);
     let src = payload(&root);
 
     println!("scratch install at {}", root.display());
@@ -128,17 +139,33 @@ fn install_produces_a_job_launchd_actually_runs() {
 
     // `bootstrap` returned 0. That says launchd accepted the plist — **not** that it ran anything,
     // which is the whole reason this file exists.
+    //
+    // Two-phase poll: first the pid (launchd spawned the process), then the marker file (our
+    // payload actually ran). The pid appears the moment `execve` returns, but the shell script's
+    // `printf > marker.txt` takes a few milliseconds more. A single check right after the pid is
+    // too early — this is what made the 26x run fail with `pid = Some(N), marker = false`.
+    //
+    // Also: `launchctl print gui/<uid>/<label>` returns a pid for the label that is loaded in
+    // this domain. If a *previous* run left a stale job under the same label (and the prior
+    // test panicked before its `uninstall`), the pid is not from this install. The marker file
+    // is the proof that *this* payload ran, not some other process launchd happens to be tracking.
     let deadline = Instant::now() + SPAWN_BUDGET;
     let mut last = service::status(&paths, &domain, &service::run_launchctl)
         .expect("`launchctl print` must be answerable once the job is loaded");
-    while last.pid.is_none() && Instant::now() < deadline {
+    let mut marker = false;
+    while Instant::now() < deadline {
+        if last.pid.is_some() {
+            marker = root.join("marker.txt").exists();
+            if marker {
+                break;
+            }
+        }
         std::thread::sleep(Duration::from_millis(250));
         last = service::status(&paths, &domain, &service::run_launchctl).expect("print");
     }
 
     let loaded = last.loaded;
     let pid = last.pid;
-    let marker = root.join("marker.txt").exists();
     let out_log = std::fs::read_to_string(&paths.out_log).unwrap_or_default();
     let err_log = std::fs::read_to_string(&paths.err_log).unwrap_or_default();
 
@@ -204,6 +231,7 @@ fn agent_serves_health_and_app_delegates() {
 
     let uid = service::read_uid().expect("`id -u` must answer");
     let domain = service::domain(uid);
+    clean_stale(&domain);
 
     println!("scratch install at {}", root.display());
     println!("domain {domain}");
