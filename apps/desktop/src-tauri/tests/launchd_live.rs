@@ -283,6 +283,10 @@ fn agent_serves_health_and_app_delegates() {
 /// `aiproviderd` is built into `target/debug/` by `cargo build --no-default-features --bin
 /// aiproviderd`. The test harness runs from `src-tauri/`, so the target dir is two levels up.
 fn target_dir() -> PathBuf {
-    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.parent().expect("src-tauri has a parent").to_path_buf()
+    // CARGO_TARGET_DIR (if set by cargo) points at the target/ dir directly;
+    // otherwise target/ lives in CARGO_MANIFEST_DIR.
+    match std::env::var("CARGO_TARGET_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => Path::new(env!("CARGO_MANIFEST_DIR")).join("target"),
+    }
 }
