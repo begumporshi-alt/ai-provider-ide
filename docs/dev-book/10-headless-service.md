@@ -4111,7 +4111,76 @@ that needs both the agent and the app up, which is the `launchd_live` harness te
 blocked on a real Aqua session). What 26t proves is the *decision* — that a taken port is read as
 "delegate" and a free port as "bind" — at the seam that does not need either process.
 
-### Increment 26u — the open-item list re-measured, and the figures corrected
+### Increment 26v — the `launchd_live` harness now runs a real `aiproviderd` and pins the 26t delegation end-to-end
+
+**The genuine remaining code task from 26t, landed.** 26t's five falsifying probes pinned
+`app_bind_decision` / `app_listener_action` / `probe_port` at the seam — the unit level. The
+end-to-end measurement, the one that puts the real agent up and asserts the app's decision reads
+`Some(port)` against a live listener, was the open item 26u's §13 note named. This is it.
+
+**What landed:**
+
+- `service.rs` — `Paths` gained two fields:
+  - `environment: BTreeMap<String, String>` — launchd's `EnvironmentVariables` dict, emitted by
+    `render_plist` when non-empty (stable order, so re-installs don't produce a diff that looks like
+    a change). Empty in the production install; the harness uses one `AIP_DATA_DIR` entry so the
+    agent points at a scratch store.
+  - `data_dir: PathBuf` — the directory `paths(home, data_dir)` was built from. Not consumed by
+    `render_plist` (launchd reads only `EnvironmentVariables`), exposed so callers can reconstruct
+    the env var value without re-deriving it from `binary`'s parent.
+  - Three new unit tests in `mod tests`: `an_empty_environment_means_no_environment_variables_dict`,
+    `a_non_empty_environment_emits_the_dict_with_each_key_escaped`,
+    `the_environment_dict_sits_between_program_arguments_and_run_at_load`.
+
+- `launchd_live.rs` — new `#[ignore]`d test
+  `agent_serves_health_and_app_delegates`:
+  1. Looks for `target/debug/aiproviderd`; if missing, prints `SKIP: aiproviderd not built` and
+     returns (a statement about the build, not a pass — the test cannot pin a listener that was
+     never execed).
+  2. Creates a scratch `Paths` with `AIP_DATA_DIR` pointing at `paths.data_dir`.
+  3. Calls `service::install`, which copies the real `aiproviderd` binary into the scratch tree,
+     writes the plist with the `EnvironmentVariables` dict, and bootstraps the job.
+  4. Polls `service::status` for the agent's pid within `SPAWN_BUDGET` (20 s).
+  5. Calls `probe_port(8800, 3 s)` — the `SERVICE_DEFAULT_PORT`, which a fresh scratch store
+     (no `gateway` setting row) falls back to.
+  6. Calls `app_listener_action(&probe, 8800)` and asserts the result is `Some(8800)` — the 26t
+     delegation pinned against a live listener, not a synthetic seam.
+  7. Uninstalls what it installed; always reports whether cleanup worked.
+
+- The file's header now documents **three** tests (previously two): the shell-script stand-in
+  (which proves `service::install` runs a payload), the real-binary test (which proves the gateway
+  runs behind it), and the stated limits (the real plist location at login is not tested; a logout
+  would be needed for that).
+
+**Why the `EnvironmentVariables` dict is the right mechanism** — launchd's `bootstrap` has no
+`-e` flag; `EnvironmentVariables` in the plist is the only way to set env vars on the agent's
+process. A wrapper script (`/bin/sh -c 'export AIP_DATA_DIR=…; exec …'`) would work but adds a
+second executable that `verify_executable` cannot check, and the dict is the native shape. The
+production install path leaves the dict empty, so the production plist is byte-identical to the
+26t version.
+
+**What it does not cover, stated:** `KeepAlive` behaviour when the binary is inside an updated
+`.app` bundle that moves the installed path (the risk register's own open question, §12). The
+scratch install here points at a stable path under `data_dir/bin/`, which is the shape
+`service::install` uses in production; the only thing not tested is the login-time scan of
+`~/Library/LaunchAgents`, which requires a logout and is the human step §12 names.
+
+**Gates:** `cargo test --no-default-features` — 1230 lib tests passed (was 1225, +3 new
+`EnvironmentVariables` tests), 5 aiproviderd bin tests passed, 2 launchd_live tests ignored (as
+designed). `cargo clippy --no-default-features --tests` clean. `cargo fmt --check` clean.
+
+**Human step still open:** the test requires an Aqua session. From Terminal.app:
+
+```bash
+cd apps/desktop/src-tauri
+cargo build --no-default-features --bin aiproviderd
+cargo test --test launchd_live -- --ignored --nocapture
+```
+
+A green run with no `SKIP` line and `action = Some(8800)` in the output is the verification.
+A `SKIP: aiproviderd not built` line means the build step was skipped; a `SKIP: no Aqua session`
+line means Terminal.app was not in a GUI session. Read the output, not the exit code.
+
 
 **No code landed in this increment — a measurement.** The "65 `invoke` / 39 `/admin` templates / 7
 still on `invoke`" figures from 26o had been propagated through 26p–26t as if they were current,
@@ -4284,7 +4353,15 @@ cost, which is D54; 26r took step 2's decision while leaving its build step open
 that build step — `scripts/substitute-tauri-free-aiproviderd.sh` plus the `otool -L` gate — and 26t
 then landed step 4's decision half: `probe_port` asks the socket, and on a taken port the app records
 the agent's port on the core rather than binding a second listener, so the two-process race is a
-designed delegation, not a silent collision. The next open item is the `launchd_live` harness
-measuring that delegation end-to-end, which needs a real Aqua session. It is
-rewritten here rather than silently overwritten because a stale "next action" is the cheapest way for a
+designed delegation, not a silent collision. **26v extended the `launchd_live` harness to close the
+loop end-to-end**: `agent_serves_health_and_app_delegates` installs a **real `aiproviderd`** binary
+(Tauri-free, `--no-default-features`) as the agent payload, points it at a scratch store via
+`AIP_DATA_DIR` (a new `EnvironmentVariables` dict in `render_plist`, empty in the production install
+so the production plist is unchanged), and asserts that after the agent is up, `probe_port` +
+`app_listener_action` reads `Some(port)` — the 26t delegation, pinned against a live listener rather
+than a synthetic seam. The test is `#[ignore]`d and requires an Aqua session, so it runs from
+Terminal.app with `cargo test --test launchd_live -- --ignored --nocapture` after `cargo build
+--no-default-features --bin aiproviderd`. The only remaining open item is that human step: run the
+ignored test from a GUI session and confirm the agent's pid + `/health` + the delegation assert hold.
+It is rewritten here rather than silently overwritten because a stale "next action" is the cheapest way for a
 plan to stop describing its own project.)

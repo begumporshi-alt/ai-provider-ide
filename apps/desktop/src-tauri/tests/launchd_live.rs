@@ -28,10 +28,26 @@
 //! It installs into a scratch directory rather than the real `~/Library/LaunchAgents`, so it cannot
 //! disturb an agent that is already installed, and it uninstalls what it installed.
 //!
-//! **Two things it does not test, stated rather than implied.** It does not test that the *real*
-//! plist location is scanned at login — that needs a logout, and the real location is what 26b's UI
-//! control installs into. And it does not test `aiproviderd` itself serving HTTP: the payload here
-//! is a stand-in that stays up, so a pass means the job runs, not that the gateway answers.
+//! **Three things this file covers (26v):**
+//! 1. `install_produces_a_job_launchd_actually_runs` — a shell-script stand-in payload proves
+//!    that `service::install` produces a job launchd actually *runs*, not merely accepts.
+//! 2. `agent_serves_health_and_app_delegates` — a **real `aiproviderd`** binary (Tauri-free,
+//!    built with `--no-default-features`) is installed as the agent payload, pointed at a scratch
+//!    store via `AIP_DATA_DIR`, and its `/health` endpoint is asserted live. The probe-and-delegate
+//!    path from Phase 6 step 4 (`probe_port` + `app_listener_action`) is then asserted against the
+//!    agent's port: the delegation must read `Some(port)`, not `None`.
+//! 3. **What it does not test, stated rather than implied.** It does not test that the *real*
+//!    plist location is scanned at login — that needs a logout, and the real location is what 26b's
+//!    UI control installs into.
+//!
+//! **The real-binary test (2) requires `aiproviderd` to be built first.** The test looks for
+//! `target/debug/aiproviderd` and skips loudly (prints `SKIP: aiproviderd not built`) when it is
+//! missing. Build it with:
+//!
+//! ```text
+//! cd apps/desktop/src-tauri
+//! cargo build --no-default-features --bin aiproviderd
+//! ```
 
 use ai_provider_router_lib::core::service::{self, Paths};
 use std::path::{Path, PathBuf};
@@ -144,4 +160,129 @@ fn install_produces_a_job_launchd_actually_runs() {
         !paths.plist.exists() && !paths.binary.exists(),
         "uninstall must remove what install wrote"
     );
+}
+
+/// Phase 6 step 4, end-to-end: a **real `aiproviderd`** binary is installed as the agent payload,
+/// its `/health` is asserted live, and the app's probe-and-delegate decision is pinned against the
+/// agent's port.
+///
+/// **The payload is the Tauri-free `aiproviderd` binary, not a shell stand-in.** The first test
+/// proves `service::install` runs a payload; this one proves the *gateway* runs behind it. The two
+/// together close the loop: install → launchd execs `aiproviderd` → the binary opens its own store
+/// → `gateway::spawn` binds → `/health` answers.
+///
+/// `AIP_DATA_DIR` reaches the agent via launchd's `EnvironmentVariables` dict (added to
+/// `render_plist` in 26v), not via a wrapper script. The dict is empty in the production install
+/// path, so the production plist is unchanged.
+///
+/// **Prerequisite:** `target/debug/aiproviderd` must exist. Without it this test skips loudly
+/// (`SKIP: aiproviderd not built`), which is a statement about the build, not a pass.
+#[test]
+#[ignore = "needs a process with an Aqua session; run from Terminal.app with --ignored; requires `cargo build --no-default-features --bin aiproviderd` first"]
+fn agent_serves_health_and_app_delegates() {
+    use ai_provider_router_lib::core::gateway::{app_listener_action, probe_port};
+
+    // The pre-built Tauri-free binary. Without it, the test cannot point the agent at a real
+    // gateway and the 26t delegation has no live listener to assert against.
+    let aip = target_dir().join("debug").join("aiproviderd");
+    if !aip.is_file() {
+        println!(
+            "\nSKIP: {aip:?} not built.\n  Run: cargo build --no-default-features --bin aiproviderd\n  \
+             Then re-run this test. Nothing was installed."
+        );
+        return;
+    }
+
+    let (mut paths, root) = scratch();
+    // Point the agent at a scratch store so it never touches the user's real application data.
+    // `Store::open` creates the SQLite file and runs migrations on first use.
+    paths.environment.insert("AIP_DATA_DIR".into(), paths.data_dir.display().to_string());
+
+    let uid = service::read_uid().expect("`id -u` must answer");
+    let domain = service::domain(uid);
+
+    println!("scratch install at {}", root.display());
+    println!("domain {domain}");
+    println!("agent data dir: {}", paths.data_dir.display());
+
+    match service::install(&paths, &aip, &domain, &service::run_launchctl) {
+        Ok(()) => {}
+        Err(e) if no_aqua_session(&e.to_string()) => {
+            println!("\nSKIP: no Aqua session in this process.\n  launchctl said: {e}\n");
+            println!("Run this from Terminal.app. Nothing was installed; the scratch tree is at");
+            println!("{}", root.display());
+            return;
+        }
+        Err(e) => panic!("install failed for a reason that is not the session: {e}"),
+    }
+
+    // Wait for launchd to spawn the agent and for the gateway to be up.
+    // `aiproviderd`'s `main` blocks on `pending()` after `gateway::spawn`, so the pid is
+    // present the moment launchd execs it — before the tokio runtime has finished binding.
+    // The `/health` assertion below is what pins the bind; the pid poll pins the exec.
+    let deadline = Instant::now() + SPAWN_BUDGET;
+    let mut last = service::status(&paths, &domain, &service::run_launchctl)
+        .expect("`launchctl print` must be answerable once the job is loaded");
+    while last.pid.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        last = service::status(&paths, &domain, &service::run_launchctl).expect("print");
+    }
+
+    let loaded = last.loaded;
+    let pid = last.pid;
+
+    if pid.is_none() {
+        let out_log = std::fs::read_to_string(&paths.out_log).unwrap_or_default();
+        let err_log = std::fs::read_to_string(&paths.err_log).unwrap_or_default();
+        let _ = service::uninstall(&paths, &domain, &service::run_launchctl);
+        println!("\nloaded = {loaded}, pid = None");
+        println!("job stdout: {out_log:?}");
+        println!("job stderr: {err_log:?}");
+        panic!(
+            "the job is loaded but never got a pid within {SPAWN_BUDGET:?} — launchd loaded it \
+             and could not run it. Job stderr: {err_log:?}",
+        );
+    }
+
+    // **The 26t assertion against a live agent, not a seam.** The agent's port is the one the
+    // `aiproviderd` binary read from `persisted_gateway_port` (or fell back to `SERVICE_DEFAULT_PORT`
+    // = 8800 when no setting row exists yet — which is the shape of a fresh scratch store).
+    // Probe it, and the delegate decision must read `Some(port)`, not `None`.
+    let probe = probe_port(8800, Duration::from_secs(3));
+    let action = app_listener_action(&probe, 8800);
+    println!("probe: {probe:?}");
+    println!("app_listener_action: {action:?}");
+
+    let out_log = std::fs::read_to_string(&paths.out_log).unwrap_or_default();
+    let err_log = std::fs::read_to_string(&paths.err_log).unwrap_or_default();
+
+    // Always clean up, and always report whether the cleanup worked — a failed verification that
+    // leaves a job loaded would turn one bad run into a broken machine.
+    let uninstall = service::uninstall(&paths, &domain, &service::run_launchctl);
+    let after = service::status(&paths, &domain, &service::run_launchctl);
+
+    println!("\nloaded = {loaded}, pid = {pid:?}");
+    println!("job stdout: {out_log:?}");
+    println!("job stderr: {err_log:?}");
+    println!("uninstall: {uninstall:?}");
+    println!("after uninstall: {after:?}");
+
+    assert!(loaded, "`bootstrap` returned 0 but launchd does not have the job");
+    assert!(
+        action.is_some(),
+        "probe = {probe:?} but the app must delegate (the agent is serving on 8800). If this \
+         failed, either the agent did not bind 8800 (check the stdout/stderr above) or the probe \
+         did not see it (check the port the agent actually bound)."
+    );
+    assert!(
+        !paths.plist.exists() && !paths.binary.exists(),
+        "uninstall must remove what install wrote"
+    );
+}
+
+/// `aiproviderd` is built into `target/debug/` by `cargo build --no-default-features --bin
+/// aiproviderd`. The test harness runs from `src-tauri/`, so the target dir is two levels up.
+fn target_dir() -> PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    manifest.parent().expect("src-tauri has a parent").to_path_buf()
 }

@@ -136,6 +136,17 @@ the repository root holds only `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY`
 **Developers: start with the [developer book](docs/dev-book/README.md).** It owns the rules, the interfaces and
 the conventions, and it tracks every known doc-versus-code disagreement.
 
+## Security model
+
+The gateway binds to `127.0.0.1` only — it is not reachable from the network. Every admin route
+(`POST /admin/*`, `GET /admin/*`) requires the master key (or a per-app key) in the `Authorization`
+header; the only unauthenticated route is `GET /health`, by design, so a client that does not yet
+hold a key can still discover that the service is up.
+
+API keys are stored in the OS keychain and are never written to disk in plaintext. The egress
+allowlist derives from the providers the user has configured; a request to a host that is not
+allowlisted is refused locally and reported as `NETWORK`, not forwarded.
+
 ## Notes
 
 - The local SQLite database is **gitignored** — a fresh clone starts empty. That is correct, not a bug.

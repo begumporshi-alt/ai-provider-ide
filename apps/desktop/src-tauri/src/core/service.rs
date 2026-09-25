@@ -45,6 +45,7 @@
 //! `BridgeHost` — and the reason is the same: the alternative is a module whose only coverage is
 //! the machine it happens to run on.
 
+use std::collections::BTreeMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -75,6 +76,32 @@ pub struct Paths {
     pub binary: PathBuf,
     pub out_log: PathBuf,
     pub err_log: PathBuf,
+    /// Environment variables set on the agent's process via launchd's `EnvironmentVariables`
+    /// dict. Deliberately a `BTreeMap` so `render_plist` emits keys in a stable order — a
+    /// different order across builds would make the plist diff on re-install, which is a
+    /// symptom an operator chasing "my agent broke after update" would not want to chase.
+    ///
+    /// Empty by default; the production install path does not set any. The harness uses one
+    /// (`AIP_DATA_DIR`) so the agent points at a scratch store rather than the user's real
+    /// application data.
+    pub environment: BTreeMap<String, String>,
+    /// The data directory this install was built for. Not used by `render_plist` — launchd
+    /// only reads `EnvironmentVariables` — but exposed so callers can reconstruct the env var
+    /// value without re-deriving it from `binary`'s parent.
+    pub data_dir: PathBuf,
+}
+
+impl Default for Paths {
+    fn default() -> Self {
+        Self {
+            plist: PathBuf::new(),
+            binary: PathBuf::new(),
+            out_log: PathBuf::new(),
+            err_log: PathBuf::new(),
+            environment: BTreeMap::new(),
+            data_dir: PathBuf::new(),
+        }
+    }
 }
 
 /// Where each piece goes, from the two directories the caller resolves.
@@ -88,6 +115,8 @@ pub fn paths(home: &Path, data_dir: &Path) -> Paths {
         binary: data_dir.join("bin").join("aiproviderd"),
         out_log: data_dir.join("aiproviderd.log"),
         err_log: data_dir.join("aiproviderd.err.log"),
+        environment: BTreeMap::new(),
+        data_dir: data_dir.to_path_buf(),
     }
 }
 
@@ -107,6 +136,21 @@ fn escape_xml(s: &str) -> String {
 /// what make availability independent of the UI process, and both are why installing this while
 /// the app still starts its own gateway is a bind conflict rather than a handover.
 pub fn render_plist(p: &Paths) -> String {
+    let env_dict = if p.environment.is_empty() {
+        String::new()
+    } else {
+        let entries: Vec<String> = p
+            .environment
+            .iter()
+            .map(|(k, v)| {
+                format!("    <key>{}</key>\n    <string>{}</string>", escape_xml(k), escape_xml(v),)
+            })
+            .collect();
+        format!(
+            "    <key>EnvironmentVariables</key>\n    <dict>\n{}\n    </dict>\n",
+            entries.join("\n")
+        )
+    };
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -118,7 +162,7 @@ pub fn render_plist(p: &Paths) -> String {
     <array>
         <string>{binary}</string>
     </array>
-    <key>RunAtLoad</key>
+    {env_dict}<key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <true/>
@@ -131,6 +175,7 @@ pub fn render_plist(p: &Paths) -> String {
 "#,
         label = LABEL,
         binary = escape_xml(&p.binary.display().to_string()),
+        env_dict = env_dict,
         out = escape_xml(&p.out_log.display().to_string()),
         err = escape_xml(&p.err_log.display().to_string()),
     )
@@ -508,6 +553,41 @@ mod tests {
         assert!(plist.contains(&format!("<string>{}</string>", p.binary.display())), "{plist}");
         assert!(plist.contains(&format!("<string>{}</string>", p.out_log.display())), "{plist}");
         assert!(plist.contains(&format!("<string>{}</string>", p.err_log.display())), "{plist}");
+    }
+
+    #[test]
+    fn an_empty_environment_means_no_environment_variables_dict() {
+        let (p, _dir) = scratch();
+        let plist = render_plist(&p);
+        assert!(
+            !plist.contains("EnvironmentVariables"),
+            "no env vars means no dict: the production install shape must not gain one\n{plist}"
+        );
+    }
+
+    #[test]
+    fn a_non_empty_environment_emits_the_dict_with_each_key_escaped() {
+        let (mut p, _dir) = scratch();
+        p.environment.insert("AIP_DATA_DIR".into(), "/tmp/a&b/aiproviderd-data".into());
+        let plist = render_plist(&p);
+        assert!(plist.contains("EnvironmentVariables"), "{plist}");
+        assert!(plist.contains("<key>AIP_DATA_DIR</key>"), "{plist}");
+        assert!(
+            plist.contains("<string>/tmp/a&amp;b/aiproviderd-data</string>"),
+            "the env value must be XML-escaped like every other string: {plist}"
+        );
+    }
+
+    #[test]
+    fn the_environment_dict_sits_between_program_arguments_and_run_at_load() {
+        let (mut p, _dir) = scratch();
+        p.environment.insert("HOME".into(), "/home/tester".into());
+        let plist = render_plist(&p);
+        let prog = plist.find("</array>").expect("ProgramArguments array is missing");
+        let env_key = plist.find("EnvironmentVariables").expect("dict key is missing");
+        let run = plist.find("RunAtLoad").expect("RunAtLoad is missing");
+        assert!(prog < env_key, "the dict must come after ProgramArguments");
+        assert!(env_key < run, "the dict must come before RunAtLoad");
     }
 
     #[test]

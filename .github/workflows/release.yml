@@ -84,6 +84,17 @@ jobs:
           releaseDraft: true
           prerelease: false
 
+      # The distributed service binary must not link WebKit. `tauri build` always overwrites the
+      # bundled `aiproviderd` with the default-features (Tauri/WebKit) one, so the post-bundle
+      # substitution is a step, not a property of the build: without it, the 26s gate (the
+      # `check-bundled-aiproviderd-links.sh` otool check) would redden and the release would be a
+      # WebKit-linked service binary, which is the exact thing the no-WebKit build exists to avoid.
+      - name: Substitute the Tauri-free aiproviderd into the bundle
+        run: bash scripts/substitute-tauri-free-aiproviderd.sh
+
+      - name: Verify bundled aiproviderd links no WebKit
+        run: bash scripts/check-bundled-aiproviderd-links.sh
+
       # Read the artefacts back and prove what they are, instead of trusting that the environment
       # variables above were enough. `codesign --verify` alone would NOT catch this: an ad-hoc
       # signature is a *valid* signature and passes it. The checks that separate the two states are
