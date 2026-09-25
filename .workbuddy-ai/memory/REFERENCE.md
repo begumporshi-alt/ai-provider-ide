@@ -5103,4 +5103,13 @@ The Tests row's documented **1216** had already aged by 54 across 26c–26i.
 **Tool hazard:** bash `grep -c "A\|B"` returned a false `0` twice over code that was present. Use the
 host-side Grep tool for an absence claim.
 
+**The 8,000 B cap: the number is established, the enforcement point is not.** Prior sessions measured
+`MEMORY.md` against 8,000 B and paid for additions rather than appending (26l, and the two rules at
+:5086). But on 26n the file sat at **8,237 B** and the working-memory block injected at session start
+reproduced it **in full** — the last bullet's final clause was present, nothing truncated mid-rule. So
+one of three things is true and none has been measured: the threshold is above 8,000, truncation is
+applied at a coarser granularity than a rule, or the cap governs a representation other than the file's
+byte count. **Do not treat 8,237 as proof the cap is imaginary, and do not treat 8,000 as a measured
+cliff.** The file was trimmed back under the cap on 26n — the tighter index is worth having either way.
+
 
