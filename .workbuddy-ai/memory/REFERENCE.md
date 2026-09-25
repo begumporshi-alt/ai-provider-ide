@@ -2397,6 +2397,48 @@ Assistant/UI path only, so moving it to `tauri/` wholesale costs the service not
   `cfg(test)`. Harmless for `--bin aiproviderd`, but "core never imports tauri/" is false under `cargo test`.
   Still true, and now gated: **8 references in 5 functions**, each carrying `#[cfg(feature = "app")]`.
 
+### `service::install` — what it verifies, and the two facts that decide whether a job runs (measured 2026-09-25, increment 26q)
+
+`core/service.rs` copies the bundled `aiproviderd` to `~/Library/Application Support/dev.aiprovider.router/bin/`,
+renders a LaunchAgent plist, `bootout`s the label, then `bootstrap`s it, and returns `Ok(())` on launchctl's exit
+code. Three measured facts about that sequence:
+
+1. **`bootstrap` registers a job; it does not exec the program.** A non-executable binary yields a job that
+   `launchctl` reports *loaded* whose every spawn fails `EACCES`, which `KeepAlive` retries until launchd
+   throttles the job. The operator's view is "installed". Until 26q `install` returned `Ok(())` for exactly that
+   binary — it claimed success on the exit code alone. `verify_executable` now runs **immediately after
+   `fs::copy` and before any launchd state is touched**, so a `0644` source is refused with
+   `not executable (mode 0644)` and no `launchctl` call is made. It deliberately has **no `chmod`**: `fs::copy`
+   preserves the source mode, so re-spelling the fact would hide a broken bundle rather than report it.
+2. **Only a process in a GUI login session may mutate `gui/<uid>`.** `launchctl managername` returns `Aqua`
+   even in a shell where `launchctl list` returns **0 lines** and every `bootstrap` exits `5: Input/output
+   error`. The failure is identical under `gui/501`, `user/501`, `load -w` and `load -S Aqua -w`, so it is the
+   *calling process's session* — not the domain, the plist, or the verb.
+3. **`bootstrap`'s exit code is not a discriminator** — every failure shape is EIO, including a malformed plist
+   and a missing session. Only two things distinguish a job that is *up*: a `pid` in `launchctl print`, and the
+   payload's own marker file.
+
+**The live harness.** `apps/desktop/src-tauri/tests/launchd_live.rs`, `#[ignore]`d, installs into a scratch
+directory (not the real `~/Library/LaunchAgents`), polls `status` for a pid, asserts the payload's marker, and
+always uninstalls. Run it from Terminal.app:
+
+```
+cargo test --test launchd_live -- --ignored --nocapture
+```
+
+**A green run with no `SKIP` line is the verification; a green run with one is not** — it prints `SKIP` (carrying
+launchctl's own message) when there is no session. Read the output, not the exit code. CI cannot run it.
+
+**`plutil -lint` is the external check on `render_plist`.** Substring assertions only prove the renderer agrees
+with itself; `the_rendered_plist_survives_a_real_plist_parser` pipes the output through `/usr/bin/plutil` with a
+path carrying `&`, `<` and `>`, and prints `SKIP` if `plutil` is absent.
+
+**The fixture lesson (D55).** The unit suite's `source()` fixture wrote its source with `std::fs::write` (mode
+`0644`) under a comment claiming *"the one property that matters: it exists"*. All 15 tests therefore installed a
+non-executable binary, and the defect was invisible **from inside the suite written to catch it**. A fixture's
+comment is a claim about the invariant the test depends on; the fixture now sets `0755` explicitly, and
+`non_executable_source()` supplies the hostile `0644`.
+
 ## Feature-gating `core/` away from Tauri — landed 2026-09-23
 
 The end state: `cargo build --bin aiproviderd --no-default-features` compiles **no Tauri at all** — not the
