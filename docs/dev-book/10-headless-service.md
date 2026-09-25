@@ -3292,6 +3292,32 @@ have it" tests green — which is what separates the three status states from on
 **Measured:** `cargo test` lib **1201 → 1216**, binary **5 → 5** — 15 new tests in `core/service.rs`. Gates:
 `fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean.
 
+**The live run, and the one thing it could not reach (2026-09-25).** A temporary integration probe
+(`tests/launchd_live.rs`, deleted after the run) drove the **real** `service::install` against the real
+`launchctl`: real `~/Library/LaunchAgents`, real copy of the binary, real `bootstrap`, then `GET /health`,
+then `uninstall`. What it established, measured:
+
+- The plist this module generates is **accepted by `plutil -lint`** — `OK`, 779 bytes — and points at
+  `/Users/tushershikder/Library/Application Support/dev.aiprovider.router/bin/aiproviderd`.
+- `fs::copy` preserves the executable bit, so no `chmod` is needed: the installed binary is `-rwxr-xr-x`.
+- The failure path reports usefully — `launchctl bootstrap gui/501 … failed (5): Bootstrap failed: 5:
+  Input/output error` — naming the domain and launchctl's own message, not a paraphrase.
+
+**And the one thing it did not reach:** `bootstrap` returned **error 5 (EIO)**, from a shell with no launchd
+user session. Measured: `launchctl list` returns **0 lines** in that context, while `launchctl print gui/501`
+shows the domain alive (`type = login`, `creator = loginwindow[171]`, 410 services). Both the modern
+`bootstrap gui/501` and the legacy `launchctl load -w` fail identically, and so does `bootstrap user/501` —
+so this is the *calling process's session*, not the domain, the plist or the verb. Ruled out along the way:
+the sandbox (it fails with the sandbox off too), a malformed plist (`plutil` says otherwise), and the
+`com.apple.provenance` xattr on the plist and the binary (stripping both changed nothing).
+
+**What that means, and what it does not.** It does **not** indicate a defect in `core/service.rs`: mutating
+`gui/<uid>` requires a process with an Aqua session, and the Tauri app is one by construction — this is the
+ordinary reason a CLI cannot install a LaunchAgent. It **does** mean the end-to-end claim for 26a is
+**unverified**, and it must stay that way until something with a session calls `install`. That is 26b's UI
+control, and this paragraph is the debt it has to pay. The state was left clean: no plist, no copied binary,
+no job in `gui/501`.
+
 ---
 
 ## 12. What we know we do not know
@@ -3309,6 +3335,13 @@ real containment failure lives. See §2.1.3.
   and D24.
 - Whether launchd's `KeepAlive` behaves correctly when the binary is inside an `.app` bundle that
 is updated (the path changes). This needs a real update cycle to verify.
+- **Whether `service::install` actually gets a job running.** Unverified as of 2026-09-25. The one live
+  attempt returned `Bootstrap failed: 5: Input/output error` from a shell with **no launchd user session**
+  (`launchctl list` → 0 lines), and both `bootstrap` and the legacy `load` fail there while
+  `launchctl print gui/501` shows the domain alive — so the evidence points at the caller's session, not at
+  the plist or the domain. A CLI is not a process that may mutate `gui/<uid>`; the Tauri app is. Closing
+  this needs a caller with an Aqua session, which is what 26b's UI control provides. Full measurement in
+  the 26a note above
 
 ---
 
