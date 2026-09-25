@@ -36,9 +36,11 @@ use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::core::context;
 use crate::core::gateway::{
     check_gateway_key, err, openai_error, peer_ip, GatewayCore, APP_KEY_PREFIX,
 };
+use crate::core::memory;
 use crate::core::persist;
 use crate::core::store::Store;
 
@@ -708,6 +710,571 @@ pub async fn ledger_recent_h(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not read the ledger: {e}"),
             Some("ledger_read_failed"),
+        ),
+    }
+}
+
+// ── Memory (P7) ────────────────────────────────────────────────────────────
+//
+// Memory is service-owned, not app-owned. `core/memory.rs` and `core/context_scope.rs` are both
+// Rust and both available to the headless binary, and the gateway already injects a memory block
+// at system position 0 on every request (§5.5, the `AIP-Memory` header). So the headless service
+// could *use* memory before these routes existed; what it could not do is let anyone *manage* it.
+//
+// **Two spellings on one surface, and it is not a mistake.** The `persist::*` rows above are
+// camelCase (symmetric read+write registry rows). `memory::MemoryInput` is **snake_case with
+// `deny_unknown_fields`** — see the note on that struct: serde's default silently turns a
+// misspelled key into `None`, which is exactly how `memory_capture_batch` dropped `session_id`
+// for months and disabled the per-session ring cap in `prune`. These routes reuse the struct
+// rather than reshaping it, so the wire spelling cannot drift from the one the tests pin.
+//
+// **Capture is not injection.** A row is born `Unscoped`, which is capture-only and never
+// injected; `assign_scope` is the only way in, and it is a deliberate human act. Nothing here
+// auto-binds — an auto-bound atom would make the header-less client degrade to global.
+
+/// `GET /admin/memory` — the Memory screen's list, filtered by layer.
+///
+/// The query is read as a raw map for the same reason as `memory_session_atoms_h`: a typed
+/// `Query` extractor rejects before `authorize` ever runs, so a malformed query would be answered
+/// by a route that has not checked who is asking.
+pub async fn memory_list_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/memory") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let layer = params.get("layer").map(|s| s.as_str());
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
+    match memory::list(store, layer, limit) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not list memories: {e}"),
+            Some("memory_list_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory` — capture one. The body is `memory::MemoryInput` verbatim.
+pub async fn memory_capture_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(input): Json<memory::MemoryInput>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::capture(store, &input) {
+        Ok(m) => (StatusCode::OK, Json(m)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("could not capture the memory: {e}"),
+            Some("memory_capture_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/batch` — capture several in one transaction.
+pub async fn memory_capture_batch_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(items): Json<Vec<memory::MemoryInput>>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/batch") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::capture_batch(store, &items) {
+        Ok(n) => (StatusCode::OK, Json(json!({ "captured": n }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("could not capture the memories: {e}"),
+            Some("memory_capture_batch_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/recall` — BM25 recall. A POST because `layers` is an array; a GET would
+/// force it into a delimiter-encoded string for no reason.
+#[derive(Deserialize)]
+pub struct MemoryRecallBody {
+    pub query: String,
+    pub limit: Option<usize>,
+    pub layers: Option<Vec<String>>,
+}
+
+pub async fn memory_recall_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<MemoryRecallBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/recall") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::recall(store, &body.query, body.limit.unwrap_or(8), body.layers.as_deref()) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not recall: {e}"),
+            Some("memory_recall_failed"),
+        ),
+    }
+}
+
+/// `DELETE /admin/memory/{id}` — forget one.
+pub async fn memory_forget_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "DELETE /admin/memory/{id}") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::forget(store, &id) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not forget the memory: {e}"),
+            Some("memory_forget_failed"),
+        ),
+    }
+}
+
+/// `PUT /admin/memory/{id}` — rewrite the text of one.
+#[derive(Deserialize)]
+pub struct MemoryUpdateBody {
+    pub text: String,
+}
+
+pub async fn memory_update_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryUpdateBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "PUT /admin/memory/{id}") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::update(store, &id, &body.text) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not update the memory: {e}"),
+            Some("memory_update_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/{id}/pin` — pinning exempts a row from retention.
+#[derive(Deserialize)]
+pub struct MemoryPinBody {
+    pub pinned: bool,
+}
+
+pub async fn memory_set_pinned_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryPinBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/{id}/pin") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::set_pinned(store, &id, body.pinned) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not pin the memory: {e}"),
+            Some("memory_pin_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/memory/{id}/scope` — the review surface. Flat, not a tagged enum, for the same
+/// reason `MemoryScopeInput` is: a Rust enum variant is an awkward thing to construct in TS.
+#[derive(Deserialize)]
+pub struct MemoryScopeBody {
+    /// `project` | `global` | `unscoped`.
+    pub kind: String,
+    pub project: Option<String>,
+    pub agent: Option<String>,
+}
+
+pub async fn memory_assign_scope_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<MemoryScopeBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/{id}/scope") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let assignment = match body.kind.trim().to_ascii_lowercase().as_str() {
+        // An absent project falls through to `assign_scope`'s own "project scope is empty"
+        // refusal rather than being silently defaulted here.
+        "project" => memory::ScopeAssignment::Project {
+            project: body.project.unwrap_or_default(),
+            agent: body.agent,
+        },
+        "global" => memory::ScopeAssignment::Global,
+        "unscoped" => memory::ScopeAssignment::Unscoped,
+        other => {
+            return admin_error(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown scope kind '{other}'"),
+                Some("unknown_scope_kind"),
+            )
+        }
+    };
+    match memory::assign_scope(store, &id, assignment) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("could not bind the memory: {e}"),
+            Some("memory_scope_failed"),
+        ),
+    }
+}
+
+/// `GET /admin/memory/session/{session_id}` — one session's atoms, which is what the per-session
+/// ring cap in `prune` keys on.
+///
+/// The query is read as a raw map rather than a typed struct **because an extractor runs before
+/// the handler body**. A typed `Query<{ layer: String }>` rejects a request with no `layer` with a
+/// 400 that never reaches `authorize` — so a malformed request gets an answer from a route that
+/// has not checked who is asking. Parsing after auth keeps the rule the auth test pins: nothing
+/// on this surface answers before it authenticates.
+pub async fn memory_session_atoms_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/memory/session/{session_id}") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let Some(layer) = params.get("layer").map(|s| s.as_str()) else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "GET /admin/memory/session/{session_id} needs a `layer`",
+            Some("missing_layer"),
+        );
+    };
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
+    match memory::session_atoms(store, &session_id, layer, limit) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read the session's atoms: {e}"),
+            Some("memory_session_failed"),
+        ),
+    }
+}
+
+/// `DELETE /admin/memory` — wipe the table. No scope filter, and that is the point: a partial
+/// clear would leave the operator unable to say what is still remembered.
+pub async fn memory_clear_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "DELETE /admin/memory") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::clear(store) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not clear memory: {e}"),
+            Some("memory_clear_failed"),
+        ),
+    }
+}
+
+/// `GET /admin/memory/stats` — per-layer counts plus how many rows are actually injectable.
+pub async fn memory_stats_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/memory/stats") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::stats(store) {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read memory stats: {e}"),
+            Some("memory_stats_failed"),
+        ),
+    }
+}
+
+/// §6.4.3 — mark one memory superseded by another. The old row is kept, not deleted.
+#[derive(Deserialize)]
+pub struct MemorySupersedeBody {
+    pub old: String,
+    pub new: String,
+}
+
+pub async fn memory_supersede_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<MemorySupersedeBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/supersede") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    // A pinned or L3 row is refused by `supersede` itself (§6.4.5), and that refusal is a 400
+    // here rather than a silent false: the caller asked for an act the policy forbids.
+    match memory::supersede(store, &body.old, &body.new) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("could not supersede: {e}"),
+            Some("memory_supersede_failed"),
+        ),
+    }
+}
+
+/// §6.4.3 — undo a supersession. The row was never deleted, so this only makes it reachable again.
+pub async fn memory_unsupersede_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/{id}/unsupersede") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::unsupersede(store, &id) {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not unsupersede: {e}"),
+            Some("memory_unsupersede_failed"),
+        ),
+    }
+}
+
+/// §6.4.5 — what the Memory screen has to put in front of a human.
+pub async fn memory_conflicts_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/memory/conflicts") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::conflicts(store) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read conflicts: {e}"),
+            Some("memory_conflicts_failed"),
+        ),
+    }
+}
+
+/// §6.2 retention. A POST rather than something the request path does: pruning there would add a
+/// second write to the hottest code in the app.
+pub async fn memory_prune_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/prune") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match memory::prune(store) {
+        Ok(s) => (StatusCode::OK, Json(s)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not prune: {e}"),
+            Some("memory_prune_failed"),
+        ),
+    }
+}
+
+/// Which client may use memory, independent of whether the machine does. The master switch still
+/// beats every row here — turning memory off globally has to remain one unambiguous act.
+pub async fn memory_principal_list_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/memory/principals") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match crate::core::gateway::principal::list(store) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not list principals: {e}"),
+            Some("principal_list_failed"),
+        ),
+    }
+}
+
+/// `enabled: null` returns the principal to inheriting the master switch.
+#[derive(Deserialize)]
+pub struct PrincipalPolicyBody {
+    pub principal: String,
+    pub enabled: Option<bool>,
+}
+
+pub async fn memory_principal_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<PrincipalPolicyBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/memory/principals") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let res = match body.enabled {
+        Some(on) => crate::core::gateway::principal::set(store, &body.principal, on),
+        None => crate::core::gateway::principal::clear(store, &body.principal),
+    };
+    match res {
+        Ok(v) => (StatusCode::OK, Json(json!({ "ok": v }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not set the principal policy: {e}"),
+            Some("principal_set_failed"),
+        ),
+    }
+}
+
+// ── Context graph (P4) ─────────────────────────────────────────────────────
+//
+// Nodes and edges are recorded in one batch so a turn is never half-present. The gateway writes
+// here during a request (`gateway_cmds.rs`), so the headless service needs the write path, not
+// just the read.
+//
+// The History screen's own two commands (`history_sessions`, `history_timeline`) are deliberately
+// **not** ported: 26e's scope correction measured them as app-owned UI state, not service data.
+
+#[derive(Deserialize)]
+pub struct ContextRecordBody {
+    pub nodes: Vec<context::ContextNode>,
+    pub edges: Vec<context::ContextEdge>,
+}
+
+pub async fn context_record_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<ContextRecordBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/context") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    // `context::record` refuses an unknown node kind, and that is a 400: the caller named a kind
+    // the graph does not have, which is a caller error, not a server fault.
+    match context::record(store, &body.nodes, &body.edges) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("could not record the context: {e}"),
+            Some("context_record_failed"),
+        ),
+    }
+}
+
+pub async fn context_graph_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/context") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    let limit = params.get("limit").and_then(|s| s.parse::<usize>().ok()).unwrap_or(200);
+    match context::graph(store, limit) {
+        Ok(g) => (StatusCode::OK, Json(g)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read the context graph: {e}"),
+            Some("context_graph_failed"),
+        ),
+    }
+}
+
+pub async fn context_clear_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "DELETE /admin/context") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match context::clear(store) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not clear the context graph: {e}"),
+            Some("context_clear_failed"),
         ),
     }
 }

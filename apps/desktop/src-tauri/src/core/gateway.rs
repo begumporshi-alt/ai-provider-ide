@@ -1976,6 +1976,33 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         )
         .route("/admin/aliases", get(admin::aliases_list_h).post(admin::aliases_replace_h))
         .route("/admin/ledger", get(admin::ledger_recent_h))
+        // Memory and context. The static segments are declared before `/admin/memory/{id}` so a
+        // literal path is never captured as an id — the ordering is load-bearing, not cosmetic.
+        .route(
+            "/admin/memory",
+            get(admin::memory_list_h).post(admin::memory_capture_h).delete(admin::memory_clear_h),
+        )
+        .route("/admin/memory/batch", post(admin::memory_capture_batch_h))
+        .route("/admin/memory/recall", post(admin::memory_recall_h))
+        .route("/admin/memory/stats", get(admin::memory_stats_h))
+        .route("/admin/memory/conflicts", get(admin::memory_conflicts_h))
+        .route("/admin/memory/prune", post(admin::memory_prune_h))
+        .route("/admin/memory/supersede", post(admin::memory_supersede_h))
+        .route(
+            "/admin/memory/principals",
+            get(admin::memory_principal_list_h).post(admin::memory_principal_set_h),
+        )
+        .route("/admin/memory/session/{session_id}", get(admin::memory_session_atoms_h))
+        .route("/admin/memory/{id}", delete(admin::memory_forget_h).put(admin::memory_update_h))
+        .route("/admin/memory/{id}/pin", post(admin::memory_set_pinned_h))
+        .route("/admin/memory/{id}/scope", post(admin::memory_assign_scope_h))
+        .route("/admin/memory/{id}/unsupersede", post(admin::memory_unsupersede_h))
+        .route(
+            "/admin/context",
+            get(admin::context_graph_h)
+                .post(admin::context_record_h)
+                .delete(admin::context_clear_h),
+        )
         // Both refusals authenticate first, for the same reason `unknown_route` does: an
         // unauthenticated 404 or 405 is a statement that the route exists.
         .method_not_allowed_fallback(method_not_allowed)

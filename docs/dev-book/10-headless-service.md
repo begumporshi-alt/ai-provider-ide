@@ -3467,9 +3467,11 @@ pure HTTP**, and its scope **corrected by measurement** (107 commands, narrowed 
 service owns — see the decision entry); ~~add CORS~~ **landed 26c**; ~~add the §5.3 admin routes~~
 **landed 26d**; ~~provider CRUD~~ **landed 26e**, which also added the allowlist seam the routes
 need. ~~Remaining CRUD routes — api-keys, manifests (+ activate), models cache,
-aliases, ledger read~~ **landed 26f** (committed `449d4ec`, pushed). After that, the
-memory/context routes (~25), the tool toggles and service management, and finally
-the TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
+aliases, ledger read~~ **landed 26f** (committed `449d4ec`, pushed); ~~the memory/context routes~~
+**landed 26g** — 17 memory + 3 context-graph routes. The History screen's two commands
+(`history_sessions`, `history_timeline`) are **not** ported: 26e measured them as app-owned UI
+state, not service data. After that, the tool toggles and service management, and finally the
+TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
 binary is bundled undeclared). With `RunAtLoad` set, the agent and the app both bind the same
 persisted port, so the agent is only usable once the app stops starting its own gateway — which is
 what step 4 does. The other decisions in §10 still stand.

@@ -3519,10 +3519,31 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("GET", "/admin/aliases", json!(null)),
         ("POST", "/admin/aliases", json!(null)), // 422 is fine
         ("GET", "/admin/ledger", json!(null)),
+        ("GET", "/admin/memory", json!(null)),
+        ("POST", "/admin/memory", json!({ "layer": "L1", "text": "x" })),
+        ("DELETE", "/admin/memory", json!(null)),
+        ("POST", "/admin/memory/batch", json!([])),
+        ("POST", "/admin/memory/recall", json!({ "query": "x" })),
+        ("GET", "/admin/memory/stats", json!(null)),
+        ("GET", "/admin/memory/conflicts", json!(null)),
+        ("POST", "/admin/memory/prune", json!(null)),
+        ("POST", "/admin/memory/supersede", json!({ "old": "a", "new": "b" })),
+        ("GET", "/admin/memory/principals", json!(null)),
+        ("POST", "/admin/memory/principals", json!({ "principal": "p" })),
+        ("GET", "/admin/memory/session/s1", json!(null)),
+        ("DELETE", "/admin/memory/m1", json!(null)),
+        ("PUT", "/admin/memory/m1", json!({ "text": "x" })),
+        ("POST", "/admin/memory/m1/pin", json!({ "pinned": true })),
+        ("POST", "/admin/memory/m1/scope", json!({ "kind": "global" })),
+        ("POST", "/admin/memory/m1/unsupersede", json!(null)),
+        ("GET", "/admin/context", json!(null)),
+        ("POST", "/admin/context", json!({ "nodes": [], "edges": [] })),
+        ("DELETE", "/admin/context", json!(null)),
     ] {
         let s = start_with_store().await;
         let res = match method {
             "GET" => s.client.get(format!("{}{}", s.base, path)).send().await.unwrap(),
+            "PUT" => s.client.put(format!("{}{}", s.base, path)).json(&body).send().await.unwrap(),
             "POST" => {
                 s.client.post(format!("{}{}", s.base, path)).json(&body).send().await.unwrap()
             }
@@ -4022,6 +4043,416 @@ async fn admin_ledger_read_honours_limit() {
     assert_eq!(res.status(), 200);
     let rows: Value = res.json().await.unwrap();
     assert_eq!(rows.as_array().map(|a| a.len()), Some(2), "limit=2 must return two rows: {rows}");
+}
+
+// ── memory ─────────────────────────────────────────────────────────────────
+
+/// The regression that `MemoryInput`'s `deny_unknown_fields` exists for. Serde's default silently
+/// turns a misspelled key into `None`, which is exactly how `memory_capture_batch` dropped
+/// `session_id` for months and disabled the per-session ring cap in `prune`. The route reuses the
+/// struct rather than reshaping it, so the wire spelling is the one the struct already pins.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_capture_keeps_the_snake_case_session_id() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L0", "text": "hello", "session_id": "s1" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let m: Value = res.json().await.unwrap();
+    assert_eq!(
+        m.get("session_id").and_then(|v| v.as_str()),
+        Some("s1"),
+        "a snake_case session_id must survive the route, or the per-session ring cap in `prune` \
+         is silently disabled: {m}"
+    );
+}
+
+/// The other half of the same regression: `deny_unknown_fields` makes the camelCase spelling a
+/// hard error rather than a silent `None`. Without it the misspelling is ignored, the row lands
+/// with `session_id = NULL`, and the per-session ring cap in `prune` — guarded by
+/// `session_id IS NOT NULL` — quietly stops applying.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_capture_rejects_the_camel_case_spelling() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L0", "text": "hello", "sessionId": "s1" }))
+        .send()
+        .await
+        .unwrap();
+    assert!(
+        res.status().as_u16() >= 400,
+        "`sessionId` must be refused, not silently dropped — got {}",
+        res.status()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_capture_and_list_round_trip() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "prefers dark mode" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/memory?layer=L1", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    let arr = rows.as_array().expect("a list");
+    assert_eq!(arr.len(), 1, "one captured atom, filtered to its layer: {rows}");
+    assert_eq!(arr[0].get("text").and_then(|v| v.as_str()), Some("prefers dark mode"));
+}
+
+/// Batch capture, which is the path the original `session_id` bug lived on.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_capture_batch_reports_the_count() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/batch", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!([
+            { "layer": "L1", "text": "one" },
+            { "layer": "L1", "text": "two" },
+        ]))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body.get("captured").and_then(|v| v.as_u64()), Some(2), "two captured: {body}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_recall_finds_a_captured_atom() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "Postgres runs on port 5432" }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/recall", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "query": "Postgres", "limit": 5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    let arr = rows.as_array().expect("a list");
+    assert!(!arr.is_empty(), "BM25 must find the atom it just stored: {rows}");
+}
+
+/// Capture is not injection: a row is born `Unscoped` and must not be returned by a scoped recall
+/// until someone binds it on purpose.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_a_captured_row_is_not_injectable_until_scoped() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "an unbound atom" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let m: Value = res.json().await.unwrap();
+    let id = m.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+    let before = s.core.store().unwrap().clone();
+    let stats_before = crate::core::memory::stats(&before).unwrap();
+    assert_eq!(
+        stats_before.injectable, 0,
+        "a freshly captured row is Unscoped, which is capture-only and never injected"
+    );
+
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/{id}/scope", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "kind": "global" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "binding to global must succeed");
+
+    let stats_after = crate::core::memory::stats(&before).unwrap();
+    assert_eq!(stats_after.injectable, 1, "and the bind is what makes it injectable");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_assign_scope_refuses_an_unknown_kind() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory/m1/scope", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "kind": "sometimes" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "an unknown scope kind is a caller error, not a silent default");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_forget_removes_the_row() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "forget me" }))
+        .send()
+        .await
+        .unwrap();
+    let m: Value = res.json().await.unwrap();
+    let id = m.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+    let res = s
+        .client
+        .delete(format!("{}/admin/memory/{id}", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(0), "the row is gone: {rows}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_update_rewrites_the_text() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "before" }))
+        .send()
+        .await
+        .unwrap();
+    let m: Value = res.json().await.unwrap();
+    let id = m.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+    let res = s
+        .client
+        .put(format!("{}/admin/memory/{id}", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "text": "after" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(
+        rows.as_array()
+            .and_then(|a| a.first())
+            .and_then(|r| r.get("text"))
+            .and_then(|v| v.as_str()),
+        Some("after"),
+        "the text is rewritten: {rows}"
+    );
+}
+
+/// `session_atoms` is what the per-session ring cap in `prune` keys on, so the route has to carry
+/// the session through — the same fact the snake_case test pins at the write end.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_session_atoms_reads_back_the_sessions_rows() {
+    let s = start_with_store().await;
+    for (sid, text) in [("s1", "in s1"), ("s2", "in s2")] {
+        s.client
+            .post(format!("{}/admin/memory", s.base))
+            .header("authorization", "Bearer sk-aip-test")
+            .json(&json!({ "layer": "L0", "text": text, "session_id": sid }))
+            .send()
+            .await
+            .unwrap();
+    }
+
+    let res = s
+        .client
+        .get(format!("{}/admin/memory/session/s1?layer=L0", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    let arr = rows.as_array().expect("a list");
+    assert_eq!(arr.len(), 1, "only s1's rows: {rows}");
+    assert_eq!(arr[0].get("session_id").and_then(|v| v.as_str()), Some("s1"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_clear_empties_the_table() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "layer": "L1", "text": "x" }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = s
+        .client
+        .delete(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/memory", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let rows: Value = res.json().await.unwrap();
+    assert_eq!(rows.as_array().map(|a| a.len()), Some(0), "cleared: {rows}");
+}
+
+/// The master switch beats every per-principal row, so the list is readable without writing.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_principals_list_is_an_empty_array_on_a_fresh_store() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/memory/principals", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let rows: Value = res.json().await.unwrap();
+    assert!(rows.is_array(), "a list, not an object: {rows}");
+}
+
+// ── context ────────────────────────────────────────────────────────────────
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_context_record_and_graph_round_trip() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({
+            "nodes": [{ "id": "n1", "kind": "memory", "label": "an atom", "source": "ui", "ts": 1 }],
+            "edges": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "a valid node kind is accepted: {:?}", res.text().await);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let g: Value = res.json().await.unwrap();
+    let nodes = g.get("nodes").and_then(|v| v.as_array()).expect("nodes");
+    assert_eq!(nodes.len(), 1, "the recorded node is in the graph: {g}");
+}
+
+/// `context::record` refuses an unknown kind, and that is a 400 — the caller named a kind the
+/// graph does not have, which is not a server fault.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_context_record_refuses_an_unknown_node_kind() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({
+            "nodes": [{ "id": "n1", "kind": "not-a-kind", "label": "x", "source": "ui", "ts": 1 }],
+            "edges": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "an unknown kind is refused, not silently dropped");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_context_clear_empties_the_graph() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({
+            "nodes": [{ "id": "n1", "kind": "memory", "label": "x", "source": "ui", "ts": 1 }],
+            "edges": [],
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = s
+        .client
+        .delete(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = s
+        .client
+        .get(format!("{}/admin/context", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let g: Value = res.json().await.unwrap();
+    let nodes = g.get("nodes").and_then(|v| v.as_array()).expect("nodes");
+    assert!(nodes.is_empty(), "cleared: {g}");
 }
 
 #[test]
