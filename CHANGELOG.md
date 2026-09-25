@@ -11,6 +11,8 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-09-26
+
 ### Added
 
 - **Headless service, Phase 1 — the gateway no longer has to live inside the desktop app.** The Rust
