@@ -1,0 +1,147 @@
+//! The live launchd check, as a command rather than a paragraph.
+//!
+//! **`#[ignore]`d on purpose, and the reason is the whole point of the file.** Registering a
+//! `LaunchAgent` requires a process with an **Aqua session**. A shell spawned by an IDE, an agent
+//! host or an SSH connection does not have one, and `launchctl bootstrap` answers
+//! `5: Input/output error` there while `launchctl print gui/<uid>` still shows the domain alive and
+//! well. Measured twice — 26a's throwaway probe and 26q's independent re-run — with the sandbox
+//! ruled out by running outside it, the plist validated by `plutil -lint`, and the legacy
+//! `load -w` and `bootstrap user/<uid>` failing identically. So this cannot be a gate step: on CI
+//! it would go red for a reason that has nothing to do with the code, which is how a suite teaches
+//! people to ignore it.
+//!
+//! Run it from **Terminal.app**, which launchd starts inside the GUI session:
+//!
+//! ```text
+//! cd apps/desktop/src-tauri
+//! cargo test --test launchd_live -- --ignored --nocapture
+//! ```
+//!
+//! **A pass means one of two things, and which one is printed rather than inferred.** With no Aqua
+//! session this prints `SKIP` and returns — that is a statement about the environment and *not* a
+//! verification. With a session it asserts the real claim 26a could not close: **that
+//! `service::install` produces a job launchd actually runs**, not merely one launchd accepted.
+//! `bootstrap` registers a job; it does not exec the program, so acceptance and execution are
+//! different facts and only the second one is the gateway being up. **A green run with no `SKIP`
+//! line is the verification; a green run with one is not.** Read the output, not the exit code.
+//!
+//! It installs into a scratch directory rather than the real `~/Library/LaunchAgents`, so it cannot
+//! disturb an agent that is already installed, and it uninstalls what it installed.
+//!
+//! **Two things it does not test, stated rather than implied.** It does not test that the *real*
+//! plist location is scanned at login — that needs a logout, and the real location is what 26b's UI
+//! control installs into. And it does not test `aiproviderd` itself serving HTTP: the payload here
+//! is a stand-in that stays up, so a pass means the job runs, not that the gateway answers.
+
+use ai_provider_router_lib::core::service::{self, Paths};
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+/// How long launchd gets to spawn the job before the test calls it a failure. `RunAtLoad` starts it
+/// as part of loading, so this is generous rather than tight.
+const SPAWN_BUDGET: Duration = Duration::from_secs(20);
+
+/// A payload that stays up with **no arguments**, because `render_plist` emits a one-element
+/// `ProgramArguments` and names no interpreter.
+///
+/// It is a shell script relying on the kernel honouring the shebang, which is the ordinary
+/// behaviour of `execve` and is **not** something this repository has measured before now — so if
+/// the job loads and never gets a pid, suspect this before suspecting `install`. The marker file it
+/// writes is the proof that *this* program ran rather than some other process launchd happened to
+/// have.
+fn payload(dir: &Path) -> PathBuf {
+    let path = dir.join("payload");
+    let marker = dir.join("marker.txt");
+    std::fs::write(
+        &path,
+        format!("#!/bin/sh\nprintf 'ran\\n' > {}\nsleep 120\n", marker.display()),
+    )
+    .expect("the scratch directory must be writable");
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    std::os::unix::fs::PermissionsExt::set_mode(&mut perms, 0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path
+}
+
+/// A scratch install. Deliberately **not** the real `~/Library/LaunchAgents`: this must not be able
+/// to clobber an agent someone is actually running.
+fn scratch() -> (Paths, PathBuf) {
+    let root = std::env::temp_dir().join("aip-launchd-live");
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    let home = root.join("home");
+    let data = root.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    (service::paths(&home, &data), root)
+}
+
+/// `launchctl`'s own words for "this process may not mutate that domain". Matching on the message
+/// rather than on the exit code, because 5 is also what a malformed plist produces and those need
+/// different responses: one is environmental and skips, the other is a defect and fails.
+fn no_aqua_session(message: &str) -> bool {
+    message.contains("Input/output error")
+}
+
+#[test]
+#[ignore = "needs a process with an Aqua session; run from Terminal.app with --ignored"]
+fn install_produces_a_job_launchd_actually_runs() {
+    let (paths, root) = scratch();
+    let uid = service::read_uid().expect("`id -u` must answer");
+    let domain = service::domain(uid);
+    let src = payload(&root);
+
+    println!("scratch install at {}", root.display());
+    println!("domain {domain}");
+
+    match service::install(&paths, &src, &domain, &service::run_launchctl) {
+        Ok(()) => {}
+        Err(e) if no_aqua_session(&e.to_string()) => {
+            // Environmental, not a defect — and loud, because a silent skip is indistinguishable
+            // from a pass. This is the outcome every non-session caller gets.
+            println!("\nSKIP: no Aqua session in this process.\n  launchctl said: {e}\n");
+            println!("Run this from Terminal.app. Nothing was installed; the scratch tree is at");
+            println!("{}", root.display());
+            return;
+        }
+        Err(e) => panic!("install failed for a reason that is not the session: {e}"),
+    }
+
+    // `bootstrap` returned 0. That says launchd accepted the plist — **not** that it ran anything,
+    // which is the whole reason this file exists.
+    let deadline = Instant::now() + SPAWN_BUDGET;
+    let mut last = service::status(&paths, &domain, &service::run_launchctl)
+        .expect("`launchctl print` must be answerable once the job is loaded");
+    while last.pid.is_none() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        last = service::status(&paths, &domain, &service::run_launchctl).expect("print");
+    }
+
+    let loaded = last.loaded;
+    let pid = last.pid;
+    let marker = root.join("marker.txt").exists();
+    let out_log = std::fs::read_to_string(&paths.out_log).unwrap_or_default();
+    let err_log = std::fs::read_to_string(&paths.err_log).unwrap_or_default();
+
+    // Always clean up, and always report whether the cleanup worked — a failed verification that
+    // leaves a job loaded would turn one bad run into a broken machine.
+    let uninstall = service::uninstall(&paths, &domain, &service::run_launchctl);
+    let after = service::status(&paths, &domain, &service::run_launchctl);
+
+    println!("\nloaded = {loaded}, pid = {pid:?}, marker written = {marker}");
+    println!("job stdout: {out_log:?}");
+    println!("job stderr: {err_log:?}");
+    println!("uninstall: {uninstall:?}");
+    println!("after uninstall: {after:?}");
+
+    assert!(loaded, "`bootstrap` returned 0 but launchd does not have the job");
+    assert!(
+        pid.is_some(),
+        "the job is loaded but never got a pid within {SPAWN_BUDGET:?} — launchd loaded it and \
+         could not run it. Job stderr: {err_log:?}"
+    );
+    assert!(marker, "a pid exists but our payload never wrote its marker, so that pid is not ours");
+    assert!(
+        !paths.plist.exists() && !paths.binary.exists(),
+        "uninstall must remove what install wrote"
+    );
+}

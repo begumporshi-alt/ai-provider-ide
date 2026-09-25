@@ -206,6 +206,45 @@ pub fn read_uid() -> Result<u32, ServiceError> {
     parse_uid(&String::from_utf8_lossy(&out.stdout))
 }
 
+/// The installed binary must be executable, or the job launchd loads can never start.
+///
+/// **This is the check that makes `install`'s success mean something.** `bootstrap` does not exec
+/// the program — it registers the job — so a non-executable binary yields a job that launchd
+/// reports as loaded, whose every spawn fails with `EACCES`, which `KeepAlive` restarts until
+/// launchd throttles the job. The operator sees "installed" and a gateway that never answers, and
+/// nothing in the plist, the exit code or `launchctl print` distinguishes it from a working
+/// install. Measured 2026-09-25: before this check, `install` returned `Ok(())` for a `0644` copy.
+///
+/// The module note above argues against a `chmod` here — the mode is a fact of the bundle, and
+/// re-spelling it would hide a broken bundle rather than report it. That argument is kept: this
+/// **checks** the fact instead of inventing a second one, and a bad bundle fails loudly at install
+/// time rather than silently at spawn time.
+///
+/// Gated to unix because an executable bit is a unix concept and this module still compiles
+/// everywhere; on a platform with no launchd there is nothing to protect.
+#[cfg(unix)]
+fn verify_executable(path: &Path) -> Result<(), ServiceError> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = std::fs::metadata(path)
+        .map_err(|e| ServiceError(format!("cannot stat {}: {e}", path.display())))?
+        .permissions()
+        .mode();
+    if mode & 0o111 == 0 {
+        return Err(ServiceError(format!(
+            "{} is not executable (mode {:o}) — launchd would load the job, fail every spawn with \
+             EACCES, and `KeepAlive` would throttle it rather than report it",
+            path.display(),
+            mode & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn verify_executable(_path: &Path) -> Result<(), ServiceError> {
+    Ok(())
+}
+
 /// Copy the service binary to its stable path, write the plist, and bootstrap the job.
 ///
 /// **The `bootout` first is not tidiness.** `bootstrap` of an already-loaded label fails, so a
@@ -237,6 +276,11 @@ pub fn install(
             source.display()
         ))
     })?;
+    // **Before anything is registered with launchd, and that order is deliberate.** A refused
+    // install must leave a previously-loaded job alone; booting the old job out and *then* failing
+    // would trade a working gateway for a broken one. This is also the last point at which the
+    // failure is cheap — no launchd state has been touched yet.
+    verify_executable(&p.binary)?;
 
     let plist_dir = p
         .plist
@@ -396,12 +440,40 @@ mod tests {
         (p, root)
     }
 
-    /// A source binary to install from, with the one property that matters: it exists.
+    /// A source binary to install from, with the properties that matter: it exists, **and it is
+    /// executable**.
+    ///
+    /// The second half used to be missing and its absence is what hid the defect below.
+    /// `std::fs::write` creates a file with mode `0644`, so this fixture stood in for a bundled
+    /// binary launchd could never exec — while the comment claimed the only property that mattered
+    /// was that it existed. `fs::copy` preserves the mode, so *every* install test was installing a
+    /// job that could never start, and `install` returned `Ok(())` for all of them. A fixture
+    /// asserts an invariant; this one asserted the wrong one.
     fn source(dir: &Path) -> PathBuf {
         let src = dir.join("bundled-aiproviderd");
         std::fs::write(&src, "#!/bin/sh\nexit 0\n").unwrap();
+        set_mode(&src, 0o755);
         src
     }
+
+    /// The same stand-in with the mode a broken bundle would give it: readable, not executable.
+    fn non_executable_source(dir: &Path) -> PathBuf {
+        let src = dir.join("bundled-aiproviderd-not-exec");
+        std::fs::write(&src, "#!/bin/sh\nexit 0\n").unwrap();
+        set_mode(&src, 0o644);
+        src
+    }
+
+    /// Unix-only, and so is the property it sets. On a platform without an executable bit the
+    /// tests that use it assert nothing about one, which is the honest outcome rather than a pass.
+    #[cfg(unix)]
+    fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    fn set_mode(_path: &Path, _mode: u32) {}
 
     /// The plist on disk, for the status tests — which are about what launchd says, not about
     /// whether install wrote the file.
@@ -462,6 +534,53 @@ mod tests {
         assert!(!plist.contains("<string>/tmp/a&b/"), "the raw ampersand must not survive");
     }
 
+    /// The plist is consumed by a program, not by these tests.
+    ///
+    /// Every other assertion here is substring containment against the string `render_plist`
+    /// produced, which proves the renderer agrees with itself. `plutil` is a real external judge —
+    /// the parser Apple's own plist toolchain uses — and it runs in this environment, so the one
+    /// artefact launchd actually reads can be validated rather than described. Measured 2026-09-25:
+    /// `plutil -lint` answers `OK` for the rendered plist including the hostile path below.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_rendered_plist_survives_a_real_plist_parser() {
+        const PLUTIL: &str = "/usr/bin/plutil";
+        if !Path::new(PLUTIL).exists() {
+            // Not a silent pass: the assertion is about a tool, and a missing tool is a fact worth
+            // printing. (The repo's own lesson — a guard that cannot fail is not a guard.)
+            eprintln!("SKIP: {PLUTIL} is absent, so the plist was not externally validated");
+            return;
+        }
+        let (mut p, dir) = scratch();
+        // The three characters that make XML not XML, in one path. `escape_xml` handles them by
+        // hand; a parser is the only thing that can say whether it handled them all.
+        p.binary = dir.join("a&b").join("c<d>e").join("aiproviderd");
+        p.out_log = dir.join("out&<log>.txt");
+        p.err_log = dir.join("err&<log>.txt");
+
+        let file = dir.join("lint-me.plist");
+        let rendered = render_plist(&p);
+        std::fs::write(&file, &rendered).unwrap();
+        let out = Command::new(PLUTIL)
+            .args(["-lint", &file.display().to_string()])
+            .output()
+            .expect("plutil exists, so it must be runnable");
+        assert!(
+            out.status.success(),
+            "plutil -lint rejected the rendered plist:\nstdout: {}\nstderr: {}\n--- plist ---\n{rendered}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A parser accepts a plist whose strings are empty, so acceptance alone is not the property:
+        // the paths must still be the ones we meant, escaped rather than dropped or truncated.
+        assert!(rendered.contains("a&amp;b"), "the ampersand must be escaped: {rendered}");
+        assert!(rendered.contains("c&lt;d&gt;e"), "the angle brackets must be escaped: {rendered}");
+        assert!(
+            rendered.contains("out&amp;&lt;log&gt;.txt"),
+            "the log path must survive: {rendered}"
+        );
+    }
+
     /* --------------------------------- install ---------------------------------- */
 
     #[test]
@@ -475,6 +594,50 @@ mod tests {
             std::fs::read_to_string(&p.binary).unwrap(),
             std::fs::read_to_string(&src).unwrap(),
             "the installed binary must be the source's bytes"
+        );
+        // The module note above claims "permissions come along: `fs::copy` copies the mode, and the
+        // bundled binary is already executable". The claim had no test, and the fixture was
+        // quietly violating it — so the property the whole install rests on was asserted nowhere.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let installed = std::fs::metadata(&p.binary).unwrap().permissions().mode() & 0o7777;
+            let from = std::fs::metadata(&src).unwrap().permissions().mode() & 0o7777;
+            assert_eq!(
+                installed, from,
+                "the installed binary must carry the source's mode, not the umask's"
+            );
+        }
+    }
+
+    #[test]
+    fn install_refuses_a_binary_launchd_could_never_exec() {
+        let (p, dir) = scratch();
+        let src = non_executable_source(&dir);
+        // The runner is deliberately not the variable: it answers 0 for everything, which is what a
+        // real `bootstrap` does with a plist pointing at a non-executable program. **`bootstrap`
+        // registers a job; it does not exec the program.** So launchd reports success, the job
+        // appears in `launchctl print`, every spawn fails with EACCES, and `KeepAlive` restarts it
+        // until launchd throttles the job — while this function reports success and the gateway
+        // never answers. Nothing in the operator's view distinguishes that from a working install.
+        let rec = Recorder::ok(0, "");
+        let err = install(&p, &src, DOMAIN, &|a| rec.run(a))
+            .expect_err("a job launchd can never exec is not an install");
+        assert!(
+            err.to_string().contains("not executable"),
+            "the error must name the condition, not just the file: {err}"
+        );
+        assert!(
+            err.to_string().contains(&p.binary.display().to_string()),
+            "the error must name the path an operator has to go and look at: {err}"
+        );
+        // Refusing *before* touching launchd is the point, and it is asserted rather than implied:
+        // a refused re-install must leave a previously-loaded job alone. Booting the old job out
+        // and then failing would trade a working gateway for a broken one.
+        assert!(
+            rec.calls().is_empty(),
+            "a binary launchd cannot exec must be refused before launchctl is run at all: {:?}",
+            rec.calls()
         );
     }
 

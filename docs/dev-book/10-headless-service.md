@@ -3484,13 +3484,18 @@ have it" tests green — which is what separates the three status states from on
 `fmt` clean, `clippy --all-targets -D warnings` clean, `--no-default-features --all-targets` clean.
 
 **The live run, and the one thing it could not reach (2026-09-25).** A temporary integration probe
-(`tests/launchd_live.rs`, deleted after the run) drove the **real** `service::install` against the real
+(`tests/launchd_live.rs`, deleted after the run — **26q later reintroduced a file at this path as a
+persistent, `#[ignore]`d harness; see the 26q note below**) drove the **real** `service::install` against the real
 `launchctl`: real `~/Library/LaunchAgents`, real copy of the binary, real `bootstrap`, then `GET /health`,
 then `uninstall`. What it established, measured:
 
 - The plist this module generates is **accepted by `plutil -lint`** — `OK`, 779 bytes — and points at
   `/Users/tushershikder/Library/Application Support/dev.aiprovider.router/bin/aiproviderd`.
 - `fs::copy` preserves the executable bit, so no `chmod` is needed: the installed binary is `-rwxr-xr-x`.
+  **This is true of the real bundle and it is exactly why the `install` defect stayed invisible for three
+  increments (26q):** `fs::copy` preserves *whatever* mode the source carries, and the unit suite's fixture
+  wrote its source at `0644`, so all 15 tests exercised a path the bundle never takes. The measurement was
+  correct and its scope was the bundle — the fixture never shared the property.
 - The failure path reports usefully — `launchctl bootstrap gui/501 … failed (5): Bootstrap failed: 5:
   Input/output error` — naming the domain and launchctl's own message, not a paraphrase.
 
@@ -3863,6 +3868,75 @@ load, because the shim answers an unrouted `/admin/*` path with `404 unknown_rou
 same spec passed in 16.8 s. So the browser suite exercises the new transport rather than tolerating
 it: a route that is not wired is a failure, not a silent `undefined`.
 
+### Increment 26q — the install's success claim, and the fixture that hid it
+
+**The standing item was "whether `service::install` actually gets a job running."** §12 says it is
+unverified, and 26a's note already explains why: the one live attempt returned `Bootstrap failed: 5:
+Input/output error` from a shell with no launchd user session. **26q rebuilt that attempt from
+scratch before reading the 26a note, and reproduced it exactly** — `launchctl list` → 0 lines;
+`bootstrap gui/501`, `bootstrap user/501` and the legacy `load -S Aqua -w` all exit 5; while
+`launchctl print gui/501` and `print gui/501/com.apple.Finder` both answer. Running the identical
+probe **outside the sandbox** changes nothing, so the sandbox is not the variable. That is a
+confirmation of 26a rather than a new finding, and it cost an hour that reading §26a first would have
+saved. The conclusion is unchanged: **only a process with an Aqua session can close this, and the app
+is one.** 26b built that caller; nobody has run it and recorded the result.
+
+**What 26q could close, it closed — and the defect is not in launchd.** `install` reported success on
+the strength of exactly one fact: `bootstrap` exited 0. **`bootstrap` registers a job; it does not
+exec the program** — acceptance and execution are different facts, and only the second one is a
+gateway that is up. The reachable case: `fs::copy` preserves the source's mode, the module note
+relies on the bundled binary already being executable, and **nothing checked**. Install a `0644`
+source and launchd loads a job whose every spawn fails with `EACCES`, which `KeepAlive` restarts until
+launchd throttles the job — while `install` returns `Ok(())` and the operator is told it worked.
+`verify_executable` now refuses, **before any launchd state is touched**, because a refused re-install
+must leave a previously loaded job alone rather than trade a working gateway for a broken one.
+
+**And the reason no test caught it is the interesting part.** `service.rs`'s `source()` fixture writes
+the stand-in binary with `std::fs::write`, which produces mode `0644`, under a comment reading *"a
+source binary to install from, with the one property that matters: it exists."* **The property that
+mattered was that it is executable.** So the fixture stood in for a bundle launchd could never exec,
+every install test installed a job that could never start, and `install` returned `Ok(())` for all of
+them — **the defect was live inside the suite that was supposed to catch it.** A fixture asserts an
+invariant; this one asserted the wrong one, and the wrong invariant is written down as a comment,
+which is what made it invisible. Fixed: `source()` is `0755`, `non_executable_source()` carries the
+hostile mode, and the module's own previously untested claim that "permissions come along" now has an
+assertion. Register **D55**.
+
+**Two probes, one at a time, both reverted.** `install_refuses_a_binary_launchd_could_never_exec` goes
+red with the `verify_executable` call commented out — `panicked … not an install: ()`, the `()` being
+the `Ok(())` that *was* the defect. And the new plist test goes red when `escape_xml` stops escaping
+`<` and `>`, printing the malformed `<string>…c<d>e…</string>` that caused it.
+
+**The plist is now judged by a parser rather than by the renderer.** Every pre-existing assertion
+about `render_plist` is substring containment against the string `render_plist` produced, which
+proves only that the renderer agrees with itself. `the_rendered_plist_survives_a_real_plist_parser`
+pipes it through `plutil -lint` — Apple's own parser, the same one 26a's live run used — on a path
+carrying `&`, `<` and `>`. It is `#[cfg(target_os = "macos")]` and prints a `SKIP` line rather than
+passing quietly when `plutil` is absent. This is the one artefact launchd actually consumes, and it is
+now validated by something that is not us.
+
+**The live check is a command now, not a paragraph.** `tests/launchd_live.rs`, `#[ignore]`d — CI has
+no Aqua session, and a gate step that is red for environmental reasons is how a suite teaches people
+to ignore it:
+
+```text
+cd apps/desktop/src-tauri
+cargo test --test launchd_live -- --ignored --nocapture
+```
+
+Run it from **Terminal.app**, which launchd starts inside the GUI session. It installs into a scratch
+directory so it cannot clobber a real agent, polls `status` for a pid instead of trusting `bootstrap`'s
+exit code, asserts the payload's own marker file exists (so the pid is *ours* and not some other
+process launchd happened to have), and uninstalls what it installed. **Its output distinguishes the
+two meanings of a pass**: `SKIP` means the environment, no `SKIP` means the verification. What was
+verified here is the harness — it compiles, runs, and takes the `SKIP` path carrying `launchctl`'s own
+message. **The verification itself is still open**; §12 now names the command.
+
+**Measured.** App lib **1284 → 1286**, headless **1220 → 1222**, binary **5 → 5** — two new unit tests
+in `core/service.rs`, both reachable without the app feature, plus one `#[ignore]`d integration
+target. Gates: `cargo fmt --check` clean; `clippy --all-targets -- -D warnings` clean; `cargo check
+--no-default-features --all-targets` clean; lib **1286/0**; headless **1222/0**.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3878,13 +3952,24 @@ real containment failure lives. See §2.1.3.
   and D24.
 - Whether launchd's `KeepAlive` behaves correctly when the binary is inside an `.app` bundle that
 is updated (the path changes). This needs a real update cycle to verify.
-- **Whether `service::install` actually gets a job running.** Unverified as of 2026-09-25. The one live
-  attempt returned `Bootstrap failed: 5: Input/output error` from a shell with **no launchd user session**
-  (`launchctl list` → 0 lines), and both `bootstrap` and the legacy `load` fail there while
-  `launchctl print gui/501` shows the domain alive — so the evidence points at the caller's session, not at
-  the plist or the domain. A CLI is not a process that may mutate `gui/<uid>`; the Tauri app is. Closing
-  this needs a caller with an Aqua session, which is what 26b's UI control provides. Full measurement in
-  the 26a note above
+- **Whether `service::install` actually gets a job running.** **Unverified, and it now has a command
+  instead of a paragraph.** Reproduced independently by 26q on 2026-09-25: `bootstrap gui/501`,
+  `bootstrap user/501` and the legacy `load -S Aqua -w` all exit `5: Input/output error` from a shell
+  with **no launchd user session** (`launchctl list` → 0 lines), while `launchctl print gui/501` shows
+  the domain alive — and running the identical probe **outside the sandbox** changes nothing, so the
+  sandbox is not the variable. A CLI is not a process that may mutate `gui/<uid>`; the Tauri app is,
+  which is what 26b's UI control provides. **Run this from Terminal.app and read the output, not the
+  exit code:**
+
+  ```text
+  cd apps/desktop/src-tauri
+  cargo test --test launchd_live -- --ignored --nocapture
+  ```
+
+  `SKIP` in the output means the environment rather than the code, and a green run carrying `SKIP` is
+  **not** a verification. What 26q did close is the half that needed no session: `install` no longer
+  reports success for a binary launchd could never exec (`verify_executable`). Full measurements in
+  the 26a and 26q notes above
 - **What `gateway_startup` should do when `aiproviderd` is the process serving.** Opened 2026-09-25 by
   26l. The app now starts its own listener on a fresh install (`GatewayStartup::Default`), and
   `gateway_settings_row`'s two-process reasoning covers *which port* but not *who owns it*. With
