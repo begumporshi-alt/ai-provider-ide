@@ -1263,6 +1263,70 @@ fn the_memo_stops_being_served_once_its_ttl_expires() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// D51: the credential `ui_session` mints is one the gateway actually accepts — asked at the gate,
+/// not assumed from either half.
+///
+/// This is the link the whole pure-HTTP decision rests on and nothing had exercised: 26c–26h built
+/// ~75 `/admin/*` routes whose only imagined caller is the webview, and every test of them supplies
+/// its own `Bearer` token. A test that hands itself a credential cannot discover that its caller has
+/// none — and once the credential existed, the same gap moved: the mint was tested, the *acceptance*
+/// was not. So this one walks the real path end to end: mint through `ensure_with`, read the secret
+/// back out of the injected keychain the way `vault_app_key_provider` would, and present it.
+#[test]
+fn the_ui_session_credential_authenticates_at_the_gate() {
+    let dir = std::env::temp_dir().join(format!("aip-uisession-gate-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+
+    // The keychain, injected: `vault::put` needs a real OS keychain CI does not have, and a test
+    // that skipped it would prove the mint without proving anyone can read the secret back.
+    let keychain: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (k1, k2) = (keychain.clone(), keychain.clone());
+    let secret = crate::core::ui_session::ensure_with(
+        &store,
+        &move |account: &str| k1.lock().unwrap().get(account).cloned(),
+        &move |account: &str, s: &str| {
+            k2.lock().unwrap().insert(account.to_string(), s.to_string());
+            Ok(())
+        },
+    )
+    .expect("the mint must succeed with a working keychain");
+
+    // A core whose provider is the production shape — active ids from SQLite, secrets from the
+    // keychain — with only the OS call replaced.
+    let (s2, kc) = (store.clone(), keychain.clone());
+    let core = Arc::new(
+        GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("sk-aip-master".into())))
+            .with_app_keys(Arc::new(move || {
+                crate::core::persist::active_gateway_key_ids(&s2)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter_map(|id| {
+                        let account = format!("{}{}", super::APP_KEY_PREFIX, id);
+                        let secret = kc.lock().unwrap().get(&account).cloned();
+                        Some(AppKey { id, secret: secret? })
+                    })
+                    .collect()
+            }))
+            .with_store(store),
+    );
+
+    assert!(crate::core::ui_session::accepted_by(&core), "the core lists the UI's key");
+    // The assertion that matters: the secret TypeScript is handed authenticates, as its own id —
+    // `app_key_for` is constant-time over every candidate, so a lookup that ignored the presented
+    // secret could still answer `Some(_)` for the wrong key.
+    assert_eq!(
+        core.app_key_for(&secret).as_deref(),
+        Some(crate::core::ui_session::UI_SESSION_ID),
+        "the UI's credential must pass the gate the admin routes are behind"
+    );
+    // ...and the master key still works: minting a second credential must not have replaced one
+    // authority with another.
+    assert_eq!(core.app_key_for("sk-aip-master"), None, "the master is not a per-app key");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// No store means no authoritative id set, so nothing is memoised. This is what keeps
 /// `r4_revoked_app_key_rejected_immediately` honest: that harness mutates the provider's vec
 /// directly, and a cache would have masked the change.

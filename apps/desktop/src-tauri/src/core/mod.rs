@@ -67,5 +67,6 @@ pub mod template;
 pub mod tool_registry;
 pub mod tool_wire;
 pub mod tools;
+pub mod ui_session;
 pub mod usage;
 pub mod vault;

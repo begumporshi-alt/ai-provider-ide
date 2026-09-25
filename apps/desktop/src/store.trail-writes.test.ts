@@ -72,6 +72,16 @@ vi.mock("@tauri-apps/api/core", () => ({
   },
 }));
 
+/**
+ * The transport, replaced at the module boundary (26j).
+ *
+ * `approveRepair` ends by pushing the provider's new status to the host, which since 26i is
+ * `POST /admin/providers` rather than an IPC command. Without this the repair's *own* failure — the
+ * thing these specs are about — is masked by a socket error from a gateway no spec started.
+ */
+vi.mock("./lib/gateway-client", async () => await import("./lib/gateway-client.fake"));
+
+import { resetAdmin } from "./lib/gateway-client.fake";
 import {
   BUILTIN_TEMPLATES,
   type AdapterManifest,
@@ -180,6 +190,7 @@ function drift(providerId: string, requestedModel: string, errors = 5): void {
 beforeEach(() => {
   h.failing.clear();
   h.invokes = [];
+  resetAdmin();
   pendingRepairs.clear();
   registry.hydrate([], []); // the registry is a module singleton; start each spec empty
   driftMonitor.reset(); // ...and so is the monitor, whose cooldown would silence the second spec

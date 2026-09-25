@@ -15,8 +15,9 @@
  * switches without it would have wiped them on every gateway restart.
  *
  * The fake below is a two-command host: `settings_get` returns the row or `null`, `settings_set`
- * replaces it. Everything else (the two `set_tools_*` commands) resolves and is recorded, so the
- * startup-push specs can assert on the calls without a second mock.
+ * replaces it. The tool switches are **not** among those commands — since 26i they are
+ * `POST /admin/tools`, so they are covered by the transport fake in `lib/gateway-client.fake.ts`
+ * and asserted on the bodies sent rather than on an IPC command name.
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -37,11 +38,21 @@ vi.mock("@tauri-apps/api/core", () => ({
         h.row = args.valueJson as string; // whole-row replace, as the host does it
         return undefined;
       default:
-        return undefined; // set_tools_enabled / set_tools_mutation_enabled
+        return undefined;
     }
   },
 }));
 
+/**
+ * The transport, replaced at the module boundary (26j).
+ *
+ * The two tool switches no longer go through `invoke` — they are `POST /admin/tools` now — so a
+ * spec that mocks only IPC dials a real port and gets `ECONNREFUSED`. The store's own behaviour is
+ * still what is under test; only the wire underneath it is faked.
+ */
+vi.mock("./lib/gateway-client", async () => await import("./lib/gateway-client.fake"));
+
+import { resetAdmin, adminBodies } from "./lib/gateway-client.fake";
 import {
   applyPersistedGatewaySwitches,
   patchGatewaySettings,
@@ -62,6 +73,7 @@ const calls = (cmd: string) => h.invokes.filter((i) => i.cmd === cmd);
 beforeEach(() => {
   h.row = null;
   h.invokes = [];
+  resetAdmin();
 });
 
 describe("patchGatewaySettings merges, never replaces", () => {
@@ -138,10 +150,12 @@ describe("applyPersistedGatewaySwitches pushes persisted state into the core", (
 
     await applyPersistedGatewaySwitches();
 
-    expect(calls("set_tools_enabled")).toHaveLength(1);
-    expect(calls("set_tools_enabled")[0]?.args).toEqual({ enabled: false });
-    expect(calls("set_tools_mutation_enabled")).toHaveLength(1);
-    expect(calls("set_tools_mutation_enabled")[0]?.args).toEqual({ enabled: true });
+    // Both switches are one route now (`POST /admin/tools`), so the body is what tells them apart —
+    // and a bare truthiness check would drop the `false` this spec exists to push.
+    expect(adminBodies("POST", "/admin/tools")).toEqual([
+      { enabled: false },
+      { mutationEnabled: true },
+    ]);
   });
 
   it("leaves a switch alone when the row predates it", async () => {
@@ -151,8 +165,7 @@ describe("applyPersistedGatewaySwitches pushes persisted state into the core", (
 
     await applyPersistedGatewaySwitches();
 
-    expect(calls("set_tools_enabled")).toHaveLength(0);
-    expect(calls("set_tools_mutation_enabled")).toHaveLength(0);
+    expect(adminBodies("POST", "/admin/tools")).toHaveLength(0);
   });
 
   it("does not write the row it is reading", async () => {
@@ -162,6 +175,7 @@ describe("applyPersistedGatewaySwitches pushes persisted state into the core", (
     await applyPersistedGatewaySwitches();
 
     expect(calls("settings_set")).toHaveLength(0);
+    expect(adminBodies("POST", "/admin/settings")).toHaveLength(0);
     expect(stored()).toEqual({ port: 8800, enabled: true, toolsEnabled: true });
   });
 });

@@ -5,6 +5,7 @@
  * calls one fixed host command (the invariant-12-safe replacement for a raw StorePort).
  */
 import { invoke } from "@tauri-apps/api/core";
+import { fetchAdmin } from "./lib/gateway-client";
 import {
   AdapterRuntime,
   DriftMonitor,
@@ -405,8 +406,8 @@ export async function bootstrap(): Promise<void> {
 
 async function refreshFromHost(): Promise<void> {
   const [providers, keys] = await Promise.all([
-    invoke<HostProviderRow[]>("providers_list"),
-    invoke<HostKeyRow[]>("api_keys_list", { providerId: null }),
+    fetchAdmin("GET", "/admin/providers") as Promise<HostProviderRow[]>,
+    fetchAdmin("GET", "/admin/api-keys") as Promise<HostKeyRow[]>,
   ]);
   registry.hydrate(providers.map(hostToProvider), keys.map(hostToKey));
 }
@@ -433,7 +434,7 @@ async function refreshStaleCatalogs(): Promise<void> {
 }
 
 async function persistAliases(): Promise<void> {
-  await invoke("aliases_replace", {
+  await fetchAdmin("POST", "/admin/aliases", {
     rows: catalog.aliases.map((a) => ({
       alias: a.alias, providerId: a.providerId, nativeModelId: a.nativeModelId, priority: a.priority,
     })),
@@ -492,13 +493,11 @@ export async function addProvider(input: {
     baseUrl: input.baseUrl, status: "draft", rotationStrategy: "round_robin",
   });
   try {
-    await invoke("provider_upsert", { p: providerToHost(p) });
+    await fetchAdmin("POST", "/admin/providers", providerToHost(p));
     adapters.register(p.id, input.manifest);
-    await invoke("manifest_upsert_active", {
-      m: {
-        id: crypto.randomUUID(), providerId: p.id, version: 1, origin: "builtin-template",
-        bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
-      },
+    await fetchAdmin("POST", "/admin/manifests", {
+      id: crypto.randomUUID(), providerId: p.id, version: 1, origin: "builtin-template",
+      bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
     });
     return p;
   } catch (e) {
@@ -513,17 +512,17 @@ export async function addProvider(input: {
 export async function setProviderStatus(id: string, status: ProviderRecord["status"]): Promise<void> {
   registry.setProviderStatus(id, status);
   const p = registry.getProvider(id);
-  if (p) await invoke("provider_upsert", { p: providerToHost(p) }); // syncs allowlist host-side
+  if (p) await fetchAdmin("POST", "/admin/providers", providerToHost(p)); // syncs allowlist host-side
 }
 
 export async function setProviderRotation(id: string, rotationStrategy: ProviderRecord["rotationStrategy"]): Promise<void> {
   registry.setProviderRotation(id, rotationStrategy);
   const p = registry.getProvider(id);
-  if (p) await invoke("provider_upsert", { p: providerToHost(p) });
+  if (p) await fetchAdmin("POST", "/admin/providers", providerToHost(p));
 }
 
 export async function deleteProvider(id: string): Promise<void> {
-  await invoke("provider_delete", { id }); // cascades; host recomputes the allowlist
+  await fetchAdmin("DELETE", `/admin/providers/${id}`); // cascades; host recomputes the allowlist
   adapters.unregister(id);
   await refreshFromHost();
 }
@@ -532,7 +531,7 @@ export async function deleteProvider(id: string): Promise<void> {
 export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
   const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });
-  await invoke("api_key_upsert", { k: keyToHost(k) });
+  await fetchAdmin("POST", "/admin/api-keys", keyToHost(k));
   // draft providers aren't host-allowlisted (invariant 3); the first key promotes to
   // pending so Test works immediately.
   if (provider?.status === "draft") await setProviderStatus(providerId, "pending");
@@ -540,14 +539,14 @@ export async function addKey(providerId: string, label: string, secret: string):
 }
 
 export async function deleteKey(id: string): Promise<void> {
-  await invoke("api_key_delete", { id }); // host removes the keychain entry too (§7)
+  await fetchAdmin("DELETE", `/admin/api-keys/${id}`); // host removes the keychain entry too (§7)
   await refreshFromHost();
 }
 
 export async function setKeyStatus(id: string, status: ApiKeyRecord["status"]): Promise<void> {
   registry.updateKey(id, { status });
   const k = registry.getKey(id);
-  if (k) await invoke("api_key_upsert", { k: keyToHost(k) });
+  if (k) await fetchAdmin("POST", "/admin/api-keys", keyToHost(k));
 }
 
 /**
@@ -568,7 +567,7 @@ export async function testKey(keyId: string): Promise<PingResult & { verdict: Ke
   if (isConclusive(verdict)) patch.status = verdict;
   registry.updateKey(keyId, patch);
   const fresh = registry.getKey(keyId);
-  if (fresh) await invoke("api_key_upsert", { k: keyToHost(fresh) });
+  if (fresh) await fetchAdmin("POST", "/admin/api-keys", keyToHost(fresh));
   return { ...res, verdict };
 }
 
@@ -606,7 +605,7 @@ export async function modelContextCount(): Promise<number> {
 
 export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
   const n = await catalog.refreshProvider(providerId, signal);
-  await invoke("models_cache_replace", {
+  await fetchAdmin("POST", "/admin/models-cache", {
     providerId,
     rows: catalog.all().filter((m) => m.providerId === providerId).map((m) => ({
       providerId: m.providerId, nativeId: m.nativeId, modality: m.modality,
@@ -681,12 +680,12 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
     id: crypto.randomUUID(), slug, name, type: "manifest",
     baseUrl, status: "pending", rotationStrategy: "round_robin",
   });
-  await invoke("provider_upsert", { p: providerToHost(p) });
+  await fetchAdmin("POST", "/admin/providers", providerToHost(p));
   return p.id;
 }
 
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
-  return invoke<HostLedgerRow[]>("ledger_recent", { limit: 200 });
+  return fetchAdmin("GET", "/admin/ledger?limit=200") as Promise<HostLedgerRow[]>;
 }
 
 // ---------- P4: context graph ----------
@@ -702,15 +701,15 @@ export async function recordContext(
   edges: HostContextEdge[],
 ): Promise<void> {
   if (nodes.length === 0 && edges.length === 0) return;
-  await invoke("context_record", { nodes, edges });
+  await fetchAdmin("POST", "/admin/context", { nodes, edges });
 }
 
 export async function loadContextGraph(limit = 400): Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }> {
-  return invoke<{ nodes: HostContextNode[]; edges: HostContextEdge[] }>("context_graph", { limit });
+  return fetchAdmin("GET", `/admin/context?limit=${limit}`) as Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }>;
 }
 
 export async function clearContextGraph(): Promise<void> {
-  await invoke("context_clear");
+  await fetchAdmin("DELETE", "/admin/context");
 }
 
 // ---------- history: sessions and their timelines ----------
@@ -880,10 +879,10 @@ export async function captureMemory(m: {
   layer: MemoryLayer; text: string;
   sessionId?: string | null; subject?: string | null; pinned?: boolean;
 }): Promise<Memory> {
-  return invoke<Memory>("memory_capture", {
+  return fetchAdmin("POST", "/admin/memory", {
     layer: m.layer, text: m.text,
-    sessionId: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
-  });
+    session_id: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
+  }) as Promise<Memory>;
 }
 
 /**
@@ -900,22 +899,25 @@ export async function captureMemories(
   items: Array<{ layer: MemoryLayer; text: string; session_id?: string | null; subject?: string | null; pinned?: boolean }>,
 ): Promise<number> {
   if (items.length === 0) return 0;
-  return invoke<number>("memory_capture_batch", { items });
+  const res = await fetchAdmin("POST", "/admin/memory/batch", items) as { captured: number };
+  return res.captured;
 }
 
 /** BM25 recall. `layers` narrows the search; omit it to search all four. */
 export async function recallMemories(
   query: string, limit = 8, layers?: MemoryLayer[],
 ): Promise<Memory[]> {
-  return invoke<Memory[]>("memory_recall", { query, limit, layers: layers ?? null });
+  return fetchAdmin("POST", "/admin/memory/recall", { query, limit, layers: layers ?? null }) as Promise<Memory[]>;
 }
 
 export async function listMemories(layer?: MemoryLayer | null, limit = 200): Promise<Memory[]> {
-  return invoke<Memory[]>("memory_list", { layer: layer ?? null, limit });
+  const qs = layer ? `?layer=${layer}&limit=${limit}` : `?limit=${limit}`;
+  return fetchAdmin("GET", `/admin/memory${qs}`) as Promise<Memory[]>;
 }
 
 export async function forgetMemory(id: string): Promise<boolean> {
-  return invoke<boolean>("memory_forget", { id });
+  const res = await fetchAdmin("DELETE", `/admin/memory/${id}`) as { ok: boolean };
+  return res.ok;
 }
 
 /**
@@ -925,21 +927,24 @@ export async function forgetMemory(id: string): Promise<boolean> {
  * Rejects on a pinned or L3 row — §6.4.5 forbids quietly replacing either.
  */
 export async function supersedeMemory(old: string, newId: string): Promise<boolean> {
-  return invoke<boolean>("memory_supersede", { old, new: newId });
+  const res = await fetchAdmin("POST", "/admin/memory/supersede", { old, new: newId }) as { ok: boolean };
+  return res.ok;
 }
 
 /** §6.4.3: undo a supersession. The row was never deleted, so this makes it reachable again. */
 export async function unsupersedeMemory(id: string): Promise<boolean> {
-  return invoke<boolean>("memory_unsupersede", { id });
+  const res = await fetchAdmin("POST", `/admin/memory/${id}/unsupersede`) as { ok: boolean };
+  return res.ok;
 }
 
 /** §6.4.5: what the Memory screen has to put in front of a human. */
 export async function memoryConflicts(): Promise<MemoryConflict[]> {
-  return invoke<MemoryConflict[]>("memory_conflicts");
+  return fetchAdmin("GET", "/admin/memory/conflicts") as Promise<MemoryConflict[]>;
 }
 
 export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
-  return invoke<boolean>("memory_set_pinned", { id, pinned });
+  const res = await fetchAdmin("POST", `/admin/memory/${id}/pin`, { pinned }) as { ok: boolean };
+  return res.ok;
 }
 
 /**
@@ -963,12 +968,14 @@ export async function assignMemoryScope(
     scope.kind === "project"
       ? { kind: "project", project: scope.project, agent: scope.agent ?? null }
       : { kind: scope.kind, project: null, agent: null };
-  return invoke<boolean>("memory_assign_scope", { id, scope: payload });
+  const res = await fetchAdmin("POST", `/admin/memory/${id}/scope`, payload) as { ok: boolean };
+  return res.ok;
 }
 
 /** Rewrite one memory's text. The layer is left alone — promotion is the caller's call. */
 export async function updateMemory(id: string, text: string): Promise<boolean> {
-  return invoke<boolean>("memory_update", { id, text });
+  const res = await fetchAdmin("PUT", `/admin/memory/${id}`, { text }) as { ok: boolean };
+  return res.ok;
 }
 
 /**
@@ -978,15 +985,15 @@ export async function updateMemory(id: string, text: string): Promise<boolean> {
 export async function sessionMemories(
   sessionId: string, layer: MemoryLayer, limit = 200,
 ): Promise<Memory[]> {
-  return invoke<Memory[]>("memory_session_atoms", { sessionId, layer, limit });
+  return fetchAdmin("GET", `/admin/memory/session/${sessionId}?layer=${layer}&limit=${limit}`) as Promise<Memory[]>;
 }
 
 export async function clearMemories(): Promise<void> {
-  await invoke("memory_clear");
+  await fetchAdmin("DELETE", "/admin/memory");
 }
 
 export async function memoryStats(): Promise<MemoryStats> {
-  return invoke<MemoryStats>("memory_stats");
+  return fetchAdmin("GET", "/admin/memory/stats") as Promise<MemoryStats>;
 }
 
 // ---------- capture queue (§3.3) ----------
@@ -1296,19 +1303,21 @@ export async function driftEventsList(limit?: number): Promise<DriftEventEntry[]
  * every launch looked like a bug rather than a policy.
  */
 export async function gatewayToolsEnabled(): Promise<boolean> {
-  return invoke<boolean>("get_tools_enabled");
+  const res = await fetchAdmin("GET", "/admin/tools") as { enabled: boolean };
+  return res.enabled;
 }
 
 export async function setGatewayToolsEnabled(enabled: boolean): Promise<void> {
-  await invoke("set_tools_enabled", { enabled });
+  await fetchAdmin("POST", "/admin/tools", { enabled });
 }
 
 export async function gatewayMutationEnabled(): Promise<boolean> {
-  return invoke<boolean>("get_tools_mutation_enabled");
+  const res = await fetchAdmin("GET", "/admin/tools") as { mutationEnabled: boolean };
+  return res.mutationEnabled;
 }
 
 export async function setGatewayMutationEnabled(enabled: boolean): Promise<void> {
-  await invoke("set_tools_mutation_enabled", { enabled });
+  await fetchAdmin("POST", "/admin/tools", { mutationEnabled: enabled });
 }
 
 /**

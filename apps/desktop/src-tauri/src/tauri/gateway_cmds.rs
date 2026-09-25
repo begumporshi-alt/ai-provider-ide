@@ -289,6 +289,12 @@ pub fn gateway_disable(state: State<'_, Arc<GatewayState>>) -> Result<(), String
         let _ = handle.shutdown.send(());
     }
     state.core.set_running(false);
+    // D51: the UI's session credential dies with the gateway, so a token minted for one session
+    // cannot keep authenticating after Stop. Without this, `ui_session::ensure` next time finds the
+    // old secret still in the keychain and hands it back — a credential that outlived its gateway.
+    if let Some(store) = state.core.store() {
+        crate::core::ui_session::revoke(store);
+    }
     Ok(())
 }
 
@@ -376,8 +382,12 @@ pub struct AppKeyView {
 pub fn gateway_app_keys(store: State<'_, Arc<Store>>) -> Result<Vec<AppKeyView>, String> {
     let rows = crate::core::persist::gateway_keys_list(&store).map_err(|e| e.to_string())?;
     let spend = crate::core::persist::month_spend_by_app(&store);
+    // D51: the UI's own credential is not the operator's to revoke. It is listed nowhere, because
+    // revoking it here would blank every admin screen with no visible cause — the operator would
+    // see a working app and a row that says the key is gone.
     Ok(rows
         .into_iter()
+        .filter(|k| !crate::core::ui_session::is_ui_session(&k.id))
         .map(|k| AppKeyView {
             month_micros: spend.get(&k.id).copied().unwrap_or(0),
             id: k.id,

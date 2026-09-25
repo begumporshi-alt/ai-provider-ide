@@ -8,7 +8,14 @@ import { expect, test, type Page } from "@playwright/test";
 
 const APP = "/web-test/";
 
-type Host = { serviceStatus: (next: Record<string, unknown>) => void };
+/**
+ * Both halves this spec arranges: the service state, and the app gateway's running flag — the port
+ * conflict it warns about is the *combination*, so one without the other cannot be reached.
+ */
+type Host = {
+  serviceStatus: (next: Record<string, unknown>) => void;
+  gatewayStatus: (next: Record<string, unknown>) => void;
+};
 
 async function openGatewayTab(page: Page, status: Record<string, unknown>): Promise<void> {
   await page.goto(`${APP}?seed=systemai`);

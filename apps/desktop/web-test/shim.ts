@@ -115,6 +115,10 @@ const serviceStatus = {
   pid: null as number | null,
 };
 
+/** D51: the UI's own credential for the admin HTTP surface. A spec sets this to the secret
+ *  it wants `ui_session_key` to return; absent means the credential has not been configured. */
+let uiSessionKey: string | undefined = undefined;
+
 /**
  * The capture queue is host-owned exactly like gateway status: the UI reads it and cannot derive
  * it. Settable here so a spec can arrange the one branch it could never otherwise produce — rows
@@ -848,6 +852,10 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     // ---- gateway status: host-reported, since the host owns the listener and the worker ----
     case "gateway_status":
       return { ...gatewayStatus };
+
+    // D51: the UI's own credential for the admin HTTP surface.
+    case "ui_session_key":
+      return uiSessionKey; // set by the spec that needs it; absent means not configured
 
     // ---- events ----
     case "plugin:event|listen": {

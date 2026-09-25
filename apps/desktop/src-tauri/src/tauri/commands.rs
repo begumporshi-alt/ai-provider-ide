@@ -601,6 +601,16 @@ pub fn crash_clear_all(store: State<'_, Arc<store::Store>>) -> Result<usize, Com
     Ok(crash_report::clear_all_crash_reports(&app_data_dir(&store)))
 }
 
+/// D51: mint the UI's own credential and return the secret.
+///
+/// This is the one place TypeScript receives a secret — a local, revocable token for its own
+/// gateway, not a provider credential. Invariant 2 still holds: TS never holds a *provider*
+/// secret, and this token is scoped to the gateway's admin surface only.
+#[tauri::command]
+pub fn ui_session_key(store: State<'_, Arc<store::Store>>) -> Result<String, CommandError> {
+    crate::core::ui_session::ensure(&store).map_err(CommandError)
+}
+
 pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sync + 'static {
     tauri::generate_handler![
         vault_put,
@@ -731,6 +741,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::tauri::service_cmds::service_install,
         crate::tauri::service_cmds::service_uninstall,
         crate::tauri::service_cmds::service_status,
+        // D51: the UI's own credential for the admin HTTP surface. Returns the secret so the
+        // webview can authenticate to `/admin/*` over `fetch()` — the enabler the pure-HTTP
+        // decision assumed and invariant 2 denied.
+        crate::tauri::commands::ui_session_key,
     ]
 }
 

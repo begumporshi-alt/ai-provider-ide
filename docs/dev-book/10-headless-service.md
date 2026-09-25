@@ -3473,10 +3473,13 @@ aliases, ledger read~~ **landed 26f** (committed `449d4ec`, pushed); ~~the memor
 state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admin/tools` and
 `PUT /admin/tools/workspace-root`; the toggle writes **both** authorities (the in-memory flag and
 `gatewayToolsEnabled` in the `router` row) because writing only one would be a toggle that lies.
-After that, the TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
-binary is bundled undeclared). With `RunAtLoad` set, the agent and the app both bind the same
-persisted port, so the agent is only usable once the app stops starting its own gateway — which is
-what step 4 does. The other decisions in §10 still stand.
+~~the TypeScript migration~~ **landed 26i** — D51 resolved with a host-mediated session credential
+(`ak-ui`), and the provider/key/memory/context/tools groups are migrated from `invoke` to
+`fetchAdmin`. ~12 `invoke` calls remain for app-owned UI state and commands with no HTTP route.
+Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the binary is bundled undeclared).
+With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
+usable once the app stops starting its own gateway — which is what step 4 does. The other decisions
+in §10 still stand.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
