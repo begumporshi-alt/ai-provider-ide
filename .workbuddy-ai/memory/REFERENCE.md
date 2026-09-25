@@ -5031,3 +5031,76 @@ tests **alone**. Outer join → inner → reddens no-row test **alone**. `manife
 **Measured:** lib **1197 → 1201** (4 new in `workbuddy.rs`), binary 5 → 5. book **749.9 KB** / 204 ids.
 D41 register line updated with D49 note.
 
+---
+
+## 26l — the listener the app starts, and the boot that survives it being off (2026-09-25)
+
+**The regression.** `bootstrap()` became listener-dependent when 26i–26k moved the reads to
+`fetchAdmin`. On a fresh install nothing is bound, because `persisted_gateway_port` only auto-restores
+once the gateway has been enabled at least once — and "never chosen" (no `gateway` row) read as the
+same `None` as "turned off". Measured, unguarded: the app rendered `App data could not be opened /
+TypeError: Failed to fetch` with restore-from-backup advice, and `createPendingProvider` answered
+`{"ok":false,"err":"TypeError: Failed to fetch"}` — so a new user could not add a provider at all.
+
+**`GatewayStartup`** — three states, `Default` / `Off` / `On(port)`, built on a shared
+`gateway_settings_row`. `persisted_gateway_port` keeps the stricter reading (`enabled` with no `port`
+→ `None`) because `aiproviderd` has its own default; `gateway_startup` answers `On(DEFAULT_PORT)`
+there. One query, two policies. `DEFAULT_PORT` is **8787**.
+
+**The master key comes before the port.** `check_gateway_key` tests the master key before the app-key
+loop, so a listener with no key answers **401 to everything**, including the UI's `ak-ui` session
+credential — a surface that looks healthy and serves nothing. `app.rs` therefore generates the first
+key when `master_key_state()` is `Absent`, and never on `Unavailable` (the keychain did not answer;
+generating would rotate an existing key).
+
+**The degradation rule, and it is one line.** `isUnreachable(e)` is `e instanceof TypeError`. The
+browser rejects a `fetch()` to a closed port with a `TypeError`; every other failure on this path —
+an HTTP status through `fetchAdmin`, or whatever Tauri rejects an `invoke` with — arrives as a plain
+`Error`. So "the gateway is not running" degrades the boot (six reads in one `try`, `bootDegraded`
+set, `bootstrapped` left false so a retry works) and "the store could not be opened" still fails it,
+which is what keeps a corrupt database reported as one. `Shell.tsx` renders the state;
+`Control.tsx` retries `bootstrap()` after the switch starts the listener.
+
+**The StrictMode bug the guard exposed.** The degradation worked and the notice did not appear. Cause:
+StrictMode mounts `App` twice, both `bootstrap()` calls start, the second returned early, its `then`
+fired first, and `App` marked itself ready with the reads still in flight — so `bootDegraded` was still
+`null` when the shell rendered. Fix: one shared `bootInFlight` promise, `bootstrapped` set only at the
+end of a successful path. **A guard that is correct and a guard that has run are different facts.**
+
+**`GET/POST /admin/settings/{key}`.** `settings` holds unrelated rows: `gateway` (the listener + the
+tool switches) and `router` (read **per request** by `RouterSettings::from_store`, carrying
+`failoverEnabled`, `systemAi`, `perProviderConcurrency`). `/admin/settings` owns only `gateway`, so
+the UI's `settings_get`/`settings_set` on `router` had no route. The keyed route **merges** (26h's
+rule). `read_gateway_settings` deleted; `read_settings_object` is now the single "absent and corrupt
+both mean `{}`". `gatewayBaseUrl()` also stopped falling back to **8800** — a port this app has never
+bound.
+
+**Harness.** `__webTestAdminSurfaceAbsent` (seeded from `globalThis.__webTestAdminSurfaceAbsent`, so
+`addInitScript` is required — `bootstrap()` runs at mount). `isAdminTarget` returns false, the request
+falls through to the real network stack, and it fails as a first launch does. Until it existed the shim
+answered every `/admin/*` call unconditionally, so an unbootable-on-fresh-install regression passed all
+106 tests. `gateway-off.spec.ts` asserts the corrupt-database screen is **absent** *and* `Gateway not
+running` is **present** — degrading without naming the state is not enough, because an empty screen and
+an absent gateway look identical and have opposite fixes.
+
+**Two rules demoted from `MEMORY.md` (the 8,000 B cap forced a choice), recorded here so they are not
+lost:**
+- **An implicit default depends on the install.** `tsconfig.json` pins `"types": ["node"]`; a package
+  that omits it inherits whatever the installed `@types` set happens to provide, so a spec can pass on
+  one machine and fail on another with no code change.
+- **An interceptor cannot test CORS.** `web-test/shim.ts` answers before the network stack, so the
+  browser never performs the preflight or the origin check `cors_headers` exists to satisfy. A CORS
+  regression cannot redden the browser harness — it is stated in the module header rather than implied.
+
+**Measured:** lib **1278/0** (26l adds 8: three keyed-settings, five startup-policy), headless
+`--no-default-features` **1214/0**, binary **5/0**, browser **108/0** (was 106), vitest **181/181**.
+The Tests row's documented **1216** had already aged by 54 across 26c–26i.
+
+**Falsified, both reverted:** the keyed write ignoring its path segment reddened
+`admin_keyed_settings_merge_into_their_own_row_only` with `port: 8800` bleeding from the `gateway` row;
+`if false && row.get("enabled")…` reddened `gateway_startup_honours_an_explicit_off` with `On(8787)`.
+
+**Tool hazard:** bash `grep -c "A\|B"` returned a false `0` twice over code that was present. Use the
+host-side Grep tool for an absence claim.
+
+
