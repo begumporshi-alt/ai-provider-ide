@@ -594,6 +594,23 @@ let eventSeq = 0;
   serviceStatus: (next: Partial<typeof serviceStatus>): void => {
     Object.assign(serviceStatus, next);
   },
+  /**
+   * Set the credential `ui_session_key` returns, and that `/admin/*` accepts.
+   *
+   * The shim mints one on first ask, so an ordinary spec sees a healthy host. Clearing it here is
+   * how a spec reaches the refusal — the branch D51 exists because a caller with no credential
+   * must not be answered, and a harness that always hands one over cannot see it.
+   */
+  uiSessionKey: (next: string | undefined): void => {
+    uiSessionKey = next;
+  },
+  /**
+   * The `/admin/*` calls the page has made, oldest first — the HTTP counterpart of
+   * `store.requests()`, so a spec can assert what the UI actually sent after the migration moved
+   * the transport. Bounded, for the same reason the egress log is.
+   */
+  adminCalls: (method?: string, path?: string): { method: string; path: string; body: unknown }[] =>
+    adminCalls.filter((c) => (method ? c.method === method : true) && (path ? c.path.startsWith(path) : true)),
 };
 
 // ---------------------------------------------------------------------------
@@ -855,7 +872,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 
     // D51: the UI's own credential for the admin HTTP surface.
     case "ui_session_key":
-      return uiSessionKey; // set by the spec that needs it; absent means not configured
+      // Mint on first ask, the way `ui_session::ensure` does in the host. Before this the case
+      // returned `undefined` unless a spec had set one, so the UI cached no credential and every
+      // `/admin/*` call would have been a 401 — a second, quieter way for the migrated screens to
+      // render empty. The harness models a healthy host; `__webTest.uiSessionKey` arranges the
+      // refusal when a spec wants it.
+      return mintUiSession();
 
     // ---- events ----
     case "plugin:event|listen": {
@@ -1770,6 +1792,500 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 }
 
 // ---------------------------------------------------------------------------
+// Admin HTTP surface — a second entry point over the SAME store.
+//
+// §10 decision 2 is pure HTTP: the UI reaches the gateway with `fetch()`, and
+// `gateway-client.ts` supplies a `Bearer` credential the host minted
+// (`core/ui_session.rs`). Until this section existed, every one of those calls
+// left the page for a port nothing listens on, so the screens that migrated in
+// 26i rendered as though the host had answered empty — the browser suite went
+// red while `tsc` stayed clean, which is the same blindness 26j found in vitest
+// and closed with `gateway-client.fake.ts`. A typecheck cannot see a transport.
+//
+// This is deliberately NOT a second implementation of the business logic. Each
+// route is a thin adapter: parse path/query/body, call the same `dispatch` case
+// the `invoke` path uses, reshape the reply into what `core/gateway_admin.rs`
+// answers. One store, two entry points — the shape the Rust half already has,
+// where routes delegate to `persist::*` / `memory::*` / `context::*` cores.
+//
+// Two things it cannot model, stated rather than left implied:
+//   - **CORS.** The interceptor answers before the network stack runs, so the
+//     browser never performs the preflight or the origin check that
+//     `cors_headers` exists to satisfy. A CORS regression cannot redden this
+//     harness.
+//   - **Extractor timing.** 26g moved a query parse after `authorize` because a
+//     typed axum extractor runs before the handler body and would answer a
+//     caller it had not authenticated. Here the credential is checked before
+//     anything is parsed, which is the same rule enforced by hand.
+// ---------------------------------------------------------------------------
+
+/** Stands in for the `ak-ui` secret `core/ui_session.rs` mints into the keychain. */
+const UI_SESSION_SECRET = "ak-ui-web-test-secret";
+
+/** Mint on first ask, the way `ui_session::ensure` does — see the `ui_session_key` case. */
+function mintUiSession(): string {
+  if (uiSessionKey === undefined) uiSessionKey = UI_SESSION_SECRET;
+  return uiSessionKey;
+}
+
+/** An admin route refusing, carrying the status `core/gateway_admin.rs` would answer. */
+class AdminRefusal extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly code?: string,
+  ) {
+    super(message);
+  }
+}
+
+function refuse(status: number, message: string, code?: string): never {
+  throw new AdminRefusal(status, message, code);
+}
+
+/** `{ error: { … } }`, the body `err()` builds, so a refusal reads like the host's. */
+function refusalBody(e: AdminRefusal): unknown {
+  return { error: { message: e.message, type: "invalid_request", code: e.code ?? null } };
+}
+
+/** The last N admin calls, so a spec can assert what the UI actually sent. */
+const adminCalls: { method: string; path: string; body: unknown }[] = [];
+const ADMIN_CALL_LIMIT = 50;
+function recordAdminCall(method: string, path: string, body: unknown): void {
+  adminCalls.push({ method, path, body });
+  if (adminCalls.length > ADMIN_CALL_LIMIT) adminCalls.splice(0, adminCalls.length - ADMIN_CALL_LIMIT);
+}
+
+/** Is this URL one the host's admin surface owns? Loopback only — see invariant 3. */
+function isAdminTarget(url: URL): boolean {
+  if (!isLocal(url.hostname)) return false;
+  return url.pathname === "/admin" || url.pathname.startsWith("/admin/");
+}
+
+/**
+ * One settings row as an object.
+ *
+ * Absent **and** unparseable both collapse to `{}`, for the reason
+ * `read_gateway_settings` gives: they are different faults but the caller's
+ * recovery is identical, and a corrupt row must not take a screen down.
+ */
+function settingsObject(key: string): Record<string, unknown> {
+  const raw = settings.get(key);
+  if (!raw) return {};
+  try {
+    const v: unknown = JSON.parse(raw);
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * `persist::MemoryInput` is snake_case with `deny_unknown_fields`, so a
+ * misspelled key is a hard error rather than a silent `None` — the rule that
+ * let `session_id` go missing for months and disabled the per-session ring cap.
+ * The `invoke` path checks this inside `memory_capture_batch`; the HTTP route
+ * carries the same struct for a single capture, so it is checked here too.
+ */
+const MEMORY_INPUT_KEYS = ["layer", "text", "session_id", "subject", "pinned"];
+function assertMemoryInput(it: unknown, where: string): void {
+  if (!it || typeof it !== "object") refuse(400, `${where} expects a memory object`, "not_an_object");
+  const unknown = Object.keys(it as Row).filter((k) => !MEMORY_INPUT_KEYS.includes(k));
+  if (unknown.length > 0) {
+    refuse(400, `${where}: unknown key(s) ${unknown.join(", ")} — MemoryInput is snake_case with deny_unknown_fields`, "unknown_field");
+  }
+}
+
+/** `?limit=N`, defaulting the way each handler in `gateway_admin.rs` does. */
+function limitOf(q: URLSearchParams, fallback: number): number {
+  const raw = q.get("limit");
+  if (raw === null) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : fallback;
+}
+
+/**
+ * The admin router. `segs` is the path split on `/` with empties dropped, so
+ * `/admin/memory/L1/pin` arrives as `["admin","memory","L1","pin"]`.
+ */
+async function routeAdmin(method: string, segs: string[], q: URLSearchParams, body: unknown): Promise<unknown> {
+  const at = (i: number): string => (i < segs.length ? decodeURIComponent(segs[i]) : "");
+
+  switch (at(1)) {
+    // ── gateway settings ───────────────────────────────────────────────────
+    case "settings": {
+      if (method === "GET") return settingsObject("gateway");
+      if (method === "POST") {
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          refuse(400, "POST /admin/settings expects a JSON object", "not_an_object");
+        }
+        const merged = { ...settingsObject("gateway"), ...(body as Record<string, unknown>) };
+        settings.set("gateway", JSON.stringify(merged));
+        persistSettings();
+        return merged;
+      }
+      break;
+    }
+
+    // ── per-app gateway keys (R4) ──────────────────────────────────────────
+    case "keys": {
+      if (method === "GET" && segs.length === 2) return appKeys.map((k) => ({ ...k }));
+      if (method === "POST" && segs.length === 2) {
+        const label = String((body as Row | undefined)?.label ?? "").trim();
+        if (!label) refuse(400, "POST /admin/keys requires a non-empty `label`", "missing_label");
+        const id = `ak-${appKeys.length + 1}`;
+        const row = {
+          id, label, createdAt: Date.now(), lastUsedAt: null, revokedAt: null,
+          capMicros: null, monthMicros: 0,
+        };
+        appKeys.push(row);
+        // The secret crosses the wire exactly once, as it does in `AppKeyCreated`. The
+        // harness has no keychain, so it is generated here and not retained.
+        return { id, label, secret: `sk-aip-${id}-${Math.random().toString(16).slice(2, 10)}` };
+      }
+      if (method === "DELETE" && segs.length === 3) {
+        const row = appKeys.find((k) => k.id === at(2));
+        if (!row || row.revokedAt) throw new Error("gateway key not found or already revoked");
+        row.revokedAt = Date.now();
+        return { ok: true };
+      }
+      break;
+    }
+
+    case "spend": {
+      if (method === "GET") return { ...spendStatus };
+      break;
+    }
+
+    // ── config CRUD ────────────────────────────────────────────────────────
+    case "providers": {
+      if (method === "GET" && segs.length === 2) return dispatch("providers_list", {});
+      if (method === "POST" && segs.length === 2) {
+        await dispatch("provider_upsert", { p: body as Row });
+        return { ok: true };
+      }
+      if (method === "DELETE" && segs.length === 3) {
+        await dispatch("provider_delete", { id: at(2) });
+        return { ok: true };
+      }
+      break;
+    }
+    case "api-keys": {
+      if (method === "GET" && segs.length === 2) return dispatch("api_keys_list", {});
+      if (method === "POST" && segs.length === 2) {
+        await dispatch("api_key_upsert", { k: body as Row });
+        return { ok: true };
+      }
+      if (method === "DELETE" && segs.length === 3) {
+        await dispatch("api_key_delete", { id: at(2) });
+        return { ok: true };
+      }
+      break;
+    }
+    case "manifests": {
+      if (method === "GET" && segs.length === 2) return dispatch("manifests_active", {});
+      if (method === "POST" && segs.length === 2) {
+        await dispatch("manifest_upsert_active", { m: body as Row });
+        return { ok: true };
+      }
+      if (method === "POST" && segs.length === 4 && at(3) === "activate") {
+        const previous = await dispatch("manifest_activate", { provider_id: at(2), version: (body as Row)?.version });
+        return { previousVersion: previous ?? null };
+      }
+      break;
+    }
+    case "models-cache": {
+      if (method === "GET" && segs.length === 2) return dispatch("models_cache_list", {});
+      if (method === "POST" && segs.length === 2) {
+        const b = (body ?? {}) as Row;
+        await dispatch("models_cache_replace", { provider_id: b.providerId, rows: (b.rows ?? []) as Row[] });
+        return { ok: true };
+      }
+      break;
+    }
+    case "aliases": {
+      if (method === "GET" && segs.length === 2) return dispatch("aliases_list", {});
+      if (method === "POST" && segs.length === 2) {
+        // `aliases_replace_h` takes `Json<Vec<AliasRow>>` — a bare array, which is what
+        // `admin_aliases_replace_*` posts and what `aliases_replace_rows` consumes.
+        // `persistAliases` in store.ts sends `{ rows }`, the IPC command's shape; the pair
+        // disagrees and this is the first thing that walks it.
+        if (!Array.isArray(body)) {
+          refuse(422, "POST /admin/aliases expects a JSON array of alias rows", "not_an_array");
+        }
+        await dispatch("aliases_replace", { rows: body as Row[] });
+        return { ok: true };
+      }
+      break;
+    }
+    case "ledger": {
+      if (method === "GET" && segs.length === 2) return dispatch("ledger_recent", { limit: limitOf(q, 200) });
+      break;
+    }
+
+    // ── memory (P7) ────────────────────────────────────────────────────────
+    case "memory":
+      return routeMemory(method, segs, q, body);
+
+    // ── context graph (P4) ─────────────────────────────────────────────────
+    case "context": {
+      if (method === "GET" && segs.length === 2) return dispatch("context_graph", { limit: limitOf(q, 200) });
+      if (method === "POST" && segs.length === 2) {
+        const b = (body ?? {}) as Row;
+        await dispatch("context_record", { nodes: (b.nodes ?? []) as Row[], edges: (b.edges ?? []) as Row[] });
+        return { ok: true };
+      }
+      if (method === "DELETE" && segs.length === 2) {
+        await dispatch("context_clear", {});
+        return { ok: true };
+      }
+      break;
+    }
+
+    // ── gateway tool toggles ───────────────────────────────────────────────
+    case "tools":
+      return routeTools(method, segs, body);
+  }
+
+  refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
+}
+
+async function routeMemory(method: string, segs: string[], q: URLSearchParams, body: unknown): Promise<unknown> {
+  const at = (i: number): string => (i < segs.length ? decodeURIComponent(segs[i]) : "");
+
+  // Static segments first, exactly as `gateway.rs` declares them before `/admin/memory/{id}`:
+  // the ordering is load-bearing, not cosmetic — "stats" must not be captured as an id.
+  switch (at(2)) {
+    case "":
+      if (method === "GET") {
+        return dispatch("memory_list", { layer: q.get("layer"), limit: limitOf(q, 200) });
+      }
+      if (method === "POST") {
+        assertMemoryInput(body, "POST /admin/memory");
+        return dispatch("memory_capture", body as Record<string, unknown>);
+      }
+      if (method === "DELETE") {
+        await dispatch("memory_clear", {});
+        return { ok: true };
+      }
+      break;
+    case "batch": {
+      if (method === "POST") {
+        const items = Array.isArray(body) ? (body as unknown[]) : [];
+        for (const it of items) assertMemoryInput(it, "POST /admin/memory/batch");
+        const n = await dispatch("memory_capture_batch", { items: items as Row[] });
+        return { captured: n };
+      }
+      break;
+    }
+    case "recall": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return dispatch("memory_recall", {
+          query: b.query ?? "", limit: b.limit ?? 8, layers: b.layers ?? null,
+        });
+      }
+      break;
+    }
+    case "stats": {
+      if (method === "GET") return dispatch("memory_stats", {});
+      break;
+    }
+    case "conflicts": {
+      if (method === "GET") return dispatch("memory_conflicts", {});
+      break;
+    }
+    case "prune": {
+      // The UI reaches pruning over IPC (`gateway_prune_memories`), so this route has no
+      // caller yet. It delegates to the same shim case rather than inventing a summary.
+      if (method === "POST") return dispatch("gateway_prune_memories", {});
+      break;
+    }
+    case "supersede": {
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return { ok: await dispatch("memory_supersede", { old: b.old, new: b.new }) };
+      }
+      break;
+    }
+    case "principals": {
+      if (method === "GET") return dispatch("memory_principal_list", {});
+      if (method === "POST") {
+        const b = (body ?? {}) as Row;
+        return { ok: await dispatch("memory_principal_set", { policy: { principal: b.principal, enabled: b.enabled ?? null } }) };
+      }
+      break;
+    }
+    case "session": {
+      if (method === "GET" && segs.length === 4) {
+        const layer = q.get("layer");
+        if (layer === null) refuse(400, "GET /admin/memory/session/{session_id} needs a `layer`", "missing_layer");
+        return dispatch("memory_session_atoms", { session_id: at(3), layer, limit: limitOf(q, 200) });
+      }
+      break;
+    }
+    default: {
+      // `/admin/memory/{id}` and its three sub-routes.
+      const id = at(2);
+      if (segs.length === 3) {
+        if (method === "DELETE") return { ok: await dispatch("memory_forget", { id }) };
+        if (method === "PUT") return { ok: await dispatch("memory_update", { id, text: (body as Row)?.text }) };
+      }
+      if (segs.length === 4) {
+        if (at(3) === "pin" && method === "POST") {
+          return { ok: await dispatch("memory_set_pinned", { id, pinned: Boolean((body as Row)?.pinned) }) };
+        }
+        if (at(3) === "scope" && method === "POST") {
+          const b = (body ?? {}) as Row;
+          const kind = String(b.kind ?? "").trim().toLowerCase();
+          if (!["project", "global", "unscoped"].includes(kind)) {
+            refuse(400, `unknown scope kind '${b.kind}'`, "unknown_scope_kind");
+          }
+          return { ok: await dispatch("memory_assign_scope", { id, scope: { kind, project: b.project ?? null, agent: b.agent ?? null } }) };
+        }
+        if (at(3) === "unsupersede" && method === "POST") {
+          return { ok: await dispatch("memory_unsupersede", { id }) };
+        }
+      }
+      break;
+    }
+  }
+
+  refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
+}
+
+/**
+ * The tool toggles. `GET` reports **both** authorities, because 26h measured that
+ * "are gateway tools on" has two: the in-memory flag the running gateway reads and
+ * `gatewayToolsEnabled` in the `router` row a headless service boots from. A route
+ * that picked one would be a toggle that lies in the other process.
+ */
+async function routeTools(method: string, segs: string[], body: unknown): Promise<unknown> {
+  const persisted = settingsObject("router");
+  const status = () => ({
+    enabled: toolsState.enabled,
+    mutationEnabled: toolsState.mutationEnabled,
+    // `RouterSettings::default()` is `true`, and a row that lacks the key keeps it — so an
+    // absent row is `true`, not `null` (router.rs:321).
+    persistedEnabled: typeof persisted.gatewayToolsEnabled === "boolean" ? persisted.gatewayToolsEnabled : true,
+    workspaceRoot: DEFAULT_WORKSPACE_ROOT,
+  });
+
+  if (segs.length === 2) {
+    if (method === "GET") return status();
+    if (method === "POST") {
+      const patch = (body ?? {}) as Row;
+      if (typeof patch.enabled === "boolean") {
+        toolsState.enabled = patch.enabled;
+        const row = { ...settingsObject("router"), gatewayToolsEnabled: patch.enabled };
+        settings.set("router", JSON.stringify(row));
+        persistSettings();
+      }
+      if (typeof patch.mutationEnabled === "boolean") {
+        toolsState.mutationEnabled = patch.mutationEnabled;
+      }
+      return status();
+    }
+  }
+  if (segs.length === 3 && at2(segs) === "workspace-root" && method === "PUT") {
+    const root = String((body as Row)?.root ?? "");
+    if (!root.startsWith("/") || root.split("/").includes("..")) {
+      refuse(400, `that workspace root was refused: ${root || "(empty)"}`, "bad_workspace_root");
+    }
+    return { workspaceRoot: root };
+  }
+  refuse(404, `no admin route for ${method} /${segs.join("/")}`, "unknown_route");
+}
+function at2(segs: string[]): string {
+  return segs.length > 2 ? decodeURIComponent(segs[2]) : "";
+}
+
+/** Parse the body `fetchAdmin` sends: JSON, or absent for GET/DELETE. */
+function adminBody(init?: RequestInit): unknown {
+  const raw = init?.body;
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  try {
+    return JSON.parse(raw);
+  } catch {
+    refuse(400, "the admin request body is not JSON", "invalid_json");
+  }
+}
+
+/** The `Authorization` header, however the caller capitalised it. */
+function bearerOf(init?: RequestInit): string | null {
+  const h = init?.headers;
+  if (!h) return null;
+  const read = (k: string): string | null => {
+    if (h instanceof Headers) return h.get(k);
+    if (Array.isArray(h)) return (h.find(([n]) => n.toLowerCase() === k)?.[1] as string) ?? null;
+    const rec = h as Record<string, string>;
+    for (const [n, v] of Object.entries(rec)) if (n.toLowerCase() === k) return v;
+    return null;
+  };
+  const auth = read("authorization");
+  if (!auth) return null;
+  return auth.startsWith("Bearer ") ? auth.slice(7) : null;
+}
+
+/**
+ * Serve one `/admin/*` request, or `null` when the URL is not the admin surface.
+ *
+ * The credential is checked **before** anything is parsed — the rule 26g moved a
+ * query parse to satisfy, so nothing on this surface answers before it knows who
+ * is asking.
+ */
+async function serveAdmin(method: string, url: URL, init?: RequestInit): Promise<Response> {
+  const path = `${url.pathname}${url.search}`;
+  const body = adminBody(init);
+  recordAdminCall(method, path, body);
+
+  const json = (status: number, payload: unknown): Response =>
+    new Response(JSON.stringify(payload), { status, headers: { "Content-Type": "application/json" } });
+
+  if (bearerOf(init) !== mintUiSession()) {
+    return json(401, { error: { message: "unauthorized", type: "invalid_request", code: "invalid_api_key" } });
+  }
+
+  // A one-shot failure a spec arranged, keyed `METHOD path` — the HTTP counterpart of
+  // `failNext` on a command name, so "this read failed" stays arrangeable now that the
+  // read is a route rather than an `invoke`.
+  const failKey = `${method} ${url.pathname}`;
+  const failure = failNext.get(failKey);
+  if (failure !== undefined) {
+    failNext.delete(failKey);
+    const afterMs = failDelay.get(failKey) ?? 0;
+    failDelay.delete(failKey);
+    if (afterMs > 0) await new Promise((resolve) => setTimeout(resolve, afterMs));
+    return json(500, { error: { message: failure, type: "invalid_request", code: "shim_fail_next" } });
+  }
+
+  const segs = url.pathname.split("/").filter((s) => s.length > 0);
+  try {
+    const payload = await routeAdmin(method, segs, url.searchParams, body);
+    persist(); // commit before the caller sees the reply, as the Rust host does
+    return json(200, payload);
+  } catch (e) {
+    if (e instanceof AdminRefusal) return json(e.status, refusalBody(e));
+    // A store-level rejection (`memory text is empty`, `gateway key not found`) is a 400:
+    // the caller named an act the host refuses, which is not a server fault.
+    return json(400, { error: { message: String((e as Error).message ?? e), type: "invalid_request", code: null } });
+  }
+}
+
+/** Answer an admin request if it is one, else `null` so the real network can have it. */
+async function tryServeAdmin(input: RequestInfo | URL, init?: RequestInit): Promise<Response | null> {
+  if (typeof input !== "string" && !(input instanceof URL)) return null; // a `Request` we do not model
+  let url: URL;
+  try {
+    url = new URL(typeof input === "string" ? input : input.href, location.href);
+  } catch {
+    return null;
+  }
+  if (!isAdminTarget(url)) return null;
+  return serveAdmin(init?.method ?? "GET", url, init);
+}
+
+// ---------------------------------------------------------------------------
 // Egress — browser mirror of egress.rs / e2e/host-http.ts.
 // ---------------------------------------------------------------------------
 
@@ -2008,6 +2524,11 @@ async function egressStream(req: WireReq, onEvent: string): Promise<null> {
 // Install BEFORE main.tsx executes. Vite loads this module first (document order), so the
 // internals object exists when the app's first `invoke` fires.
 (globalThis as unknown as { __TAURI_INTERNALS__: Internals }).__TAURI_INTERNALS__ = internals;
+// ...and so does the admin transport. Bound before the patch so an egress call can never
+// re-enter the interceptor.
+const nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
+  (await tryServeAdmin(input, init)) ?? nativeFetch(input as RequestInfo, init)) as typeof fetch;
 (globalThis as unknown as {
   __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: (event: string, eventId: number) => void };
 }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {

@@ -66,9 +66,20 @@ test("memory recall: the recalled block lands in the chat-completions request as
     .fill("what is the timezone where you live?");
   await page.getByRole("button", { name: "Send" }).click();
 
-  // Wait for the streamed answer to land. The mock returns the model id in the body, so
-  // matching on that avoids hardcoding the seeded answer text.
-  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
+  // Wait for the round-trip, not for a bubble. The user's own message renders in a
+  // `whitespace-pre-wrap` div too, so `getBy(...).last()` matched the question the instant it was
+  // echoed and this read the egress log before any request had been made — a race that only lost
+  // once the send path had an HTTP recall in front of it. The assertion is about the request, so
+  // wait on the request. (The reply text is still asserted through the body below.)
+  await expect
+    .poll(
+      async () =>
+        (await store<EgressLogEntry[]>(page, "requests")).some(
+          (r) => r.url.endsWith("/chat/completions") && r.body,
+        ),
+      { timeout: 30_000 },
+    )
+    .toBe(true);
 
   const body = await lastChatBody(page);
   // The recalled block is labeled and bounded so the model can tell it apart from current input.

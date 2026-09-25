@@ -702,11 +702,17 @@ export function MemoryScreen() {
 
   async function doPin(m: Memory, pinned: boolean) {
     setError(null);
+    // Optimistic, and reconciled by the re-read below. While this was an `invoke` the round-trip was
+    // one hop and the checkbox looked instant; over HTTP it is a real request, and a control that
+    // lags a beat behind the click reads as broken — or, worse, as a write that did not land. The
+    // host is still the authority: `bump()` re-reads, and on failure it reads the truth back.
+    setAll((prev) => prev.map((r) => (r.id === m.id ? { ...r, pinned } : r)));
     try {
       await setMemoryPinned(m.id, pinned);
-      bump();
     } catch (e) {
       setError(String(e));
+    } finally {
+      bump();
     }
   }
 

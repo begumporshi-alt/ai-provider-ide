@@ -434,11 +434,16 @@ async function refreshStaleCatalogs(): Promise<void> {
 }
 
 async function persistAliases(): Promise<void> {
-  await fetchAdmin("POST", "/admin/aliases", {
-    rows: catalog.aliases.map((a) => ({
-      alias: a.alias, providerId: a.providerId, nativeModelId: a.nativeModelId, priority: a.priority,
-    })),
-  });
+  // A bare array, not `{ rows }`. The IPC command took an object because Tauri hands a command one
+  // argument bag; `aliases_replace_h` takes `Json<Vec<AliasRow>>` — the same shape
+  // `POST /admin/memory/batch` takes, and the one `admin_aliases_replace_*` posts. The HTTP route is
+  // the surviving contract, so the spelling that goes is the IPC one.
+  //
+  // Found by the browser harness: the wrapper made this a 422, and because `persistAliases` runs in
+  // the boot path, the app came up with "App data could not be opened" — no screen rendered at all.
+  await fetchAdmin("POST", "/admin/aliases", catalog.aliases.map((a) => ({
+    alias: a.alias, providerId: a.providerId, nativeModelId: a.nativeModelId, priority: a.priority,
+  })));
 }
 
 function withBaseUrl(m: AdapterManifest, baseUrl: string): AdapterManifest {

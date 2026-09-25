@@ -3431,6 +3431,60 @@ docs:book, key-leak-grep all clean.
 
 ---
 
+## Increment 26k — the shim serves `/admin/*` (and the browser suite runs as a gate again)
+
+**The gap 26i left.** 26i moved a group of `store.ts` functions from `invoke` to `fetchAdmin`, which
+dials `http://127.0.0.1:<port>/admin/*`. The browser harness stood in for the **IPC** host only, so
+every migrated call left the page for a port nothing listens on. `web-test/shim.ts` now intercepts
+`fetch` for loopback URLs whose path is `/admin/*` and dispatches to the **same in-memory store** the
+`invoke` cases use.
+
+**This is a second entry point, not a second implementation — which is the point.** Each route is a
+thin adapter: parse path/query/body, call the `dispatch` case the `invoke` path already calls, reshape
+the reply into what `core/gateway_admin.rs` answers. One store, two entry points — the shape the Rust
+half has, where routes delegate to `persist::*` / `memory::*` / `context::*` cores. All 29 path
+templates are served, not just the ones with a caller today.
+
+**Three things the interception does, and one it cannot.**
+- **It authenticates first.** `ui_session_key` now mints on first ask the way `ui_session::ensure`
+  does, and the route refuses with 401 before parsing anything — the rule 26g moved a query parse to
+  satisfy, since an axum extractor runs before the handler body and would answer a caller it had not
+  authenticated. `__webTest.uiSessionKey` arranges the refusal.
+- **It is arrangeable.** `failNext` accepts `METHOD path` alongside a command name, so "this read
+  failed" survives the migration; `__webTest.adminCalls()` records what the UI sent, the HTTP
+  counterpart of `store.requests()`.
+- **It cannot model CORS.** The interceptor answers before the network stack runs, so the browser
+  never performs the preflight or the origin check `cors_headers` exists to satisfy. **A CORS
+  regression cannot redden this harness** — stated here rather than implied.
+
+**The bug it found, and it is a live one.** `persistAliases` sent `{ rows }` — the IPC command's
+shape — while `aliases_replace_h` takes `Json<Vec<AliasRow>>`, a bare array, which is what
+`admin_aliases_replace_*` posts and what `POST /admin/memory/batch` already uses. The pair had never
+been walked: 26f's test posts the array, 26j's fake accepts anything. Because `persistAliases` is in
+the **boot** path, the app came up with "App data could not be opened" — no screen rendered at all.
+Fixed on the client: the HTTP route is the surviving contract, so the IPC spelling is the one that
+goes.
+
+**Two more consequences of the transport change, both real, both fixed at the right layer.**
+- **The pin checkbox lagged a round-trip.** `doPin` awaited the write and then re-read, so the control
+  only moved after the host answered — invisible when that was one IPC hop, visible over HTTP, and a
+  checkbox that lags the click reads as a write that did not land. `Memory.tsx` now updates
+  optimistically and lets the re-read reconcile; the host is still the authority, and a failure reads
+  the truth back.
+- **`memory-recall.spec.ts` waited on the wrong element.** It waited for `div.whitespace-pre-wrap`,
+  which also matches the user's own echoed message, so it read the egress log before the request had
+  been made. It now waits on the request it is about to assert on. The assertions are unchanged; only
+  the wait was wrong.
+
+**Measured.** Browser suite **106 passed / 0 failed** in 1.5 m — the first time it has run green since
+26b, and the first time it has run as a gate at all. Before: red from test 18 onward, each failure
+costing the full 120 s timeout. `web-test:types` clean, `pnpm typecheck` clean, vitest **181/181**,
+`key-leak-grep` clean. No Rust changed.
+
+**Falsified.** With the interception removed (`globalThis.fetch = nativeFetch`), `smoke.spec.ts` goes
+**13/14** — the memory screen renders "No memories yet" again. Probe reverted; `shim.ts` is back at
+its committed size.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3475,7 +3529,11 @@ state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admi
 `gatewayToolsEnabled` in the `router` row) because writing only one would be a toggle that lies.
 ~~the TypeScript migration~~ **landed 26i** — D51 resolved with a host-mediated session credential
 (`ak-ui`), and the provider/key/memory/context/tools groups are migrated from `invoke` to
-`fetchAdmin`. ~12 `invoke` calls remain for app-owned UI state and commands with no HTTP route.
+`fetchAdmin`. ~12 `invoke` calls remain for app-owned UI state and commands with no HTTP route. ~~the browser
+harness~~ **landed 26k** — `web-test/shim.ts` intercepts `fetch` to `127.0.0.1:<port>/admin/*` and
+dispatches to the same in-memory store the `invoke` cases use, so the suite runs as a gate again:
+**106/106**, from red at test 18. It found one live bug on the way (`persistAliases` sent `{ rows }`
+where the route wants a bare array) and cannot model CORS — see the 26k note.
 Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the binary is bundled undeclared).
 With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
 usable once the app stops starting its own gateway — which is what step 4 does. The other decisions
