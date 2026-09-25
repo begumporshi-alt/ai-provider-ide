@@ -262,8 +262,10 @@ whether this phase is a port or a rewrite, and the framing held up: the answer i
 primitives arrive in a shape the TypeScript does not have, and one of them is a containment failure
 rather than an inconvenience.
 
-**The harness.** A standalone crate, 723 lines, 13 probes, at `.workbuddy-ai/spikes/js-engine/`
-(`cargo run --release`; `SPIKE_CRASH=1` for the two that are expected to kill the process). Every probe
+**The harness.** A standalone crate at `.workbuddy-ai/spikes/js-engine/` (`cargo run --release`;
+`SPIKE_CRASH=1` for the probes expected to kill the process). It was **723 lines / 13 probes** when
+measured on 2026-09-24 and is **988 / 17** after 26p — the counts are given per date because this
+sentence had already gone stale once. Every probe
 states one claim the TypeScript design depends on, and the money probe copies `GOOD_GUEST`
 **verbatim** out of `code-adapter.test.ts:21-37` — not adapted, not reformatted, not re-indented. It
 passes:
@@ -317,11 +319,12 @@ declares `Send`/`Sync` for `Runtime` and `Context` **under its `parallel` featur
    ran" together with "a job threw", so a caller that needs to see a job's exception must inspect the
    promise instead of the return value.
 
-3. **The memory limit is not a containment boundary in-process.** This is the finding that changes the
-   plan. `MEMORY_LIMIT` is 32 MB (`code-adapter.ts:67`) and the TS suite has **no test for it** — it
-   covers lint, wall-clock timeout, http and emit rate limits, path traversal, disposal and recovery,
-   but never an over-allocating guest. Measured here, each variant its own run because a crash takes the
-   process with it:
+3. **The memory limit fires; QuickJS's out-of-memory *path* is what faults.** This is the finding that
+   changes the plan. `MEMORY_LIMIT` is 32 MB (`code-adapter.ts:67`) and the TS suite has **no test for
+   it** — it covers lint, wall-clock timeout, http and emit rate limits, path traversal, disposal and
+   recovery, but never an over-allocating guest. Measured here, each variant its own run because a crash
+   takes the process with it. **Rows S6g–S6j were added 2026-09-25 (26p) and change what rows S6b–S6c
+   mean**; the earlier rows are left as measured.
 
    | Probe | Guest | Result |
    |---|---|---|
@@ -331,6 +334,10 @@ declares `Send`/`Sync` for `Runtime` and `Context` **under its `parallel` featur
    | S6d | allocates ~60 MB *after an `await`*, 8 MB limit | rejects cleanly, no crash |
    | S6e | `throw new Error("boom")` at entry | rejects cleanly |
    | S6f | runaway recursion against the 512 KB stack limit | rejects cleanly |
+   | S6g | S6f's recursion off the **main** thread, thread C stack varied | `SIGABRT` at 256 KB; contained at 512 KB–2 MB (detail in §19b) |
+   | S6h | S6b's guest **+ a signal handler** — the one difference | handler fires: `SIGSEGV`, `si_addr = 0x20`, `si_code = 2`; faulting frame is `build_backtrace` |
+   | S6i | S6h's guest **+ `siglongjmp` armed** — the one difference | **survives the fault**; a fresh `Runtime` still evaluates `1+1` afterwards |
+   | S6j | calibrate `si_addr`: a deliberate read of `0x1234` | reads back `0x1234` — the instrument is faithful |
 
    The trap is therefore specific: an out-of-memory raised while the guest executes **directly inside
    the call** — before its first `await` — kills the process with `SIGSEGV`, while the same trap inside
@@ -339,16 +346,57 @@ declares `Send`/`Sync` for `Runtime` and `Context` **under its `parallel` featur
    not a containment limit**, and the contract suite cannot see the difference because it never tests
    one.
 
+   **What the fault actually is — measured 2026-09-25 (S6h, S6i, S6j).** The *site* was recorded on the
+   first day; the *cause* was not, and the two support different conclusions. S6h is S6b's guest with a
+   signal handler installed — the only difference — and the handler reports **`si_addr = 0x20`,
+   `si_code = 2`**, with the faulting frame inside QuickJS's own **`build_backtrace`**, called from
+   `JS_CallInternal`'s `exception:` label (`quickjs.c:17439`) — the path that decorates a thrown error
+   with `.stack`. Disassembling the faulting offset (`build_backtrace + 0xCCC`) lands on the instruction
+   **after** `bl _JS_DefineProperty`, i.e. the `JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, …)`
+   that closes `build_backtrace` (`quickjs.c:6792`). So the sequence is: the limit fires, the allocation
+   fails, QuickJS raises the error, and then **dereferences a NULL base at `+0x20` while attaching the
+   backtrace to it**. That is an unhandled allocation failure inside QuickJS's error path — not the
+   guest's allocation, and not a stack overflow. Two independent legs support it: `0x20` cannot be a
+   stack address, and the handler ran to completion (a 48-frame `backtrace()` plus
+   `backtrace_symbols_fd`) on the stack it was allegedly out of. S6j calibrates the instrument rather
+   than assuming it: a deliberate read of `0x1234` reports `si_addr = 0x1234`, so the number is the
+   faulting address and not a mis-read field.
+
 **What this decides, and what it leaves open.** The port is real work but it is not a rewrite: the guest
 contract, the deferred-promise bridge, the pump, the interrupt handler and the stack limit all map, and
 S5 aborted a spinning guest at 300.7 ms and 301.2 ms on two runs against a 300 ms budget. What trap 3
-decides is *where* the sandbox runs. §8's risk register already names the fallback — "keep Tier-2
-adapters in a sandboxed subprocess" — and the spike promotes it from fallback to the recommended shape
-for the heap boundary specifically: in-process the sandbox can enforce a wall-clock deadline, the http
-and emit budgets, path containment and stack depth, but it cannot enforce a heap ceiling without the
-power to kill the host. Whether the whole adapter runtime moves out-of-process, or only the heap ceiling
-is enforced by a supervisor, is the next decision — and it is now a decision with evidence under it
-rather than a preference.
+decides is *where* the sandbox runs.
+
+**Corrected 2026-09-25 (increment 26p).** The sentence that stood here read: *"it cannot enforce a heap
+ceiling without the power to kill the host."* **S6i falsifies it.** S6i is S6h's guest with `siglongjmp`
+armed — again the only difference — and the process **survives**: the faulting frame is abandoned and a
+*fresh* `Runtime` is created and evaluates `1+1` afterwards. The two probes differ in exactly one
+variable and produce opposite outcomes, so the survival is attributable to the fence and not to the
+fault being benign. The heap ceiling **can** be enforced in-process, on the measured fault.
+
+**Reachable is not the same as advisable, and the recommendation does not flip on this alone.** What
+S6i establishes is that a fence is *possible*; what it does not establish is that it is *safe*, and the
+probe says so in its own output. `siglongjmp` out of a fault runs no destructor, so the faulting
+`Runtime`, its heap and any lock it held are abandoned in place. Three questions are open, and each
+needs its own probe:
+
+- **The leak is unmeasured.** That the abandoned allocation is lost is certain; its *size*, and whether
+  it is bounded across repeated faults, is not. Putting a number on it would cost a hand-declared
+  `mach_task_info` ABI — `libc 0.2.189` exports no `task_info` — so it is named here rather than
+  asserted.
+- **The abandoned runtime's global lock is never released.** Under `parallel`, `Context::with` holds a
+  non-reentrant lock for the whole closure (trap 2). If the fault happens inside that scope, the guard's
+  `Drop` does not run. The fresh `Runtime` succeeding is evidence the lock is **per-instance rather than
+  process-global** — an inference from S6i's result, not a direct measurement — and it means a fenced
+  design must *abandon* the runtime, never reuse it.
+- **The fault was measured on the main thread and at one site.** S6i ran on the main thread with 8 MB of
+  C stack; the actor runs on a 2 MB `std::thread` (S6g). Whether the fence holds there, and whether the
+  fault site is identical at 32 MB, is untested.
+
+So the shape of the decision has changed rather than disappeared. It is no longer *"in-process is
+impossible, so supervise"* but *"in-process is possible — does the abandoned-frame cost make a
+supervisor preferable anyway?"* That is a question about the leak, and it is now a question with a named
+probe behind it rather than a premise under it.
 
 **What the spike did not test**, stated so the gaps are not mistaken for coverage: the `log` global
 (`code-adapter.ts:166`); `dispose()` and the hot-swap path (`adapter-runtime.ts`); the
@@ -370,8 +418,15 @@ differ in exactly one respect: whether the out-of-memory is raised **before or a
 `await`**. Before, the host dies — `SIGSEGV`, 3 of 3 runs, at 8 MB *and* at the TypeScript's own 32 MB. After,
 the same trap rejects cleanly. That is a one-variable experiment, and it is the experiment that decides whether
 the heap ceiling needs a supervisor process at all or whether the allocating entry segment can be fenced off
-in-process. **It has not been run, and nothing here claims the fence works.** Until a probe says otherwise,
+in-process. ~~**It has not been run, and nothing here claims the fence works.**~~ Until a probe says otherwise,
 §8's subprocess fallback stays the recommended shape for the heap boundary specifically.
+
+**Run 2026-09-25 (increment 26p): the probe said otherwise.** S6h diagnosed the fault and S6i ran the fence;
+both are recorded under trap 3 above. The hedge in this paragraph was honest and correctly scoped — and it
+**did not survive being quoted.** Three later restatements of this finding dropped it and asserted the
+conclusion as a property of the platform, which is how a hypothesis came to read as a fact for two increments.
+That is **D54**, and the rule it earns is that a contingency belongs in the conclusion's own sentence rather
+than only in the paragraph above it.
 
 **Update, 2026-09-24 (increment 19a): the dependency is in, and the seam's bound is not what this
 section implied.** `rquickjs 0.9` is now a dependency of the crate, with `features = ["parallel"]`
@@ -413,7 +468,7 @@ resolve/reject functions are restored into the next scope — is increment 19b's
 
 **Finding 4 (the simplification): `armed` is a second spelling of one state.** The interrupt handler checked `armed` before reading `deadline_ms`, but `deadline_ms == u64::MAX` already means "no deadline" and makes the comparison false for every clock reading. A probe removed the `armed` check and the whole module suite — including the spinning-guest abort test — passed identically. The flag, its two `store` calls, and the `AtomicBool` import were all removed.
 
-**Finding 5: `Runtime` has no `memory_limit()` or `max_stack_size()` getters in 0.9.0.** The only observable consequence of the memory limit is the `SIGSEGV` of trap 3, which cannot be tested in-process; the stack limit is observable, and `runaway_recursion_is_contained_on_the_actor_thread` asserts it on the actor's own thread — the condition S6f never measured, because S6f ran on the main thread with 8 MB of C stack.
+**Finding 5: `Runtime` has no `memory_limit()` or `max_stack_size()` getters in 0.9.0.** The only observable consequence of the memory limit is the `SIGSEGV` of trap 3, ~~which cannot be tested in-process~~; the stack limit is observable, and `runaway_recursion_is_contained_on_the_actor_thread` asserts it on the actor's own thread — the condition S6f never measured, because S6f ran on the main thread with 8 MB of C stack. **Corrected 2026-09-25 (26p):** the `SIGSEGV` *is* observable in-process, and S6h does exactly that — a `sigaction` handler with `SA_SIGINFO` reads `si_addr` and `si_code` and walks a 48-frame backtrace. What is not observable is the limit *as a number*, which is what this finding is actually about; the phrase was true of the getter and false of the fault.
 
 **Finding 6: `std::thread`'s default stack is not a contract.** `RUST_MIN_STACK` overrides it, and a probe showed that without an explicit `.stack_size` the actor thread gets whatever the environment says. With `RUST_MIN_STACK=262144` the recursion test `SIGABRT`s on `js-sandbox`; with `.stack_size(ACTOR_STACK_BYTES)` the same environment passes. The explicit size is therefore load-bearing, not decorative.
 
@@ -2341,7 +2396,7 @@ two scope-wrong claims in two consecutive increments.
 | Risk | Likelihood | Impact | Mitigation |
 |---|---|---|---|
 | **Execution engine port introduces bugs** | High | Critical | Port tests first; keep JS implementation behind a feature flag; run both in parallel for one release |
-| **Adapter runtime (QuickJS-WASM) is hard to port** | **Resolved 2026-09-24** | High | **Spiked and answered: it is a port.** `rquickjs` runs `GOOD_GUEST` verbatim to the same three values the TS suite asserts, and every host primitive maps (§2.1.3). The residual risk is narrower and named: the **32 MB heap limit is not containment** — an OOM raised during the synchronous part of the call `SIGSEGV`s the host — so that ceiling needs a supervisor or a subprocess |
+| **Adapter runtime (QuickJS-WASM) is hard to port** | **Resolved 2026-09-24** | High | **Spiked and answered: it is a port.** `rquickjs` runs `GOOD_GUEST` verbatim to the same three values the TS suite asserts, and every host primitive maps (§2.1.3). The residual risk is narrower and named: an OOM raised during the synchronous part of the call **`SIGSEGV`s the host** — measured 2026-09-25 to be a **NULL dereference at `+0x20` inside QuickJS's own `build_backtrace`**, not the guest's allocation. **Corrected 2026-09-25:** this cell used to conclude *"the 32 MB heap limit is not containment … so that ceiling needs a supervisor or a subprocess"*, and **S6i falsifies that** — `siglongjmp` out of the fault leaves a working process, so the ceiling **is** enforceable in-process. What is unmeasured is the cost of the abandoned frame: the leak's size, and a `Runtime` left holding its global lock. See §2.1.3 and D54 |
 | **SQLite concurrent access deadlocks** | Low | High | WAL mode is already on; add connection pooling; test with `cargo test` under `tokio::task::spawn` |
 | ** launchd plist gets out of sync with binary path** | Medium | Medium | The template above points `ProgramArguments` at an absolute path **inside** the bundle (`/Applications/AI-Provider Router.app/Contents/MacOS/aiproviderd`), so anything that moves the bundle — a versioned install path, an atomic directory swap — leaves the job pointing at a path that no longer exists. Remedies, in order of preference: (1) put the binary at a fixed path **outside** the bundle, or behind a stable symlink, and point the plist there; (2) have the updater run `launchctl bootout` before the swap and `launchctl bootstrap` after it. "Check the path and rewrite the plist if the bundle moved" is the weakest of the three, because it only helps once the app is running again. Note that `KeepAlive` **throttles**, and can leave the job disabled after repeated failed execs, so a path that is briefly missing during a swap is not self-healing |
 | **UI → service discovery fails on first install** | Medium | Medium | Graceful degradation: UI shows "service not running" with manual start instructions |
@@ -2401,9 +2456,13 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
    If not, subprocess.~~
    - **Answered 2026-09-24 by the spike in §2.1.3.** The spike was run and the contract suite passes
    verbatim, so **port**. Note the premise: "`rquickjs` is immature" was never tested, and it is now
-   contradicted for every primitive this sandbox actually uses. One sub-decision survives and the spike
-   does *not* answer it — the 32 MB heap ceiling cannot be enforced in-process without the power to kill
-   the host, so either the whole adapter runtime runs under a supervisor or that one limit does.
+   contradicted for every primitive this sandbox actually uses. One sub-decision survives — what to do
+   about the heap ceiling. ~~the 32 MB heap ceiling cannot be enforced in-process without the power to
+   kill the host, so either the whole adapter runtime runs under a supervisor or that one limit does.~~
+   **Corrected 2026-09-25 (26p): the ceiling *can* be enforced in-process** — S6i fences the fault and
+   the process keeps working. The question is now whether the abandoned-frame cost (an unmeasured leak,
+   plus a `Runtime` abandoned while holding its global lock) makes a supervisor preferable *anyway*. It
+   is open, and it is a question about the leak rather than about feasibility. See D54.
 
 2. **Do we keep the Tauri app as a pure HTTP client, or keep a subset of IPC for performance?**
    — **RESOLVED 2026-09-25: pure HTTP.**
@@ -3898,6 +3957,7 @@ is now a live question, not a hypothetical. The other decisions in §10 still st
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
 adapter-runtime spike left open — in-process with a supervised heap ceiling, or out-of-process — and
 then give that module a phase in §7" until 2026-09-25, by which point Phase 4b had given that module
-its phase and the spike's residual was recorded in the risk register instead. It is rewritten here
-rather than silently overwritten because a stale "next action" is the cheapest way for a plan to stop
-describing its own project.)
+its phase and the spike's residual was recorded in the risk register instead; and 26p then *answered*
+that residual — S6i fences the fault in-process — narrowing it from feasibility to the abandoned-frame
+cost, which is D54. It is rewritten here rather than silently overwritten because a stale "next action"
+is the cheapest way for a plan to stop describing its own project.)

@@ -7,3 +7,7 @@ edition = "2021"
 rquickjs = { version = "0.9", features = ["bindgen", "futures", "loader", "macro", "parallel"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 serde_json = "1"
+# S6h/S6i need `sigaction`, `sigsetjmp`/`siglongjmp` and `backtrace_symbols_fd`. Added 2026-09-25
+# for the in-process fence experiment: the dev-book recorded the crash *site* (inside `m.call`) but
+# never the *cause*, and `lldb` cannot attach under this sandbox, so the probe diagnoses itself.
+libc = "0.2"

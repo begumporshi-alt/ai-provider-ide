@@ -228,6 +228,11 @@ fn main() {
         // Opt-in, like S6b/S6c, and for the same reason: a size whose C stack runs out first kills
         // the process. One size per run, from `SPIKE_THREAD_STACK`; the default is `std::thread`'s.
         ("S6g containment off the main thread (SPIKE_THREAD_STACK bytes)", probe_thread_stack, true),
+        // Opt-in for the same reason as S6b: S6h exits 70 by design and S6i either survives the
+        // fault or dies on it, so neither can share a process with the probes after it.
+        ("S6h the fault itself: handler + backtrace (S6b's guest, one difference)", probe_segv_cause, true),
+        ("S6j calibrate si_addr: a deliberate dereference of 0x1234 must read back 0x1234", probe_fault_calibration, true),
+        ("S6i the fence: does siglongjmp out of the fault leave a working process?", probe_segv_fence, true),
         ("S7  Runtime/Context are Send+Sync (feature `parallel`)", probe_send_sync, false),
         ("S8  GOOD_GUEST verbatim: listModels/generateText/generateImage", probe_good_guest, false),
     ];
@@ -694,6 +699,212 @@ fn probe_thread_stack() -> Probe {
         })
         .map_err(|e| format!("thread spawn: {e}"))?;
     handle.join().unwrap_or_else(|_| Err("the guest thread panicked".to_string()))
+}
+
+// ---------------------------------------------------------------------------------------------
+// S6h / S6i — what the fault *is*, and whether the allocating entry segment can be fenced
+// ---------------------------------------------------------------------------------------------
+//
+// The dev-book records S6b's *site* — "SIGSEGV, 3 of 3 runs, inside `m.call`" — and not its
+// *cause*, then recommends a decision that turns on the cause: "whether the heap ceiling needs a
+// supervisor process at all or whether the allocating entry segment can be fenced off in-process".
+// It also states that this experiment "has not been run". These two probes run it.
+//
+// `lldb` cannot attach under the build sandbox (it hangs waiting for a debugger authorisation that
+// is never granted), so the probe carries its own handler. That is not a workaround for its own
+// sake: a handler that can *observe* the fault is the first half of a handler that can *survive* it,
+// so the diagnostic and the experiment are the same mechanism with one difference — whether
+// `siglongjmp` is armed.
+
+/// Darwin's `sigjmp_buf` is **196 bytes** — measured with a one-line C probe (`cc` printing
+/// `sizeof`), not assumed, because `libc` does not export the type on Apple targets at all.
+/// Over-sized and 16-byte aligned so the engine's own layout cannot overflow it.
+#[repr(C, align(16))]
+struct SigJmpBuf([u64; 32]); // 256 B >= the measured 196 B
+
+extern "C" {
+    // The *linkable* names are `sigsetjmp`/`siglongjmp` — verified with `nm -u` on a C probe that
+    // calls them. `<setjmp.h>` presents them as macros over `__sigsetjmp`, which is **not** the
+    // symbol, and `libc` exposes neither, so the type and both functions are declared here.
+    fn sigsetjmp(env: *mut SigJmpBuf, savemask: libc::c_int) -> libc::c_int;
+    fn siglongjmp(env: *mut SigJmpBuf, val: libc::c_int) -> !;
+}
+
+/// Where a fault handler should resume, if it is meant to survive the fault.
+///
+/// A `static` rather than a thread-local because the handler runs on the faulting thread and needs
+/// the same `sigjmp_buf` the probe armed. **Null means "do not jump — report and die"**, which is
+/// S6h; S6i points it at its own frame.
+static FAULT_JMP: std::sync::atomic::AtomicPtr<SigJmpBuf> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+/// The signal that actually fired, for the probe to read after a surviving `siglongjmp`.
+static FAULT_SIGNAL: AtomicU64 = AtomicU64::new(0);
+
+/// `si_addr` — **the address the fault touched, which is the measurement that names the defect.**
+/// A NULL (or near-NULL) `si_addr` is an unhandled allocation failure dereferenced; an `si_addr`
+/// that looks like a live stack address is a stack overflow. Those are different bugs with
+/// different fixes, and the signal number alone cannot tell them apart.
+static FAULT_ADDR: AtomicU64 = AtomicU64::new(0);
+
+/// `si_code` — `SEGV_MAPERR` vs `SEGV_ACCERR` on Darwin, which separates "nothing is mapped here"
+/// from "this is mapped and you may not touch it".
+static FAULT_CODE: AtomicU64 = AtomicU64::new(0);
+
+/// A fixed buffer in BSS, **not on the handler's stack**, because the fault this handler explains
+/// may be one that exhausted the stack — and a handler that needs stack space to report a stack
+/// overflow reports nothing. Single-shot and reentrancy-irrelevant: the process is on its way out.
+struct HexBuf(std::cell::UnsafeCell<[u8; 48]>);
+unsafe impl Sync for HexBuf {}
+static HEXBUF: HexBuf = HexBuf(std::cell::UnsafeCell::new([0u8; 48]));
+
+/// Write `0x` + 16 hex digits + newline. **Async-signal-safe**: no allocation, no `format!`, no
+/// lock — `write(2)` is the only call. Digits are formatted by hand for exactly that reason.
+fn write_hex(tag: &[u8], v: usize) {
+    let buf = unsafe { &mut *HEXBUF.0.get() };
+    let mut n = 0;
+    for &b in tag {
+        buf[n] = b;
+        n += 1;
+    }
+    buf[n] = b'0';
+    buf[n + 1] = b'x';
+    n += 2;
+    let mut i = 16;
+    while i > 0 {
+        i -= 1;
+        let d = ((v >> (i * 4)) & 0xf) as u8;
+        buf[n] = if d < 10 { b'0' + d } else { b'a' + d - 10 };
+        n += 1;
+    }
+    buf[n] = b'\n';
+    n += 1;
+    unsafe { libc::write(2, buf.as_ptr() as *const libc::c_void, n) };
+}
+
+extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut libc::c_void) {
+    // **Async-signal-safe by construction, and that is not decoration.** The fault this exists to
+    // diagnose is an out-of-memory, so the allocator is very plausibly mid-operation when it fires;
+    // a handler that called `format!` or `println!` would malloc and then either deadlock or fault
+    // again inside the handler — a diagnosis of the diagnosis. `write(2)` and
+    // `backtrace_symbols_fd` are the two calls documented not to malloc.
+    FAULT_SIGNAL.store(sig as u64, Ordering::SeqCst);
+    if !info.is_null() {
+        let si = unsafe { &*info };
+        FAULT_ADDR.store(si.si_addr as usize as u64, Ordering::SeqCst);
+        FAULT_CODE.store(si.si_code as u64, Ordering::SeqCst);
+    }
+    let head = b"\n[fault] caught a fatal signal; backtrace follows\n";
+    unsafe { libc::write(2, head.as_ptr() as *const libc::c_void, head.len()) };
+    write_hex(b"[fault] si_addr = ", FAULT_ADDR.load(Ordering::SeqCst) as usize);
+    write_hex(b"[fault] si_code = ", FAULT_CODE.load(Ordering::SeqCst) as usize);
+    let mut frames = [std::ptr::null_mut::<libc::c_void>(); 48];
+    let n = unsafe { libc::backtrace(frames.as_mut_ptr(), frames.len() as libc::c_int) };
+    unsafe { libc::backtrace_symbols_fd(frames.as_ptr(), n, 2) };
+    let jmp = FAULT_JMP.load(Ordering::SeqCst);
+    if !jmp.is_null() {
+        // The experiment: abandon the faulting frame and resume at the probe's `sigsetjmp` point.
+        // `sigsetjmp`/`siglongjmp` rather than `setjmp`/`longjmp` because only the `sig` pair
+        // restores the signal mask — the default blocks the signal for the handler's duration, so
+        // without the restore the resumed code would run with SIGSEGV blocked and a second fault
+        // would take the default action instead of reaching here.
+        unsafe { siglongjmp(jmp, 1) };
+    }
+    let tail = b"[fault] no jump armed (S6h) - exiting 70, so a handled fault is distinguishable \
+                 from a raw SIGSEGV (139)\n";
+    unsafe { libc::write(2, tail.as_ptr() as *const libc::c_void, tail.len()) };
+    unsafe { libc::_exit(70) };
+}
+
+/// Arm the handler for every fatal signal an out-of-memory can plausibly raise.
+///
+/// `SA_SIGINFO` only — deliberately **not** `SA_NODEFER`. The default (signal blocked while the
+/// handler runs) is what stops a fault inside `backtrace_symbols_fd` from recursing into the
+/// handler forever; `sigsetjmp(..., 1)` restores the mask on the way out, so the resumed code is
+/// not left with SIGSEGV blocked.
+fn arm_fault_handler() {
+    let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
+    sa.sa_sigaction = on_fault
+        as extern "C" fn(libc::c_int, *mut libc::siginfo_t, *mut libc::c_void)
+        as usize;
+    sa.sa_flags = libc::SA_SIGINFO;
+    unsafe { libc::sigemptyset(&mut sa.sa_mask) };
+    for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGABRT, libc::SIGILL, libc::SIGFPE] {
+        unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) };
+    }
+}
+
+/// S6h — **what the fault is**, with a backtrace, and whether it is interceptable at all.
+///
+/// Exit 70 means the handler caught it; exit 139 means the handler never fired, which would itself
+/// be a finding (it would mean the fault is not delivered as a catchable signal). The guest and the
+/// limit are S6b's exactly, so the only difference from S6b is the installed handler.
+fn probe_segv_cause() -> Probe {
+    arm_fault_handler();
+    mem_probe(Some(8 * 1024 * 1024), false)
+}
+
+/// S6j — **calibration for S6h's `si_addr`.** S6h's number supports the claim "the fault is a NULL
+/// dereference", and that claim is only as good as the instrument: the handler reads `si_addr` out
+/// of a `libc::siginfo_t` that nothing had exercised before. A deliberate, distinctive dereference
+/// must come back byte-identical, or the reading is a constant, an offset, or the wrong field.
+///
+/// `0x1234` rather than `0x20`: if the handler were echoing a fixed value or a truncated pointer,
+/// re-using S6h's own number would hide it. One variable — the address — and the reading must track.
+fn probe_fault_calibration() -> Probe {
+    arm_fault_handler();
+    unsafe {
+        let p = 0x1234usize as *const u64;
+        let v = std::ptr::read_volatile(p);
+        // Unreachable unless the calibration failed, which is itself the finding.
+        Err(format!("dereferenced 0x1234 and read {v} — the fault handler never fired, so S6h's si_addr is uncalibrated"))
+    }
+}
+
+/// S6i — **the fence experiment the dev-book names and had not run.**
+///
+/// Same guest, same 8 MB limit, same handler as S6h; the one difference is that `siglongjmp` is
+/// armed. Surviving the fault is necessary but **not sufficient** for a fence to be usable, so the
+/// probe then asks the question that actually decides it: *is anything behind the fault still
+/// working?* `siglongjmp` out of a SIGSEGV taken inside the allocator unwinds without running a
+/// single destructor, so the faulting `Runtime` and `Context` are leaked mid-operation. If a fresh
+/// runtime still evaluates `1 + 1`, the process survived in a way a supervisor-free design could
+/// build on; if it does not, the fence is a mirage and the subprocess shape is the answer.
+fn probe_segv_fence() -> Probe {
+    arm_fault_handler();
+    let mut jmp = SigJmpBuf([0u64; 32]);
+    FAULT_JMP.store(&mut jmp as *mut SigJmpBuf, Ordering::SeqCst);
+    let jumped = unsafe { sigsetjmp(&mut jmp, 1) };
+    if jumped == 0 {
+        // Armed. Run the fatal guest; if this ever returns, the probe did not exercise the fence.
+        let r = mem_probe(Some(8 * 1024 * 1024), false);
+        FAULT_JMP.store(std::ptr::null_mut(), Ordering::SeqCst);
+        return match r {
+            Ok(m) => Err(format!("the guest did NOT fault, so the fence was never exercised: {m}")),
+            Err(m) => Err(format!("the guest errored instead of faulting: {m}")),
+        };
+    }
+    // --- resumed here by `siglongjmp` ---
+    FAULT_JMP.store(std::ptr::null_mut(), Ordering::SeqCst);
+    let sig = FAULT_SIGNAL.load(Ordering::SeqCst);
+    let addr = FAULT_ADDR.load(Ordering::SeqCst);
+    let code = FAULT_CODE.load(Ordering::SeqCst);
+    let rt = Runtime::new()
+        .map_err(|e| format!("survived signal {sig} (si_addr {addr:#x}, si_code {code}), but a fresh Runtime::new failed: {e}"))?;
+    let ctx = rquickjs::Context::full(&rt)
+        .map_err(|e| format!("survived signal {sig} (si_addr {addr:#x}, si_code {code}), but Context::full failed: {e}"))?;
+    ctx.with(|ctx| -> Probe {
+        match ctx.eval::<i32, _>("1 + 1") {
+            Ok(2) => Ok(format!(
+                "SURVIVED signal {sig} (si_addr {addr:#x}, si_code {code}) by siglongjmp, and a FRESH \
+                 runtime still evaluates 1+1 — so the fence is reachable in-process. **Not a safety \
+                 claim:** the faulting runtime was abandoned mid-allocation and nothing here inspects \
+                 the app's own heap, which `siglongjmp` leaves exactly as the allocator left it"
+            )),
+            Ok(v) => Err(format!("survived signal {sig}, but 1+1 evaluated to {v}")),
+            Err(e) => Err(format!("survived signal {sig}, but a fresh eval failed: {e}")),
+        }
+    })
 }
 
 // ---------------------------------------------------------------------------------------------
