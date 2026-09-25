@@ -89,6 +89,10 @@ pub struct Paths {
     /// only reads `EnvironmentVariables` — but exposed so callers can reconstruct the env var
     /// value without re-deriving it from `binary`'s parent.
     pub data_dir: PathBuf,
+    /// The launchd label. Both tests in `launchd_live` share the same gui domain, and launchd
+    /// only allows one plist per label. The production path always uses `LABEL`; the harness
+    /// overrides this so two jobs can coexist in the same domain.
+    pub label: String,
 }
 
 impl Default for Paths {
@@ -100,6 +104,7 @@ impl Default for Paths {
             err_log: PathBuf::new(),
             environment: BTreeMap::new(),
             data_dir: PathBuf::new(),
+            label: LABEL.to_string(),
         }
     }
 }
@@ -117,6 +122,7 @@ pub fn paths(home: &Path, data_dir: &Path) -> Paths {
         err_log: data_dir.join("aiproviderd.err.log"),
         environment: BTreeMap::new(),
         data_dir: data_dir.to_path_buf(),
+        label: LABEL.to_string(),
     }
 }
 
@@ -173,7 +179,7 @@ pub fn render_plist(p: &Paths) -> String {
 </dict>
 </plist>
 "#,
-        label = LABEL,
+        label = p.label,
         binary = escape_xml(&p.binary.display().to_string()),
         env_dict = env_dict,
         out = escape_xml(&p.out_log.display().to_string()),
@@ -337,7 +343,7 @@ pub fn install(
     std::fs::write(&p.plist, render_plist(p))
         .map_err(|e| ServiceError(format!("cannot write {}: {e}", p.plist.display())))?;
 
-    let target = format!("{domain}/{LABEL}");
+    let target = format!("{domain}/{}", p.label);
     let plist = p.plist.display().to_string();
     let _ = run(&["bootout", &target]);
     let out = run(&["bootstrap", domain, &plist])?;
@@ -360,7 +366,7 @@ pub fn uninstall(
     domain: &str,
     run: &impl Fn(&[&str]) -> Result<Outcome, String>,
 ) -> Result<(), ServiceError> {
-    let target = format!("{domain}/{LABEL}");
+    let target = format!("{domain}/{}", p.label);
     let _ = run(&["bootout", &target]);
     if p.plist.exists() {
         std::fs::remove_file(&p.plist)
@@ -404,7 +410,7 @@ pub fn status(
     run: &impl Fn(&[&str]) -> Result<Outcome, String>,
 ) -> Result<Status, ServiceError> {
     let plist_present = p.plist.is_file();
-    let target = format!("{domain}/{LABEL}");
+    let target = format!("{domain}/{}", p.label);
     match run(&["print", &target])? {
         Outcome { status: 0, stdout, .. } => {
             Ok(Status { plist_present, loaded: true, pid: parse_pid(&stdout) })

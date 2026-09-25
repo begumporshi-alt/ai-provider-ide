@@ -97,12 +97,10 @@ fn scratch(tag: &str) -> (Paths, PathBuf) {
 
 /// Boot out any job a previous run left behind under the shared label.
 ///
-/// Both tests use the same label (`dev.aiprovider.router`) in the same gui domain.
-/// If a prior run panicked before its `uninstall`, the old job is still tracked by launchd
-/// and `launchctl print` will report its (now-stale) pid. Booting out first makes
-/// `bootstrap` the only source of the pid we assert on.
-fn clean_stale(domain: &str) {
-    let _ = service::run_launchctl(&["bootout", &format!("{domain}/{}", service::LABEL)]);
+/// Both tests use the same gui domain but **different labels** (`dev.aiprovider.router`
+/// and `dev.aiprovider.router-test`), so a prior run can never contaminate the other test.
+fn clean_stale(domain: &str, label: &str) {
+    let _ = service::run_launchctl(&["bootout", &format!("{domain}/{label}")]);
 }
 
 /// `launchctl`'s own words for "this process may not mutate that domain". Matching on the message
@@ -118,7 +116,8 @@ fn install_produces_a_job_launchd_actually_runs() {
     let (paths, root) = scratch("install");
     let uid = service::read_uid().expect("`id -u` must answer");
     let domain = service::domain(uid);
-    clean_stale(&domain);
+    let label = service::LABEL; // "dev.aiprovider.router"
+    clean_stale(&domain, label);
     let src = payload(&root);
 
     println!("scratch install at {}", root.display());
@@ -228,10 +227,14 @@ fn agent_serves_health_and_app_delegates() {
     // Point the agent at a scratch store so it never touches the user's real application data.
     // `Store::open` creates the SQLite file and runs migrations on first use.
     paths.environment.insert("AIP_DATA_DIR".into(), paths.data_dir.display().to_string());
+    // **A distinct label** so this job and the `install` test's job can coexist in the same
+    // gui domain — launchd only allows one plist per label. `install` uses `LABEL`;
+    // this one uses `LABEL_AGENT` so the two tests run in parallel without collision.
+    paths.label = "dev.aiprovider.router-test".to_string();
 
     let uid = service::read_uid().expect("`id -u` must answer");
     let domain = service::domain(uid);
-    clean_stale(&domain);
+    clean_stale(&domain, &paths.label);
 
     println!("scratch install at {}", root.display());
     println!("domain {domain}");
