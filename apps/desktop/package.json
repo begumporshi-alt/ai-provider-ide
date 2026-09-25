@@ -15,7 +15,8 @@
     "web-test:clean": "if [ -d test-results ]; then mv test-results \"/tmp/web-test-results-$(date +%s)\"; fi; if [ -d node_modules/.vite ]; then mv node_modules/.vite \"/tmp/web-test-vite-$(date +%s)\"; fi",
     "web-test": "pnpm web-test:clean && pnpm web-test:types && playwright test --config=playwright.config.ts",
     "preview": "vite preview",
-    "tauri": "tauri"
+    "tauri": "tauri",
+    "build:headless": "bash ../../scripts/substitute-tauri-free-aiproviderd.sh"
   },
   "dependencies": {
     "@aiprovider/adapter-spec": "workspace:*",

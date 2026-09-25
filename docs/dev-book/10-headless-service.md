@@ -4006,6 +4006,55 @@ what remains in step 2.
 code. Gates: `cargo fmt --check`, `clippy --all-targets -- -D warnings`,
 `cargo check --no-default-features --all-targets`, `check-doc-links` and `docs:book`, all green.
 
+### Increment 26s — Phase 6 step 2's build step, and the gate that can actually fail
+
+**26r closed step 2's *decision* and left its *build step* open**: bundle the Tauri-free `aiproviderd`,
+for the linkage, not for the 16.5 KB — and `tauri build` cannot produce it, because it builds the
+default-features target. That step is what this increment lands.
+
+**The build step is a script, not a config key, because there is no config key.** `tauri build` runs
+one `cargo build` per target; there is no `tauri.conf.json` field that says "build the `[[bin]]`
+target without the `app` feature". So the substitution is a *post-bundle* step: build the Tauri-free
+`aiproviderd` with `--no-default-features`, verify its linkage, copy it into `Contents/MacOS/`, and
+re-verify. `scripts/substitute-tauri-free-aiproviderd.sh` is that step; `pnpm build:headless` is its
+one-command entry point.
+
+**The gate is a different instrument than the one D56 retired.** The status row's evidence
+(`cargo tree … | grep -ci 'webkit|wry|gtk'` → 0) was BSD BRE: the pattern is the literal string
+`webkit|wry|gtk`, so it returns 0 on *any* input, including a tree with 34 real WebKit matches. The
+replacement is `otool -L` on the binary — a check that reads the *actual dylib list* — plus `grep -icE`
+(ERE, so the alternation is real). `scripts/check-bundled-aiproviderd-links.sh` runs it.
+
+**The instrument is proven fail-capable, which D56's rule requires for any absence claim.** Pointed
+at the default-features binary (which links WebKit) it exits **2** and names the offending
+`/System/Library/Frameworks/WebKit.framework/Versions/A/WebKit` line; pointed at the Tauri-free
+binary it exits **0**. An instrument that cannot report the failure it exists to detect is worse
+than no instrument, because a green exit reads as a passing check.
+
+**Run 2026-09-25.** `pnpm build:headless` succeeded: Tauri-free build → WebKit link count **0**;
+default-features build → WebKit link count **1** (the contrast); post-substitution bundle → WebKit
+link count **0**. The gate then passed against the substituted bundle, and was *re-run* against the
+default-features binary placed back in the bundle (falsification), which exited 2 as expected. The
+bundle now ships the Tauri-free binary.
+
+**What this does not close.** The two binaries are *functionally* different only in their
+dependencies: Tauri-free `aiproviderd` does not start a webview or a Tauri event loop, so it
+cannot *be* the desktop app. The substitution is one-way — `tauri build` always overwrites the
+bundled `aiproviderd` with the default-features one — so any future `tauri build` run **must** be
+followed by `pnpm build:headless`, or the bundle regresses to WebKit-linked. That coupling is
+stated here and is the reason the gate (not the substitution) is the durable guard: a missing
+substitution is caught by the gate's exit 2, not by the silent absence of a WebKit-free binary.
+
+**What 26s leaves open, and it is a step 4 question.** `gateway_startup`'s two-process race (26l)
+is still unmeasured: with `RunAtLoad` set the agent and the app both bind the same persisted port,
+and nothing can test it without both processes up. Step 4 is where the app stops starting its own
+gateway; this increment does not touch that.
+
+**Gates:** `cargo fmt --check`, `clippy --all-targets -- -D warnings`,
+`cargo check --no-default-features --all-targets` clean; `check-doc-links` 52 files/127 links;
+`docs:book` 212 ids; `key-leak-grep` OK. No test counts change — this increment adds two shell
+scripts and one `package.json` entry, and lands no Rust or TypeScript.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -4100,11 +4149,17 @@ and it generates the first master key when there is none; `bootstrap()` degrades
 surface instead of reporting the database as corrupt; the keyed `GET/POST /admin/settings/{key}`
 route closes the last gap the TypeScript migration had; and `gatewayBaseUrl()`'s fallback stopped
 naming 8800. Browser suite **108/108**.
-Steps 1 and 3 are landed (26a and 26b); **26r took step 2's decision and left its build step open** —
+Steps 1 and 3 are landed (26a and 26b); **26r took step 2's decision and 26s closed its build step** —
 bundle the **Tauri-free** build, because it does not link WebKit (the size difference is 16.5 KB and is
-not the reason), but `tauri build` builds the default-features target, so producing the right binary and
-substituting it into the bundle is still to do. `bundle.externalBin` is **not** needed: the bundler
-already places the `[[bin]]` target, which is how the service reached `Contents/MacOS/` (D56).
+not the reason). `tauri build` cannot produce that binary — it builds the default-features target — so
+`scripts/substitute-tauri-free-aiproviderd.sh` (`pnpm build:headless`) is the post-bundle step: build the
+Tauri-free `aiproviderd` with `--no-default-features`, verify its linkage with `otool -L`, and copy it
+into `Contents/MacOS/`. The substitution is **one-way**: any future `tauri build` overwrites the bundled
+binary with the WebKit-linked one, so the durable guard is the gate `scripts/check-bundled-aiproviderd-links.sh`
+(ERE `grep -icE 'WebKit|wry|gtk'` against `otool -L`), which is the instrument D56 required — one that
+reports *presence*, not the BRE command that returned 0 on any input. `bundle.externalBin` is **not**
+needed: the bundler already places the `[[bin]]` target, which is how the service reached `Contents/MacOS/`
+(D56).
 With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
 usable once the app stops starting its own gateway — which is what step 4 does. **26l sharpens that
 collision rather than deferring it**: the app now starts its listener on a fresh install instead of
@@ -4117,6 +4172,8 @@ adapter-runtime spike left open — in-process with a supervised heap ceiling, o
 then give that module a phase in §7" until 2026-09-25, by which point Phase 4b had given that module
 its phase and the spike's residual was recorded in the risk register instead; and 26p then *answered*
 that residual — S6i fences the fault in-process — narrowing it from feasibility to the abandoned-frame
-cost, which is D54; and 26r then took step 2's decision while leaving its build step open. It is
+cost, which is D54; 26r took step 2's decision while leaving its build step open, and 26s then closed
+that build step — `scripts/substitute-tauri-free-aiproviderd.sh` plus the `otool -L` gate — so the next
+open item is step 4: the app stops starting its own gateway, and the agent owns the port. It is
 rewritten here rather than silently overwritten because a stale "next action" is the cheapest way for a
 plan to stop describing its own project.)
