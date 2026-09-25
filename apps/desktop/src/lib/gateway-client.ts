@@ -36,12 +36,28 @@ export function clearUiSession(): void {
   _cached = null;
 }
 
-/** The gateway base URL, read from the `gateway` settings row. */
+/**
+ * The gateway base URL.
+ *
+ * **The live port is the authority.** `gateway_status` reports the port the host actually bound,
+ * and that is the only thing that answers "where is the listener". Reading the `gateway` settings
+ * row instead was wrong in two reachable ways: the row is only written once the operator toggles
+ * the switch, so on a first run there is no row at all; and a row written from an emptied port
+ * field carries no `port` key while the host binds its own default.
+ *
+ * The fallback is for a failed status call, and its constant must match `gateway::DEFAULT_PORT` —
+ * it used to say `8800`, which this app has never bound, so the UI dialled a closed port while the
+ * gateway was healthy. `gateway_status` is cached host-side (see `master_key_state`), so asking it
+ * per call is a cheap local read, not a keychain hit.
+ */
 export async function gatewayBaseUrl(): Promise<string> {
+  const status = await invoke<{ port?: number }>("gateway_status").catch(() => null);
+  if (typeof status?.port === "number" && status.port > 0) {
+    return `http://127.0.0.1:${status.port}`;
+  }
   const raw = await invoke<string | null>("settings_get", { key: "gateway" });
   const s = raw ? (JSON.parse(raw) as { port?: number }) : {};
-  const port = s.port ?? 8800;
-  return `http://127.0.0.1:${port}`;
+  return `http://127.0.0.1:${s.port ?? 8787}`;
 }
 
 /** One authenticated `fetch()` to the admin surface.

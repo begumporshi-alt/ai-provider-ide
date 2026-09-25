@@ -3565,6 +3565,8 @@ async fn admin_routes_refuse_without_the_master_key() {
     for (method, path, body) in [
         ("GET", "/admin/settings", json!(null)),
         ("POST", "/admin/settings", json!({})),
+        ("GET", "/admin/settings/router", json!(null)),
+        ("POST", "/admin/settings/router", json!({})),
         ("GET", "/admin/keys", json!(null)),
         ("POST", "/admin/keys", json!({ "label": "x" })),
         ("DELETE", "/admin/keys/ak-1", json!(null)),
@@ -3720,6 +3722,157 @@ async fn admin_settings_write_refuses_a_non_object() {
         .await
         .unwrap();
     assert_eq!(res.status(), 400);
+}
+
+/// The keyed read, which is the one the UI's `settings_get` on the `router` row needs.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_keyed_settings_reads_back_an_empty_object_when_there_is_no_row() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/settings/router", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.json::<Value>().await.unwrap(), json!({}));
+}
+
+/// **The row separation is the point of the keyed route.** `settings` is one table holding
+/// unrelated rows, and `router` is read per request by the headless host. A keyed write must land
+/// on its own row and leave `gateway` alone — the failure this guards is a route that ignores the
+/// path segment and writes the row the unkeyed pair owns.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_keyed_settings_merge_into_their_own_row_only() {
+    let s = start_with_store().await;
+    let auth = |r: reqwest::RequestBuilder| r.header("authorization", "Bearer sk-aip-test");
+
+    // The `gateway` row first, so "left alone" is a claim about a row that exists.
+    let res = auth(s.client.post(format!("{}/admin/settings", s.base)))
+        .json(&json!({ "port": 8800 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // Two writes into `router`, the second knowing only one key.
+    let res = auth(s.client.post(format!("{}/admin/settings/router", s.base)))
+        .json(&json!({ "failoverEnabled": true, "perProviderConcurrency": 3 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let res = auth(s.client.post(format!("{}/admin/settings/router", s.base)))
+        .json(&json!({ "systemAi": "gpt-5" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let merged: Value = res.json().await.unwrap();
+    assert_eq!(
+        merged,
+        json!({ "failoverEnabled": true, "perProviderConcurrency": 3, "systemAi": "gpt-5" }),
+        "an unmentioned key must survive a keyed patch"
+    );
+
+    // Re-read both rows from the host: the response body could have been right while the write
+    // went somewhere else.
+    let router = auth(s.client.get(format!("{}/admin/settings/router", s.base)))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(router, merged, "the `router` row must hold what the keyed route answered");
+
+    let gateway = auth(s.client.get(format!("{}/admin/settings", s.base)))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    assert_eq!(gateway, json!({ "port": 8800 }), "a keyed write must not touch the `gateway` row");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_keyed_settings_write_refuses_a_non_object() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/settings/router", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!("not an object"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400);
+}
+
+// ── The app's startup choice — the listener's own policy ───────────────────
+
+/// Write the `gateway` row the way the app does, so the policy is read from real bytes.
+fn set_gateway_row(store: &crate::core::store::Store, json: &str) {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO settings (key, value_json) VALUES ('gateway', ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+        rusqlite::params![json],
+    )
+    .unwrap();
+}
+
+/// **The regression this whole state exists for.** No row at all means "the user has never chosen",
+/// which must start the listener — not "stay down". Collapsed into one `None`, it left a fresh
+/// install with nothing bound, and since the pure-HTTP migration every `/admin/*` call the UI makes
+/// dialled a closed port: onboarding's first write failed with `TypeError: Failed to fetch`, and
+/// `bootstrap()` reported the app's own database as corrupt.
+#[test]
+fn gateway_startup_starts_on_the_default_when_the_user_has_never_chosen() {
+    let store = admin_test_store();
+    assert_eq!(gateway_startup(&store), GatewayStartup::Default);
+    assert_eq!(gateway_startup(&store).port(), Some(DEFAULT_PORT));
+}
+
+/// An explicit off is an instruction, and it must win. This is the only reason the two states are
+/// separate — a default that overrode the operator would be a worse bug than the one it fixes.
+#[test]
+fn gateway_startup_honours_an_explicit_off() {
+    let store = admin_test_store();
+    set_gateway_row(&store, r#"{"port":8787,"enabled":false}"#);
+    assert_eq!(gateway_startup(&store), GatewayStartup::Off);
+    assert_eq!(gateway_startup(&store).port(), None);
+}
+
+#[test]
+fn gateway_startup_restores_the_port_the_user_chose() {
+    let store = admin_test_store();
+    set_gateway_row(&store, r#"{"port":9999,"enabled":true}"#);
+    assert_eq!(gateway_startup(&store), GatewayStartup::On(9999));
+}
+
+/// `enabled` is the instruction; the port is a detail with a default, so "on" with no port still
+/// starts. `persisted_gateway_port` keeps the stricter reading and is pinned here in the same test,
+/// because the headless host has its own default port and must not inherit this one.
+#[test]
+fn gateway_startup_defaults_the_port_but_not_the_decision() {
+    let store = admin_test_store();
+    set_gateway_row(&store, r#"{"enabled":true}"#);
+    assert_eq!(gateway_startup(&store), GatewayStartup::On(DEFAULT_PORT));
+    assert_eq!(persisted_gateway_port(&store), None);
+}
+
+/// A row that will not parse is not an instruction to stay down either, and it self-heals: every
+/// writer merges into what it reads, and this read answers `{}`.
+#[test]
+fn gateway_startup_treats_an_unreadable_row_as_never_chosen() {
+    let store = admin_test_store();
+    set_gateway_row(&store, "{not json");
+    assert_eq!(gateway_startup(&store), GatewayStartup::Default);
+    assert_eq!(persisted_gateway_port(&store), None);
 }
 
 #[tokio::test(flavor = "multi_thread")]

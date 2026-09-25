@@ -179,7 +179,7 @@ pub fn run() {
             gateway_cmds::run_rollup(&store);
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: rollup done");
             // Read before `store` is handed to `app.manage` — after that it is gone.
-            let restore_port = gateway::persisted_gateway_port(&store);
+            let startup = gateway::gateway_startup(&store);
             app.manage(store);
             app.manage(egress_state);
             gateway_cmds::manage(app)?;
@@ -191,21 +191,53 @@ pub fn run() {
             }
             crate::tauri::gateway_cmds::log_to_file(
                 app.handle(),
-                &format!("startup: tray done, restore_port={restore_port:?}"),
+                &format!("startup: tray done, gateway_startup={startup:?}"),
             );
-            // Bring the gateway back if it was serving when the app last quit. Best-effort: a
-            // failure here must never stop the UI from opening, so it is logged and dropped.
+            // Bring the listener up — on the port it was serving on, or on the default when the
+            // user has never chosen. Best-effort: a failure here must never stop the UI from
+            // opening, so it is logged and dropped.
+            //
+            // `Default` starting the listener is not a convenience. Since the pure-HTTP migration
+            // (dev-book §10 decision 2) every screen reaches the gateway over `fetch()`, so with
+            // nothing bound the app is unusable rather than merely degraded: measured 2026-09-25,
+            // onboarding's first write failed with `TypeError: Failed to fetch` and `bootstrap()`
+            // reported the database as corrupt. `Off` — the user said so — is still honoured.
             //
             // Logged to `gateway.log`, not just `tracing`. A release GUI build has no console, so
             // the tracing-only version of this left "the app came up without a gateway" with no
             // evidence anywhere — which is exactly how a silent failure passes for a slow start.
-            if let Some(port) = restore_port {
+            if let Some(port) = startup.port() {
                 let handle = app.handle().clone();
                 tauri::async_runtime::spawn(async move {
                     crate::tauri::gateway_cmds::log_to_file(
                         &handle,
-                        &format!("auto-restore: requested port {port}"),
+                        &format!("auto-start: requested port {port}"),
                     );
+                    // A listener with no master key refuses *everything* with 401 —
+                    // `check_gateway_key` tests the master key before it ever looks at an app key,
+                    // so even the UI's own session credential cannot get in. Starting one without
+                    // a key would therefore be a surface that looks healthy and serves nothing,
+                    // which is worse than no surface at all.
+                    //
+                    // `Absent` only, never `Unavailable`: the second means the keychain did not
+                    // answer, and generating there would rotate a key that already exists.
+                    if let Some(state) = handle
+                        .try_state::<std::sync::Arc<crate::tauri::gateway_cmds::GatewayState>>()
+                    {
+                        if matches!(state.core.master_key_state(), gateway::MasterKeyLookup::Absent)
+                        {
+                            match state.core.rotate_master_key() {
+                                Ok(_) => crate::tauri::gateway_cmds::log_to_file(
+                                    &handle,
+                                    "auto-start: generated the first master key",
+                                ),
+                                Err(e) => crate::tauri::gateway_cmds::log_to_file(
+                                    &handle,
+                                    &format!("auto-start: master key generation FAILED: {e}"),
+                                ),
+                            }
+                        }
+                    }
                     match crate::tauri::gateway_cmds::gateway_enable(handle.clone(), Some(port))
                         .await
                     {
@@ -213,14 +245,14 @@ pub fn run() {
                             tracing::info!("gateway restored on port {bound}");
                             crate::tauri::gateway_cmds::log_to_file(
                                 &handle,
-                                &format!("auto-restore: restored on port {bound}"),
+                                &format!("auto-start: serving on port {bound}"),
                             );
                         }
                         Err(e) => {
-                            tracing::warn!("gateway auto-restore failed: {e}");
+                            tracing::warn!("gateway auto-start failed: {e}");
                             crate::tauri::gateway_cmds::log_to_file(
                                 &handle,
-                                &format!("auto-restore FAILED: {e}"),
+                                &format!("auto-start FAILED: {e}"),
                             );
                         }
                     }

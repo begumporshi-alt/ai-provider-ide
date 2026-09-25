@@ -3485,6 +3485,102 @@ costing the full 120 s timeout. `web-test:types` clean, `pnpm typecheck` clean, 
 **13/14** — the memory screen renders "No memories yet" again. Probe reverted; `shim.ts` is back at
 its committed size.
 
+---
+
+## Increment 26l — the app starts its own listener, and the boot survives it being off
+
+**The gap 26k left, and 26k is what found it.** 26k made the harness serve `/admin/*` so the suite
+could see the pure-HTTP migration, and the first thing it saw was that the migration had made
+`bootstrap()` depend on a listener a fresh install does not have. `persisted_gateway_port` only
+auto-restores once the gateway has been enabled at least once, and *"the user has never chosen"* read
+as the same `None` as *"the user turned it off"*. So on a first run nothing was bound, and because
+every screen now reads over `fetch()` the app was not degraded but **unusable**: measured 2026-09-25,
+onboarding's first write (`createPendingProvider`) answered `{"ok":false,"err":"TypeError: Failed to
+fetch"}`, so a new user could not add a provider at all — and `bootstrap()` reported the app's own
+database as corrupt.
+
+**Three states, because two facts had collapsed into one.** `GatewayStartup`:
+
+- `Default` — no `gateway` row; the user has never chosen. Start on `DEFAULT_PORT`.
+- `Off` — the user said so. Stay down.
+- `On(port)` — bring it back on the port the user chose.
+
+`persisted_gateway_port` deliberately keeps the stricter reading: it answers *which port*, and
+`aiproviderd` has its own default, so `enabled` with no `port` is `None` there and `On(DEFAULT_PORT)`
+here. The two now share `gateway_settings_row` — one query, two policies, which is the only reason
+they cannot drift.
+
+**A listener with no master key is worse than no listener.** `check_gateway_key` tests the master key
+*before* it ever looks at an app key, so an auto-started listener with no key refuses everything with
+401 — including the UI's own session credential. It would look healthy and serve nothing. So the
+auto-start generates the first master key when the state is `MasterKeyLookup::Absent`, and **never** on
+`Unavailable`: the second means the keychain did not answer, and generating there would rotate a key
+that already exists.
+
+**The boot degrades, and names the state.** `bootstrap()` now guards all six reads in one `try` —
+providers, api-keys, models-cache, manifests, aliases and the `router` row — and degrades on
+`isUnreachable(e)`, which is `e instanceof TypeError`. That single distinction is the whole design: the
+browser rejects a `fetch()` to a closed port with a `TypeError`, while every other failure on the path
+(an HTTP status, or an `invoke` the host rejected) arrives as a plain `Error`. So *the gateway is not
+running* is survivable and *the store could not be opened* still fails the boot, which is what keeps a
+corrupt database reported as one. A degraded boot leaves `bootstrapped` false, so the shell's notice
+points at a recovery that works: `Shell.tsx` renders *Gateway not running — start it in Control to load
+your data*, and `Control.tsx` retries `bootstrap()` after the switch starts the listener rather than
+making the user relaunch.
+
+**The StrictMode bug underneath it.** The degradation worked and the notice still did not appear. The
+cause, once probed, was React StrictMode's double mount: `App` calls `bootstrap()` twice before either
+resolves, the second call returned early, its `then` fired first, and `App` marked itself ready with the
+reads still in flight — so the shell rendered while `bootDegraded` was still `null`. Fixed by sharing
+one in-flight promise, with `bootstrapped` set only at the very end of a successful path. **A guard that
+is correct and a guard that has run are different facts**, and only the second one reaches the screen.
+
+**The keyed settings route, and the port it fixed.** `GET/POST /admin/settings/{key}`. `settings` is one
+generic table holding rows that are not the same kind of thing: `gateway` is the listener plus the tool
+switches, while `router` is read **per request** by the headless host (`RouterSettings::from_store`) and
+carries `failoverEnabled`, `systemAi` and `perProviderConcurrency` — service data by any reading.
+`/admin/settings` owns only `gateway`, so the UI's `settings_get`/`settings_set` on `router` had no HTTP
+route at all, which was the last thing standing between the TypeScript migration and *all data access is
+over `fetch()`*. The route **merges** into the row, for the reason 26h found: a whole-row UPSERT of a row
+the caller only partly knows erases the rest of it. `read_gateway_settings` is deleted and
+`read_settings_object` is now the single implementation of *absent and corrupt both mean `{}`*, which
+until 26l existed twice.
+
+`gatewayBaseUrl()` had a second defect of the same shape and it was quieter: its fallback said **8800**,
+a port this app has never bound, while `DEFAULT_PORT` is **8787**. It now reads `gateway_status` first —
+the live port is the authority, and the row is only written once the operator toggles the switch — and
+falls back to `8787`.
+
+**Migrated in this increment:** `manifest_activate` ×2, `manifests_active`, `gateway_spend_status`,
+`memory_principal_list` / `memory_principal_set`, `gateway_prune_memories`, `persistRouterSettings`.
+**Kept on IPC, on purpose:** `readGatewaySettings` / `patchGatewaySettings` — the `gateway` row is the
+listener's own config, and the disable path writes *after* `gateway_disable`, so it must not depend on
+the surface it has just stopped.
+
+**The harness capability, built before the test that needed it.** `__webTestAdminSurfaceAbsent` makes
+`isAdminTarget` return false, so the request falls through to the real network stack and fails the way a
+first launch fails. Returning false is the honest model — refusing would have tested the harness. Until
+this existed the shim answered every `/admin/*` call unconditionally, so a boot path that had acquired a
+network dependency looked healthy in **all 106 tests**: a regression that made the app unbootable on a
+fresh install was invisible to the suite that exists to catch it.
+
+**Measured.** Rust lib **1278 / 0** — 26l adds **8** (three keyed-settings, five startup-policy); the
+row's documented **1216** had already aged by 54 across 26c–26i, which is D50's pattern repeating inside
+the window D50 was closed in. Headless `--no-default-features` **1214 / 0**; binary **5 / 0**. Browser
+**108 passed / 0 failed** in 3.8 m (was 106; the two new are `gateway-off.spec.ts`). vitest **181/181**,
+`pnpm typecheck` clean, `web-test:types` clean, fmt and clippy clean, `key-leak-grep` OK,
+`check-doc-links` 52 files / 127 links.
+
+**Falsified, both probes reverted.** (a) Making the keyed write ignore its path segment reddened
+`admin_keyed_settings_merge_into_their_own_row_only` with `port: 8800` bleeding in from the `gateway`
+row — the row separation is the property, and the test asserts on the row re-read from the host, not on
+the response body. (b) `if false && row.get("enabled")…` reddened `gateway_startup_honours_an_explicit_off`
+with `On(8787)` against `Off`.
+
+**A tool hazard, recorded because it nearly cost a landed edit.** Bash `grep -c "A\|B"` returned a false
+`0` twice over code that was present. The host-side Grep tool is the authority for an absence claim; a
+shell `grep` with alternation is not.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3507,6 +3603,12 @@ is updated (the path changes). This needs a real update cycle to verify.
   the plist or the domain. A CLI is not a process that may mutate `gui/<uid>`; the Tauri app is. Closing
   this needs a caller with an Aqua session, which is what 26b's UI control provides. Full measurement in
   the 26a note above
+- **What `gateway_startup` should do when `aiproviderd` is the process serving.** Opened 2026-09-25 by
+  26l. The app now starts its own listener on a fresh install (`GatewayStartup::Default`), and
+  `gateway_settings_row`'s two-process reasoning covers *which port* but not *who owns it*. With
+  `RunAtLoad` set the agent starts the gateway at login, so the app's auto-start and the service race
+  for the same port on the next launch. Nothing measures that race yet, and no test can: it needs both
+  processes up, which is step 4's territory.
 
 ---
 
@@ -3533,11 +3635,19 @@ state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admi
 harness~~ **landed 26k** — `web-test/shim.ts` intercepts `fetch` to `127.0.0.1:<port>/admin/*` and
 dispatches to the same in-memory store the `invoke` cases use, so the suite runs as a gate again:
 **106/106**, from red at test 18. It found one live bug on the way (`persistAliases` sent `{ rows }`
-where the route wants a bare array) and cannot model CORS — see the 26k note.
+where the route wants a bare array) and cannot model CORS — see the 26k note. ~~the boot that could
+not reach the listener~~ **landed 26l** — the app now **starts** its own gateway by default rather
+than only restoring it, because *"never chosen"* is not *"turned off"* (`GatewayStartup::Default`),
+and it generates the first master key when there is none; `bootstrap()` degrades on an unreachable
+surface instead of reporting the database as corrupt; the keyed `GET/POST /admin/settings/{key}`
+route closes the last gap the TypeScript migration had; and `gatewayBaseUrl()`'s fallback stopped
+naming 8800. Browser suite **108/108**.
 Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the binary is bundled undeclared).
 With `RunAtLoad` set, the agent and the app both bind the same persisted port, so the agent is only
-usable once the app stops starting its own gateway — which is what step 4 does. The other decisions
-in §10 still stand.
+usable once the app stops starting its own gateway — which is what step 4 does. **26l sharpens that
+collision rather than deferring it**: the app now starts its listener on a fresh install instead of
+only restoring one, so "what should `gateway_startup` do when `aiproviderd` is the process serving?"
+is now a live question, not a hypothetical. The other decisions in §10 still stand.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the

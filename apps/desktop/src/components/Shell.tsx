@@ -4,7 +4,7 @@
  */
 import { type ReactNode } from "react";
 import { useUi, type ScreenId } from "../ui-state";
-import { registry, router } from "../store";
+import { bootDegradedReason, registry, router } from "../store";
 import { StatusDot } from "../components/atoms";
 
 const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
@@ -75,6 +75,15 @@ export function Shell({ children }: { children: ReactNode }) {
             Router {live ? "healthy" : "idle"}
           </span>
         </div>
+        {/* A boot that could not reach the gateway. Named here rather than left to read as an empty
+            app: the reads that fill every screen are host calls, so "no providers" and "the gateway
+            is not running" look identical on screen and have opposite fixes. See
+            `bootDegradedReason`. */}
+        {bootDegradedReason() !== null && (
+          <div className="px-4 pb-2 text-[11px]" style={{ color: "var(--danger)" }}>
+            Gateway not running — start it in Control to load your data.
+          </div>
+        )}
         <div className="px-4 pb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
           {router.systemAiAvailable().available ? "System AI ready" : "System AI locked"}
         </div>

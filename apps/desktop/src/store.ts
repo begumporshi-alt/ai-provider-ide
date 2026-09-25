@@ -302,7 +302,10 @@ export async function approveRepair(
       createdAt: Date.now(), isActive: false,
     },
   });
-  const previous = await invoke<number | null>("manifest_activate", { providerId, version });
+  const activated = (await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, {
+    version,
+  })) as { previousVersion: number | null };
+  const previous = activated.previousVersion;
   adapters.register(providerId, manifest); // hot-swap
   await setProviderStatus(providerId, "enabled");
   await refreshCatalog(providerId).catch(() => undefined);
@@ -317,8 +320,8 @@ export async function approveRepair(
 }
 
 export async function rollbackManifest(providerId: string, version: number): Promise<void> {
-  await invoke("manifest_activate", { providerId, version });
-  const rows = await invoke<HostManifestRow[]>("manifests_active");
+  await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, { version });
+  const rows = (await fetchAdmin("GET", "/admin/manifests")) as HostManifestRow[];
   const row = rows.find((r) => r.providerId === providerId);
   if (row) {
     adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
@@ -330,19 +333,89 @@ export async function listManifestHistory(providerId: string): Promise<HostManif
 }
 
 let bootstrapped = false;
+let bootInFlight: Promise<void> | null = null;
 
-/** Load persisted state into the core; safe to call repeatedly (no-op after the first). */
-export async function bootstrap(): Promise<void> {
-  if (bootstrapped) return;
-  bootstrapped = true;
+/**
+ * Why the last boot could not reach the gateway, or `null` when it could.
+ *
+ * A listener that is not running is a state the operator can put the app in deliberately — the
+ * Control switch turns it off — so the app has to survive it rather than mistake it for a data
+ * fault. See `bootstrap` and `isUnreachable`.
+ */
+let bootDegraded: string | null = null;
 
-  const [providers, keys, models, manifests, aliases] = await Promise.all([
-    invoke<HostProviderRow[]>("providers_list"),
-    invoke<HostKeyRow[]>("api_keys_list", { providerId: null }),
-    invoke<HostModelRow[]>("models_cache_list"),
-    invoke<HostManifestRow[]>("manifests_active"),
-    invoke<HostAliasRow[]>("aliases_list"),
-  ]);
+/** The reason the boot degraded, for a surface that wants to say so. */
+export function bootDegradedReason(): string | null {
+  return bootDegraded;
+}
+
+/**
+ * A fetch that never reached a listener, as opposed to one that was answered with a refusal.
+ *
+ * The browser rejects a `fetch()` to a closed port with a `TypeError`. Every other failure on this
+ * path arrives as a plain `Error` — an HTTP status, via `fetchAdmin`, or whatever Tauri rejects an
+ * `invoke` with. That difference is the whole distinction between "the gateway is not running" and
+ * "the store could not be opened", and only the first of the two is survivable.
+ */
+function isUnreachable(e: unknown): boolean {
+  return e instanceof TypeError;
+}
+
+/**
+ * Load persisted state into the core. Safe to call repeatedly, and **concurrent callers share one
+ * boot**.
+ *
+ * That sharing is load-bearing, not tidiness. React StrictMode mounts the app twice, so `App` calls
+ * this twice before either call resolves. While the second call returned early instead, its `then`
+ * fired first and marked the app ready with the reads still in flight — so the shell rendered while
+ * `bootDegraded` was still `null`, and a gateway that was not running produced an app that said
+ * nothing about it. Measured 2026-09-25, which is why `gateway-off.spec.ts` asserts on the notice
+ * and not merely on the app having painted.
+ *
+ * A degraded boot deliberately leaves `bootstrapped` false, so starting the gateway can retry.
+ */
+export function bootstrap(): Promise<void> {
+  if (bootstrapped) return Promise.resolve();
+  bootInFlight ??= runBootstrap().finally(() => {
+    bootInFlight = null;
+  });
+  return bootInFlight;
+}
+
+async function runBootstrap(): Promise<void> {
+  // Every host read is inside this one `try`, including the `router` row. Read later instead, a
+  // failure there would escape the degradation below and take the app down with the
+  // corrupt-database screen — which is the defect this guard exists to prevent.
+  let providers: HostProviderRow[];
+  let keys: HostKeyRow[];
+  let models: HostModelRow[];
+  let manifests: HostManifestRow[];
+  let aliases: HostAliasRow[];
+  let routerSettings: Record<string, unknown>;
+  try {
+    [providers, keys, models, manifests, aliases, routerSettings] = await Promise.all([
+      fetchAdmin("GET", "/admin/providers") as Promise<HostProviderRow[]>,
+      fetchAdmin("GET", "/admin/api-keys") as Promise<HostKeyRow[]>,
+      fetchAdmin("GET", "/admin/models-cache") as Promise<HostModelRow[]>,
+      fetchAdmin("GET", "/admin/manifests") as Promise<HostManifestRow[]>,
+      fetchAdmin("GET", "/admin/aliases") as Promise<HostAliasRow[]>,
+      fetchAdmin("GET", "/admin/settings/router") as Promise<Record<string, unknown>>,
+    ]);
+  } catch (e) {
+    // The gateway is a listener this app can start, not a precondition for opening it, so an
+    // unreachable surface degrades: the shell renders and `bootDegradedReason` names the cause.
+    // Anything else — a refusal, or an `invoke` the host rejected — is a real fault and still
+    // fails the boot, which is what keeps a corrupt database reported as one.
+    //
+    // Measured 2026-09-25, unguarded: "App data could not be opened / TypeError: Failed to fetch",
+    // with restore-from-backup advice, for a gateway that was simply not running.
+    // `web-test/gateway-off.spec.ts` is the guard.
+    if (!isUnreachable(e)) throw e;
+    // `bootstrapped` stays false — the reads never happened, so starting the gateway can retry.
+    bootDegraded = String(e);
+    return;
+  }
+  bootDegraded = null;
 
   registry.hydrate(providers.map(hostToProvider), keys.map(hostToKey));
 
@@ -385,23 +458,33 @@ export async function bootstrap(): Promise<void> {
     catalog.setAliases(aliases.map((a) => ({ ...a, auto: false })));
   } else {
     catalog.deriveAutoAliases();
-    await persistAliases();
+    // Best-effort, and deliberately the same shape as the call in `refreshStaleCatalogs` below.
+    //
+    // The alias table is a **derived cache**: it is rebuilt from the catalog whenever it is empty, so
+    // a write that does not land costs one re-derivation and nothing else — which is why swallowing
+    // it is honest rather than convenient.
+    //
+    // Unguarded, it made the boot path depend on a listener that is not there on a fresh install
+    // (the app only restores its own gateway once it has been enabled at least once). Measured:
+    // the app came up as "App data could not be opened / TypeError: Failed to fetch" — a
+    // corrupt-database screen, with its restore-from-backup advice, for a gateway that is simply off.
+    // `web-test/gateway-off.spec.ts` is the guard.
+    await persistAliases().catch(() => undefined);
   }
 
-  const settingsRaw = await invoke<string | null>("settings_get", { key: "router" });
-  if (settingsRaw) {
-    try {
-      Object.assign(router.settings, JSON.parse(settingsRaw));
-    } catch {
-      /* keep defaults */
-    }
-  }
+  // The `router` row, read above with the rest — `/admin/settings` owns the `gateway` row only,
+  // which is why the keyed form exists at all. No null case to special-case: a missing row answers
+  // `{}`, and assigning an empty object keeps the defaults, which is what the old
+  // `if (settingsRaw)` guard did.
+  Object.assign(router.settings, routerSettings);
 
   // Self-heal a stale catalog: a persisted cache can outlive its adapter's modality rules
   // (the 2026-09-16 rawMatch amendment is the case), and `isStale` was never called, so a
   // pre-fix cache would otherwise keep showing wrong classifications until a manual refresh.
   // Rows already fresh are untouched; failures leave the stale rows in place (stale-fallback).
   await refreshStaleCatalogs().catch(() => undefined);
+
+  bootstrapped = true;
 }
 
 async function refreshFromHost(): Promise<void> {
@@ -656,7 +739,11 @@ export async function workbuddySetModels(models: string[]): Promise<WorkbuddySyn
 }
 
 export function persistRouterSettings(): void {
-  void invoke("settings_set", { key: "router", valueJson: JSON.stringify(router.settings) });
+  // Best-effort by signature, and now a **merge** rather than a whole-row UPSERT: the route merges
+  // into the row, so a key another writer added between this call and the write survives. The
+  // `catch` is not decoration — nothing awaits this, so a rejection would surface as an unhandled
+  // promise rather than anywhere useful.
+  void fetchAdmin("POST", "/admin/settings/router", router.settings).catch(() => undefined);
 }
 
 export function listLedger(): LedgerEntry[] {
@@ -1068,7 +1155,7 @@ export interface MemoryPruneStats {
 
 /** §6.2 retention for memories: L0 TTL + per-session ring, L1/L2 decay. Pinned and L3 are exempt. */
 export async function pruneMemories(): Promise<MemoryPruneStats> {
-  return invoke<MemoryPruneStats>("gateway_prune_memories");
+  return fetchAdmin("POST", "/admin/memory/prune") as Promise<MemoryPruneStats>;
 }
 
 /** Live-context retention: turn ring per session, TTL on turns, TTL on idle sessions. */
@@ -1094,7 +1181,7 @@ export interface PrincipalRow {
 }
 
 export async function memoryPrincipalList(): Promise<PrincipalRow[]> {
-  return invoke<PrincipalRow[]>("memory_principal_list");
+  return fetchAdmin("GET", "/admin/memory/principals") as Promise<PrincipalRow[]>;
 }
 
 /**
@@ -1102,12 +1189,18 @@ export async function memoryPrincipalList(): Promise<PrincipalRow[]> {
  *
  * The master switch still wins: a principal set to `true` gets nothing while memory is off
  * globally, which is what keeps "off" a single unambiguous act.
+ *
+ * The route takes the fields flat and answers `{ ok }` — the IPC command wrapped them in a
+ * `policy` object because Tauri hands a command one argument bag, which is the shape that went.
  */
 export async function setMemoryPrincipal(
   principal: string,
   enabled: boolean | null,
 ): Promise<boolean> {
-  return invoke<boolean>("memory_principal_set", { policy: { principal, enabled } });
+  const res = (await fetchAdmin("POST", "/admin/memory/principals", { principal, enabled })) as {
+    ok: boolean;
+  };
+  return res.ok;
 }
 
 /** The memory/context layer's master switch. Off by default: no reads, no writes. */
@@ -1147,7 +1240,7 @@ export async function gatewayStatus(): Promise<GatewayStatus> {
 }
 
 export async function gatewaySpendStatus(): Promise<GatewaySpendStatus> {
-  return invoke<GatewaySpendStatus>("gateway_spend_status");
+  return fetchAdmin("GET", "/admin/spend") as Promise<GatewaySpendStatus>;
 }
 
 /** The login-item service: launchd's word on whether the agent is installed and up. */

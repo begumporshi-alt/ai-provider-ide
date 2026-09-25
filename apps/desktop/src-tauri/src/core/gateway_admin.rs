@@ -134,9 +134,11 @@ fn admin_error(status: StatusCode, message: &str, code: Option<&str>) -> Respons
 
 // ── GET /admin/settings ────────────────────────────────────────────────────
 
-/// The gateway settings row, as an object. `{}` when there is no row, and `{}` when the row is
-/// unparseable — a corrupt row must not take a screen down, and it must not be reported as an
-/// error either, because there is nothing the caller can do about it.
+/// The `gateway` settings row, as an object — the unkeyed form of `GET /admin/settings/{key}`,
+/// kept because this is the row these routes own and the one the listener is configured from.
+///
+/// This read and the keyed one are now the **same** read: `read_settings_object` is the single
+/// implementation of "absent and corrupt both mean `{}`", which until 26l existed twice.
 pub async fn settings_get_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
     if let Err(r) = authorize(&core, &headers) {
         return *r;
@@ -145,26 +147,7 @@ pub async fn settings_get_h(State(core): State<Arc<GatewayCore>>, headers: Heade
         Ok(s) => s,
         Err(r) => return *r,
     };
-    (StatusCode::OK, Json(read_gateway_settings(store))).into_response()
-}
-
-/// The stored gateway settings, defaulting to an empty object on absence **or** corruption.
-///
-/// Both collapse to `{}` on purpose. They are different faults, but the caller's recovery is the
-/// same (treat every field as unset), and distinguishing them here would put a "your settings are
-/// corrupt" decision in a function with no screen to show it on.
-pub(crate) fn read_gateway_settings(store: &Store) -> Value {
-    let conn = store.conn.lock().unwrap();
-    let raw: Option<String> = conn
-        .query_row("SELECT value_json FROM settings WHERE key = ?", [GATEWAY_SETTINGS_KEY], |r| {
-            r.get(0)
-        })
-        .ok();
-    drop(conn);
-    match raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
-        Some(Value::Object(o)) => Value::Object(o),
-        _ => json!({}),
-    }
+    (StatusCode::OK, Json(read_settings_object(store, GATEWAY_SETTINGS_KEY))).into_response()
 }
 
 // ── POST /admin/settings ───────────────────────────────────────────────────
@@ -195,28 +178,95 @@ pub async fn settings_set_h(
         );
     };
 
-    let mut current = match read_gateway_settings(store) {
-        Value::Object(o) => o,
-        _ => serde_json::Map::new(),
-    };
+    let mut current = read_settings_object(store, GATEWAY_SETTINGS_KEY);
     for (k, v) in patch {
         current.insert(k, v);
     }
     let merged = Value::Object(current);
 
-    let written = serde_json::to_string(&merged).unwrap_or_else(|_| "{}".to_string());
-    let conn = store.conn.lock().unwrap();
-    let res = conn.execute(
-        "INSERT INTO settings (key, value_json) VALUES (?, ?) \
-         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
-        rusqlite::params![GATEWAY_SETTINGS_KEY, written],
-    );
-    drop(conn);
-    match res {
-        Ok(_) => (StatusCode::OK, Json(merged)).into_response(),
+    match write_settings_object(store, GATEWAY_SETTINGS_KEY, &merged) {
+        Ok(()) => (StatusCode::OK, Json(merged)).into_response(),
         Err(e) => admin_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not write the gateway settings: {e}"),
+            Some("settings_write_failed"),
+        ),
+    }
+}
+
+// ── GET /admin/settings/{key} ──────────────────────────────────────────────
+
+/// Any settings row, as an object — `{}` when there is no row, and `{}` when the row is
+/// unparseable, for the reason `read_settings_object` gives.
+///
+/// **Why a keyed route exists at all.** `settings` is one generic key-value table, and the rows in it
+/// are not the same kind of thing. `gateway` is the listener plus the tool switches. `router` is read
+/// **per request** by the headless host (`RouterSettings::from_store`) and carries `failoverEnabled`,
+/// `systemAi` and `perProviderConcurrency` — service data by any reading. `/admin/settings` alone
+/// owns the `gateway` row, so the UI's `settings_get`/`settings_set` on `router` had no HTTP route at
+/// all; that gap is the last thing standing between the TypeScript migration and "all data access is
+/// over `fetch()`".
+///
+/// The route is generic on purpose: it must not be **narrower** than the IPC command it replaces, or
+/// the migration cannot finish. It is not broader in any way that matters — the caller already holds
+/// the master key, and the IPC command is a whole-row UPSERT where this merges.
+pub async fn settings_key_get_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/settings/{key}") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    (StatusCode::OK, Json(read_settings_object(store, &key))).into_response()
+}
+
+// ── POST /admin/settings/{key} ─────────────────────────────────────────────
+
+/// Merge a patch into one settings row and answer with the result — the same merge as
+/// `POST /admin/settings`, for the same reason, applied to whichever row the caller names.
+///
+/// The merge is what makes this safe for `router`: writing the tools toggle from TypeScript as a
+/// whole-row UPSERT would erase `failoverEnabled`, `systemAi` and `perProviderConcurrency`, none of
+/// which the caller mentioned. 26h already had to hand-roll that merge for `/admin/tools`; this is
+/// the general form of it.
+pub async fn settings_key_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(key): Path<String>,
+    Json(patch): Json<Value>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/settings/{key}") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+
+    let Value::Object(patch) = patch else {
+        return admin_error(
+            StatusCode::BAD_REQUEST,
+            "POST /admin/settings/{key} expects a JSON object",
+            Some("not_an_object"),
+        );
+    };
+
+    let mut current = read_settings_object(store, &key);
+    for (k, v) in patch {
+        current.insert(k, v);
+    }
+    let merged = Value::Object(current);
+
+    match write_settings_object(store, &key, &merged) {
+        Ok(()) => (StatusCode::OK, Json(merged)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not write the `{key}` settings: {e}"),
             Some("settings_write_failed"),
         ),
     }

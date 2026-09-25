@@ -1823,6 +1823,75 @@ pub fn copy_master_key() -> Result<(), String> {
     cb.set_text(key).map_err(|e| e.to_string())
 }
 
+/// The `gateway` settings row, parsed — `None` when there is no row, or it will not parse.
+///
+/// The distinction this preserves is the point: `None` means "no instruction here", which is not
+/// the same fact as a row that says `enabled: false`. Collapsing the two is what left a fresh
+/// install with no listener at all — see `GatewayStartup`.
+///
+/// Absence and corruption collapse together on purpose: they are different faults whose recovery is
+/// identical, and neither is an instruction to stay down. A corrupt row also self-heals, because
+/// every writer merges into what it reads and reads `{}` here.
+fn gateway_settings_row(store: &crate::core::store::Store) -> Option<serde_json::Value> {
+    let raw: String = {
+        let conn = store.conn.lock().unwrap();
+        conn.query_row("SELECT value_json FROM settings WHERE key = 'gateway'", [], |r| r.get(0))
+            .ok()?
+    };
+    serde_json::from_str(&raw).ok()
+}
+
+/// What the desktop app should do about its own listener at launch.
+///
+/// Three states rather than two, because "never chosen" and "turned off" are different facts and
+/// only one of them is an instruction. The app read both as `None` and stayed down, which is right
+/// for a user who turned it off and wrong for everyone else: on a fresh install nothing was bound,
+/// so every screen that reaches the gateway over HTTP was talking to a closed port. Measured
+/// 2026-09-25, before this existed: onboarding's first write (`createPendingProvider`) failed with
+/// `TypeError: Failed to fetch`, so a new user could not add a provider at all, and `bootstrap()`
+/// reported the app's own database as corrupt.
+///
+/// The listener is the app's reason to exist, it binds loopback only, and every launch after the
+/// first already brings it back — so "on unless you turned it off" is the honest default, and
+/// `Off` still wins whenever the user has said so.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GatewayStartup {
+    /// No `gateway` row: the user has never chosen. Start on `DEFAULT_PORT`.
+    Default,
+    /// The user turned it off. Leave it off.
+    Off,
+    /// The user left it on. Bring it back on this port.
+    On(u16),
+}
+
+impl GatewayStartup {
+    /// The port to start on, or `None` when the user turned the listener off.
+    pub fn port(self) -> Option<u16> {
+        match self {
+            GatewayStartup::Off => None,
+            GatewayStartup::On(p) => Some(p),
+            GatewayStartup::Default => Some(DEFAULT_PORT),
+        }
+    }
+}
+
+/// The startup choice, read from the `gateway` row.
+///
+/// A row that says `enabled: true` but carries no `port` starts on `DEFAULT_PORT` rather than
+/// staying down: `enabled` is the operator's instruction, and the port is a detail that has a
+/// default. `persisted_gateway_port` deliberately keeps the stricter reading — it answers "which
+/// port", and the headless host has its own default — so the two share the query, not the policy.
+pub fn gateway_startup(store: &crate::core::store::Store) -> GatewayStartup {
+    let Some(row) = gateway_settings_row(store) else {
+        return GatewayStartup::Default;
+    };
+    if row.get("enabled").and_then(|e| e.as_bool()) != Some(true) {
+        return GatewayStartup::Off;
+    }
+    let port = row.get("port").and_then(|p| p.as_u64()).unwrap_or(DEFAULT_PORT as u64);
+    GatewayStartup::On(port as u16)
+}
+
 /// The port the gateway should come back up on, or `None` when it was left off.
 ///
 /// The gateway is a local endpoint other processes point at — WorkBuddy's custom-provider entry
@@ -1833,15 +1902,12 @@ pub fn copy_master_key() -> Result<(), String> {
 /// gateway, and `aiproviderd` picking a port at boot. One authority — two copies of this query
 /// would drift the moment one of them gained a fallback.
 pub fn persisted_gateway_port(store: &crate::core::store::Store) -> Option<u16> {
-    let conn = store.conn.lock().unwrap();
-    let value: String = conn
-        .query_row("SELECT value_json FROM settings WHERE key = 'gateway'", [], |r| r.get(0))
-        .ok()?;
-    let parsed: serde_json::Value = serde_json::from_str(&value).ok()?;
-    if !(parsed.get("enabled")?.as_bool()?) {
-        return None;
+    let row = gateway_settings_row(store)?;
+    if row.get("enabled")?.as_bool()? {
+        Some(row.get("port")?.as_u64()? as u16)
+    } else {
+        None
     }
-    Some(parsed.get("port")?.as_u64()? as u16)
 }
 
 pub struct ServerHandle {
@@ -1953,11 +2019,19 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/v1/responses", post(responses_h))
         .route("/v1beta/models/{*tail}", post(gemini_h))
         // Admin surface for the UI (dev-book §10 §5.3). The `PUT`-less set is deliberate: a
-        // settings write is a *merge*, so `POST /admin/settings` is the only one there is — see
-        // `gateway_admin`. Declared here rather than in the headless binary so the in-app gateway
-        // serves the identical surface, which is the whole point of the pure-HTTP decision: one
-        // contract, whichever process is listening on the port.
+        // settings write is a *merge*, so `POST` is the only verb there is — see `gateway_admin`.
+        // Declared here rather than in the headless binary so the in-app gateway serves the
+        // identical surface, which is the whole point of the pure-HTTP decision: one contract,
+        // whichever process is listening on the port.
+        //
+        // The unkeyed pair owns the `gateway` row; the keyed pair reaches every other row in the
+        // same table, `router` among them. Both merge, for the reason 26h found: a whole-row
+        // UPSERT of a row the caller only partly knows erases the rest of it.
         .route("/admin/settings", get(admin::settings_get_h).post(admin::settings_set_h))
+        .route(
+            "/admin/settings/{key}",
+            get(admin::settings_key_get_h).post(admin::settings_key_set_h),
+        )
         .route("/admin/keys", get(admin::keys_list_h).post(admin::key_create_h))
         .route("/admin/keys/{id}", delete(admin::key_revoke_h))
         .route("/admin/spend", get(admin::spend_h))

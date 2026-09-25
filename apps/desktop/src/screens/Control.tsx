@@ -18,6 +18,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { clampConcurrency, MAX_PER_PROVIDER } from "@aiprovider/router-core";
 import { Button, EmptyState, StatusDot, type Health } from "../components/atoms";
 import {
+  bootstrap,
   gatewayInjectionStats,
   gatewayLogTail,
   gatewayMemoryEnabled,
@@ -496,6 +497,14 @@ function GatewayTab({
         await invoke("gateway_enable", { port: portNum });
         await patchGatewaySettings({ port: portNum, enabled: true });
         if (!g?.hasKey) await invoke("gateway_key_generate");
+        // A boot that could not reach the gateway left every screen empty, and this is the recovery
+        // the shell's notice points at — so retry the reads here instead of making the user
+        // relaunch. A no-op when the boot already succeeded (`bootstrap` is guarded).
+        //
+        // Swallowed on purpose: the gateway did start, and `bootstrap` records its own reason, so a
+        // failure here is still visible in the shell rather than only in this screen's error slot.
+        await bootstrap().catch(() => undefined);
+        useUi.getState().bump();
       } else {
         await invoke("gateway_disable");
         // Persist the off state too: "enabled" is what startup restores, so leaving a stale `true`

@@ -605,6 +605,17 @@ let eventSeq = 0;
     uiSessionKey = next;
   },
   /**
+   * Model "the gateway is not listening" — the state a fresh install boots into, because the
+   * listener is only auto-restored once it has been enabled at least once.
+   *
+   * Every `/admin/*` fetch then falls through to the network stack and fails, which is what the app
+   * must survive. Toggling it after boot cannot test the boot path: set the init-time global with
+   * `addInitScript` for that. See `gateway-off.spec.ts`.
+   */
+  adminSurfaceAbsent: (absent: boolean): void => {
+    adminSurfaceAbsent = absent;
+  },
+  /**
    * The `/admin/*` calls the page has made, oldest first — the HTTP counterpart of
    * `store.requests()`, so a spec can assert what the UI actually sent after the migration moved
    * the transport. Bounded, for the same reason the egress log is.
@@ -1857,7 +1868,24 @@ function recordAdminCall(method: string, path: string, body: unknown): void {
 }
 
 /** Is this URL one the host's admin surface owns? Loopback only — see invariant 3. */
+/**
+ * Whether the harness pretends nothing is listening on the gateway port.
+ *
+ * Seeded from `globalThis.__webTestAdminSurfaceAbsent`, which a spec sets with `addInitScript`
+ * before the page boots — the boot path runs at mount, so a flag set afterwards is too late to
+ * reach it. `__webTest.adminSurfaceAbsent` toggles the same state for a spec that wants it mid-run.
+ *
+ * Until this existed the harness answered every `/admin/*` call unconditionally, so the suite could
+ * not see a boot path that depends on a live listener. It could not: a regression that made the app
+ * unbootable on a fresh install passed all 106 tests.
+ */
+let adminSurfaceAbsent: boolean = (globalThis as any).__webTestAdminSurfaceAbsent === true;
+
 function isAdminTarget(url: URL): boolean {
+  // "The gateway is not listening." Returning false here is not the same as refusing: the request
+  // falls through to the real network stack, where nothing is bound, and fails the way a first
+  // launch fails — `TypeError: Failed to fetch`.
+  if (adminSurfaceAbsent) return false;
   if (!isLocal(url.hostname)) return false;
   return url.pathname === "/admin" || url.pathname.startsWith("/admin/");
 }
@@ -1865,9 +1893,9 @@ function isAdminTarget(url: URL): boolean {
 /**
  * One settings row as an object.
  *
- * Absent **and** unparseable both collapse to `{}`, for the reason
- * `read_gateway_settings` gives: they are different faults but the caller's
- * recovery is identical, and a corrupt row must not take a screen down.
+ * Absent **and** unparseable both collapse to `{}`, for the reason `read_settings_object` gives:
+ * they are different faults but the caller's recovery is identical, and a corrupt row must not
+ * take a screen down.
  */
 function settingsObject(key: string): Record<string, unknown> {
   const raw = settings.get(key);
@@ -1914,6 +1942,21 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
   switch (at(1)) {
     // ── gateway settings ───────────────────────────────────────────────────
     case "settings": {
+      // The keyed form reaches every row in the table; the unkeyed one owns `gateway`. The keyed
+      // checks come first because the unkeyed branches do not test `segs.length`, so a keyed path
+      // would otherwise be answered as the `gateway` row — the ordering is load-bearing, as it is
+      // in `routeMemory`.
+      if (method === "GET" && segs.length === 3) return settingsObject(segs[2]);
+      if (method === "POST" && segs.length === 3) {
+        if (!body || typeof body !== "object" || Array.isArray(body)) {
+          refuse(400, "POST /admin/settings/{key} expects a JSON object", "not_an_object");
+        }
+        const key = segs[2];
+        const merged = { ...settingsObject(key), ...(body as Record<string, unknown>) };
+        settings.set(key, JSON.stringify(merged));
+        persistSettings();
+        return merged;
+      }
       if (method === "GET") return settingsObject("gateway");
       if (method === "POST") {
         if (!body || typeof body !== "object" || Array.isArray(body)) {
