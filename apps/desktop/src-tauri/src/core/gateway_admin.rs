@@ -1278,3 +1278,171 @@ pub async fn context_clear_h(State(core): State<Arc<GatewayCore>>, headers: Head
         ),
     }
 }
+
+// ── Gateway tool toggles ───────────────────────────────────────────────────
+//
+// **"Are gateway tools on" currently has two authorities, and this module reports both rather
+// than picking one.**
+//
+//   1. The in-memory `AtomicBool` on `GatewayCore::settings`, which is what the **in-app**
+//      gateway reads on every request (`gateway_handlers.rs`).
+//   2. `gatewayToolsEnabled` in the **`router`** settings row, which is what the **headless**
+//      host reads per request (`aiproviderd.rs`, via `RouterSettings::from_store`).
+//
+// They are not the same row as the `gateway` row these settings routes own — `gatewayToolsEnabled`
+// lives under key `router`, which is why `GATEWAY_SETTINGS_KEY` is not used here.
+//
+// A route that wrote only the in-memory flag would be a toggle that appears to work and does
+// nothing on the service, and one that wrote only the row would leave the running in-app gateway
+// unchanged. So `POST` writes **both**, and `GET` returns both, so a caller can see them disagree
+// instead of being told a single number that is true of only one process.
+//
+// The row write is a **merge** for the same reason `POST /admin/settings` is: `settings` is a
+// whole-row UPSERT, and `router` also carries `failoverEnabled`, `systemAi` and
+// `perProviderConcurrency`. Writing only the tools key would erase them.
+
+/// The settings row that owns `gatewayToolsEnabled`. Not `GATEWAY_SETTINGS_KEY` — see the note.
+const ROUTER_SETTINGS_KEY: &str = "router";
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsStatus {
+    /// What the running gateway will use on the next request.
+    pub enabled: bool,
+    /// Audit H1b: may tools mutate the workspace? **In-memory only** — there is no persisted
+    /// counterpart, so this resets to `false` on restart by design.
+    pub mutation_enabled: bool,
+    /// What a service started from this database would boot with. Absent from the response when
+    /// there is no store to read it from.
+    pub persisted_enabled: Option<bool>,
+    pub workspace_root: Option<String>,
+}
+
+fn tools_status(core: &GatewayCore, store: Option<&Arc<Store>>) -> ToolsStatus {
+    ToolsStatus {
+        enabled: core.is_tools_enabled(),
+        mutation_enabled: core.is_tools_mutation_enabled(),
+        persisted_enabled: store
+            .map(|s| crate::core::router::RouterSettings::from_store(s).gateway_tools_enabled),
+        workspace_root: core.workspace_root().map(|p| p.to_string_lossy().to_string()),
+    }
+}
+
+pub async fn tools_get_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    // The store is optional here, unlike most routes: a core with no store can still report the
+    // two in-memory flags truthfully, and refusing would hide them. `persistedEnabled` is what
+    // goes to `null`.
+    let status = tools_status(&core, core.store());
+    (StatusCode::OK, Json(status)).into_response()
+}
+
+/// A partial patch: an omitted field leaves that toggle alone, rather than resetting it.
+///
+/// `rename_all` is load-bearing and matches `ToolsStatus`, so the read and write halves of this
+/// pair spell `mutationEnabled` the same way. Without it the camelCase key is silently ignored —
+/// a patch that reports success and changes nothing, which is the same failure class
+/// `MemoryInput` guards against with `deny_unknown_fields`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolsPatch {
+    pub enabled: Option<bool>,
+    pub mutation_enabled: Option<bool>,
+}
+
+pub async fn tools_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(patch): Json<ToolsPatch>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    if let Some(on) = patch.enabled {
+        core.set_tools_enabled(on);
+    }
+    if let Some(on) = patch.mutation_enabled {
+        core.set_tools_mutation_enabled(on);
+    }
+
+    // Persist only the flag that has a persisted counterpart, and only when it was named.
+    if let Some(on) = patch.enabled {
+        let store = match require_store(&core, "POST /admin/tools") {
+            Ok(s) => s,
+            Err(r) => return *r,
+        };
+        let mut current = read_settings_object(store, ROUTER_SETTINGS_KEY);
+        current.insert("gatewayToolsEnabled".to_string(), Value::Bool(on));
+        if let Err(e) = write_settings_object(store, ROUTER_SETTINGS_KEY, &Value::Object(current)) {
+            return admin_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("could not persist the tool toggle: {e}"),
+                Some("tools_persist_failed"),
+            );
+        }
+    }
+
+    let status = tools_status(&core, core.store());
+    (StatusCode::OK, Json(status)).into_response()
+}
+
+/// One settings row as an object, defaulting to empty on absence or corruption.
+///
+/// Shared by the tools toggle and any future writer into a row it does not own outright, so the
+/// "absent and corrupt both mean empty" rule has one implementation. Both collapse on purpose:
+/// they are different faults but the caller's recovery is the same.
+fn read_settings_object(store: &Store, key: &str) -> serde_json::Map<String, Value> {
+    let conn = store.conn.lock().unwrap();
+    let raw: Option<String> =
+        conn.query_row("SELECT value_json FROM settings WHERE key = ?", [key], |r| r.get(0)).ok();
+    drop(conn);
+    match raw.and_then(|s| serde_json::from_str::<Value>(&s).ok()) {
+        Some(Value::Object(o)) => o,
+        _ => serde_json::Map::new(),
+    }
+}
+
+fn write_settings_object(store: &Store, key: &str, value: &Value) -> Result<(), rusqlite::Error> {
+    let written = serde_json::to_string(value).unwrap_or_else(|_| "{}".to_string());
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO settings (key, value_json) VALUES (?, ?) \
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+        rusqlite::params![key, written],
+    )
+    .map(|_| ())
+}
+
+/// The workspace root for gateway-side tool execution.
+///
+/// Validated and canonicalised at set time, not only at call time: `tool_run` re-validates per
+/// call, so accepting a bad root was never a breach — but a refusal surfacing mid-request becomes
+/// a tool error the model has to interpret. Canonicalising also freezes `..` and symlinks.
+#[derive(Deserialize)]
+pub struct WorkspaceRootBody {
+    pub root: String,
+}
+
+pub async fn workspace_root_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<WorkspaceRootBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    match crate::core::tools::validate_root(&std::path::PathBuf::from(&body.root)) {
+        Ok(canonical) => {
+            core.set_workspace_root(canonical.clone());
+            (StatusCode::OK, Json(json!({ "workspaceRoot": canonical.to_string_lossy() })))
+                .into_response()
+        }
+        Err(e) => admin_error(
+            StatusCode::BAD_REQUEST,
+            &format!("that workspace root was refused: {e}"),
+            Some("bad_workspace_root"),
+        ),
+    }
+}

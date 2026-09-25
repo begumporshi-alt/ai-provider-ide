@@ -27,7 +27,7 @@ use axum::body::Body;
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use rand::Rng as _;
 use serde_json::{json, Value};
 use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
@@ -2003,6 +2003,10 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
                 .post(admin::context_record_h)
                 .delete(admin::context_clear_h),
         )
+        // Gateway tool toggles. `PUT` on the workspace root rather than `POST`, because setting it
+        // replaces one value rather than patching a set.
+        .route("/admin/tools", get(admin::tools_get_h).post(admin::tools_set_h))
+        .route("/admin/tools/workspace-root", put(admin::workspace_root_set_h))
         // Both refusals authenticate first, for the same reason `unknown_route` does: an
         // unauthenticated 404 or 405 is a statement that the route exists.
         .method_not_allowed_fallback(method_not_allowed)

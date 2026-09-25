@@ -3539,6 +3539,9 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("GET", "/admin/context", json!(null)),
         ("POST", "/admin/context", json!({ "nodes": [], "edges": [] })),
         ("DELETE", "/admin/context", json!(null)),
+        ("GET", "/admin/tools", json!(null)),
+        ("POST", "/admin/tools", json!({})),
+        ("PUT", "/admin/tools/workspace-root", json!({ "root": "/tmp" })),
     ] {
         let s = start_with_store().await;
         let res = match method {
@@ -4453,6 +4456,142 @@ async fn admin_context_clear_empties_the_graph() {
     let g: Value = res.json().await.unwrap();
     let nodes = g.get("nodes").and_then(|v| v.as_array()).expect("nodes");
     assert!(nodes.is_empty(), "cleared: {g}");
+}
+
+// ── gateway tool toggles ───────────────────────────────────────────────────
+
+/// The route reports both authorities rather than one. A single number would be true of only one
+/// of the two processes that can serve this port.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_get_reports_both_the_flag_and_the_persisted_row() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .get(format!("{}/admin/tools", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body.get("enabled").and_then(|v| v.as_bool()),
+        Some(true),
+        "tools default on: {body}"
+    );
+    assert_eq!(
+        body.get("mutationEnabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "mutation defaults off (audit H1b): {body}"
+    );
+    assert!(
+        body.get("persistedEnabled").is_some(),
+        "the persisted value must be reported, not silently omitted: {body}"
+    );
+}
+
+/// The one that matters: the write reaches **both** authorities. Setting only the in-memory flag
+/// would be a toggle that appears to work and does nothing on the service; setting only the row
+/// would leave the running gateway unchanged.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_set_writes_both_the_flag_and_the_row() {
+    let s = start_with_store().await;
+    // Seed the row with an unrelated key, so the merge has something to preserve.
+    {
+        let conn = s.core.store().unwrap().conn.lock().unwrap();
+        conn.execute(
+            "INSERT INTO settings (key, value_json) VALUES ('router', '{\"failoverEnabled\":true}')",
+            [],
+        )
+        .unwrap();
+    }
+
+    let res = s
+        .client
+        .post(format!("{}/admin/tools", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "enabled": false }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body.get("enabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "the running flag: {body}"
+    );
+    assert_eq!(
+        body.get("persistedEnabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "and the row a service would boot from: {body}"
+    );
+
+    // The merge must not have erased the rest of the row.
+    let raw: String = {
+        let conn = s.core.store().unwrap().conn.lock().unwrap();
+        conn.query_row("SELECT value_json FROM settings WHERE key = 'router'", [], |r| r.get(0))
+            .unwrap()
+    };
+    let row: Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        row.get("gatewayToolsEnabled").and_then(|v| v.as_bool()),
+        Some(false),
+        "the toggle is persisted: {row}"
+    );
+    assert_eq!(
+        row.get("failoverEnabled").and_then(|v| v.as_bool()),
+        Some(true),
+        "and the rest of the row survives — a whole-row UPSERT would have erased it: {row}"
+    );
+}
+
+/// An omitted field leaves that toggle alone rather than resetting it.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_patch_leaves_an_omitted_toggle_alone() {
+    let s = start_with_store().await;
+    s.client
+        .post(format!("{}/admin/tools", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "mutationEnabled": true }))
+        .send()
+        .await
+        .unwrap();
+
+    let res = s
+        .client
+        .get(format!("{}/admin/tools", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body.get("enabled").and_then(|v| v.as_bool()),
+        Some(true),
+        "an unnamed `enabled` must not be reset: {body}"
+    );
+    assert_eq!(
+        body.get("mutationEnabled").and_then(|v| v.as_bool()),
+        Some(true),
+        "the named one did change: {body}"
+    );
+}
+
+/// Validated at set time, not only at call time — a refusal surfacing mid-request becomes a tool
+/// error the model has to interpret.
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_tools_workspace_root_refuses_a_path_that_is_not_there() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .put(format!("{}/admin/tools/workspace-root", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "root": "/definitely/not/a/real/path" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "a non-existent root is refused at set time");
 }
 
 #[test]
