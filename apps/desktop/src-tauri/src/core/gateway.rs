@@ -2035,6 +2035,7 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/admin/keys", get(admin::keys_list_h).post(admin::key_create_h))
         .route("/admin/keys/{id}", delete(admin::key_revoke_h))
         .route("/admin/spend", get(admin::spend_h))
+        .route("/admin/spend/cap", post(admin::spend_cap_set_h))
         .route("/admin/providers", get(admin::providers_list_h).post(admin::provider_upsert_h))
         .route("/admin/providers/{id}", delete(admin::provider_delete_h))
         .route("/admin/api-keys", get(admin::api_keys_list_h).post(admin::api_key_upsert_h))
@@ -2043,18 +2044,27 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
             "/admin/manifests",
             get(admin::manifests_list_h).post(admin::manifest_upsert_active_h),
         )
+        .route("/admin/manifests/stage", post(admin::manifest_stage_h))
         .route("/admin/manifests/{id}/activate", post(admin::manifest_activate_h))
+        // `{id}` is the provider id on both sub-routes — see `manifest_history_h`. Named
+        // identically rather than descriptively because two parameter names at one path position is
+        // a router conflict, and the sibling's name is already on the wire.
+        .route("/admin/manifests/{id}/history", get(admin::manifest_history_h))
         .route(
             "/admin/models-cache",
             get(admin::models_cache_list_h).post(admin::models_cache_replace_h),
         )
         .route("/admin/aliases", get(admin::aliases_list_h).post(admin::aliases_replace_h))
-        .route("/admin/ledger", get(admin::ledger_recent_h))
+        .route("/admin/ledger", get(admin::ledger_recent_h).post(admin::ledger_append_h))
         // Memory and context. The static segments are declared before `/admin/memory/{id}` so a
         // literal path is never captured as an id — the ordering is load-bearing, not cosmetic.
         .route(
             "/admin/memory",
             get(admin::memory_list_h).post(admin::memory_capture_h).delete(admin::memory_clear_h),
+        )
+        .route(
+            "/admin/memory/enabled",
+            get(admin::memory_enabled_get_h).post(admin::memory_enabled_set_h),
         )
         .route("/admin/memory/batch", post(admin::memory_capture_batch_h))
         .route("/admin/memory/recall", post(admin::memory_recall_h))
@@ -2077,6 +2087,10 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
                 .post(admin::context_record_h)
                 .delete(admin::context_clear_h),
         )
+        // Bounds the live-context tables. Separate from `POST /admin/memory/prune`, which applies
+        // `memories` retention — the two policies are unrelated and one stats struct over both would
+        // hide which rule removed what.
+        .route("/admin/context/prune", post(admin::context_prune_h))
         // Gateway tool toggles. `PUT` on the workspace root rather than `POST`, because setting it
         // replaces one value rather than patching a set.
         .route("/admin/tools", get(admin::tools_get_h).post(admin::tools_set_h))

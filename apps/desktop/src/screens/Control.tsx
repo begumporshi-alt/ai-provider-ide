@@ -45,6 +45,7 @@ import {
   type ServiceStatus,
 } from "../store";
 import { usd } from "../lib/format";
+import { fetchAdmin } from "../lib/gateway-client";
 import { useUi } from "../ui-state";
 
 // ---------- vocabulary ----------
@@ -528,7 +529,8 @@ function GatewayTab({
         return Math.max(0, Math.round(usdValue * 1_000_000));
       })();
     try {
-      await invoke("gateway_spend_cap_set", { capMicros: micros });
+      // The route clamps at 0 as the command did, so the two agree on what a negative cap means.
+      await fetchAdmin("POST", "/admin/spend/cap", { capMicros: micros });
       setCapInput(micros > 0 ? String(micros / 1_000_000) : "");
       await refreshGateway();
     } catch (e) {

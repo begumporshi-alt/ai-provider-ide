@@ -59,7 +59,8 @@ export function adminBodies(method: string, path: string): unknown[] {
 
 /**
  * Shape-only fallbacks. Every `GET` in the admin surface returns a collection except the ones
- * named here, and every write returns either `{ ok: true }` or — for the batch capture — a count.
+ * named here, and most writes return `{ ok: true }` — with the exceptions in `NON_OK_WRITES`, which
+ * cannot have a default at all.
  */
 function defaultResponse(method: string, path: string): unknown {
   if (method === "GET") {
@@ -79,6 +80,27 @@ function defaultResponse(method: string, path: string): unknown {
   return { ok: true };
 }
 
+/**
+ * The writes whose response is **not** `{ ok: true }`, and so have no honest default.
+ *
+ * Added with 26o, when seven routes joined this fake and two of them answer a different shape. The
+ * fallback above fabricates `{ ok: true }` for any `POST`, which is right for most writes and
+ * *silently wrong* for these: `store.ts` destructures `{ version }` out of the first and reads
+ * `.enabled` off the second, so a wrong shape yields `undefined` rather than an error. That is not
+ * hypothetical — it is how `store.trail-writes.test.ts` went red on 26o, in a spec covering a
+ * *different* property (`approveRepair`'s trail bookkeeping), where the only visible symptom was
+ * `expected undefined to be 2`.
+ *
+ * The value cannot be defaulted, because neither is the fake's to invent: the host computes the
+ * manifest version from that provider's `MAX(version)`, and the memory switch reads its own flag
+ * back. A spec that asserts on either must seed it with `seedAdmin`; an unseeded call fails loudly
+ * here instead of handing the caller a shape that looks like data.
+ */
+const NON_OK_WRITES: Record<string, string> = {
+  "POST /admin/manifests/stage": "the host computes the version, so seed it with seedAdmin",
+  "POST /admin/memory/enabled": "the route reads the flag back, so seed it with seedAdmin",
+};
+
 /** The `fetchAdmin` signature, verbatim — the fake is a drop-in for the real module. */
 export async function fetchAdmin(method: string, path: string, body?: unknown): Promise<unknown> {
   calls.push({ method, path, body });
@@ -86,6 +108,8 @@ export async function fetchAdmin(method: string, path: string, body?: unknown): 
   const failure = failing.get(k);
   if (failure) throw new Error(failure);
   if (responses.has(k)) return responses.get(k);
+  const hint = NON_OK_WRITES[k];
+  if (hint) throw new Error(`${k} — ${hint}`);
   return defaultResponse(method, path);
 }
 

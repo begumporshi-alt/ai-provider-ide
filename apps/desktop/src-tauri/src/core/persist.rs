@@ -621,11 +621,19 @@ pub fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Re
     Ok(())
 }
 
+/// Append one ledger row under the store's lock.
+///
+/// The shared entry point for the `ledger_append` command and `POST /admin/ledger`, so the lock and
+/// the statement have one home rather than two that can drift.
+pub fn ledger_append_row(store: &Store, e: &LedgerRow) -> rusqlite::Result<()> {
+    let conn = store.conn.lock().unwrap();
+    ledger_insert(&conn, e)
+}
+
 #[cfg(feature = "app")]
 #[tauri::command]
 pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), CommandError> {
-    let conn = store.conn.lock().unwrap();
-    ledger_insert(&conn, &e)?;
+    ledger_append_row(&store, &e)?;
     Ok(())
 }
 
@@ -973,11 +981,15 @@ pub fn drift_events_list(
     list_drift_events(&store, limit.unwrap_or(50))
 }
 
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn manifests_history(
-    store: State<'_, Arc<Store>>,
-    provider_id: String,
+/// One provider's recorded manifest versions, newest first.
+///
+/// **Un-gated since 26o**, for the reason D39 gave and `ledger_insert` already paid for: this takes a
+/// plain `&Store` and touches no Tauri type, so the `app` gate was inherited from its caller rather
+/// than earned. `gateway_admin::manifest_history_h` — the headless route — is the other caller, and a
+/// route that re-issued this SQL would be a second implementation free to drift from the first.
+pub fn list_manifest_history(
+    store: &Store,
+    provider_id: &str,
 ) -> Result<Vec<ManifestRow>, CommandError> {
     let conn = store.conn.lock().unwrap();
     let mut stmt = conn.prepare(
@@ -998,10 +1010,21 @@ pub fn manifests_history(
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
-/// Stage a repair candidate as a NEW version without activating it (human confirms first).
 #[cfg(feature = "app")]
 #[tauri::command]
-pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i64, CommandError> {
+pub fn manifests_history(
+    store: State<'_, Arc<Store>>,
+    provider_id: String,
+) -> Result<Vec<ManifestRow>, CommandError> {
+    list_manifest_history(&store, &provider_id)
+}
+
+/// Stage a repair candidate as a NEW version without activating it (human confirms first).
+///
+/// **Un-gated since 26o** for the same reason as `list_manifest_history`. The version is computed,
+/// never supplied: `next` is the next free version for that provider, so a caller cannot choose a
+/// number that collides or goes backwards.
+pub fn manifest_stage_row(store: &Store, m: &ManifestRow) -> Result<i64, CommandError> {
     let conn = store.conn.lock().unwrap();
     let next: i64 = conn.query_row(
         "SELECT COALESCE(MAX(version),0)+1 FROM manifests WHERE provider_id = ?1",
@@ -1013,6 +1036,12 @@ pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i6
         params![m.id, m.provider_id, next, m.origin, m.body_json, m.contract_result_json, m.created_at],
     )?;
     Ok(next)
+}
+
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn manifest_stage(store: State<'_, Arc<Store>>, m: ManifestRow) -> Result<i64, CommandError> {
+    manifest_stage_row(&store, &m)
 }
 
 /// Activate a staged manifest; returns the previously-active version for one-click rollback.

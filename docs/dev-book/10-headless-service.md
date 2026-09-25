@@ -2472,13 +2472,20 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
      clipboard to copy into — but the in-app UI does not call it. This is a **third admissible reason
      for IPC**, alongside ownership and app-state: *a route whose response carries a secret the
      webview must not hold.*
-   - **Measured 2026-09-25 after 26l and 26n:** 73 `invoke` commands remain, against 39 `fetchAdmin`
+   - **Measured 2026-09-25 after 26l and 26n:** 73 `invoke` commands remained, against 39 `fetchAdmin`
      call sites over 30 `/admin/*` templates. The "~34" above is close to the measured **~39**
-     app-owned; the gateway-data remainder is **~10** — three whose routes already existed
+     app-owned; the gateway-data remainder was **~10** — three whose routes already existed
      (`manifest_upsert_active`; `settings_get`/`settings_set` for non-`gateway` rows — migrated in
-     26n) and seven that need one (`manifest_stage`, `manifests_history`, `gateway_spend_cap_set`,
+     26n) and seven that needed one (`manifest_stage`, `manifests_history`, `gateway_spend_cap_set`,
      `gateway_memory_enabled`, `gateway_set_memory_enabled`, `gateway_prune_live_context`,
      `ledger_append`).
+   - **All seven were migrated in 26o, so the gateway-data remainder is now zero.** Every one of the
+     seven listed above has a route; the list is kept rather than deleted because it is the record of
+     what the increment closed. Measured after 26o by a different method — which is why the numbers
+     differ from the line above rather than superseding it: **65** `invoke` commands and **39**
+     `/admin/*` templates, counted from `invoke("name")` first-argument literals and `/admin/…`
+     string literals with template holes normalised. What remains on IPC is app-state,
+     secret-bearing, or host-resource — see §13 for the enumeration.
    - `gateway_enable/disable` and `gateway_worker_error` are deleted (service is always on).
    - **Revisit if:** a real performance bottleneck appears that HTTP cannot serve — unlikely on
      localhost, but the hybrid door stays open if measured.
@@ -3707,6 +3714,96 @@ unmatched `GET`, and `Object.assign(x, [])` is a silent no-op — so a settings 
 would have looked like a passing spec while returning nothing. It now answers `{}` for
 `/admin/settings`, which is the shape the real route has.
 
+**26o — the gateway-data remainder, closed.** The seven commands §13 listed as gateway data still
+needing a route all have one now: `POST /admin/manifests/stage`, `GET /admin/manifests/{id}/history`,
+`POST /admin/spend/cap`, `POST /admin/context/prune`, `POST /admin/ledger`, and
+`GET`/`POST /admin/memory/enabled`. **Six of the seven are database state. The seventh is not, and
+that is the increment's one real decision.**
+
+**The memory master switch is process state, and it is still right to route it.** It is an
+`AtomicBool` on `GatewayCore`, read by the request path on every request — so its authority is
+*whichever process serves the listener*. `invoke` reached the **app's own** core instead. In the
+default install those are the same core, because the app starts and serves its own listener (26l), so
+this route changes nothing observable today; the claim that it fixes a live bug would have been
+**false**, and it was checked before it was written (`gateway_status` reports `state.core.port()`, and
+`gatewayBaseUrl()` reads it, so the UI always dials the app's own listener). It is here because the
+headless deployment is the case the port exists for, and there the two cores differ. It is
+deliberately **not** the `MemoryMode` in `context_scope.rs`, which is per-client and parsed from the
+`AIP-Memory` header: that decides what a given client gets, this decides whether the layer runs at
+all, and a client's explicit mode can only narrow it.
+
+**Two store functions were extracted rather than duplicated.** `manifest_stage` and
+`manifests_history` held their SQL inline in their `#[tauri::command]` bodies, so a route calling
+`persist::*` did not exist to call. Both are now un-gated `pub fn`s — `manifest_stage_row`,
+`list_manifest_history` — for the reason D39 gave and `ledger_insert` already paid for: they take a
+plain `&Store` and touch no Tauri type, so the `app` gate was inherited from their caller rather than
+earned. `ledger_append` gained `ledger_append_row` for the same reason. **A route that re-issued the
+SQL would be a second implementation free to drift from the first**, and the headless build is the
+one that would have drifted silently.
+
+**The harness could not model the switch, and that was a defect in the harness.** `web-test/shim.ts`
+answered `gateway_memory_enabled` with a literal `false` and `gateway_set_memory_enabled` with its own
+argument, storing nothing — so a POST followed by a GET disagreed with itself and no spec could have
+caught a route that failed to write. Both are now backed by a `memoryEnabled` variable defaulting to
+`false`, which is what the stub returned, so specs that only read it are unaffected. This is the
+harness counterpart of the rule the 26k note already carries: **a harness that answers unconditionally
+cannot see a dependency.**
+
+**`{id}` on both manifest sub-routes means the provider id.** The activate route already had this
+shape (`manifest_activate_row(store, provider_id, version)`, called from
+`/admin/manifests/${providerId}/activate`), so the new history route reuses the same parameter name
+rather than a descriptive one: two parameter names at one path position is a router conflict waiting
+to happen, and the sibling's name was already on the wire. Recorded here because a reader of
+`{id}/history` would reasonably assume a manifest id.
+
+**The fifth instance of the master-key premise, and the first in source.** `gateway_admin.rs`'s module
+header still said *"The UI holds the master key in memory for the session"* — the premise §10
+decision 2 retired, which 26m fixed in three places and 26n in a fourth. This one is in the **file
+D51's own Location cell names**, closed as Fixed in 26i without the sentence being edited: **a
+closure does not sweep its own citation.** Register entry **D53**; the header now states the `ak-ui`
+model and cites the history.
+
+**A second harness, a second defect of the same family — and this one was found by a red spec.**
+`web-test/shim.ts` answered the memory switch unconditionally; `src/lib/gateway-client.fake.ts`, the
+**vitest** transport, did something subtler. Its `defaultResponse` returns `{ ok: true }` for any
+`POST` that a spec has not seeded — right for most writes, and *silently wrong* for the two 26o added:
+`store.ts` destructures `{ version }` out of `POST /admin/manifests/stage` and reads `.enabled` off
+`POST /admin/memory/enabled`, so the fallback yielded `undefined` rather than an error. The visible
+symptom was `store.trail-writes.test.ts` failing with `expected undefined to be 2` — **in a spec about
+`approveRepair`'s trail bookkeeping, which is not the property that broke.** Both routes now have no
+default at all: they are listed in a `NON_OK_WRITES` table and a call to either throws unless the spec
+seeds it with `seedAdmin`. The rule is the one the shim's own header already carries, applied to
+*shapes* rather than to *answers*: **a fabricated response is a claim about the wire, and a wrong
+claim is worse than a loud failure.** Two dead `case`s in the same spec's `invoke` mock were removed
+with it — `manifest_stage` and `manifest_activate` no longer go through IPC, and a stub for a command
+nothing issues reads as coverage.
+
+**Gates, measured 2026-09-25 after 26o.** App lib **1284/0** and binary **5/0**
+(`cargo test`); headless **1220/0** (`cargo test --no-default-features`); `cargo check
+--no-default-features --all-targets` clean; clippy clean under `--all-targets -- -D warnings` on
+**rustc 1.98.1**; `cargo fmt --check` clean; vitest **181/181**; `pnpm typecheck` clean;
+`web-test:types` clean; browser suite **108/108**; `key-leak-grep` OK; `check-doc-links` 52 files /
+127 links. **Two of those runs are not reproducible with the obvious command**, and both are
+environment rather than code: (1) the headless suite **hung** at 1220 tests on the two
+`ui_session` keychain specs when run at full parallelism, and passed in 4.12 s in isolation — it is
+keychain contention, and `-- --test-threads=4` completes in 9.84 s; (2) the browser suite's first two
+attempts failed before any test ran, and **neither failure was the suite's**. The first was
+`Timed out waiting 30000ms from config.webServer`, caused by the four `http_proxy`/`https_proxy`
+variables pointing at `127.0.0.1:53585`: Playwright's readiness probe for the mock provider went
+through the proxy, got a `502`, and never saw the server as up. The second was
+`SAFE_DELETE_BULK_CONFIRM_REQUIRED` — the sandbox's bulk-delete guard refusing Playwright's cleanup of
+a 4,102-file `test-results`. **The suite is green with all six proxy variables unset and
+`web-test:clean` run first**; both traps are recorded here because the next run will meet them, and
+because a `502` from a proxy satisfies a `status != 000` readiness loop — the check passes and the
+server is not there.
+
+**Falsified with one probe, not assumed.** `gatewayMemoryEnabled`'s path was pointed at
+`/admin/memory/PROBE-WRONG-PATH`; `web-test/memory.spec.ts:128` — *"the master switch is live,
+proving the screen's host load succeeded"* — went red at line 134, its assertion about the screen's
+load, because the shim answers an unrouted `/admin/*` path with `404 unknown_route`. Reverted, the
+same spec passed in 16.8 s. So the browser suite exercises the new transport rather than tolerating
+it: a route that is not wired is a failure, not a silent `undefined`.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -3760,12 +3857,26 @@ state, not service data. ~~the tool toggles~~ **landed 26h** — `GET/POST /admi
 both readings: 73 `invoke` commands remained, against 39 `fetchAdmin` call sites over 30 `/admin/*`
 templates.** **26n** then migrated the three whose routes already existed — `manifest_upsert_active`
 (`POST /admin/manifests`) and `settings_get` / `settings_set` for non-`gateway` rows (26l's keyed
-route) — taking it to **72 / 43**. What remains is **not** the ~12 the old sentence implied: ~44 stay
-on IPC by ownership *or security* (§10 decision 2 — skills, crash, capture, agent trails, service,
-egress, vault, onboarding, history, config, workbuddy, `gateway_key_*`, and the **app-key group**,
-which R4/H5 keep off HTTP because `POST /admin/keys` returns the secret), and **7 are gateway data
-that still need a route**: `manifest_stage`, `manifests_history`, `gateway_spend_cap_set`,
-`gateway_memory_enabled`, `gateway_set_memory_enabled`, `gateway_prune_live_context`, `ledger_append`. ~~the browser
+route). **26o closed the seven this line had listed as gateway data still needing a route**: each now
+has one — `manifest_stage` (`POST /admin/manifests/stage`), `manifests_history`
+(`GET /admin/manifests/{id}/history`), `gateway_spend_cap_set` (`POST /admin/spend/cap`),
+`gateway_prune_live_context` (`POST /admin/context/prune`), `ledger_append` (`POST /admin/ledger`),
+and the memory master switch (`GET`/`POST /admin/memory/enabled`). What remains on `invoke` is
+app-state, secret-bearing, or host-resource, and **no command whose data the gateway owns is left**:
+listener control and discovery (`gateway_status` — which *must* stay IPC, since it is how the UI
+learns where to send HTTP — plus `gateway_enable`/`gateway_disable`), the workspace root
+(`gateway_project_key`), in-memory telemetry (`gateway_injection_stats`), the host log file
+(`gateway_log_tail`), the `router_model_context_*` pair, and the two secret groups — `gateway_key_*`
+(master) and `gateway_app_key_*` (R4/H5, because `POST /admin/keys` returns the secret in its body).
+
+**The measured state after 26o, with its method** — because the figures above were measured another
+way and do not reconcile with this count: `apps/desktop/src` holds **65** distinct `invoke` commands
+and names **39** distinct `/admin/*` path templates. Counted by extracting `invoke("name")`
+first-argument literals and `/admin/…` string literals from `apps/desktop/src`, normalising template
+holes to `{x}`, query strings kept. This increment removed **7** commands and added **6** templates
+(the memory switch is one path serving both verbs). **A total without its method cannot be
+rechecked** — which is why 26l's "30 templates" and 26n's "43 call sites" were left as written and
+this figure stands beside them rather than replacing them. ~~the browser
 harness~~ **landed 26k** — `web-test/shim.ts` intercepts `fetch` to `127.0.0.1:<port>/admin/*` and
 dispatches to the same in-memory store the `invoke` cases use, so the suite runs as a gate again:
 **106/106**, from red at test 18. It found one live bug on the way (`persistAliases` sent `{ rows }`

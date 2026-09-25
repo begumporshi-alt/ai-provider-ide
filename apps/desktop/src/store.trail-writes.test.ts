@@ -61,14 +61,11 @@ vi.mock("@tauri-apps/api/core", () => ({
     h.invokes.push({ cmd, args });
     const failure = h.failing.get(cmd);
     if (failure !== undefined) throw new Error(failure);
-    switch (cmd) {
-      case "manifest_stage":
-        return 2; // the version this repair staged
-      case "manifest_activate":
-        return 1; // the version it replaced
-      default:
-        return undefined;
-    }
+    // No per-command switch: every command these specs arrange to fail is a trail write whose
+    // success value is unused, so the honest default is `undefined`. `manifest_stage` and
+    // `manifest_activate` used to be answered here — they moved to the transport fake in 26o/26i,
+    // and a `case` for a command nothing issues is a stub that reads as coverage.
+    return undefined;
   },
 }));
 
@@ -78,10 +75,16 @@ vi.mock("@tauri-apps/api/core", () => ({
  * `approveRepair` ends by pushing the provider's new status to the host, which since 26i is
  * `POST /admin/providers` rather than an IPC command. Without this the repair's *own* failure — the
  * thing these specs are about — is masked by a socket error from a gateway no spec started.
+ *
+ * **Since 26o the two manifest writes are on this transport as well**, so the `invoke` mock above no
+ * longer sees them: `POST /admin/manifests/stage` replaced `manifest_stage`, and
+ * `POST /admin/manifests/{id}/activate` replaced `manifest_activate` in 26i. Their two `case`s were
+ * removed rather than left in place — a stub for a command nothing issues reads as coverage and is
+ * not. `stage` is seeded because the route answers `{ version }` and the fake refuses to invent one.
  */
 vi.mock("./lib/gateway-client", async () => await import("./lib/gateway-client.fake"));
 
-import { resetAdmin } from "./lib/gateway-client.fake";
+import { adminBodies, resetAdmin, seedAdmin } from "./lib/gateway-client.fake";
 import {
   BUILTIN_TEMPLATES,
   type AdapterManifest,
@@ -191,6 +194,13 @@ beforeEach(() => {
   h.failing.clear();
   h.invokes = [];
   resetAdmin();
+  // The two manifest writes `approveRepair` makes are admin routes, so the fake answers them and the
+  // fake will not invent either value: the host computes a manifest version from the provider's
+  // `MAX(version)` and `manifest_activate` answers the version it displaced. Seeded here rather than
+  // in the one spec that asserts on `version`, because the other spec's `activate` call would
+  // otherwise carry `undefined` — a body the real route would reject and this file would not notice.
+  seedAdmin("POST", "/admin/manifests/stage", { version: 2 });
+  seedAdmin("POST", `/admin/manifests/${PROVIDER}/activate`, { previousVersion: 1 });
   pendingRepairs.clear();
   registry.hydrate([], []); // the registry is a module singleton; start each spec empty
   driftMonitor.reset(); // ...and so is the monitor, whose cooldown would silence the second spec
@@ -210,8 +220,16 @@ describe("a trail write that does not land is kept, not discarded", () => {
     const r = await approveRepair(PROVIDER);
 
     // The repair itself still succeeded — this is the property `.catch(() => undefined)` was
-    // protecting, and it must survive the change.
+    // protecting, and it must survive the change. `2` is the seeded `{ version }` of the stage route:
+    // since 26o the version comes back from the host rather than from a command's return value.
     expect(r?.version).toBe(2);
+    // ...and it came back because the *row* is the request body. Asserted separately because the
+    // line above cannot tell the two wire shapes apart: the IPC command took `{ m: row }` and this
+    // route takes the row, and both would destructure a seeded `version` out of the response. Only
+    // the body shows which one was sent.
+    const staged = adminBodies("POST", "/admin/manifests/stage")[0] as Record<string, unknown>;
+    expect(staged.providerId).toBe(PROVIDER);
+    expect(staged.m).toBeUndefined(); // the `toRustArgs` wrapper is not part of this route's shape
     // ...and the operator is told the record did not land, rather than being left to infer it from a
     // row that still reads "Open".
     expect(r?.resolveRecorded).toBe(false);

@@ -98,37 +98,39 @@ export const registry = new ProviderRegistry(vault);
 export const adapters = new AdapterRuntime(http, { appUrl: "https://aiprovider.router" });
 export const ledger = new UsageLedger({
   async append(e: LedgerEntry) {
-    await invoke("ledger_append", {
-      e: {
-        ts: e.ts,
-        modality: e.modality,
-        source: e.source,
-        providerId: e.providerId ?? null,
-        keyId: e.keyId ?? null,
-        // The gateway app key. `null` for a `ui` or `generator` row, which belongs to no app. This
-        // key name must match `LedgerRow::app_key_id` exactly: the Rust payload now carries
-        // `deny_unknown_fields`, so a misspelling here is an error rather than a silent `NULL`.
-        appKeyId: e.appKeyId ?? null,
-        requestedModel: e.requestedModel,
-        model: e.model,
-        status: e.status,
-        httpStatus: e.httpStatus ?? null,
-        errorClass: e.errorClass ?? null,
-        latencyMs: e.latencyMs ?? null,
-        tokensIn: e.tokensIn,
-        tokensOut: e.tokensOut,
-        costEstimateMicros: e.costEstimateMicros,
-        // `null` when the provider reported no cache block. The ledger column is nullable so the
-        // measurement can tell "not reported" apart from "reported zero".
-        cachedTokens: e.cachedTokens ?? null,
-        fallbackChainJson: e.fallbackChain
-          ? JSON.stringify(e.fallbackChain.map((a) => ({
-              provider: a.candidate.provider.slug,
-              key: a.candidate.key.label,
-              cls: a.cls,
-            })))
-          : null,
-      },
+    // `POST /admin/ledger` takes the row itself. The IPC command's `{ e }` wrapper was
+    // `toRustArgs`'s doing, not the struct's shape — `LedgerRow` is `rename_all = "camelCase"` with
+    // `deny_unknown_fields`, so this body is the same object on both transports and a misspelling
+    // is a 4xx rather than a silent `NULL` on either.
+    await fetchAdmin("POST", "/admin/ledger", {
+      ts: e.ts,
+      modality: e.modality,
+      source: e.source,
+      providerId: e.providerId ?? null,
+      keyId: e.keyId ?? null,
+      // The gateway app key. `null` for a `ui` or `generator` row, which belongs to no app. This
+      // key name must match `LedgerRow::app_key_id` exactly: the Rust payload now carries
+      // `deny_unknown_fields`, so a misspelling here is an error rather than a silent `NULL`.
+      appKeyId: e.appKeyId ?? null,
+      requestedModel: e.requestedModel,
+      model: e.model,
+      status: e.status,
+      httpStatus: e.httpStatus ?? null,
+      errorClass: e.errorClass ?? null,
+      latencyMs: e.latencyMs ?? null,
+      tokensIn: e.tokensIn,
+      tokensOut: e.tokensOut,
+      costEstimateMicros: e.costEstimateMicros,
+      // `null` when the provider reported no cache block. The ledger column is nullable so the
+      // measurement can tell "not reported" apart from "reported zero".
+      cachedTokens: e.cachedTokens ?? null,
+      fallbackChainJson: e.fallbackChain
+        ? JSON.stringify(e.fallbackChain.map((a) => ({
+            provider: a.candidate.provider.slug,
+            key: a.candidate.key.label,
+            cls: a.cls,
+          })))
+        : null,
     });
   },
 });
@@ -294,14 +296,15 @@ export async function approveRepair(
   const manifest = entry?.plan?.candidate?.manifest ?? entry?.plan?.deterministic;
   if (!manifest || !entry) return undefined;
   const origin = entry.plan?.candidate ? "ai-patched" : "builtin-template";
-  const version = await invoke<number>("manifest_stage", {
-    m: {
-      id: crypto.randomUUID(), providerId, version: 0, origin,
-      bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
-      contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
-      createdAt: Date.now(), isActive: false,
-    },
-  });
+  // `POST /admin/manifests/stage` takes the row itself, not the IPC command's `{ m }` wrapper, and
+  // answers `{ version }` because the version is computed host-side from the provider's max rather
+  // than chosen here.
+  const { version } = (await fetchAdmin("POST", "/admin/manifests/stage", {
+    id: crypto.randomUUID(), providerId, version: 0, origin,
+    bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
+    contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
+    createdAt: Date.now(), isActive: false,
+  })) as { version: number };
   const activated = (await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, {
     version,
   })) as { previousVersion: number | null };
@@ -329,7 +332,12 @@ export async function rollbackManifest(providerId: string, version: number): Pro
 }
 
 export async function listManifestHistory(providerId: string): Promise<HostManifestRow[]> {
-  return invoke<HostManifestRow[]>("manifests_history", { providerId });
+  // `encodeURIComponent`: the provider id is a path segment here, and a slug with a `/` in it would
+  // otherwise address a different route entirely rather than failing.
+  return (await fetchAdmin(
+    "GET",
+    `/admin/manifests/${encodeURIComponent(providerId)}/history`,
+  )) as HostManifestRow[];
 }
 
 let bootstrapped = false;
@@ -1166,7 +1174,9 @@ export interface LiveContextPruneStats {
 }
 
 export async function pruneLiveContext(): Promise<LiveContextPruneStats> {
-  return invoke<LiveContextPruneStats>("gateway_prune_live_context");
+  // `POST /admin/context/prune` bounds `live_context`; `POST /admin/memory/prune` above bounds
+  // `memories`. Two routes because the retention policies are unrelated.
+  return (await fetchAdmin("POST", "/admin/context/prune")) as LiveContextPruneStats;
 }
 
 /**
@@ -1203,13 +1213,24 @@ export async function setMemoryPrincipal(
   return res.ok;
 }
 
-/** The memory/context layer's master switch. Off by default: no reads, no writes. */
+/**
+ * The memory/context layer's master switch. Off by default: no reads, no writes.
+ *
+ * The switch itself is an `AtomicBool` on `GatewayCore`, so the authority is whichever process
+ * serves the listener — not the app's own core, which is what `invoke` reached. In the default
+ * install those are the same core; they are not once a separate service serves the port, and the
+ * route is what makes the toggle follow the listener in use.
+ */
 export async function gatewayMemoryEnabled(): Promise<boolean> {
-  return invoke<boolean>("gateway_memory_enabled");
+  const res = (await fetchAdmin("GET", "/admin/memory/enabled")) as { enabled: boolean };
+  return res.enabled;
 }
 
 export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean> {
-  return invoke<boolean>("gateway_set_memory_enabled", { enabled });
+  const res = (await fetchAdmin("POST", "/admin/memory/enabled", { enabled })) as {
+    enabled: boolean;
+  };
+  return res.enabled;
 }
 
 // ---------- Control screen: observability + cross-cutting switches ----------

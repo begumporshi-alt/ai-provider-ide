@@ -8,8 +8,13 @@
 //!
 //! **Authentication is the external one, not a new one.** Every handler calls the same
 //! `check_gateway_key` the `/v1/*` routes use, so a caller needs the master key (or an app key)
-//! and gets the same refusals. The UI holds the master key in memory for the session — see the
-//! decision entry in §10.
+//! and gets the same refusals. **The UI never holds the master key.** It authenticates with the
+//! host-minted `ak-ui` session credential (D51, `core/ui_session.rs`), which the host reserves for
+//! this surface and caches in a TypeScript `let` that is never persisted. This paragraph said *"the
+//! UI holds the master key in memory for the session"* until 26o — the premise §10 decision 2
+//! retired, and the **fifth** place it survived: three claims fixed in 26m, a fourth in 26n, and
+//! this one, which is in source rather than documentation. D44's lesson is that a fix's sweep
+//! covers where a claim *appears*, not where the fix *touched*; a comment is one of those places.
 //!
 //! **The store is optional and that is not an error to hide.** `GatewayCore::store()` is `None`
 //! for cores built without one (every existing test). A route that needs it answers 503 naming
@@ -501,6 +506,44 @@ pub async fn spend_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -
         .into_response()
 }
 
+/// `POST /admin/spend/cap` — set the monthly cap in micro-USD. `0` disables it.
+///
+/// The clamp is repeated here from `gateway_spend_cap_set` rather than dropped, because the reader
+/// contradicts a negative: `spend_cap_micros` returns `None` for anything `<= 0`, so a stored `-5`
+/// would read back as `0` and the row would hold two spellings of one state. Storing what the reader
+/// will report is the point.
+///
+/// `rename_all` is load-bearing and matches `SpendStatus`, so the wire spells `capMicros` the way
+/// the response does. Without it the camelCase key would be silently ignored — a write that reports
+/// success and changes nothing, the failure `ToolsPatch` documents.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SpendCapBody {
+    pub cap_micros: i64,
+}
+
+pub async fn spend_cap_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<SpendCapBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/spend/cap") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match persist::spend_cap_set(store, body.cap_micros.max(0)) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not write the spend cap: {e}"),
+            Some("spend_cap_set_failed"),
+        ),
+    }
+}
+
 // ── Config CRUD: api-keys ──────────────────────────────────────────────────
 
 pub async fn api_keys_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
@@ -645,6 +688,64 @@ pub async fn manifest_activate_h(
     }
 }
 
+/// `POST /admin/manifests/stage` — a repair candidate as a NEW version, not activated.
+///
+/// Staging and activating are two routes because they are two decisions: a staged manifest is a
+/// proposal the operator has not accepted, and `manifest_stage_row` computes its version so the
+/// caller cannot pick one that collides. The response names the version the activate route needs.
+pub async fn manifest_stage_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(m): Json<persist::ManifestRow>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/manifests/stage") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match persist::manifest_stage_row(store, &m) {
+        Ok(version) => (StatusCode::OK, Json(json!({ "version": version }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not stage the manifest: {e}"),
+            Some("manifest_stage_failed"),
+        ),
+    }
+}
+
+/// `GET /admin/manifests/{id}/history` — every recorded version for one provider, newest first.
+///
+/// **`{id}` is the provider id**, as it already is in `{id}/activate` above: both routes are keyed
+/// by provider, not by a manifest's own id. The name is kept identical to its sibling on purpose —
+/// two different parameter names at the same path position is a router conflict waiting to happen,
+/// and the sibling's name was the one already on the wire.
+///
+/// A path segment rather than a query parameter: the provider id is the identity of the collection.
+/// `GET /admin/manifests` already means something else — the active row per provider.
+pub async fn manifest_history_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "GET /admin/manifests/{id}/history") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match persist::list_manifest_history(store, &id) {
+        Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not read the manifest history: {e}"),
+            Some("manifest_history_failed"),
+        ),
+    }
+}
+
 // ── Config CRUD: models cache ──────────────────────────────────────────────
 
 pub async fn models_cache_list_h(
@@ -764,6 +865,34 @@ pub async fn ledger_recent_h(
     }
 }
 
+/// `POST /admin/ledger` — append one row.
+///
+/// A write on the same path `GET /admin/ledger` reads: the ledger is append-only, so the two are
+/// the same collection and neither is a sub-resource of the other. The row arrives whole rather
+/// than being derived here, because `store.ts` writes it once a generation has finished and it is
+/// the only place that knows `source` and which app key paid.
+pub async fn ledger_append_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(row): Json<persist::LedgerRow>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/ledger") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match persist::ledger_append_row(store, &row) {
+        Ok(()) => (StatusCode::OK, Json(json!({ "ok": true }))).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not append the ledger row: {e}"),
+            Some("ledger_append_failed"),
+        ),
+    }
+}
+
 // ── Memory (P7) ────────────────────────────────────────────────────────────
 //
 // Memory is service-owned, not app-owned. `core/memory.rs` and `core/context_scope.rs` are both
@@ -781,6 +910,50 @@ pub async fn ledger_recent_h(
 // **Capture is not injection.** A row is born `Unscoped`, which is capture-only and never
 // injected; `assign_scope` is the only way in, and it is a deliberate human act. Nothing here
 // auto-binds — an auto-bound atom would make the header-less client degrade to global.
+
+/// The memory layer's master switch — `GET`/`POST /admin/memory/enabled`.
+///
+/// **This pair is not database state, and that is the point of routing it.** The switch is an
+/// `AtomicBool` on `GatewayCore`, read by the request path on every request, so its authority is
+/// whichever process serves *this listener*. `invoke` reaches the **app's own** core instead. In the
+/// default install those are the same core — the app starts and serves its own listener (26l) — so
+/// this route changes nothing observable today. It exists because the headless deployment is the
+/// case the port is for, and there the two cores differ: the switch has to follow the listener the
+/// caller is using, not the one the app happens to own.
+///
+/// Not to be confused with `MemoryMode` (`context_scope.rs`), which is per-client and parsed from
+/// the `AIP-Memory` header. That decides what a *given* client gets; this decides whether the layer
+/// runs at all, and a client's explicit mode can only narrow it, never widen.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MemoryEnabledBody {
+    pub enabled: bool,
+}
+
+pub async fn memory_enabled_get_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    (StatusCode::OK, Json(json!({ "enabled": core.memory_enabled() }))).into_response()
+}
+
+pub async fn memory_enabled_set_h(
+    State(core): State<Arc<GatewayCore>>,
+    headers: HeaderMap,
+    Json(body): Json<MemoryEnabledBody>,
+) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    core.set_memory_enabled(body.enabled);
+    // Read back rather than echo the request. `set_memory_enabled` also drops the frozen memory
+    // blocks, and a response that echoed its own input would agree with itself even if the write
+    // had not taken — the round-trip `__webTest.failNext` exists to catch.
+    (StatusCode::OK, Json(json!({ "enabled": core.memory_enabled() }))).into_response()
+}
 
 /// `GET /admin/memory` — the Memory screen's list, filtered by layer.
 ///
@@ -1325,6 +1498,32 @@ pub async fn context_clear_h(State(core): State<Arc<GatewayCore>>, headers: Head
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("could not clear the context graph: {e}"),
             Some("context_clear_failed"),
+        ),
+    }
+}
+
+/// `POST /admin/context/prune` — bound the live-context tables.
+///
+/// Turn ring per session, TTL on turns, TTL on idle sessions. A route rather than something the
+/// request path does, for the reason `gateway_prune_live_context` gives: pruning there would add a
+/// second write to the hottest code in the app. Deliberately **not** merged with
+/// `POST /admin/memory/prune`, which applies `memories` retention — the two tables have unrelated
+/// retention policies and one stats struct over both would hide which rule removed what. The
+/// separation is on IPC for that reason and is kept here.
+pub async fn context_prune_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers) {
+        return *r;
+    }
+    let store = match require_store(&core, "POST /admin/context/prune") {
+        Ok(s) => s,
+        Err(r) => return *r,
+    };
+    match crate::core::gateway::session_context::prune(store) {
+        Ok(stats) => (StatusCode::OK, Json(stats)).into_response(),
+        Err(e) => admin_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("could not prune the live context: {e}"),
+            Some("context_prune_failed"),
         ),
     }
 }

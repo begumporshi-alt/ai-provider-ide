@@ -149,6 +149,15 @@ const appKeys: Row[] = [];
  * gateway_cmds.rs computes, and the UI colours the number off it. */
 const spendStatus = { monthMicros: 0, capMicros: 0, capped: false };
 /**
+ * The memory layer's master switch. Stateful since 26o, and that is a correction rather than a
+ * feature: `gateway_memory_enabled` used to `return false` unconditionally and
+ * `gateway_set_memory_enabled` used to return its own argument without storing it, so the pair
+ * could not model a toggle at all — a POST followed by a GET disagreed with itself, and no spec
+ * could have caught a route that failed to write. The default is `false`, which is what the
+ * unconditional stub returned, so specs that only read it are unaffected.
+ */
+let memoryEnabled = false;
+/**
  * What `gateway_log_tail` answers. The host owns `{app_data_dir}/gateway.log`, so a spec cannot
  * produce the branches that matter — an empty log, a line with no timestamp, a capped line —
  * without arranging them here.
@@ -1592,9 +1601,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "capture_purge_finished":
       return 0;
     case "gateway_memory_enabled":
-      return false;
+      return memoryEnabled;
     case "gateway_set_memory_enabled":
-      return Boolean(args.enabled);
+      memoryEnabled = Boolean(args.enabled);
+      // Read back rather than echo the argument, matching `memory_enabled_set_h`: an echo would
+      // agree with itself even if the store had not taken.
+      return memoryEnabled;
     // Deliberately one populated row rather than an empty object: with `{}` a field-name mismatch
     // between the Rust DTO and the screen would pass the browser sweep unnoticed. The keys mirror
     // `injection_log::InjectionEvent` under `rename_all = "camelCase"`.
@@ -1996,7 +2008,14 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
     }
 
     case "spend": {
-      if (method === "GET") return { ...spendStatus };
+      // The sub-path is checked first. The bare `GET` below used to answer any `/admin/spend/*`
+      // path, so `/admin/spend/cap` would have been answered as the status rather than falling
+      // through to a 404 — the same ordering hazard `routeMemory` documents.
+      if (method === "POST" && segs.length === 3 && at(2) === "cap") {
+        await dispatch("gateway_spend_cap_set", { cap_micros: (body as Row)?.capMicros });
+        return { ok: true };
+      }
+      if (method === "GET" && segs.length === 2) return { ...spendStatus };
       break;
     }
 
@@ -2031,6 +2050,16 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
         await dispatch("manifest_upsert_active", { m: body as Row });
         return { ok: true };
       }
+      if (method === "POST" && segs.length === 3 && at(2) === "stage") {
+        // `manifest_stage_h` takes `Json<ManifestRow>`, so the body *is* the row. The IPC
+        // command's `{ m }` wrapper is `toRustArgs`'s doing, not the struct's shape — the pair
+        // disagrees here the same way `POST /admin/aliases` does.
+        const version = await dispatch("manifest_stage", { m: body as Row });
+        return { version };
+      }
+      if (method === "GET" && segs.length === 4 && at(3) === "history") {
+        return dispatch("manifests_history", { provider_id: at(2) });
+      }
       if (method === "POST" && segs.length === 4 && at(3) === "activate") {
         const previous = await dispatch("manifest_activate", { provider_id: at(2), version: (body as Row)?.version });
         return { previousVersion: previous ?? null };
@@ -2063,6 +2092,12 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
     }
     case "ledger": {
       if (method === "GET" && segs.length === 2) return dispatch("ledger_recent", { limit: limitOf(q, 200) });
+      if (method === "POST" && segs.length === 2) {
+        // `ledger_append_h` takes `Json<LedgerRow>` — the body is the row, and the IPC command's
+        // `{ e }` wrapper is `toRustArgs`'s. Same disagreement as `manifest_stage`.
+        await dispatch("ledger_append", { e: body as Row });
+        return { ok: true };
+      }
       break;
     }
 
@@ -2081,6 +2116,13 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
       if (method === "DELETE" && segs.length === 2) {
         await dispatch("context_clear", {});
         return { ok: true };
+      }
+      // Live-context retention. Delegates to `gateway_prune_live_context`, which is the *other*
+      // pruning command: `POST /admin/memory/prune` bounds `memories` and this bounds
+      // `live_context`. They are separate because the policies are unrelated and one stats struct
+      // over both would hide which rule removed what.
+      if (method === "POST" && segs.length === 3 && at(2) === "prune") {
+        return dispatch("gateway_prune_live_context", {});
       }
       break;
     }
@@ -2112,6 +2154,16 @@ async function routeMemory(method: string, segs: string[], q: URLSearchParams, b
         return { ok: true };
       }
       break;
+    // The master switch, which is not a memory row. A static segment, so it precedes the id
+    // handling for the reason the note at the top of this switch gives.
+    case "enabled": {
+      if (method === "GET") return { enabled: memoryEnabled };
+      if (method === "POST") {
+        memoryEnabled = Boolean((body as Row)?.enabled);
+        return { enabled: memoryEnabled };
+      }
+      break;
+    }
     case "batch": {
       if (method === "POST") {
         const items = Array.isArray(body) ? (body as unknown[]) : [];

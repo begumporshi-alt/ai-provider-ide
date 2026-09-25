@@ -3571,6 +3571,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("POST", "/admin/keys", json!({ "label": "x" })),
         ("DELETE", "/admin/keys/ak-1", json!(null)),
         ("GET", "/admin/spend", json!(null)),
+        ("POST", "/admin/spend/cap", json!(null)), // 422 is fine — auth ran first
         ("GET", "/admin/providers", json!(null)),
         ("POST", "/admin/providers", provider_json("p1", "https://x.test/v1")),
         ("DELETE", "/admin/providers/p1", json!(null)),
@@ -3580,11 +3581,14 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("GET", "/admin/manifests", json!(null)),
         ("POST", "/admin/manifests", json!(null)), // 422 is fine — auth ran first
         ("POST", "/admin/manifests/p1/activate", json!(null)), // 422 is fine
+        ("POST", "/admin/manifests/stage", json!(null)), // 422 is fine
+        ("GET", "/admin/manifests/p1/history", json!(null)),
         ("GET", "/admin/models-cache", json!(null)),
         ("POST", "/admin/models-cache", json!(null)), // 422 is fine
         ("GET", "/admin/aliases", json!(null)),
         ("POST", "/admin/aliases", json!(null)), // 422 is fine
         ("GET", "/admin/ledger", json!(null)),
+        ("POST", "/admin/ledger", json!(null)), // 422 is fine
         ("GET", "/admin/memory", json!(null)),
         ("POST", "/admin/memory", json!({ "layer": "L1", "text": "x" })),
         ("DELETE", "/admin/memory", json!(null)),
@@ -3592,6 +3596,10 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("POST", "/admin/memory/recall", json!({ "query": "x" })),
         ("GET", "/admin/memory/stats", json!(null)),
         ("GET", "/admin/memory/conflicts", json!(null)),
+        // The master switch. Listed with the memory statics because it is one, and because a reader
+        // of the routes should see that it authenticates like every other one.
+        ("GET", "/admin/memory/enabled", json!(null)),
+        ("POST", "/admin/memory/enabled", json!({ "enabled": true })),
         ("POST", "/admin/memory/prune", json!(null)),
         ("POST", "/admin/memory/supersede", json!({ "old": "a", "new": "b" })),
         ("GET", "/admin/memory/principals", json!(null)),
@@ -3605,6 +3613,7 @@ async fn admin_routes_refuse_without_the_master_key() {
         ("GET", "/admin/context", json!(null)),
         ("POST", "/admin/context", json!({ "nodes": [], "edges": [] })),
         ("DELETE", "/admin/context", json!(null)),
+        ("POST", "/admin/context/prune", json!(null)),
         ("GET", "/admin/tools", json!(null)),
         ("POST", "/admin/tools", json!({})),
         ("PUT", "/admin/tools/workspace-root", json!({ "root": "/tmp" })),
@@ -4827,4 +4836,265 @@ fn cors_headers_include_the_gateway_auth_headers() {
             "CORS must allow the `{needed}` header — the UI sends it to authenticate"
         );
     }
+}
+
+// ── 26o: the routes the last seven gateway-data commands needed ────────────
+//
+// Each test asserts on the **row re-read from the store**, never on the write's own response. A
+// handler that echoed its input would satisfy the latter and prove nothing about the write — the
+// same reason `memory_enabled_set_h` reads its flag back instead of returning the argument.
+
+/// Seed a provider row. `manifests.provider_id` is a **foreign key**, so nothing can be staged
+/// before the provider exists — the route reports the store's refusal as a 500, which is the correct
+/// behaviour and this fixture's problem to satisfy rather than work around.
+async fn seed_provider(s: &TestServer, id: &str) {
+    // `providers.slug` is `NOT NULL UNIQUE` (`store.rs:35`) and `provider_json` hardcodes it, so
+    // seeding a second provider through that helper alone is a 500. Setting the slug to the id makes
+    // it unique **by construction** rather than by remembering to vary an argument.
+    let mut body = provider_json(id, "https://x.test/v1");
+    body["slug"] = json!(id);
+    let res = s
+        .client
+        .post(format!("{}/admin/providers", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200, "seeding provider `{id}` must succeed");
+}
+
+/// Stage one manifest through the route and return the version it assigned.
+///
+/// `id` is a parameter because `manifests.id` is the **primary key**: staging one row twice is a
+/// 500, again the store behaving correctly and the fixture's job to avoid.
+///
+/// `isActive` is sent as `true` deliberately: `manifest_stage_row` hardcodes `is_active = 0` in the
+/// INSERT, so a route that honoured the field would activate a proposal the operator has not
+/// accepted. The tests below rely on that being ignored.
+async fn stage_manifest(s: &TestServer, id: &str, provider: &str) -> i64 {
+    let res = s
+        .client
+        .post(format!("{}/admin/manifests/stage", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({
+            "id": id,
+            "providerId": provider,
+            "version": 0,
+            "origin": "ai-patched",
+            "bodyJson": "{}",
+            "contractResultJson": "null",
+            "createdAt": 1,
+            "isActive": true
+        }))
+        .send()
+        .await
+        .unwrap();
+    // Body before status: a 500 here carries the store's own message, and an assertion that printed
+    // only the status code would have hidden the foreign key behind "left: 500, right: 200".
+    let status = res.status();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(status, 200, "staging must succeed: {body}");
+    body.get("version")
+        .and_then(|v| v.as_i64())
+        .expect("the response must name the assigned version")
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_ledger_append_writes_a_row_the_read_returns() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/ledger", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({
+            "ts": 42,
+            "modality": "text",
+            "source": "ui",
+            "providerId": null,
+            "keyId": null,
+            "appKeyId": null,
+            "requestedModel": null,
+            "model": "gpt-4o",
+            "status": "ok",
+            "httpStatus": null,
+            "errorClass": null,
+            "latencyMs": null,
+            "tokensIn": 7,
+            "tokensOut": 9,
+            "costEstimateMicros": 3,
+            "cachedTokens": null,
+            "fallbackChainJson": null
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // Re-read through the sibling route. `LedgerRow` is `deny_unknown_fields`, so a body that
+    // misspelled a field would have been a 422 above rather than a silent `NULL` here.
+    let rows: Value = s
+        .client
+        .get(format!("{}/admin/ledger", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let row = &rows.as_array().expect("an array")[0];
+    assert_eq!(row.get("ts").and_then(|v| v.as_i64()), Some(42));
+    assert_eq!(row.get("tokensIn").and_then(|v| v.as_i64()), Some(7));
+    assert_eq!(row.get("model").and_then(|v| v.as_str()), Some("gpt-4o"));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_manifest_stage_assigns_the_next_version_and_leaves_it_inactive() {
+    let s = start_with_store().await;
+    seed_provider(&s, "p1").await;
+    let v1 = stage_manifest(&s, "m1", "p1").await;
+    let v2 = stage_manifest(&s, "m2", "p1").await;
+    assert_eq!((v1, v2), (1, 2), "the version is computed host-side, never supplied by the caller");
+
+    // Staging is not activating. `isActive: true` went out on both requests above and neither may
+    // have taken effect, which is the property that keeps a repair a proposal.
+    let active: Value = s
+        .client
+        .get(format!("{}/admin/manifests", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        active.as_array().map(|a| a.len()),
+        Some(0),
+        "a staged manifest must not be active: {active}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_manifest_history_lists_every_version_newest_first() {
+    let s = start_with_store().await;
+    seed_provider(&s, "p1").await;
+    seed_provider(&s, "p2").await;
+    stage_manifest(&s, "m1", "p1").await;
+    stage_manifest(&s, "m2", "p1").await;
+    // A second provider's row, which the history route must not include.
+    stage_manifest(&s, "m3", "p2").await;
+
+    let hist: Value = s
+        .client
+        .get(format!("{}/admin/manifests/p1/history", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rows = hist.as_array().expect("an array");
+    assert_eq!(rows.len(), 2, "p1 has two versions and p2's must not appear: {hist}");
+    assert_eq!(rows[0].get("version").and_then(|v| v.as_i64()), Some(2), "newest first");
+    assert_eq!(rows[1].get("version").and_then(|v| v.as_i64()), Some(1));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_spend_cap_set_clamps_a_negative_to_zero() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/spend/cap", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "capMicros": -5 }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    // The reader's view is what the clamp exists for: `spend_cap_micros` reports `None` for anything
+    // `<= 0`, so a stored `-5` and a stored `0` are one state, and the row must not hold two
+    // spellings of it.
+    let status: Value = s
+        .client
+        .get(format!("{}/admin/spend", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        status.get("capMicros").and_then(|v| v.as_i64()),
+        Some(0),
+        "a negative cap must read back as 0: {status}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_context_prune_reports_the_three_counters() {
+    let s = start_with_store().await;
+    let res = s
+        .client
+        .post(format!("{}/admin/context/prune", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let stats: Value = res.json().await.unwrap();
+    // `PruneStats` is snake_case, unlike the camelCase registry rows — the two spellings on one
+    // surface are deliberate (see the memory section note in `gateway_admin.rs`).
+    for key in ["turns_by_count", "turns_by_age", "sessions_reaped"] {
+        assert!(stats.get(key).is_some(), "prune must report `{key}`: {stats}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn admin_memory_enabled_round_trips_and_is_off_by_default() {
+    let s = start_with_store().await;
+
+    let before: Value = s
+        .client
+        .get(format!("{}/admin/memory/enabled", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(before.get("enabled").and_then(|v| v.as_bool()), Some(false), "off by default");
+
+    let set = s
+        .client
+        .post(format!("{}/admin/memory/enabled", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&json!({ "enabled": true }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(set.status(), 200);
+
+    // A **second** request, not the POST's own body: the handler reads the flag back after setting
+    // it, so asserting on that response would pass even if the write had not taken.
+    let after: Value = s
+        .client
+        .get(format!("{}/admin/memory/enabled", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(after.get("enabled").and_then(|v| v.as_bool()), Some(true));
+
+    // And it is the *core's* flag the request path consults, not a copy the route keeps. This is the
+    // assertion that makes the route's authority claim testable rather than prose.
+    assert!(s.core.memory_enabled(), "the route must flip the core's own flag");
 }
