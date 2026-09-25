@@ -2304,11 +2304,12 @@ two scope-wrong claims in two consecutive increments.
    See the 26b note in §11.
 4. Change the UI from `invoke` to `fetch()` for gateway operations. **In progress (2026-09-25).**
    §10 decision 2 is settled: **pure HTTP**. The migration covers gateway request routes (already
-   HTTP), the §5.3 admin routes, and ~15 new admin route groups for CRUD operations. See the
-   decision entry in §10.
-5. Add CORS headers to the gateway for `tauri://localhost`. **In progress (2026-09-25).** A
+   HTTP), the §5.3 admin routes, and the CRUD route groups. ~~Admin routes (settings, keys,
+   spend)~~ **landed 26d**; ~~provider CRUD~~ **landed 26e**; ~~remaining CRUD (api-keys,
+   manifests, models-cache, aliases, ledger)~~ **landed 26f**. See the decision entry in §10.
+5. ~~Add CORS headers to the gateway for `tauri://localhost`.~~ **Landed 26c.** A
    prerequisite for step 4, now unblocked by the pure-HTTP decision.
-6. Update `09-status.md` and the drift register. **Done for 26a–26b.**
+6. Update `09-status.md` and the drift register. **Done for 26a–26f.**
 
 ---
 
@@ -3465,10 +3466,10 @@ assumptions are tested.
 pure HTTP**, and its scope **corrected by measurement** (107 commands, narrowed to the ~75 the
 service owns — see the decision entry); ~~add CORS~~ **landed 26c**; ~~add the §5.3 admin routes~~
 **landed 26d**; ~~provider CRUD~~ **landed 26e**, which also added the allowlist seam the routes
-need. Remaining CRUD routes — **api-keys, manifests (+ activate), models cache, aliases, ledger
-read** — follow the same mechanical pattern 26e established: extract a store-only core from the
-app-gated command, then register the route. After that, the memory/context routes (~25), the tool
-toggles and service management, and finally the TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
+need. ~~Remaining CRUD routes — api-keys, manifests (+ activate), models cache,
+aliases, ledger read~~ **landed 26f** (committed `449d4ec`, pushed). After that, the
+memory/context routes (~25), the tool toggles and service management, and finally
+the TypeScript migration itself. Steps 1 and 3 are landed (26a and 26b); step 2 is half-done (the
 binary is bundled undeclared). With `RunAtLoad` set, the agent and the app both bind the same
 persisted port, so the agent is only usable once the app stops starting its own gateway — which is
 what step 4 does. The other decisions in §10 still stand.
