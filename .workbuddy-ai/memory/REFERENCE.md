@@ -2439,6 +2439,43 @@ non-executable binary, and the defect was invisible **from inside the suite writ
 comment is a claim about the invariant the test depends on; the fixture now sets `0755` explicitly, and
 `non_executable_source()` supplies the hostile `0644`.
 
+### Which build gets bundled, and why the size argument was the wrong one (measured 2026-09-25, increment 26r)
+
+Phase 6 step 2 asked whether the bundled `aiproviderd` should be the default-features build or the
+Tauri-free one, and justified the question with a size delta. Both halves needed correcting.
+
+**`bundle.externalBin` is not needed.** The service is already in `Contents/MacOS/` with `externalBin`
+unset, no `resources` entry, and no script naming it — so the bundler's `[[bin]]` handling places it.
+Declaring `externalBin` would want a `<path>-<target-triple>` source that nothing produces, and would
+target the same destination. (There is no `binaries/` directory in this repo.)
+
+**The two builds, one variable — the feature set.** Release profile, same session:
+
+| | `cargo build --release --bin aiproviderd` | `… --no-default-features` |
+|---|---|---|
+| bytes | **8,603,760** | **8,586,864** |
+| `otool -L` dylibs | 12, includes **`WebKit.framework`** | 8, no WebKit |
+| `cargo tree` nodes matching `webkit`/`wry`/`gtk` (`-iE`) | **34** | **0** |
+
+The delta is **16,896 B** — not the 380 KB the docs claimed. **WebKit is a system framework linked
+*dynamically*, so it costs no file size**; the whole delta is Tauri's own Rust code. The old figure was
+measured before Phases 2–5 moved the engine into `aiproviderd`, when Tauri's code was a large fraction
+of a much smaller binary.
+
+**The bundler's copy is the WebKit-linking one.** `otool -L` on
+`target/release/bundle/macos/AI-Provider Router.app/Contents/MacOS/aiproviderd` (4,454,336 B, dated
+2026-09-24) lists 12 dylibs including `WebKit.framework` — matching a fresh default-features build, and
+confirming §2.1.1's claim by linkage rather than by size. `tauri build` builds the **default-features**
+target, so producing the Tauri-free binary and substituting it into the bundle is a **build step**, not a
+config key. That is what remains in step 2.
+
+**Two instruments that can fail, because the cited one could not.** The status row's evidence was
+`cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` → 0. Without `-E` that is BSD
+**BRE**, where `|` is **literal** — the pattern is the string `webkit|wry|gtk`, which matches nothing, so
+it prints 0 on *any* input. Run against the default-features tree, which holds **34** real matches, it
+printed **0** as well. Use `-iE` and `otool -L`, and run an absence check against the case where the thing
+*is* present before trusting a zero.
+
 ## Feature-gating `core/` away from Tauri — landed 2026-09-23
 
 The end state: `cargo build --bin aiproviderd --no-default-features` compiles **no Tauri at all** — not the
