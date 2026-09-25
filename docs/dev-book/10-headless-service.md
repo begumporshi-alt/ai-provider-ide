@@ -4111,6 +4111,34 @@ that needs both the agent and the app up, which is the `launchd_live` harness te
 blocked on a real Aqua session). What 26t proves is the *decision* — that a taken port is read as
 "delegate" and a free port as "bind" — at the seam that does not need either process.
 
+### Increment 26u — the open-item list re-measured, and the figures corrected
+
+**No code landed in this increment — a measurement.** The "65 `invoke` / 39 `/admin` templates / 7
+still on `invoke`" figures from 26o had been propagated through 26p–26t as if they were current,
+and the live tree had moved under them. Re-measured on the tree 26t committed:
+
+- `invoke` commands in `apps/desktop/src`: **~17** total (7 in `store.ts`, 10 across the screens),
+  every one in the must-stay-on-IPC category §13 lists (listener control + discovery, workspace root,
+  the two secret groups, `agent_run_*`, `service_uninstall`, `skills_*`, `tools_check_root`,
+  `settings_set gateway`). **No command whose data the gateway owns is left on `invoke`.**
+- `/admin/*` templates used by the UI: **23**, all served. The two that look absent
+  (`/admin/settings/background`, `/admin/settings/router`) are served by the generic
+  `/admin/settings/{key}` route (`gateway.rs:2127`).
+- **Task #8 (manifest extraction) done**: `manifest_stage_row`/`manifests_history` live in
+  `persist.rs`; `gateway_admin.rs`'s `manifest_stage_h` calls `persist::manifest_stage_row` (shared
+  SQL); `gateway_tests.rs:5017` pins the route. No second SQL implementation.
+- The vitest/Playwright suite is **181/181**, not "108/108" — it grew after 26l.
+
+**The class is the register's own, one level down.** D56 retired a command that could not fail; D57
+retired an instrument that had not been pointed at the artefact. This is *a "cannot be rechecked"
+total re-used without re-measurement* — 26o's closing sentence said exactly that about the 65/39
+figures ("A total without its method cannot be rechecked"), and the next five increments quoted the
+same figure without running the grep. D59 records it. The corrected inventory in §13 is the method a
+reader can re-run in one line each.
+
+**Gates:** no Rust or TypeScript change; `check-doc-links`, `docs:book`, `key-leak-grep` — run with
+the commit. The 181/181 suite is the current green line.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
@@ -4222,6 +4250,29 @@ decision half**: `probe_port` asks the socket, and on a taken port the app recor
 the core and returns without binding a second listener — the two-process race is no longer a silent
 collision but a designed delegation. The end-to-end measurement (both processes up) still lives in the
 `launchd_live` harness. The other decisions in §10 still stand.
+
+**The 26u re-measurement — the open-item list under-reported the tree, and this entry corrects it.**
+The "65 `invoke` / 39 `/admin` templates / 7 still on `invoke`" figures (from 26o) have been
+propagated through 26p–26t without being re-measured, and the live tree has moved. Measured 2026-09-25
+on the same tree 26t committed:
+
+- **`invoke` commands remaining: ~17**, not 65 — and every one is in the *must-stay-on-IPC* category
+  §13 itself listed (listener control + discovery, `gateway_enable`/`disable`, the workspace root,
+  the two secret groups, `agent_run_*`, `service_uninstall`, `skills_*`, `tools_check_root`,
+  `settings_set gateway`). **No command whose data the gateway owns is left on `invoke`.**
+- **`/admin/*` templates used by the UI: 23**, all served by Rust routes — the two that look absent
+  (`/admin/settings/background`, `/admin/settings/router`) are served by the generic
+  `/admin/settings/{key}` route registered in `gateway.rs:2127`. Every `fetchAdmin` call site in
+  `store.ts`/screens has a matching `axum` route.
+- **Task #8 is done** — `manifest_stage_row`/`manifests_history` are extracted into `persist.rs`,
+  the `POST /admin/manifests/stage` handler calls `persist::manifest_stage_row` (shared SQL), and
+  `gateway_tests.rs:5017` pins its version-increment behaviour. No second SQL implementation.
+- The browser/vitest suite is **181/181**, not "108/108" — it has grown since 26l.
+
+The class is the register's own: a "cannot be rechecked" total was re-used as if it were current. D59
+records it. The corrected inventory above is the method a reader can re-run: `grep -c "invoke("
+apps/desktop/src/store.ts` (~8), `grep -rhoE '"/admin/…"' apps/desktop/src/…` (23), and the Rust route
+registrations in `gateway.rs:2125-2142`.
 
 (This line read "answer the four decisions in §10, then begin Phase 1" until 2026-09-24, by which
 point Phase 1 and twelve increments had landed; it then read "decide the sub-question the
