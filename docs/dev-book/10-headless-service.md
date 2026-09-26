@@ -3889,6 +3889,46 @@ load, because the shim answers an unrouted `/admin/*` path with `404 unknown_rou
 same spec passed in 16.8 s. So the browser suite exercises the new transport rather than tolerating
 it: a route that is not wired is a failure, not a silent `undefined`.
 
+### Increment 26w — Phase 6 step 2, verified end-to-end against a fresh `tauri build`, and the vault sweep the register owed
+
+**The 26s flow had never run against a fresh `tauri build` on this tree.** 26s landed the two scripts
+and the `pnpm build:headless` entry point, and 26s's own "Run 2026-09-25" record was against a bundle
+that pre-dated the subcommands and the file vault. Between 26s and today, the commit `e27503e`
+(replace OS keychain with file-backed secrets store) rewrote `vault.rs`, added five subcommands to
+`aiproviderd`, and removed `keyring` from `Cargo.toml` — so the bundled binary was stale before this
+verification even began.
+
+**The verification, measured 2026-09-26.** `pnpm tauri build` (4m08s, the `.app` built; the DMG step
+failed on `hdiutil` — the recorded `09-status.md` sandbox limitation, not a regression). Then
+`bash scripts/substitute-tauri-free-aiproviderd.sh`:
+
+- Tauri-free `aiproviderd` build: WebKit/wry/gtk match count **0** (must be 0).
+- Default-features `aiproviderd` build: match count **1** — the contrast D56 demanded. The instrument
+  reports *presence*, not absence: a WebKit-linked binary is counted, a Tauri-free one is not.
+- Post-substitution bundle: match count **0**. `scripts/check-bundled-aiproviderd-links.sh` passed.
+
+The substituted binary was then run directly from `Contents/MacOS/` with `mint`: it rotated the
+master key and wrote it to `~/Library/Application Support/dev.aiprovider.router/.secrets.json` —
+the file vault `e27503e` replaced the OS keychain with. **The subcommands work in the Tauri-free
+target, which is the target the bundler would otherwise ship with WebKit linked.**
+
+**The CI mirrors gained the two `otool` steps they were missing.** `ci.yml`'s `checks` job and
+`ci-local.sh` both run `tauri build --bundles app` but neither ran the substitute or the gate —
+the two steps `release.yml` already carries. A PR that overwrote the bundle with the WebKit-linked
+binary would have stayed green in both mirrors until it reached a release. Both mirrors now run
+`scripts/substitute-tauri-free-aiproviderd.sh` followed by
+`scripts/check-bundled-aiproviderd-links.sh` immediately after the `tauri build` step, gated on
+`otool` being present (macOS only, matching the substitute script's own guard). **D60 records the
+sweep the vault commit owed:** `MASTER_PROMPT.md`'s current-state §6/§7 still read "OS keychain",
+`DECISIONS.md`'s 2026-09-16 entry recorded the `keyring v3→v2` downgrade as a live decision, and
+`ci.yml`'s `headless-service` job cited "no keychain approval" as the reason `--version` is safe —
+all now corrected; `DECISIONS.md` gained the 2026-09-26 entry that supersedes the 2026-09-16 one.
+
+**Gates, measured 2026-09-26.** `bash -n` clean on both scripts; `check-doc-links` 53 files / 126
+links, all resolve; `docs:book` 215 ids, clean (one table-row pipe fix during this increment —
+the same class D16 recorded, an escaped pipe inside a code span splitting a row). No test counts
+change; this increment adds two CI steps and one register entry, and lands no Rust or TypeScript.
+
 ### Increment 26q — the install's success claim, and the fixture that hid it
 
 **The standing item was "whether `service::install` actually gets a job running."** §12 says it is

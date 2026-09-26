@@ -119,13 +119,15 @@ Model Router, and the Router talks to providers.**
     `8787`, but AI Hub v2 also claims 8787 and slides up when it loses, so this machine runs `8800`.
     Never quote a port as a fact; read `settings.gateway.port`.
     On first enable the IDE **generates a master key** (crypto-random, `sk-aip-…`, stored in
-    the OS keychain, shown once, rotatable — rotation kills the old key instantly — and
-    revocable). External apps (Cursor, scripts, chat UIs) paste the endpoint URL + master key
+    the file-backed secrets store — `<data_dir>/.secrets.json`, mode 600 — shown once, rotatable
+    via `aiproviderd mint`, revocable). The OS keychain was abandoned 2026-09-26 (DECISIONS.md);
+    rotation kills the old key instantly. External apps (Cursor, scripts, chat UIs) paste the
+    endpoint URL + master key
     and can then use **all configured providers** through that one URL, with the same key
     rotation and provider failover as the IDE's own UI. Binds `127.0.0.1` only; LAN sharing
     is an explicit opt-in with a warning. Flow and details: [ARCHITECTURE.md](ARCHITECTURE.md) §3.3.
 14. **[DEFAULT] Config export & diagnostics:** export/import the full configuration as JSON
-    (providers, manifests, aliases, settings, `secret_ref`s — never keychain secrets; secrets
+    (providers, manifests, aliases, settings, `secret_ref`s — never secrets; secrets
     are re-entered on import with a guided flow), plus a user-initiated diagnostics bundle
     (scrubbed logs) for bug reports — the telemetry-free replacement for crash reporting.
 
@@ -154,8 +156,8 @@ Model Router, and the Router talks to providers.**
 
 ## 6. Security — hard requirements
 
-- API keys are stored in the **OS keychain** (via the Rust host's `keyring` crate — `keytar`
-  is archived; the webview never touches a raw key), never in
+- API keys are stored in the **file-backed secrets store** (`<data_dir>/.secrets.json`,
+  mode 600 — the OS keychain was abandoned 2026-09-26, see DECISIONS.md), never in
   plaintext config files, never logged, never sent anywhere except their own provider endpoint.
 - Masked display everywhere except a one-shot reveal on explicit user action.
 - All provider traffic goes directly from the user's machine to the provider — no middleman
@@ -163,8 +165,8 @@ Model Router, and the Router talks to providers.**
 
 ## 7. Confirmed stack (per ARCHITECTURE.md)
 
-- **Desktop shell:** Tauri 2 with a Rust host layer (owns all network egress, the OS keychain,
-  and SQLite — the webview is key-blind and CORS-blocked from providers by design).
+- **Desktop shell:** Tauri 2 with a Rust host layer (owns all network egress, the file-backed
+  secrets store, and SQLite — the webview is key-blind and CORS-blocked from providers by design).
 - **UI:** React + TypeScript + Tailwind (matches a provider-card / dashboard style UI).
 - **Core:** a UI-agnostic TypeScript package — `packages/router-core` (published as
   `@aiprovider/router-core`) containing providers, key management, routing, and failover — fully
@@ -215,7 +217,8 @@ Model Router, and the Router talks to providers.**
 
 0. **Decisions spike:** pin b.ai + OpenCode Zen facts; freeze the compatibility contract,
    manifest grammar v1.1, and gateway bridge contract; scaffold the monorepo + CI.
-1. Rust host layer: `keychain-vault` + `egress-gateway` (credential injection, host allowlist)
+1. Rust host layer: `vault` (file-backed secrets store; was `keychain-vault` until 2026-09-26)
+   + `egress-gateway` (credential injection, host allowlist)
    + SQLite schema v1.1 with the migration runner.
 2. `packages/router-core`: manifest schema + interpreter, `openai-compat`/`anthropic-compat`
    templates, routing with key rotation, provider failover, cancellation, and the ledger —

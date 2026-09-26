@@ -58,6 +58,17 @@ jobs:
       # step above is a fast-fail for the frontend, not a prerequisite for this one.
       - name: Tauri build (the bundle must bundle)
         run: pnpm --filter ai-provider-router-desktop tauri build --bundles app
+      # `tauri build` bundles the default-features `aiproviderd` — the one that links WebKit.
+      # The substitution is a step, not a property of the build (D57: the guard must be pointed
+      # at the artefact): `substitute` builds the Tauri-free target, otool-verifies it, and
+      # copies it into `Contents/MacOS/`; `check` is the durable gate on the final bundle.
+      # `release.yml` runs the same two steps between the tauri-action and the signature check;
+      # this step set mirrors that, so a WebKit-linked service binary reddens the PR before it
+      # reaches a release.
+      - name: Substitute Tauri-free aiproviderd into the bundle
+        run: bash scripts/substitute-tauri-free-aiproviderd.sh
+      - name: Verify bundled aiproviderd links no WebKit
+        run: bash scripts/check-bundled-aiproviderd-links.sh
       - name: Key-leak grep (criterion 5)
         run: pnpm key-leak-grep
       - name: Single TypeScript version (audit R6)
@@ -142,8 +153,12 @@ jobs:
       # version of it proved nothing: it built the service WITH the `app` feature, so Tauri was
       # compiled and the WebKitGTK step below was genuinely required. The package now declares
       # `default = ["app"]` with `tauri`/`tauri-plugin-opener` optional, so this flag drops the
-      # runtime crate (and `wry`, and WebKitGTK) from the graph entirely -- measured locally with
-      # `cargo tree --no-default-features --edges all | grep -ci 'webkit|wry|gtk'` -> 0.
+      # runtime crate (and `wry`, and WebKitGTK) from the graph entirely. Measured locally with
+      # `cargo tree --no-default-features --edges all | grep -ciE 'WebKit|wry|gtk'` -> 0, and
+      # against the default-features tree -> 34. **D56 retired the BRE form this step used to
+      # cite** — `grep -ci 'webkit\|wry\|gtk'` — in which the pattern is the *literal string*
+      # `webkit|wry|gtk` (BSD BRE treats `\|` as literal) and returns 0 on **any** input, so it
+      # was an instrument that cannot fail. The ERE above is the one that reports presence.
       #
       # GTK/WebKit/rsvg/appindicator are therefore no longer installed. What remains is the C
       # toolchain (`rusqlite`) and `libssl-dev`/`pkg-config` (a transitive TLS build); the ubuntu
@@ -177,10 +192,12 @@ jobs:
       - name: Check every target without the app feature
         run: cargo check --no-default-features --all-targets
         working-directory: apps/desktop/src-tauri
-      # `--version` is the whole of the runtime assertion here, deliberately. It needs no port,
-      # no keychain approval and no store, so it cannot flake -- and it still proves the binary
-      # links and starts. The `/health` proof is a manual step (dev-book §10 records it): binding
-      # a port and reading the OS keychain on a shared runner is exactly the kind of step that
+      # `--version` is the whole of the runtime assertion here, deliberately. It needs no port
+      # and no store, so it cannot flake -- and it still proves the binary links and starts.
+      # The keychain is no longer in this path: since 2026-09-26 the vault is a file
+      # (`<data_dir>/.secrets.json`), and `aiproviderd --version` never opens the store at all.
+      # The `/health` proof is a manual step (dev-book §10 records it): binding
+      # a port on a shared runner is exactly the kind of step that
       # fails for reasons unrelated to the change under test.
       #
       # `working-directory` is load-bearing, and its absence is the reason the first run of this

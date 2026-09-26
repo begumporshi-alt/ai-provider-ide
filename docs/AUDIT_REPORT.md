@@ -167,7 +167,7 @@ no-secrets config export (manifests, aliases, settings, refs) for portable disas
 - **L5** Allowlist wording: the *candidate's* baseUrl during probing is neither a registered
   provider nor a docs URL — clarify user-supplied baseUrls are allowlisted at input time;
   consider a lint whitelist of request-body fields per endpoint.
-- **L6** Lifecycle hygiene: port-conflict UX, key-deletion → keychain cleanup, playground
+- **L6** Lifecycle hygiene: port-conflict UX, key-deletion → vault cleanup (the keychain was abandoned 2026-09-26; the vault is now `<data_dir>/.secrets.json`, mode 600), playground
   persistence, models-cache TTL, single-window rule (second window = second router core),
   i18n/a11y as declared non-goals, per-app gateway keys as a stated v1 limitation.
 - **L7** tauri-driver macOS coverage is limited — state the per-OS E2E strategy (Playwright vs

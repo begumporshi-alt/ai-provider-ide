@@ -98,6 +98,15 @@ step "Build"                  pnpm build
 # gate is testing. `tauri build` runs `beforeBuildCommand` (`pnpm build`) itself, so the step
 # above is a fast-fail for the frontend rather than a prerequisite for this one.
 step "Tauri build"            pnpm --filter ai-provider-router-desktop tauri build --bundles app
+# The `Tauri build` step above bundles the default-features `aiproviderd`, which links WebKit
+# (D56: the contrast is measured — 1 match vs 0). The substitution is a step, not a property of
+# the build: `tauri build` always overwrites the bundled binary, so the two otool-verified steps
+# that `release.yml` runs between the tauri-action and the signature check are mirrored here.
+# macOS only (`otool`), same as the substitute step's own guard.
+if command -v otool >/dev/null 2>&1; then
+  step "Substitute Tauri-free aiproviderd" bash "$ROOT/scripts/substitute-tauri-free-aiproviderd.sh"
+  step "Bundled aiproviderd links no WebKit" bash "$ROOT/scripts/check-bundled-aiproviderd-links.sh"
+fi
 step "Key-leak grep"          pnpm key-leak-grep
 step "Single TypeScript ver"  pnpm check-ts-version
 step "One product version"    pnpm check-version-sync

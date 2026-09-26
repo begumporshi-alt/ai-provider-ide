@@ -1,6 +1,6 @@
 # 09 — Status
 
-**As of 2026-09-23**, against `031ae4f`.
+**As of 2026-09-26**, against `e27503e`.
 
 > **This is the one chapter expected to age quickly, and the only one where staleness is normal.** Every other
 > chapter states a rule that changes only when someone decides to change it. This one states where the work
@@ -19,13 +19,13 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Adapter tiers | Builtin templates, manifest interpreter, QuickJS sandbox | `router-core`, Tier-2 review screen |
 | Onboarding | Deterministic fingerprint path, AI fallback, contract-gated | `onboarding-e2e.test.ts` |
 | Drift and repair | Detection window, patch flow, versioned rollback | `drift-repair-e2e.test.ts` |
-| Secrets | Keychain-only, key-blind TypeScript, one-shot reveal | Invariants 1–2, `key-leak-grep` in CI |
+| Secrets | File-backed store (`.secrets.json`, mode 600), key-blind TypeScript, one-shot reveal; OS keychain abandoned 2026-09-26 | `core/vault.rs` (JSON file, atomic tmp+rename write, `OnceLock` cache), `aiproviderd mint` subcommand; `keyring` removed from `Cargo.toml`; `key-leak-grep` in CI still guards the UI |
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tauri/tools.rs` |
 | Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |
 | Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. **0016 is in the source but not in the installed database** — measured 2026-09-23, the live DB sits at `schema_version` 15, so `ledger.app_key_id` does not exist there yet and attribution begins on the first launch after a rebuild |
 | Schema | 17 versions, count asserted, rewind-tested | `core/store.rs:1009-1013` |
-| Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; **`core/` no longer compiles Tauri at all** — `default = ["app"]` with both Tauri crates `optional` and every `tauri` mention behind `#[cfg(feature = "app")]`, so `cargo build --bin aiproviderd --no-default-features` drops `tauri`/`wry`/WebKitGTK from the graph entirely. `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Does not serve completions** — the router core is still TypeScript in a webview, so every completion route answers 503 by design | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1; CI job `headless-service`, which now builds with `--no-default-features` and installs no GTK/WebKit. Acceptance audited in [10](10-headless-service.md) §2.1.2: 8 of the prompt's 9 criteria hold as written, and the ninth (`pnpm build` "produces a working Tauri app") is false as written — it is met by the real bundler command, now a CI step |
+| Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; **`core/` no longer compiles Tauri at all** — `default = ["app"]` with both Tauri crates `optional` and every `tauri` mention behind `#[cfg(feature = "app")]`, so `cargo build --bin aiproviderd --no-default-features` drops `tauri`/`wry`/WebKitGTK from the graph entirely. `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Serves completions** via the Rust-native `RouterBridge` (Phase 4b; `HeadlessBridge` deleted 25f). Phase 6 closed 2026-09-26: the `.app` bundle's `Contents/MacOS/aiproviderd` is the Tauri-free binary, verified by `scripts/check-bundled-aiproviderd-links.sh` (an `otool -L` gate that counts WebKit/wry/gtk dylib matches; 0 = pass); run via `scripts/substitute-tauri-free-aiproviderd.sh` (`pnpm build:headless`) after every `tauri build`, since the bundler always overwrites it with the default-features (WebKit-linked) target | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1, Phase 6; CI steps "Substitute the Tauri-free aiproviderd into the bundle" and "Verify bundled aiproviderd links no WebKit" in `.github/workflows/release.yml`; D56–D57 record the null-instrument history |
 | Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
 | Rust lints | `cargo clippy --all-targets -- -D warnings` is clean | 64 → 0 on 2026-09-22; two were real dead branches, not style |
@@ -287,6 +287,20 @@ nothing to bridge to — it installed a bridge that discarded every dispatch, so
 subsystem. The paragraph is kept rather than deleted because the *shape* of the original problem — availability
 bound to something the operator does not control — is what Phase 6's process manager exists to finish.
 
+**Phase 6's build step was verified end-to-end on 2026-09-26, against a fresh `tauri build`.** The flow
+is `pnpm tauri build` (bundles the default-features `aiproviderd`, which links WebKit) followed by
+`pnpm build:headless` — `scripts/substitute-tauri-free-aiproviderd.sh`: build
+`cargo build --no-default-features --release --bin aiproviderd`, otool-verify it links no
+WebKit/wry/gtk, snapshot it, build the default-features target for contrast, then copy the snapshot
+into `Contents/MacOS/`. Measured against the fresh bundle: Tauri-free match count **0**, default-features
+match count **1** (the contrast D56 demanded — the instrument reports *presence*), post-substitution
+match count **0**. The substituted binary was then run directly from the bundle with `mint`: it rotated
+the master key and wrote it to `~/Library/Application Support/dev.aiprovider.router/.secrets.json`
+—the file vault the OS keychain was replaced with on 2026-09-26. The durable guard remains
+`scripts/check-bundled-aiproviderd-links.sh`, wired into `release.yml` between the tauri-action step and
+the signature verification, so a `tauri build` that overwrites the bundle with the WebKit-linked binary
+reddens the release before a draft is published.
+
 **The two recall paths differ on exactly one axis, and it reads as a bug.** Gateway recall is scoped and
 excludes unscoped atoms; Assistant recall passes `None`. Every atom is born unscoped, so gateway recall returns
 nothing until a human binds scope. Measured live corpus: **0 versus 14**. The asymmetry is deliberate and the
@@ -319,7 +333,11 @@ sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provide
   "SELECT COUNT(*) FROM pragma_table_info('ledger') WHERE name='cached_tokens';"   # expect 1
 cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings  # expect clean
 cargo build --manifest-path apps/desktop/src-tauri/Cargo.toml --bin aiproviderd --release --no-default-features
-cargo tree  --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --edges all | grep -ci 'webkit|wry|gtk'  # expect 0
+# D56 retired the BRE `grep -ci 'webkit|wry|gtk'` (returned 0 on any input). The ERE form is the instrument:
+cargo tree  --manifest-path apps/desktop/src-tauri/Cargo.toml --no-default-features --edges all | grep -ciE 'WebKit|wry|gtk'  # expect 0
+# After every `pnpm tauri build`, the post-bundle substitution and its gate:
+bash scripts/substitute-tauri-free-aiproviderd.sh   # expect "OK — bundled aiproviderd is Tauri-free"
+bash scripts/check-bundled-aiproviderd-links.sh     # expect "PASS: bundled aiproviderd links no WebKit/wry/gtk."
 ```
 
 Counts in this chapter came from the tree, not from other docs — the documented test counts had drifted twice

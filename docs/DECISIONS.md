@@ -986,3 +986,29 @@ validating the configured id against `/v1/models`, which advertises qualified id
   `gateway_worker_error` are deleted.
 - **Revisit if:** a real performance bottleneck appears that HTTP cannot serve — unlikely on
   localhost.
+
+## 2026-09-26 — OS keychain abandoned; secrets live in a file-backed store
+
+- **Decision:** `vault.rs` is rewritten from `keyring::Entry` to a JSON file at
+  `<data_dir>/.secrets.json` (mode 600, atomic tmp+rename write, `OnceLock` process cache).
+  `keyring` is removed from `Cargo.toml`. `aiproviderd` gains subcommands: `install`, `uninstall`,
+  `status`, `self-install`, `mint` (rotate the master key without opening the UI). `tauri/app.rs`
+  and `aiproviderd.rs` both call `vault::set_data_dir` before the first `get`/`put`.
+- **Options considered:**
+  1. Keep keychain, one-time "Always Allow" per signing identity (rejected — every `tauri dev`
+     and `cargo build` produces a new ad-hoc identity, so every rebuild re-triggers the prompt).
+  2. Environment-based secrets file at a fixed path (rejected — couples the service to a path
+     the user must know; the data-dir resolution already lives in both binaries).
+  3. **File-backed vault in the data directory** (chosen): same path the service and app
+     already resolve for SQLite; no OS prompt; `keyring` out of the dependency graph; a 600-mode
+     file is at least as strong as the OS keychain for a single-user desktop.
+- **Rationale:** the keychain was the single most-annoying operational cost of the project —
+  every rebuild forced a re-approval, and the headless service (which must run unattended under
+  launchd) cannot interact with a prompt at all. The file store is mode 600, machine-local, and
+  written atomically; `key-leak-grep` in CI still guards that no secret ever reaches the webview.
+- **Consequence:** existing keychain entries are orphaned — the first launch after this change
+  answers `401 no master key configured` until `aiproviderd mint` (or the UI's mint flow) writes
+  a new key. This is a one-time migration, recorded in the 1.1.0 changelog.
+- **Revisit if:** a second user on the same machine needs different keys, or the data directory
+  becomes network-synced (iCloud Drive, sync tools) — either moves the threat model and a
+  machine-key-encrypted store is worth the one-time cost.
