@@ -20,6 +20,9 @@ import {
 } from "../components/atoms";
 import { TrailWriteWarning } from "../components/TrailWriteWarning";
 import { verdictNotice } from "../lib/keys/verdict";
+import {
+  authHeaderFor, buildManualManifest, type ManualDialect,
+} from "../lib/providers/manual-manifest";
 import { clock, dayKey } from "../lib/memory/timeline";
 
 const KNOWN = Object.keys(PROVIDER_PROFILES); // openrouter | opencode | b.ai
@@ -247,46 +250,17 @@ function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: ()
   const [manualAuthPrefix, setManualAuthPrefix] = useState("Bearer");
   const [manualDialect, setManualDialect] = useState("openai-chat-v1");
 
+  // Derives from the builtin template for the chosen dialect. The hand-written body this replaces
+  // had drifted from it in four ways at once — no `responseMap.toolCalls`, no
+  // `stream.chunkMap.toolCalls`, no `stream.toolCallStream`, and a dialect label that did not
+  // change the paths — so every custom provider silently dropped tool calls and an Anthropic one
+  // was wired to OpenAI paths. See `lib/providers/manual-manifest.ts`.
   function buildManifest(): AdapterManifest {
-    const authHeader = manualAuth === "x-api-key"
-      ? { name: "x-api-key" }
-      : manualAuth === "custom"
-        ? { name: manualAuthHeader, prefix: manualAuthPrefix || undefined }
-        : { name: "Authorization", prefix: "Bearer" };
-
-    return {
-      manifestVersion: 1,
-      kind: "declarative",
-      dialect: manualDialect,
-      provider: { baseUrl: manualUrl.trim(), auth: { headers: [authHeader] } },
-      endpoints: {
-        listModels: { method: "GET", path: "/models", map: { models: "$.data[*].id", raw: "$.data[*]" } },
-        generateText: {
-          method: "POST",
-          path: "/chat/completions",
-          requestTemplate: {
-            model: "{{model}}",
-            messages: "{{messages}}",
-            stream: "{{stream}}",
-            max_tokens: "{{maxTokens?}}",
-            temperature: "{{temperature?}}",
-            tools: "{{tools?}}",
-            tool_choice: "{{toolChoice?}}",
-            response_format: "{{responseFormat?}}",
-          },
-          responseMap: { text: "$.choices[0].message.content", usage: "$.usage" },
-          stream: {
-            protocol: "sse",
-            chunkMap: { delta: "$.choices[0].delta.content" },
-            errorMap: { "$.error": "PASS_THROUGH" },
-            finish: "$.choices[0].finish_reason",
-            requestUsage: true,
-          },
-        },
-      },
-      capabilities: { text: true, image: false },
-      provenance: { origin: "user-edited", generatorModel: null, createdAt: new Date().toISOString() },
-    };
+    return buildManualManifest({
+      url: manualUrl.trim(),
+      dialect: manualDialect as ManualDialect,
+      authHeader: authHeaderFor(manualAuth, manualAuthHeader, manualAuthPrefix),
+    });
   }
 
   const manualValid =

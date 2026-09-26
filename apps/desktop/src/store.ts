@@ -592,7 +592,12 @@ export async function addProvider(input: {
     await fetchAdmin("POST", "/admin/providers", providerToHost(p));
     adapters.register(p.id, input.manifest);
     await fetchAdmin("POST", "/admin/manifests", {
-      id: crypto.randomUUID(), providerId: p.id, version: 1, origin: "builtin-template",
+      id: crypto.randomUUID(), providerId: p.id, version: 1,
+      // The manifest's OWN provenance, not a constant. Hardcoded `"builtin-template"` here made
+      // every hand-added provider's row claim it came from a builtin template while its body said
+      // `user-edited` — measured 2026-09-26, both spellings on one row. The row is what the drift
+      // register and the history view read, so the lie was the durable half.
+      origin: input.manifest.provenance.origin,
       bodyJson: JSON.stringify(input.manifest), contractResultJson: null, createdAt: Date.now(), isActive: true,
     });
     return p;
