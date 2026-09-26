@@ -107,7 +107,13 @@ async function sendAdmin(
     init.body = JSON.stringify(body);
   }
   const res = await fetch(url, init);
-  if (res.status === 401 && mayRetry) {
+  // **A 429 belongs here too, and the reason is easy to miss.** The brute-force backoff is checked
+  // *after* the key (`core/gateway.rs`: a match returns before `auth_allowed` is consulted), so a
+  // valid credential never sees it. A 429 therefore means the credential was *still* bad — and the
+  // stale key tripped that very backoff, by polling. Re-minting yields a key the server matches
+  // before it reads the failures map, so the retry succeeds at once and clears the map on the way
+  // through. Without this, the app locks itself out of its own gateway for the backoff window.
+  if ((res.status === 401 || res.status === 429) && mayRetry) {
     clearUiSession();
     return sendAdmin(method, path, body, false);
   }

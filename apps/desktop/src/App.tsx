@@ -20,6 +20,7 @@ import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
 import { ControlScreen } from "./screens/Control";
 import { OnboardingScreen } from "./screens/Onboarding";
+import { bootFailureHint } from "./lib/boot-failure";
 
 export default function App() {
   const screen = useUi((s) => s.screen);
@@ -69,8 +70,11 @@ export default function App() {
         <div className="max-w-md rounded-md border p-6" style={{ background: "var(--surface)", borderColor: "var(--danger)" }}>
           <h1 className="mb-2 text-[16px] font-semibold" style={{ color: "var(--danger)" }}>App data could not be opened</h1>
           <p className="mono text-[12px]" style={{ color: "var(--text-dim)" }}>{bootError}</p>
+          {/* The advice is *chosen from the error*, not asserted over it — see lib/boot-failure.ts.
+              This used to prescribe the most destructive remedy the app has (restore a backup) for
+              every cause, including a 429 that clears by itself. */}
           <p className="mt-3 text-[12px]" style={{ color: "var(--text-faint)" }}>
-            If the database is corrupt, restore from the newest dated backup (§4) — backups live next to the database file.
+            {bootFailureHint(bootError)}
           </p>
         </div>
       </div>

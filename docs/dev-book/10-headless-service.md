@@ -4390,6 +4390,35 @@ assert the retry's `Authorization` header **differs** from the first attempt's, 
 same stale key would satisfy a call count while fixing nothing; they were falsified by disabling the retry,
 which reddens exactly the two retry tests.
 
+### Increment 26ac — the retry that did not cover its own storm, and the advice it could not stop
+
+**The two symptoms.** `POST /admin/api-keys` answered `401 invalid gateway key`, and then, on the next
+boot, `GET /admin/api-keys` answered `429 too many failed auth attempts — backing off` while the boot
+screen displayed its unconditional *"restore from the newest dated backup"* line. Two defects, one root:
+the 429 is the brute-force window that 26ab's stale key *opened by polling*, and the advice is a
+destructive remedy asserted over a transient fault.
+
+**Why the 429 is a consequence of the 401, not an independent fault.** The backoff is consulted *after*
+the key match (`core/gateway.rs:1487`), so a valid credential never reaches it — `r4_valid_key_not_throttled_
+by_another_callers_failures` pins that a matched key returns 200 inside an open window and clears the map
+on the way through. A 429 therefore means the credential was *still* bad. 26ab re-minted on a 401 but
+not on a 429, so the first poll after the re-mint presented the *new* key, the server matched it and
+cleared the window — but only if the retry was triggered by the *first* 429, not by a subsequent one.
+Without the 429 in the retry condition, the app locked itself out of its own gateway for the backoff
+duration.
+
+**The boot screen's advice.** `App.tsx:73` appended *"If the database is corrupt, restore from the newest
+dated backup (§4)"* to every `bootError`, including a 429 that clears in ~32 s. An operator who followed
+it for a rate limit would have destroyed their store to fix a transient. `bootFailureHint` in
+`boot-failure.ts` replaces the sentence with a choice made from the error string: 429 → "reload, the
+backoff clears by itself"; 401 → "reload mints a fresh credential"; 5xx → "check the log"; no listener →
+"the gateway did not answer"; unknown → the backup advice, now hedged ("the only thing the host reported").
+
+**Tests and falsification.** Two new tests in `gateway-client.test.ts`: a 429 re-mints and the retry's
+`Authorization` header differs; a second 429 is not retried. Five tests in `boot-failure.test.ts`, one
+per branch plus the hedged fallback. The 429 branch was falsified by removing it from the condition: both
+429 tests reddened, the 401 and 500 tests stayed green. D65 records both defects.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is

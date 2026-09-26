@@ -55,6 +55,13 @@ beforeEach(() => {
 
 const unauthorized = () =>
   new Response(JSON.stringify({ error: { code: "invalid_api_key" } }), { status: 401 });
+const tooMany = () =>
+  new Response(
+    JSON.stringify({
+      error: { code: null, message: "too many failed auth attempts — backing off", type: "rate_limit" },
+    }),
+    { status: 429 },
+  );
 const ok = (body: unknown) =>
   new Response(JSON.stringify(body), {
     status: 200,
@@ -88,6 +95,28 @@ test("a non-401 failure is not retried at all", async () => {
   await expect(fetchAdmin("GET", "/admin/providers")).rejects.toThrow(/500/);
 
   expect(seen).toHaveLength(1);
+});
+
+test("a 429 (the backoff window a stale key tripped) re-mints and the retry succeeds", async () => {
+  // The live symptom: the stale key's own polling opened the brute-force window, so the
+  // re-minted call first meets a 429, not a 200. The property the Rust test pins — a
+  // *matched* key returns before the backoff is consulted — is what makes the second attempt
+  // succeed at once.
+  respond = (n) => (n === 1 ? tooMany() : ok({ providers: [] }));
+
+  await expect(fetchAdmin("GET", "/admin/providers")).resolves.toEqual({ providers: [] });
+
+  expect(seen).toHaveLength(2);
+  expect(seen[0]).not.toBe(seen[1]);
+  expect(seen[1]).toBe(`Bearer ui-session-secret-2`);
+});
+
+test("a second 429 is not retried — re-minting against a real lockout would extend it", async () => {
+  respond = () => tooMany();
+
+  await expect(fetchAdmin("GET", "/admin/providers")).rejects.toThrow(/429/);
+
+  expect(seen).toHaveLength(2);
 });
 
 test("a successful call mints once and never retries", async () => {
