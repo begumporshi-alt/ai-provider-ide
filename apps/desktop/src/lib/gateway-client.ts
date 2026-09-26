@@ -73,6 +73,27 @@ export async function fetchAdmin(
   path: string,
   body?: unknown,
 ): Promise<unknown> {
+  return sendAdmin(method, path, body, true);
+}
+
+/**
+ * **The 401 retry is the handover's missing half.** `gateway_disable` revokes the UI's session
+ * credential host-side — D51, so a token cannot outlive the gateway it was minted for — and the
+ * Start handover calls it. Bringing the service up therefore revokes the very credential the
+ * webview is holding: `uiSessionKey()` caches in a `let` and never re-invokes, so every `/admin/*`
+ * call afterwards presented a secret whose `gateway_keys` row had just been deleted, and the agent
+ * answered `401 invalid gateway key` — for a credential this app had thrown away itself.
+ *
+ * Dropping the cache and retrying once re-mints against the *new* listener, which is the whole
+ * recovery. Once, and not in a loop: a second 401 is a real refusal, and re-minting against it
+ * would dress a refusal up as a retry.
+ */
+async function sendAdmin(
+  method: string,
+  path: string,
+  body: unknown,
+  mayRetry: boolean,
+): Promise<unknown> {
   const [base, key] = await Promise.all([gatewayBaseUrl(), uiSessionKey()]);
   const url = `${base}${path}`;
   const init: RequestInit = {
@@ -86,6 +107,10 @@ export async function fetchAdmin(
     init.body = JSON.stringify(body);
   }
   const res = await fetch(url, init);
+  if (res.status === 401 && mayRetry) {
+    clearUiSession();
+    return sendAdmin(method, path, body, false);
+  }
   if (!res.ok) {
     const text = await res.text().catch(() => res.statusText);
     throw new Error(`${method} ${path} → ${res.status}: ${text}`);

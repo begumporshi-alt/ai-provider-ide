@@ -4363,6 +4363,33 @@ operator nothing about the one cause it actually has. Mapping status 5 to the li
 the job; this needs a logged-in desktop session" — while keeping the raw text is a small, well-understood
 follow-up.
 
+### Increment 26ab — the handover revoked the UI's credential, and nothing minted it back
+
+**The symptom, and the four measurements that located it.** After a successful Start, every admin call from
+the app answered `401 {"code":"invalid_api_key","message":"invalid gateway key"}`. The chain, each step measured
+rather than inferred: the listener on the port was **`aiproviderd`**, not the app (`lsof`); the secrets file held
+`masterkey` and two `key:` entries but **no `key:ak-ui`**; `gateway_keys` held **only the operator's own key**;
+and `gateway_disable` calls `ui_session::revoke` (`gateway_cmds.rs:296`) — which the handover invokes.
+
+**The mechanism.** `uiSessionKey()` caches the credential in a module-level `let` and returns it for the life of
+the webview, and `clearUiSession()` — whose own comment reads *"Called on gateway stop so the next start mints a
+fresh one"* — **had no call sites at all**. So the credential was revoked host-side, correctly and by design
+(D51), while the client went on presenting it. The revoke was never wrong; the re-mint was never wired.
+
+**Why 26y is what exposed it.** `gateway_disable` was reachable before only by the operator deliberately
+switching the Gateway off — a rare act, followed by a switch back on that the operator would also read as a
+fresh start. 26y made it the **first half of one button press**, so the ordinary act of bringing the service up
+began silently invalidating the UI's own credential. This is D64, and it is D63's mirror image: D63 was a
+compensating step with no compensation, this is a teardown step whose paired setup was never wired.
+
+**The fix, and its boundary.** `fetchAdmin` retries **once** on a 401 after dropping the cached credential, so
+the recovery is to re-mint against whichever process now holds the port — the app's own listener or the agent,
+which is the point of `ak-ui` being an ordinary app key. Not a loop: a second 401 is a real refusal, and
+re-minting against it would dress a refusal up as a retry. A non-401 failure is not retried at all. The tests
+assert the retry's `Authorization` header **differs** from the first attempt's, because a retry that re-sent the
+same stale key would satisfy a call count while fixing nothing; they were falsified by disabling the retry,
+which reddens exactly the two retry tests.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
