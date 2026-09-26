@@ -22,6 +22,15 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   window instead of being silently dropped forever. Applies to both the `aiproviderd` gateway and
   the in-app Assistant. See `DECISIONS.md` 2026-09-27.
 
+### Fixed
+
+- **Adding a key could strand its secret in the vault with no row to reach it.** `addKey` writes the
+  secret to the keychain and *then* records the `api_keys` row; when the row insert failed — a 500
+  from the provider foreign key, a dead gateway, a 401 — the secret was left behind. It was invisible
+  to the keys list, which reads `api_keys`, and so could be neither selected nor revoked anywhere in
+  the UI. The secret is now deleted again when the row does not land, matching the rollback the host's
+  `key_create_h` and `addProvider` already performed. See `DECISIONS.md` 2026-09-27.
+
 ## [1.2.0] - 2026-09-26
 
 ### Changed

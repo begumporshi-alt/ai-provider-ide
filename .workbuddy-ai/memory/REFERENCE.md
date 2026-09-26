@@ -5370,4 +5370,40 @@ inside the package and reached through `store.ts`'s `router` facade. **Search fo
   write a hedge, expect it to be read as a claim — so either measure it or say explicitly what would
   make it false.
 
+## Moved out of `MEMORY.md` — 2026-09-27 (increment 31)
+
+- **`memory_enabled` is in-memory only**, and `Disabled` outranks `WriteOnly`; check the Memory screen,
+  not HTTP. (Moved out of the Auth/install group, where it did not belong.)
+- **A breaker is never a wait**: `key_retry_at` answers `None` for `KeyBlock::Breaker` and for a denied
+  status, because the window is minutes against a request's seconds — so fail-over is still right.
+
+### The `addKey` vault ghost
+
+`store.ts:632` `addKey` writes the secret to the vault (inside `registry.addKey`) and *then* records the
+`api_keys` row. `sendAdmin` (`lib/gateway-client.ts:120`) throws on any non-2xx, and until increment 31
+nothing undid the vault write — leaving a `key:<uuid>` entry that no row names, unreachable from the
+keys list (which reads `api_keys`), hence unrevokable. The invariant was stated in two comments
+(`gateway_admin.rs:321`, `tauri/gateway_cmds.rs:340`) and enforced at three of four sites:
+`addProvider` — eleven lines above `addKey` — had the guard, and `addKey` did not.
+
+Reachable because `api_keys.provider_id` is a real FK with `PRAGMA foreign_keys = ON` (`store.rs:517`),
+and `registry.addProvider` (`provider-registry.ts:22`) is **in-memory only** — a draft provider can
+exist in the registry and not in the host, so the insert can legitimately 500.
+
+The fix mirrors the host: on a failed row insert, `registry.deleteKey(k.id)` removes the vault entry
+**and** the in-memory record, then the original error is re-thrown. The rollback is best-effort, like
+`let _ = vault::delete(...)` in Rust. Spec: `apps/desktop/src/store.add-key-rollback.test.ts`, three
+cases — rollback, no in-memory ghost, and a control that the secret survives a *successful* add.
+
+**Not covered:** a crash between the two writes still strands the secret; that needs a boot-time
+reconciliation sweep, deliberately not built (see `DECISIONS.md` 2026-09-27).
+
+**Diagnosing a ghost** (also triage skill §10): a `key:` account in `.secrets.json` with no `secret_ref`
+match in `api_keys` is a ghost. Confirm it is unused with
+`SELECT COUNT(*) FROM ledger WHERE key_id = '<uuid>'` — `ledger.key_id` holds the **bare uuid**, not the
+`key:` prefix. A 39-char `sk-aip-…` value is `generate_random_key()`'s exact format, i.e. a **gateway**
+credential pasted into the provider-key field — a leak, not a stale key. Remove by rewriting
+`.secrets.json` the way `vault::save` does (tmp → `chmod 600` → rename); every `vault::*` call runs
+`load()` first, so a running process re-reads and will not resurrect the entry.
+
 

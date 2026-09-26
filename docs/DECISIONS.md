@@ -1051,3 +1051,43 @@ validating the configured id against `/v1/models`, which advertises qualified id
 - **Revisit if:** the ledger shows `AUTH_FAILED` rows caused by re-probes (the window is too short),
   or a rotated credential takes longer than a minute to become usable (too long). Also revisit if the
   two implementations are ever unified — this entry exists partly because they are not.
+
+## 2026-09-27 — `addKey` rolls its secret back out of the vault when the row does not land
+
+- **The decision:** `addKey` (`apps/desktop/src/store.ts`) now deletes the keychain entry it has just
+  created if the `POST /admin/api-keys` that would have recorded the matching row fails.
+- **The defect this removes:** the function is a two-store write — `registry.addKey` stores the secret
+  under `key:<uuid>` first, and the row insert follows on the next line. `fetchAdmin` throws on any
+  non-2xx (`sendAdmin`), and nothing undid the vault write. The secret then sat in `.secrets.json`
+  with no `api_keys` row to reach it: the keys list reads `api_keys`, so the entry could be neither
+  seen nor revoked through any path in the app. The host's own `key_create_h` rolls back for exactly
+  this reason and says so (`core/gateway_admin.rs:359` — *"a secret with no row is an unrevokable
+  ghost"*), and `addProvider` — eleven lines above `addKey`, in the same file — already had the guard.
+  The invariant was written down twice and enforced in three of the four places that needed it.
+- **Observed, not hypothetical:** one such ghost was live in the developer's own vault
+  (`key:323d5158-…`, a 39-char `sk-aip-…` value matching `generate_random_key`'s format exactly). It
+  appeared in **no column of any of the 30 tables** and had **zero ledger rows**, so it had never been
+  used for a request. It has been removed: the vault went from 5 entries to 4, with the remaining four
+  verified byte-identical (sha256) to a pre-change backup, and a live request afterwards returned 200
+  and wrote ledger row 1622.
+- **Why it could fire in practice:** `api_keys.provider_id` is a real foreign key and
+  `PRAGMA foreign_keys = ON` (`store.rs:517`), so adding a key to a provider the host has not
+  persisted is a 500. `registry.addProvider` is **in-memory only**, so exactly that state is
+  reachable — a draft provider lives in the registry before anything writes it to the host.
+- **Options considered:**
+  1. Leave it. Rejected: the artifact is invisible, permanent, and a *credential*.
+  2. Reorder — insert the row first, then write the secret. Rejected: it trades one half of the
+     invariant for the other ("a row with no secret is a credential nobody holds"), and the host's
+     ordering is deliberate and documented.
+  3. **Mirror the host: roll the vault entry back on failure** (chosen). Consistent with
+     `key_create_h` and with `addProvider`, and it restores the in-memory registry too — the *second*
+     ghost the same failure left behind, and the one that outlived the error.
+- **Known limitation, deliberately not fixed here:** a crash *between* the vault write and the row
+  insert still strands the secret — no rollback runs if the process dies. Closing that needs a
+  reconciliation sweep at boot (enumerate `key:*` in the vault, delete any with no `api_keys` row),
+  which is a new mechanism with its own race against a concurrent add in the other process. Recorded
+  rather than built: the failure needs a crash inside a two-line window, and the sweep's failure mode
+  is deleting a secret mid-add.
+- **Revisit if:** a ghost is found in a vault this fix has been running against — which would mean a
+  creation path other than `addKey` (a direct `vault_put` from the webview, or the crash window
+  above).

@@ -628,11 +628,31 @@ export async function deleteProvider(id: string): Promise<void> {
   await refreshFromHost();
 }
 
-/** Add a key: vault write happens inside registry.addKey via the KeyVaultPort (one call). */
+/**
+ * Add a key: vault write happens inside registry.addKey via the KeyVaultPort (one call).
+ *
+ * **The vault write precedes the row insert, so this needs a rollback — and it did not have one.**
+ * `registry.addKey` stores the secret under `key:<id>` first; the `POST /admin/api-keys` that
+ * creates the matching row comes second and *throws* on any non-2xx (`sendAdmin`). When it threw,
+ * the secret stayed in the keychain with no row to reach it: the keys list reads `api_keys`, so the
+ * entry could be neither seen nor revoked through any path in the app — the "unrevokable ghost"
+ * the host's own `key_create_h` rollback exists to prevent, and the same guard `addProvider` eleven
+ * lines up already had. This is that guard, on the path that strands a *credential* rather than
+ * in-memory state.
+ *
+ * The rollback is best-effort, like the host's (`let _ = vault::delete(...)`): if the keychain
+ * refuses, the original error is still the one the operator needs. `registry.deleteKey` drops the
+ * vault entry **and** the in-memory record, so a failed add leaves nothing on either side.
+ */
 export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
   const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });
-  await fetchAdmin("POST", "/admin/api-keys", keyToHost(k));
+  try {
+    await fetchAdmin("POST", "/admin/api-keys", keyToHost(k));
+  } catch (e) {
+    await registry.deleteKey(k.id).catch(() => undefined);
+    throw e;
+  }
   // draft providers aren't host-allowlisted (invariant 3); the first key promotes to
   // pending so Test works immediately.
   if (provider?.status === "draft") await setProviderStatus(providerId, "pending");
