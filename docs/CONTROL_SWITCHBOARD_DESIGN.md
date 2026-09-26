@@ -164,6 +164,8 @@ The raw skip reasons are precise but opaque. Layer 1 translates them:
 | Raw (`SkipReason`) | Plain language |
 |---|---|
 | `no_candidates` | Nothing matched this question |
+| `no_store` | Memory had no store to search |
+| `recall_failed` | The memory search itself failed |
 | `principal_off` | Off for this app |
 | `client_off` | The app asked for no memory |
 | `disabled` | Memory is switched off |

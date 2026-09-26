@@ -23,7 +23,7 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tauri/tools.rs` |
 | Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |
-| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns. 0015 is live: 1530 rows, every one `cached_tokens IS NULL` by design. **0016 is in the source but not in the installed database** — measured 2026-09-23, the live DB sits at `schema_version` 15, so `ledger.app_key_id` does not exist there yet and attribution begins on the first launch after a rebuild |
+| Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns, **all live: measured 2026-09-26 the DB sits at `schema_version` 17**, `0016_ledger_app_key` was applied 2026-09-23 14:09:19, and `ledger.app_key_id` and `idx_ledger_app_key_ts` both exist. This cell used to read *"0016 is in the source but not in the installed database… the live DB sits at `schema_version` 15"* — true when measured, false from 14:09 on 2026-09-23, never revisited (D69). `cached_tokens` is no longer all-`NULL` either: **11 of 1574** rows carry one. **0 of 1574** carry an `app_key_id`, which is the honest state of attribution — the column exists and its writer has produced nothing yet |
 | Schema | 17 versions, count asserted, rewind-tested | `core/store.rs:1009-1013` |
 | Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; **`core/` no longer compiles Tauri at all** — `default = ["app"]` with both Tauri crates `optional` and every `tauri` mention behind `#[cfg(feature = "app")]`, so `cargo build --bin aiproviderd --no-default-features` drops `tauri`/`wry`/WebKitGTK from the graph entirely. `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Serves completions** via the Rust-native `RouterBridge` (Phase 4b; `HeadlessBridge` deleted 25f). Phase 6 closed 2026-09-26: the `.app` bundle's `Contents/MacOS/aiproviderd` is the Tauri-free binary, verified by `scripts/check-bundled-aiproviderd-links.sh` (an `otool -L` gate that counts WebKit/wry/gtk dylib matches; 0 = pass); run via `scripts/substitute-tauri-free-aiproviderd.sh` (`pnpm build:headless`) after every `tauri build`, since the bundler always overwrites it with the default-features (WebKit-linked) target | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1, Phase 6; CI steps "Substitute the Tauri-free aiproviderd into the bundle" and "Verify bundled aiproviderd links no WebKit" in `.github/workflows/release.yml`; D56–D57 record the null-instrument history |
 | Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
@@ -289,10 +289,20 @@ the master key and wrote it to `~/Library/Application Support/dev.aiprovider.rou
 the signature verification, so a `tauri build` that overwrites the bundle with the WebKit-linked binary
 reddens the release before a draft is published.
 
-**The two recall paths differ on exactly one axis, and it reads as a bug.** Gateway recall is scoped and
-excludes unscoped atoms; Assistant recall passes `None`. Every atom is born unscoped, so gateway recall returns
-nothing until a human binds scope. Measured live corpus: **0 versus 14**. The asymmetry is deliberate and the
-drain must not auto-bind — but a user comparing the two screens will reasonably conclude the gateway is broken.
+**The two recall paths differ on exactly one axis, it is deliberate, and this paragraph used to overstate what
+it costs.** Gateway recall is scoped and excludes unscoped atoms; Assistant recall passes `None`. The drain must
+not auto-bind. Three things in the original text were wrong, measured 2026-09-26 (D70). The corpus is **79**,
+not 14. The atoms are **not** unscoped — every row carries `scope_user='local'` (`memory.rs:739`: "`scope_user`
+is not assignable — this is a single-user desktop app and every row is `local`"), and `context_scope.rs:325`
+resolves an absent user to `"local"`, so **the user predicate always matches**. What no row has is a **project**
+or a **global** mark — `scope_project IS NOT NULL` → **0**, `scope_global = 1` → **0** — so both branches of the
+predicate (`memory.rs:487-510`) yield nothing and the split is **0 versus 79**. And the closing claim is
+**falsified by the code**: `Control.tsx:136-144` raises *"No fact is scoped, so none can ever be injected — All
+79 recorded facts are capture-only. Scope one in Memory."* whenever facts exist and none are injectable, with
+the hint *"none scoped — see below"* at `:887`; the Memory screen's `injectable` badge (`:751-757`) and its
+per-row *"Capture-only. Never injected into any request."* (`:536`) are older still. Those shipped in `8091721`
+(2026-09-22) and `c8a15ba` (2026-09-21) — both **before** this sentence was written in `ad8a794` (2026-09-23).
+The asymmetry is real; the claim that the operator cannot diagnose it was not.
 
 **Docs had drifted behind code in ten measured places.** All ten are closed and tracked in
 [07](07-drift-register.md). The durable fix is the register plus the change checklist, not a one-off sweep — and
@@ -316,7 +326,7 @@ mechanism nobody had built and described it wrongly, so they were deleted rather
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" pnpm ci:local          # the whole gate
 sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
-  "SELECT MAX(version) FROM schema_version;"          # expect 15
+  "SELECT MAX(version) FROM schema_version;"          # expect 17
 sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
   "SELECT COUNT(*) FROM pragma_table_info('ledger') WHERE name='cached_tokens';"   # expect 1
 cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings  # expect clean

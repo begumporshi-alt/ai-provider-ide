@@ -1238,7 +1238,11 @@ The TypeScript is this port's reference and cannot move, so the Rust-only names 
 its string `"no_candidates"` is written into the `aip-memory` response header (`apply_memory_headers:447`), so
 renaming the variant would have meant either a wire change or a name contradicting its own value. The rename
 is compiler-verified and behaviour-preserving: `cargo test` was **554/0 before and 554/0 after**, no test
-touched.
+touched. **The variant was later *split* rather than renamed** (2026-09-26, D71): `NoStore` (`"no_store"`) and
+`RecallFailed` (`"recall_failed"`) were added beside it, with `"no_candidates"` kept for the genuine empty
+result — so the wire value this paragraph protects is untouched and the header vocabulary only gains values.
+The split is the rule the enum's own `WriteOnly` doc states: two causes that send an operator to different
+places must not collapse into one reason.
 
 **Four properties the loop has to keep.**
 

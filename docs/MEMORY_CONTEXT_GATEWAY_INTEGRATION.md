@@ -301,8 +301,11 @@ that is invisible if the header only appears on success.
 An unparseable header value is dropped rather than propagated (`:431-436`) — the response has already
 been earned, and telemetry is not worth failing it for.
 
-**Skip reasons** (`context_scope.rs:380-390`): `disabled`, `principal_off`, `client_off`,
-`no_project`, `no_candidates`, `below_floor`, `deadline`, `injected`.
+**Skip reasons** (`context_scope.rs:385-397`): `disabled`, `principal_off`, `client_off`,
+`no_project`, `no_store`, `recall_failed`, `no_candidates`, `below_floor`, `deadline`, `injected`.
+`no_store` and `recall_failed` were split out of `no_candidates` on 2026-09-26 (D71): with the three
+collapsed, the Control screen reported a store that never opened — or a recall that threw — as
+"found no candidate facts", a claim about the operator's corpus rather than about the fault.
 
 ---
 
