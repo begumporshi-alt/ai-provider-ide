@@ -11,6 +11,40 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-09-26
+
+### Changed
+
+- **The OS keychain is gone. Secrets live in `<data_dir>/.secrets.json` (mode 600, atomic write).**
+  `keyring` was removed from the dependency graph. This is a **one-time migration**: existing
+  keychain entries are abandoned, not migrated. The first launch after this change answers
+  `401 no master key configured` until you run `aiproviderd mint` (or use the UI's mint flow)
+  to rotate a new key. Provider keys need one re-entry in the UI. See `DECISIONS.md` 2026-09-26.
+
+- **`aiproviderd` subcommands.** Five new subcommands let you manage the headless service
+  without opening the UI:
+  - `aiproviderd install` — copy the binary to `~/Library/Application Support/…/bin/`,
+    write the plist, `launchctl bootstrap`
+  - `aiproviderd uninstall` — `launchctl bootout` + remove the plist
+  - `aiproviderd status` — print the job's loaded/pid/health state
+  - `aiproviderd self-install` — copy the running binary to `/opt/homebrew/bin` or
+    `/usr/local/bin` (whichever exists)
+  - `aiproviderd mint` — rotate the master key and write it to `.secrets.json`;
+    prints the new key once (the old key stops working immediately)
+
+### Added
+
+- **Phase 6 — headless service end-to-end.** The `.app` bundle now ships the Tauri-free
+  `aiproviderd` (no WebKit linkage). `scripts/substitute-tauri-free-aiproviderd.sh`
+  (`pnpm build:headless`) is the post-bundle step; `scripts/check-bundled-aiproviderd-links.sh`
+  is the gate. Both CI mirrors (`ci.yml`, `ci-local.sh`) and `release.yml` run the two steps.
+
+- **`launchd_live` tests** (`#[ignore]`, Aqua session required). Test 1: `service::install`
+  produces a job launchd actually runs. Test 2: a real `aiproviderd` binary is installed as
+  the agent payload, `/health` is asserted live, and the app's probe-and-delegate decision
+  reads `Some(port)` against the agent's port. Run from Terminal.app after building the
+  Tauri-free binary.
+
 ## [1.1.0] - 2026-09-26
 
 ### Added
