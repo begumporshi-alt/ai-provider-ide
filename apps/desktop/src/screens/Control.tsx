@@ -59,6 +59,8 @@ import { useUi } from "../ui-state";
 const REASON: Record<string, string> = {
   injected: "Used",
   no_candidates: "Nothing matched this question",
+  no_store: "Memory had no store to search",
+  recall_failed: "The memory search itself failed",
   principal_off: "Off for this app",
   client_off: "The app asked for no memory",
   write_only: "The app asked to record only, not to be reminded",
@@ -111,6 +113,22 @@ function findings(d: ControlData): Finding[] {
   const total = d.injection?.total ?? 0;
   const injected = d.injection?.counts.injected ?? 0;
   const noCandidates = d.injection?.counts.no_candidates ?? 0;
+  const noStore = d.injection?.counts.no_store ?? 0;
+  const recallFailed = d.injection?.counts.recall_failed ?? 0;
+
+  // A search that *could not run* is not a search that found nothing. Both reasons used to be folded
+  // into `no_candidates`, so the warning below reported a failing recall — or a store that never
+  // opened — as a fact about the operator's corpus. "Blockers are things that *failed*"; these failed.
+  const searchFailed = noStore + recallFailed;
+  if (searchFailed > 0) {
+    out.push({
+      id: "memory-search-failed",
+      severity: "blocker",
+      tab: "memory",
+      title: "Memory could not be searched",
+      evidence: `${searchFailed} of ${total} requests never reached a result — ${noStore} with no store open, ${recallFailed} with recall failing.`,
+    });
+  }
 
   // Warnings are "off, with evidence it is wanted".
   if (d.memory === false && total > 0) {

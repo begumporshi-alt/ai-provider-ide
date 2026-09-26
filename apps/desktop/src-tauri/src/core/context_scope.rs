@@ -385,6 +385,15 @@ pub enum SkipReason {
     /// one had merely declined to be read back to.
     WriteOnly,
     NoProject,
+    /// The store is not open, so there was nothing to recall *from*. Distinct from `NoCandidates`,
+    /// which means the store answered and held nothing: collapsing the two let the Control screen
+    /// report a missing database as an empty corpus, because it counts `no_candidates` and renders
+    /// the total as "found no candidate facts".
+    NoStore,
+    /// The recall query itself failed. Distinct from `NoCandidates` for the same reason, and this
+    /// arm **keeps the error** — it used to discard it (`Err(_)`), so a real fault reached the
+    /// operator as a claim about their memory corpus.
+    RecallFailed,
     NoCandidates,
     BelowFloor,
     Deadline,
@@ -399,6 +408,8 @@ impl SkipReason {
             Self::ClientOff => "client_off",
             Self::WriteOnly => "write_only",
             Self::NoProject => "no_project",
+            Self::NoStore => "no_store",
+            Self::RecallFailed => "recall_failed",
             Self::NoCandidates => "no_candidates",
             Self::BelowFloor => "below_floor",
             Self::Deadline => "deadline",
@@ -572,7 +583,7 @@ pub fn inject_context_deadline(
     // Every step below is fallible and every failure degrades to "no memory block". Nothing on this
     // path may return an error to the client.
     let Some(store) = core.store() else {
-        return skip(SkipReason::NoCandidates);
+        return skip(SkipReason::NoStore);
     };
     // An unresolved project is not a reason to bail: `recall_scoped` already narrows that case to
     // pinned global rows. Bailing here would silently drop the hard constraints, which is the one
@@ -619,7 +630,17 @@ pub fn inject_context_deadline(
                 &rscope,
             ) {
                 Ok(r) => r,
-                Err(_) => return skip(SkipReason::NoCandidates),
+                Err(e) => {
+                    // A miss is logged, not silent — the rule the deadline arm above follows. This arm
+                    // used to discard the error (`Err(_)`), so a failing recall reached the operator as
+                    // `no_candidates`: a claim about their corpus rather than about this fault.
+                    tracing::warn!(
+                        scope = %scope_hdr,
+                        error = %e,
+                        "memory recall failed — dispatching without memory"
+                    );
+                    return skip(SkipReason::RecallFailed);
+                }
             };
 
             let mut candidates: Vec<MemoryItem> = rows
@@ -1529,6 +1550,72 @@ mod context_scope_tests {
         assert_eq!(body["messages"].as_array().unwrap().len(), 1, "no system message was added");
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D71: the three causes `NoCandidates` used to collapse must stay apart, because the Control
+    /// screen reports them to the operator differently — and it used to report all three as "found no
+    /// candidate facts", a claim about the corpus rather than about the fault.
+    ///
+    /// This is the *missing store* half, and it is reachable without a database because
+    /// `principal::allows` answers `true` when there is no store (`principal.rs:161`), so the mode
+    /// guard passes and the store check is what stops the path.
+    #[test]
+    fn a_missing_store_is_reported_as_no_store_not_an_empty_corpus() {
+        let core = core();
+        core.set_memory_enabled(true);
+        let mut body = json!({"model": "m", "messages": [
+            {"role": "user", "content": "what database does this project use"}
+        ]});
+        let out = inject_context(&core, &HeaderMap::new(), None, &mut body);
+        assert!(!out.injected);
+        assert_eq!(
+            out.reason,
+            SkipReason::NoStore,
+            "no store is a missing database, not a fact about the memory corpus"
+        );
+    }
+
+    /// D71, the other fault half: a recall that *fails* is not a recall that found nothing. The
+    /// instrument is the store's own connection (`store.rs:504`, `pub conn`), so this is real SQLite
+    /// failing a real query rather than a stubbed error — and dropping only the FTS index the recall
+    /// joins against leaves every other table intact, so the one thing changed is the one thing
+    /// under test.
+    #[test]
+    fn a_failing_recall_is_reported_as_recall_failed_not_an_empty_corpus() {
+        let dir = std::env::temp_dir().join(format!("aip-recall-failed-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let store = crate::core::store::Store::open(&dir).unwrap();
+        store.conn.lock().unwrap().execute_batch("DROP TABLE memories_fts;").unwrap();
+
+        let core = core().with_store(Arc::new(store));
+        core.set_memory_enabled(true);
+        let mut body = json!({"model": "m", "messages": [
+            {"role": "user", "content": "what database does this project use"}
+        ]});
+        let out = inject_context(&core, &HeaderMap::new(), None, &mut body);
+        assert!(!out.injected);
+        assert_eq!(
+            out.reason,
+            SkipReason::RecallFailed,
+            "a recall error is a fault, not a fact about the corpus"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// D71: the vocabulary is the contract the Control screen reads. Three causes, three tokens, and
+    /// `no_candidates` keeps the string the `aip-memory` header already carries — so the split adds
+    /// vocabulary rather than changing it, which is what let it land without a wire change.
+    #[test]
+    fn the_three_no_result_reasons_have_distinct_tokens() {
+        assert_eq!(
+            [
+                SkipReason::NoStore.as_str(),
+                SkipReason::RecallFailed.as_str(),
+                SkipReason::NoCandidates.as_str(),
+            ],
+            ["no_store", "recall_failed", "no_candidates"]
+        );
     }
 
     /// §3.4, on the request path: the same request must behave differently once the model's real

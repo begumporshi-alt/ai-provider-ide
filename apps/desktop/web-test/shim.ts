@@ -116,6 +116,32 @@ const serviceStatus = {
 };
 
 /**
+ * What `gateway_injection_stats` reports.
+ *
+ * Held here rather than returned inline so a spec can reach the two *fault* reasons — `no_store` and
+ * `recall_failed` — which a healthy harness cannot produce, and so it can assert that a genuine empty
+ * corpus (`no_candidates`) is reported differently from them. Those three collapsed into one string
+ * until 2026-09-26 (D71), so the difference was not expressible before this hook existed.
+ */
+const injectionStats = {
+  total: 1,
+  counts: { injected: 1 } as Record<string, number>,
+  recent: [
+    {
+      tsMs: 1758468000000,
+      id: "gw-1",
+      model: "agnes-3.0-flash",
+      scope: "user=local;project=-;agent=-",
+      injected: true,
+      items: 3,
+      context: 1,
+      tokens: 96,
+      reason: "injected",
+    },
+  ],
+};
+
+/**
  * The commands the login-item card issued, in the order the screen issued them.
  *
  * `gateway_disable` is in here alongside the four `service_*` verbs because it is the *first half*
@@ -613,6 +639,14 @@ let eventSeq = 0;
    */
   serviceStatus: (next: Partial<typeof serviceStatus>): void => {
     Object.assign(serviceStatus, next);
+  },
+  /**
+   * Set what `gateway_injection_stats` reports. The harness has no store to lose and no recall to
+   * fail, so the two fault reasons can only be reached by arranging them here — which is what makes
+   * "a fault is not an empty corpus" testable at all.
+   */
+  injectionStats: (next: Partial<typeof injectionStats>): void => {
+    Object.assign(injectionStats, next);
   },
   /** The service-card commands the screen has issued, oldest first. See `serviceCallLog`. */
   serviceCalls: (): string[] => [...serviceCallLog],
@@ -1624,27 +1658,11 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       // Read back rather than echo the argument, matching `memory_enabled_set_h`: an echo would
       // agree with itself even if the store had not taken.
       return memoryEnabled;
-    // Deliberately one populated row rather than an empty object: with `{}` a field-name mismatch
-    // between the Rust DTO and the screen would pass the browser sweep unnoticed. The keys mirror
-    // `injection_log::InjectionEvent` under `rename_all = "camelCase"`.
+    // The default above is deliberately one populated row rather than an empty object: with `{}` a
+    // field-name mismatch between the Rust DTO and the screen would pass the browser sweep unnoticed.
+    // The keys mirror `injection_log::InjectionEvent` under `rename_all = "camelCase"`.
     case "gateway_injection_stats":
-      return {
-        total: 1,
-        counts: { injected: 1 },
-        recent: [
-          {
-            tsMs: 1758468000000,
-            id: "gw-1",
-            model: "agnes-3.0-flash",
-            scope: "user=local;project=-;agent=-",
-            injected: true,
-            items: 3,
-            context: 1,
-            tokens: 96,
-            reason: "injected",
-          },
-        ],
-      };
+      return injectionStats;
     case "gateway_prune_memories":
       return { l0_expired: 0, l0_ring: 0, decayed: 0 };
     case "gateway_prune_live_context":
