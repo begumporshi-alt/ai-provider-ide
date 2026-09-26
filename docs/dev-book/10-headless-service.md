@@ -1107,15 +1107,15 @@ and here it releases at once. The worst case for a careless caller is therefore 
 enforced for one attempt — **fail-open, not fail-closed** — and `Option` being `#[must_use]` makes the
 careless call site a compiler warning too. `a_permit_that_is_never_bound_cannot_leak_capacity` pins it.
 
-**A finding about the TypeScript suite: its idempotence test does not test idempotence.** Recorded as
-[D18](07-drift-register.md). Deleting the `released` flag from `concurrency.ts:77-80` leaves
+**A finding about the TypeScript suite: its idempotence test did not test idempotence.** Recorded as
+[D18](07-drift-register.md), and **fixed 2026-09-26** — this paragraph is the before. Deleting the `released` flag from `concurrency.ts:77-80` used to leave
 `release is idempotent — a double release cannot leak capacity` **passing** — measured 2026-09-23, 1
 passed and 272 skipped. With a cap of 1 the count is already 0 and the entry already deleted after the
 first release, so the second and third calls take the "delete at zero" branch again and change nothing.
 The property only bites with **two** permits held, where a double release drops the count from 2 to 0
 while the other permit is still in flight and the limiter then admits two more. The Rust port keeps the
 weak test for fidelity, marks it as weak in place, and carries the property in
-`an_explicit_release_followed_by_drop_counts_once` — which is the one the falsification fires.
+`an_explicit_release_followed_by_drop_counts_once` — which is the one the falsification fires. **The TypeScript test now holds two permits and over-releases one of them**, so the same deletion reddens it with `expected +0 to be 1` and leaves the other 16 in that file green: the property is carried in both languages now, not one.
 
 **Preserved, for the loop port.** A skipped candidate is reported with class `RATE_LIMITED` and status
 `429` (`execution-engine.ts:85`, `:169`) even though the provider was never contacted and may be
