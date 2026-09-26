@@ -109,7 +109,10 @@ pub fn is_local(host: &str) -> bool {
     host.parse::<std::net::Ipv4Addr>().map(|ip| ip.octets()[0] == 127).unwrap_or(false)
 }
 
-#[derive(Debug, Deserialize)]
+/// Cloneable because a stalled attempt is re-sent: [`stream`] rebuilds the request for a
+/// second attempt, and taking `EgressRequest` by value in [`build`] means the retry needs its
+/// own copy rather than a borrow that outlives the first `send`.
+#[derive(Debug, Clone, Deserialize)]
 pub struct EgressRequest {
     pub url: String,
     pub method: String,
@@ -413,6 +416,55 @@ pub async fn fetch_image(
 /// a stream that keeps producing data is never cut off, however long it runs.
 const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// How long the upstream may take to produce **response headers** before the attempt is
+/// abandoned and retried.
+///
+/// **Split from [`UPSTREAM_IDLE_TIMEOUT`] because one constant was doing two jobs with
+/// contradictory requirements, and the retry is what lost.** `stream` bounded *both* the wait for
+/// headers and each wait for a chunk by `idle_timeout`, so the pre-headers phase inherited the
+/// 120s streaming budget. But the gateway's `FIRST_MSG_TIMEOUT` (`gateway.rs`) fails the request
+/// at **30s** and drops the slot, whose `Drop` calls `bridge.cancel` — so a pre-headers stall was
+/// aborted by the *gateway* 90s before this layer would have noticed it, and
+/// [`UPSTREAM_STALL_RETRIES`], written for exactly that stall, could never fire in production.
+///
+/// Measured 2026-09-26, on the build that had just added the retry: ledger row 1600,
+/// `CANCELLED` at 30 019ms, `tokens_out = 0`, log `bridge produced nothing for 30000ms` bound to
+/// `request_id=12` — and **no `connection stalled` line in any log**, which is the proof that the
+/// pre-headers bound below was never reached.
+///
+/// **The invariant is that `(UPSTREAM_STALL_RETRIES + 1) x` this must stay under the gateway's
+/// first-message bound**, or the retry becomes unreachable again. 10s x 2 = 20s leaves 10s of
+/// headroom inside the 30s gateway budget. `the_stall_budget_fits_inside_the_gateway_bound` pins
+/// that; raising either number without re-checking the other reintroduces the defect.
+///
+/// 10s is also ~5x the expected header latency: an OpenAI-compatible SSE endpoint sends `200` +
+/// `text/event-stream` as soon as it accepts, before prompt processing, so headers normally
+/// arrive in well under a second. **That expectation is an assumption, not a measurement** — the
+/// ledger records no time-to-first-byte, which is why `Slot::recv` now logs it. If headers turn
+/// out to legitimately take longer, raise this *and* the gateway bound together, never this alone.
+const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How many *extra* attempts a **pre-output** stall gets.
+///
+/// The bound is one, and the reason it is safe is narrower than "retrying is usually fine": a
+/// stall in the header phase has written **nothing** to the sink — no `Headers`, no `Line`, no
+/// `Error` — so the consumer cannot have seen output it would then receive twice. A stall that
+/// happens *after* headers is deliberately **not** retried, because the sink already carries a
+/// status the consumer has read and a second attempt would replay it; that case is reported
+/// instead. Retries never apply to a refusal either — [`EgressError::is_policy_refusal`] is
+/// decided before anything is dialled, so a denied host is denied once.
+///
+/// What this buys: an intermittent upstream stall stops being a lost turn. Measured on
+/// 2026-09-26, two turns were lost to an upstream that went silent past the idle timeout with
+/// one provider and one key configured — so failover had nowhere to go, and the turn ended.
+/// A second attempt on a fresh request is the difference between that and a slow success.
+///
+/// The cost is bounded and stated: a genuine stall now costs at most
+/// `(UPSTREAM_STALL_RETRIES + 1) x UPSTREAM_IDLE_TIMEOUT` before it is reported, rather than
+/// `1 x`. Nothing else about the request changes — the retry re-runs the same allowlist and
+/// secret-host checks through [`build`], so it cannot reach a host the first attempt could not.
+const UPSTREAM_STALL_RETRIES: usize = 1;
+
 /// Drive one streaming request and push its events into `sink`.
 ///
 /// **The sink is an `mpsc` sender rather than a `tauri::ipc::Channel`, and that is what makes this
@@ -442,85 +494,123 @@ pub async fn stream(
     // "ended before reporting response headers". Measured 2026-09-24, found while giving the
     // refusal its own class (D46); the module comment above `egress_port`'s `None` arm claimed that
     // path was unreachable, and it was reachable for exactly this case.
-    let b = match build(state, req).await {
-        Ok(b) => b,
-        Err(e) => {
-            let _ = sink.send(StreamEvent::from_egress_error(&e));
-            return Err(e);
-        }
-    };
-    // Bounded the same way as the chunks below: headers are progress too, and a server that
-    // completes the handshake and then never answers is indistinguishable from a stall.
-    let sent = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, b.send()).await;
-    match sent {
-        Ok(Ok(res)) => {
-            let status = res.status().as_u16();
-            let headers = res
-                .headers()
-                .iter()
-                .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
-                .collect();
-            if sink.send(StreamEvent::Headers { status, headers }).is_err() {
-                return Ok(()); // consumer gone; provider stream drops => cancelled
+    // Retried, unlike the streaming phase below — see `UPSTREAM_STALL_RETRIES`, where the
+    // asymmetry is the safety argument rather than an oversight. `req` is cloned per attempt
+    // because `build` consumes it and the next attempt needs the same allowlist and
+    // secret-host checks to run again from the same inputs.
+    let mut attempt = 0usize;
+    loop {
+        let b = match build(state, req.clone()).await {
+            Ok(b) => b,
+            Err(e) => {
+                let _ = sink.send(StreamEvent::from_egress_error(&e));
+                return Err(e);
             }
-            if status >= 400 {
-                let body = res.text().await.unwrap_or_default();
-                let _ = sink.send(StreamEvent::error(format!(
-                    "http {status}: {}",
-                    body.chars().take(2000).collect::<String>()
-                )));
-                return Ok(());
-            }
-            let mut stream = res.bytes_stream();
-            let mut buf = String::new();
-            loop {
-                // Each wait for the next chunk is bounded, not the stream as a whole: a
-                // provider that keeps sending is never cut off, however long it runs.
-                let next = tokio::time::timeout(UPSTREAM_IDLE_TIMEOUT, stream.next()).await;
-                let chunk = match next {
-                    Ok(Some(c)) => c,
-                    Ok(None) => break, // upstream closed the stream
-                    Err(_) => {
-                        let _ = sink.send(StreamEvent::error(format!(
-                            "upstream went silent for {}s — abandoning the stream",
-                            UPSTREAM_IDLE_TIMEOUT.as_secs()
-                        )));
-                        return Ok(());
-                    }
-                };
-                match chunk {
-                    Ok(bytes) => {
-                        buf.push_str(&String::from_utf8_lossy(&bytes));
-                        while let Some(pos) = buf.find('\n') {
-                            let line = buf[..pos].trim_end_matches('\r').to_string();
-                            buf.drain(..=pos);
-                            if sink.send(StreamEvent::Line { text: line }).is_err() {
-                                return Ok(()); // mid-stream disconnect -> cancel upstream
+        };
+        // Bounded the same way as the chunks below: headers are progress too, and a server that
+        // completes the handshake and then never answers is indistinguishable from a stall.
+        // **The pre-headers wait is bounded by `header_timeout`, not `idle_timeout`.** Using the
+        // streaming budget here is what made `UPSTREAM_STALL_RETRIES` unreachable: 120s of silence
+        // before a retry could even be considered, against a gateway that gives up at 30s. See
+        // `UPSTREAM_HEADER_TIMEOUT` for the measurement and for the invariant that keeps the two
+        // bounds ordered.
+        let sent = tokio::time::timeout(state.header_timeout, b.send()).await;
+        match sent {
+            Ok(Ok(res)) => {
+                let status = res.status().as_u16();
+                let headers = res
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                if sink.send(StreamEvent::Headers { status, headers }).is_err() {
+                    return Ok(()); // consumer gone; provider stream drops => cancelled
+                }
+                if status >= 400 {
+                    let body = res.text().await.unwrap_or_default();
+                    let _ = sink.send(StreamEvent::error(format!(
+                        "http {status}: {}",
+                        body.chars().take(2000).collect::<String>()
+                    )));
+                    return Ok(());
+                }
+                let mut stream = res.bytes_stream();
+                let mut buf = String::new();
+                loop {
+                    // Each wait for the next chunk is bounded, not the stream as a whole: a
+                    // provider that keeps sending is never cut off, however long it runs.
+                    let next = tokio::time::timeout(state.idle_timeout, stream.next()).await;
+                    let chunk = match next {
+                        Ok(Some(c)) => c,
+                        Ok(None) => break, // upstream closed the stream
+                        Err(_) => {
+                            // Not retried: `Headers` is already on the sink and the consumer has
+                            // read a status off it, so a second attempt would replay it. The
+                            // trace is the point — this stall left no line in any log before.
+                            tracing::warn!(
+                                idle_secs = state.idle_timeout.as_secs(),
+                                "upstream went silent mid-stream — abandoning the request",
+                            );
+                            let _ = sink.send(StreamEvent::error(format!(
+                                "upstream went silent for {}s — abandoning the stream",
+                                state.idle_timeout.as_secs()
+                            )));
+                            return Ok(());
+                        }
+                    };
+                    match chunk {
+                        Ok(bytes) => {
+                            buf.push_str(&String::from_utf8_lossy(&bytes));
+                            while let Some(pos) = buf.find('\n') {
+                                let line = buf[..pos].trim_end_matches('\r').to_string();
+                                buf.drain(..=pos);
+                                if sink.send(StreamEvent::Line { text: line }).is_err() {
+                                    return Ok(()); // mid-stream disconnect -> cancel upstream
+                                }
                             }
                         }
-                    }
-                    Err(e) => {
-                        let _ = sink.send(StreamEvent::error(e.to_string()));
-                        return Ok(());
+                        Err(e) => {
+                            let _ = sink.send(StreamEvent::error(e.to_string()));
+                            return Ok(());
+                        }
                     }
                 }
+                if !buf.trim().is_empty() {
+                    let _ = sink.send(StreamEvent::Line { text: buf.trim().to_string() });
+                }
+                let _ = sink.send(StreamEvent::Done);
+                return Ok(());
             }
-            if !buf.trim().is_empty() {
-                let _ = sink.send(StreamEvent::Line { text: buf.trim().to_string() });
+            Ok(Err(e)) => {
+                let _ = sink.send(StreamEvent::error(e.to_string()));
+                return Err(e.into());
             }
-            let _ = sink.send(StreamEvent::Done);
-            Ok(())
-        }
-        Ok(Err(e)) => {
-            let _ = sink.send(StreamEvent::error(e.to_string()));
-            Err(e.into())
-        }
-        Err(_) => {
-            let _ = sink.send(StreamEvent::error(format!(
-                "upstream sent no response headers for {}s — abandoning the request",
-                UPSTREAM_IDLE_TIMEOUT.as_secs()
-            )));
-            Ok(())
+            Err(_) => {
+                attempt += 1;
+                // The only trace a pre-output stall leaves anywhere. Without it the failure
+                // reached the ledger as a bare `NETWORK` and no line in any log, which is what
+                // made 2026-09-26's two lost turns take a database query to explain.
+                //
+                // Counted, not subtracted: `attempt` can exceed the budget on the way out, and
+                // `panic = "abort"` makes an underflowing `usize` a dead daemon rather than a
+                // bad number in a log line.
+                tracing::warn!(
+                    attempt = attempt as u64,
+                    max_attempts = (UPSTREAM_STALL_RETRIES + 1) as u64,
+                    // The *header* budget, which is the one this arm actually waited out. Reporting
+                    // `idle_timeout` here named a number 12x the one that expired, so the line
+                    // misdescribed its own cause.
+                    header_secs = state.header_timeout.as_secs(),
+                    "upstream sent no response headers — connection stalled",
+                );
+                if attempt > UPSTREAM_STALL_RETRIES {
+                    let _ = sink.send(StreamEvent::error(format!(
+                        "upstream sent no response headers for {}s — abandoning the request",
+                        state.header_timeout.as_secs()
+                    )));
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -555,10 +645,39 @@ pub struct EgressState {
     /// that returns an `imageUrl` on a CDN host the allowlist has never seen may have
     /// THAT host fetched back — scoped, expiring, never persisted to the allowlist.
     returned_hosts: RwLock<HashMap<String, Instant>>,
+    /// How long an upstream may stay silent before the request is abandoned.
+    ///
+    /// **A field rather than the constant read directly in [`stream`], so a test can shrink it.**
+    /// Proving that a pre-output stall is retried — and that a post-headers one is not — needs
+    /// two abandonment cycles, which at the production budget is a four-minute test and would
+    /// never be run. It defaults to [`UPSTREAM_IDLE_TIMEOUT`] and is not read from configuration:
+    /// nothing in the UI exposes a silence budget today, and inventing one to make this settable
+    /// would be a feature, not a seam.
+    idle_timeout: Duration,
+    /// How long the upstream may take to produce response headers before the attempt is abandoned
+    /// and retried. Separate from `idle_timeout`, and the split is load-bearing rather than
+    /// cosmetic — see [`UPSTREAM_HEADER_TIMEOUT`] for the measurement and for the invariant it
+    /// holds with the gateway's `FIRST_MSG_TIMEOUT`. A field for the same reason `idle_timeout`
+    /// is one: the production budget is longer than any test should be asked to wait.
+    header_timeout: Duration,
 }
 
 /// How long a provider-returned host stays fetchable (invariant 3 carve-out).
 const RETURNED_HOST_TTL: Duration = Duration::from_secs(10 * 60);
+
+/// How long an idle pooled connection may be kept before it is evicted.
+///
+/// **Hardening, not a demonstrated fix, and the comment says so because the difference matters.**
+/// A pooled socket the server has already closed is still handed out, and the request then waits
+/// on a connection nobody is reading — which presents as an upstream stall rather than as a dead
+/// socket. Evicting idle sockets sooner narrows that race. It was added after the 2026-09-26
+/// stalls, whose cause was *not* reproduced, so this is a prior against one plausible mechanism
+/// and not evidence about it.
+const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// TCP keepalive interval on provider connections: probes a socket that is still in the pool
+/// but whose peer has gone away, so the failure surfaces as a reset rather than as silence.
+const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
 impl EgressState {
     /// Connect budget per §3.6; redirect policy vetoes any off-allowlist hop (Blocker 1 of
@@ -586,6 +705,10 @@ impl EgressState {
                 // NOT strip cross-host) to the redirect target — that would exfiltrate the key
                 // (diff-review Blocker 1). A 3xx surfaces as a classified error instead.
                 .redirect(reqwest::redirect::Policy::none())
+                // See the two constants for what this is and is not: `POOL_IDLE_TIMEOUT` is
+                // hardening against a stalled-but-open socket, not a fix for a measured cause.
+                .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+                .tcp_keepalive(TCP_KEEPALIVE)
                 .tcp_nodelay(true)
                 .build()
                 .expect("reqwest client"),
@@ -608,6 +731,8 @@ impl EgressState {
             store,
             secrets,
             returned_hosts: RwLock::new(HashMap::new()),
+            idle_timeout: UPSTREAM_IDLE_TIMEOUT,
+            header_timeout: UPSTREAM_HEADER_TIMEOUT,
         }
     }
 
@@ -1046,5 +1171,191 @@ mod secret_provider_tests {
              the keychain and the seam is decoration"
         );
         let _ = std::fs::remove_dir_all(&path);
+    }
+}
+
+/// Upstream stalls — that a silent upstream is survivable while nothing has been emitted.
+///
+/// **This module exists because the retry is invisible from every other angle.** The ledger
+/// records `NETWORK` either way, the consumer receives the same `StreamEvent::Error` either way,
+/// and before 2026-09-26 a stall left no line in any log at all — which is why two lost turns
+/// took a database query to explain. The connection count on a listener that accepts and then
+/// holds is the only observable that separates "retried" from "not".
+///
+/// **Both directions are asserted, because a retry that fires when it must not is the worse
+/// bug.** Re-sending a request whose headers the consumer has already read replays a status it
+/// has already acted on, so the post-headers case pins the *absence* of a retry rather than
+/// leaving it unpinned.
+#[cfg(test)]
+mod stall_tests {
+    use super::*;
+
+    use std::io::Write as _;
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Where the listener goes silent: before it writes any byte, or after it has written headers.
+    #[derive(Clone, Copy)]
+    enum Stall {
+        BeforeHeaders,
+        AfterHeaders,
+    }
+
+    /// How long a connection is held open without an answer. Comfortably longer than the tests'
+    /// idle budget, so the request abandons on **silence** rather than on a closed socket — the
+    /// failure under test. A socket closed early would surface as `Ok(Err(_))`, not as a stall.
+    const HOLD: Duration = Duration::from_secs(2);
+
+    /// The budget the two tests run under. Two abandonment cycles at the production 120s is a
+    /// four-minute test, which is why [`EgressState::idle_timeout`] is a field at all.
+    const TEST_IDLE: Duration = Duration::from_millis(120);
+
+    /// A listener that accepts, counts, and then never answers.
+    fn silent_listener(mode: Stall) -> (Arc<AtomicUsize>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let mut socket = match incoming {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                counted.fetch_add(1, Ordering::SeqCst);
+                // **The hold runs on its own thread, and that is what makes the count a usable
+                // observable.** Sleeping in the accept loop counts the second connection only
+                // after the first hold expires, so the assertion reads `1` for a request that
+                // really did dial twice — a harness that answers "not retried" whatever the code
+                // does. Measured 2026-09-26: the first run of this test failed on exactly that,
+                // with the retry already in place and working.
+                std::thread::spawn(move || {
+                    if matches!(mode, Stall::AfterHeaders) {
+                        // Status line and headers only. `send()` returns on headers, so this is
+                        // the shape that turns the stall into a mid-stream one.
+                        let _ = socket.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
+                        );
+                        let _ = socket.flush();
+                    }
+                    std::thread::sleep(HOLD);
+                });
+            }
+        });
+        (connections, format!("http://127.0.0.1:{port}/v1/chat/completions"))
+    }
+
+    /// A state whose silence budget is short enough to test, with no secret on the request so the
+    /// only thing that can refuse it is the stall itself.
+    fn state(dir: &std::path::Path) -> EgressState {
+        let _ = std::fs::remove_dir_all(dir);
+        let store = Arc::new(Store::open(dir).unwrap());
+        let mut s = EgressState::new(Arc::new(AllowList::default()), store);
+        s.idle_timeout = TEST_IDLE;
+        s.header_timeout = TEST_IDLE;
+        s
+    }
+
+    fn req(url: String) -> EgressRequest {
+        EgressRequest {
+            url,
+            method: "POST".to_string(),
+            headers: std::collections::BTreeMap::new(),
+            body: None,
+            secret_ref: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// Drain the sink into `(error messages, whether headers were seen)`.
+    fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<StreamEvent>) -> (Vec<String>, bool) {
+        let mut messages = Vec::new();
+        let mut headers = false;
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                StreamEvent::Error { message, .. } => messages.push(message),
+                StreamEvent::Headers { .. } => headers = true,
+                _ => {}
+            }
+        }
+        (messages, headers)
+    }
+
+    #[tokio::test]
+    async fn a_stall_before_headers_is_retried_once() {
+        let dir = std::env::temp_dir().join(format!("aip-stall-retry-{}", std::process::id()));
+        let (connections, url) = silent_listener(Stall::BeforeHeaders);
+        let s = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let r = stream(&s, req(url), tx).await;
+        assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
+
+        let (messages, headers) = drain(&mut rx);
+        // **A literal `2`, not `UPSTREAM_STALL_RETRIES + 1`, and the difference is the test.**
+        // Deriving the expectation from the constant makes the assertion a tautology: set the
+        // budget to `0` and both sides move together, so the test stays green against a retry
+        // that does nothing. Measured 2026-09-26 — with the constant at `0` this test *passed*,
+        // which is precisely the false pass a derived expectation hides.
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "a stall that emitted nothing must be re-sent once — that is the whole fix"
+        );
+        assert!(!headers, "no status was ever received, so nothing can have been replayed");
+        assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
+        assert!(
+            messages[0].contains("no response headers"),
+            "the consumer must be told what happened, not merely that something did: {}",
+            messages[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_stall_after_headers_is_not_retried() {
+        let dir = std::env::temp_dir().join(format!("aip-stall-noretry-{}", std::process::id()));
+        let (connections, url) = silent_listener(Stall::AfterHeaders);
+        let s = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let r = stream(&s, req(url), tx).await;
+        assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
+
+        let (messages, headers) = drain(&mut rx);
+        assert!(headers, "the consumer must see the status before the break");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "a stall after headers must NOT be retried — the consumer already read a status off \
+             the sink, and a second attempt would replay it"
+        );
+        assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
+        assert!(
+            messages[0].contains("went silent"),
+            "the mid-stream stall must say it was mid-stream: {}",
+            messages[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The ordering between the two budgets *is* the fix, so it gets a test of its own.**
+    ///
+    /// `UPSTREAM_HEADER_TIMEOUT` only helps if the retry it enables can finish before the gateway
+    /// gives up. That is a relationship between two constants in two modules, and nothing else in
+    /// this suite would notice if someone raised one of them — the retry would simply go back to
+    /// being unreachable, silently, exactly as it was between 27b and now. So this asserts the
+    /// *relationship* rather than either number: a deliberate retune of both still passes, and only
+    /// a retune that breaks the ordering goes red.
+    #[test]
+    fn the_stall_budget_fits_inside_the_gateway_bound() {
+        let worst_case = UPSTREAM_HEADER_TIMEOUT * (UPSTREAM_STALL_RETRIES as u32 + 1);
+        let gateway_bound = crate::core::gateway::FIRST_MSG_TIMEOUT;
+        assert!(
+            worst_case < gateway_bound,
+            "a pre-headers stall costs at most {worst_case:?} before this layer reports it, but the \
+             gateway abandons the request at {gateway_bound:?} — so the retry that budget pays for \
+             could never run. Lower UPSTREAM_HEADER_TIMEOUT, or raise FIRST_MSG_TIMEOUT with it."
+        );
     }
 }

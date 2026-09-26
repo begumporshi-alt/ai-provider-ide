@@ -5278,4 +5278,96 @@ because the shim answers an unrouted `/admin/*` path with `404 unknown_route`. R
 passed in 16.8 s. **A route that is not wired is a failure, not a silent `undefined`** — which is what
 makes the suite evidence rather than decoration.
 
+## Distilled out of `MEMORY.md` — 2026-09-27
+
+Moved here to bring `MEMORY.md` back under its 8,000 B cap. The *rules* stayed there; the mechanisms,
+line references and worked examples are here.
+
+### The auth breaker (2026-09-27, increment 30)
+
+`HealthTracker::record_result` opens a per-key breaker on the **third consecutive `AuthFailed`**
+(`AUTH_BREAKER_THRESHOLD = 3`). Until increment 30 the breaker was a **latch**: `breaker_open` was
+cleared only by an `ErrorClass::Ok`, and an open breaker meant the key was **never tried again** — so
+no `Ok` could arrive to clear it, and a credential restored by an operator stayed dead for the life of
+the process. Never observed in production (`AUTH_FAILED` = 3 ledger rows), so the fix is preventive.
+
+The state is now `breaker_open_at: Option<i64>` (Rust) / `breakerOpenAt: number | null` (TS) rather
+than a flag, and the key is excluded only for `BREAKER_HALF_OPEN_MS = 60_000` after that stamp. Past
+the window the key is admissible again and the next attempt decides. `record_result` stamps on **every**
+failure past the threshold, not only the transition — without the re-stamp the key would be admitted on
+every request from then on, the latch traded for the opposite defect. A `RATE_LIMITED` deliberately
+leaves the stamp alone: a 429 says nothing about the credential.
+
+**`key_retry_at` still answers `None` for `KeyBlock::Breaker`**, and that is load-bearing: the window is
+minutes against a request's budget of seconds, so waiting is still the wrong answer and failing over is
+still the right one. Increment 29's contract is untouched.
+
+**The measurement the whole fix rests on:** `is_retryable_with_next_key` lists `AuthFailed`
+(`core/engine.rs:216-223`, pinned at `:1396`), so a failed attempt advances to the next key rather than
+failing the request. Admitting a dead key costs one wasted attempt. **Check this before making a
+failover cheap** — the same shape will recur.
+
+Two `tracing` lines exist for observability and as deploy markers (the change itself adds no string
+literal): `"auth breaker opened; the key is excluded for one half-open window"` (fields `failures`,
+`re_armed`) and `"auth breaker cleared by a successful re-probe"`.
+
+### Two live request paths — a router rule change needs both
+
+**This is not a single-router system.** `aiproviderd` (Rust, `core/router.rs` + `core/engine.rs`) serves
+gateway clients over `127.0.0.1:8800`. Separately, the **webview** runs the TypeScript
+`packages/router-core` router: `apps/desktop/src/store.ts:138` builds `new ModelRouter(...)`, and
+`Assistant.tsx:760` / `:838` / `:1118` plus `lib/memory/engine.ts:236` call `generateText` /
+`generateImage` on it. So `packages/router-core/src/health-tracker.ts` and `core/engine.rs` are **two
+implementations of one policy** — `AUTH_BREAKER_THRESHOLD`, `COOLDOWN_FLOOR_MS` and
+`BREAKER_HALF_OPEN_MS` each exist in both, and each side's test file names the other's test.
+
+The frontend imports router-core mostly for **types and constants** (`PROVIDER_PROFILES`,
+`AdapterManifest`, `HttpPort`, `ToolCall`, `clampConcurrency`, `BUILTIN_TEMPLATES`), which is why a
+`grep` for `HealthTracker` in `apps/desktop/src` finds only comments — the *class* is instantiated
+inside the package and reached through `store.ts`'s `router` facade. **Search for the call site
+(`generateText`), not for the class name.**
+
+### Details moved out of the rules
+
+- **Migration recipe** — migration = SQL or a `DATA_MIGRATIONS` entry + bump `schema_version` + a count
+  assertion + the table list. Four things, and a missed one is silent.
+- **`bootstrap` detail** — a `0644` binary produces a job `launchctl` reports as *loaded* whose spawns
+  `EACCES` until `KeepAlive` throttles it. Prove a job by **pid + its marker**, never by `state`.
+- **`shim.ts:toRustArgs`** snake-cases top-level keys only; **every new command needs a
+  `web-test/shim.ts` case the same day**.
+- **`lru` rotation is dead in both languages** — `planner.rs` sorts by `last_used_at.unwrap_or(0)` and
+  `updateKey` is never called with `lastUsedAt`, so every key compares equal, the stable sort preserves
+  input order, and `lru` always yields key #1. `lru_orders_a_never_used_key_first` sets the field
+  directly on the structs, so it proves the *comparator*, not the *population*. Use `round_robin`.
+- **`__webTest.failNext`** — an immediate failure cannot test supersession, and a negative assertion on
+  an auto-dismissing surface **can never fail**.
+- **A fixture's comment is a claim about the invariant the test needs** — a wrong one hides the defect
+  *from inside* the suite written to catch it.
+- **A spec must not prove a round-trip by an input's value** — assert on the row re-read from the host.
+- **`gateway_keys` vs the vault** — `check_gateway_key` (`core/gateway.rs:1525`) compares the bearer
+  token against the vault **secret** (`gwkey:<id>` in `.secrets.json`), *not* against `gateway_keys.id`.
+  A row whose `gwkey:` entry is missing authenticates nothing while still listing. Measured
+  2026-09-27: `ak-fc85350a2fb1dc67` ("Work buddy") had a row and no secret, and its id as a token
+  answered `401 invalid gateway key` in 2 ms; only `gwkey:ak-ui` existed.
+- **UI detail** — `getByText` matching two elements means a **duplicated fact on screen**, and a
+  readiness wait must match only the awaited view (a wait that also matches the loading state never
+  waits). An accessible name must not change with state, or a screen-reader user cannot tell which
+  state they are in. Each `writeTrail` channel is **per trail** — one channel for two trails cannot
+  report which one was swallowed.
+- **`memory_enabled` detail** — the switch is in-memory only; `Disabled` outranks `WriteOnly`. Check
+  the Memory screen rather than probing HTTP, because the HTTP view can read a different copy.
+- **Session identity** — hashes `principal|user|project|agent`. Derive it from identity, never from
+  the place the request arrived.
+- **A DB-unique id needs a boot marker** — otherwise "no row yet" and "row exists but the process has
+  not re-read the table" are the same observation (see the `api_keys` boot snapshot in the skill).
+- **A drift guard is not a behaviour guard**, and **a cap is enforced where its function is *called*,
+  not where it is described** — a description-level assertion passes while the call site passes a
+  private copy.
+- **`serde_json` sorts keys** — parse, never substring-match. A substring assertion on serialised JSON
+  silently stops meaning what it meant when field order changes.
+- **A hedge does not survive being quoted** (D54). `ARCHITECTURE.md` §2.1.3 said a claim *"has not been
+  run"*; three downstream documents quoted it as a flat assertion of what the system does. When you
+  write a hedge, expect it to be read as a claim — so either measure it or say explicitly what would
+  make it false.
+
 

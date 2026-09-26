@@ -144,10 +144,36 @@ struct Wanted {
 /// TypeScript `continue`s in each of those cases (`:51`, `:55`) and so does this; the plan is
 /// allowed to be empty, and an empty plan is a caller-visible "no route for model".
 pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) -> Vec<Candidate> {
-    let wanted = resolve_wanted(input.model, ctx);
     let mut plan = Vec::new();
+    for (provider, model) in servable_carriers(input, ctx) {
+        let keys = order_keys(
+            ctx.keys_for(&provider.id),
+            &provider.rotation_strategy,
+            ctx,
+            &provider.id,
+            ctx.health(),
+            now_ms,
+        );
+        for key in keys {
+            plan.push(Candidate { provider: provider.clone(), key, model: model.clone() });
+        }
+    }
+    plan
+}
 
-    for w in order_carriers(wanted, ctx) {
+/// The `(provider, model)` pairs `input` could be served by, in failover order — **before any key
+/// is consulted.**
+///
+/// **Extracted so `build_plan` and `earliest_key_retry_at` cannot disagree about who carries the
+/// model.** The second asks "would this plan be non-empty if the keys were free", which is only a
+/// meaningful question against the *same* carrier resolution the first uses; a second copy of the
+/// loop would be a second spelling of one rule, free to drift from this one.
+fn servable_carriers(
+    input: &PlanInput<'_>,
+    ctx: &impl PlanContext,
+) -> Vec<(ProviderRow, ModelRow)> {
+    let mut out = Vec::new();
+    for w in order_carriers(resolve_wanted(input.model, ctx), ctx) {
         // **The provider check is `HealthTracker::is_provider_usable`, not an inline
         // `status == "enabled"`.** The TypeScript spells the string literal here
         // (`route-planner.ts:49`) while the tracker owns the same allow-list one file over
@@ -167,20 +193,37 @@ pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) ->
         }) else {
             continue;
         };
+        out.push((provider.clone(), model));
+    }
+    out
+}
 
-        let keys = order_keys(
-            ctx.keys_for(&provider.id),
-            &provider.rotation_strategy,
-            ctx,
-            &provider.id,
-            ctx.health(),
-            now_ms,
-        );
-        for key in keys {
-            plan.push(Candidate { provider: provider.clone(), key, model: model.clone() });
+/// The soonest moment at which `input` would plan to something, when **every** key that could
+/// serve it is unusable *only* because it is cooling down.
+///
+/// **`None` is the load-bearing answer, and it means "do not wait".** It covers the three ways
+/// waiting cannot help: the model has no carrier at all; a carrier exists and has a usable key (so
+/// the caller's empty plan came from somewhere else); or every blocked key is blocked by a denied
+/// status or an auth breaker. A denied status is permanent; the breaker expires, but after minutes
+/// rather than the seconds a request has — so neither is a wait. See
+/// [`HealthTracker::key_retry_at`], which is where that distinction lives rather than here.
+///
+/// The answer is the **minimum** across carriers, because the caller sleeps once and re-plans: the
+/// earliest key to come free is the one that makes the plan non-empty.
+pub fn earliest_key_retry_at(
+    input: &PlanInput<'_>,
+    ctx: &impl PlanContext,
+    now_ms: i64,
+) -> Option<i64> {
+    let mut soonest: Option<i64> = None;
+    for (provider, _model) in servable_carriers(input, ctx) {
+        for key in ctx.keys_for(&provider.id) {
+            if let Some(at) = ctx.health().key_retry_at(&key, now_ms) {
+                soonest = Some(soonest.map_or(at, |s| s.min(at)));
+            }
         }
     }
-    plan
+    soonest
 }
 
 /// `cost_spread` carrier ordering (audit R2). The port of `orderCarriers` (`:72-84`).
@@ -335,6 +378,9 @@ pub fn order_keys(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::engine::{
+        ErrorClass, AUTH_BREAKER_THRESHOLD, BREAKER_HALF_OPEN_MS, COOLDOWN_FLOOR_MS,
+    };
     use crate::core::pricing::PricingMicros;
 
     // ---- fixtures ---------------------------------------------------------------------------
@@ -438,6 +484,13 @@ mod tests {
     fn plan_for(model_id: &str, f: &Fixture) -> Vec<Candidate> {
         let input = PlanInput { model: model_id, modality: "text", exclude_provider_ids: &[] };
         build_plan(&input, f, 1_000)
+    }
+
+    /// The same context as `plan_for`, read through the cooldown-wait reader instead — so a test
+    /// can assert on "the plan is empty, and here is when it stops being empty".
+    fn retry_at_for(model_id: &str, f: &Fixture) -> Option<i64> {
+        let input = PlanInput { model: model_id, modality: "text", exclude_provider_ids: &[] };
+        earliest_key_retry_at(&input, f, 1_000)
     }
 
     fn carrier_ids(plan: &[Candidate]) -> Vec<&str> {
@@ -772,6 +825,117 @@ mod tests {
         assert_eq!(key_ids_of(&order("round_robin", keys.clone(), 1)), vec!["k2", "k3", "k1"]);
         // The cursor wraps: a caller advances it past the end rather than resetting it.
         assert_eq!(key_ids_of(&order("round_robin", keys.clone(), 4)), vec!["k2", "k3", "k1"]);
+    }
+
+    // ---- earliest_key_retry_at: when an empty plan is worth waiting for ----------------------
+
+    #[test]
+    fn a_plan_emptied_by_a_cooldown_reports_when_it_comes_back() {
+        // **The case the router's cooldown wait exists for.** The plan is empty — and it is empty
+        // for a reason that expires, which is exactly what used to become an instant `NO_ROUTE`.
+        let f = Fixture {
+            providers: vec![provider("pA", "a", "priority")],
+            keys: vec![key("a:k1", "pA")],
+            models: vec![model("pA", "m1", "text")],
+            ..Default::default()
+        };
+        f.health.record_result("a:k1", ErrorClass::RateLimited, None, 1_000);
+
+        assert!(plan_for("m1", &f).is_empty(), "a cooled key contributes no candidate");
+        assert_eq!(
+            retry_at_for("m1", &f),
+            Some(1_000 + COOLDOWN_FLOOR_MS as i64),
+            "the wait is the cooldown the tracker actually applied"
+        );
+    }
+
+    #[test]
+    fn a_model_no_provider_carries_reports_no_retry_time() {
+        // Nothing to wait for, and the caller must not sleep on it: a model that resolves to no
+        // carrier resolves to no carrier a second later too, so `NO_ROUTE` stays immediate for a
+        // genuine no-route rather than being delayed by the wait budget.
+        let f = Fixture {
+            providers: vec![provider("pA", "a", "priority")],
+            keys: vec![key("a:k1", "pA")],
+            models: vec![model("pA", "m1", "text")],
+            ..Default::default()
+        };
+        assert!(plan_for("no-such-model", &f).is_empty());
+        assert_eq!(retry_at_for("no-such-model", &f), None);
+    }
+
+    #[test]
+    fn a_usable_key_reports_no_retry_time() {
+        // The plan is not empty, so the router never asks — but the answer still has to be honest
+        // rather than "now". A `Some(now)` here would be a caller sleeping zero and re-planning
+        // forever: a spin loop wearing a cooldown's clothes.
+        let f = Fixture {
+            providers: vec![provider("pA", "a", "priority")],
+            keys: vec![key("a:k1", "pA")],
+            models: vec![model("pA", "m1", "text")],
+            ..Default::default()
+        };
+        assert!(!plan_for("m1", &f).is_empty());
+        assert_eq!(retry_at_for("m1", &f), None);
+    }
+
+    #[test]
+    fn a_breaker_blocked_key_is_not_waited_on_but_a_cooled_sibling_decides_the_wait() {
+        // **The two-carrier case, and why the answer is the minimum across carriers.** `pB` is
+        // blocked by something no clock clears, so it must contribute nothing; `pA` is merely
+        // cooling, so it decides the wait. A reader that took the *maximum*, or that let a
+        // breaker-blocked key set the answer, would wait on a key that never comes back.
+        let f = Fixture {
+            providers: vec![provider("pA", "a", "priority"), provider("pB", "b", "priority")],
+            keys: vec![key("a:k1", "pA"), key("b:k1", "pB")],
+            models: vec![model("pA", "m1", "text"), model("pB", "m1", "text")],
+            ..Default::default()
+        };
+        f.health.record_result("a:k1", ErrorClass::RateLimited, Some(2_000), 1_000);
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            f.health.record_result("b:k1", ErrorClass::AuthFailed, None, 1_000);
+        }
+
+        assert!(plan_for("m1", &f).is_empty(), "neither carrier has a usable key");
+        assert_eq!(
+            retry_at_for("m1", &f),
+            Some(3_000),
+            "pA's cooldown decides the wait; pB's open breaker must not be waited on"
+        );
+    }
+
+    #[test]
+    fn a_half_open_breaker_contributes_no_wait_at_any_instant() {
+        // **The increment-29 contract, at the layer that decides the wait.** A breaker now expires,
+        // which makes it *look* like a cooldown and therefore like something worth sleeping on. It
+        // is not: the window is minutes and a request's budget is seconds, so a reader that let a
+        // half-open key set the wait would stall and then fail anyway. Both instants are asserted
+        // because they are different code paths — `KeyBlock::Breaker` while the window runs, then
+        // `None` — and the test above only covers the first.
+        let f = Fixture {
+            providers: vec![provider("pA", "a", "priority")],
+            keys: vec![key("a:k1", "pA")],
+            models: vec![model("pA", "m1", "text")],
+            ..Default::default()
+        };
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            f.health.record_result("a:k1", ErrorClass::AuthFailed, None, 1_000);
+        }
+        let input = PlanInput { model: "m1", modality: "text", exclude_provider_ids: &[] };
+
+        assert!(plan_for("m1", &f).is_empty(), "the only key is breaker-blocked");
+        assert_eq!(retry_at_for("m1", &f), None, "an open breaker is not a wait");
+
+        // Past the window the key is admissible, so the plan is non-empty and there is still
+        // nothing to wait for. Read through `earliest_key_retry_at` directly rather than through
+        // `retry_at_for`, which is pinned to `now = 1_000` and so cannot reach this instant.
+        let half_open = 1_000 + BREAKER_HALF_OPEN_MS as i64;
+        assert!(!build_plan(&input, &f, half_open).is_empty(), "half-open admits the key");
+        assert_eq!(
+            earliest_key_retry_at(&input, &f, half_open),
+            None,
+            "a half-open key is usable, so there is nothing to wait for"
+        );
     }
 
     #[test]

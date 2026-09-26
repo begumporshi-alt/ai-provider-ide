@@ -1121,6 +1121,27 @@ pub async fn execute_text(
 /// Consecutive auth failures before a key is treated as invalid rather than merely unlucky.
 pub const AUTH_BREAKER_THRESHOLD: u32 = 3;
 
+/// How long an open auth breaker excludes its key before one re-probe is allowed.
+///
+/// **A breaker with no half-open state is a permanent exclusion, and that was this crate's
+/// behaviour until now.** [`KeyHealth::breaker_open_at`] was cleared *only* by an
+/// [`ErrorClass::Ok`], and an open breaker meant the key was never tried again — so no `Ok` could
+/// ever arrive to clear it. A credential rotated back into service, or an upstream that had a bad
+/// five minutes, stayed dead to the router for the life of the process. This window bounds that:
+/// past it the key is admissible again, and the next attempt decides — an `Ok` clears the breaker,
+/// an `AuthFailed` re-stamps it and excludes the key for another window. A genuinely revoked key
+/// therefore costs **one** `401` per window rather than one per request.
+///
+/// **The re-probe is safe because an auth failure is retryable with the next key** — see
+/// [`is_retryable_with_next_key`], which lists [`ErrorClass::AuthFailed`]. The cost of admitting a
+/// dead key is one wasted attempt, not a failed request.
+///
+/// One minute: long enough that a revoked credential is not sampled per request, short enough that
+/// a credential restored by an operator comes back without restarting the daemon. **The breaker is
+/// a heuristic layered on the persisted `status` column** — the way to exclude a key permanently is
+/// `status = "disabled"`, which is [`KeyBlock::Denied`] and is genuinely not on a clock.
+pub const BREAKER_HALF_OPEN_MS: u64 = 60_000;
+
 /// The key statuses that make a key unusable outright.
 ///
 /// **This is a deny-list, and that is load-bearing.** [`HealthTracker::is_key_usable`] rejects
@@ -1140,8 +1161,37 @@ pub struct KeyHealth {
     pub cooldown_until_ms: i64,
     /// Reset to zero by any `Ok`, because the breaker counts *consecutive* failures.
     pub consecutive_auth_failures: u32,
-    /// Too many auth failures in a row: treat the key as invalid, not merely rate-limited.
-    pub breaker_open: bool,
+    /// When the auth breaker opened, epoch ms — `None` while it is closed.
+    ///
+    /// **The moment rather than a flag, and that is what bounds the exclusion.** A `bool` plus a
+    /// separate `opened_at` would be two fields that must agree, and the pair has a state the flag
+    /// cannot describe on its own: open, with no idea when it started. Storing the moment makes
+    /// that state unrepresentable, and it is the moment — not the flag — that
+    /// [`HealthTracker::key_block`] reads, so the half-open window cannot be defeated by a missing
+    /// stamp. See [`BREAKER_HALF_OPEN_MS`].
+    pub breaker_open_at: Option<i64>,
+}
+
+/// Why a key cannot be tried right now.
+///
+/// **The variant is what decides whether waiting is worth anything**, which is why this is an enum
+/// and not a `bool`. `Cooling` carries the moment the key comes back, so a caller can sleep exactly
+/// that long; `Denied` and `Breaker` carry nothing, and they carry nothing for **different**
+/// reasons — which is the distinction a single `bool` would lose. `Denied` is permanent, because
+/// the persisted status is a decision an operator made. `Breaker` is not permanent: it expires
+/// after [`BREAKER_HALF_OPEN_MS`], but on a scale of minutes, so it is still not something a
+/// request should sleep on — the right answer to a dead credential is to fail over to the next key,
+/// which [`is_retryable_with_next_key`] permits. A caller that could not tell the three apart would
+/// either give up on a key that was about to be free, or wait on one that would not be free in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyBlock {
+    /// The persisted status is `disabled` or `invalid`. Waiting does not help, ever.
+    Denied,
+    /// Too many consecutive auth failures, inside the half-open window. Waiting does not help
+    /// *in time*; the key returns after [`BREAKER_HALF_OPEN_MS`].
+    Breaker,
+    /// A cooldown that expires at this epoch-ms. Waiting **is** the remedy.
+    Cooling(i64),
 }
 
 /// Per-key and per-provider circuit state, kept free of I/O so failover ordering can be tested
@@ -1168,6 +1218,42 @@ impl HealthTracker {
         Self::default()
     }
 
+    /// Why `key` cannot be tried at `now_ms`, or `None` when it can.
+    ///
+    /// **One spelling of the rule, two readers.** [`Self::is_key_usable`] asks "may I try it" and
+    /// [`Self::key_retry_at`] asks "when may I try it again" — and the second is only answerable
+    /// for [`KeyBlock::Cooling`]. Two independent predicates would be two spellings of one rule,
+    /// which is the defect this crate keeps finding; they are derived from this one instead.
+    fn key_block(&self, key: &ApiKeyRow, now_ms: i64) -> Option<KeyBlock> {
+        if KEY_STATUS_DENIED.contains(&key.status.as_str()) {
+            return Some(KeyBlock::Denied);
+        }
+        // A read must not create an entry. The TypeScript `health()` inserts on read, which grows
+        // the map for every key ever *considered*; the answer is identical either way, because an
+        // absent entry means default health.
+        let h = self.keys.lock().unwrap().get(&key.id).copied().unwrap_or_default();
+        // **Half-open: an open breaker excludes the key for one window, then admits it again.**
+        // See [`BREAKER_HALF_OPEN_MS`]. Past the window this *falls through* rather than returning,
+        // so the key is tried once more — and that attempt decides the breaker's fate: an `Ok`
+        // clears it, an `AuthFailed` re-stamps it and excludes the key for another window. The
+        // alternative, an unbounded `if h.breaker_open { return .. }`, is a latch: nothing but an
+        // `Ok` could clear it, and an open breaker means no `Ok` is ever attempted.
+        if let Some(opened_at) = h.breaker_open_at {
+            // `saturating_add` rather than `+`: the stamp is wall-clock derived, so a clock step
+            // could make the sum exceed `i64::MAX` — and that is a panic in a debug build, on the
+            // path that decides whether a request may proceed. Saturating excludes the key instead.
+            if now_ms < opened_at.saturating_add(BREAKER_HALF_OPEN_MS as i64) {
+                return Some(KeyBlock::Breaker);
+            }
+        }
+        // **The tracker's cooldown and the row's own `cooldown_until` are two different fields**,
+        // and the later of the two is when the key is actually free again. Taking the max rather
+        // than checking them separately keeps `is_key_usable`'s answer and `key_retry_at`'s time
+        // from disagreeing about which one is in force.
+        let until = h.cooldown_until_ms.max(key.cooldown_until.unwrap_or(0));
+        (until > now_ms).then_some(KeyBlock::Cooling(until))
+    }
+
     /// Whether `key` may be tried at `now_ms`.
     ///
     /// Four independent ways to be unusable, deliberately separate: the persisted status, this
@@ -1175,23 +1261,25 @@ impl HealthTracker {
     /// a different field from the in-memory one, and currently unreachable. See
     /// `a_key_cooldown_on_the_record_is_honoured`.
     pub fn is_key_usable(&self, key: &ApiKeyRow, now_ms: i64) -> bool {
-        if KEY_STATUS_DENIED.contains(&key.status.as_str()) {
-            return false;
+        self.key_block(key, now_ms).is_none()
+    }
+
+    /// When `key` becomes tryable again, if a cooldown is the **only** reason it is not now.
+    ///
+    /// **`None` is the load-bearing answer, and it means "do not wait on this key".** It covers
+    /// three cases: the key is usable already; its status is `disabled`/`invalid`; or its auth
+    /// breaker is open. `Denied` is permanent — no clock clears it, so a caller that slept on it
+    /// would sleep until the gateway gave up. **`Breaker` is different, and the difference is the
+    /// point**: it *does* expire now, but after [`BREAKER_HALF_OPEN_MS`], which is minutes against a
+    /// request's seconds — so waiting for it is still the wrong answer and failing over to the next
+    /// key is still the right one. Only a genuine cooldown yields a time, and that time is strictly
+    /// greater than `now_ms`, so a caller looping on this answer is guaranteed to make progress
+    /// rather than spin.
+    pub fn key_retry_at(&self, key: &ApiKeyRow, now_ms: i64) -> Option<i64> {
+        match self.key_block(key, now_ms) {
+            Some(KeyBlock::Cooling(until)) => Some(until),
+            _ => None,
         }
-        // A read must not create an entry. The TypeScript `health()` inserts on read, which grows
-        // the map for every key ever *considered*; the answer is identical either way, because an
-        // absent entry means default health.
-        if let Some(h) = self.keys.lock().unwrap().get(&key.id) {
-            if h.breaker_open || h.cooldown_until_ms > now_ms {
-                return false;
-            }
-        }
-        if let Some(until) = key.cooldown_until {
-            if until > now_ms {
-                return false;
-            }
-        }
-        true
     }
 
     /// Whether `provider` may be tried at all. An allow-list: only `"enabled"` passes.
@@ -1218,18 +1306,44 @@ impl HealthTracker {
         let h = keys.entry(key_id.to_string()).or_default();
         match cls {
             ErrorClass::Ok => {
+                // Taken rather than cleared so the recovery can be *observed*: a key that was
+                // excluded by a breaker and has just served a request is the one event that proves
+                // the half-open window did its job, and it is otherwise indistinguishable from a
+                // key that was never blocked at all.
+                let recovered = h.breaker_open_at.take();
                 h.consecutive_auth_failures = 0;
                 h.cooldown_until_ms = 0;
-                h.breaker_open = false;
+                if recovered.is_some() {
+                    tracing::info!(key_id = key_id, "auth breaker cleared by a successful re-probe");
+                }
             }
             ErrorClass::RateLimited => {
                 let wait = retry_after_ms.unwrap_or(0).max(COOLDOWN_FLOOR_MS);
                 h.cooldown_until_ms = now_ms + wait as i64;
+                // **A 429 says nothing about the credential, so a half-open breaker stays
+                // half-open.** The key is cooled but its stamp is left alone, which is what makes
+                // the two readers agree: the key is unusable *now* (cooling) yet not re-armed, so
+                // the next attempt — not this rate limit — decides the breaker.
             }
             ErrorClass::AuthFailed => {
                 h.consecutive_auth_failures += 1;
                 if h.consecutive_auth_failures >= AUTH_BREAKER_THRESHOLD {
-                    h.breaker_open = true;
+                    // **Stamped on every failure past the threshold, not only on the transition.**
+                    // A half-open re-probe that fails again must re-arm the window; if the stamp
+                    // were written only when the breaker first opened, the key would be admitted on
+                    // every request from then on — the latch traded for the opposite defect.
+                    let re_armed = h.breaker_open_at.is_some();
+                    h.breaker_open_at = Some(now_ms);
+                    // The event is otherwise invisible: without this line "the breaker just
+                    // excluded this key" and "the key was already excluded" leave the same trace,
+                    // which is none. `re_armed` is what distinguishes a dead credential from a
+                    // fresh one, and it is the only place that distinction is recorded.
+                    tracing::warn!(
+                        key_id = key_id,
+                        failures = h.consecutive_auth_failures,
+                        re_armed = re_armed,
+                        "auth breaker opened; the key is excluded for one half-open window"
+                    );
                 }
             }
             // Everything else leaves key health alone, and this arm is *explicit* on purpose. The
@@ -1537,25 +1651,154 @@ mod tests {
     }
 
     #[test]
+    fn a_cooled_key_reports_the_moment_it_comes_back() {
+        // The reader the router's cooldown wait is built on. `agnes` names no `Retry-After`, so the
+        // wait is the floor — and the answer must be that floor rather than "unknown", or the
+        // caller has no number to sleep on.
+        let key = key_row("k1", "active", None);
+        let t = HealthTracker::new();
+        t.record_result("k1", ErrorClass::RateLimited, None, NOW);
+
+        assert!(!t.is_key_usable(&key, NOW));
+        assert_eq!(t.key_retry_at(&key, NOW), Some(NOW + COOLDOWN_FLOOR_MS as i64));
+
+        // ...and once that moment arrives the key is usable, so there is nothing left to wait for.
+        // This is also what guarantees the caller's loop makes progress: the time it is handed is
+        // always strictly in the future, so it always sleeps rather than spinning.
+        let after = NOW + COOLDOWN_FLOOR_MS as i64;
+        assert!(t.is_key_usable(&key, after));
+        assert_eq!(t.key_retry_at(&key, after), None);
+    }
+
+    #[test]
+    fn a_blocked_key_reports_no_retry_time_when_waiting_cannot_help() {
+        // **The distinction the whole fix rests on.** A denied status and an open breaker both make
+        // a key unusable, and **neither clears on a clock** — so a caller that slept until they did
+        // would sleep until its own bound killed the request. Both must answer `None`, and the
+        // router must then fall back to `NO_ROUTE` rather than waiting.
+        let t = HealthTracker::new();
+
+        for denied in ["disabled", "invalid"] {
+            let key = key_row("k1", denied, None);
+            assert!(!t.is_key_usable(&key, NOW), "{denied} is not usable");
+            assert_eq!(t.key_retry_at(&key, NOW), None, "{denied} must never be waited on");
+        }
+
+        let key = key_row("k1", "active", None);
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        }
+        assert!(!t.is_key_usable(&key, NOW));
+        assert_eq!(t.key_retry_at(&key, NOW), None, "an open breaker must never be waited on");
+    }
+
+    #[test]
+    fn a_retry_time_honours_whichever_cooldown_lasts_longer() {
+        // The tracker's cooldown and the row's own `cooldown_until` are **two different fields**,
+        // and the key is free only when *both* have cleared. A reader that consulted one of them
+        // would report a wait that is too short and re-plan into the same empty plan.
+        let row_cooled = key_row("k1", "active", Some(NOW + 4_000));
+        let t = HealthTracker::new();
+        assert_eq!(t.key_retry_at(&row_cooled, NOW), Some(NOW + 4_000));
+
+        // A tracker cooldown that outlasts the row's wins, because it is the later of the two.
+        t.record_result("k1", ErrorClass::RateLimited, Some(9_000), NOW);
+        assert_eq!(t.key_retry_at(&row_cooled, NOW), Some(NOW + 9_000));
+    }
+
+    #[test]
     fn three_consecutive_auth_failures_open_the_breaker_and_an_ok_closes_it() {
         let key = key_row("k1", "active", None);
         let t = HealthTracker::new();
 
         for i in 1..AUTH_BREAKER_THRESHOLD {
             t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
-            assert!(!t.keys()["k1"].breaker_open, "still closed after {i} failure(s)");
+            assert!(t.keys()["k1"].breaker_open_at.is_none(), "still closed after {i} failure(s)");
             assert!(t.is_key_usable(&key, NOW));
         }
         t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
-        assert!(t.keys()["k1"].breaker_open, "opens on failure {AUTH_BREAKER_THRESHOLD}");
+        assert!(
+            t.keys()["k1"].breaker_open_at.is_some(),
+            "opens on failure {AUTH_BREAKER_THRESHOLD}"
+        );
         assert!(!t.is_key_usable(&key, NOW));
 
         // One success clears it: the breaker counts *consecutive* failures, so the count resets
         // too rather than merely closing.
         t.record_result("k1", ErrorClass::Ok, None, NOW);
-        assert!(!t.keys()["k1"].breaker_open);
+        assert!(t.keys()["k1"].breaker_open_at.is_none());
         assert_eq!(t.keys()["k1"].consecutive_auth_failures, 0);
         assert!(t.is_key_usable(&key, NOW));
+    }
+
+    #[test]
+    fn an_open_breaker_admits_its_key_again_after_the_half_open_window() {
+        // **The regression test for the latch.** Only an `Ok` could clear an open breaker, and an
+        // open breaker meant the key was never tried again — so no `Ok` could ever arrive. A
+        // credential restored by an operator stayed dead to the router for the life of the process.
+        // The window is what makes the exclusion finite. Both sides of the boundary are asserted,
+        // because an off-by-one here is the difference between "one probe per window" and "never".
+        let key = key_row("k1", "active", None);
+        let t = HealthTracker::new();
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        }
+        assert_eq!(
+            t.keys()["k1"].breaker_open_at,
+            Some(NOW),
+            "the window starts when the breaker opens"
+        );
+
+        let half_open = NOW + BREAKER_HALF_OPEN_MS as i64;
+        assert!(
+            !t.is_key_usable(&key, half_open - 1),
+            "excluded one millisecond before the window"
+        );
+        assert!(t.is_key_usable(&key, half_open), "the window bounds the exclusion");
+        // Usable is not the same as cleared. The breaker is *half* open: the key may be tried, but
+        // it is not yet trusted, and the next attempt is what closes it.
+        assert_eq!(t.keys()["k1"].breaker_open_at, Some(NOW), "still half-open, not cleared");
+
+        // A re-probe that fails again re-arms the window. Without the re-stamp the key would be
+        // admitted on every request from here on — the latch traded for the opposite defect.
+        t.record_result("k1", ErrorClass::AuthFailed, None, half_open);
+        assert_eq!(t.keys()["k1"].breaker_open_at, Some(half_open), "re-armed by the re-probe");
+        assert!(!t.is_key_usable(&key, half_open), "excluded again");
+        assert!(t.is_key_usable(&key, half_open + BREAKER_HALF_OPEN_MS as i64));
+
+        // A re-probe that succeeds closes it for real.
+        t.record_result("k1", ErrorClass::Ok, None, half_open);
+        assert_eq!(t.keys()["k1"].breaker_open_at, None, "cleared");
+        assert!(t.is_key_usable(&key, half_open));
+    }
+
+    #[test]
+    fn a_half_open_breaker_is_never_waited_on() {
+        // **The increment-29 contract, preserved across a change that makes a breaker look like a
+        // cooldown.** A breaker does now clear on a clock — but on a scale of minutes, against a
+        // request budget measured in seconds, so a caller that slept on it would sleep past the
+        // gateway's own bound and fail anyway. Every instant must answer `None`: while the window
+        // runs, at the half-open instant, and past it (where the key is usable, so there is nothing
+        // left to wait for either).
+        let key = key_row("k1", "active", None);
+        let t = HealthTracker::new();
+        for _ in 0..AUTH_BREAKER_THRESHOLD {
+            t.record_result("k1", ErrorClass::AuthFailed, None, NOW);
+        }
+        let half_open = NOW + BREAKER_HALF_OPEN_MS as i64;
+
+        for at in [NOW, half_open - 1, half_open, half_open + 1] {
+            assert_eq!(
+                t.key_retry_at(&key, at),
+                None,
+                "a breaker must never be waited on (at {at})"
+            );
+        }
+
+        // ...and the two mechanisms stay separate: a cooldown recorded while the breaker is
+        // half-open still yields its own time, because *there* waiting is the remedy.
+        t.record_result("k1", ErrorClass::RateLimited, Some(2_000), half_open);
+        assert_eq!(t.key_retry_at(&key, half_open), Some(half_open + 2_000));
     }
 
     #[test]
@@ -1567,7 +1810,7 @@ mod tests {
         t.record_result("k1", ErrorClass::RateLimited, Some(60_000), NOW);
         let before = t.keys()["k1"];
         assert!(
-            before.breaker_open
+            before.breaker_open_at.is_some()
                 && before.cooldown_until_ms > NOW
                 && before.consecutive_auth_failures > 0
         );

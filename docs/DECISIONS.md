@@ -1012,3 +1012,42 @@ validating the configured id against `/v1/models`, which advertises qualified id
 - **Revisit if:** a second user on the same machine needs different keys, or the data directory
   becomes network-synced (iCloud Drive, sync tools) — either moves the threat model and a
   machine-key-encrypted store is worth the one-time cost.
+
+## 2026-09-27 — The auth breaker gets a half-open state, in both implementations
+
+- **Decision:** an open auth breaker no longer excludes its key permanently. `KeyHealth` stores the
+  moment the breaker opened — `breaker_open_at: Option<i64>` in Rust (`core/engine.rs`),
+  `breakerOpenAt: number | null` in TS (`packages/router-core/src/health-tracker.ts`) — instead of a
+  `boolean`, and the key is excluded only for `BREAKER_HALF_OPEN_MS` (60 000 ms) after that moment.
+  Past the window the key is admissible again and the next attempt decides: an `OK` clears the
+  breaker, an `AUTH_FAILED` re-stamps it and excludes the key for another window.
+- **The defect this removes:** the breaker was cleared *only* by a successful attempt, and an open
+  breaker meant the key was never tried again — so no success could ever arrive to clear it. The
+  exclusion was a latch, not a circuit: a credential rotated back into service, or an upstream that
+  had a bad five minutes, stayed dead to the router for the life of the process. **Never observed in
+  production** — `AUTH_FAILED` is 3 ledger rows against a threshold of 3 — so this is preventive
+  rather than a fix for an incident.
+- **Options considered:**
+  1. Leave it, on the grounds that it has never fired. Rejected: "unreachable so far" is a claim
+     about history, not about the design, and the failure mode is silent and permanent.
+  2. Expire the breaker on a timer with no probe. Rejected: that admits a revoked key on *every*
+     request rather than once per window, and it asserts a credential works without testing it.
+  3. **Half-open: a bounded exclusion plus one re-probe per window** (chosen). A genuinely revoked
+     key costs one `401` per window; a restored credential recovers without a restart.
+  4. Exponential backoff on repeated re-failure. Rejected for now — more state, and the window is
+     already long relative to a request. Revisit if probe cost ever shows in the ledger.
+- **Why the re-probe is safe, and this is the measurement the decision rests on:**
+  `is_retryable_with_next_key` lists `AUTH_FAILED` in both languages, so a failed attempt advances to
+  the next key rather than failing the request. Admitting a dead key costs one wasted attempt, not a
+  failed request.
+- **This diverges from the TypeScript original, and it is applied to both sides.** The TS tracker had
+  the identical latch. **Both paths are live**: the Rust `aiproviderd` serves gateway clients, and the
+  webview `ModelRouter` serves the in-app Assistant (`Assistant.tsx:760`, `lib/memory/engine.ts:236`)
+  — so a one-sided change would have left half the product latched. The two are now two
+  implementations of one policy at one value, and each side's test file names the other's.
+- **Consequence for the `lru` strategy:** unchanged. `updateKey` is never called with `lastUsedAt` in
+  either language, so `lru` remains non-functional; that is a faithful port, not a defect, and this
+  entry does not touch it.
+- **Revisit if:** the ledger shows `AUTH_FAILED` rows caused by re-probes (the window is too short),
+  or a rotated credential takes longer than a minute to become usable (too long). Also revisit if the
+  two implementations are ever unified — this entry exists partly because they are not.

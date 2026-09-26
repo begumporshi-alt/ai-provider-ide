@@ -1322,6 +1322,17 @@ struct Slot {
     rx: mpsc::UnboundedReceiver<BridgeMsg>,
     /// Set once the bridge has produced its first message; only that wait is bounded.
     started: bool,
+    /// When the handler first polled this slot — i.e. when the request reached the bridge.
+    ///
+    /// Stamped on the first `recv` rather than at construction: `try_slot` can wait for a routing
+    /// permit, and that queue time is not what `FIRST_MSG_TIMEOUT` bounds.
+    ///
+    /// It exists to be *measured*. The ledger stores only total duration, dominated by prompt size
+    /// and output length, so a stall and a long generation are indistinguishable in it — which is
+    /// how a legitimate 113s generation was once read as a disarmed timeout. This log line is the
+    /// only record of time-to-first-message the system has, and it is what any future tuning of
+    /// `FIRST_MSG_TIMEOUT` or of the egress pre-headers budget must be calibrated against.
+    started_at: Option<Instant>,
 }
 
 impl Slot {
@@ -1334,10 +1345,22 @@ impl Slot {
         if self.started {
             return self.rx.recv().await;
         }
+        // Stamped on the first poll, not at construction: `try_slot` may have waited for a routing
+        // permit, and that queue time is not what this bound covers.
+        let dispatched_at = *self.started_at.get_or_insert_with(Instant::now);
         let bound = self.core.first_msg_timeout();
         match tokio::time::timeout(bound, self.rx.recv()).await {
             Ok(msg) => {
                 self.started = true;
+                // The measurement the ledger cannot hold. One line per request, on the request
+                // path, because time-to-first-message is the only number that can justify the
+                // bound it just passed — and the only way to tell a stalled upstream from a large
+                // prompt that is merely still being processed.
+                tracing::info!(
+                    request_id = self.id,
+                    first_msg_ms = dispatched_at.elapsed().as_millis() as u64,
+                    "bridge produced its first message"
+                );
                 msg
             }
             Err(_) => {
@@ -1423,7 +1446,15 @@ async fn try_slot(core: &Arc<GatewayCore>) -> Result<Slot, Response> {
     let id = core.next_id.fetch_add(1, Ordering::Relaxed);
     let (tx, rx) = mpsc::unbounded_channel();
     core.replies.register(id, tx);
-    Ok(Slot { core: core.clone(), _permit: permit, _dispatch: dispatch, id, rx, started: false })
+    Ok(Slot {
+        core: core.clone(),
+        _permit: permit,
+        _dispatch: dispatch,
+        id,
+        rx,
+        started: false,
+        started_at: None,
+    })
 }
 
 // ---------- auth (invariants 10, 11, 15) ----------

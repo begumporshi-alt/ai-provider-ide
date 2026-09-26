@@ -74,7 +74,7 @@ use crate::core::persist::{
     aliases_rows, api_keys_rows, models_cache_rows, providers_rows, setting_value, AliasRow,
     ApiKeyRow, LedgerRow, ModelRow, ProviderRow,
 };
-use crate::core::planner::{build_plan, Candidate, PlanContext, PlanInput};
+use crate::core::planner::{build_plan, earliest_key_retry_at, Candidate, PlanContext, PlanInput};
 use crate::core::pricing::{estimate_cost_micros, pricing_from_cache_json, PricingMicros};
 use crate::core::store::Store;
 use crate::core::usage::UsageTokens;
@@ -730,6 +730,87 @@ impl<'a> ModelRouter<'a> {
         plan.into_iter().filter(|c| c.provider.id == first).collect()
     }
 
+    /// How long a request may wait for a key cooldown to clear before giving up, in milliseconds.
+    ///
+    /// **The cooldown it waits on is `COOLDOWN_FLOOR_MS` (1 s)** — the floor
+    /// `HealthTracker::record_result` applies when the provider named no `Retry-After`, which is
+    /// what `agnes` does. This budget is therefore a *ceiling* on the wait and not its expected
+    /// size: it exists so a key cooled by a provider that named a long `Retry-After` cannot hold
+    /// the request open indefinitely.
+    ///
+    /// **It must stay inside the gateway's `FIRST_MSG_TIMEOUT`.** That bound starts when the
+    /// request is dispatched, and this wait spends from the same budget — so waiting longer than it
+    /// would make the gateway drop a `Slot` whose request is still sleeping, which is the shape
+    /// increment 28 fixed one layer down. Pinned by
+    /// `the_cooldown_wait_fits_inside_the_gateway_bound`.
+    const COOLDOWN_WAIT_BUDGET_MS: u64 = 5_000;
+
+    /// When the next cooldown clears for `model`, or `None` when waiting cannot help.
+    ///
+    /// A thin adapter over [`earliest_key_retry_at`], which owns the rule; this only builds the
+    /// `PlanView` that the planner needs, exactly as `plan` does.
+    fn cooldown_retry_at(&self, model: &str, modality: &str) -> Option<i64> {
+        let input = PlanInput { model, modality, exclude_provider_ids: &[] };
+        let cursors = self.shared.cursors();
+        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors };
+        earliest_key_retry_at(&input, &view, now_ms())
+    }
+
+    /// Plan, waiting out a key cooldown when that is the **only** reason the plan is empty.
+    ///
+    /// **The measurement this exists for.** `COOLDOWN_FLOOR_MS` is 1 s and `agnes` sends no
+    /// `Retry-After`, so a 429 cools its key for exactly one second. `order_keys` then retains the
+    /// key away, the plan comes back empty, and the old code returned `NoRoute` **without
+    /// attempting anything** — 36 ledger rows, every one with an empty chain and 0–3 ms latency,
+    /// 31 of them on 2026-09-22, the same day as 176 of the 189 `RATE_LIMITED` rows. A one-second
+    /// cooldown was being converted into an instant hard failure.
+    ///
+    /// **Bounded twice.** `COOLDOWN_WAIT_BUDGET_MS` caps the total, and the caller's cancel flag is
+    /// checked before every sleep, so a cancelled request stops waiting and lets its caller record
+    /// the row it would have recorded anyway. The loop terminates because
+    /// [`HealthTracker::key_retry_at`] returns a time **strictly greater** than now, so every
+    /// iteration sleeps for at least a millisecond rather than spinning.
+    async fn plan_waiting_out_cooldown(
+        &self,
+        model: &str,
+        modality: &str,
+        cancel: &Cancel,
+    ) -> Vec<Candidate> {
+        let plan = self.plan(model, modality, &[]);
+        if !plan.is_empty() {
+            return plan;
+        }
+        let deadline_ms = now_ms() + Self::COOLDOWN_WAIT_BUDGET_MS as i64;
+        loop {
+            let Some(at) = self.cooldown_retry_at(model, modality) else {
+                return plan;
+            };
+            let wait_ms = at - now_ms();
+            // `wait_ms <= 0` cannot happen while `key_retry_at` holds its contract; it is checked
+            // anyway because a backwards wall-clock step would otherwise make the cast below
+            // produce a very large unsigned value and sleep for years.
+            if wait_ms <= 0 || wait_ms > deadline_ms - now_ms() || cancel.is_cancelled() {
+                return plan;
+            }
+            // **The fix announcing itself, and it is not decoration.** The ledger row written after
+            // a waited-out cooldown is indistinguishable from any other success, so without this
+            // line "the cooldown was waited out" and "the key was free all along" leave the same
+            // evidence. It is also the marker a deploy is verified against, since this increment
+            // adds no other string literal to the binary.
+            tracing::info!(
+                model = model,
+                modality = modality,
+                wait_ms = wait_ms,
+                "waiting out a key cooldown before re-planning"
+            );
+            tokio::time::sleep(Duration::from_millis(wait_ms as u64)).await;
+            let replanned = self.plan(model, modality, &[]);
+            if !replanned.is_empty() {
+                return replanned;
+            }
+        }
+    }
+
     // ---------- text ----------
 
     /// Route one text request, streaming every chunk to `on_chunk`, and record it.
@@ -755,7 +836,10 @@ impl<'a> ModelRouter<'a> {
     ) -> Result<TextSuccess, RouterError> {
         let t0 = now_ms();
         self.sync_concurrency();
-        let plan = self.plan(&req.model, TEXT, &[]);
+        // **Not `self.plan` directly.** An empty plan here used to be an instant `NoRoute` even when
+        // the only reason it was empty was a key cooldown that expires within the second — see
+        // `plan_waiting_out_cooldown` for the measurement.
+        let plan = self.plan_waiting_out_cooldown(&req.model, TEXT, cancel).await;
         if plan.is_empty() {
             self.record_no_route(&req.model, TEXT, opts, t0)?;
             return Err(RouterError::NoRoute {
@@ -963,7 +1047,9 @@ impl<'a> ModelRouter<'a> {
     ) -> Result<ImageResult, RouterError> {
         let t0 = now_ms();
         self.sync_concurrency();
-        let plan = self.plan(&req.model, IMAGE, &[]);
+        // Same rule as the text path — see `plan_waiting_out_cooldown`. Both modalities reach the
+        // same empty-plan decision, so both must wait it out rather than fail on the spot.
+        let plan = self.plan_waiting_out_cooldown(&req.model, IMAGE, cancel).await;
         if plan.is_empty() {
             self.record_no_route(&req.model, IMAGE, opts, t0)?;
             return Err(RouterError::NoRoute {
@@ -2112,6 +2198,85 @@ mod tests {
         assert_eq!(row.model, "ghost");
         assert_eq!(chain(row).len(), 0, "\"[]\" — there were no attempts to record");
         assert!(row.fallback_chain_json.is_some(), "and that is not the same as absent");
+    }
+
+    #[test]
+    fn the_cooldown_wait_fits_inside_the_gateway_bound() {
+        // **The cross-layer invariant, one layer up from increment 28's.** This wait spends from
+        // the same budget the gateway's first-message bound measures — that bound starts when the
+        // request is dispatched, and the request is sleeping in here. A budget larger than the
+        // bound would therefore let the gateway drop a `Slot` whose request is still waiting, which
+        // is exactly the shape increment 28 fixed between the egress stall budget and this same
+        // constant. Pinned here so the new term cannot quietly outgrow it.
+        assert!(
+            Duration::from_millis(ModelRouter::COOLDOWN_WAIT_BUDGET_MS)
+                < crate::core::gateway::FIRST_MSG_TIMEOUT,
+            "a cooldown wait of {}ms must fit inside the gateway's {}ms bound",
+            ModelRouter::COOLDOWN_WAIT_BUDGET_MS,
+            crate::core::gateway::FIRST_MSG_TIMEOUT.as_millis()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cooled_key_is_waited_out_instead_of_failing_the_request() {
+        // **The regression test for the 36 `NO_ROUTE` rows.** A key cooled by a 429 is unusable for
+        // one second; the plan is then empty, and the old code failed the request *without trying
+        // anything* — an instant hard failure produced by a one-second cooldown.
+        //
+        // The row's own `cooldown_until` is used rather than a recorded 429 purely so the wait can
+        // be 50 ms instead of `COOLDOWN_FLOOR_MS`. It is the same `KeyBlock::Cooling` arm either
+        // way, so the path under test is the one production takes.
+        let mut k = key("k1", "p1", "k1");
+        k.cooldown_until = Some(now_ms() + 50);
+        let store = RouterStore::hydrate(
+            vec![provider("p1", "p1", "enabled", "priority")],
+            vec![k],
+            vec![model("p1", "m1", TEXT)],
+            vec![],
+        );
+        let adapter = Scripted::new(vec![chunks(&["hello"])]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        let started = now_ms();
+        let result =
+            router.generate_text(text_req("m1"), &opts("ui"), &Cancel::new(), &mut on_chunk).await;
+
+        assert!(result.is_ok(), "the cooled key came back and served the request");
+        assert_eq!(adapter.calls().len(), 1, "the request reached the adapter instead of NO_ROUTE");
+        assert!(
+            now_ms() - started >= 50,
+            "it waited the cooldown out rather than re-planning into the same empty plan"
+        );
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "ok", "the row records the success, not a NO_ROUTE");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_genuine_no_route_is_not_delayed_by_the_wait_budget() {
+        // The other half of the contract: waiting is **only** for a cooldown. A model that nothing
+        // carries resolves to nothing a second later too, so the fix must not turn every genuine
+        // `NO_ROUTE` into a multi-second stall. With no key in the store there is nothing to wait
+        // on, so the answer is immediate — asserted against the budget rather than a tight
+        // constant, so a loaded machine cannot make it flake.
+        let store = RouterStore::hydrate(vec![], vec![], vec![], vec![]);
+        let adapter = Scripted::new(vec![chunks(&["x"])]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        let started = now_ms();
+        let error = router
+            .generate_text(text_req("ghost"), &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect_err("nothing carries it");
+        let elapsed = now_ms() - started;
+
+        assert!(matches!(error, RouterError::NoRoute { .. }));
+        assert!(
+            elapsed < ModelRouter::COOLDOWN_WAIT_BUDGET_MS as i64,
+            "a genuine no-route waited {elapsed}ms — the budget is for cooldowns, not for this"
+        );
+        assert_eq!(adapter.calls().len(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

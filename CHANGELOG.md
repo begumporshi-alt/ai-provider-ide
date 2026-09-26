@@ -11,6 +11,17 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ## [Unreleased]
 
+### Changed
+
+- **A key excluded by the auth breaker is no longer excluded forever.** Three consecutive auth
+  failures opened a breaker that only a *successful* attempt could clear — and an open breaker meant
+  the key was never tried again, so no success could ever arrive to clear it. A credential rotated
+  back into service, or an upstream that had a bad five minutes, stayed dead to the router for the
+  life of the process. The breaker is now half-open after 60 s: the key is tried again, and that one
+  attempt either clears the breaker or re-arms it, so a genuinely revoked key costs one `401` per
+  window instead of being silently dropped forever. Applies to both the `aiproviderd` gateway and
+  the in-app Assistant. See `DECISIONS.md` 2026-09-27.
+
 ## [1.2.0] - 2026-09-26
 
 ### Changed
