@@ -22,7 +22,12 @@ if [ -n "$HITS" ]; then
 fi
 
 # any file that writes a secret to disk from the TS layer
-if grep -rn 'writeFile.*secret' apps packages --include='*.ts' --include='*.tsx' --exclude-dir=node_modules 2>/dev/null; then
+# The exclude list has to match the grep above. Without `--exclude-dir=target` this walks the cargo
+# build directory looking for `.ts` files that are not there: measured 2026-09-26 on a built tree,
+# 40s in this form against 1s with `--exclude-dir=target` added, one variable changed. The cost is
+# invisible until someone runs a `tauri build`, and two such scans concurrently stretched each to
+# ~4 minutes — long enough that a foreground run was SIGTERM'd before it could report.
+if grep -rn 'writeFile.*secret' apps packages --include='*.ts' --include='*.tsx' --exclude-dir=node_modules --exclude-dir=target --exclude-dir=dist 2>/dev/null; then
   echo "ERROR: suspicious secret write found" >&2
   STATUS=1
 fi

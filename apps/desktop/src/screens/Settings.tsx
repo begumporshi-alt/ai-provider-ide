@@ -299,7 +299,7 @@ function ConfigDiagnosticsSection() {
   return (
     <Section
       title="Config & diagnostics"
-      hint="Export moves your setup to another machine: providers, adapters, aliases and settings — never keychain secrets. Import re-adds them as drafts; keys must be re-entered and tested before anything routes."
+      hint="Export moves your setup to another machine: providers, adapters, aliases and settings — never secret material. Import re-adds them as drafts; keys must be re-entered and tested before anything routes."
     >
       <div className="flex flex-wrap gap-2">
         <button className={btn} style={btnStyle} disabled={busy !== null} onClick={doExport}>

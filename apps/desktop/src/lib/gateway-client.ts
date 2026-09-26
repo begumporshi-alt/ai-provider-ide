@@ -48,7 +48,7 @@ export function clearUiSession(): void {
  * The fallback is for a failed status call, and its constant must match `gateway::DEFAULT_PORT` —
  * it used to say `8800`, which this app has never bound, so the UI dialled a closed port while the
  * gateway was healthy. `gateway_status` is cached host-side (see `master_key_state`), so asking it
- * per call is a cheap local read, not a keychain hit.
+ * per call is a cheap local read, not a secrets-file read.
  */
 export async function gatewayBaseUrl(): Promise<string> {
   const status = await invoke<{ port?: number }>("gateway_status").catch(() => null);

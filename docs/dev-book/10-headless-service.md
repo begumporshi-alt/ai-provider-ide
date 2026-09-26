@@ -4248,6 +4248,78 @@ reader can re-run in one line each.
 **Gates:** no Rust or TypeScript change; `check-doc-links`, `docs:book`, `key-leak-grep` — run with
 the commit. The 181/181 suite is the current green line.
 
+### Increment 26y — the login-item service gets Start and Stop, and the card stops telling you to go and use another control
+
+**The gap.** 26b shipped the login-item control with Install and Remove and nothing between them. So the state
+`plistPresent: true, loaded: false` — the one an operator reaches by quitting the app, by a throttled restart,
+or by installing while the app gateway held the port — rendered as "Installed, not running" with exactly one
+button beside it, **Remove**. The only way to bring the service up was `aiproviderd install` from Terminal.app,
+which is the command 26b existed to make unnecessary. Reported by the operator as "i want to run it from the ui".
+
+**Two verbs, and the reason there are two.** `service::start` is `bootstrap` when launchd does not hold the job
+and `kickstart -k` when it does — because `bootstrap` **refuses a label launchd already holds** ("service
+already loaded"). The two not-running shapes are indistinguishable from `ServiceStatus`, so the branch lives in
+the host, where the question can be put to launchd directly, rather than in the UI as two buttons that would
+each be wrong half the time. `service::stop` is `bootout`, not `kill`: **`KeepAlive` restarts a killed
+process**, so a stop built on `kill` would appear to work and then quietly come back. Its cost is stated in the
+card rather than hidden — `bootout` unloads the job until the next login, when launchd re-reads
+`~/Library/LaunchAgents`, so Stop means "off for now" and Remove is what makes it stay off.
+
+**What the UI could not previously say.** The card read `loaded` as "Running". `loaded` is launchd *holding* the
+job, which is also the shape a throttled `KeepAlive` leaves — so a gateway that was down reported as healthy,
+with the Start button (had it existed) hidden. `up` is now the pair, `loaded && pid !== null`, and the
+loaded-without-a-pid state reads "Installed, not running" and offers Start. That is D61's class seen from the
+other side: the card had no way to describe the state it most needed to describe.
+
+**Start performs the handover.** The agent and the app's in-process listener bind one port, so a Start issued
+while the app gateway is up loads a job whose every spawn dies on `EADDRINUSE` — launchd reports it loaded,
+`KeepAlive` throttles it, and the card shows the very state the button was meant to clear. The card's copy used
+to instruct the operator to stop the gateway first; that instruction is now the button's own first step. It
+calls `gateway_disable` rather than reusing `toggle(false)`, deliberately: `toggle` also persists
+`enabled: false`, which would record that the operator switched the gateway off when what they did was hand the
+port over. Leaving the preference alone means the next launch restores the app gateway, finds the agent on the
+port, and delegates (26t).
+
+**What the tests are, and what they are not.** Six Rust tests cover the two functions — the bootstrap branch, the
+kickstart branch, the refusal when no plist is on disk, and both launchd-refusal messages. The no-plist test is
+built on a recorder that answers `0` to *everything*, so a `start` that wrongly asked launchd anything would
+**succeed** and fail on the `expect_err`: the detector is the call, not the status. **Two were falsified rather
+than trusted** — forcing the loaded branch to `bootstrap` reddens
+`start_kickstarts_a_job_launchd_already_holds` with `left: ["bootstrap", …]` against `right: ["kickstart", "-k", …]`,
+and disabling the plist guard reddens `start_refuses_before_touching_launchd_when_the_plist_is_absent` with
+`no plist is not a start: ()`. The first draft of `start` also **named only the plist** in its failure message,
+dropping the domain that `install`'s message names; the test caught that before the code shipped.
+
+The **five** new web-tests cannot test launchd — the harness has none — so they test the two things the old spec
+could not reach. **Three are wiring:** that Start calls `service_start`, that Stop calls `service_stop`, and that
+Start issues `gateway_disable` **before** `service_start`. The order is the property; reversed, the button would
+produce the throttled job it exists to clear. **Two are state and copy:** that `loaded: true, pid: null` reads
+"Installed, not running" and offers Start, and that a refusal from the host is shown rather than swallowed.
+`service_start` and `service_stop` throw in the shim for the same reason the two existing verbs do — a shim that
+*pretended* to start a job would let a spec assert a lifecycle no real machine performs. The spec went 4 → 9, and
+the split is not 5 additions: two of the four originals were **replaced in place** (*installed but not running* →
+*…offers Start*; *warns when installed but not up* → *…says Start will hand the port over*), so a reader counting
+`+5` against a diff of names sees five and a reader counting changed lines sees seven.
+
+**The env trap, recorded because it cost three runs.** Playwright's `webServer` readiness probe to
+`http://127.0.0.1:1430/web-test/` answered **404** and the suite never started. The cause was not vite, not the
+port, and not the module cache: `HTTP_PROXY`/`http_proxy`/`HTTPS_PROXY`/`https_proxy` are set to
+`http://127.0.0.1:61542` here, so the probe went *through a proxy* that does not serve the route. What showed it
+was `DEBUG=pw:webserver` — every other signal (the mock listening on 18901, the exact vite command working
+standalone, `curl` answering 200) pointed away from the environment. Run the browser suite with those variables
+unset. This is the class the working memory already records for the gateway's own probes, arriving on a
+different tool.
+
+**The sweep the gates owed, and the one they found.** Running the full browser suite for this change put
+`gateway: the master key is keychain-resident and never rendered` on screen — a test whose *name* asserts a
+mechanism `e27503e` had removed. Following it found the larger set **D62** records: eleven user-facing strings
+across five screens still told the user their key lived in the OS keychain, and one of them — Providers'
+first-run hero, *"this app never writes them to disk"* — was **inverted** rather than stale, because the vault
+*is* a file. D60 had swept the *documents* for exactly this and left the app's own copy and its test names
+untouched, which are the surfaces a reader meets first. All of it is re-worded, the harness's `keychain` map is
+renamed `secrets`, and the absence is asserted with a control grep so the instrument is known to report
+presence. See D62.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is

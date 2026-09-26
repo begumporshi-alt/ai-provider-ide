@@ -32,7 +32,9 @@ import {
   readGatewaySettings,
   router,
   serviceInstall,
+  serviceStart,
   serviceStatus,
+  serviceStop,
   serviceUninstall,
   setGatewayMutationEnabled,
   setGatewayToolsEnabled,
@@ -230,26 +232,35 @@ function useControlData(tick: number) {
   }, []);
 
   /**
-   * Re-read only what the gateway poll needs.
+   * Re-read the three values on this tab that move on a clock of their own.
    *
    * The gateway is the one subject on this screen that changes while the operator does nothing: the
    * worker's beat lapses after ~8 idle minutes, another process takes the port, a connected IDE
    * crosses the monthly cap. `tick` is bumped by user actions alone, so a tab that showed gateway
    * state without a clock of its own would freeze at whatever it read when the screen opened.
    *
+   * **The service row joined it because the pid arrives late, and because the buttons used to
+   * refresh nothing.** `bootstrap` registers the job and returns; the program is exec'd afterwards,
+   * so a single read taken straight after `service_start` sees `loaded: true, pid: null` — the same
+   * shape a throttled restart leaves, which a card that could not tell the two apart would report
+   * as stuck. And Install/Remove/Start/Stop all call this, so leaving the service out meant every
+   * one of them left the card describing the state *before* the click.
+   *
    * It is deliberately **not** a second call to `load()`: that would re-run `memory_stats` — a
-   * SQLite aggregate — every 2.5 seconds for the sake of a status dot. Two commands, merged into
-   * the slice they belong to.
+   * SQLite aggregate — every 2.5 seconds for the sake of a status dot. Three commands, merged into
+   * the slice they belong to. The added cost is one `launchctl print` per tick, the same order as
+   * the spend route's aggregate that already runs here.
    *
    * `hostError` is left alone. It is derived from several reads, and one command failing while the
    * host is alive is §4.3's per-row failure, not a dead host.
    */
   const refreshGateway = useCallback(async () => {
-    const [gateway, spend] = await Promise.all([
+    const [gateway, spend, service] = await Promise.all([
       gatewayStatus().catch(() => null),
       gatewaySpendStatus().catch(() => null),
+      serviceStatus().catch(() => null),
     ]);
-    setData((prev) => ({ ...prev, gateway, spend }));
+    setData((prev) => ({ ...prev, gateway, spend, service }));
   }, []);
 
   useEffect(() => {
@@ -457,7 +468,14 @@ function GatewayTab({
   const [switchError, setSwitchError] = useState<string | null>(null);
   const [capInput, setCapInput] = useState("");
   const [capError, setCapError] = useState<string | null>(null);
-  const [serviceBusy, setServiceBusy] = useState(false);
+  /**
+   * Which service action is in flight, **by name** rather than as a boolean.
+   *
+   * Start and Remove are on screen at the same time now, so one shared flag would paint
+   * "Removing…" on the button the operator did not press. Naming the action is what lets each
+   * button report only its own work while every other one is merely disabled.
+   */
+  const [serviceBusy, setServiceBusy] = useState<string | null>(null);
   const [serviceError, setServiceError] = useState<string | null>(null);
 
   /**
@@ -538,6 +556,40 @@ function GatewayTab({
     }
   }
 
+  /**
+   * One shape for the four service buttons: clear the last error, run the action, report, re-read.
+   *
+   * `before` exists for exactly one caller — **Start** — and it is the port handover. The agent and
+   * the app's in-process listener bind the same port, so a `service_start` issued while the app
+   * gateway is up loads a job whose every spawn dies on `EADDRINUSE`: launchd reports it loaded,
+   * `KeepAlive` restarts it, and the card reads "Installed, not running" with nothing on screen to
+   * say why. The card used to instruct the operator to go and stop the gateway first; that
+   * instruction is now this function's first step, because a control that tells you to go and use
+   * another control has not finished being built.
+   *
+   * `gateway_disable` rather than the `toggle` above, deliberately: `toggle` also persists
+   * `enabled: false`, which would record that the operator switched the gateway off when what they
+   * did was hand the port over. Leaving the preference alone means the next launch restores the app
+   * gateway, finds the agent already on the port, and delegates (26t) rather than fighting for it.
+   */
+  async function serviceAction(
+    name: string,
+    action: () => Promise<unknown>,
+    before?: () => Promise<unknown>,
+  ) {
+    setServiceError(null);
+    setServiceBusy(name);
+    try {
+      if (before) await before();
+      await action();
+    } catch (e) {
+      setServiceError(String(e));
+    } finally {
+      setServiceBusy(null);
+      await refreshGateway();
+    }
+  }
+
   const health: Health = !g ? "unknown" : g.running ? "healthy" : "disabled";
 
   // "Serving" is the whole state now. It used to be qualified by the worker's beat — awake or
@@ -613,33 +665,39 @@ function GatewayTab({
       <div className="mt-3">
         <Card title="Login-item service">
           <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-            Runs the gateway as a system service, so it stays up after you quit the app. The service
-            and the in-app gateway bind the same port — only one can run at a time. Installing the
-            service while the app gateway is running is a bind conflict, not a handover.
+            Runs the gateway as a system service, so it stays up after you quit the app — no app
+            process needed, and it comes back at login. The service and the in-app gateway bind the
+            same port and only one can hold it, so <b>Start</b> stops the app gateway first.{" "}
+            <b>Stop</b> takes the job down until your next login, when launchd reads it again;{" "}
+            <b>Remove</b> is what makes it stay down.
           </p>
           {(() => {
             const s = d.service;
             const installed = s?.plistPresent ?? false;
             const loaded = s?.loaded ?? false;
             const pid = s?.pid ?? null;
+            // "Running" is the *pair*: launchd holding the job **and** a process behind it.
+            // `loaded` alone is a job between restarts — the shape a throttled `KeepAlive` leaves —
+            // and reporting that as running is how a card ends up hiding a gateway that is down.
+            const up = loaded && pid !== null;
             return (
               <div className="mt-2">
                 <div className="flex items-center gap-3 text-[13px]">
-                  <StatusDot health={loaded ? "healthy" : installed ? "degraded" : "unavailable"} />
+                  <StatusDot health={up ? "healthy" : installed ? "degraded" : "unavailable"} />
                   <span>
                     {s === null
                       ? "—"
-                      : loaded
-                        ? `Running${pid !== null ? ` (pid ${pid})` : ""}`
+                      : up
+                        ? `Running (pid ${pid})`
                         : installed
                           ? "Installed, not running"
                           : "Not installed"}
                   </span>
                 </div>
-                {running && installed && !loaded && (
+                {running && installed && !up && (
                   <p className="mt-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
-                    The app gateway is running and owns the port. Stop it before starting the service,
-                    or the service will fail to bind.
+                    The app gateway is running and owns the port. <b>Start</b> stops it first, then
+                    brings the service up — the two cannot hold the same port at once.
                   </p>
                 )}
                 {serviceError && (
@@ -648,33 +706,53 @@ function GatewayTab({
                 <div className="mt-2 flex items-center gap-2">
                   {!installed ? (
                     <Button
-                      disabled={serviceBusy || d.hostError !== null}
-                      onClick={() => {
-                        setServiceError(null);
-                        setServiceBusy(true);
-                        serviceInstall()
-                          .then(() => refreshGateway())
-                          .catch((e) => setServiceError(String(e)))
-                          .finally(() => setServiceBusy(false));
-                      }}
+                      disabled={serviceBusy !== null || d.hostError !== null}
+                      onClick={() => void serviceAction("install", serviceInstall)}
                     >
-                      {serviceBusy ? "Installing…" : "Install"}
+                      {serviceBusy === "install" ? "Installing…" : "Install"}
                     </Button>
                   ) : (
-                    <Button
-                      variant="danger"
-                      disabled={serviceBusy || d.hostError !== null}
-                      onClick={() => {
-                        setServiceError(null);
-                        setServiceBusy(true);
-                        serviceUninstall()
-                          .then(() => refreshGateway())
-                          .catch((e) => setServiceError(String(e)))
-                          .finally(() => setServiceBusy(false));
-                      }}
-                    >
-                      {serviceBusy ? "Removing…" : "Remove"}
-                    </Button>
+                    <>
+                      {/*
+                        **One button for both not-running shapes**, because the UI cannot tell them
+                        apart and the host can: `service::start` asks launchd whether it holds the job
+                        and picks `bootstrap` or `kickstart` accordingly. Two buttons here would be a
+                        second place to get that branch wrong — and the wrong branch is a silent
+                        no-op, since `bootstrap` of a label launchd already holds fails while the old
+                        job keeps running.
+                      */}
+                      {!up && (
+                        <Button
+                          variant="primary"
+                          disabled={serviceBusy !== null || d.hostError !== null}
+                          onClick={() =>
+                            void serviceAction(
+                              "start",
+                              serviceStart,
+                              // The handover, and only when there is a port to hand over.
+                              running ? () => invoke("gateway_disable") : undefined,
+                            )
+                          }
+                        >
+                          {serviceBusy === "start" ? "Starting…" : "Start"}
+                        </Button>
+                      )}
+                      {up && (
+                        <Button
+                          disabled={serviceBusy !== null || d.hostError !== null}
+                          onClick={() => void serviceAction("stop", serviceStop)}
+                        >
+                          {serviceBusy === "stop" ? "Stopping…" : "Stop"}
+                        </Button>
+                      )}
+                      <Button
+                        variant="danger"
+                        disabled={serviceBusy !== null || d.hostError !== null}
+                        onClick={() => void serviceAction("remove", serviceUninstall)}
+                      >
+                        {serviceBusy === "remove" ? "Removing…" : "Remove"}
+                      </Button>
+                    </>
                   )}
                 </div>
               </div>

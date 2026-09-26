@@ -10,7 +10,7 @@
  * Host-boundary discipline is preserved 1:1 with the real app:
  *   - router-core stays key-blind and performs no network I/O;
  *   - THIS module is the only place in the browser process that combines a secret with a
- *     request (it owns the keychain map and substitutes the `{{secret}}` sentinel), exactly
+ *     request (it owns the secrets map and substitutes the `{{secret}}` sentinel), exactly
  *     as `egress.rs` is the only such place in production, and as `e2e/host-http.ts` is in
  *     the live Node tests. Nothing else in the page ever sees a raw key.
  *
@@ -20,7 +20,7 @@
 import { seedByName, type SeedInput } from "./seeds";
 
 // ---------------------------------------------------------------------------
-// Store: the tables the Rust host owns (SQLite + keychain), in memory.
+// Store: the tables the Rust host owns (SQLite + secrets), in memory.
 // ---------------------------------------------------------------------------
 
 interface Row {
@@ -80,8 +80,8 @@ type DriftRow = {
 const drift: DriftRow[] = [];
 const audits: Row[] = [];
 const sessions: Row[] = [];
-/** secretRef (== key label) -> raw secret. The keychain. Never leaves this module. */
-const keychain = new Map<string, string>();
+/** secretRef (== key label) -> raw secret. Stands in for the host's secrets file. Never leaves this module. */
+const secrets = new Map<string, string>();
 let sessionSeq = 0;
 let auditSeq = 0;
 
@@ -114,6 +114,17 @@ const serviceStatus = {
   loaded: false,
   pid: null as number | null,
 };
+
+/**
+ * The commands the login-item card issued, in the order the screen issued them.
+ *
+ * `gateway_disable` is in here alongside the four `service_*` verbs because it is the *first half*
+ * of Start: the agent and the app's listener bind the same port, so Start has to release the port
+ * before it asks launchd for the job. An order between two commands cannot be asserted from two
+ * separate spies, and asserting it is the whole point — a Start that bootstrapped first and freed
+ * the port second would leave exactly the throttled job the button exists to clear.
+ */
+const serviceCallLog: string[] = [];
 
 /** D51: the UI's own credential for the admin HTTP surface. A spec sets this to the secret
  *  it wants `ui_session_key` to return; absent means the credential has not been configured. */
@@ -310,7 +321,7 @@ interface Snapshot {
   drift: DriftRow[];
   audits: Row[];
   sessions: Row[];
-  keychain: [string, string][];
+  secrets: [string, string][];
   contextNodes: Row[];
   contextEdges: Row[];
   skills: Row[];
@@ -331,7 +342,7 @@ function snapshot(): Snapshot {
     drift: [...drift],
     audits: [...audits],
     sessions: [...sessions],
-    keychain: [...keychain.entries()],
+    secrets: [...secrets.entries()],
     contextNodes: [...contextNodes],
     contextEdges: [...contextEdges],
     skills: [...skills],
@@ -362,8 +373,8 @@ function restore(s: Snapshot): void {
   audits.push(...s.audits);
   sessions.length = 0;
   sessions.push(...s.sessions);
-  keychain.clear();
-  for (const [ref, secret] of s.keychain) keychain.set(ref, secret);
+  secrets.clear();
+  for (const [ref, secret] of s.secrets) secrets.set(ref, secret);
   contextNodes.length = 0;
   contextNodes.push(...(s.contextNodes ?? []));
   contextEdges.length = 0;
@@ -422,7 +433,7 @@ function applySeed(s: SeedInput | null): void {
   for (const p of s.providers ?? []) providers.set(p.id, { ...p });
   for (const k of s.keys ?? []) {
     keys.set(k.id, { ...k });
-    if (k.secret) keychain.set(k.secretRef, k.secret);
+    if (k.secret) secrets.set(k.secretRef, k.secret);
   }
   for (const m of s.models ?? []) models.push({ ...m });
   for (const m of s.manifests ?? []) manifests.push({ ...m });
@@ -603,6 +614,12 @@ let eventSeq = 0;
   serviceStatus: (next: Partial<typeof serviceStatus>): void => {
     Object.assign(serviceStatus, next);
   },
+  /** The service-card commands the screen has issued, oldest first. See `serviceCallLog`. */
+  serviceCalls: (): string[] => [...serviceCallLog],
+  /** Clear the log, so a spec asserts the calls *its own* click made, not the mount's. */
+  resetServiceCalls: (): void => {
+    serviceCallLog.length = 0;
+  },
   /**
    * Set the credential `ui_session_key` returns, and that `/admin/*` accepts.
    *
@@ -741,7 +758,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     }
     case "api_key_delete": {
       const k = keys.get(args.id as string);
-      if (k) keychain.delete(k.secretRef);
+      if (k) secrets.delete(k.secretRef);
       keys.delete(args.id as string);
       return null;
     }
@@ -867,12 +884,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return row.id;
     }
 
-    // ---- keychain (the secret goes IN once and never comes OUT) ----
+    // ---- secrets (the secret goes IN once and never comes OUT) ----
     case "vault_put":
-      keychain.set(args.account as string, args.secret as string);
+      secrets.set(args.account as string, args.secret as string);
       return null;
     case "vault_delete":
-      keychain.delete(args.account as string);
+      secrets.delete(args.account as string);
       return null;
 
     // ---- egress: the host boundary. Sentinel substitution happens HERE. ----
@@ -1642,9 +1659,25 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "service_status":
       return { ...serviceStatus };
     case "service_install":
+      serviceCallLog.push("service_install");
       throw new Error("service_install: the browser harness has no launchd to install into");
     case "service_uninstall":
+      serviceCallLog.push("service_uninstall");
       throw new Error("service_uninstall: the browser harness has no launchd to remove from");
+    /*
+     * Recorded, then refused — refused for the same reason the two above are: the harness has no
+     * launchd, and a shim that *pretended* to start a job would let a spec assert a lifecycle no
+     * real machine performs, which is the class this file's own `service_status` note warns about.
+     * What is testable here is the screen's wiring, and the log is where it is observable: that
+     * Start calls `service_start`, that Stop calls `service_stop`, and that Start releases the port
+     * first.
+     */
+    case "service_start":
+      serviceCallLog.push("service_start");
+      throw new Error("service_start: the browser harness has no launchd to start a job in");
+    case "service_stop":
+      serviceCallLog.push("service_stop");
+      throw new Error("service_stop: the browser harness has no launchd to stop a job in");
 
     // ---- gateway listener and its keys (R4) ----
     case "gateway_enable": {
@@ -1653,6 +1686,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return port; // the command answers with the port it bound
     }
     case "gateway_disable":
+      // Logged because Start calls this as the handover's first half — see `serviceCallLog`.
+      serviceCallLog.push("gateway_disable");
       gatewayStatus.running = false;
       return null;
     case "gateway_key_generate":
@@ -1842,7 +1877,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 //     anything is parsed, which is the same rule enforced by hand.
 // ---------------------------------------------------------------------------
 
-/** Stands in for the `ak-ui` secret `core/ui_session.rs` mints into the keychain. */
+/** Stands in for the `ak-ui` secret `core/ui_session.rs` mints into the secrets. */
 const UI_SESSION_SECRET = "ak-ui-web-test-secret";
 
 /** Mint on first ask, the way `ui_session::ensure` does — see the `ui_session_key` case. */
@@ -1995,7 +2030,7 @@ async function routeAdmin(method: string, segs: string[], q: URLSearchParams, bo
         };
         appKeys.push(row);
         // The secret crosses the wire exactly once, as it does in `AppKeyCreated`. The
-        // harness has no keychain, so it is generated here and not retained.
+        // harness has no secrets, so it is generated here and not retained.
         return { id, label, secret: `sk-aip-${id}-${Math.random().toString(16).slice(2, 10)}` };
       }
       if (method === "DELETE" && segs.length === 3) {
@@ -2406,7 +2441,7 @@ function isLocal(host: string): boolean {
  */
 function resolveSecret(secretRef: string): { secret: string; expectedHost: string } {
   const k = [...keys.values()].find((k) => k.secretRef === secretRef);
-  if (!k) throw new Error(`secret ${secretRef} not found in keychain (re-enter the key)`);
+  if (!k) throw new Error(`secret ${secretRef} not found in secrets (re-enter the key)`);
   const p = providers.get(k.providerId);
   if (!p) throw new Error(`secret ${secretRef} has no provider (re-enter the key)`);
   let expectedHost: string;
@@ -2415,8 +2450,8 @@ function resolveSecret(secretRef: string): { secret: string; expectedHost: strin
   } catch {
     throw new Error(`provider ${p.slug} has an invalid baseUrl`);
   }
-  const secret = keychain.get(secretRef);
-  if (secret === undefined) throw new Error(`secret ${secretRef} not found in keychain (re-enter the key)`);
+  const secret = secrets.get(secretRef);
+  if (secret === undefined) throw new Error(`secret ${secretRef} not found in secrets (re-enter the key)`);
   return { secret, expectedHost };
 }
 

@@ -201,7 +201,7 @@ export function createKeyVaultPort(): KeyVaultPort {
     },
     async get() {
       // Intentionally unsupported: TS is key-blind (invariant 2). The egress gateway reads
-      // the keychain host-side.
+      // the secrets file host-side.
       throw new Error("vault.get is not callable from the webview (key-blind by construction)");
     },
     async delete(secretRef) {

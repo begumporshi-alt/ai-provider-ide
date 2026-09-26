@@ -302,7 +302,7 @@ day one.
 - **macOS:** `launchd` LaunchAgent plist
 - **Windows:** Windows Service via `windows-service` crate (or `sc` CLI for registration)
 - **Linux:** `systemd` user service unit file
-- **Tauri app changes:** Service discovery (`GET /health`), install/uninstall UI, status indicator
+- **Tauri app changes:** Service discovery (`GET /health`), install/uninstall/start/stop UI, status indicator. The app and the service contend for one port on every platform, so the UI owns the handover — starting the service stops the app's own listener first (26y)
 - **CI gate:** Build and package on all three platforms
 
 **Total: 11-17 weeks.** The wide range depends on how the execution engine port goes — it is the

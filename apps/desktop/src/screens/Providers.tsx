@@ -193,8 +193,8 @@ export function ProvidersScreen() {
         <Modal title={confirmDelete.kind === "provider" ? `Remove ${confirmDelete.name}?` : `Remove ${confirmDelete.name}?`} onClose={() => setConfirmDelete(null)}>
           <p className="mb-4 text-[13px]" style={{ color: "var(--text-dim)" }}>
             {confirmDelete.kind === "provider"
-              ? "Removes the provider, its keys (including their keychain entries), manifests, and catalog rows. Activity history is preserved."
-              : "The keychain entry is deleted in the same operation."}
+              ? "Removes the provider, its keys (including their stored secrets), manifests, and catalog rows. Activity history is preserved."
+              : "The stored secret is deleted in the same operation."}
           </p>
           <div className="flex justify-end gap-2">
             <Button onClick={() => setConfirmDelete(null)}>Cancel</Button>
@@ -222,9 +222,9 @@ function FirstRunHero({ onAdd }: { onAdd: () => void }) {
     <div className="rounded-md border p-8 text-center" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
       <h2 className="text-[18px] font-semibold">Connect your first provider</h2>
       <p className="mx-auto mt-2 max-w-md text-[13px]" style={{ color: "var(--text-dim)" }}>
-        OpenRouter, OpenCode Zen and b.ai live in about two minutes. Keys are stored in your OS
-        keychain — this app never writes them to disk, and nothing leaves your machine except
-        requests to the providers you configure.
+        OpenRouter, OpenCode Zen and b.ai live in about two minutes. Keys are stored in a local
+        secrets file that only your user account can read (mode 600), never in the database, and
+        nothing leaves your machine except requests to the providers you configure.
       </p>
       <div className="mt-5 flex justify-center">
         <Button variant="primary" onClick={onAdd}>Add Provider</Button>
@@ -452,7 +452,7 @@ function AddKeyModal({
       <Field label="Label">
         <input className={inputCls} style={inputStyle} value={label} onChange={(e) => setLabel(e.target.value)} />
       </Field>
-      <Field label="API key (stored in your OS keychain)">
+      <Field label="API key (stored in a local secrets file)">
         <input className={`${inputCls} mono`} type="password" style={inputStyle} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="sk-…" autoFocus />
       </Field>
       {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}

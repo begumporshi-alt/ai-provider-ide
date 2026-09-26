@@ -237,17 +237,17 @@ test("OpenRouter: image models are discovered from provider metadata, not their 
  * The gateway's HTTP surface is served by the Rust host, not by this page, so there is nothing
  * on :8787 to call here — and a spec that reached for it would pass or fail depending on
  * whether a real app happened to be running. What this harness *can* verify is the one
- * security property the screen owns: the master key lives in the OS keychain and is never
+ * security property the screen owns: the master key lives in a local secrets file and is never
  * rendered, so there is no token on the page to scrape.
  */
-test("gateway: the master key is keychain-resident and never rendered", async ({ page }) => {
+test("gateway: the master key is file-resident and never rendered", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Gateway" }).click();
 
   // `exact` — the snippets below contain "<master key>" and would otherwise match too.
   await expect(page.getByText("Master key", { exact: true })).toBeVisible({ timeout: 10_000 });
-  // Either "stored in your OS keychain" or "none yet" — both are the screen refusing to print it.
-  await expect(page.getByText(/keychain|None yet/)).toBeVisible();
+  // Either "stored in a local secrets file" or "none yet" — both are the screen refusing to print it.
+  await expect(page.getByText(/secrets file|None yet/)).toBeVisible();
   await expect(page.getByText(/sk-[a-z0-9]{8,}/)).toHaveCount(0);
 });
 

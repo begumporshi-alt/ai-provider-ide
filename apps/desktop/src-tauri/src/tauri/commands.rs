@@ -740,6 +740,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         // runs `aiproviderd` without the app.
         crate::tauri::service_cmds::service_install,
         crate::tauri::service_cmds::service_uninstall,
+        crate::tauri::service_cmds::service_start,
+        crate::tauri::service_cmds::service_stop,
         crate::tauri::service_cmds::service_status,
         // D51: the UI's own credential for the admin HTTP surface. Returns the secret so the
         // webview can authenticate to `/admin/*` over `fetch()` — the enabler the pure-HTTP

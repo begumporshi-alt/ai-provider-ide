@@ -1,4 +1,4 @@
-//! The three service commands, re-attached to Tauri.
+//! The five service commands, re-attached to Tauri.
 //!
 //! **The logic lives in `core::service`, and these wrappers add none** — the same rule
 //! `tools_cmds.rs` states for the tool host, and for the same reason. If one of them grows a line
@@ -68,6 +68,27 @@ pub fn service_install(app: tauri::AppHandle) -> Result<service::Paths, String> 
 pub fn service_uninstall(app: tauri::AppHandle) -> Result<(), String> {
     let (paths, domain) = context(&app)?;
     service::uninstall(&paths, &domain, &service::run_launchctl).map_err(|e| e.to_string())
+}
+
+/// Bring the installed job up — `bootstrap` if launchd has never had it, `kickstart` if it holds it
+/// but is not running it. See `service::start`; the branch is there because `bootstrap` refuses a
+/// label launchd already holds, and the throttled-after-a-restart state is exactly that.
+///
+/// **This is the command that has to run in the app.** Registering a `LaunchAgent` needs an Aqua
+/// session, and the app is the process that has one — which is the whole reason the login-item
+/// control is a button rather than a line in the README. `aiproviderd install` from a shell without
+/// a session answers `5: Input/output error`.
+#[tauri::command]
+pub fn service_start(app: tauri::AppHandle) -> Result<(), String> {
+    let (paths, domain) = context(&app)?;
+    service::start(&paths, &domain, &service::run_launchctl).map_err(|e| e.to_string())
+}
+
+/// Take the job down without uninstalling it: the plist survives, so `service_start` brings it back.
+#[tauri::command]
+pub fn service_stop(app: tauri::AppHandle) -> Result<(), String> {
+    let (paths, domain) = context(&app)?;
+    service::stop(&paths, &domain, &service::run_launchctl).map_err(|e| e.to_string())
 }
 
 /// Is the service installed, is launchd holding it, and is it up?

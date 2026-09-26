@@ -4,7 +4,7 @@
  * after restart (§2.1 state persistence). The AI-assisted path shows as locked until the
  * first provider is live (§2.9 bootstrap guard) — Phase 4 wires it.
  *
- * Cancellation removes everything the wizard created (provider row + keychain entry).
+ * Cancellation removes everything the wizard created (provider row + stored secret).
  */
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
@@ -126,7 +126,7 @@ export function OnboardingScreen() {
   }, []);
 
   /** Restart the wizard from a saved session: re-attach provider/key rows (the key lives in
-   *  the keychain — the secret itself is never re-needed) and jump to the saved step. */
+   *  the secrets file — the secret itself is never re-needed) and jump to the saved step. */
   const resumeSession = useCallback(
     async (saved: OnboardingSessionData & { rowId?: number }) => {
       setResumable(null);
@@ -597,7 +597,7 @@ export function OnboardingScreen() {
           <ul className="mb-3 list-disc pl-5 text-[13px]" style={{ color: "var(--text-dim)" }}>
             <li>dialect: <span className="mono">{dialect}</span></li>
             <li>base URL: <span className="mono">{orchRef.current?.session.input.baseUrl}</span></li>
-            <li>key: {refs.current?.keyLabel} (stored in your OS keychain)</li>
+            <li>key: {refs.current?.keyLabel} (stored in a local secrets file)</li>
             {contract && <li>tests: {contract.checks.filter((c) => c.pass).length}/{contract.checks.length} passed</li>}
           </ul>
           <div className="flex gap-2">
@@ -633,7 +633,7 @@ function ConnectForm({
   return (
     <Section title="Connect">
       <p className="mb-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
-        Name, base URL and an API key. The key goes straight to your OS keychain; the IDE probes the API
+        Name, base URL and an API key. The key goes straight to a local secrets file; the IDE probes the API
         (free requests only) to figure out how it behaves.
       </p>
       <Field label="Name">
@@ -642,7 +642,7 @@ function ConnectForm({
       <Field label="Base URL">
         <input className={`${inputCls} mono`} style={inputStyle} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
       </Field>
-      <Field label="API key (stored in your OS keychain)">
+      <Field label="API key (stored in a local secrets file)">
         <input className={`${inputCls} mono`} style={inputStyle} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
       </Field>
       <Field label="Docs URL (optional)">

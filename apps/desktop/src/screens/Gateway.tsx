@@ -11,7 +11,7 @@ import { readGatewaySettings, type GatewayStatus } from "../store";
 import { fetchAdmin } from "../lib/gateway-client";
 
 /**
- * Audit R4: metadata only — the secret lives in the keychain and is never returned here.
+ * Audit R4: metadata only — the secret lives in the local secrets file and is never returned here.
  *
  * `capMicros` and `monthMicros` are 0017's per-app budget: what this app may spend in the month,
  * and what it has spent. `monthMicros` counts only rows written since attribution landed
@@ -239,7 +239,7 @@ export function GatewayScreen() {
           <div>
             <span className="text-[13px]">Master key</span>
             <p className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-              {status?.hasKey ? "Stored in your OS keychain. Shown once on generation; reveal = copy to clipboard (never shown here)." : "None yet — starting the gateway on Control generates one."}
+              {status?.hasKey ? "Stored in a local secrets file (mode 600), not the database. Shown once on generation; reveal = copy to clipboard (never shown here)." : "None yet — starting the gateway on Control generates one."}
             </p>
           </div>
           <div className="flex gap-2">

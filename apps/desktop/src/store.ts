@@ -635,7 +635,7 @@ export async function addKey(providerId: string, label: string, secret: string):
 }
 
 export async function deleteKey(id: string): Promise<void> {
-  await fetchAdmin("DELETE", `/admin/api-keys/${id}`); // host removes the keychain entry too (§7)
+  await fetchAdmin("DELETE", `/admin/api-keys/${id}`); // host removes the stored secret too (§7)
   await refreshFromHost();
 }
 
@@ -1288,6 +1288,20 @@ export async function serviceInstall(): Promise<ServicePaths> {
 
 export async function serviceUninstall(): Promise<void> {
   return invoke("service_uninstall");
+}
+
+/**
+ * Bring the installed service up. `bootstrap` if launchd has never had it, `kickstart` if it holds
+ * it but is not running it — the branch lives host-side in `service::start`, because `bootstrap`
+ * refuses a label launchd already holds and the UI cannot tell the two apart from `ServiceStatus`.
+ */
+export async function serviceStart(): Promise<void> {
+  return invoke("service_start");
+}
+
+/** Take the service down without uninstalling it: the plist survives, so `serviceStart` restores it. */
+export async function serviceStop(): Promise<void> {
+  return invoke("service_stop");
 }
 
 /**

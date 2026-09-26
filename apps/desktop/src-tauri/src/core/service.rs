@@ -379,6 +379,85 @@ pub fn uninstall(
     Ok(())
 }
 
+/// Bring an installed job up, whichever of the two not-running shapes it is in.
+///
+/// **Two verbs, because `bootstrap` refuses a label launchd already holds.** An installed job that
+/// is not running is either unknown to launchd — the state `stop` leaves — or held but not up,
+/// which is what `KeepAlive` leaves behind after a restart it then throttled. Only `kickstart`
+/// revives the second, and `bootstrap` fails on it with "service already loaded". Asking launchd
+/// which case this is costs one `print` and is what makes `start` idempotent, rather than something
+/// that only works if the caller read `status` first and picked a button accordingly.
+///
+/// **The plist must be on disk**, and that is checked here rather than left to `bootstrap`: handing
+/// launchd a path that does not exist fails with a message that names neither the path nor the
+/// remedy. `stop` keeps the plist, so a stopped service starts again without a reinstall; only
+/// `uninstall` removes it.
+///
+/// **`bootstrap` returning 0 is not the same claim as the job running.** It registers the job; the
+/// program is exec'd afterwards. So a `start` that succeeds against a port another process owns
+/// still leaves a gateway that never answers — which is why the UI polls `status` for a pid rather
+/// than trusting this call's return.
+pub fn start(
+    p: &Paths,
+    domain: &str,
+    run: &impl Fn(&[&str]) -> Result<Outcome, String>,
+) -> Result<(), ServiceError> {
+    if !p.plist.is_file() {
+        return Err(ServiceError(format!(
+            "{} is not installed — install the service before starting it",
+            p.plist.display()
+        )));
+    }
+    let target = format!("{domain}/{}", p.label);
+    let loaded = matches!(run(&["print", &target])?, Outcome { status: 0, .. });
+    let plist = p.plist.display().to_string();
+    // The message names what `install`'s names — the domain *and* the plist for `bootstrap` — so an
+    // operator reading one failure can compare it with the other. The first draft named only the
+    // plist, which dropped the domain the call was actually given; the test below caught it.
+    let (what, out) = if loaded {
+        (format!("kickstart -k {target}"), run(&["kickstart", "-k", &target])?)
+    } else {
+        (format!("bootstrap {domain} {plist}"), run(&["bootstrap", domain, &plist])?)
+    };
+    if out.status != 0 {
+        return Err(ServiceError(format!(
+            "launchctl {what} failed ({}): {}",
+            out.status,
+            first_line(&out)
+        )));
+    }
+    Ok(())
+}
+
+/// Take the job down **without uninstalling it**: `bootout` unloads the job and stops the process,
+/// and the plist stays on disk so `start` brings it back.
+///
+/// **`kill` is not the verb here, and `KeepAlive` is why.** Signalling the process leaves launchd
+/// free to restart it — which is exactly what the plist asks for — so a "stop" built on `kill`
+/// would appear to work and then quietly come back. Unloading the job is the only way to stop
+/// something `KeepAlive` is watching.
+///
+/// **The cost is that the job is unloaded only until the next login.** The plist lives in
+/// `~/Library/LaunchAgents`, which launchd re-reads at login, so `stop` means "off for now" and
+/// `uninstall` is the way to make it stay off. That is stated rather than hidden because an
+/// operator who wanted "off" and got "off until tomorrow" has been misled by the control.
+pub fn stop(
+    p: &Paths,
+    domain: &str,
+    run: &impl Fn(&[&str]) -> Result<Outcome, String>,
+) -> Result<(), ServiceError> {
+    let target = format!("{domain}/{}", p.label);
+    let out = run(&["bootout", &target])?;
+    if out.status != 0 {
+        return Err(ServiceError(format!(
+            "launchctl bootout {target} failed ({}): {}",
+            out.status,
+            first_line(&out)
+        )));
+    }
+    Ok(())
+}
+
 /// What the UI needs to answer "is the service running": whether it is installed, whether
 /// launchd has it, and — if it is up — its pid.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -469,6 +548,25 @@ mod tests {
                 .borrow_mut()
                 .pop_front()
                 .unwrap_or_else(|| Err("the script ran out of answers".to_string()))
+        }
+
+        /// Answers each invocation from the list, in order — for the functions whose *second* call
+        /// depends on what the *first* one answered.
+        ///
+        /// `ok` cannot express that: it gives every call the same status, so a `start` that asks
+        /// launchd whether the job is loaded would read `loaded = true` from the same answer that
+        /// was meant for `bootstrap`. Running out is an error rather than a repeat, so a test that
+        /// makes one call too many fails instead of quietly passing.
+        fn scripted(answers: &[(i32, &str, &str)]) -> Recorder {
+            let mut q = VecDeque::new();
+            for (status, stdout, stderr) in answers {
+                q.push_back(Ok(Outcome {
+                    status: *status,
+                    stdout: stdout.to_string(),
+                    stderr: stderr.to_string(),
+                }));
+            }
+            Recorder { calls: RefCell::new(Vec::new()), answers: RefCell::new(q) }
         }
 
         fn calls(&self) -> Vec<Vec<String>> {
@@ -795,6 +893,100 @@ mod tests {
         let rec = Recorder::ok(0, "");
         // Nothing on disk. `bootout` of an unknown job fails, and that must not surface.
         uninstall(&p, DOMAIN, &|a| rec.run(a)).unwrap();
+    }
+
+    /* ---------------------------------- start ---------------------------------- */
+
+    #[test]
+    fn start_bootstraps_a_job_launchd_does_not_have() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        // `print` answers non-zero for a job launchd does not hold — the state `stop` leaves, and
+        // the only one `bootstrap` accepts.
+        let rec = Recorder::scripted(&[(1, "", ""), (0, "", "")]);
+        start(&p, DOMAIN, &|a| rec.run(a)).unwrap();
+        let calls = rec.calls();
+        assert_eq!(calls[0], vec!["print".to_string(), format!("{DOMAIN}/{LABEL}")]);
+        assert_eq!(
+            calls[1],
+            vec!["bootstrap".to_string(), DOMAIN.to_string(), p.plist.display().to_string()],
+            "an unloaded job is started by handing launchd its plist: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn start_kickstarts_a_job_launchd_already_holds() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        // Loaded with no pid: the shape `KeepAlive` leaves behind after a restart it then
+        // throttled. `bootstrap` refuses a label launchd already holds, so the same call has to
+        // reach for `kickstart` — which is the whole reason `start` asks before it acts.
+        let rec = Recorder::scripted(&[(0, "{\n\tstate = waiting;\n}\n", ""), (0, "", "")]);
+        start(&p, DOMAIN, &|a| rec.run(a)).unwrap();
+        let calls = rec.calls();
+        assert_eq!(
+            calls[1],
+            vec!["kickstart".to_string(), "-k".to_string(), format!("{DOMAIN}/{LABEL}")],
+            "a job launchd holds is restarted, not bootstrapped: {calls:?}"
+        );
+    }
+
+    #[test]
+    fn start_refuses_before_touching_launchd_when_the_plist_is_absent() {
+        let (p, _dir) = scratch();
+        // Nothing installed. There is no plist to hand launchd, and `bootstrap` would fail on a path
+        // that does not exist with a message naming neither. `Recorder::ok` answers 0 to everything,
+        // so a `start` that wrongly asked launchd anything would *succeed* and fail this test on the
+        // `expect_err` — the detector is the call, not the status.
+        let rec = Recorder::ok(0, "");
+        let err = start(&p, DOMAIN, &|a| rec.run(a)).expect_err("no plist is not a start");
+        assert!(err.to_string().contains("not installed"), "{err}");
+        assert!(err.to_string().contains(&p.plist.display().to_string()), "{err}");
+        assert!(rec.calls().is_empty(), "nothing may be run: {:?}", rec.calls());
+    }
+
+    #[test]
+    fn a_start_launchd_refuses_is_an_error_not_a_silent_success() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        let rec =
+            Recorder::scripted(&[(1, "", ""), (5, "", "Bootstrap failed: 5: Input/output error")]);
+        let err = start(&p, DOMAIN, &|a| rec.run(a)).unwrap_err();
+        assert!(err.to_string().contains("bootstrap"), "{err}");
+        assert!(err.to_string().contains(DOMAIN), "the error must name the domain: {err}");
+        assert!(err.to_string().contains("Input/output error"), "{err}");
+    }
+
+    /* ---------------------------------- stop ---------------------------------- */
+
+    #[test]
+    fn stop_boots_the_job_out_and_leaves_it_installed() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        std::fs::create_dir_all(p.binary.parent().unwrap()).unwrap();
+        std::fs::write(&p.binary, b"stand-in").unwrap();
+        let rec = Recorder::scripted(&[(0, "", "")]);
+        stop(&p, DOMAIN, &|a| rec.run(a)).unwrap();
+        assert_eq!(
+            rec.calls(),
+            vec![vec!["bootout".to_string(), format!("{DOMAIN}/{LABEL}")]],
+            "stop unloads the job; it does not delete anything"
+        );
+        // The distinction from `uninstall`, asserted rather than implied: both files survive, so
+        // `start` brings the job back without a reinstall. A `stop` that removed the plist would
+        // make the Start button unreachable the moment anyone used Stop.
+        assert!(p.plist.is_file(), "stop must not uninstall the plist");
+        assert!(p.binary.is_file(), "stop must not uninstall the binary");
+    }
+
+    #[test]
+    fn a_stop_launchd_refuses_is_an_error_not_a_silent_success() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        let rec = Recorder::scripted(&[(5, "", "Bootout failed: 5: Input/output error")]);
+        let err = stop(&p, DOMAIN, &|a| rec.run(a)).unwrap_err();
+        assert!(err.to_string().contains("bootout"), "{err}");
+        assert!(err.to_string().contains("Input/output error"), "{err}");
     }
 
     /* --------------------------------- status ---------------------------------- */
