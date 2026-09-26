@@ -132,13 +132,31 @@ describe("ProviderLimiter", () => {
   });
 
   it("release is idempotent — a double release cannot leak capacity", () => {
-    const lim = new ProviderLimiter(1);
-    const rel = lim.acquire("p1")!;
-    rel();
-    rel();
-    rel();
-    expect(lim.inFlightCount("p1")).toBe(0);
-    expect(lim.acquire("p1")).not.toBeNull(); // still admits after over-release
+    // Cap **2**, not 1. This test used cap 1 and could not fail: the first release deletes the
+    // entry, so the second computes `0 - 1`, takes the `next <= 0` branch and deletes again — a
+    // no-op with or without the `released` flag. Measured 2026-09-23: deleting the flag left it
+    // **passing** (1 passed / 272 skipped), so the name claimed a property the check could not see
+    // (drift D18). The property only bites while a second permit is still held: releasing one
+    // twice would drop the count from 2 to 0, the limiter would admit two more, and three
+    // attempts would run concurrently against a cap of two.
+    const lim = new ProviderLimiter(2);
+    const relA = lim.acquire("p1")!;
+    const relB = lim.acquire("p1")!;
+    expect(lim.inFlightCount("p1")).toBe(2);
+
+    relA();
+    relA(); // the over-release: must not decrement a second time
+    relA();
+    expect(lim.inFlightCount("p1")).toBe(1); // B is still in flight
+
+    // The cap must still hold: one slot free, the third acquire refused. Without the flag the
+    // count would be 0 by now and both acquires below would succeed — that is the leak.
+    expect(lim.acquire("p1")).not.toBeNull();
+    expect(lim.acquire("p1")).toBeNull();
+    expect(lim.inFlightCount("p1")).toBe(2);
+
+    relB();
+    expect(lim.inFlightCount("p1")).toBe(1); // the third permit, still held
   });
 
   it("treats a non-positive cap as unlimited", () => {
