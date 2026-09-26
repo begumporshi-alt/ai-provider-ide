@@ -34,9 +34,7 @@ struct Cache {
 
 impl Cache {
     fn new() -> Self {
-        Self {
-            map: Mutex::new(HashMap::new()),
-        }
+        Self { map: Mutex::new(HashMap::new()) }
     }
 
     fn get(&self, account: &str) -> Option<String> {
@@ -79,20 +77,14 @@ fn default_data_dir() -> std::path::PathBuf {
             .map(std::path::PathBuf::from)
             .or_else(|| {
                 std::env::var_os("HOME")
-                    .map(|h| {
-                        std::path::PathBuf::from(h)
-                            .join(".local/share")
-                            .join(SERVICE)
-                    })
+                    .map(|h| std::path::PathBuf::from(h).join(".local/share").join(SERVICE))
             })
             .unwrap_or_else(|| std::path::PathBuf::from(SERVICE))
     }
 }
 
 fn secrets_path() -> std::path::PathBuf {
-    DATA_DIR
-        .get_or_init(default_data_dir)
-        .join(SECRETS_FILE)
+    DATA_DIR.get_or_init(default_data_dir).join(SECRETS_FILE)
 }
 
 /// Load the secrets file into the cache. Runs once per process.
@@ -117,11 +109,10 @@ fn save() -> Result<(), std::io::Error> {
         std::fs::create_dir_all(parent)?;
     }
     let map = cache().map.lock().unwrap();
-    let json =
-        serde_json::to_string_pretty(&HashMap::<String, String>::from_iter(
-            map.iter().map(|(k, v)| (k.clone(), v.clone())),
-        ))
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let json = serde_json::to_string_pretty(&HashMap::<String, String>::from_iter(
+        map.iter().map(|(k, v)| (k.clone(), v.clone())),
+    ))
+    .map_err(std::io::Error::other)?;
 
     let tmp = path.with_extension("json.tmp");
     std::fs::write(&tmp, json.as_bytes())?;
@@ -139,10 +130,7 @@ fn save() -> Result<(), std::io::Error> {
 pub fn put(account: &str, secret: &str) -> Result<(), VaultError> {
     load();
     cache().put(account, secret);
-    save().map_err(|source| VaultError::File {
-        account: account.into(),
-        source,
-    })?;
+    save().map_err(|source| VaultError::File { account: account.into(), source })?;
     Ok(())
 }
 
@@ -154,10 +142,7 @@ pub fn get(account: &str) -> Result<Option<String>, VaultError> {
 pub fn delete(account: &str) -> Result<(), VaultError> {
     load();
     cache().remove(account);
-    save().map_err(|source| VaultError::File {
-        account: account.into(),
-        source,
-    })?;
+    save().map_err(|source| VaultError::File { account: account.into(), source })?;
     Ok(())
 }
 

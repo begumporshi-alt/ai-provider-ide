@@ -25,8 +25,7 @@ use ai_provider_router_lib::core::{
     persist,
     router::{RouterSettings, RouterStore, SharedRouterState},
     router_bridge::{BridgeHost, RouterBridge},
-    service,
-    store,
+    service, store,
 };
 use tokio::runtime::Handle;
 
@@ -122,7 +121,7 @@ fn cmd_install() {
         }
     };
 
-    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+    let domain = match service::read_uid().map(service::domain) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("aiproviderd install: cannot resolve the launchd domain: {e}");
@@ -132,7 +131,9 @@ fn cmd_install() {
 
     match service::install(&paths, &exe, &domain, &service::run_launchctl) {
         Ok(()) => {
-            println!("aiproviderd: installed. The gateway will start at login and restart on failure.");
+            println!(
+                "aiproviderd: installed. The gateway will start at login and restart on failure."
+            );
             println!("Check status with: aiproviderd status");
         }
         Err(e) => {
@@ -150,7 +151,7 @@ fn cmd_uninstall() {
     });
 
     let paths = service::paths(&home, &data_dir);
-    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+    let domain = match service::read_uid().map(service::domain) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("aiproviderd uninstall: cannot resolve the launchd domain: {e}");
@@ -159,7 +160,9 @@ fn cmd_uninstall() {
     };
 
     match service::uninstall(&paths, &domain, &service::run_launchctl) {
-        Ok(()) => println!("aiproviderd: uninstalled. The agent plist and binary copy have been removed."),
+        Ok(()) => {
+            println!("aiproviderd: uninstalled. The agent plist and binary copy have been removed.")
+        }
         Err(e) => {
             eprintln!("aiproviderd uninstall failed: {e}");
             std::process::exit(1);
@@ -175,7 +178,7 @@ fn cmd_status() {
     });
 
     let paths = service::paths(&home, &data_dir);
-    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+    let domain = match service::read_uid().map(service::domain) {
         Ok(d) => d,
         Err(e) => {
             eprintln!("aiproviderd status: cannot resolve the launchd domain: {e}");
@@ -214,20 +217,16 @@ fn cmd_self_install() {
     // Pick the user-writable bin dir.
     let candidates = [
         PathBuf::from("/opt/homebrew/bin"), // Apple Silicon + Homebrew
-        PathBuf::from("/usr/local/bin"),     // Intel + Homebrew, or manual install
+        PathBuf::from("/usr/local/bin"),    // Intel + Homebrew, or manual install
     ];
 
-    let target_dir = candidates
-        .iter()
-        .find(|d| d.exists())
-        .cloned()
-        .unwrap_or_else(|| {
-            eprintln!(
-                "aiproviderd self-install: neither /opt/homebrew/bin nor /usr/local/bin exists. \
+    let target_dir = candidates.iter().find(|d| d.exists()).cloned().unwrap_or_else(|| {
+        eprintln!(
+            "aiproviderd self-install: neither /opt/homebrew/bin nor /usr/local/bin exists. \
                  Install one of them first, or add the binary's directory to PATH manually."
-            );
-            std::process::exit(1);
-        });
+        );
+        std::process::exit(1);
+    });
 
     let target = target_dir.join("aiproviderd");
 
@@ -236,13 +235,12 @@ fn cmd_self_install() {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ = std::fs::set_permissions(
-                    &target,
-                    std::fs::Permissions::from_mode(0o755),
-                );
+                let _ = std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755));
             }
             println!("aiproviderd: installed to {}", target.display());
-            println!("You can now run: aiproviderd install, aiproviderd status, aiproviderd uninstall");
+            println!(
+                "You can now run: aiproviderd install, aiproviderd status, aiproviderd uninstall"
+            );
         }
         Err(e) => {
             eprintln!(
@@ -272,10 +270,8 @@ fn cmd_mint() {
     ai_provider_router_lib::core::vault::set_data_dir(&data_dir);
 
     // Check if a key already exists; if so, replace it (rotate).
-    let had_existing = ai_provider_router_lib::core::vault::get("masterkey")
-        .ok()
-        .flatten()
-        .is_some();
+    let had_existing =
+        ai_provider_router_lib::core::vault::get("masterkey").ok().flatten().is_some();
 
     let full_key = ai_provider_router_lib::core::gateway::generate_random_key();
 
@@ -303,7 +299,7 @@ async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
 
     // Subcommands that must run before the tokio runtime / store setup.
-    let sub = args.get(0).map(|s| s.as_str());
+    let sub = args.first().map(String::as_str);
     if let Some(cmd) = sub {
         match cmd {
             "install" => {
