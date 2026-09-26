@@ -4320,6 +4320,49 @@ untouched, which are the surfaces a reader meets first. All of it is re-worded, 
 renamed `secrets`, and the absence is asserted with a control grep so the instrument is known to report
 presence. See D62.
 
+### Increment 26aa — Start's handover gets an undo, and the `EIO` that is not a defect
+
+**The defect the operator found, in the first minute of use.** Pressing **Start** with the app gateway running
+turned the gateway off and then failed:
+
+```
+launchctl bootstrap gui/501 /Users/…/dev.aiprovider.router.plist failed (5): Bootstrap failed: 5: Input/output error
+```
+
+leaving the app gateway **off** and no service — nothing serving. The handover is destructive-first by necessity
+(`gateway_disable` must release the port before the service can bind it), but 26y shipped it with no undo, so a
+failed second step left a state strictly worse than either one the operator started from. `serviceAction` now
+takes `{ run, undo }` and runs the undo when the action throws *after* `run` succeeded; `Start` undoes with
+`gateway_enable`, which is runtime-only and therefore symmetric with `gateway_disable` — **not** `toggle(true)`,
+which would persist an `enabled: true` the handover never changed. A failed undo is reported *alongside* the
+original error rather than replacing it, because a recovery that did not land is its own fact. D63 records the
+class, and with it the assertion that should have caught it: the spec asserted
+`["gateway_disable", "service_start"]`, an assertion that **stops at the failure** and so could not see what
+followed it.
+
+**The `EIO` is not a defect, and it took three measurements to say so.** The same `Bootstrap failed: 5` appeared
+for a **trivial** plist — `/usr/bin/true`, `plutil -lint: OK`, sharing nothing with the app — bootstrapped into
+the same `gui/501`. That rules out the app's plist, its binary and its code in a single step. The project's own
+harness then named the condition: `launchd_live` reports
+
+```
+SKIP: no Aqua session in this process.
+  launchctl said: launchctl bootstrap gui/501 … failed (5): Bootstrap failed: 5: Input/output error
+Run this from Terminal.app.
+```
+
+when run from an agent shell, where the same two tests **pass** from Terminal.app (the 12:50 run). So the domain
+refuses *every* bootstrap from a process outside a real GUI session — and the app under test had been started
+from an agent shell, inheriting exactly that. **The operator's fix is to launch the app normally**; there is
+nothing to repair in `service.rs`. The diagnostic order is the part worth reusing: reproduce with a control that
+shares nothing with the suspect, then hand the question to an instrument that already distinguishes the two
+cases, rather than reasoning about which is likelier.
+
+**What it still owes.** The card surfaces `Bootstrap failed: 5: Input/output error` verbatim, which tells an
+operator nothing about the one cause it actually has. Mapping status 5 to the likely cause — "launchd refused
+the job; this needs a logged-in desktop session" — while keeping the raw text is a small, well-understood
+follow-up.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is

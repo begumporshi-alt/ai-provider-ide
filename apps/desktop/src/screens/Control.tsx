@@ -575,15 +575,31 @@ function GatewayTab({
   async function serviceAction(
     name: string,
     action: () => Promise<unknown>,
-    before?: () => Promise<unknown>,
+    before?: { run: () => Promise<unknown>; undo: () => Promise<unknown> },
   ) {
     setServiceError(null);
     setServiceBusy(name);
+    let handedOver = false;
     try {
-      if (before) await before();
+      if (before) {
+        await before.run();
+        handedOver = true;
+      }
       await action();
     } catch (e) {
-      setServiceError(String(e));
+      // **Undo the handover.** `run` released the port on the promise that the service would take
+      // it. If the service did not, leaving the app's own listener down is the one outcome with
+      // *nothing* serving — strictly worse than either state the operator started from, and it is
+      // exactly what a failed `bootstrap` produces: the port is already gone by the time it fails.
+      let undoNote = "";
+      if (handedOver) {
+        try {
+          await before!.undo();
+        } catch (undoError) {
+          undoNote = ` — and restarting the app gateway failed too: ${undoError}`;
+        }
+      }
+      setServiceError(`${e}${undoNote}`);
     } finally {
       setServiceBusy(null);
       await refreshGateway();
@@ -730,7 +746,17 @@ function GatewayTab({
                               "start",
                               serviceStart,
                               // The handover, and only when there is a port to hand over.
-                              running ? () => invoke("gateway_disable") : undefined,
+                              running
+                                ? {
+                                    run: () => invoke("gateway_disable"),
+                                    // Symmetric with `run`, and `gateway_enable` rather than
+                                    // `toggle(true)`: `gateway_disable` is runtime-only and leaves the
+                                    // `enabled` preference alone, so the undo must not persist a
+                                    // preference the handover never changed.
+                                    undo: () =>
+                                      invoke("gateway_enable", { port: g?.port ?? undefined }),
+                                  }
+                                : undefined,
                             )
                           }
                         >

@@ -129,8 +129,38 @@ test("Start releases the port before it asks launchd for the job", async ({ page
 
   // **The order is the property.** Reversed, the agent would load into a port the app still holds,
   // every spawn would die on `EADDRINUSE`, and `KeepAlive` would throttle the job — which is
-  // precisely the "Installed, not running" state this button exists to clear.
-  await expect.poll(() => calls(page)).toEqual(["gateway_disable", "service_start"]);
+  // precisely the "Installed, not running" state this button exists to clear. Only the first two
+  // entries are this test's business: `service_start` always throws in this harness, so a third
+  // call follows, and that rollback is the next test's property rather than this one's.
+  await expect
+    .poll(async () => (await calls(page)).slice(0, 2))
+    .toEqual(["gateway_disable", "service_start"]);
+});
+
+test("a Start that launchd refuses puts the app gateway back", async ({ page }) => {
+  // The handover released the port on the promise that the service would take it. `service_start`
+  // always throws here, so this is the failure path an operator actually hits: without the undo the
+  // card would end with the app gateway off **and** no service — nothing serving, which is worse
+  // than either state Start was pressed from.
+  await page.goto(`${APP}?seed=systemai`);
+  await page.evaluate(
+    (s) => {
+      (window as unknown as { __webTest: Host }).__webTest.serviceStatus(s);
+      (window as unknown as { __webTest: Host }).__webTest.gatewayStatus({ running: true });
+    },
+    { plistPresent: true, loaded: false, pid: null },
+  );
+  await page.getByRole("button", { name: "Control" }).click();
+  await expect(page.getByRole("heading", { name: "Control" })).toBeVisible({ timeout: 10_000 });
+  await page.getByRole("tab", { name: "Gateway" }).click();
+  await expect(page.getByRole("switch", { name: "Gateway" })).toBeVisible({ timeout: 10_000 });
+
+  await clearCalls(page);
+  await page.getByRole("button", { name: "Start" }).click();
+
+  await expect
+    .poll(() => calls(page))
+    .toEqual(["gateway_disable", "service_start", "gateway_enable"]);
 });
 
 test("Start leaves the gateway alone when the app is not holding the port", async ({ page }) => {

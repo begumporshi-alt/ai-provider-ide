@@ -1683,6 +1683,9 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "gateway_enable": {
       const port = Number(args.port) || 8787;
       Object.assign(gatewayStatus, { running: true, port });
+      // Logged for the same reason `gateway_disable` is: Start calls this as the handover's
+      // *undo* when the service fails to take the port, and that recovery is worth asserting.
+      serviceCallLog.push("gateway_enable");
       return port; // the command answers with the port it bound
     }
     case "gateway_disable":
