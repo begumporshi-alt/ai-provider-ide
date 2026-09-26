@@ -723,8 +723,13 @@ key with the reserved id **`ak-ui`** (`core/ui_session.rs`) — and hands it to 
 **never** in `localStorage`, `sessionStorage` or a cookie, so it vanishes on reload and a fresh one is
 minted next call — a secret that survives a reload is one a compromised webview can extract, which is
 the whole of invariant 2. It works in **both** processes that can serve the port, because both install
-`vault_app_key_provider` against the same keychain and the same database, and **no auth path was
-widened** to make it work. It carries no provider credential, so invariant 2 still binds where it was
+`vault_app_key_provider` against the same vault and the same database, and **no auth path was
+widened** to make it work. **That reasoning was incomplete, and 26ae is the correction:** installing
+the same provider proves nothing when the store behind it is read **once per process**, which the
+file-backed vault was (`vault::load` ran under a `Once`). The app minted `ak-ui` into a file the
+service had already snapshotted, so the service never held the credential it was being asked to
+honour — see D67. Two processes sharing a *file* is not the same as two processes sharing a *view*
+of it. It carries no provider credential, so invariant 2 still binds where it was
 meant to. It is filtered out of `GET /admin/keys` (`is_ui_session`) so an operator cannot revoke the
 UI's own credential and break every screen with no visible cause. See D51.
 
@@ -4464,6 +4469,53 @@ is absent for the wrong reason.** Making the note unconditional reddened both. T
 probe was itself worthless — it returned `"PROBE"`, which does not contain the substrings the negative tests
 assert on, so it could not have failed them. **A probe must be built to fail the assertion it targets**, not
 merely to differ from the correct code. Rust lib tests **1304 → 1306**. D66 records the fixture.
+
+### Increment 26ae — the app could not authenticate to its own service, and the vault was why
+
+**The symptom, and why 26ac did not fix it.** After 26ac the boot screen said the right thing —
+`GET /admin/aliases → 429 too many failed auth attempts — backing off`, with advice chosen for a rate
+limit instead of a corrupt database. The operator's reply was the one that mattered: *"i think this not
+the correct approach to start the app."* Correct. The advice was accurate and the app was still broken;
+26ac had made the failure **legible**, not fixed it.
+
+**The measurement that located it.** Against the live listener, `masterkey` answered **200** while
+`gwkey:ak-ui` answered **401 invalid gateway key**. That single pair decides the question: the gateway
+was healthy and unthrottled, so the 429 was not a rate limit at all — it was the **backoff opened by
+repeated 401s**. The credential itself was being refused. `launchctl print` then showed `runs = 1`:
+the service had started once, and `launchctl kickstart -k` (no code change, no new secret) turned the
+same credential from 401 to **200**.
+
+**The cause.** `vault::load()` was `static LOADED: Once` — *"Load the secrets file into the cache.
+Runs once per process."* Two processes can share a **file** without sharing a **view** of it. 26y moved
+the listener into a second process, and from that moment the app minted `gwkey:ak-ui` into a file the
+service had already snapshotted; the service was asked to honour a credential it did not hold. 26i's
+resolution — *"it works in both processes, because both install `vault_app_key_provider`"* — was true of
+the provider and false of the store behind it; that claim is corrected in place above. It also failed in
+the **worse** direction: a *revoked* credential kept authenticating in any process that had already
+loaded it, so `ui_session::revoke` did not do what its comment promises.
+
+**The second defect, same class one layer up.** `AppKeyCache` invalidated on the **id set**
+(*"unchanged ids mean unchanged secrets behind them"*). `ak-ui` is a reserved id deliberately re-minted
+*under that same id* — `ui_session` deletes the row and inserts a fresh one — so a rotation changed the
+secret and left the fingerprint byte-for-byte identical, and the memo served the pre-rotation secret for
+its whole 60 s TTL.
+
+**The fix.** `vault::load` re-reads when the file's `(mtime, len)` stamp changes, **replacing** rather
+than merging, because `save` writes the whole map and a merge would resurrect an account another process
+deleted. `AppKeyCache` invalidates on `(id, created_at)` via the new `active_gateway_key_stamps`, with
+`ORDER BY id` — the vector is compared whole, so an order-only difference would defeat the memo, which
+is a bug the new test found in the fallback path before it shipped.
+
+**Tests, falsification, and the live proof.** Six new tests. Falsified both ways: freezing the stamp
+reddened the two vault cross-process tests; comparing ids only reddened the rotation test. Then the
+end-to-end check that a unit test cannot make — against the **live service, not restarted**: a faithful
+re-mint (row `created_at` and secret both changed) went **401 → 200**, with the old secret correctly
+rejected.
+
+**What is still bounded, on purpose.** A secret rotated *without* the row changing is still invisible
+for up to the 60 s TTL. That is `APP_KEY_CACHE_TTL`'s stated job — the case SQLite cannot see — and no
+normal flow does it: `ensure` reuses an existing secret, so nothing rotates on boot. Rust lib
+**1306 → 1312**. D67 records both defects.
 
 ## 12. What we know we do not know
 

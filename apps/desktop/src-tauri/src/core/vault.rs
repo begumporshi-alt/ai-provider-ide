@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Mutex, Once};
+use std::sync::Mutex;
+use std::time::SystemTime;
 
 /// The service-name constant, kept for any external caller that still names it.
 pub const SERVICE: &str = "ai-provider-router";
@@ -28,13 +29,25 @@ pub enum VaultError {
     },
 }
 
+/// What the secrets file looked like the last time *this* process read it.
+///
+/// Compared so the file can be re-read when it changes. `None` means "no file", which is a real
+/// state and not the same as "never looked".
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FileStamp {
+    modified: Option<SystemTime>,
+    len: u64,
+}
+
 struct Cache {
     map: Mutex<HashMap<String, String>>,
+    /// The stamp as of `map`, or `None` before the first read.
+    stamp: Mutex<Option<FileStamp>>,
 }
 
 impl Cache {
     fn new() -> Self {
-        Self { map: Mutex::new(HashMap::new()) }
+        Self { map: Mutex::new(HashMap::new()), stamp: Mutex::new(None) }
     }
 
     fn get(&self, account: &str) -> Option<String> {
@@ -87,19 +100,51 @@ fn secrets_path() -> std::path::PathBuf {
     DATA_DIR.get_or_init(default_data_dir).join(SECRETS_FILE)
 }
 
-/// Load the secrets file into the cache. Runs once per process.
+/// The secrets file's stamp, or `None` when there is no file to read.
+fn file_stamp(path: &Path) -> Option<FileStamp> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some(FileStamp { modified: meta.modified().ok(), len: meta.len() })
+}
+
+/// Bring the cache back into agreement with the secrets file.
+///
+/// **The file is the authority, and more than one process writes it.** It used to be read once per
+/// process (`Once`), which in the two-process service (26y) meant a process never saw anything
+/// minted after it started: the app mints `gwkey:ak-ui` (D51) while the headless `aiproviderd` is
+/// the one serving requests, so the service answered `401 invalid gateway key` to the app's own
+/// credential until the service was restarted — and the failed attempts piling up behind that are
+/// what turned the next boot into a `429`. It also failed in the opposite direction, which is the
+/// worse half: a *revoked* credential went on authenticating in any process that had already
+/// loaded it, so `ui_session::revoke` did not do what its own comment claims. Re-reading when the
+/// stamp changes fixes both, at one `stat` per call.
+///
+/// A reload **replaces** rather than merges. `save` writes the whole map, so the file is the
+/// complete truth and a merge would resurrect an account another process deleted.
 fn load() {
-    static LOADED: Once = Once::new();
-    LOADED.call_once(|| {
-        if let Ok(bytes) = std::fs::read(secrets_path()) {
-            if let Ok(map) = serde_json::from_slice::<HashMap<String, String>>(&bytes) {
-                let mut cache_map = cache().map.lock().unwrap();
-                for (k, v) in map {
-                    cache_map.insert(k, v);
-                }
-            }
+    reload_if_changed(cache(), &secrets_path());
+}
+
+/// The reload itself, against an explicit cache and path.
+///
+/// Split out because `DATA_DIR` is a `OnceLock` that cannot be re-pointed once a test process has
+/// read it, so the cross-process behaviour can only be exercised through a path the test owns.
+fn reload_if_changed(c: &Cache, path: &Path) {
+    let current = file_stamp(path);
+    {
+        let mut seen = c.stamp.lock().unwrap();
+        if *seen == current {
+            return;
         }
-    });
+        *seen = current;
+    }
+    let fresh = std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<HashMap<String, String>>(&bytes).ok())
+        .unwrap_or_default();
+    // Lock order here is `stamp` then `map`, and `save` takes only `map`, so this cannot deadlock
+    // against a writer.
+    let mut map = c.map.lock().unwrap();
+    *map = fresh;
 }
 
 /// Write the cache to disk with 600 permissions, atomically.
@@ -183,5 +228,67 @@ mod tests {
         let result = get("definitely-not-a-real-account");
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), None);
+    }
+
+    /// A file the test owns, so "another process wrote it" can be simulated without re-pointing
+    /// `DATA_DIR` — that is a `OnceLock` and a test process may already have read it.
+    fn scratch_file(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("vault-reload-{}-{name}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".secrets.json");
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn a_secret_minted_by_another_process_is_visible_without_a_restart() {
+        let path = scratch_file("mint");
+        let c = Cache::new();
+        // The service's situation exactly: it read the file when it started, at which point the
+        // UI session credential did not exist yet.
+        reload_if_changed(&c, &path);
+        assert_eq!(c.get("gwkey:ak-ui"), None, "no file, so nothing to see");
+        // The app then mints and writes it.
+        std::fs::write(&path, "{\"gwkey:ak-ui\":\"secret-B\"}").unwrap();
+        reload_if_changed(&c, &path);
+        // Before this fix the answer stayed `None` until the process restarted — which is the
+        // `401 invalid gateway key` the app got from its own service.
+        assert_eq!(
+            c.get("gwkey:ak-ui").as_deref(),
+            Some("secret-B"),
+            "a secret minted by another process must be visible without a restart"
+        );
+    }
+
+    #[test]
+    fn a_secret_revoked_by_another_process_stops_being_returned() {
+        let path = scratch_file("revoke");
+        std::fs::write(&path, "{\"gwkey:ak-ui\":\"secret-A\"}").unwrap();
+        let c = Cache::new();
+        reload_if_changed(&c, &path);
+        assert_eq!(c.get("gwkey:ak-ui").as_deref(), Some("secret-A"));
+        // The other process revokes. The worse half of the old behaviour: a revoked credential
+        // went on authenticating in every process that had already loaded it.
+        std::fs::write(&path, "{}").unwrap();
+        reload_if_changed(&c, &path);
+        assert_eq!(c.get("gwkey:ak-ui"), None, "a revoke by another process must take effect");
+    }
+
+    #[test]
+    fn an_unchanged_file_is_not_reread() {
+        let path = scratch_file("stable");
+        std::fs::write(&path, "{\"gwkey:ak-ui\":\"secret-A\"}").unwrap();
+        let c = Cache::new();
+        reload_if_changed(&c, &path);
+        // A write this process has not saved yet must survive a reload that does not happen.
+        // This is the test that fails if the stamp gate is removed and every call re-reads: the
+        // point of the stamp is that the common path costs one `stat` and no clobber.
+        c.put("local", "pending");
+        reload_if_changed(&c, &path);
+        assert_eq!(
+            c.get("local").as_deref(),
+            Some("pending"),
+            "an unchanged file must not clobber a write this process has not saved"
+        );
     }
 }

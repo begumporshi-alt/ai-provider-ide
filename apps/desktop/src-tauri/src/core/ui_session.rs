@@ -115,8 +115,12 @@ pub fn revoke_with(store: &Store, delete: &dyn Fn(&str)) {
     let account = format!("{APP_KEY_PREFIX}{UI_SESSION_ID}");
     delete(&account);
     let _ = persist::gateway_key_delete(store, UI_SESSION_ID);
-    // The key provider re-reads the active ids per request, so this takes effect on the next call
-    // with no restart.
+    // The key provider re-reads the active ids per request, and the vault re-reads its file when
+    // the stamp changes (`vault::load`), so this takes effect on the next call with no restart —
+    // **including in the other process**, which is the half that used to be false. The vault was
+    // read once per process, so a deleted credential went on authenticating in any process that
+    // had already loaded it, while the process that minted the replacement could not serve it
+    // either. Both directions are fixed by the same re-read (26ae).
 }
 
 /// `revoke_with` against the real keychain. The production half.

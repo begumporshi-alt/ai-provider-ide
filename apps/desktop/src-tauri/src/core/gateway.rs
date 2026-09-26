@@ -284,13 +284,19 @@ const APP_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 /// on a macOS SecurityAgent prompt — see `MASTER_KEY_WAIT`. Uncached, a gateway with N app keys
 /// takes N blocking calls per request, so one stale keychain ACL stops the whole HTTP surface.
 ///
-/// Keyed on the **set of active ids** rather than on time alone: that set is read fresh from
-/// SQLite each request (one indexed scan, no keychain), so create and revoke invalidate the memo
-/// immediately. Keying on a bare TTL instead would have quietly broken revocation, which today
-/// takes effect on the very next request.
+/// Keyed on the active **`(id, created_at)` stamps** rather than on time alone: those are read
+/// fresh from SQLite each request (one indexed scan, no keychain), so create and revoke invalidate
+/// the memo immediately. Keying on a bare TTL instead would have quietly broken revocation, which
+/// today takes effect on the very next request.
+///
+/// The stamp carries `created_at` and not just the id because **ids alone are not a fingerprint
+/// for secrets**. `ak-ui` is re-minted under a stable id (`ui_session` deletes the row and inserts
+/// a fresh one), so after a rotation the id set is identical and the secret is not — an id-keyed
+/// memo answers with the pre-rotation secret until the TTL expires, which is a 401 against a
+/// credential the gateway does hold (26ae).
 struct AppKeyCache {
-    /// Active ids as of `keys`. `None` until first filled.
-    ids: Option<Vec<String>>,
+    /// Active `(id, created_at)` stamps as of `keys`. `None` until first filled.
+    ids: Option<Vec<(String, i64)>>,
     keys: Vec<AppKey>,
     at: Option<Instant>,
     ttl: Duration,
@@ -304,7 +310,7 @@ impl Default for AppKeyCache {
 
 impl AppKeyCache {
     /// `active` is the freshly-read id set, or `None` when there is no store to ask (a harness).
-    fn fresh(&self, active: &Option<Vec<String>>) -> bool {
+    fn fresh(&self, active: &Option<Vec<(String, i64)>>) -> bool {
         let Some(at) = self.at else {
             return false;
         };
@@ -312,7 +318,8 @@ impl AppKeyCache {
             return false;
         }
         match (active, &self.ids) {
-            // The set is the authority: unchanged ids mean unchanged secrets behind them.
+            // The stamp is the authority: unchanged (id, created_at) pairs mean unchanged secrets
+            // behind them. Ids alone would not — see `AppKeyCache`.
             (Some(a), Some(c)) => a == c,
             // No store to consult (a harness), or nothing memoised yet. An unchecked memo would
             // let a revoked key keep authenticating for the whole TTL — see
@@ -506,6 +513,61 @@ mod assistant_text_tests {
     fn ordinary_text_is_untouched() {
         assert_eq!(clean_assistant_text("\n\nping"), "\n\nping");
         assert_eq!(clean_assistant_text(""), "");
+    }
+}
+
+#[cfg(test)]
+mod app_key_cache_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    /// A memo filled from `stamps`, holding a distinct secret per id so a stale replay is visible.
+    /// Ids are sorted, as production sorts them: the memo is compared as a whole vector, so what
+    /// `an_unchanged_stamp_stays_fresh` asserts is only true when both sides agree on order.
+    fn memo(stamps: &[(&str, i64)]) -> AppKeyCache {
+        let mut ids: Vec<(String, i64)> =
+            stamps.iter().map(|(id, at)| (id.to_string(), *at)).collect();
+        ids.sort();
+        AppKeyCache {
+            ids: Some(ids),
+            keys: stamps
+                .iter()
+                .map(|(id, _)| AppKey { id: id.to_string(), secret: "old".to_string() })
+                .collect(),
+            at: Some(Instant::now()),
+            ttl: Duration::from_secs(60),
+        }
+    }
+
+    #[test]
+    fn an_unchanged_stamp_stays_fresh() {
+        let c = memo(&[("ak-ui", 100), ("ak-other", 5)]);
+        assert!(
+            c.fresh(&Some(vec![("ak-other".to_string(), 5), ("ak-ui".to_string(), 100)])),
+            "an unchanged stamp must not force a re-read"
+        );
+    }
+
+    #[test]
+    fn a_rotation_under_a_stable_id_invalidates_the_memo() {
+        // `ui_session` re-mints `ak-ui` by deleting the row and inserting a fresh one, so the id
+        // afterwards is identical and the secret is not. Keyed on ids alone this reads as *fresh*
+        // and the pre-rotation secret is served for the whole TTL — which is a `401` against a
+        // credential the gateway does in fact hold (26ae).
+        let c = memo(&[("ak-ui", 100)]);
+        assert!(
+            !c.fresh(&Some(vec![("ak-ui".to_string(), 200)])),
+            "a re-mint under the same id must invalidate the memo"
+        );
+    }
+
+    #[test]
+    fn a_revocation_invalidates_the_memo() {
+        let c = memo(&[("ak-ui", 100), ("ak-other", 5)]);
+        assert!(
+            !c.fresh(&Some(vec![("ak-other".to_string(), 5)])),
+            "a removed key must invalidate the memo"
+        );
     }
 }
 
@@ -892,8 +954,10 @@ impl GatewayCore {
             return Vec::new();
         };
         // Cheap and authoritative: one indexed SQLite scan, no keychain.
-        let active =
-            self.store.as_ref().and_then(|s| crate::core::persist::active_gateway_key_ids(s).ok());
+        let active = self
+            .store
+            .as_ref()
+            .and_then(|s| crate::core::persist::active_gateway_key_stamps(s).ok());
         if let Ok(cache) = self.app_key_cache.lock() {
             if cache.fresh(&active) {
                 return cache.keys.clone();
@@ -901,7 +965,12 @@ impl GatewayCore {
         }
         let keys = provider();
         if let Ok(mut cache) = self.app_key_cache.lock() {
-            cache.ids = active.or_else(|| Some(keys.iter().map(|k| k.id.clone()).collect()));
+            // Sorted, because `active_gateway_key_stamps` returns `ORDER BY id` and the memo is
+            // compared as a whole vector: an order-only difference would invalidate it on every
+            // request, which is a memo that never memoises.
+            let mut ids: Vec<(String, i64)> = keys.iter().map(|k| (k.id.clone(), 0)).collect();
+            ids.sort();
+            cache.ids = active.or(Some(ids));
             cache.keys = keys.clone();
             cache.at = Some(Instant::now());
         }

@@ -1102,6 +1102,26 @@ pub fn active_gateway_key_ids(store: &Store) -> Result<Vec<String>, CommandError
     Ok(rows)
 }
 
+/// `(id, created_at)` for every live app key — what the app-key memo invalidates on.
+///
+/// **`created_at`, not the id alone.** `ak-ui` is a reserved id deliberately re-minted *under the
+/// same id*: `ui_session` deletes the row and inserts a fresh one, so a rotation changes the
+/// secret while leaving the id set byte-for-byte identical. A memo keyed on ids therefore keeps
+/// serving the pre-rotation secret for the whole TTL — which is how a valid credential can 401
+/// against a gateway that is in fact holding it (26ae).
+///
+/// `ORDER BY id` because the result is compared as a whole: SQLite owes no row order without it,
+/// and an order-only difference would invalidate the memo on every single request.
+pub fn active_gateway_key_stamps(store: &Store) -> Result<Vec<(String, i64)>, CommandError> {
+    let conn = store.conn.lock().unwrap();
+    let mut stmt = conn
+        .prepare("SELECT id, created_at FROM gateway_keys WHERE revoked_at IS NULL ORDER BY id")?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GatewayKeyRow {
