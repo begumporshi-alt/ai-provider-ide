@@ -7,8 +7,8 @@
 //! - binds 127.0.0.1 only;
 //! - every request authenticated by the master key BEFORE any routing work; constant-time
 //!   compare; per-IP exponential backoff on repeated auth failures;
-//! - the master key lives only in the OS keychain (account `masterkey`); reveal is a
-//!   Rust-side copy-to-clipboard (§14) — it never enters webview-observable state;
+//! - the master key lives only in the file-backed secrets store (account `masterkey`);
+//!   reveal is a Rust-side copy-to-clipboard (§14) — it never enters webview-observable state;
 //!   rotation overwrites the account, so the old key dies on the NEXT request read (§3.3);
 //! - gateway stopped: 503 + Retry-After: 1, nothing queued (§3.5);
 //! - capacity: 8 concurrent + 32 queued -> 429 + Retry-After;
@@ -1448,11 +1448,11 @@ fn check_gateway_key(
             });
         }
         MasterKeyLookup::Unavailable => {
-            // The keychain did not answer in time. A 401 here would blame the caller's credential
-            // for a purely local fault and send it hunting for a new key, so say what happened.
+            // The secrets file did not answer in time. A 401 here would blame the caller's
+            // credential for a purely local fault, so say what happened.
             return Err(GateRefusal {
                 status: StatusCode::SERVICE_UNAVAILABLE,
-                message: "master key unavailable — the OS keychain did not respond; approve the keychain prompt for this app, then retry".into(),
+                message: "master key unavailable — the secrets file could not be read; check that the data directory is accessible, then retry".into(),
                 retry_after: Some("5"),
                 openai_type: "service_unavailable",
                 openai_code: None,

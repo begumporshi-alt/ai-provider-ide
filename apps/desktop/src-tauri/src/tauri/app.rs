@@ -148,6 +148,9 @@ pub fn run() {
             // didn't come back" is indistinguishable from "it is still starting". The last
             // marker written names the step that never returned.
             let data_dir = app.path().app_data_dir()?;
+            // Point the file-backed vault at the real data dir so .secrets.json lands next to
+            // the SQLite DB. Must happen before any vault::get/put call.
+            crate::core::vault::set_data_dir(&data_dir);
             // Install the panic hook now that we know the real app data dir.
             // This captures panics that happen after setup completes (the common case).
             // Panics during setup itself will print to stderr but won't produce a report —
@@ -158,15 +161,11 @@ pub fn run() {
                 store::Store::open(&data_dir).map_err(|e| format!("store init failed: {e}"))?,
             );
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: store opened");
-            // Deferred off the startup path deliberately. This reads the OS keychain, and a
-            // keychain read can *block* on an authorization prompt — which is exactly what happens
-            // after the app is rebuilt or reinstalled, because macOS re-checks the stored ACL
-            // against the new code signature. Run inline here it blocked `setup()` before any
-            // window existed, so the prompt had nowhere to appear and the process simply sat
-            // there: alive, no window, no socket, and no log line past this one. Off the startup
-            // path the app is up and the prompt is answerable.
+            // Deferred off the startup path deliberately. This probes provider key refs and can
+            // trigger egress allowlist recomputation — work that should not block `setup()`
+            // before a window exists. Off the startup path the app is up when it runs.
             //
-            // It also holds no store lock across the keychain read, so moving it cannot deadlock
+            // It also holds no store lock across the probe, so moving it cannot deadlock
             // against the restore task that now runs beside it.
             let probe_app = app.handle().clone();
             let probe_store = store.clone();

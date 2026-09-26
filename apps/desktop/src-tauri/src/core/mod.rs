@@ -1,5 +1,5 @@
-//! Tauri-independent half of the crate: the HTTP gateway, the SQLite store, the keychain
-//! vault, and the store helpers they call.
+//! Tauri-independent half of the crate: the HTTP gateway, the SQLite store, the file-based
+//! secret store, and the store helpers they call.
 //!
 //! Split for the headless service (`src/bin/aiproviderd.rs`). Two rules, and they are different
 //! strengths:

@@ -25,6 +25,7 @@ use ai_provider_router_lib::core::{
     persist,
     router::{RouterSettings, RouterStore, SharedRouterState},
     router_bridge::{BridgeHost, RouterBridge},
+    service,
     store,
 };
 use tokio::runtime::Handle;
@@ -96,10 +97,239 @@ impl BridgeHost for HeadlessHost {
     }
 }
 
+/// The current executable's path — what install copies into the stable binary slot.
+fn self_path() -> Result<PathBuf, String> {
+    std::env::current_exe()
+        .map(|p| p.canonicalize().unwrap_or(p))
+        .map_err(|e| format!("cannot resolve current executable: {e}"))
+}
+
+fn cmd_install() {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let data_dir = data_dir().unwrap_or_else(|e| {
+        eprintln!("aiproviderd install: cannot resolve the data directory: {e}");
+        std::process::exit(1);
+    });
+
+    let mut paths = service::paths(&home, &data_dir);
+    paths.environment.insert("AIP_DATA_DIR".to_string(), data_dir.display().to_string());
+
+    let exe = match self_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("aiproviderd install: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("aiproviderd install: cannot resolve the launchd domain: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match service::install(&paths, &exe, &domain, &service::run_launchctl) {
+        Ok(()) => {
+            println!("aiproviderd: installed. The gateway will start at login and restart on failure.");
+            println!("Check status with: aiproviderd status");
+        }
+        Err(e) => {
+            eprintln!("aiproviderd install failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_uninstall() {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let data_dir = data_dir().unwrap_or_else(|e| {
+        eprintln!("aiproviderd uninstall: cannot resolve the data directory: {e}");
+        std::process::exit(1);
+    });
+
+    let paths = service::paths(&home, &data_dir);
+    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("aiproviderd uninstall: cannot resolve the launchd domain: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match service::uninstall(&paths, &domain, &service::run_launchctl) {
+        Ok(()) => println!("aiproviderd: uninstalled. The agent plist and binary copy have been removed."),
+        Err(e) => {
+            eprintln!("aiproviderd uninstall failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn cmd_status() {
+    let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default();
+    let data_dir = data_dir().unwrap_or_else(|e| {
+        eprintln!("aiproviderd status: cannot resolve the data directory: {e}");
+        std::process::exit(1);
+    });
+
+    let paths = service::paths(&home, &data_dir);
+    let domain = match service::read_uid().map(|uid| service::domain(uid)) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("aiproviderd status: cannot resolve the launchd domain: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    match service::status(&paths, &domain, &service::run_launchctl) {
+        Ok(s) => {
+            println!("plist present : {}", s.plist_present);
+            println!("loaded        : {}", s.loaded);
+            match s.pid {
+                Some(pid) => println!("pid           : {pid}"),
+                None => println!("pid           : (not running)"),
+            }
+        }
+        Err(e) => {
+            eprintln!("aiproviderd status: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Copy the current binary to /usr/local/bin/aiproviderd so it is on PATH without a full
+/// path. Requires write access to /usr/local/bin (Homebrew installs it user-writable on
+/// Intel Macs; on Apple Silicon it lives at /opt/homebrew/bin and is user-writable).
+fn cmd_self_install() {
+    let exe = match self_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("aiproviderd self-install: {e}");
+            std::process::exit(1);
+        }
+    };
+
+    // Pick the user-writable bin dir.
+    let candidates = [
+        PathBuf::from("/opt/homebrew/bin"), // Apple Silicon + Homebrew
+        PathBuf::from("/usr/local/bin"),     // Intel + Homebrew, or manual install
+    ];
+
+    let target_dir = candidates
+        .iter()
+        .find(|d| d.exists())
+        .cloned()
+        .unwrap_or_else(|| {
+            eprintln!(
+                "aiproviderd self-install: neither /opt/homebrew/bin nor /usr/local/bin exists. \
+                 Install one of them first, or add the binary's directory to PATH manually."
+            );
+            std::process::exit(1);
+        });
+
+    let target = target_dir.join("aiproviderd");
+
+    match std::fs::copy(&exe, &target) {
+        Ok(_) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &target,
+                    std::fs::Permissions::from_mode(0o755),
+                );
+            }
+            println!("aiproviderd: installed to {}", target.display());
+            println!("You can now run: aiproviderd install, aiproviderd status, aiproviderd uninstall");
+        }
+        Err(e) => {
+            eprintln!(
+                "aiproviderd self-install failed to copy to {}:\n  {}\n\n\
+                 Try:  sudo cp {} {} && sudo chmod +x {}",
+                target.display(),
+                e,
+                exe.display(),
+                target.display(),
+                target.display()
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Mint (or rotate) the master key directly into the secrets file. No UI, no auth — this is the
+/// bootstrap command for a fresh install or a vault migration.
+fn cmd_mint() {
+    let data_dir = match data_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("aiproviderd mint: cannot resolve the data directory: {e}");
+            std::process::exit(1);
+        }
+    };
+    ai_provider_router_lib::core::vault::set_data_dir(&data_dir);
+
+    // Check if a key already exists; if so, replace it (rotate).
+    let had_existing = ai_provider_router_lib::core::vault::get("masterkey")
+        .ok()
+        .flatten()
+        .is_some();
+
+    let full_key = ai_provider_router_lib::core::gateway::generate_random_key();
+
+    if let Err(e) = ai_provider_router_lib::core::vault::put("masterkey", &full_key) {
+        eprintln!("aiproviderd mint: failed to write the key: {e}");
+        std::process::exit(1);
+    }
+
+    if had_existing {
+        println!("aiproviderd: rotated the master key.");
+    } else {
+        println!("aiproviderd: minted a new master key.");
+    }
+    println!();
+    println!("Master key : {full_key}");
+    println!("Store path  : {}", data_dir.display());
+    println!("Note: the previous key is no longer valid.");
+    println!("If you're using aiproviderd as a headless gateway, restart it with:");
+    println!("  aiproviderd install && aiproviderd status");
+}
+
 #[tokio::main]
 async fn main() {
     let version = env!("CARGO_PKG_VERSION");
     let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Subcommands that must run before the tokio runtime / store setup.
+    let sub = args.get(0).map(|s| s.as_str());
+    if let Some(cmd) = sub {
+        match cmd {
+            "install" => {
+                cmd_install();
+                return;
+            }
+            "uninstall" => {
+                cmd_uninstall();
+                return;
+            }
+            "status" => {
+                cmd_status();
+                return;
+            }
+            "self-install" => {
+                cmd_self_install();
+                return;
+            }
+            "mint" => {
+                cmd_mint();
+                return;
+            }
+            _ => {}
+        }
+    }
+
     if args.iter().any(|a| a == "--version" || a == "-V") {
         println!("aiproviderd {version}");
         return;
@@ -118,6 +348,8 @@ async fn main() {
         }
     };
     crash_report::install_panic_hook(dir.clone());
+    // Point the file-backed vault at this dir so secrets land next to the SQLite DB.
+    ai_provider_router_lib::core::vault::set_data_dir(&dir);
 
     let store = match store::Store::open(&dir) {
         Ok(s) => Arc::new(s),
