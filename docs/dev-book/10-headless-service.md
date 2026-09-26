@@ -4517,6 +4517,108 @@ for up to the 60 s TTL. That is `APP_KEY_CACHE_TTL`'s stated job — the case SQ
 normal flow does it: `ensure` reuses an existing secret, so nothing rotates on boot. Rust lib
 **1306 → 1312**. D67 records both defects.
 
+### Increment 26af — the capability sweep a real client would run, and the tool calls it found missing
+
+**The request.** *"check how our gateway work with ai model as custom provider. and should check all
+important capabilities are working or not."* In this chapter's own vocabulary a **custom provider** is
+an external client pointed *at* this gateway (`gateway.rs:1977`; DECISIONS 2026-09-18), so the test is
+the wire surface a real client uses — not a harness, not a mock. The gateway was live (`aiproviderd`
+on `127.0.0.1:8800`, `/health` 200) with one provider (`agnes`, type `manifest`,
+`https://apihub.agnes-ai.com/v1`, enabled), one active provider key, and **12 text models, 0 image**.
+Probes live under `/tmp/aip-live/`, outside the repo, so no credential can be committed.
+
+**Everything passes except one thing.**
+
+| Capability | Result |
+|---|---|
+| Auth: master, `gwkey:ak-ui`, the key WorkBuddy holds | `200` · `200` · `200` |
+| Auth: no credential, wrong credential | `401` · `429` |
+| Dialect auth: `x-api-key`, `x-goog-api-key`, `Bearer` with no space | `200` · `200` · `401` |
+| `GET /v1/models` | `200`, 12 models, listed as `agnes/<native>` |
+| Chat, non-streaming | `200` in 0.74 s, `gw-18`, `finish_reason: stop`, usage `{prompt: 1440, completion: 3}` |
+| Chat, streaming | `200`, `role` in frame 1, `[DONE]` sent, usage nested at `choices[0].usage` |
+| **Tool calls** | **failed — silently dropped** |
+| `POST /v1/messages` (Anthropic), `x-api-key` and `Bearer` | `200` · `200`, `msg_gw_*`, `stop_reason: end_turn` |
+| `POST /v1/responses` | `200`, `resp_gw_*` |
+| `POST /v1/messages/count_tokens` | `200`, `{"input_tokens": 2}` |
+| Client namespace: `custom-local:<id>`, and `agnes/<id>` | `200` · `200` |
+| Error shapes: `405`, `404`, `404` with no credential, missing model, malformed JSON, `functions`, empty `messages` | all correct — and the unauthenticated `404` answers `401`, so the route table is still not an oracle |
+| Memory headers | scope resolves (`user=tushu;project=cap-sweep;agent=jarvi-probe`); the master switch is off, so every case reads `reason=disabled`; a CRLF-smuggled `aip-memory: injected=99` did **not** take effect |
+
+**The defect.** The same payload with `tools` declared, sent both ways:
+
+- **upstream direct** → `finish_reason: tool_calls`, `get_weather({"city": "Dhaka"})`, usage 314
+- **through the gateway** → `finish_reason: stop`, `content: ""`, `tool_calls: undefined`
+
+The model behaved; the router discarded the result. Root cause, one site:
+`Providers.tsx::buildManifest()` — the **manual/custom** path — omits `responseMap.toolCalls` and
+`stream.chunkMap.toolCalls`, both of which `builtin-templates.ts::openaiCompat()` (the *known*-provider
+path) has. `manifest-interpreter.ts:310` emits only `if (ep.responseMap.toolCalls)`, so the omission is
+silent, and the grammar documents it in as many words: *"a manifest that omits it simply never reports
+tool calls"* (`adapter-spec/manifest.ts:83-85`). Two further omissions in the same function: no
+`stream.toolCallStream` (the Anthropic multi-event framing), and **no dialect switch at all** —
+selecting `anthropic-messages-v1` only relabelled the manifest while the paths stayed
+`/chat/completions` and `$.choices[0]…`. The tell is the asymmetry: the request side already forwarded
+`{{tools?}}`, so nothing about a request looked wrong.
+
+**Why nothing caught it.** `store.ts::addProvider` stages with `contractResultJson: null`, so the
+contract suite — the one check that would notice a manifest missing a response mapping — never runs
+when a provider is added; measured, `manifests.contract_result_json` is `NULL`. And `buildManifest()`
+was an unexported closure with no test at all.
+
+**The fix.** The manifest is now *derived*: `lib/providers/manual-manifest.ts::buildManualManifest()`
+takes `BUILTIN_TEMPLATES[dialect]` and overrides only dialect, auth and provenance. One authority
+instead of two, so the manual path cannot drift from the template again — which is the property whose
+absence caused all four omissions. `store.ts::addProvider` also takes `origin` from the manifest's own
+provenance rather than the hardcoded `"builtin-template"`: measured, a hand-added provider's row
+claimed `builtin-template` while its body said `user-edited`, both spellings on one row.
+
+**The test is a parity test, not a string test.** Six tests in `manual-manifest.test.ts`. The
+load-bearing assertion compares the manual manifest's `path`, `requestTemplate`, `responseMap`,
+`stream` and `limits` against the matching builtin template's — pinning the two selector strings would
+let the *next* divergence through. Falsified: deleting both selectors from the overlay reddened exactly
+the two tool-call tests and left the other four green. The suite also caught a defect in its own author
+— it asserted `limits` on the OpenAI dialect, but only the Anthropic template sets it, so the assertion
+became a parity claim at the manifest level.
+
+**Repaired live, and the repair found a second defect.** A corrected manifest was staged as v2 through
+the app's own admin routes (`POST /admin/manifests/stage` then `/admin/manifests/{id}/activate`), with
+v1 preserved and inactive, and the database snapshotted first (`sqlite3 .backup`). **Activation alone
+did not take effect.** The serving `aiproviderd` had activated its providers at boot, so it went on
+serving the old adapter until it was reloaded (`launchctl kickstart -k gui/501/dev.aiprovider.router`,
+pid 64232 → 76278) — after which the same payload answered `finish_reason: tool_calls` with the real
+call. **Two processes, one store, no reload: D67's class one layer up**, where the stale thing is the
+adapter rather than the secrets file.
+
+**Measured:** desktop vitest **192 → 198**, typecheck clean. Rust unchanged at 1312. Re-measured across
+all three TS packages, **18 adapter-spec + 273 router-core + 198 desktop = 489**, which corrects
+`09-status.md`'s headline: it read **471**, a figure equal to neither that sum nor the parts as the note
+that introduced it stated them (249 + 185 + 18 = 452). D68 records the defect, the reload gap, and the
+forward-only limitation.
+
+**The fix is forward-only, and that is a limitation rather than a detail.** `buildManualManifest` has
+exactly one production caller — the add/edit form (`Providers.tsx:259`, reached from `buildManifest()`
+at `:296`) — so a provider added *before* 26af keeps the drifted manifest it was stored with. The fix
+changes what the form **writes**, not what the store **holds**, and nothing in the repo detects that an
+existing row omits `toolCalls`; the live provider was corrected by hand. A re-derivation on load, or a
+detection pass over stored manifests, is an open item and not part of 26af.
+
+**Also repaired: `09-status.md`'s Tests row — structurally broken, not merely stale.** `0e51225` (26q)
+rewrote the row in place and deleted nothing, leaving the pre-26q *wrapped* tail behind as twelve orphan
+lines beneath it. Markdown cannot continue a table row onto a line that does not begin with `|`, so the
+table ended at the row and the Coverage row was ejected from it — measured, 20 table rows and `Coverage`
+not among them. The rewrite also inherited an unclosed `(` (opened at *"after increments 11b–24c ("*)
+whose only `)` was the orphan's final character, so the row's parentheses did not balance either. The two
+halves then drifted apart, each receiving increments the other never got: 26y/26aa/26ac appended to the
+orphan, 26ad/26ae/26af to the row. Repaired by folding the orphan's unique tail into the row, closing the
+parenthetical at the end where it had closed before the split, and correcting the headline. Verified
+after: **21** table rows with `Coverage` among them, paren balance **0**, 4 pipes.
+
+**Not verified, and why.** No CLI client is installed on this machine (`claude`, `codex`,
+`cursor-agent`, `aider`, `llm`, `opencode` all absent), so §5.3's Claude Code and Codex legs of
+`gateway-flexibility-plan.md` could not be run; the WorkBuddy leg was checked directly through its
+`models.json`. The 8+32 admission ceiling remains unexercised live, unchanged from the 2026-09-22 pass.
+
 ## 12. What we know we do not know
 
 - ~~Whether `rquickjs` (or `boa`) can run the existing Tier-2 adapter sandbox. The contract suite is
