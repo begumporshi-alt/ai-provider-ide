@@ -348,11 +348,7 @@ pub fn install(
     let _ = run(&["bootout", &target]);
     let out = run(&["bootstrap", domain, &plist])?;
     if out.status != 0 {
-        return Err(ServiceError(format!(
-            "launchctl bootstrap {domain} {plist} failed ({}): {}",
-            out.status,
-            first_line(&out)
-        )));
+        return Err(describe_failure(&format!("bootstrap {domain} {plist}"), &out));
     }
     Ok(())
 }
@@ -420,11 +416,7 @@ pub fn start(
         (format!("bootstrap {domain} {plist}"), run(&["bootstrap", domain, &plist])?)
     };
     if out.status != 0 {
-        return Err(ServiceError(format!(
-            "launchctl {what} failed ({}): {}",
-            out.status,
-            first_line(&out)
-        )));
+        return Err(describe_failure(&what, &out));
     }
     Ok(())
 }
@@ -449,11 +441,7 @@ pub fn stop(
     let target = format!("{domain}/{}", p.label);
     let out = run(&["bootout", &target])?;
     if out.status != 0 {
-        return Err(ServiceError(format!(
-            "launchctl bootout {target} failed ({}): {}",
-            out.status,
-            first_line(&out)
-        )));
+        return Err(describe_failure(&format!("bootout {target}"), &out));
     }
     Ok(())
 }
@@ -508,6 +496,54 @@ fn first_line(out: &Outcome) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("no output")
         .to_string()
+}
+
+/// The cause note appended to a launchctl error, or `None` when nothing is recognised.
+///
+/// **Keyed on the *pair* (exit status **and** message text), not on the number.** `launchctl`
+/// exits 5 for `bootstrap` failures that are not all the same fault, and launchd embeds its *own*
+/// status code inside the message ("Bootstrap failed: **5**: …") — so the inner number is a
+/// launchd-protocol code, not `launchctl`'s exit code, and two different faults can carry the
+/// same inner number in different contexts. The only combination measured on a live machine is
+/// exit **5** + `Input/output error` on `bootstrap`, and even that one is **hedged rather than
+/// asserted**: the cause ("the calling process has no GUI session") was established by *excluding*
+/// the alternatives — a trivial, app-independent plist failed identically, and the project's own
+/// `launchd_live` harness printed `SKIP: no Aqua session` in the same context — not by observing a
+/// success under the suspected cause. Stating it flat would be a D54-class claim: a hedge that
+/// does not survive being quoted into a user-facing string.
+///
+/// `bootout`'s live shape is different: exit **3** + `No such process` for a job launchd does not
+/// hold. That is the *ordinary* outcome of stopping something already stopped, and `uninstall`
+/// discards it for exactly that reason — so it is named here, but only so a caller can decide
+/// whether to surface it. `stop` surfaces it, because a `bootout` failure in `stop` is a real
+/// refusal, not a discarded tidiness step.
+fn cause_note(status: i32, line: &str) -> Option<&'static str> {
+    const EIO: &str = " Most common cause: this process has no GUI session (Aqua), so launchd \
+        will not register the job in its domain. The app itself is the process that has one — \
+        start the service from the app's Control screen, not from a shell. If the app is the \
+        caller and this still happens, the session itself may have been revoked: log out and back \
+        in, then retry.";
+    if status == 5 && line.contains("Input/output error") {
+        return Some(EIO);
+    }
+    const NO_SUCH_PROCESS: &str = " launchd is not holding the job — it was never registered, or \
+        it is already stopped. That is usually not a fault: stopping something that is already \
+        stopped answers exactly this.";
+    if status == 3 && line.contains("No such process") {
+        return Some(NO_SUCH_PROCESS);
+    }
+    None
+}
+
+/// What one launchctl failure looks like to a caller: the failure itself, and — only when
+/// `cause_note` recognises the *measured* shape — the note that says what it most likely means.
+/// The raw message is always kept; the note is appended, never substituted, because a cause
+/// that turns out wrong is a line the operator can discount, and a raw message that was
+/// dropped is not.
+fn describe_failure(what: &str, out: &Outcome) -> ServiceError {
+    let line = first_line(out);
+    let note = cause_note(out.status, &line).unwrap_or("");
+    ServiceError(format!("launchctl {what} failed ({}): {}{}", out.status, line, note))
 }
 
 #[cfg(test)]
@@ -865,6 +901,11 @@ mod tests {
         // launchctl explains itself on stderr; an error that dropped it would leave the operator
         // with an exit code and nothing else.
         assert!(err.to_string().contains("Input/output error"), "{err}");
+        // The recognised shape gets the cause note appended (26ad): it hedges — "Most common
+        // cause" — because the cause was established by excluding the alternatives, not by
+        // observing a success under it.
+        assert!(err.to_string().contains("Most common cause"), "{err}");
+        assert!(err.to_string().contains("GUI session"), "{err}");
     }
 
     /* --------------------------------- uninstall ---------------------------------- */
@@ -955,6 +996,24 @@ mod tests {
         assert!(err.to_string().contains("bootstrap"), "{err}");
         assert!(err.to_string().contains(DOMAIN), "the error must name the domain: {err}");
         assert!(err.to_string().contains("Input/output error"), "{err}");
+        // The EIO note is appended for the measured shape (26ad): it is what the operator saw
+        // on the card, and it is the only cause the project has *excluded down* to.
+        assert!(err.to_string().contains("Most common cause"), "{err}");
+        assert!(err.to_string().contains("Control screen"), "{err}");
+    }
+
+    #[test]
+    fn a_start_refusal_that_is_not_the_measured_shape_gets_no_note() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        // A refusal with an unrecognised status keeps the raw message and adds nothing:
+        // a note attached to a fault whose cause is not the one measured would assert
+        // rather than hedge, and the operator cannot discount a claim that is always there.
+        let rec =
+            Recorder::scripted(&[(1, "", ""), (9, "", "Bootstrap failed: 9: Bad file descriptor")]);
+        let err = start(&p, DOMAIN, &|a| rec.run(a)).unwrap_err();
+        assert!(err.to_string().contains("Bad file descriptor"), "{err}");
+        assert!(!err.to_string().contains("Most common cause"), "{err}");
     }
 
     /* ---------------------------------- stop ---------------------------------- */
@@ -983,10 +1042,30 @@ mod tests {
     fn a_stop_launchd_refuses_is_an_error_not_a_silent_success() {
         let (p, _dir) = scratch();
         write_plist(&p);
-        let rec = Recorder::scripted(&[(5, "", "Bootout failed: 5: Input/output error")]);
+        // Measured live on 2026-09-26: `launchctl bootout gui/501/<label>` of a job launchd does
+        // not hold answers exit **3** `No such process`, not the 5 `Input/output error` the earlier
+        // fixture assumed. The fixture was pinning a shape launchctl does not actually produce, and
+        // a cause note keyed on the *measured* shape is what 26ad is owed.
+        let rec = Recorder::scripted(&[(3, "", "Boot-out failed: 3: No such process")]);
         let err = stop(&p, DOMAIN, &|a| rec.run(a)).unwrap_err();
         assert!(err.to_string().contains("bootout"), "{err}");
-        assert!(err.to_string().contains("Input/output error"), "{err}");
+        assert!(err.to_string().contains("No such process"), "{err}");
+        // The note is appended for the recognised shape, and names the ordinary case.
+        assert!(err.to_string().contains("not holding the job"), "{err}");
+    }
+
+    #[test]
+    fn a_stop_refusal_that_is_not_the_measured_shape_gets_no_note() {
+        let (p, _dir) = scratch();
+        write_plist(&p);
+        // A `bootout` refusal with an unrecognised status must keep the raw message and add
+        // nothing: a note that is *always* present for a fault whose cause is not the one
+        // measured would assert rather than hedge.
+        let rec = Recorder::scripted(&[(7, "", "Boot-out failed: 7: Unknown error")]);
+        let err = stop(&p, DOMAIN, &|a| rec.run(a)).unwrap_err();
+        assert!(err.to_string().contains("Unknown error"), "{err}");
+        assert!(!err.to_string().contains("Most common cause"), "{err}");
+        assert!(!err.to_string().contains("not holding the job"), "{err}");
     }
 
     /* --------------------------------- status ---------------------------------- */

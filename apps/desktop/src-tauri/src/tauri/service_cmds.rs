@@ -77,7 +77,8 @@ pub fn service_uninstall(app: tauri::AppHandle) -> Result<(), String> {
 /// **This is the command that has to run in the app.** Registering a `LaunchAgent` needs an Aqua
 /// session, and the app is the process that has one — which is the whole reason the login-item
 /// control is a button rather than a line in the README. `aiproviderd install` from a shell without
-/// a session answers `5: Input/output error`.
+/// a session answers `5: Input/output error`. That shape is the one `service::describe_failure`
+/// recognises, so a refusal here reaches the card with the cause appended rather than bare.
 #[tauri::command]
 pub fn service_start(app: tauri::AppHandle) -> Result<(), String> {
     let (paths, domain) = context(&app)?;

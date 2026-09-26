@@ -4358,10 +4358,16 @@ nothing to repair in `service.rs`. The diagnostic order is the part worth reusin
 shares nothing with the suspect, then hand the question to an instrument that already distinguishes the two
 cases, rather than reasoning about which is likelier.
 
-**What it still owes.** The card surfaces `Bootstrap failed: 5: Input/output error` verbatim, which tells an
-operator nothing about the one cause it actually has. Mapping status 5 to the likely cause — "launchd refused
-the job; this needs a logged-in desktop session" — while keeping the raw text is a small, well-understood
-follow-up.
+**Paid by 26ad — and the debt was larger than it looked.** The card *did* surface
+`Bootstrap failed: 5: Input/output error` verbatim; it no longer does. Two things changed the shape of the
+fix. First, **"mapping status 5" would have been the wrong key**: `launchctl`'s exit code and the number
+launchd embeds *inside* its own message are two different numbers that happen to agree here, so 26ad keys on
+the **pair** (exit status **and** message text) rather than on the number. Second, **the verbatim problem was
+not confined to `bootstrap`**: measuring `bootout` live showed its ordinary refusal is exit **3**
+`No such process`, not 5 — so a mapping keyed on 5 alone would have left `stop`'s most common failure
+verbatim too. Both notes are **appended, never substituted**, and both are **hedged** ("Most common cause")
+rather than asserted: the cause was established by *excluding* the alternatives, not by observing a success
+under it, and a hedge that does not survive being quoted into a user-facing string is D54's class.
 
 ### Increment 26ab — the handover revoked the UI's credential, and nothing minted it back
 
@@ -4418,6 +4424,46 @@ backoff clears by itself"; 401 → "reload mints a fresh credential"; 5xx → "c
 `Authorization` header differs; a second 429 is not retried. Five tests in `boot-failure.test.ts`, one
 per branch plus the hedged fallback. The 429 branch was falsified by removing it from the condition: both
 429 tests reddened, the 401 and 500 tests stayed green. D65 records both defects.
+
+### Increment 26ad — the launchd error now says what it means, and one fixture was pinning a shape launchctl cannot produce
+
+**The debt 26aa left.** Its closing paragraph said the card "surfaces `Bootstrap failed: 5: Input/output
+error` verbatim, which tells an operator nothing about the one cause it actually has," and filed the mapping
+as a follow-up. That is what this increment pays. All three failure sites — `install`, `start` and `stop`
+(`service.rs:351`, `:419`, `:444`) — now go through one `describe_failure`, which appends a cause note when
+the shape is one the project has actually measured.
+
+**Two measurements changed the shape of the fix.** First, **"map status 5" is the wrong key.** `launchctl`
+exits 5, and launchd separately embeds *its own* status code inside the message
+(`Bootstrap failed: **5**: …`). The two agree here, so the error string contains the same number twice
+meaning two different things, and a mapping keyed on the number would fire on any 5 from any verb. 26ad keys
+on the **pair** — exit status *and* message text. Second, **the verbatim problem was never confined to
+`bootstrap`.** Measuring `bootout` live showed its ordinary refusal is exit **3** `No such process`, not
+5 — so a mapping keyed on 5 alone would have left `stop`'s most common failure just as opaque. Both notes are
+**appended, never substituted**: a cause that turns out wrong is a line the operator can discount, and a raw
+message that was dropped is not recoverable.
+
+**A fixture was pinning a shape launchctl cannot produce.** `a_stop_launchd_refuses_…` used
+`Recorder::scripted(&[(5, "", "Bootout failed: 5: Input/output error")])` — status 5, copied from the
+`bootstrap` fixture beside it. A live `launchctl bootout gui/501/<label>` of a job launchd does not hold
+answers **3 / `No such process`**. The test was green against a shape the tool cannot emit, which is the
+D61-instrument class again: a green assertion about a fiction. The fixture now uses the measured shape, and
+the cause note it asserts is the one that shape actually earns.
+
+**The note hedges; it does not assert.** "Most common cause: this process has no GUI session (Aqua)" — not
+"the session is missing." The cause was established by *excluding* the alternatives (a trivial,
+app-independent plist failed identically; `launchd_live` printed `SKIP: no Aqua session` in the same
+context), not by observing a successful bootstrap under the suspected cause. A hedge that does not survive
+being quoted into a user-facing string is D54's class, and this string is now on the card.
+
+**Tests and falsification.** Two new tests: an unrecognised `start` refusal (status 9) and an unrecognised
+`stop` refusal (status 7) each keep the raw message and get **no** note. Both directions were falsified.
+Disabling the note reddened the three positive assertions and left the two negative ones green — which is
+exactly why the negative tests needed their own probe: **an absence assertion passes trivially when the thing
+is absent for the wrong reason.** Making the note unconditional reddened both. The first attempt at that
+probe was itself worthless — it returned `"PROBE"`, which does not contain the substrings the negative tests
+assert on, so it could not have failed them. **A probe must be built to fail the assertion it targets**, not
+merely to differ from the correct code. Rust lib tests **1304 → 1306**. D66 records the fixture.
 
 ## 12. What we know we do not know
 
