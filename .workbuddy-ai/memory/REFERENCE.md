@@ -5409,4 +5409,38 @@ an earlier note here called it "a leak, not a stale key" and that was wrong. Rem
 `.secrets.json` the way `vault::save` does (tmp → `chmod 600` → rename); every `vault::*` call runs
 `load()` first, so a running process re-reads and will not resurrect the entry.
 
+## Moved out of `MEMORY.md` — 2026-09-27 (increment 33)
+
+Depth behind the one-line rules that stayed in `MEMORY.md`.
+
+**Routing concurrency — §3.5 is two semaphores.** `permits` *admits* (the per-provider cap);
+`dispatch` *routes* (which attempt gets sent). They are different resources and a change to one is not
+a change to the other.
+
+**Caps are independent, not narrowed.** An app-level cap sitting under a global cap still breaches the
+global one; a single request can be refused by either, and the two 402 codes mean different things.
+Read which one fired.
+
+**A provider-wide limit needs a separate provider.** When every key of one provider is cooled, only a
+key from a *different* provider survives the limit — there is no ordering trick inside one provider
+that recovers it. This is why `plan.is_empty()` → `NO_ROUTE` is a hard outage rather than a slow path.
+
+**`&mut` on shared state is a concurrency ceiling.** A function that takes `&mut` on state shared with
+another task cannot be called concurrently, whatever the caller does. Share via `Arc` + interior
+mutability instead.
+
+**Never pin a signing identity in `tauri.conf.json`.** CI cannot catch it — the build succeeds and
+produces an artefact signed by whatever identity the machine happens to hold. Only a real build
+verifies it.
+
+**The empty-instrument failure mode (2026-09-27).** The recorded bash-`grep` trap is a *false zero*: a
+pattern that matches nothing on a file that has content. `launchctl list` is the other kind — a **true
+zero**: from a non-interactive shell it emits no lines at all, so no pattern can find anything in it.
+Both produce an empty result, and neither is evidence of absence. The control that separates them:
+run the probe against a target you *know* is present (`com.tdai.gateway`'s plist is on disk) — if the
+control also comes back empty, the instrument is empty, not the world. `launchctl print
+gui/<uid>/<label>` reports `state`, `pid` and the program for the job; it is the probe that works, and
+it is what showed the service running when `launchctl list | grep` had already been read as "no job".
+
+
 
