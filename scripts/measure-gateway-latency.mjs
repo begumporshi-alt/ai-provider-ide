@@ -158,8 +158,14 @@ async function setup() {
   const manifest = q(`SELECT body_json FROM manifests WHERE provider_id='${providerId}' AND is_active=1`);
   if (manifest && manifest.includes(realHost)) fail(`the manifest still names ${realHost} — the rewrite missed; the run would report a policy refusal as NETWORK (D46)`);
 
-  KEY = process.env.AIP_GW_KEY || sh("security", ["find-generic-password", "-s", "ai-provider-router", "-a", "masterkey", "-w"]).trim();
-  if (!KEY) fail("could not read a credential from the keychain (or set AIP_GW_KEY)");
+  // File-backed since 1.2.0 (increment 27a). The keychain item is left behind and holds a
+  // *superseded* value, so reading it here presented an obsolete credential.
+  KEY = process.env.AIP_GW_KEY
+    || JSON.parse(fs.readFileSync(path.join(os.homedir(), "Library/Application Support/dev.aiprovider.router/.secrets.json"), "utf8")).masterkey;
+  if (!KEY) fail("could not read the master key from the file vault (or set AIP_GW_KEY)");
+  // **The mechanism below predates the file vault (1.2.0 / 27a)** and is left as recorded rather
+  // than restated: both credential kinds now come from the same `.secrets.json` cache, so the
+  // cache-vs-keychain distinction it explains may no longer hold. Re-measure before relying on it.
   // Which credential this is matters to the numbers, not just to auth: the master key is served
   // from a bounded cache, while per-app keys are read from the keychain on every request
   // (`gateway.rs:1374`). Measured 2026-09-24, the difference is **0.8 ms** (11.6 ms master vs

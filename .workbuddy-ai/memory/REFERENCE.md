@@ -5401,8 +5401,11 @@ reconciliation sweep, deliberately not built (see `DECISIONS.md` 2026-09-27).
 **Diagnosing a ghost** (also triage skill §10): a `key:` account in `.secrets.json` with no `secret_ref`
 match in `api_keys` is a ghost. Confirm it is unused with
 `SELECT COUNT(*) FROM ledger WHERE key_id = '<uuid>'` — `ledger.key_id` holds the **bare uuid**, not the
-`key:` prefix. A 39-char `sk-aip-…` value is `generate_random_key()`'s exact format, i.e. a **gateway**
-credential pasted into the provider-key field — a leak, not a stale key. Remove by rewriting
+`key:` prefix. A 39-char `sk-aip-…` value is `generate_random_key()`'s exact format. **Measured
+2026-09-27:** the one found here was **byte-identical to the stale keychain `masterkey`**
+(`18870dd9a43b`) — a *superseded* master key, which authenticates nothing because the current one is
+what gets compared. Compare against the keychain item to tell a dead superseded key from a live leak;
+an earlier note here called it "a leak, not a stale key" and that was wrong. Remove by rewriting
 `.secrets.json` the way `vault::save` does (tmp → `chmod 600` → rename); every `vault::*` call runs
 `load()` first, so a running process re-reads and will not resurrect the entry.
 

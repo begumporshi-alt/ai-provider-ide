@@ -71,28 +71,48 @@ fn cache() -> &'static Cache {
 }
 
 fn default_data_dir() -> std::path::PathBuf {
-    #[cfg(target_os = "macos")]
+    // **A test binary must never reach the user's real data directory.** `DATA_DIR` is a
+    // `OnceLock` (reached through `secrets_path` → `get_or_init`), so the *first* caller decides it
+    // for the whole process and every later `set_data_dir` is **silently ignored**. The vault's
+    // location therefore depends on which test happens to touch it first — and
+    // `get_returns_none_for_missing_account` below does exactly that, with a real account name,
+    // pinning every other test in the same binary to `~/Library/Application Support/<SERVICE>`. A
+    // test that then writes a secret puts it in the user's home, where nothing reads it.
+    //
+    // Measured 2026-09-27: a stray `{"k1": "v1"}` was found at
+    // `~/Library/Application Support/ai-provider-router/.secrets.json` — the `SERVICE` default.
+    // No code in the repo calls `vault::put("k1", "v1")`, so the writer was not identified; this
+    // is a backstop for the class, not a fix for one call site. A test that needs secrets must
+    // still call `set_data_dir` with a temp dir of its own.
+    #[cfg(test)]
     {
-        let home = std::env::var_os("HOME")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("/"));
-        home.join("Library/Application Support").join(SERVICE)
+        std::env::temp_dir().join(format!("aip-vault-default-{}", std::process::id()))
     }
-    #[cfg(target_os = "windows")]
+    #[cfg(not(test))]
     {
-        std::env::var_os("APPDATA")
-            .map(|p| std::path::PathBuf::from(p).join(SERVICE))
-            .unwrap_or_else(|| std::path::PathBuf::from(SERVICE))
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        std::env::var_os("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(|h| std::path::PathBuf::from(h).join(".local/share").join(SERVICE))
-            })
-            .unwrap_or_else(|| std::path::PathBuf::from(SERVICE))
+        #[cfg(target_os = "macos")]
+        {
+            let home = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            home.join("Library/Application Support").join(SERVICE)
+        }
+        #[cfg(target_os = "windows")]
+        {
+            std::env::var_os("APPDATA")
+                .map(|p| std::path::PathBuf::from(p).join(SERVICE))
+                .unwrap_or_else(|| std::path::PathBuf::from(SERVICE))
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+        {
+            std::env::var_os("XDG_DATA_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME")
+                        .map(|h| std::path::PathBuf::from(h).join(".local/share").join(SERVICE))
+                })
+                .unwrap_or_else(|| std::path::PathBuf::from(SERVICE))
+        }
     }
 }
 

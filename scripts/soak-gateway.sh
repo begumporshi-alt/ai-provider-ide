@@ -33,7 +33,10 @@ if ! up; then
 fi
 up || { echo "GATEWAY NEVER CAME UP"; exit 1; }
 
-KEY=$(security find-generic-password -s ai-provider-router -a masterkey -w)
+# The master key is file-backed since 1.2.0 (increment 27a). The keychain item is **no longer read**
+# by the app, and it still holds a *superseded* value — reading it here presented an obsolete
+# credential, so every request answered `401 invalid gateway key` with nothing to point at.
+KEY=$(python3 -c "import json;print(json.load(open('$APP_DATA/.secrets.json'))['masterkey'])")
 START=$(date +%s)
 : > "$OUT"
 printf 'epoch\thttp\ttime_s\ttcp\n' >> "$OUT"
