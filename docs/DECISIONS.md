@@ -1091,3 +1091,58 @@ validating the configured id against `/v1/models`, which advertises qualified id
 - **Revisit if:** a ghost is found in a vault this fix has been running against — which would mean a
   creation path other than `addKey` (a direct `vault_put` from the webview, or the crash window
   above).
+
+## 2026-09-27 — Operator scripts resolve the gateway port instead of assuming it
+
+**Decision.** `scripts/soak-gateway.sh` and `scripts/repro-restore.sh` now take the port from a shared
+`scripts/lib/gateway-port.sh`, which resolves it the way the service does — the persisted
+`settings.gateway.port` first, then `SERVICE_DEFAULT_PORT` (`bin/aiproviderd.rs:35`, `= 8800`) — and
+they drive `launchctl` against the job that owns the listener rather than launching a GUI app.
+
+**Defect.** Both scripts hardcoded **8787**, which is `gateway::DEFAULT_PORT` — the *other* gateway's
+constant (`core/gateway.rs:38`) — not `aiproviderd`'s, and not the persisted setting. The live listener
+is on `8800`. So on a healthy machine `soak-gateway.sh` declared the gateway down and then took a
+recovery path that could not work either (`open -a "/Applications/AI-Provider Router.app"` — not
+installed there), exiting `GATEWAY NEVER CAME UP`.
+
+**Three defects were stacked behind it, each hidden by the one before.** (1) `repro-restore.sh`'s
+`pkill -f "AI-Provider Router"` matched no process — the service is `aiproviderd` — so it killed
+nothing, waited on a port that never went down, and reported `up=yes after 1s` on every attempt:
+a no-op attributed to a successful restore. (2) Once the port was right, the soak loop actually ran
+and its TSV was unparseable — `${RES// /$'\t'}` does not expand `$'\t'` inside a parameter-expansion
+*replacement*, so rows carried the five literal characters and 3 tab-separated columns against a
+4-column header. (3) The supervisor was misidentified: `launchctl list` prints **0 lines** from a
+non-interactive shell here, and a control label whose plist is present returned nothing too, so the
+absence it showed was not evidence; `launchctl print gui/501/dev.aiprovider.router` reports
+`state = running`.
+
+**Why it was reachable, and why it is not a documentation defect.** The doctrine already existed in
+two documents — `10-headless-service.md` (*"a port this app has never bound, while `DEFAULT_PORT` is
+8787 … the live port is the authority"*) and `COUNT_TOKENS_PLAN.md:148` (*"a hardcoded 8787 targets
+whatever else holds that port"*). Drift-register D7 records the 8787/8800 split as *"not drift"*,
+which is true of the two documents it cites and silent about executables: a document may state the
+default, an executable has to *reach* the listener, and only the second is falsified by dialling 8787.
+
+**Options considered.**
+1. **Set the default to `8800`.** One character, and wrong for anyone who ever changes the port in
+   Settings — it replaces one hardcoded constant with another.
+2. **Read the port from `gateway_status` per run.** Closest to the live truth, but it needs a valid
+   master key before the port is known, and the port is needed to reach the thing that would tell us.
+3. **Resolve from the persisted setting, fall back to the constant, in one shared file** (chosen).
+   Mirrors `persisted_gateway_port(&store).unwrap_or(SERVICE_DEFAULT_PORT)` exactly, needs no
+   credential, and one file means a third script cannot drift the same way.
+
+**Known limitations, deliberately not fixed here.**
+- `repro-restore.sh` still measures a *launchd* restart, not the app's old launch path, because that
+  is what owns the listener now. Whether the Tauri-era `gateway_enable` stall can still occur in a
+  supervised process — and whether `gateway.log` still carries the markers the script greps for — is
+  an open question for a human; a green run must not be read as evidence the old race is fixed.
+- Its `up=yes after 0s` is honest but coarse: the `sleep 4` before the timer starts lets KeepAlive
+  restore the process before measurement begins, so a fast restart is indistinguishable from an
+  instant one. A stall longer than the 60 s window still shows.
+- A crash between the vault write and the row insert remains unfixed (previous entry).
+
+**Revisit if:** the port is made configurable per-run in Settings and a script is written that ignores
+this helper; or `repro-restore.sh` is either retargeted at the supervised process or retired, which is
+the decision this entry defers.
+

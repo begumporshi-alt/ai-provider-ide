@@ -31,6 +31,19 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   the UI. The secret is now deleted again when the row does not land, matching the rollback the host's
   `key_create_h` and `addProvider` already performed. See `DECISIONS.md` 2026-09-27.
 
+- **Two operator scripts dialled a port nothing was listening on.** `soak-gateway.sh` defaulted to
+  `8787` — the *other* gateway's compiled default — and `repro-restore.sh` probed the same port, while
+  the service listens on `8800`. Both then took recovery paths that could not work either:
+  `open -a "/Applications/AI-Provider Router.app"`, a bundle that is not installed there. Three more
+  defects sat behind the port, each hidden by the one before it. `repro-restore.sh`'s
+  `pkill -f "AI-Provider Router"` matched no process — the service is `aiproviderd` — so it killed
+  nothing and reported a successful restore on every attempt. The soak's TSV wrote the five literal
+  characters `$'\t'` between its fields, so every row carried 3 tab-separated columns against a
+  4-column header. And the listener's supervisor was misidentified, because `launchctl list` prints
+  nothing from a non-interactive shell while `launchctl print` reports the job running. Both scripts
+  now resolve the port through a shared `scripts/lib/gateway-port.sh`, drive `launchctl` against the
+  job that owns the listener, and emit parseable output. See `docs/dev-book/07-drift-register.md` D72.
+
 ## [1.2.0] - 2026-09-26
 
 ### Changed
