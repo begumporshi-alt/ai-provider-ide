@@ -51,6 +51,32 @@ pnpm --filter ai-provider-router-desktop web-test
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
 ```
 
+## Building a bundle
+
+```bash
+cd apps/desktop
+./node_modules/.bin/tauri build --bundles app
+```
+
+The bundle lands in
+`apps/desktop/src-tauri/target/release/bundle/macos/AI-Provider Router.app`.
+
+**No signing identity is committed.** Without one, Tauri falls back to **ad-hoc signing**, which is fine for
+local use. To sign with your own certificate:
+
+```bash
+APPLE_SIGNING_IDENTITY="Apple Development: You (TEAMID)" ./node_modules/.bin/tauri build --bundles app
+```
+
+`APPLE_SIGNING_IDENTITY` overrides the config, so you never need to edit `tauri.conf.json`. Notarization is
+skipped unless `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` are set.
+
+> The `.dmg` step may fail on some machines (`hdiutil`). The signed `.app` is already complete at that
+> point — the DMG failure is cosmetic.
+
+For a faster loop, `pnpm --filter ai-provider-router-desktop tauri dev` runs the app with hot reloading, and
+`pnpm --filter ai-provider-router-desktop dev` runs the frontend alone with no Rust shell.
+
 ## Releasing
 
 A release is a `v*` tag. `.github/workflows/release.yml` then runs the preflight, the gate, a

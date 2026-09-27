@@ -14,6 +14,18 @@ Developed and tested on **macOS** (CI runs `macos-14`). Windows and Linux are un
 Windows/Linux icons, but the file-backed secret store and the gateway have only ever been exercised on
 macOS.
 
+**There is no downloadable release yet.** A build another Mac will launch has to be Developer ID signed and
+notarized by Apple, which needs a paid Apple Developer Program membership; until then the release workflow
+attaches its artefacts to a **draft**. The supported path is building from source.
+
+## Getting started
+
+| I want to… | Start here |
+|---|---|
+| **use the app** | [`USER_GUIDE.md`](USER_GUIDE.md) — build from source, first run, pointing another tool at the gateway, what each error code means |
+| **change the code** | Prerequisites and Quickstart below, then [`CONTRIBUTING.md`](CONTRIBUTING.md) for the gate, and the [developer book](docs/dev-book/README.md) for the rules |
+| **understand the design** | [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and [`docs/DECISIONS.md`](docs/DECISIONS.md) |
+
 ## Prerequisites
 
 | Tool | Version | Notes |
@@ -23,95 +35,31 @@ macOS.
 | Rust | stable | no `rust-toolchain` file, so whatever your default is |
 | Xcode command line tools | — | for `codesign` |
 
-## Install
+## Quickstart
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/begumporshi-alt/ai-provider-ide.git
 cd ai-provider-ide
 pnpm install
+pnpm --filter ai-provider-router-desktop tauri dev    # full desktop app
 ```
 
-## Run
+`pnpm --filter ai-provider-router-desktop dev` runs the frontend alone, with no Rust shell — faster to start,
+but the gateway and the secret store are absent.
 
-Frontend only (fast iteration, no Rust shell):
+## First run
 
-```bash
-pnpm --filter ai-provider-router-desktop dev
-```
+Add a provider, add its key, enable it, then switch the gateway on under **Control → Local Gateway**. It
+listens on `127.0.0.1:8787` by default and shows the master key to paste into whichever other tool you want
+to route through it.
 
-Full desktop app:
+The full walkthrough — provider setup, pointing Cursor or a script at the gateway, where your data lives,
+and every error code — is in [`USER_GUIDE.md`](USER_GUIDE.md).
 
-```bash
-pnpm --filter ai-provider-router-desktop tauri dev
-```
+## Build, sign and release
 
-## Build
-
-```bash
-cd apps/desktop
-./node_modules/.bin/tauri build --bundles app
-```
-
-The signed bundle lands in
-`apps/desktop/src-tauri/target/release/bundle/macos/AI-Provider Router.app`.
-
-**Signing.** No signing identity is committed. Without one, Tauri falls back to **ad-hoc signing**, which is
-fine for local use. To sign with your own certificate:
-
-```bash
-APPLE_SIGNING_IDENTITY="Apple Development: You (TEAMID)" ./node_modules/.bin/tauri build --bundles app
-```
-
-`APPLE_SIGNING_IDENTITY` overrides the config, so you never need to edit `tauri.conf.json`. Notarization is
-skipped unless `APPLE_ID` / `APPLE_PASSWORD` / `APPLE_TEAM_ID` are set.
-
-> The `.dmg` step may fail on some machines (`hdiutil`). The signed `.app` is already complete at that point —
-> the DMG failure is cosmetic.
-
-## Releasing
-
-`.github/workflows/release.yml` builds a **universal** (Apple Silicon + Intel) macOS bundle on a `v*`
-tag and attaches it to a **draft** GitHub Release, so the artefacts can be checked before anyone can
-download them.
-
-**Signing is optional and works in two modes**, determined by which secrets are set in the repository:
-
-| Mode | Secrets | Result |
-|---|---|---|
-| Ad-hoc (default) | None of the five below | The bundle is ad-hoc signed. Works on the machine that built it. macOS Gatekeeper refuses to launch it on any other Mac. Suitable for self-distribution on your own hardware. |
-| Developer ID + notarization | All five | The bundle is signed with a Developer ID Application certificate and notarized. A draft release other Macs can launch. |
-
-The five secrets needed for the full path:
-
-| Secret | What it is |
-|---|---|
-| `APPLE_CERTIFICATE` | Developer ID Application certificate (`.p12`), base64-encoded |
-| `APPLE_CERTIFICATE_PASSWORD` | The password set when exporting that `.p12` |
-| `APPLE_ID` | The Apple ID email used for notarization |
-| `APPLE_PASSWORD` | An **app-specific** password for that Apple ID (`APPLE_PASSWORD` at <https://appleid.apple.com>) |
-| `APPLE_TEAM_ID` | The 10-character team identifier from the Apple Developer portal |
-
-`APPLE_SIGNING_IDENTITY` is optional — Tauri derives it from the certificate. Set it only to
-disambiguate when the `.p12` holds more than one identity.
-
-A half-configured state (some secrets, others missing) is caught by `scripts/release-preflight.sh`
-before the build starts; the job fails fast with the list of missing names. See `CONTRIBUTING.md`,
-"Releasing", for how to obtain the secrets and run the full path by hand.
-
-> **Trust model.** For an open-source project, the trust path is building from source — not code
-> signing. An ad-hoc signed release is perfectly valid on your own machine; the notarized path
-> exists for users who download the release rather than building it themselves.
-
-**There is no auto-updater — updates are manual.** The user downloads the new release and replaces
-the app. `UPDATER.md`, `SIGNING.md` and the two updater scripts were removed in 1.0.0 because they
-described an updater that was never implemented, and described it wrongly: a top-level `updater`
-config block (Tauri v1's shape, not v2's `plugins.updater`), a `TAURI_SIGNING_PUBLIC_KEY` variable
-Tauri does not read, and an RSA keypair where Tauri verifies minisign/ed25519. See `CHANGELOG.md`.
-
-A notarized release is a **different signing identity** from a locally built app. That used to matter for
-the secret store — a keychain item is bound to the identity, so switching between them prompted once — but
-the store is now a file owned by your user account, so switching no longer prompts for anything. See
-`SECURITY.md`.
+To bundle, sign, or cut a release, see [`CONTRIBUTING.md`](CONTRIBUTING.md) — "Building a bundle" and
+"Releasing". In short, `./node_modules/.bin/tauri build --bundles app` from `apps/desktop`.
 
 ## Test
 
@@ -122,18 +70,7 @@ pnpm ci:local                  # the full gate: leak scan, version sync, build, 
 ```
 
 `pnpm ci:local` needs `PATH="$HOME/.cargo/bin:$PATH"` or it reports a bogus "Rust (cargo missing)" failure.
-
-## First run
-
-1. Launch the app. It starts with no providers — the home screen asks you to add one.
-2. **Providers → + Add Provider**:
-   - **Quick add** — OpenRouter, OpenCode Zen, b.ai (known profiles).
-   - **Manual** — any OpenAI- or Anthropic-compatible API: name, base URL, auth header, dialect.
-   - **Guided setup** — for anything else; it probes the API, identifies the dialect, runs free contract
-     checks, and only enables the provider after you approve.
-3. Add a key per provider (**+ Add key**). It goes to the local secrets file.
-4. Enable the provider. The gateway listens on `127.0.0.1` on a **configurable port** — Control → Local
-   Gateway shows the current one along with the master key. A fresh install starts on `8787`.
+The step-by-step version, and what each step exists to catch, is in [`CONTRIBUTING.md`](CONTRIBUTING.md).
 
 ## Layout
 
@@ -143,9 +80,10 @@ packages/router-core/    routing, adapter runtime, model catalog, onboarding orc
 packages/adapter-spec/   the manifest grammar (zod) — the frozen contract
 ```
 
-Architecture and decisions live in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) and
-[`docs/DECISIONS.md`](docs/DECISIONS.md). The rest of the design and session records are in `docs/` too —
-the repository root holds only `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` and `LICENSE`.
+The repository root holds only the audience-facing documents — `README.md`, `USER_GUIDE.md`,
+`CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md` and `LICENSE`. Everything else is in
+[`docs/`](docs/) — design notes, session records, audits — with the visual diagrams in
+[`diagrams/`](diagrams/).
 
 **Developers: start with the [developer book](docs/dev-book/README.md).** It owns the rules, the interfaces and
 the conventions, and it tracks every known doc-versus-code disagreement.
