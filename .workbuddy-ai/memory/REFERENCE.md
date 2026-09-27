@@ -342,6 +342,92 @@ moved just before a later `tauri build` can be byte-identical to the new one wit
   `curl` reached openrouter.ai fine — provider-specific, not app egress.
 - A three-key comparator is easy to get backwards in one key and the compiler will not say so.
 
+## The vault detects change by content, not metadata (landed 2026-09-27, audit M4)
+
+- `reload_if_changed` (`core/vault.rs`) decides whether to re-read `.secrets.json` by comparing the
+  file's **bytes** against the bytes it last read. It used to compare a `FileStamp { mtime, len }`.
+- **Metadata is not a fingerprint.** A rewrite of the same *length* landing on the same *timestamp*
+  compares equal, so the early return keeps serving the superseded secret — the exact window the reload
+  exists to close. Reproduced deterministically by
+  `a_same_length_rewrite_with_an_identical_timestamp_is_still_seen`, which **constructs** the collision
+  with `set_modified` rather than waiting for one. On macOS/APFS it does not arise on its own (0 in
+  5000); on Linux it does, because file timestamps come from the coarse clock — and `ci.yml`'s
+  `headless-service` matrix builds this binary on `ubuntu-latest`.
+- **Never "add a hash" to a stat-based gate.** Hashing requires *reading*, which is the cost the gate
+  exists to avoid — the fix is to compare content and drop the metadata.
+- **Two failure modes, not one.** `NotFound` means "no file", so the map is cleared. Any *other* read
+  error returns early and changes **nothing**, so the next call retries. The old gate latched the new
+  stamp *before* reading, so one transient failure emptied the cache and then compared equal forever.
+- **The cross-process lock (landed 2026-09-27, the lost-update finding).** `put`/`delete` hold
+  `std::fs::File::lock` on a sibling `.secrets.lock` across the whole `load → mutate → save`, plus
+  `Cache::ops` (an in-process mutex) around each public operation. **No new dependency:** std stabilised
+  `File::lock` in **1.89** and this toolchain is 1.98.1 — `flock(2)` on unix, `LockFileEx` on Windows.
+  The API is `lock()` / `try_lock()` / `unlock()`, **not** `lock_exclusive()`; `fs4`'s own docs are what
+  point at std, and the name alone would have produced a compile error.
+- **`save` writes the whole map, so an unexcluded pair fails twice over.** Measured before the fix by
+  `two_processes_writing_different_accounts_lose_nothing` — two **real** processes behind a start
+  barrier: **26 of 50** `put`s returned `No such file or directory` (both wrote the same
+  `.secrets.json.tmp`, so one `rename`d it out from under the other) **and 25 of 50** accounts were
+  absent from the file, with both calls returning `Ok`. The loud half hides the silent one; report both.
+- **Why the in-process mutex is not redundant:** the file lock excludes other *processes*, but `get`
+  calls `load`, whose `*map = fresh` is a **replace** — so a `get` landing between a `put`'s mutation and
+  its `save` would erase the mutation, and the `put` would then save that.
+- **The lock file is never unlinked, and that is load-bearing.** A probe whose child leg removed and
+  re-created the lock file locked a **different inode** and excluded nobody: it read "not excluded"
+  until the unlink was moved below the child branch. A lock file that can vanish is not a lock — `save`
+  renames only `.secrets.json.tmp`.
+- **Measured semantics, each by its own probe:** excludes across processes; excludes two fds in one
+  process (so threads serialise too); **blocks** rather than failing (a second process's `lock()`
+  returned after 3.0026 s against a 3 s holder); released on drop and by the kernel when the holder dies
+  — no stale-lock state to age out or steal, which is why a `create_new` lockfile was rejected.
+- **Falsified both ways on identical test code:** lock stubbed out → 3/3 red; lock in place → 5/5 green.
+  Two harness traps that each cost a pass: `--exact` needs the **full test path** (a filter matching
+  nothing **exits 0**), and `libtest` writes assertion failures to **stdout**, not stderr.
+
+## The TS gateway normalizer is a frozen oracle, not dead code (relabelled 2026-09-27, audit M5)
+
+- `packages/router-core/src/gateway-normalizer.ts` + `gateway-client-detector.ts` are **not on any
+  production path** — the Rust `core/gateway_normalizer.rs` serves requests (via `core/router_bridge.rs`),
+  and nothing but each module's own spec imports the TypeScript.
+- **They cannot be deleted**, which is what the finding first proposed: D32/D33/D34 each close with *"the
+  TypeScript is left exactly as written, so the reference the port is measured against does not move under
+  it"*, and increment 22 pinned the Rust hash helpers *"by running the original in Node rather than by
+  reading it"*. Deleting the file would break three register entries and one increment's evidence.
+- What changed: `index.ts`'s two re-export lines are gone (an export with no importer is a promise the
+  package cannot keep); both module headers now name the Rust authority.
+- **Both header rewrites are line-count-preserving on purpose — 16 lines in, 16 out; 4 in, 4 out.** The
+  Rust port and the dev book cite these files **by line number** (`gateway-normalizer.ts:596-602`,
+  `:513-516`; `gateway-normalizer.test.ts:375-382`, `:380`), so a prepended header would have silently
+  invalidated every one. **Read the cited ranges before advertising them** — all four were accurate, so
+  the header could name them safely. Re-check after any edit to either file.
+
+## The host boundary: `unknown` in, validated type out (landed 2026-09-27, audit M3+M8)
+
+- **`lib/host-boundary.ts` imports nothing.** That is load-bearing, not tidiness: `gateway-client.ts`
+  needs `parseHostJsonOr`, so if the module imported `store.ts` there would be a runtime import cycle.
+  The guards that *do* need `store.ts`'s interfaces live in `lib/host-guards.ts`, pulled in with
+  `import type` (erased at runtime, so still no cycle).
+- **`fetchAdmin` returns `Promise<unknown>`.** Read it through `fetchAdminAs(method, path, guard)`; never
+  assert it. There were **~37** bare `as` assertions in `store.ts` alone — the audit's "six sites" was
+  wrong by a factor of six, which is itself the finding.
+- **Two policies, deliberately.** `expectShape` / `parseHostJson` **throw** `HostShapeError` for reads
+  that feed rendering; `expectShapeOr` / `parseHostJsonOr` **default** for boolean flags and optional
+  settings blobs, where a missing field is already the safe answer. One uniform policy would turn a
+  missing optional field into a boot failure.
+- **`HostShapeError extends Error`, never `TypeError`.** `isUnreachable(e)` in `store.ts` is
+  `e instanceof TypeError`, so a shape mismatch that extended `TypeError` would be read as "host
+  unreachable" and **degrade silently**. A boundary mismatch must fail loudly.
+- **A guard is a runtime twin of an interface, and nothing checks the pair.** The mapped-type table
+  (`{[K in keyof T]-?: Guard<T[K]>}`) ties each guard to its field's *declared* type, so a wrong guard is
+  a compile error — but a field added to the interface and not to the guard is **not** caught. Update
+  both by hand.
+- **`gateway-client.fake.ts` must export anything `store.ts` reads through.** Three specs mock that
+  module; the suite stayed green after `fetchAdminAs` was introduced **only because no spec reached a
+  converted path**. Adding a transport helper means adding it to the fake.
+- **Not covered:** `JSON.parse(…) as X` over persisted row columns and IPC results outside the
+  `fetchAdmin` path (report L11). Those are `try/catch`-wrapped, so they survive malformed JSON but not
+  *well-formed JSON of the wrong shape*.
+
 ## Browser harness (`apps/desktop/web-test`) — use it for UI work
 - **`getByRole("heading", { name })` matches a *substring*, not the whole name.** Adding a section
   heading "Memory layer" broke a test that matched the screen title "Memory": the locator then
@@ -725,6 +811,16 @@ containing one PARSE_ERROR row still finished 200).
 
 Do not "fix" this by loosening the classification — the row is the honest one. If it ever needs
 handling, the fix belongs in retry/continuation, not in the error class.
+
+**Corrected 2026-09-27, without loosening the class.** Roughly a quarter of `PARSE_ERROR` rows were
+neither truncation nor a parse failure: a turn whose **entire output is a tool call** produces zero
+chunks (tool calls travel by `on_tool_call`), and "served" was being decided by a chunk count — so a
+healthy `finish_reason:"tool_calls"` answer was filed as an error while the same request recorded
+`OK` in key health. The fix is not a looser class, it is a correct definition of *served*: text chunk
+**or** tool call (`router.rs` `Delivered::any`, `execution-engine.ts`). A `200` with an empty body
+and an aborted request are still `PARSE_ERROR` / `CANCELLED`. So when triaging: a `PARSE_ERROR` row
+that **names a provider** is not this at all, and one with small non-zero `tokens_out` on a
+tool-capable request is worth probing before believing it.
 
 ### Two hazards measured down to "no change justified" (2026-09-20)
 - **`ensureArrayContent`** (string → `[{type:"text",…}]` for every message, all providers): measured
@@ -1469,6 +1565,12 @@ test that only checks the heading is visible passes against a screen whose data 
   `playwright test` dies with `Error: Timed out waiting 30000ms from config.webServer` even though
   both servers are up and curling fine — Playwright's own readiness probe goes through the proxy.
   Always `env -u NODE_OPTIONS -u HTTP_PROXY -u HTTPS_PROXY -u http_proxy -u https_proxy`.
+  **Recurred 2026-09-27 in a shape that does not look like a timeout.** With the vars set, Playwright's
+  probe of `http://127.0.0.1:1430/web-test/` got **HTTP 404** on every poll — from the *proxy*, not from
+  vite, which serves the same URL 200 standalone (ready in 914 ms). Playwright treats a non-2xx
+  readiness response as not-ready, so the surface symptom is still the timeout but the evidence in the
+  log is a 404. Diagnose with `DEBUG=pw:webserver`, and **check the four vars first** — this bullet is
+  the cause; do not re-derive it.
 - **A vite started with `&` inside a Bash tool call dies when that call returns.** Use
   `run_in_background: true`. Symptom: `lsof` shows the port listening, `curl` gets 000.
 - **The nav button is "Local Gateway", not "Gateway".** `getByRole("button", { name: "Gateway" })`
@@ -5441,6 +5543,105 @@ run the probe against a target you *know* is present (`com.tdai.gateway`'s plist
 control also comes back empty, the instrument is empty, not the world. `launchctl print
 gui/<uid>/<label>` reports `state`, `pid` and the program for the job; it is the probe that works, and
 it is what showed the service running when `launchctl list | grep` had already been read as "no job".
+
+## M1 — the blocking reads leave the reactor (2026-09-27)
+
+Depth behind the offload boundary. The audit (`docs/AUDIT_REPORT_2026-09-27.md`, M1) found blocking
+SQLite reads on the async request path and offered two options; option 1 — "wrap the auth-path and
+spend-gate DB reads in `spawn_blocking`; the UI CRUD commands can stay synchronous" — is what landed.
+
+**The boundary, and both sides of it are deliberate.**
+
+| Read | Status |
+|---|---|
+| `egress::build` → `check_secret_host` **and** the vault read | **Offloaded**, one shared `Store::offload` hop |
+| `check_gateway_key` → the per-app key scan (`app_keys`) | **Offloaded** — `app_keys_blocking` |
+| `check_gateway_key` → the spend gate (`spend_gate`) | **Offloaded** — `spend_gate_blocking` |
+| `context_scope.rs:549` → `key_principal_for`, `principal::allows` | **Left synchronous, on purpose** |
+
+**Why the vault read had to move *with* `check_secret_host`.** It `stat`s and may read a file.
+Offloading only the check would have left a blocking call on the same path — a fix that looks complete
+and is not, which is the failure mode this exercise exists to catch.
+
+**Why the memory-path reads were left alone — do not "finish" M1 by moving them without reading this.**
+Both are reached only with the memory toggle **on**. With it off — the default — `key_principal_for` is
+never called and `allows` returns on its first line without opening the store, so a disabled layer
+costs **zero** database reads. Offloading them needs either scope resolution outside `inject_context`
+(a second authority free to drift from the one inside it) or making that function `async`, which
+converts the **~33 synchronous `#[test]`s** that use it as scaffolding. The reasoning is also at the
+call site.
+
+**`check_gateway_key` is now `async`**, so every caller awaits: 9 dialect-handler call sites (5
+`gateway_handlers`, 2 `gateway_anthropic`, 1 each Gemini/Responses) plus `gateway_admin`'s `authorize`,
+which is itself opened by **52** admin routes. `rustfmt` wants the `authorize` chain on one line —
+hand-wrapping it fails `fmt --check`.
+
+**`EgressError::StoreTask` is deliberately *not* a policy refusal.** A lost blocking task is a real
+local fault, not a decision taken here, so it stays out of `is_policy_refusal`; otherwise it becomes
+the D46 class by yet another route.
+
+**The falsification, and why it was necessary.** This was a *refactor*: the test count stayed at
+**1340**, and a green suite at an unchanged count is exactly the case where "the suite passes" proves
+nothing about the new transport. Both offloads were broken on purpose — `app_keys_blocking` → `Vec::new()`
+turned **8** tests red, `spend_gate_blocking` → `None` turned **4** red. Both fail **through the real
+handler** (`post_chat(&s, "sk-aip-app1")`), not through direct calls to the helpers, which is the
+distinction that matters: a refactor whose new path is covered only by direct unit calls can pass while
+the request path diverges.
+
+**Sweep.** The deletion-sweep rule applies to a *change* too: grep for the claims your change
+*falsifies*, not the files it touched. One live one — the audit report's own "`grep` finds exactly
+**one** `spawn_blocking`", now four. Rewritten as a dated observation.
+
+**Gates:** `fmt --check` clean · `clippy --all-targets -D warnings` clean · `cargo test --lib` 1340 / 0
+· `cargo check --no-default-features --all-targets` clean · `check-doc-links` 127/127 ·
+`check-version-sync` OK · `key-leak-grep` OK.
+
+
+## M2 — the request-reachable panics become errors (2026-09-27)
+
+Depth behind `panic = "abort"`. The audit (`docs/AUDIT_REPORT_2026-09-27.md`, M2) listed **9**
+production panic sites; a from-scratch census found **11**.
+
+**The two the audit missed are both in `ledger.rs`, and one is a non-lock `.unwrap()`** —
+`ledger.rs:151`, `self.mem.back().unwrap()`. That is precisely the thing the 2026-09-20 closure claimed
+did not exist. The 2026-09-20 census ("3 production `expect()`, every production `.unwrap()` is a lock
+call") was **accurate for its tree** and falsified four days later when the router-core port
+(2026-09-24) landed `sandbox.rs`, `gateway_normalizer.rs`, `ledger.rs`. **A census goes stale the moment
+code lands — re-derive it, never quote it.** That rule is now in `dev-book/06-conventions.md`.
+
+**`panic = "abort"` is set under `[profile.release]` only** → one panic ends the gateway for *every*
+client. **Poison is impossible under abort** (poisoning is set in `MutexGuard::drop`, which runs only
+while unwinding), so `.lock().unwrap()` is *unreachable rather than dangerous*. **Non-lock panics are the
+real surface**; chasing lock calls is the wrong instinct.
+
+| Site | Status |
+|---|---|
+| `sandbox.rs` `forbidden_patterns`, `export_default_re` | `Result<…, String>` + `OnceLock<Result<…>>`; testable `compile_patterns` seam |
+| `sandbox.rs` `js_number_to_string` | made **total** — non-finite guard + `let … else` on the split and the parse |
+| `gateway_normalizer.rs` `to_base36` | `Vec<char>` collect; `from_utf8(…).expect(…)` gone |
+| `gateway_normalizer.rs` `sanitize_openai_tool` | holds the `Map` directly; both expects gone |
+| `ledger.rs` — `sink.append(self.mem.back().unwrap())` | `.ok_or(…)?` — reads at **:158** now; the inserted comment is the only thing that moved it |
+| `Egress`'s two clients, the Tauri builder | **Kept panicking, by design** — all three run before any request exists |
+
+`lint_code_source` fails **closed** (a bad pattern becomes a lint error). Precedent: `core/modality.rs:348`
+already says "*An unparseable pattern is an error, not a non-match*" — `sandbox.rs` was the outlier.
+
+**Census instruments — two were broken before one worked.** (a) A brace-matching blanker mis-blanks files
+holding several `#[cfg(test)]` modules (`egress.rs` has five); use a **line-based cut** — truncate at the
+first `#[cfg(test)]` + column-0 `mod NAME {`, skip `*_tests.rs` (included via `#[path]`), and
+**control-pass against a file known to have tests**. (b) Doc comments *discussing* `.expect(` count as
+hits — **strip comments** (6 → 3). **Calibrate the instrument, not just the reading.**
+
+**Falsified twice, one probe per site.** `js_number_to_string` restored to `expect` → panicked at
+`sandbox.rs:657`. `compile_patterns` made to panic → `sandbox.rs:280`. A probe that **fails to compile
+prints nothing and looks like a pass** — apply it so it compiles *and* panics.
+
+**Sweep.** `docs/SECURITY_AUDIT_2026-09-20.md` H3 gained a **CORRECTION 2026-09-27** blockquote: the
+11-site table, and the named worst-aged sentence ("there is not one non-lock `.unwrap()` in the shipped
+code").
+
+**Gates:** `fmt --check` clean · `clippy -D warnings` clean · `cargo test --lib` **1342 / 0** ·
+`--no-default-features --all-targets` clean.
 
 
 

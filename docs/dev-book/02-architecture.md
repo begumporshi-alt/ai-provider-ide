@@ -15,7 +15,7 @@ A request from `router-core` does not carry a credential. It carries a `secretRe
 
 ```
 TS  →  { secretRef: "key:k1", method: "POST", url: "…/v1/chat/completions", body, headers }   // no auth
-Rust →  resolve k1 in the OS keychain → inject "Authorization: Bearer …" → send → drop the value
+Rust →  resolve k1 in the vault → inject "Authorization: Bearer …" → send → drop the value
 ```
 
 So the webview never holds a raw secret, and code running in the webview — including anything an AI generated
@@ -34,7 +34,7 @@ Two consequences worth stating plainly:
 | Runtime | Holds | May touch |
 |---|---|---|
 | Webview (TypeScript) | The entire `router-core` package, the React UI | Nothing privileged. Talks to the host only through 125 typed IPC commands |
-| Rust host | The gateway, the egress module, the keychain, SQLite | The network with credentials, the OS keychain, the filesystem |
+| Rust host | The gateway, the egress module, the vault, SQLite | The network with credentials, the local secrets file, the filesystem |
 
 Both live in one desktop process, but they are not peers. The webview is the brain and the Rust host is the
 only thing with hands.
@@ -46,7 +46,7 @@ Three reasons, in order of weight:
 1. **Credential injection has to be somewhere audited.** Putting it in Rust makes "all egress flows through one
    module" mechanically true rather than aspirational.
 2. **The webview origin cannot call provider APIs at all** — no CORS headers from providers.
-3. **The keychain and SQLite are Rust APIs.** Anything else would need a second bridge.
+3. **The vault and SQLite are Rust APIs.** Anything else would need a second bridge.
 
 ### The gateway bridge, and its availability cost
 
@@ -80,7 +80,7 @@ modules are the pipeline's tools rather than a layer beneath it.
 | L3 Application | Provider registry, model catalog, usage ledger, onboarding orchestrator, drift monitor |
 | L2 Router core | Model router, route planner, health tracker, execution engine, adapter runtime |
 | L1 Adapters | Manifest interpreter, builtin templates, probe runner, redaction, adapter generator, contract suite, sandbox |
-| L0 Host | Egress gateway, local gateway, keychain vault, SQL store — all Rust |
+| L0 Host | Egress gateway, local gateway, vault, SQL store — all Rust |
 
 **Hard rule:** the UI imports nothing except `ipc-client`. Any new screen is a new consumer of `ipc-client`;
 nothing else should change.

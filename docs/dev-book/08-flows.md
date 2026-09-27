@@ -52,7 +52,7 @@ the plan — the next key, or the next provider — *is* the retry. There is no 
 | Step | You do | Under the hood |
 |---|---|---|
 | 1 · Add a provider | Quick add for known profiles (OpenRouter, OpenCode Zen, b.ai), Manual for any OpenAI- or Anthropic-compatible base URL, or Guided setup for anything else | Guided setup tries the **deterministic** path first: free probes, dialect fingerprinting against the builtin templates, OpenAPI discovery when a spec is served. The AI generator runs only if that fails, and it never sees a key or a raw response body |
-| 2 · Add a key | One key per provider, entered on the Providers screen | The keychain write happens in Rust. The webview holds only a `secretRef`, and the one-shot reveal never enters webview-observable state |
+| 2 · Add a key | One key per provider, entered on the Providers screen | The vault write happens in Rust. The webview holds only a `secretRef`, and the one-shot reveal never enters webview-observable state |
 | 3 · Enable and verify | Contract tests run against the provider with your key, then you approve | `pingKey`, then `listModels`, then a minimal text call. Paid calls require explicit consent with an estimated cost. The provider stays `pending` until you confirm, and the report is kept on its card |
 | 4 · Browse models | Model Browser, Text and Image tabs, alias priority, per-capability defaults | Discovery goes through the adapter and is cached with a TTL. Entries are exposed as `provider-slug/native-id`; a bare ID resolves through the alias map. Nothing is an image model unless a manifest declares it |
 

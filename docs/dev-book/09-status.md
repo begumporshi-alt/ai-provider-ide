@@ -19,7 +19,7 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Adapter tiers | Builtin templates, manifest interpreter, QuickJS sandbox | `router-core`, Tier-2 review screen |
 | Onboarding | Deterministic fingerprint path, AI fallback, contract-gated | `onboarding-e2e.test.ts` |
 | Drift and repair | Detection window, patch flow, versioned rollback | `drift-repair-e2e.test.ts` |
-| Secrets | File-backed store (`.secrets.json`, mode 600), key-blind TypeScript, one-shot reveal; OS keychain abandoned 2026-09-26 | `core/vault.rs` (JSON file, atomic tmp+rename write, `OnceLock` cache), `aiproviderd mint` subcommand; `keyring` removed from `Cargo.toml`; `key-leak-grep` in CI still guards the UI |
+| Secrets | File-backed store (`.secrets.json`, mode 600), key-blind TypeScript, one-shot reveal; OS keychain abandoned 2026-09-26 | `core/vault.rs` (JSON file, atomic tmp+rename write, a cross-process `File::lock` over the read-modify-write, `OnceLock` cache), `aiproviderd mint` subcommand; `keyring` removed from `Cargo.toml`; `key-leak-grep` in CI still guards the UI |
 | Memory | Scoped recall, capture queue, retention, supersession | Migration 0014, `memory.spec.ts` |
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tauri/tools.rs` |
 | Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |

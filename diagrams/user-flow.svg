@@ -18,7 +18,7 @@
 
 <rect x="60" y="132" width="250" height="48" rx="8" fill="#E6F1FB" stroke="#185FA5" stroke-width="0.5"/>
 <text x="185" y="150" text-anchor="middle" dominant-baseline="central" font-size="13" font-weight="500" fill="#042C53">2 · Add a key</text>
-<text x="185" y="166" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">written to the OS keychain</text>
+<text x="185" y="166" text-anchor="middle" dominant-baseline="central" font-size="12" fill="#185FA5">written to the local secrets file</text>
 
 <line x1="185" y1="180" x2="185" y2="196" stroke="#888780" stroke-width="1.5" marker-end="url(#arrow)"/>
 

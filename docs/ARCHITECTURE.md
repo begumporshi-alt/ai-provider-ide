@@ -46,8 +46,8 @@ Any third-party app — Cursor, scripts, chat UIs — can use
 every configured provider through that single URL and single credential, with the same key
 rotation and failover as the IDE's own UI ("custom AI to 3rd party").
 
-Stack adjustment vs. the spec: `keytar` is archived (Dec 2022) — replaced by the Rust `keyring`
-crate, with all outbound HTTP routed through a **Rust egress gateway** that performs credential
+Stack adjustment vs. the spec: `keytar` is archived (Dec 2022) — replaced by a Rust file-backed
+vault (`vault.rs`), with all outbound HTTP routed through a **Rust egress gateway** that performs credential
 injection so the TypeScript layer never holds a raw secret.
 
 ---
@@ -66,8 +66,8 @@ L2  Router Core         Model Router, Route Planner, Health Tracker,
 L1  Adapter Layer       Manifest Interpreter (one generic adapter),
                          Builtin Dialect Templates, Sandbox Runtime,
                          Adapter Generator, Contract Suite
-L0  Host Infrastructure Egress Gateway (Rust/reqwest), Keychain Vault
-                         (Rust/keyring), SQLite Store, OS Keychain
+L0  Host Infrastructure Egress Gateway (Rust/reqwest), Vault
+                         (Rust, file-backed), SQLite Store
 ```
 
 *Layering is deliberately relaxed, not strict:* the rule "arrows point downward" governs the
@@ -81,12 +81,12 @@ Two runtimes inside one desktop process:
 
 - **Webview (TypeScript):** React UI + the entire `@aiprovider/router-core` package. UI-agnostic;
   talks to the host only through narrow ports implemented over Tauri IPC commands and channels.
-- **Rust host:** the only code allowed to touch the network with credentials, the OS keychain,
+- **Rust host:** the only code allowed to touch the network with credentials, the local secrets file,
   and SQLite. Exposes typed commands (`vault:*`, `egress:*`, `store:*`) and streams responses
   back via Tauri `Channel`s. Also runs the **Local Gateway** — an axum HTTP server exposing the
   router as an OpenAI-compatible endpoint (`/v1/chat/completions`, `/v1/models`,
   `/v1/images/generations`) authenticated by the master key; it validates the key against the
-  keychain in Rust, then bridges the request into the router core over internal IPC. The
+  vault in Rust, then bridges the request into the router core over internal IPC. The
   gateway serves while the IDE runs (a future service mode could keep it alive headless).
 
 Why HTTP lives in Rust: the Tauri webview origin cannot `fetch()` provider APIs directly
@@ -127,7 +127,7 @@ allowlisting, secret scrubbing).
 | `contract-suite` | L1 | Conformance tests: `pingKey`, `listModels`, minimal text/image gen |
 | `egress-gateway` (Rust) | L0 | ALL outbound HTTP: credential injection, host allowlist, SSE→channel streaming |
 | `local-gateway` (Rust) | L0 | OpenAI-compatible local endpoint: master-key auth, request → router bridge, SSE streaming out |
-| `keychain-vault` (Rust) | L0 | OS keychain CRUD via `keyring` v2; one-shot reveal; stores the master key |
+| `vault` (Rust) | L0 | JSON file CRUD (`.secrets.json`, mode 600); one-shot reveal; stores the master key |
 | `sql-store` (Rust) | L0 | SQLite access + migrations |
 
 **The L4 screen rows above are the spec-era map, not the shipped set.** The app ships **13** screens —
@@ -164,7 +164,7 @@ provider-registry ──refs──> key-vault-service   route-planner ──plan
      │                          │                                              │                ├─manifest──> manifest-interpreter
      ▼                          ▼                                              │                └─code──────> sandbox-runtime
   sql-store <──store-port──────┤                                              ▼
-                              keychain-vault (Rust) <────────── secretRef ── egress-gateway (Rust) <──http-port── manifest-interpreter
+                              vault (Rust) <────────── secretRef ── egress-gateway (Rust) <──http-port── manifest-interpreter
                                   │                                               │        sandbox-runtime
                                   └── raw secret (memory only) ────────────────────┘
 execution-engine ──entries──> usage-ledger ──> sql-store
@@ -175,7 +175,7 @@ onboarding-orchestrator ──> contract-suite ──> adapter-runtime
 onboarding-orchestrator ──register manifest──> provider-registry
 model-router ──stream chunks──(Tauri Channel)──> ipc-client ──> screen-assistant
 external apps ──HTTP, Bearer master key──> local-gateway (Rust) ──auth ok──> model-router
-local-gateway ──verify key──> keychain-vault
+local-gateway ──verify key──> vault
 ```
 
 Hard rules encoded in the graph:
@@ -192,7 +192,7 @@ Hard rules encoded in the graph:
 ### 2.1 Pipeline
 
 ```
-User: name, baseUrl, apiKey, [docsUrl]                     (apiKey → straight to keychain-vault)
+User: name, baseUrl, apiKey, [docsUrl]                     (apiKey → straight to vault)
   ▼
 [1] probe-runner ──GET/OPTIONS probes──> egress-gateway ──> candidate provider
         │  endpoint matrix (/v1/models, /models, /v1/chat/completions, /v1/messages,
@@ -422,7 +422,7 @@ execution-engine ──attempt 1──> adapter-runtime ──manifest──> ma
   │                                └─http-port: { secretRef:k1, POST /v1/chat/completions, no auth }
   │                                        │
   │                                        ▼
-  │                                egress-gateway (Rust): resolve k1 → keychain → inject
+  │                                egress-gateway (Rust): resolve k1 → vault → inject
   │                                "Authorization: Bearer •••" → provider host allowlist check
   │                                        │  SSE stream
   │  401/429 ◄────────────────────────────┘
@@ -456,7 +456,7 @@ Any app (Cursor · VS Code ext · scripts · chat UI)
   │  Authorization: Bearer sk-aip-…            (the master key)
   ▼
 local-gateway (Rust, axum)
-  │  1. validate master key against keychain-vault   → 401 on invalid/revoked
+  │  1. validate master key against vault   → 401 on invalid/revoked
   │  2. parse the OpenAI-compatible request (model, messages, stream)
   ▼
 model-router            ← identical path to internal requests:
@@ -469,7 +469,7 @@ usage-ledger.append({ ..., source: "gateway" })
 ```
 
 **Master key lifecycle.** Generated in-app on first enable (crypto-random, `sk-aip-…`
-format), stored in the OS keychain (account `masterkey`), displayed once with a copy button,
+format), stored in the local secrets file (account `masterkey`), displayed once with a copy button,
 never written to the DB or logs. Rotate = generate a new key (old one dies instantly);
 revoke = disable the gateway. Reveal is one-shot, like provider keys.
 
@@ -588,7 +588,7 @@ CREATE TABLE api_keys (
   id             TEXT PRIMARY KEY,
   provider_id    TEXT NOT NULL REFERENCES providers(id) ON DELETE CASCADE,
   label          TEXT NOT NULL,
-  secret_ref     TEXT NOT NULL,          -- keychain account `key:<id>`; NEVER the secret
+  secret_ref     TEXT NOT NULL,          -- vault account `key:<id>`; NEVER the secret
   secret_hint    TEXT,                   -- last 4 chars only; feeds the re-enter-key UX
   status         TEXT NOT NULL DEFAULT 'active'
                  CHECK (status IN ('active','cooldown','invalid','disabled')),
@@ -727,15 +727,16 @@ rollups never affect drift detection. No request/response bodies are stored by d
 `foreign_keys` OFF — without this every FK above is decorative). On open: `integrity_check`;
 on quit or daily: `VACUUM INTO` a dated backup, keep the last 7; on corruption, offer restore
 from the newest good backup. A user-initiated **config export** (JSON: providers, manifests,
-aliases, settings, `secret_ref`s — never keychain values) provides a portable,
+aliases, settings, `secret_ref`s — never secret values) provides a portable,
 human-inspectable disaster-recovery path.
 
-**OS keychain** (Rust `keyring` v2, service `ai-provider-router`, accounts `key:<keyId>` for
-provider keys and `masterkey` for the Local Gateway master key): the only home of raw secrets.
-Linux requires Secret Service (gnome-keyring/KWallet) — surfaced as a
-first-run check; macOS Keychain and Windows Credential Manager work out of the box.
+**Local secrets file** (Rust `vault.rs`; `<data_dir>/.secrets.json`, mode 600, written
+atomically via tmp + rename; the `ai-provider-router` service name is kept for external
+callers, accounts `key:<keyId>` for provider keys and `masterkey` for the Local Gateway
+master key): the only home of raw secrets. There is no OS keychain and no code-signing
+dependency — the file is owned by the user, and nothing leaves the machine.
 
-**Restore on a new machine.** A restored DB references keychain accounts that do not exist
+**Restore on a new machine.** A restored DB references vault accounts that do not exist
 there (audit H7). On startup, the key-vault service probes every `secret_ref`; on a miss it
 sets `api_keys.status='invalid'` and the Providers screen shows a re-enter-key flow per key
 (the `secret_hint` last-4-chars makes this usable). Importing a config export does the same
@@ -749,10 +750,10 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 
 ## 5. Security Invariants (numbered, testable)
 
-1. **Raw secrets live only in the OS keychain.** The DB stores `secret_ref` only.
+1. **Raw secrets live only in the file-backed vault.** The DB stores `secret_ref` only.
 2. **The TypeScript layer is key-blind by construction.** Credential injection happens only in
    the Rust egress gateway: TS sends `{secretRef, request-without-auth}`; Rust resolves the
-   keychain entry, injects the header, sends, drops the value. The Generator AI — and any code
+   vault entry, injects the header, sends, drops the value. The Generator AI — and any code
    in the webview — cannot leak a key it can never read.
 3. **All egress flows through one audited module** (egress-gateway) enforcing: destination host
    ∈ the user-supplied baseUrl of a registered provider or a provider being onboarded
@@ -770,8 +771,8 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 8. **Sandboxed code adapters get no filesystem, no direct network, no eval**, hard timeouts,
    egress via the same gateway allowlist.
 9. **No telemetry.** The egress allowlist makes this mechanically true, not aspirational.
-10. **The master key is a keychain secret, not config.** Generated locally (crypto-random),
-    stored under the `masterkey` keychain account, shown once, never in the DB or logs.
+10. **The master key is a vault secret, not config.** Generated locally (crypto-random),
+    stored under the `masterkey` vault account, shown once, never in the DB or logs.
     Rotation kills the old key instantly; the gateway answers 401 before any routing work.
 11. **The Local Gateway binds `127.0.0.1` only by default.** LAN exposure is a separate
     explicit opt-in with a warning; the gateway authenticates every request (Bearer master
@@ -799,18 +800,17 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
 
 | Dependency | Purpose | Notes |
 |---|---|---|
-| Tauri 2 | Desktop shell, Rust host, IPC, channels | Rust host needed anyway for keychain/CORS-free egress/sandbox |
+| Tauri 2 | Desktop shell, Rust host, IPC, channels | Rust host needed anyway for secrets/CORS-free egress/sandbox |
 | React 18 + TypeScript + Vite + Tailwind | UI | Per spec |
 | pnpm workspaces | `apps/desktop`, `packages/router-core`, `packages/adapter-spec` | Keeps core UI-agnostic, independently testable |
-| zod | Manifest schema, IPC payload validation | Runtime validation of AI output is security-relevant |
-| eventsource-parser | SSE parsing in `manifest-interpreter` | |
+| zod | Manifest schema, IPC payload validation | Runtime validation of AI output is security-relevant. Declared by `adapter-spec` only — `router-core` carried a second, unimported copy until 2026-09-27 |
 | zustand | UI client state | Server-ish state lives in core |
 | vitest | Unit tests of router core with fake ports | |
 | mock OpenAI-compatible server (Fastify, test-only) | Contract-suite double + E2E rotation/failover tests | Also used by CI key-leak grep test |
 | Playwright + tauri-driver | E2E | Phase 3+; macOS is tauri-driver's weakest platform — UI logic is E2E'd with Playwright against the Vite dev server, true app E2E runs tauri-driver on Linux CI |
 | Rust: reqwest + tokio | `egress-gateway` — all outbound HTTP, streaming | Own client = credential injection + allowlist control |
 | Rust: axum | `local-gateway` — OpenAI-compatible local endpoint, master-key auth | Serves external apps; streams SSE out |
-| Rust: keyring v2 | `keychain-vault` | v3's macOS data-protection keychain breaks unsigned dev builds (secrets unreadable cross-process) — see DECISIONS.md 2026-09-16; revisit at signed-release time. `keytar` archived Dec 2022 — rejected |
+| Rust: (no keyring) | `vault` | File-backed secrets since 27a — `.secrets.json`, mode 600, atomic write. Replaced `keyring` v2; `keytar` archived Dec 2022 — rejected |
 | tauri-plugin-sql (SQLite) | `sql-store` + migrations | Behind `store-port` |
 | quickjs-emscripten | Tier-2 sandbox for generated code adapters | Phase 6 |
 | No telemetry/analytics SDK | — | Deliberate |
@@ -835,7 +835,7 @@ references. A CI test greps the app-data dir and logs for key patterns after eve
   router call; the router core itself stays single-surface (§3.4 v1.1).
 
 **Lifecycle & hygiene (v1 decisions, from the audit):** port-conflict on 8787 is a loud error
-with remediation UX; deleting a key removes its keychain entry in the same transaction;
+with remediation UX; deleting a key removes its vault entry as part of the same operation;
 deleting a provider cascades keys/manifests/catalog rows (ledger history is preserved — it has
 no FKs by design); Assistant conversations persist per session only (v1); models-cache TTL
 24 h with manual refresh and stale-fallback; the app is single-window (a second window would
@@ -865,7 +865,6 @@ declared **non-goals for v1**; per-app gateway keys ship (§3.6), and so do per-
   schema validation, host pinning. **Major — addressed head-on.**
 - **Generator bootstrap dead-end** if the user's only provider is non-standard — the wizard
   explains the prerequisite clearly. **Minor.**
-- **Linux keychain absence on headless setups** — first-run check + clear error. **Minor.**
 - **E2E testing of rotation/failover** — local mock OpenAI-compatible server. **Major.**
 - App signing/notarization + updater — the **release pipeline ships and is self-verifying** as of 2026-09-23:
   the preflight refuses an unprovisioned build and the artefact is read back and must be notarized, so signing

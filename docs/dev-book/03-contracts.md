@@ -10,7 +10,7 @@ is testable, and each is here because breaking it is a security or correctness r
 
 | # | Invariant | Why it holds |
 |---|---|---|
-| 1 | Raw secrets live only in the OS keychain; the DB stores `secret_ref` only | A database is a file that gets copied, backed up and shared |
+| 1 | Raw secrets live only in the file-backed vault; the DB stores `secret_ref` only | A database is a file that gets copied, backed up and shared |
 | 2 | The TypeScript layer is key-blind; only the Rust egress gateway injects credentials | One audited egress path instead of N |
 | 3 | All egress flows through that one module, with a host allowlist | The allowlist is what makes "no telemetry" mechanical |
 | 4 | The generator never changes hosts — manifest lint pins `baseUrl` to user input | A hostile provider must not be able to redirect egress |
@@ -19,7 +19,7 @@ is testable, and each is here because breaking it is a security or correctness r
 | 7 | Paid validation calls require explicit consent with an estimated cost | The user's money, the user's decision |
 | 8 | Sandboxed code adapters get no filesystem, no direct network, no eval | Defence in depth, not the only boundary |
 | 9 | No telemetry | Structurally true because of #3, not by policy |
-| 10 | The master key is a keychain secret, not config; rotation kills the old key instantly | Shown once, never in the DB or logs |
+| 10 | The master key is a vault secret, not config; rotation kills the old key instantly | Shown once, never in the DB or logs |
 | 11 | The gateway binds `127.0.0.1` by default; LAN exposure is an explicit opt-in with a warning | The warning must say the key and prompts transit in cleartext |
 | 12 | The webview is hardened, not trusted — strict CSP, per-window capabilities | `egress:*` is scoped to the context that needs it |
 | 13 | Untrusted content renders as text, always | No `dangerouslySetInnerHTML`, no unsanitised markdown-HTML |
@@ -70,16 +70,19 @@ the alias map is the only mechanism.
 | Status | Body / meaning | Where |
 |---|---|---|
 | `401` | Invalid or revoked key. **A healthy gateway answers 401 to a bad key** | key check |
+| `401` | `"no master key configured"` — the secrets file holds no `masterkey` account, so there is nothing to compare against | master-key check |
 | `429` | `"router at capacity"` — the gateway's own admission ceiling was hit | `core/gateway.rs:1302`, `:1315` |
 | `429` | `"too many failed auth attempts — backing off"` — 30s backoff after repeated bad keys | `core/gateway.rs:1437` |
 | `429` | Upstream `RATE_LIMITED`, including a cooled key's wait | execution engine |
 | `503` | `"AI-Provider Router core unavailable — is the app open?"` — the webview is gone | `core/gateway.rs:1668` |
-| `503` | `"master key unavailable"` — **the keychain entry has not been approved yet** | master-key check |
+| `503` | `"master key unavailable — the secrets file could not be read"` — the read did not complete; a local fault, not a bad credential | master-key check |
 
-> **`503 master key unavailable` is not a bug, and it precedes authentication.** After reinstalling the app,
-> macOS prompts once before the app may read its own keychain entry. Until you approve it, *every* request —
-> unauthenticated ones included — answers `503`, because the master-key check runs before auth. A `401` is the
-> signal that the gateway is healthy.
+> **`503 master key unavailable` is not a bug, and it precedes authentication.** The gateway reads `masterkey`
+> from the local secrets file, and a `503` means that read did not complete — the file is unreadable, or a
+> concurrent writer held its cross-process lock past `MASTER_KEY_WAIT` (1500 ms). It is a local fault, which is
+> why it is deliberately *not* a `401`: blaming the caller's credential would be wrong. A secrets file with no
+> `masterkey` account is the *other* answer — `401 no master key configured`. Because the master-key check runs
+> before auth, unauthenticated requests see the same code, and a `401` is the signal that the gateway is healthy.
 
 ### The client-facing `Retry-After` is the shortest wait, not the longest
 

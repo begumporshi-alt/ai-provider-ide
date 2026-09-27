@@ -151,17 +151,17 @@ Windows Store logos) — that intent should be a stated decision, not an acciden
 
 ### 3.1 No SECURITY.md
 
-The product's core promise is *"API keys are stored in the OS keychain and never written to disk"*
+The product's core promise is *"API keys are stored in a local secrets file (mode 600), never in the database"*
 (`README.md:8-9`). There is no channel to report a break of that promise. For a tool whose whole premise is
 credential safety, this is the most conspicuous governance gap after the licence.
 
-**Action:** add `SECURITY.md` — private reporting route, scope (gateway auth and the master-key check, keychain
+**Action:** add `SECURITY.md` — private reporting route, scope (gateway auth and the master-key check, vault
 handling, the egress allowlist, the memory layer's scoping), and an explicit out-of-scope list.
 
 ### 3.2 No dependency-vulnerability scanning
 
 No `pnpm audit` or `cargo audit` anywhere in CI or `scripts/`. The dependency surface is non-trivial
-(`Cargo.toml:20-40` pulls `reqwest`, `rusqlite` with a bundled SQLite, `keyring`, `axum`, `arboard`, …).
+(`Cargo.toml:20-40` pulls `reqwest`, `rusqlite` with a bundled SQLite, `axum`, `arboard`, …).
 
 **Action:** add a PR-time audit plus a scheduled job.
 
@@ -258,12 +258,13 @@ no lockfile and reports a clean audit it never ran — the same failure shape as
   `gateway.json:4` documents why the capability exists at all.
 - **`key-leak-grep` runs in CI** (`ci.yml:28-29`) and `.gitignore:23-27` covers `.env*`, `*.pem`, `*.key`.
 
-### 3.4 A distribution consequence worth stating in the docs
+### 3.4 Signing identity no longer affects secrets
 
-A notarized Developer ID release is a **different signing identity** from a local ad-hoc build. Since keychain
-ACLs are bound to the signing identity, a user moving from a local build to a release will hit the one-time
-approval prompt that `README.md:106-107` already documents — and until they approve it, every request answers
-`503 master key unavailable`. Worth a line in the release notes, because it looks like a bug.
+A notarized Developer ID release is a **different signing identity** from a local ad-hoc build. That used to
+matter: macOS keychain ACLs were bound to the signing identity, so a user moving from a local build to a release
+hit a one-time approval prompt, and until they approved it every request answered `503 master key unavailable`.
+Since 27a secrets live in a file-backed vault (`.secrets.json`, mode 600) with no code-signing dependency and no
+approval prompt, so switching identities no longer changes what the app can read.
 
 ### 3.5 Adjacent, not this repo
 

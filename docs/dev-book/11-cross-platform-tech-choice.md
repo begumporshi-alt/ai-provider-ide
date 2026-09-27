@@ -20,7 +20,7 @@ FreeLLMAPI is TypeScript end-to-end: Express server, React dashboard, Electron-s
 layer speaks the same language, and the server runs as a background Node.js process that the tray
 app merely watches.
 
-This project is different: the security boundary is Rust. The keychain, the credential injection,
+This project is different: the security boundary is Rust. The secrets vault, the credential injection,
 and the SQLite store are all Rust-native. Moving the gateway to Node.js would mean either
 duplicating that boundary in JavaScript (which breaks the "key-blind by construction" invariant) or
 bridging across the Rust→Node boundary on every request (which adds latency and complexity).
@@ -76,12 +76,12 @@ reconnects. This is exactly the property the user's project needs.
 
 FreeLLMAPI's server is **pure Node.js**. It handles auth, encryption, and key storage in
 JavaScript. This project's security model depends on the Rust host having exclusive access to the
-keychain. Moving that to Node.js would:
+secrets vault. Moving that to Node.js would:
 
 1. Break the key-blind invariant (`03-contracts.md` §1 — the TypeScript layer must never see a raw
    secret).
-2. Require a Node.js keychain library (`keytar` or `node-keychain`), which adds a native dependency
-   that is less audited than Rust's `keyring`.
+2. Require re-implementing the file vault in JavaScript — its atomic write and mode-600 permissions
+   are Rust-side guarantees — or reintroducing an OS-keychain dependency via `keytar`/`node-keychain`.
 3. Split the security boundary across two languages, making it harder to reason about.
 
 So the server cannot become a Node.js process. The Rust host must remain the server. The question
@@ -140,7 +140,7 @@ process, without a WebView.
 ```
 Rust process (aiproviderd)
 ├── axum HTTP server
-├── keychain vault
+├── vault
 ├── SQLite store
 └── deno_core / rquickjs runtime
     ├── execution-engine.ts  ← loaded as a module
@@ -150,7 +150,7 @@ Rust process (aiproviderd)
 ```
 
 The JS runtime lives in the same process as the Rust host. The Rust side exposes an API to the JS
-side for HTTP egress, keychain access, and SQLite reads.
+side for HTTP egress, vault access, and SQLite reads.
 
 **Cross-platform:** `deno_core` compiles for all three platforms. `rquickjs` is pure Rust and also
 cross-platform.
@@ -184,7 +184,7 @@ from Rust, and communicate via HTTP or IPC.
 ```
 Rust process (aiproviderd)          Node.js process (router-core)
 ├── axum HTTP server  ───────────►  ├── Express server (or plain HTTP)
-├── keychain vault                  │   ├── execution-engine.ts
+├── vault                           │   ├── execution-engine.ts
 ├── SQLite store                    │   ├── model-router.ts
 └── process manager                 │   └── route-planner.ts
                                     └── HTTP on localhost:8801
@@ -217,7 +217,7 @@ Node.js. If Node.js crashes, Rust must detect it and restart it.
 - The Node.js process is a child — if the Rust parent dies unexpectedly, the child may become a
   zombie or be re-parented to PID 1
 - Process management code is platform-specific and error-prone
-- The security boundary is split: Rust holds the keychain, but Node.js handles the request logic
+- The security boundary is split: Rust holds the secrets vault, but Node.js handles the request logic
 
 **Critical issue:** The router core today calls `fetch()` to providers. In a Node.js subprocess,
 `fetch()` works. But the router core also relies on the Tauri event bridge (`gateway-bridge.ts`)
@@ -363,8 +363,8 @@ simpler and sufficient for v1. A Service can be added later for enterprise deplo
    small change.
 
 3. **Single SQLite file, single source of truth.** FreeLLMAPI encrypts the whole database;
-   the user's project encrypts only the keychain entries. Both approaches are valid, but the
-   "single file" principle is the same.
+   the user's project keeps secrets out of the database entirely, in a mode-600 file. Both
+   approaches are valid, but the "single file" principle is the same.
 
 4. **The server auto-starts and auto-restarts.** This is the user experience that matters. A user
    should never have to think about whether the gateway is running.
@@ -374,7 +374,7 @@ simpler and sufficient for v1. A Service can be added later for enterprise deplo
 ## 7. What the user's project does better
 
 1. **The security boundary is stronger.** FreeLLMAPI handles credentials in Node.js; the user's
-   project handles them in Rust with OS keychain integration. This is not paranoia — it is the
+   project handles them in Rust in a file-backed vault. This is not paranoia — it is the
    difference between "we try not to leak keys" and "keys are physically impossible to leak from
    the TypeScript layer."
 

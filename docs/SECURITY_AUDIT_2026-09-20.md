@@ -217,6 +217,31 @@ Splitting production from test properly:
 `egress.rs:396` and `egress.rs:411` build the two reqwest clients in `Egress::new()`, `lib.rs:256` is the
 Tauri builder. Production `panic!` / `todo!` / `unimplemented!` / `assert!` / `unreachable!`: **0**.
 
+> **CORRECTION 2026-09-27 — the counts immediately above were accurate for the 2026-09-20 tree and are not
+> true of the current one.** They are left as written because they are the evidence this finding was closed
+> on; they must not be quoted as the present state. The router-core port landed `core/sandbox.rs`,
+> `core/gateway_normalizer.rs` and `core/ledger.rs` on 2026-09-24 — four days after this audit — and each
+> brought panic sources with it. A re-run on 2026-09-27, with `#[cfg(test)]` regions and comments excluded,
+> found **eleven** production panic sites where this section says three:
+>
+> | Site | Reachable from |
+> |---|---|
+> | `sandbox.rs` ×4 — the `FORBIDDEN` table's `Regex::new`, the `export default` pattern, and `{:e}` parsing in `js_number_to_string` | request path (first code-adapter lint; tool-output formatting) |
+> | `gateway_normalizer.rs` ×3 — `to_base36`'s `String::from_utf8`, and two `as_object` unwraps in tool sanitising | request body |
+> | `ledger.rs:151` — `VecDeque::back().unwrap()` on the usage-ledger append | request path |
+> | `egress.rs` ×2 and `tauri/app.rs` ×1 — the two `reqwest` clients and the Tauri builder | construction only |
+>
+> **The sentence that aged worst is "there is not one non-lock `.unwrap()` in the shipped code"** —
+> `ledger.rs:151` is exactly that, and `ledger.rs` was not among the eight files this census walked. All
+> **eight** request-reachable sites were converted to `Result` in audit M2
+> ([`AUDIT_REPORT_2026-09-27.md`](AUDIT_REPORT_2026-09-27.md)); the three construction-time ones remain by
+> design, since all three run before any request exists and a gateway with no HTTP client is not a gateway.
+>
+> The closure reasoning itself stands unchanged — poison is still impossible under abort, so the lock unwraps
+> are still unreachable. What does not stand is the conclusion drawn from it: "there are none left to remove
+> short of indexing and allocation" was a statement about a tree that no longer exists. A census with no
+> trigger to repeat it is a claim with an expiry date.
+
 **The risk that is actually there, and why it is not this finding.** With abort, *any* panic on *any* thread
 kills the app. That is a property of the profile, not of `.unwrap()` on locks — `.unwrap()` is where a panic
 would be *reported*, not what causes it. The fix for "a panic kills the app" is to remove panic sources, and

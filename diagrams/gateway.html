@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 896 952" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="aip-gateway-title aip-gateway-desc">
       <title id="aip-gateway-title">Local Gateway master key and endpoint setup flow</title>
-      <desc id="aip-gateway-desc">Setup and request flow for the local gateway: enabling the gateway in settings sets the endpoint URL, a master key is generated and stored in the OS keychain, any app pastes the URL and key, incoming requests are authenticated against the keychain before the Model Router serves them with the usual rotation and failover; invalid keys get a 401.</desc>
+      <desc id="aip-gateway-desc">Setup and request flow for the local gateway: enabling the gateway in settings sets the endpoint URL, a master key is generated and stored in the local secrets file, any app pastes the URL and key, incoming requests are authenticated against that file before the Model Router serves them with the usual rotation and failover; invalid keys get a 401.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
       </defs>
@@ -112,7 +112,7 @@
       <rect x="268" y="236" width="184" height="64" rx="6" fill="#f5f5f5"/>
       <rect x="268" y="236" width="184" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.2"/>
       <text x="360" y="266" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Generate master key</text>
-      <text x="360" y="284" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">crypto-random · keychain</text>
+      <text x="360" y="284" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">crypto-random · .secrets.json</text>
 
       <!-- Connect any app -->
       <rect x="272" y="336" width="176" height="56" rx="6" fill="#f5f5f5"/>

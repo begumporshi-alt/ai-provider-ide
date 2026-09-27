@@ -63,7 +63,7 @@
 
     <svg viewBox="0 0 1120 672" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="aip-system-title aip-system-desc">
       <title id="aip-system-title">AI-Provider Router system architecture</title>
-      <desc id="aip-system-desc">Layered architecture: the React UI calls the Model Router, which plans attempts across the Adapter Runtime; all outbound HTTPS flows through the Rust egress gateway, which alone reads API keys from the OS keychain vault and forwards requests to third-party providers. External apps reach the same Model Router through a Local Gateway at 127.0.0.1:8787 authenticated by a generated master key, and an Adapter Generator self-constructs new provider integrations using AI routed back through the Model Router.</desc>
+      <desc id="aip-system-desc">Layered architecture: the React UI calls the Model Router, which plans attempts across the Adapter Runtime; all outbound HTTPS flows through the Rust egress gateway, which alone reads API keys from the local secrets file and forwards requests to third-party providers. External apps reach the same Model Router through a Local Gateway at 127.0.0.1:8787 authenticated by a generated master key, and an Adapter Generator self-constructs new provider integrations using AI routed back through the Model Router.</desc>
       <defs>
         <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
         <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/></marker>
@@ -108,7 +108,7 @@
       <rect x="222" y="212" width="88" height="12" rx="2" fill="#f5f5f5"/>
       <text x="266" y="221" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EXTERNAL APPS</text>
 
-      <!-- Keychain Vault → Egress Gateway -->
+      <!-- Secrets Vault → Egress Gateway -->
       <line x1="496" y1="384" x2="600" y2="384" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
       <rect x="504" y="364" width="80" height="12" rx="2" fill="#f5f5f5"/>
       <text x="544" y="373" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">INJECT KEY</text>
@@ -177,13 +177,13 @@
       <text x="144" y="386" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Local Gateway</text>
       <text x="144" y="404" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">127.0.0.1:8787/v1 · master key</text>
 
-      <!-- Keychain Vault (store) -->
+      <!-- Secrets Vault (store) -->
       <rect x="304" y="352" width="192" height="64" rx="6" fill="#f5f5f5"/>
       <rect x="304" y="352" width="192" height="64" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
       <rect x="312" y="358" width="40" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
       <text x="332" y="367" fill="rgba(45,49,66,0.80)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">VAULT</text>
-      <text x="400" y="386" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Keychain Vault</text>
-      <text x="400" y="404" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">OS keychain · raw keys</text>
+      <text x="400" y="386" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Secrets Vault</text>
+      <text x="400" y="404" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">.secrets.json · mode 600</text>
 
       <!-- Egress Gateway -->
       <rect x="600" y="352" width="192" height="64" rx="6" fill="#f5f5f5"/>

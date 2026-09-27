@@ -5,13 +5,13 @@ A local desktop IDE for routing LLM requests across multiple AI providers. Provi
 you can add one manually. A local gateway exposes an OpenAI-shaped API on `127.0.0.1` so other tools can talk
 to every configured provider through one endpoint.
 
-**API keys are stored in the OS keychain and never written to disk.** Nothing leaves your machine except the
-requests you make to the providers you configure.
+**API keys are stored in a local secrets file (mode 600), never in the database.** Nothing leaves your machine
+except the requests you make to the providers you configure.
 
 ## Status
 
 Developed and tested on **macOS** (CI runs `macos-14`). Windows and Linux are untested — the bundler carries
-Windows/Linux icons, but the keychain-backed secret store and the gateway have only ever been exercised on
+Windows/Linux icons, but the file-backed secret store and the gateway have only ever been exercised on
 macOS.
 
 ## Prerequisites
@@ -108,8 +108,9 @@ described an updater that was never implemented, and described it wrongly: a top
 config block (Tauri v1's shape, not v2's `plugins.updater`), a `TAURI_SIGNING_PUBLIC_KEY` variable
 Tauri does not read, and an RSA keypair where Tauri verifies minisign/ed25519. See `CHANGELOG.md`.
 
-A notarized release is a **different signing identity** from a locally built app, and keychain access
-is bound to the identity — so the first launch after switching between them prompts once. See
+A notarized release is a **different signing identity** from a locally built app. That used to matter for
+the secret store — a keychain item is bound to the identity, so switching between them prompted once — but
+the store is now a file owned by your user account, so switching no longer prompts for anything. See
 `SECURITY.md`.
 
 ## Test
@@ -130,7 +131,7 @@ pnpm ci:local                  # the full gate: leak scan, version sync, build, 
    - **Manual** — any OpenAI- or Anthropic-compatible API: name, base URL, auth header, dialect.
    - **Guided setup** — for anything else; it probes the API, identifies the dialect, runs free contract
      checks, and only enables the provider after you approve.
-3. Add a key per provider (**+ Add key**). It goes to the keychain.
+3. Add a key per provider (**+ Add key**). It goes to the local secrets file.
 4. Enable the provider. The gateway listens on `127.0.0.1` on a **configurable port** — Control → Local
    Gateway shows the current one along with the master key. A fresh install starts on `8787`.
 
@@ -156,15 +157,16 @@ The gateway binds to `127.0.0.1` only — it is not reachable from the network. 
 header; the only unauthenticated route is `GET /health`, by design, so a client that does not yet
 hold a key can still discover that the service is up.
 
-API keys are stored in the OS keychain and are never written to disk in plaintext. The egress
+API keys are stored in the local secrets file (mode 600) and are never put in the database. The egress
 allowlist derives from the providers the user has configured; a request to a host that is not
 allowlisted is refused locally and reported as `NETWORK`, not forwarded.
 
 ## Notes
 
 - The local SQLite database is **gitignored** — a fresh clone starts empty. That is correct, not a bug.
-- After replacing the installed binary, macOS will prompt once before the app may read its keychain entry.
-  Until you approve it, every gateway request returns `503 master key unavailable`.
+- There is no keychain, so replacing the installed binary prompts for nothing: the vault is a file
+  (`<data_dir>/.secrets.json`, mode 600) owned by your account. A `503 master key unavailable` therefore means
+  the secrets file could not be read — a local fault, not a rejected credential.
 - This repository is public. Never commit a real key or token; `pnpm key-leak-grep` runs in CI.
 
 ## Contributing

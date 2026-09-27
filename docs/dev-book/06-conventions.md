@@ -30,6 +30,27 @@ is stale by the time the write happens.
 **`panic = "abort"`, so there is no poison handling.** A panic takes the process down; do not write code that
 assumes a mutex can be recovered.
 
+**…and its blast radius is every client, not the request that panicked.** Abort is set for release only, so
+one panic ends the gateway process and every in-flight client with it. Two consequences, and they point in
+opposite directions from where intuition goes:
+
+- **`.lock().unwrap()` is not the risk.** Poisoning is set in `MutexGuard::drop`, which runs only while
+  unwinding; with abort there is no unwinding, so a lock can never *become* poisoned. The ≈200 production
+  lock unwraps are unreachable, not dangerous.
+- **`expect`/`unwrap` on anything else is.** A non-lock panic source on the request path is what actually ends
+  the process, so that is what to remove — see audit M2 (2026-09-27), which converted the request-reachable
+  ones to `Result`. The three that remain are construction-time by design: `Egress`'s two `reqwest` clients and
+  the Tauri builder. All three run once, before any request exists, and a gateway with no HTTP client is not a
+  gateway.
+
+**A census like this goes stale the moment code lands, so re-derive it rather than quoting it.** The
+2026-09-20 figure was "3 production `expect()`, every production `.unwrap()` is a lock call, there is not one
+non-lock `.unwrap()` in the shipped code" — accurate for *that* tree, and falsified four days later when the
+router-core port landed `sandbox.rs`, `gateway_normalizer.rs` and `ledger.rs`. The 2026-09-27 re-run found
+**eleven**. Nothing was wrong with the original count; what was missing was a trigger to repeat it, which is why the
+corrected figure lives in [`../SECURITY_AUDIT_2026-09-20.md`](../SECURITY_AUDIT_2026-09-20.md) H3 with the
+instrument that produced it.
+
 **Parallel tests must not derive a temp directory from `pid + timestamp`.** Two tests in the same millisecond
 collide and one fails with `DatabaseBusy`, which looks like a locking bug in the code under test. Use a
 monotonic `AtomicUsize`.

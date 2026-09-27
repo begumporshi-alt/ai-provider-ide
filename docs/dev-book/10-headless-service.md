@@ -71,7 +71,7 @@ Headless mode moves the process boundary so the gateway is no longer inside the 
 |---|---|---|---|
 | **HTTP server** (`gateway.rs`) | Rust — axum on 127.0.0.1 | Same code, same port, same routes | None |
 | **Auth layer** (`gateway.rs:67-200`) | Rust — master-key + app-key check | Same code | None |
-| **Keychain vault** (`vault.rs`) | Rust — `keyring` crate | Same code | None |
+| **Vault** (`vault.rs`) | Rust — file-backed (`.secrets.json`, mode 600) | Same code | None |
 | **SQLite store** (`store.rs`, `persist.rs`) | Rust — `rusqlite` | Same code, same DB path | None |
 | **Egress** (`egress.rs`) | Rust — reqwest with credential injection | Same code | None |
 | **Model adapters** (`gateway_anthropic.rs`, `gateway_gemini.rs`, `gateway_responses.rs`) | Rust, but dispatch through bridge | Call providers directly, no bridge | Medium — remove bridge indirection |
@@ -575,7 +575,7 @@ by both the service (Rust implements them) and the UI (TypeScript calls them).
 │  └─ GET  /v1/models                 │◄────┼──┤  └─ Context compression           │
 │  └─ ...                             │◄────┼──┘                                   │
 │                                     │     │  SQLite (same DB file)              │
-│  No gateway logic — pure consumer   │     │  Keychain (same OS vault)           │
+│  No gateway logic — pure consumer   │     │  Vault (same secrets file)          │
 └─────────────────────────────────────┘     └─────────────────────────────────────┘
 ```
 
@@ -599,13 +599,13 @@ A new crate binary: `apps/desktop/src-tauri/src/bin/aiproviderd.rs`.
 
 It is **not** a Tauri app. It is a standard Rust binary that:
 1. Opens the SQLite database (`store.rs` already supports this)
-2. Reads the master key from the keychain (`vault.rs`)
+2. Reads the master key from the vault (`vault.rs`)
 3. Starts the axum HTTP server (`gateway.rs`)
 4. Registers with launchd (see §4)
 
 The binary reuses the `ai_provider_router_lib` crate for everything except Tauri-specific code.
 This means splitting the current lib into:
-- **Core** (HTTP, SQLite, keychain, adapters, store) — usable by both Tauri and the service
+- **Core** (HTTP, SQLite, vault, adapters, store) — usable by both Tauri and the service
 - **Tauri glue** (commands, events, window management) — Tauri-only
 
 ---
@@ -755,10 +755,11 @@ surface. Three design points that differ from a literal port of the commands:
    every core built without `with_store`, which is most of the test suite. Refusing loudly beats
    answering an empty list that reads as "nothing is configured".
 
-**Not tested: the happy path of `POST /admin/keys`.** `vault::put` writes to the real OS keychain,
-which a CI runner has no access to, so only the validation path (a missing `label` → 400) is
-pinned. The rest of the surface has 9 tests covering auth, the 503, the settings merge, the empty
-list and the spend shape.
+**Not tested: the happy path of `POST /admin/keys`.** Only the validation path (a missing `label` →
+400) is pinned. The reason this was left out — that `vault::put` wrote to the real OS keychain,
+which a CI runner cannot reach — no longer holds now the vault is a mode-600 file, so the gap's
+justification needs re-deriving. The rest of the surface has 9 tests covering auth, the 503, the
+settings merge, the empty list and the spend shape.
 
 ---
 
@@ -2518,13 +2519,13 @@ it. This lets the team roll back by reverting one line in `Cargo.toml`.
         `Access-Control-Allow-Origin: tauri://localhost` (or `*` in dev). Already prescribed as
         step 5.
    - **What stays as Tauri APIs (not custom `invoke`):** window/tray management, file dialogs,
-     system notifications, and master-key retrieval from the keychain (needed once at startup to
+     system notifications, and master-key retrieval from the vault (needed once at startup to
      authenticate HTTP requests). "Pure HTTP" means "no custom `invoke` commands for data access,"
      not "no Tauri at all."
    - **Authentication model:** the UI becomes an authenticated client of the gateway — but **not by
      sending the master key**, which it never holds (D51). 26i resolved this with a host-minted,
      revocable session credential (`ak-ui`): the host caches it in a `let` and sends it as
-     `Authorization: Bearer`, and the master key is read from the keychain **host-side** and never
+     `Authorization: Bearer`, and the master key is read from the vault **host-side** and never
      crosses into the webview. See §5.3 and `core/ui_session.rs`. This is consistent with how
      external clients work — they present a credential; they simply present a different one.
    - **Migration scope, corrected 2026-09-25 by measurement — as first written this was
@@ -4504,9 +4505,16 @@ loaded it, so `ui_session::revoke` did not do what its comment promises.
 secret and left the fingerprint byte-for-byte identical, and the memo served the pre-rotation secret for
 its whole 60 s TTL.
 
-**The fix.** `vault::load` re-reads when the file's `(mtime, len)` stamp changes, **replacing** rather
-than merging, because `save` writes the whole map and a merge would resurrect an account another process
-deleted. `AppKeyCache` invalidates on `(id, created_at)` via the new `active_gateway_key_stamps`, with
+**The fix.** `vault::load` re-reads when the file's **content** changes — it was a `(mtime, len)` stamp
+until audit M4 showed that metadata is not a fingerprint, because a same-length rewrite landing on the
+same timestamp compares equal and the early return then serves the superseded secret — **replacing**
+rather than merging, because `save` writes the whole map and a merge would resurrect an account another
+process deleted. `put`/`delete` also hold a **cross-process file lock** over that read-modify-write
+(`lock_writers`, `std::fs::File::lock`, added 2026-09-27): two processes write this file by design, and
+without exclusion an interleaved pair failed **both** ways at once — loudly, because both processes wrote
+the same `.secrets.json.tmp` and one `rename`d it out from under the other, and silently, because the
+whole-map save discarded the other's entry while both calls returned `Ok`.
+`AppKeyCache` invalidates on `(id, created_at)` via the new `active_gateway_key_stamps`, with
 `ORDER BY id` — the vector is compared whole, so an order-only difference would defeat the memo, which
 is a bug the new test found in the fallback path before it shipped.
 

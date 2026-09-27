@@ -164,7 +164,7 @@ Four suites, and they fail in different ways on purpose.
 
 | Suite | Covers | Cannot catch |
 |---|---|---|
-| `packages/router-core` + `adapter-spec` + desktop vitest | Routing, adapters, ledger, memory engine, pure logic — with fake ports | Anything requiring the network, the keychain, or a real SQLite file |
+| `packages/router-core` + `adapter-spec` + desktop vitest | Routing, adapters, ledger, memory engine, pure logic — with fake ports | Anything requiring the network, the vault, or a real SQLite file |
 | Rust `cargo test` | Gateway auth and dialects, egress invariants, store and migrations, persistence, tools | UI behaviour |
 | `web-test` (Playwright + a Tauri IPC shim) | Screens against a faked host, 14 spec files | The real Rust host |
 | `e2e` (Playwright, real stack) | Acceptance, onboarding, drift repair, code adapters, 7 spec files | — |
@@ -247,14 +247,6 @@ chain. Run either script by hand the same way the workflow does:
 ./scripts/verify-release-signature.sh                  # discovers bundles under target/
 ./scripts/verify-release-signature.sh path/to/App.app ABCD123456
 ```
-
-### The one-time keychain prompt
-
-A notarized release is a **different signing identity** from a local ad-hoc build, and keychain access is bound
-to the identity. So the first launch after switching between them prompts once — and **until the user approves
-it, every request answers `503 master key unavailable`**, including unauthenticated ones, because the master-key
-check precedes auth. `401` is the signal that the gateway is healthy. Worth a line in release notes, because it
-looks like a bug.
 
 ### Version
 

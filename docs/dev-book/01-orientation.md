@@ -11,8 +11,9 @@ A Rust HTTP gateway re-exposes the whole router as a single OpenAI-shaped endpoi
 Codex, a script or a chat UI can reach every configured provider through one URL and one credential, with the
 same key rotation and provider failover the built-in UI gets.
 
-**The security promise that shapes the whole design:** API keys live in the OS keychain and are never written
-to disk, and the TypeScript layer cannot read them even if it wanted to. See [02](02-architecture.md).
+**The security promise that shapes the whole design:** API keys live in a file-backed vault on your machine
+(`.secrets.json`, mode 600) — never in the database or logs — nothing leaves the machine, and the
+TypeScript layer cannot read them even if it wanted to. See [02](02-architecture.md).
 
 ## Repository map
 
@@ -25,7 +26,7 @@ Three workspace packages. The split is not cosmetic — it is what keeps the rou
 | `packages/adapter-spec` | The manifest grammar (zod) — the frozen contract | 2 files, ~220 lines |
 
 `router-core` is UI-agnostic on purpose: it is exercised by unit tests with fake ports, with no webview and no
-network. Anything that needs the network, the keychain or SQLite is a port, implemented in Rust.
+network. Anything that needs the network, the vault or SQLite is a port, implemented in Rust.
 
 ## Toolchain
 
@@ -42,7 +43,6 @@ Pinned, and each pin is enforced rather than documented.
 | Tailwind | 4 | — |
 | vitest | 4.1.11 | — |
 | Playwright | 1.63 | — |
-| `keyring` (Rust) | **2**, not 3 | see [07](07-drift-register.md) D2 |
 
 > **Node 19 is a hard floor, and the failure it prevents is misleading.** Under Node 18 every
 > `crypto.randomUUID()` in `provider-registry.ts` throws `crypto is not defined` and 27 router-core tests fail

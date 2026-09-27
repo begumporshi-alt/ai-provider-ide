@@ -1146,3 +1146,318 @@ default, an executable has to *reach* the listener, and only the second is falsi
 this helper; or `repro-restore.sh` is either retargeted at the supervised process or retired, which is
 the decision this entry defers.
 
+## 2026-09-27 — The pre-headers budget is sized from the request path, and the plan gets a deadline
+
+**The problem.** Four requests in eight minutes failed with *"the router produced no response within
+30000ms — the request was abandoned"*, recorded as `CANCELLED` at 30 010–30 025 ms (ledger rows
+1652/1655/1656/1658). Three defects were stacked behind the one symptom, and each was invisible while
+the one in front of it was in place.
+
+**1. The 10 s pre-headers budget was too small, not too large.** `first_msg_ms` — stamped from
+*dispatch* in `Slot::recv`, and the only in-path time-to-first-byte the system records — measures
+**p50 2106 ms, p90 7126 ms, p99 18626 ms, max 18644 ms** over 54 real requests. Four of them exceeded
+10 s and then **succeeded on the retry**; two are measurable (attempt 2 delivered 2.80 s and 8.60 s
+after the stall). So the bound was aborting healthy slow requests and paying a duplicate upstream call
+for the privilege. **The correction that matters is to the instrument:** the 12-probe distribution
+(`0.18–2.4 s`, one at `7.36 s`) this constant had been sized from measured a bare upstream call with a
+tiny body and **no tool schema** — `TTFB_socket`, an order of magnitude below the path's p50. A probe
+is not the request path.
+
+**2. The invariant was stated for the wrong unit.** `the_stall_budget_fits_inside_the_gateway_bound`
+pinned `10s × (retries + 1) = 20s < 30s` — one `stream` call. `execute_text` walks the whole *plan*,
+and with two candidates the real worst case was **40 s against a 30 s bound**, so the last candidate
+was always cut off mid-attempt. The log proves it rather than inferring it: entry 2 begins its own
+`attempt=1` **18 ms after** the gateway's abandonment, the counter reset being the only signature that
+a second `stream` call had started.
+
+**3. The retry was on the arm that could not benefit.** `Ok(Err(e))` — a transport error, the case a
+fresh connection genuinely fixes — returned immediately. Only the header timeout looped, and it
+re-sent the identical prompt to the identical host. The two arms had it exactly backwards.
+
+**Options considered.**
+1. **Shrink the budget further** (a 9 s × 3 proposal). Rejected on measurement: 9 s is *below* the
+   current 10 s, and 12.5% of successful requests in the incident session already exceed 10 s. This
+   would have made the failure rate worse.
+2. **Add a second provider on a different host.** Genuinely effective, and out of scope by
+   instruction. It also does not address (1) or (2): the slow-but-alive class would still be aborted
+   at 10 s on the first provider.
+3. **Race parallel attempts (hedging).** Rejected. No mainstream gateway does it; Envoy's documented
+   pattern is `per_try_idle_timeout`, a shorter per-try deadline treated as retryable, not a hedge.
+   With this distribution a hedge would duplicate a large share of *healthy* requests — the one
+   turnkey LLM hedge engine costs 33% extra calls for a 47% p99 cut in its own benchmark.
+4. **Raise the attempt budget, move the retry to the transport arm, and give the plan a deadline**
+   (chosen).
+
+**The change.** `UPSTREAM_HEADER_TIMEOUT` 10 s → **20 s** (0/54 requests ever needed more, so one
+attempt now covers every recorded success with no duplicate call). `retryable_transport` retries a
+transport error once and **excludes `is_timeout`**, so a connect timeout cannot make one candidate
+cost `2 × 10s` and break the ordering. `engine::PLAN_BUDGET` = **26 s** with `candidate_is_affordable`
+admits a candidate only when it can fund a full attempt — which is what makes the plan a *bound*
+rather than a scheduling hint, and why the first candidate is exempt (a budget below one attempt would
+refuse everything and turn a slow request into an instant silent failure). The three constants form
+one ordering, `20s <= 26s < 30s`, now asserted by
+`the_plan_budget_fits_inside_the_gateway_bound`. Being *below* the gateway bound is also what makes
+the failure legible: an exhausted plan ends as `Ended::Spent`, so the router records the class its
+attempts produced instead of being cancelled and filed as `CANCELLED`.
+
+**Falsification.** All three new tests were run against the previous behaviour before being trusted:
+with the arms swapped back, `a_stall_before_headers_is_not_retried` read 2 connections instead of 1
+and `a_transport_error_before_headers_is_retried_once` read 1 instead of 2; with `PLAN_BUDGET` at
+31 s the ordering test failed. `a_stall_after_headers_is_not_retried` passed throughout, as a control.
+
+**Known limitations, deliberately not fixed here.**
+- **A candidate is refused, not shortened.** When the plan budget cannot fund a full attempt the
+  candidate is skipped entirely. For a chain of *same-provider* entries that is the intent — entry 2
+  is the same host and would reach the same conclusion. For a chain of *different* providers it is a
+  real loss: after a slow first provider the second is never tried. Fixing that means giving each
+  candidate a *slice* of the plan, which requires threading a per-request budget through
+  `ExecuteTextArgs` → `TextArgs` → `HttpRequest` → `EgressRequest` — one production construction site
+  but ~15 sites overall, five of them test doubles. Not done here; recorded so it is not mistaken for
+  covered.
+- **The residual is not eliminated.** The four failed requests needed more than 20 s of first-byte
+  time, beyond the observed p99. If their true cause was a blackhole rather than slowness they will
+  now fail at ~20 s with a truthful class instead of at 30 s as `CANCELLED`. Earlier and legible, not
+  fixed.
+- **`FIRST_MSG_TIMEOUT` still classifies as `CANCELLED`** when it fires for any other reason, because
+  the class is decided by the cancel flag rather than the cause. The plan budget now usually wins that
+  race; the gateway path itself is unchanged.
+
+**Revisit if:** the p99 of `first_msg_ms` moves past 20 s (raise this and `PLAN_BUDGET` together, then
+re-check the gateway bound); or a multi-provider configuration is added, which makes the per-candidate
+slice above worth building; or a blackhole is demonstrated — a stall where the upstream sends nothing
+at all rather than being slow — which would justify revisiting the retry removal with a *fresh
+connection* forced per attempt rather than a re-send on the pooled one.
+
+## 2026-09-27 (later) — The pre-first-byte budget, and a fourth defect in the same family
+
+**The report.** A WorkBuddy turn failed at `12:11:28 UTC+8` against `custom-local:agnes-3.0-flash`
+with *"the router produced no response within 30000ms — the request was abandoned; retry"*. The
+operator's hypothesis was that WorkBuddy had stopped waiting for us.
+
+**That hypothesis is false, and the string proves it.** `the router produced no response within {}ms
+— the request was abandoned; retry` is **our own** literal, at `core/gateway.rs:1381`. The 30 s was
+our `FIRST_MSG_TIMEOUT`, not the client's. The operator's underlying concern — that a client with a
+tighter deadline would truncate any recovery we attempt — is a separate question and is **not**
+measured.
+
+**What the ledger said, and why every column of it is forced.** Row 1671: `error_class = CANCELLED`,
+`latency_ms = 30005`, `fallback_chain_json = []`, `http_status = NULL`, `tokens_in/out = 0`, and no
+egress line of any kind for the request. Only two engine paths can produce `CANCELLED` with an empty
+chain, and one is excluded by the timing: the first-iteration cancel check (`engine.rs:1013`) requires
+`execute_text` to be entered ≥ 30 s after `generate_text` began, but the only awaits in between are
+`sync_concurrency` (synchronous) and `plan_waiting_out_cooldown`, whose wait budget is 5 s and which
+returns *immediately* when the plan is non-empty — and had the plan been empty the row would read
+`NO_ROUTE`. `t0` was measured at `04:10:57.922Z` against a dispatch log line at `04:10:57.919040Z`, so
+the task started promptly. What remains is `break 'plan Ended::Served(candidate)`
+(`engine.rs:1158`) reached with zero chunks and zero attempts, which `write_text_ledger`'s
+`Ok(success)` arm (`router.rs:986`) files as `if cancelled { "CANCELLED" }`.
+
+**The cause.** `egress.rs:577` bounded **each** wait for a chunk with `UPSTREAM_IDLE_TIMEOUT` (120 s),
+and that loop is entered immediately after headers — so the *first* body byte inherited a budget four
+times the gateway's. The gateway's bound therefore always fired first, `Slot`'s `Drop` called
+`bridge.cancel`, `egress_port`'s watcher (`CANCEL_POLL = 25 ms`) aborted the driver, and the `lines`
+stream ended **cleanly** — no error item, so no attempt was ever pushed. The 25 ms poll phase explains
+the 30005 ms exactly: polls land at `25k + 30`, the cancel fires at 30000, the watcher notices at
+30005.
+
+**This is the same defect as the entry above, one phase later, and that entry's fix is what hid it.**
+`UPSTREAM_HEADER_TIMEOUT` took the header wait out of the 120 s budget for exactly this reason; the
+first-byte wait was left inside it. The comment justifying the split even asserted *"Only this one is
+subject to the gateway's first-message bound"* — false, and the false sentence is why nobody looked
+one line further. Worse, the fix **silently inverted a live test**:
+`a_stall_after_headers_is_not_retried` drove a shape that receives no body at all and asserted the
+message contained `went silent`, i.e. it asserted the *mid-stream* arm for a *pre-first-byte* case.
+The suite was green because the test described the wrong phase in both its name and its assertion.
+
+**The fix.** `UPSTREAM_FIRST_BYTE_TIMEOUT` (20 s), stamped **before** `b.send()` so one deadline
+encloses the header wait rather than following it; `UPSTREAM_HEADER_TIMEOUT` stays as the header
+sub-bound so the two failure modes keep distinct log lines. The chunk loop takes the phase deadline
+until the first byte and `UPSTREAM_IDLE_TIMEOUT` after it. No new number was invented: `first_msg_ms`
+is stamped at dispatch and reaches the first *bridge message*, which is the first content delta — so
+the n=54 distribution the previous entry measured is an end-to-end measurement of **this phase**, and
+bounding the phase as a whole is what that calibration always meant. Applying it to the header wait
+alone is what made it partial. A third field (`EgressState::first_byte_timeout`) exists so a test can
+set the three budgets apart.
+
+**Falsification.** With the loop's budget reverted to `state.idle_timeout` — one line — the new
+ordering test fails with `exactly one error reaches the consumer: []`, while the control passes in
+both versions. The control is `Stall::AfterFirstByte`, and it is the one that matters: without it a
+"fix" that capped *every* chunk wait would pass this suite and cut off every slow-but-alive stream.
+
+**Gates.** `cargo test --lib` 1335 passed / 0 failed; `cargo fmt -- --check` exit 0; `cargo clippy
+--all-targets` 0 warnings.
+
+**Known limitations, deliberately not fixed here.**
+- **A clean early close is still an empty chain.** If the upstream closes the connection after headers
+  with no body, the stream ends `Ok(None)` and no error is sent — the same `CANCELLED`/`PARSE_ERROR`
+  empty-chain signature by a different route. Found by accident: the first run of the new test left
+  `first_byte_timeout` at its 20 s default while the harness's listener holds for 2 s, so the socket
+  closed first. It is a genuine third path and is now recorded in the test helper.
+- **The fix bounds silence, not content.** An upstream that sends SSE keep-alives (bytes, no content)
+  defeats a byte-level deadline. Bounding the first *content event* would need an instrument that does
+  not exist; a `first_byte_ms` log line was added so the next value is calibrated rather than guessed.
+- **`CANCELLED` is still decided by the cancel flag, not the cause.** The gateway's own bound and a
+  genuine client disconnect remain indistinguishable in the ledger. Making them distinguishable means
+  giving `Cancel` a reason, set by `Slot::recv`'s timeout arm and carried through `Slot::Drop` — a
+  cross-cutting change to `Bridge`, `Cancel` and both router implementations. Not done.
+
+**Revisit if:** `first_byte_ms` accumulates past 20 s at the p99 (then raise this with `PLAN_BUDGET`
+and `FIRST_MSG_TIMEOUT` together); or a keep-alive-only stall is observed, which would justify a
+first-*content* bound; or the ledger's `CANCELLED` ambiguity costs another triage, which would justify
+the cancel-reason work.
+
+## 2026-09-27 (later still) — A tool-call turn is a success, and the ledger called it `PARSE_ERROR`
+
+**The symptom.** 11 of the 42 ledger rows written since that morning's deploy were `PARSE_ERROR`
+(26%); the two days before showed 17% and 12%. Stable and pre-existing — not caused by the deploy.
+The class reads as "the response did not parse", yet the same requests were answering the client
+correctly.
+
+**Two hypotheses, and only one survived.** (1) Real content loss — a stream whose text never reaches
+the sink. (2) Mislabelling: a turn whose **entire output is a tool call** yields zero chunks, because
+tool calls travel by `on_tool_call` and never through the text sink, while the ledger's
+"did anything get served?" test was a chunk count.
+
+**Measured, on both paths.** A non-streaming request that answered `finish_reason: "tool_calls"` with
+a correct `get_weather({"city":"Dhaka"})` produced row 1714: `status=error`,
+`error_class=PARSE_ERROR`, `tokens_out=28`. The same request streamed — SSE carrying
+`delta.tool_calls` and `finish_reason: "tool_calls"` down to `[DONE]` — produced row 1715 with the
+identical verdict. Both were healthy answers the client received intact.
+
+**The contradiction that settles it.** The engine's own success path records
+`health.recordResult(key, "OK")` (`execution-engine.ts:106`, `engine.rs:1165`). One request was
+therefore written down twice — "OK" in key health, `PARSE_ERROR` in the ledger — and only one of
+those can be right. The health record is the one with evidence behind it.
+
+**Excluded before concluding.** The reasoning-model defence (a reasoning model spends its budget on
+`reasoning_content`, so `text_tokens: 0` and `PARSE_ERROR` is the honest class) was probed directly
+rather than assumed away: `agnes-3.0-flash` returns plain `content: "Hello!"`, no
+`reasoning_content`, no `completion_tokens_details`. Not this. And the manifest is not missing its
+tool-call mapping — both `responseMap.toolCalls` and `stream.chunkMap.toolCalls` are mapped — so this
+is not a repeat of D68.
+
+**The fix, in both routers.** "Served" now means *delivered output*, which is a text chunk **or** a
+tool call. The two implementations reach it differently because the two shapes differ:
+
+- **TypeScript** — `execution-engine.ts` hands the adapter a wrapper that marks the candidate as
+  `served` before forwarding the call. The gate is preserved exactly: the interpreter only parses
+  tool calls when a callback is present (`manifest-interpreter.ts:335-336`), so the wrapper is built
+  only when the caller passed one. Handing down a callback unconditionally would have made every
+  provider start emitting tool calls to callers that never asked for them. `emitted` is deliberately
+  **not** set here — that flag decides whether a break can still fail over, which is a different
+  claim from "who answered".
+- **Rust** — `router.rs` folds a chunk count and a tool-call count into one `Delivered` value, and
+  the ledger's ok arm tests `delivered.any()`. The count is not gated on the caller having passed a
+  callback, because this router always hands the engine a `Some` forwarder, so the interpreter
+  parses tool calls either way (`interpreter.rs:515`); when the caller passed none they are parsed
+  and dropped, which is still output the provider produced.
+
+**Falsification.** Restoring `Ok(success) if delivered.chunks > 0` fails the new Rust test with
+`left: "error", right: "ok"`; restoring `onToolCall: args.onToolCall` fails the new TypeScript test
+with `expected 'error' to be 'ok'`. The controls — a `200` with an empty body is still
+`PARSE_ERROR`, an aborted request is still `CANCELLED` — pass in both versions, which is what keeps
+this from being a change that merely stops recording errors.
+
+**Gates.** `cargo test --lib` 1336 passed / 0 failed; `cargo fmt -- --check` exit 0; `cargo clippy
+--lib --all-targets` 0 warnings; `vitest run` (router-core) 279 passed; `tsc --noEmit` exit 0.
+
+**Not fixed here, and recorded rather than assumed.** A tool call that is delivered and *then* hits a
+mid-stream break still fails over to the next candidate, because `emitted` gates that decision and
+`emitted` is still chunk-only — so the next candidate can re-issue the same tool call. Ending
+failover on a delivered tool call is the consistent generalisation, but it is a separate claim with
+its own failure mode and it has not been measured.
+
+**Revisit if:** `PARSE_ERROR` does not fall sharply after this ships (then the remaining population
+is a real second cause and needs its own probe); or a client is observed running a tool call twice,
+which would justify the failover claim above.
+
+## 2026-09-27 (latest) — Failover ends on a delivered tool call, not just a text chunk
+
+**Symptom.** The recorded-not-fixed paragraph above described a tool call delivered and then a
+mid-stream break. `emitted` — the flag that decides whether a break can still fail over — was
+chunk-only, so the break failed over (`Next`), and the next candidate re-issued the same tool call.
+The consumer held a tool call from the first candidate, and was about to receive a second one from
+the next, for the same turn.
+
+**The consistent generalisation.** A delivered tool call is output, just as a delivered chunk is.
+The only honest end after a break is the error: the consumer holds partial output, and retrying
+cannot undo what was delivered. The fix folds a tool-call count into the failover predicate, so a
+delivered tool call also produces `Rethrow` (TS) / `MidStream` (Rust), not `Next`.
+
+**Measurement.** The TS test — a custom adapter that delivers a tool call via `onToolCall` then
+throws mid-stream — produced `all attempts failed for gpt-4o [openrouter/key-01:NETWORK ->
+openrouter/key-02:NETWORK]` against the old code. Both candidates were contacted, the tool call was
+delivered twice. The Rust test — a `Scripted` adapter with `with_tools` + `with_breaks` (empty
+chunks, one tool call, then a mid-stream `AttemptError::Http { status: 200, kind: MidStream }`) —
+produced `AllAttemptsFailed` with a `ParseError` entry, not `MidStream`.
+
+**The fix, in both engines.**
+- **TS** (`execution-engine.ts`): a `let toolCalls = 0;` counter incremented in the `onToolCall`
+  wrapper. The failover predicate changes from `if (emitted)` to `if (emitted || toolCalls > 0)`.
+  The wrapper's doc note — which said `emitted` is "deliberately NOT set here" because failover is
+  "a different claim" — is rewritten: the two claims are now unified at the predicate, not
+  conflated in one flag.
+- **Rust** (`engine.rs`): a `let mut tool_calls = 0usize;` counter incremented in `forward_tool`.
+  The `attempt_disposition` call changes from `attempt_disposition(emitted, ...)` to
+  `attempt_disposition(emitted || tool_calls > 0, ...)`. The `attempt_disposition` doc and the
+  `Rethrow` match-arm comment are updated. The `records_key_health` invariant — a rethrown failure
+  must be a drift class so skipping key health cannot lose a cooldown — is restated to cover the
+  tool-call case: a mid-stream break after a tool call classifies the same way as one after a chunk
+  (by status and kind, not by what preceded it), so it is still a drift class.
+
+**Falsification.** Reverting `if (emitted || toolCalls > 0)` to `if (emitted)` in the TS engine
+fails the new test with `all attempts failed` — the failover happened. Reverting
+`attempt_disposition(emitted || tool_calls > 0, ...)` to `attempt_disposition(emitted, ...)` in the
+Rust engine fails the new test with `expected MidStream, got AllAttemptsFailed`.
+
+**Gates.** `cargo test --lib` 1337 passed / 0 failed; `cargo fmt -- --check` exit 0; `cargo clippy
+--lib --all-targets` 0 warnings; `vitest run` (router-core) 280 passed; `tsc --noEmit` exit 0.
+
+**Deploy.** `cargo build --release --bin aiproviderd --no-default-features`; marker
+`"rethrow on a tool call alone — failover ended, not advanced"` = 1 (new) / 0 (installed); controls
+`"served by tool calls alone"` = 1/1, `"first-message bound"` = 0/0; `otool -L | grep -ci webkit` =
+0; sha256 `79fdaf25…` matches installed; pid 69738; `/health` → 200.
+
+**Live verification.** A streaming tool-calling request (`agnes-2.5-flash`, `stream: true`, `tools:
+[list_files]`) delivered `finish_reason: "tool_calls"` + `[DONE]`; ledger row 1771 `status=ok`,
+`error_class=NULL`, provider + key named, `tokens_out=46`, `latency_ms=840`; log carried the
+Increment 36 marker `served by tool calls alone` (16 times). The new marker fires only on a
+tool-call-then-break, which is not provokable on demand.
+
+**Revisit if:** a client reports a tool call being re-issued after a mid-stream break (then the
+predicate is not firing); or the `records_key_health` invariant is broken by a new `ErrorClass`
+that is not drift (then the rethrown path needs its own health record).
+
+## 2026-09-27 — The vault's read-modify-write is excluded by a cross-process file lock
+
+- **Decision:** `vault::put`/`vault::delete` hold an exclusive `std::fs::File::lock` on a sibling
+  `.secrets.lock` across the whole `load → mutate → save` sequence, plus one in-process `Mutex`
+  (`Cache::ops`) around each public operation. **No new dependency:** std stabilised file locking in
+  Rust 1.89 and this toolchain is 1.98.1 — `flock(2)` on unix, `LockFileEx` on Windows.
+- **Why:** two processes write this file by design — `bin/aiproviderd.rs` mints `masterkey` while the
+  app writes `gwkey:ak-ui` and provider keys — and nothing excluded them. `save` writes the *whole*
+  map, so an interleaved pair loses one side. Measured before the fix by the new
+  `two_processes_writing_different_accounts_lose_nothing`, which drives two real processes through a
+  start barrier: **26 of 50** `put`s failed outright with `No such file or directory` (both processes
+  wrote the same `.secrets.json.tmp`, so one `rename`d it out from under the other) and **25 of 50**
+  accounts were absent from the file, with both calls returning `Ok`. Falsified both ways on identical
+  test code: lock stubbed out → **3/3 red**; lock in place → **5/5 green**.
+- **Options considered:**
+  1. A `create_new` lockfile with a bounded spin and age-based stealing (rejected — reintroduces the
+     stale-lock class the OS primitive does not have, and a crashed holder would wedge the vault).
+  2. A crate wrapping the same syscalls, e.g. `fs4` (rejected — std has had `File::lock` since 1.89,
+     so the dependency buys nothing; `fs4`'s own docs point at `std::fs::File::lock`).
+  3. Shard into one file per account, so different accounts cannot collide at all (rejected for now —
+     strictly better on this axis, but it is an on-disk format migration with its own doc sweep, and
+     the lock closes the defect without moving the format).
+  4. **A file lock over the read-modify-write** (chosen).
+- **Rationale:** the kernel releases the lock when the holder dies, so there is no stale-lock state to
+  detect, age out, or steal — that property is what decides this over option 1. The lock file is
+  **never unlinked**, and that is load-bearing rather than tidy: a probe that removed and re-created it
+  locked a *different inode* and excluded nobody. A lock file that can vanish is not a lock.
+- **Consequence:** all three public vault operations now serialise in-process, so a `get` on the auth
+  path can wait behind another `get`. The critical section is one read of a small file; if that ever
+  appears in a profile, the in-process mutex is the part to revisit — not the file lock.
+- **Revisit if:** the vault grows enough accounts that a whole-map write per `put` is the cost that
+  matters (then option 3), or a profile shows `Cache::ops` on the request path.
+

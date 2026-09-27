@@ -24,6 +24,37 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Fixed
 
+- **A successful turn whose only output was a tool call was recorded as `PARSE_ERROR`.** Tool calls
+  travel by `on_tool_call`, never through the text sink, so a tool-call turn delivered zero chunks —
+  and "did anything get served?" was being answered by counting chunks. The row said
+  `status=error, error_class=PARSE_ERROR` for a request the client received intact, while the same
+  request was recorded as `OK` in key health. 11 of the 42 rows written on 2026-09-27 were this.
+  "Served" now means *delivered output*: a text chunk or a tool call. A `200` with an empty body is
+  still `PARSE_ERROR` and an aborted request is still `CANCELLED`. Applies to both the
+  `aiproviderd` gateway and the in-app Assistant. See `DECISIONS.md` 2026-09-27.
+
+- **A tool call delivered and then a mid-stream break still failed over, re-issuing the tool call.**
+  `emitted` — the flag that decides whether a break can still fail over to the next candidate — was
+  chunk-only, so a tool call delivered and then a break produced `Next` rather than `Rethrow`. The
+  next candidate re-issued the same tool call, and the consumer held two for the same turn. A
+  delivered tool call now also ends failover: the predicate folds in a tool-call count, so the
+  break produces `MidStream` (not `AllAttemptsFailed`) with the serving candidate named. The
+  `records_key_health` invariant — a rethrown failure must be a drift class — still holds, because
+  a mid-stream break after a tool call classifies the same way as one after a chunk. Applies to
+  both the `aiproviderd` gateway and the in-app Assistant. See `DECISIONS.md` 2026-09-27.
+
+- **A provider that answered with headers and then sent no body was recorded as a client abort.**
+  The egress bounded the wait for *response headers* at 20 s but left the wait for the **first body
+  byte** inside the 120 s streaming budget — four times the gateway's 30 s first-message bound — so
+  the gateway always gave up first, cancelled the request, and the ledger wrote `CANCELLED` with an
+  empty attempt chain and `http_status` null: a timeout filed under the name of a client disconnect,
+  with no line in any log and no failover, because the engine sees a stream that ended cleanly rather
+  than an attempt that failed. One deadline now encloses both phases, stamped *before* the request is
+  sent, so a body that never starts fails at the same 20 s as one that never gets headers — with a
+  real class, a populated chain, and a `warn!` naming the phase that expired. A request whose body
+  has demonstrably started is untouched: the 120 s budget still governs silence between chunks.
+  Measured on ledger row 1671. See `DECISIONS.md` 2026-09-27 and drift-register **D74**.
+
 - **Adding a key could strand its secret in the vault with no row to reach it.** `addKey` writes the
   secret to the keychain and *then* records the `api_keys` row; when the row insert failed — a 500
   from the provider foreign key, a dead gateway, a 401 — the secret was left behind. It was invisible
@@ -43,6 +74,35 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   nothing from a non-interactive shell while `launchctl print` reports the job running. Both scripts
   now resolve the port through a shared `scripts/lib/gateway-port.sh`, drive `launchctl` against the
   job that owns the listener, and emit parseable output. See `docs/dev-book/07-drift-register.md` D72.
+
+- **A slow upstream was being aborted at 10 s and then retried with the same prompt — so a healthy
+  request failed as `CANCELLED` at 30 s.** Four requests failed this way in eight minutes on
+  2026-09-27 (ledger rows 1652/1655/1656/1658), reported to the client as *"the router produced no
+  response within 30000ms"*. Three separate defects stacked behind that one symptom:
+
+  **(1) The pre-headers budget was too small.** `first_msg_ms` — the only in-path time-to-first-byte
+  this system records — measures **p50 2.1 s, p90 7.1 s, p99 18.6 s, max 18.6 s** across 54 real
+  requests. At 10 s the bound was *manufacturing* the stall it existed to survive: 4/54 requests
+  exceeded it and then succeeded on the retry, two of them measurably (attempt 2 delivered 2.80 s
+  and 8.60 s after the stall). It is now **20 s**, which covers every success ever recorded.
+
+  **(2) The retry was on the wrong arm.** A header timeout looped and re-sent the identical prompt
+  to the identical host; a genuine transport error returned with no retry at all. The two are now
+  the right way round: a transport error gets one more dial, because a *fresh connection* is a
+  different roll; a header timeout does not, because it cannot be. The header budget is no longer
+  multiplied by a retry count.
+
+  **(3) Nothing bounded the plan.** `execute_text` walks every candidate, and with two candidates the
+  worst case was `2 x 20 s = 40 s` against a 30 s gateway bound — so the last candidate was *always*
+  cut off mid-attempt. The log proves it: entry 2 starts its own `attempt=1` 18 ms **after** the
+  gateway has already given up. The engine now holds a **26 s plan budget** and admits a candidate
+  only when it can fund a full attempt, so `20 s <= 26 s < 30 s` is a real ordering. A request that
+  exhausts it now fails at ~20 s through the router's own path and is recorded with the class its
+  attempts produced, instead of reaching 30 s and being filed as `CANCELLED`.
+
+  The old invariant test pinned only one candidate's budget and so could not see (3); it now asserts
+  the three-constant ordering. All three new tests were falsified against the previous behaviour
+  before being trusted. See `docs/dev-book/07-drift-register.md` D73.
 
 ## [1.2.0] - 2026-09-26
 

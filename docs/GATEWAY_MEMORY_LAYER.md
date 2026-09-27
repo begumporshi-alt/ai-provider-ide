@@ -265,7 +265,7 @@ channel**. Both came from the review; neither was in v0 of this document.
 *Credential laundering.* Terminal output and tool results in coding-agent turns are full of secrets —
 env vars, `gh` tokens, cloud keys. A distiller will faithfully copy them into atoms; injection then
 broadcasts them into every future request, **to every vendor, cross-provider**. That recreates at the
-memory layer exactly the leak the per-vendor keychain design exists to prevent. Note the liability is
+memory layer exactly the leak the per-vendor vault design exists to prevent. Note the liability is
 the SQLite row itself, so scrubbing at injection time is too late.
 
 *Instruction channel.* Memory is eventually generated from model conversations, so the model can
