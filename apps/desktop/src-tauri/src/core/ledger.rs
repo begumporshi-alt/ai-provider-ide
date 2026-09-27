@@ -148,7 +148,15 @@ impl UsageLedger {
         self.mem.push_back(entry);
         if let Some(ref sink) = self.sink {
             // The entry is already in `mem`, so a sink failure does not lose data.
-            sink.append(self.mem.back().unwrap())?;
+            //
+            // `back()` cannot be `None` — the push above is the immediately preceding statement —
+            // but it is returned as an error rather than unwrapped (audit M2): `panic = "abort"`
+            // is set for release, so an unwrap here would end the process for every client, and
+            // the invariant it rests on lives in the line above rather than in the type. `append`
+            // already returns `Result`, so the honest answer is available at no cost.
+            let last =
+                self.mem.back().ok_or("the ledger queue was empty immediately after a push")?;
+            sink.append(last)?;
         }
         // Trim after the append, not before: the newest entry survives even at max_entries=1, and
         // the sink has already seen every entry, so dropping one from memory loses no data.

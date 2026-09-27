@@ -118,7 +118,7 @@ pub(crate) async fn gemini_h(
             }
         }
     }
-    let app_key = match check_gateway_key(&core, &headers2, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers2, peer_ip(&headers)).await {
         Ok(k) => k,
         Err(r) => return r.gemini(),
     };

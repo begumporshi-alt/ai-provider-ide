@@ -153,7 +153,7 @@ if command -v cargo >/dev/null 2>&1; then
   # ci.yml's `headless-service` job has four steps and this gate models three. The third asserts
   # the binary *starts*, not merely that it builds -- and building is not starting: a change that
   # links but dies on startup passed this gate and failed CI. `--version` is the whole of the
-  # assertion on purpose; ci.yml records why (no port, no keychain approval, no store, so it cannot
+  # assertion on purpose; ci.yml records why (no port and no store, so it cannot
   # flake, and it still proves the binary links). Path resolution is the part that already broke
   # once in CI: `working-directory` there is `apps/desktop/src-tauri`, so this resolves the same
   # way the build step above does rather than against the repo root, and a missing binary is a

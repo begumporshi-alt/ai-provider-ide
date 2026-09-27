@@ -17,6 +17,7 @@ import { ModelCatalog } from "../src/model-catalog.js";
 import { AdapterRuntime } from "../src/adapter-runtime.js";
 import { UsageLedger } from "../src/usage-ledger.js";
 import { ModelRouter } from "../src/model-router.js";
+import type { ToolCall } from "../src/ports.js";
 import { FakeHttp, FakeVault } from "./fakes.js";
 
 type Resp = { status?: number; body?: unknown; lines?: string[] };
@@ -130,6 +131,60 @@ describe("a failed route records the cause, not a category", () => {
     expect(row.providerId).toBe(s.providerId);
     expect(row.httpStatus).toBeUndefined();
   });
+
+  it("a tool call delivered then a mid-stream break does not fail over", async () => {
+    // The defect: `emitted` was chunk-only, so a tool call delivered and then a break still
+    // failed over (`Next`) — the next candidate re-issued the same tool call. The fix folds
+    // a tool-call count into the failover predicate, so a delivered tool call also rethrows.
+    //
+    // Fail this against the old code by reverting `if (emitted || toolCalls > 0)` to
+    // `if (emitted)` in `execution-engine.ts`.
+    const s = setup((url) => (url.endsWith("/models") ? MODELS : { status: 200, lines: ["data: [DONE]"] }));
+    await arm(s);
+
+    // A second key so failover *can* reach a second candidate — the test's point is that it
+    // must not.
+    await s.registry.addKey({ providerId: s.providerId, label: "key-02", secret: "sk-test2" });
+
+    // Swap in an adapter that delivers a tool call then dies mid-stream. The tool call is
+    // delivered *before* the stream starts, which is where a real adapter puts them.
+    let toolCallsDelivered = 0;
+    const dying = {
+      forProvider: async () => ({
+        baseUrl: "https://a.test/api/v1",
+        adapter: {
+          generateText(_secret: string, args: { onToolCall?: (tc: ToolCall) => void }) {
+            // Deliver the tool call before the stream starts, then the stream breaks.
+            args.onToolCall?.({ id: "call_1", name: "Bash", arguments: "{\"command\":\"ls\"}" });
+            toolCallsDelivered++;
+            return (async function* () {
+              throw new Error("connection reset by peer");
+            })();
+          },
+        },
+      }),
+    } as unknown as AdapterRuntime;
+    const router = new ModelRouter(s.registry, dying, s.catalog, s.ledger);
+
+    const calls: ToolCall[] = [];
+    const exec = await router.generateText({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "list files" }],
+      tools: [{ type: "function", function: { name: "Bash" } }],
+      onToolCall: (c) => calls.push(c),
+    });
+    await expect(collect(exec.chunks)).rejects.toThrow("connection reset");
+
+    // The tool call was delivered exactly once — no re-issue by a second candidate.
+    expect(calls).toHaveLength(1);
+    expect(toolCallsDelivered).toBe(1);
+
+    const row = s.ledger.query()[0]!;
+    expect(row.status).toBe("error");
+    expect(row.errorClass).toBe("NETWORK");
+    // The provider that served the tool call is named, not blank.
+    expect(row.providerId).toBe(s.providerId);
+  });
 });
 
 describe("a stream that completes without serving is not a success", () => {
@@ -191,5 +246,50 @@ describe("a request nothing can serve leaves a trace", () => {
     expect(row.requestedModel).toBe("no-such-model");
     // Honest: no candidate was ever attempted, so there is no chain to show.
     expect(row.fallbackChain).toEqual([]);
+  });
+});
+
+/**
+ * A tool-call turn delivers its whole answer through `onToolCall`, and none of it through
+ * `chunks` — so a ledger that decides "did anything get served?" by counting chunks answers
+ * "no" for a request that succeeded. Measured on the live ledger: 11 of the 42 rows written
+ * since the 2026-09-27 deploy were `PARSE_ERROR`, and two of those (1714/1715) were probed
+ * end to end — both were healthy `finish_reason: "tool_calls"` answers the client received
+ * intact, non-streaming and streaming alike.
+ *
+ * Fail this against the old code by restoring `onToolCall: args.onToolCall` in
+ * `execution-engine.ts:97` (i.e. drop the wrapper that marks the candidate as served).
+ */
+describe("a turn whose only output is a tool call is a success", () => {
+  it("records ok and names the provider, not PARSE_ERROR", async () => {
+    const s = setup((url) => (url.endsWith("/models") ? MODELS : {
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, id: "call_1", type: "function", function: { name: "Bash", arguments: "" } }] } }] })}`,
+        `data: ${JSON.stringify({ choices: [{ delta: { tool_calls: [{ index: 0, function: { arguments: "{\"command\":\"ls\"}" } }] } }] })}`,
+        `data: ${JSON.stringify({ choices: [{ delta: {}, finish_reason: "tool_calls" }] })}`,
+        "data: [DONE]",
+      ],
+    }));
+    const key = await arm(s);
+
+    const calls: ToolCall[] = [];
+    const exec = await s.router.generateText({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "list files" }],
+      tools: [{ type: "function", function: { name: "Bash" } }],
+      onToolCall: (c) => calls.push(c),
+    });
+    // The whole point: the answer travels by onToolCall and the transcript is empty.
+    expect(await collect(exec.chunks)).toBe("");
+    expect(calls).toHaveLength(1);
+
+    const row = s.ledger.query()[0]!;
+    // The defect: this was `status: "error"` / `PARSE_ERROR` with no provider named, while the
+    // same request recorded "OK" in key health.
+    expect(row.status).toBe("ok");
+    expect(row.errorClass).toBeUndefined();
+    expect(row.providerId).toBe(s.providerId);
+    expect(row.keyId).toBe(key.id);
   });
 });

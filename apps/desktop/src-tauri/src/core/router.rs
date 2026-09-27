@@ -628,6 +628,32 @@ impl SharedRouterState {
 /// lives in [`SharedRouterState`] behind an `Arc<Mutex<_>>`, which is the shape the original note
 /// said a wiring layer needing two owners would have to build for itself — built once, here,
 /// because a bridge with one router per request is exactly that wiring layer.
+/// What one routed request actually delivered, counted at the router's own seam.
+///
+/// **Two counts, and the split is the whole point.** `chunks` is text that reached the sink;
+/// `tool_calls` is tool calls that reached `on_tool_call`. A turn whose entire output is a tool call
+/// has `chunks == 0` and is still a successful request — which is exactly why "nothing arrived" has
+/// to be asked as `!any()` rather than as `chunks == 0`. Collapsing the two is how rows 1714/1715
+/// came to be filed `PARSE_ERROR`.
+///
+/// **One value rather than two arguments, and the shape is the reason.** `write_text_ledger` was
+/// already at the arity lint's limit; more to the point, "did anything arrive?" is *one* question,
+/// and a signature that takes its two halves separately invites a caller to answer only one. The
+/// two are counted by two different closures while the request runs — the sink can only see chunks
+/// and the forwarder can only see tool calls — and folded here at the call.
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
+struct Delivered {
+    chunks: usize,
+    tool_calls: usize,
+}
+
+impl Delivered {
+    /// The predicate the ledger's ok/error split turns on: did anything at all arrive?
+    fn any(self) -> bool {
+        self.chunks > 0 || self.tool_calls > 0
+    }
+}
+
 pub struct ModelRouter<'a> {
     store: &'a RouterStore,
     adapters: &'a dyn AdapterFactory,
@@ -824,6 +850,11 @@ impl<'a> ModelRouter<'a> {
     /// seam that already owns the sink — so the counting closure below is where the answer is, not
     /// a new field on a landed type. See `write_text_ledger`.
     ///
+    /// **…and the tool-call count is the router's too, for the same reason.** The source sets
+    /// `served` from the first chunk *or* the first tool call (`execution-engine.ts`), since a
+    /// tool-call turn produces no chunks. This port counts both, because it needs the same
+    /// distinction.
+    ///
     /// **A ledger failure is returned, and the chunks have already been delivered.** That is the
     /// source's behaviour too: its generator throws after the consumer holds the text. The caller
     /// that has drained `on_chunk` therefore learns that the *record* failed, not the request.
@@ -862,9 +893,26 @@ impl<'a> ModelRouter<'a> {
             max_attempts,
         } = req;
 
+        // **`Delivered` counts text chunks and tool calls both, and the row is only honest if it
+        // counts both.** A turn whose entire output is a tool call yields no chunk at
+        // all — tool calls travel by `on_tool_call`, never through the sink — so a chunk-only count
+        // filed a *successful* tool turn as `PARSE_ERROR` while the engine, having reached its
+        // success path, recorded the same request's key as `OK` (`engine.rs:1165`). Two records of
+        // one request, contradicting each other. Measured on the live ledger: rows 1714/1715 were
+        // both healthy `finish_reason: "tool_calls"` answers the client received intact.
+        //
+        // **The count is not gated on the caller having passed a callback.** This router always
+        // hands the engine a `Some` forwarder, so the interpreter parses tool calls either way
+        // (`interpreter.rs:515`); when the caller passed none they are parsed and dropped, which
+        // is still output the provider produced.
+        // **Two counters because two closures must share the work.** The sink can only see chunks
+        // and the forwarder can only see tool calls, and both are alive for the whole
+        // `execute_text` call — so neither can hold a `&mut` to one shared local. They are folded
+        // into a single `Delivered` at the call below.
         let mut emitted = 0usize;
+        let mut tool_calls = 0usize;
         let result = {
-            // **The counting wrapper, and the borrow is why it exists as a local.** `emitted` must
+            // **The counting wrapper, and the borrow is why it exists as a local.** The count must
             // be readable once the engine has finished with the sink, so the sink cannot borrow it
             // inline.
             let mut counting = |chunk: &str| {
@@ -887,6 +935,7 @@ impl<'a> ModelRouter<'a> {
             // call.
             let mut caller_on_tool_call = on_tool_call;
             let mut forward_tool = |tc: crate::core::adapter::ToolCall| {
+                tool_calls += 1;
                 if let Some(cb) = caller_on_tool_call.as_deref_mut() {
                     cb(tc);
                 }
@@ -922,7 +971,14 @@ impl<'a> ModelRouter<'a> {
             .await
         };
 
-        self.write_text_ledger(&model, opts, t0, &result, emitted, cancel.is_cancelled())?;
+        self.write_text_ledger(
+            &model,
+            opts,
+            t0,
+            &result,
+            Delivered { chunks: emitted, tool_calls },
+            cancel.is_cancelled(),
+        )?;
         result.map_err(|failure| RouterError::Text(Box::new(failure)))
     }
 
@@ -931,7 +987,8 @@ impl<'a> ModelRouter<'a> {
     /// **Three shapes, and the source's `if (!served)` is the one that is easy to lose.** A stream
     /// that drains with nothing in it is *not* a success — the source's comment records the live
     /// ledger holding seven such rows, "and the 99.5s / 83s latencies among them are client
-    /// timeouts, not answers". `emitted` is what tells the two apart here.
+    /// timeouts, not answers". `delivered` is what tells the two apart here, and both of its counts
+    /// matter — because a tool-call turn is an answer that never reaches the sink.
     ///
     /// **`httpStatus` and `errorClass` follow the source's spelling, including the part that looks
     /// wrong.** On the throwing path the class is `NETWORK` whenever anything served
@@ -947,14 +1004,31 @@ impl<'a> ModelRouter<'a> {
         opts: &CallOptions,
         t0: i64,
         result: &Result<TextSuccess, TextFailure>,
-        emitted: usize,
+        delivered: Delivered,
         cancelled: bool,
     ) -> Result<(), RouterError> {
         let now = now_ms();
         let source = opts.source().to_string();
 
         let (mut row, usage, attempts, served, error_class, http_status) = match result {
-            Ok(success) if emitted > 0 => {
+            // **`delivered.any()` and not `delivered.chunks > 0` — that distinction is the defect.**
+            // A turn whose entire output is a tool call delivers nothing through the sink, so a
+            // chunk-only count left `chunks == 0` on a request that answered correctly, and it
+            // landed in the `PARSE_ERROR` arm below while the engine recorded the same request's
+            // key as `OK` (`engine.rs:1165`).
+            Ok(success) if delivered.any() => {
+                // **The deploy marker, and the only evidence this path ever fires.** The row a
+                // recovered tool-call turn writes is indistinguishable from any other success, and
+                // the fix is otherwise made of types and control flow — so it leaves no string in
+                // the binary and `strings | grep` cannot tell the new build from the old (§9 of the
+                // triage skill). This line earns its place twice: it calibrates the deploy, and it
+                // is what proves a given `ok` row came from here.
+                if delivered.chunks == 0 {
+                    tracing::info!(
+                        tool_calls = delivered.tool_calls,
+                        "served by tool calls alone — recorded as ok, not PARSE_ERROR",
+                    );
+                }
                 let mut row = ledger_row(now, TEXT, &source);
                 row.provider_id = Some(success.candidate.provider.id.clone());
                 row.key_id = Some(success.candidate.key.id.clone());
@@ -983,6 +1057,10 @@ impl<'a> ModelRouter<'a> {
             // The drained-with-nothing case, and the abort case: both reach the source's `!served`
             // branch. `CANCELLED` is decided by the signal there, and by the variant here — the
             // engine can only produce `TextFailure::Cancelled` when the flag is set.
+            //
+            // "Nothing" means neither a chunk nor a tool call: the guard above has already taken
+            // every request that produced output, so what lands here is a provider that answered
+            // `200` with an empty body, or a client that cancelled before the first byte.
             Ok(success) => (
                 ledger_row(now, TEXT, &source),
                 success.usage,
@@ -1443,6 +1521,7 @@ mod tests {
 
     use crate::core::adapter::{
         AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs,
+        ToolCall,
     };
     use crate::core::engine::{AttemptError, ErrorClass, FailureKind};
     use crate::core::ledger::{LedgerFilter, LedgerSink};
@@ -1723,6 +1802,12 @@ mod tests {
     #[derive(Default)]
     struct Scripted {
         text: Mutex<VecDeque<Result<Vec<String>, AttemptError>>>,
+        /// Tool calls handed to `on_tool_call` per text call, in order — see `with_tools`.
+        tools: Mutex<VecDeque<Vec<ToolCall>>>,
+        /// An error to append to the stream *after* the chunks, per text call, in order — see
+        /// `with_breaks`. `Some(e)` makes the stream yield the chunks then `Err(e)`, which is the
+        /// shape of a mid-stream break; `None` leaves the stream clean.
+        breaks: Mutex<VecDeque<Option<AttemptError>>>,
         usage: Mutex<VecDeque<Option<UsageTokens>>>,
         image: Mutex<VecDeque<Result<ImageReply, AttemptError>>>,
         calls: Mutex<Vec<String>>,
@@ -1741,9 +1826,28 @@ mod tests {
             Arc::new(s)
         }
 
+        /// Queue one batch of tool calls per text call, in order.
+        ///
+        /// They are delivered through `args.on_tool_call` *before* the stream is handed back, which
+        /// is where a real adapter puts them — and for a turn whose entire output is a tool call,
+        /// where the whole answer is. The stream beside them is then empty, which is the shape that
+        /// the ledger used to misread.
+        fn with_tools(self: &Arc<Self>, calls: Vec<Vec<ToolCall>>) -> Arc<Self> {
+            *self.tools.lock().unwrap() = calls.into();
+            Arc::clone(self)
+        }
+
         /// Queue one usage report per text call, in order.
         fn reporting(self: &Arc<Self>, usage: Vec<Option<UsageTokens>>) -> Arc<Self> {
             *self.usage.lock().unwrap() = usage.into();
+            Arc::clone(self)
+        }
+
+        /// Queue one mid-stream break per text call, in order. `Some(e)` makes the stream yield
+        /// its chunks then `Err(e)`; `None` leaves it clean. Paired with `with_tools` to test a
+        /// tool call delivered and then a break — the defect that failover-on-tool-call fixes.
+        fn with_breaks(self: &Arc<Self>, breaks: Vec<Option<AttemptError>>) -> Arc<Self> {
+            *self.breaks.lock().unwrap() = breaks.into();
             Arc::clone(self)
         }
 
@@ -1773,17 +1877,34 @@ mod tests {
         {
             self.calls.lock().unwrap().push(format!("text:{secret_ref}|{}", args.model));
             let next = self.text.lock().unwrap().pop_front();
+            let tools = self.tools.lock().unwrap().pop_front().unwrap_or_default();
+            let brk = self.breaks.lock().unwrap().pop_front().flatten();
             let usage = self.usage.lock().unwrap().pop_front().flatten();
             Box::pin(async move {
                 match next {
                     None => Err(AttemptError::Transport),
                     Some(Err(e)) => Err(e),
                     Some(Ok(chunks)) => {
+                        if let Some(cb) = args.on_tool_call.as_deref_mut() {
+                            for call in tools {
+                                cb(call);
+                            }
+                        }
                         if let (Some(u), Some(cb)) = (usage, args.on_usage.as_deref_mut()) {
                             cb(u);
                         }
-                        Ok(Box::pin(stream::iter(chunks.into_iter().map(Ok)))
-                            as BoxStream<'a, Result<String, AttemptError>>)
+                        // A mid-stream break appends `Err(e)` after the chunks, which is the shape
+                        // of a real stream that dies mid-flight. Without `brk` the stream is clean.
+                        let stream: BoxStream<'a, Result<String, AttemptError>> = match brk {
+                            Some(e) => {
+                                let mut items: VecDeque<Result<String, AttemptError>> =
+                                    chunks.into_iter().map(Ok).collect();
+                                items.push_back(Err(e));
+                                Box::pin(stream::iter(items))
+                            }
+                            None => Box::pin(stream::iter(chunks.into_iter().map(Ok))),
+                        };
+                        Ok(stream)
                     }
                 }
             })
@@ -2080,6 +2201,118 @@ mod tests {
         assert_eq!(row.key_id, None);
         assert_eq!(row.model, "m1", "the requested id, because no native id served");
         assert_eq!(router.next_key_cursor("p1"), 0, "nothing served, so nothing advances");
+    }
+
+    /// A tool-call turn delivers its whole answer through `on_tool_call`, and none of it through
+    /// the sink — so a ledger that decides "did anything get served?" by counting chunks answers
+    /// "no" for a request that succeeded.
+    ///
+    /// Measured on the live ledger: 11 of the 42 rows written since the 2026-09-27 deploy were
+    /// `PARSE_ERROR`, and two of those (1714/1715) were probed end to end — both were healthy
+    /// `finish_reason: "tool_calls"` answers the client received intact, non-streaming and
+    /// streaming alike. Fail this by restoring `Ok(success) if delivered.chunks > 0`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_turn_whose_only_output_is_a_tool_call_is_a_success_not_a_parse_error() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&[])]).with_tools(vec![vec![ToolCall {
+            id: Some("call_1".to_string()),
+            name: Some("Bash".to_string()),
+            arguments: Some("{\"command\":\"ls\"}".to_string()),
+            raw: None,
+        }]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (seen, mut on_chunk) = sink();
+
+        // A real caller's callback rather than a tool call that is parsed and dropped, so the test
+        // pins the shape the gateway bridge actually uses (`router_bridge.rs:363`). Leaked because
+        // `TextRequest<'static>` outlives any local the test could borrow from.
+        let delivered: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let on_tool: &'static mut (dyn FnMut(ToolCall) + Send) =
+            Box::leak(Box::new(move |tc: ToolCall| {
+                delivered.lock().unwrap().push(tc.name.clone().unwrap_or_default());
+            }));
+        let mut req = text_req("m1");
+        req.on_tool_call = Some(on_tool);
+
+        router
+            .generate_text(req, &opts("gateway"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("served");
+
+        assert!(seen.lock().unwrap().is_empty(), "a tool-call turn produces no chunks at all");
+        assert_eq!(*delivered.lock().unwrap(), vec!["Bash".to_string()]);
+
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "ok", "the provider answered — PARSE_ERROR is a lie here");
+        assert_eq!(row.error_class, None);
+        assert_eq!(row.provider_id.as_deref(), Some("p1"));
+        assert_eq!(row.key_id.as_deref(), Some("k1"), "who served, and it did serve");
+        assert_eq!(row.model, "m1", "the native id that served");
+        assert_eq!(router.next_key_cursor("p1"), 1, "it served, so the cursor advances");
+    }
+
+    /// A tool call delivered and then a mid-stream break must *not* fail over — the consumer
+    /// holds a tool call, and the next candidate re-issuing it would be wrong. `emitted` is
+    /// chunk-only, so before the fix this path failed over (`Next`), and the second candidate
+    /// re-issued the same tool call.
+    ///
+    /// Fail this by reverting the predicate to `attempt_disposition(emitted, ...)`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tool_call_then_a_mid_stream_break_rethrows_not_failover() {
+        let store = one_provider();
+        // Empty chunks (no text), one tool call delivered, then a transport error mid-stream.
+        let brk =
+            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None };
+        let adapter = Scripted::new(vec![chunks(&[])])
+            .with_tools(vec![vec![ToolCall {
+                id: Some("call_1".to_string()),
+                name: Some("Bash".to_string()),
+                arguments: Some("{\"command\":\"ls\"}".to_string()),
+                raw: None,
+            }]])
+            .with_breaks(vec![Some(brk)]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        let delivered: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let on_tool: &'static mut (dyn FnMut(ToolCall) + Send) =
+            Box::leak(Box::new(move |tc: ToolCall| {
+                delivered.lock().unwrap().push(tc.name.clone().unwrap_or_default());
+            }));
+        let mut req = text_req("m1");
+        req.on_tool_call = Some(on_tool);
+
+        let error = router
+            .generate_text(req, &opts("gateway"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect_err("a mid-stream break rethrows");
+
+        // MidStream, not AllAttemptsFailed — the tool call was delivered, so failover is over.
+        let failure = text_failure(&error);
+        assert!(
+            matches!(failure, TextFailure::MidStream { .. }),
+            "expected MidStream, got {failure:?}"
+        );
+
+        // The tool call reached the caller's callback exactly once — no re-issue by a second
+        // candidate.
+        assert_eq!(*delivered.lock().unwrap(), vec!["Bash".to_string()]);
+        assert_eq!(adapter.calls().len(), 1, "only one candidate was contacted");
+
+        // The ledger row names the provider that served, and the class is `NETWORK` — the Rust
+        // router's `MidStream` arm hardcodes it (`router.rs:1076`), which is the analogue of the
+        // TS engine's `NETWORK` for a non-`ManifestHttpError` throw. Skipping key health is safe
+        // because the invariant `a_rethrown_failure_is_always_a_drift_class` covers it: a mid-stream
+        // break after a tool call classifies the same way as one after a chunk.
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "error");
+        assert_eq!(
+            row.error_class.as_deref(),
+            Some("NETWORK"),
+            "a mid-stream break after a tool call"
+        );
+        assert_eq!(row.provider_id.as_deref(), Some("p1"), "the candidate that served is named");
+        assert_eq!(row.key_id.as_deref(), Some("k1"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

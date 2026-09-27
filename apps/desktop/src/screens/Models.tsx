@@ -21,6 +21,7 @@ export function ModelsScreen() {
   // host, because that is where the client's config file is written.
   const [published, setPublished] = useState<string[]>([]);
   const [clientPresent, setClientPresent] = useState(false);
+  const [publishError, setPublishError] = useState<string | null>(null);
 
   useEffect(() => {
     workbuddyStatus()
@@ -31,14 +32,29 @@ export function ModelsScreen() {
       .catch(() => undefined);
   }, [tick]);
 
+  /**
+   * Expose/unexpose one model, adopting **only** the host's answer.
+   *
+   * This used to be `workbuddySetModels(next).catch(() => null)` followed by
+   * `setPublished(res ? res.models : next)`. On failure that fell back to the local guess, so the
+   * toggle rendered as applied while the client's config file had not been written — a swallowed
+   * write presented as success, invisible to every reader. The host dedupes and is the thing that
+   * actually writes the file, so its answer is the only authority; a failure is surfaced instead of
+   * being rendered as a change.
+   */
   const togglePublish = async (nativeId: string) => {
     const next = published.includes(nativeId)
       ? published.filter((m) => m !== nativeId)
       : [...published, nativeId];
-    const res = await workbuddySetModels(next).catch(() => null);
-    // Trust the host's answer rather than the local guess — it dedupes and is the thing that
-    // actually wrote the file.
-    setPublished(res ? res.models : next);
+    try {
+      const res = await workbuddySetModels(next);
+      setPublished(res.models);
+      setPublishError(null);
+    } catch (e) {
+      setPublishError(
+        `Could not update the client's model list — nothing was written. ${String(e)}`,
+      );
+    }
     bump();
   };
 
@@ -173,6 +189,11 @@ export function ModelsScreen() {
       {providers.length > 0 && (
         <p className="mt-2 flex items-center gap-1.5 text-[11px]" style={{ color: "var(--text-faint)" }}>
           <StatusDot health="healthy" /> Aliases: identical native IDs across providers resolve by bare name with provider failover (§3.4).
+        </p>
+      )}
+      {publishError && (
+        <p className="mt-2 text-[11px]" style={{ color: "var(--danger)" }} role="alert">
+          {publishError}
         </p>
       )}
       <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>

@@ -681,7 +681,7 @@ mod tests {
     /// The whole service, in-process, with two substitutions — and both are seams production
     /// already exposes rather than branches that exist only for tests.
     ///
-    /// - `EgressState::with_secret_provider` keeps the request path off the OS keychain. Its own
+    /// - `EgressState::with_secret_provider` keeps the request path off the vault. Its own
     ///   note makes the argument; `gateway::KeyProvider` made it first.
     /// - the master key is injected the same way, for the same reason.
     ///

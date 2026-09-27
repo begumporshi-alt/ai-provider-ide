@@ -1,7 +1,7 @@
 /**
  * provider-registry (L3): Provider/key CRUD + lifecycle. The registry holds refs only;
  * secrets go to the KeyVaultPort (invariant 1/2). Deletions cascade per §7 hygiene:
- * deleting a key deletes its keychain entry in the same operation; deleting a provider
+ * deleting a key deletes its vault entry in the same operation; deleting a provider
  * cascades keys/manifests/catalog (ledger history preserved — soft refs).
  */
 import type { KeyVaultPort } from "./ports.js";
@@ -58,11 +58,11 @@ export class ProviderRegistry {
   async addKey(input: {
     providerId: string;
     label: string;
-    secret: string; // accepted exactly once, stored in keychain, never held here
+    secret: string; // accepted exactly once, stored in vault, never held here
     priority?: number;
   }): Promise<ApiKeyRecord> {
     if (!this.providers.has(input.providerId)) throw new Error(`unknown provider ${input.providerId}`);
-    // §4 freezes the keychain account format as `key:<keyId>` — the id must be generated
+    // §4 freezes the vault account format as `key:<keyId>` — the id must be generated
     // BEFORE the vault write, or every key of a provider would share one account and
     // silently overwrite each other (diff-review M1).
     const id = crypto.randomUUID();

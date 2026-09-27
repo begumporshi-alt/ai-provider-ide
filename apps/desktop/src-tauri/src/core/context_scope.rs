@@ -546,6 +546,17 @@ pub fn inject_context_deadline(
     //
     // The app key is only resolved with memory on: off by default has to mean no extra work, and
     // resolving one means reading the app-key map.
+    //
+    // **These two reads are the memory path's residual blocking work (audit M1)**, left inline
+    // rather than offloaded. The condition is what makes that defensible: with the toggle off — the
+    // default, and the state every test in this file is written against — `key_principal_for` is
+    // never called and `allows` returns on its first line without touching the store, so a disabled
+    // layer costs zero database reads. With it on, the cost is one indexed key scan plus at most two
+    // point lookups, against a request about to spend seconds upstream. Offloading instead would
+    // mean either resolving scope outside this function — a second authority free to drift from the
+    // one below — or making `inject_context` async, converting the ~33 synchronous tests that use it
+    // as scaffolding. `Deadline` already records this trade knowingly: it bounds how many SQLite
+    // calls a request pays for, not how long any one of them takes.
     let app_key = if core.memory_enabled() {
         core.key_principal_for(crate::core::gateway::presented_key(headers))
     } else {
@@ -1828,7 +1839,7 @@ mod context_scope_tests {
         );
         assert!(!out.injected);
         assert_eq!(out.reason, SkipReason::Disabled);
-        assert_eq!(reads.load(Ordering::SeqCst), 0, "off must not cost a keychain read");
+        assert_eq!(reads.load(Ordering::SeqCst), 0, "off must not cost a vault read");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

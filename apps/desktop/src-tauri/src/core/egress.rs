@@ -3,7 +3,7 @@
 //! (invariant 3/9 — no telemetry is mechanically true, not aspirational).
 //!
 //! Contract with TS: the interpreter sends auth headers whose value carries the `{{secret}}`
-//! sentinel (e.g. `"Bearer {{secret}}"`). Rust resolves the secretRef from the keychain,
+//! sentinel (e.g. `"Bearer {{secret}}"`). Rust resolves the secretRef from the vault,
 //! substitutes the sentinel, sends, and drops the value.
 //!
 //! Trust model (diff-review 2026-09-15, the webview is UNTRUSTED — Tauri 2 does not ACL
@@ -34,7 +34,7 @@ pub enum EgressError {
     HostDenied(String),
     #[error("invalid url: {0}")]
     BadUrl(String),
-    #[error("secret {ref_} not found in keychain (re-enter the key)")]
+    #[error("secret {ref_} not found in the local secrets file (re-enter the key)")]
     SecretMissing { ref_: String },
     #[error("secretRef given but no header carries the {{secret}} sentinel — refusing to send unauthenticated")]
     SentinelMissing,
@@ -50,14 +50,30 @@ pub enum EgressError {
     Store(#[from] crate::core::store::StoreError),
     #[error("image fetch refused: {0}")]
     ImageFetch(String),
+    /// A cleartext destination this process refuses. See [`require_secure_scheme`].
+    #[error(
+        "refusing cleartext {scheme}:// to non-local host {host} — a provider credential would cross the network unencrypted (invariant 3)"
+    )]
+    InsecureScheme { scheme: String, host: String },
+    /// The blocking pool could not run a database closure. **Not** a policy refusal — it is a real
+    /// local failure, so it stays out of [`EgressError::is_policy_refusal`].
+    #[error("store task failed: {0}")]
+    StoreTask(String),
+}
+
+impl From<crate::core::store::StoreTaskError> for EgressError {
+    fn from(e: crate::core::store::StoreTaskError) -> Self {
+        EgressError::StoreTask(e.0)
+    }
 }
 
 impl EgressError {
     /// **Was this a refusal by this process, or a failure to reach the host?** — the one predicate.
     ///
     /// `HostDenied` is the allowlist; `KeyHostMismatch` is a `secret_ref` pointed at a host it is
-    /// not paired with. Neither dialled anything, so neither is evidence about the provider, and
-    /// reporting either as a network failure blames the upstream for a decision taken here (D46).
+    /// not paired with; `InsecureScheme` is a cleartext destination for a credentialed request.
+    /// None of the three dialled anything, so none is evidence about the provider, and reporting
+    /// any of them as a network failure blames the upstream for a decision taken here (D46).
     ///
     /// **Named once because two surfaces ask the same question** — [`StreamEvent::from_egress_error`]
     /// and `egress_port`'s mapping to `HttpError`. Two spellings of "is this our policy" is how a
@@ -67,7 +83,12 @@ impl EgressError {
     /// `SecretMissing` is missing configuration, and `Http`/`Store`/`Vault`/`ImageFetch` are real
     /// failures. Widening this is a decision, not a tidy-up.
     pub fn is_policy_refusal(&self) -> bool {
-        matches!(self, EgressError::HostDenied(_) | EgressError::KeyHostMismatch { .. })
+        matches!(
+            self,
+            EgressError::HostDenied(_)
+                | EgressError::KeyHostMismatch { .. }
+                | EgressError::InsecureScheme { .. }
+        )
     }
 }
 
@@ -216,6 +237,31 @@ pub fn host_is_permitted(allow: &AllowList, host: &str) -> bool {
     is_local(host) || allow.contains(host)
 }
 
+/// **May a credential-bearing request go to this URL at all?** — the scheme half of the same
+/// question [`host_is_permitted`] answers for the host.
+///
+/// `https` is always allowed. `http` is allowed **only for loopback**, which is a primary use case
+/// rather than a concession: Ollama listens on 11434 and LM Studio on 1234, both cleartext on this
+/// machine, where there is no network to cross. Everywhere else it is refused, because
+/// [`inject_secret`] attaches the provider credential to the request and the body carries the
+/// prompt — so an `http://` base URL for a remote provider puts both on the wire in plaintext.
+///
+/// **Measured 2026-09-27: nothing enforced this.** `check_url` checked the host only, and
+/// `adapter-spec`'s zod schema used `z.string().url()`, which accepts `http:`. A user who typed
+/// `http://` — a typo, or a copied internal URL — got a silent downgrade with no warning at input
+/// time and no refusal at request time. Both halves are fixed; this is the enforcement point, and
+/// the schema refuses at input time so the operator learns before the first request.
+///
+/// One predicate, so the unary path, the streaming path, the image carve-out and the redirect
+/// policy cannot disagree about which destinations are secure — the same reason
+/// [`host_is_permitted`] is a function rather than an `if` inside `check_url`.
+pub fn require_secure_scheme(url: &reqwest::Url, host: &str) -> Result<(), EgressError> {
+    if url.scheme() == "https" || is_local(host) {
+        return Ok(());
+    }
+    Err(EgressError::InsecureScheme { scheme: url.scheme().to_string(), host: host.to_string() })
+}
+
 /// Pure allowlist + URL check (unit-testable).
 pub fn check_url(allow: &AllowList, raw: &str) -> Result<reqwest::Url, EgressError> {
     let url = reqwest::Url::parse(raw).map_err(|e| EgressError::BadUrl(e.to_string()))?;
@@ -223,6 +269,9 @@ pub fn check_url(allow: &AllowList, raw: &str) -> Result<reqwest::Url, EgressErr
     if !host_is_permitted(allow, host) {
         return Err(EgressError::HostDenied(host.into()));
     }
+    // After the allowlist check, not before: an unregistered host is reported as `HostDenied`
+    // whatever its scheme, so the two refusals stay distinguishable to a caller and to the tests.
+    require_secure_scheme(&url, host)?;
     Ok(url)
 }
 
@@ -258,7 +307,7 @@ pub fn check_secret_host(
     Ok(())
 }
 
-/// Inject the keychain secret into sentinel headers. Returns the mutated map.
+/// Inject the vault secret into sentinel headers. Returns the mutated map.
 pub fn inject_secret(
     mut headers: std::collections::BTreeMap<String, String>,
     secret: Option<&str>,
@@ -294,17 +343,29 @@ async fn build(
     let host = url.host_str().unwrap_or("");
     // The port of any local provider is allowed, but a NON-local key may only ever meet a
     // non-local host on its own provider domain.
-    if let Some(r) = &req.secret_ref {
-        check_secret_host(&state.store, r, host)?;
-    }
-    let secret = match &req.secret_ref {
-        Some(r) => Some(
-            // Through the seam, not `vault::get` directly — see `SecretProvider`. The `?` still
-            // propagates a keychain *error* as `EgressError::Vault`, and a `None` from the provider
-            // still means "no secret is stored under this ref", which is a different answer from
-            // "the keychain could not be read".
-            (state.secrets)(r)?.ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })?,
-        ),
+    //
+    // **Both steps block, and both used to run on the async executor.** The first is a SQLite read
+    // behind the store mutex; the second is the vault read, which `stat`s — and may read — a file
+    // on disk. They are moved to the blocking pool **together**, so a credentialed request pays one
+    // hop rather than two, and the **order is unchanged**: the host pairing is still checked before
+    // the secret is fetched, which is the property `check_secret_host`'s own doc calls out.
+    let secret = match req.secret_ref.clone() {
+        Some(r) => {
+            let host = host.to_string();
+            let secrets = state.secrets.clone();
+            let s = state
+                .store
+                .offload(move |store| {
+                    check_secret_host(store, &r, &host)?;
+                    // Through the seam, not `vault::get` directly — see `SecretProvider`. The `?`
+                    // still propagates a vault *error* as `EgressError::Vault`, and a `None` from
+                    // the provider still means "no secret is stored under this ref", which is a
+                    // different answer from "the secrets file could not be read".
+                    secrets(&r)?.ok_or_else(|| EgressError::SecretMissing { ref_: r.clone() })
+                })
+                .await?;
+            Some(s)
+        }
         None => None,
     };
     let headers = inject_secret(req.headers.clone(), secret.as_deref())?;
@@ -371,7 +432,11 @@ pub async fn fetch_image(
     req: ImageFetchRequest,
 ) -> Result<ImageFetchResponse, EgressError> {
     let url = reqwest::Url::parse(&req.url).map_err(|e| EgressError::BadUrl(e.to_string()))?;
-    image_host_allowed(state, url.host_str().unwrap_or(""))?;
+    let host = url.host_str().unwrap_or("");
+    image_host_allowed(state, host)?;
+    // This carve-out attaches no secret — but a **pre-signed** CDN URL *is* a credential, so a
+    // cleartext fetch leaks the signature and the object. Same rule as the credentialed path.
+    require_secure_scheme(&url, host)?;
     let mut b = state.image_client.get(url);
     if let Some(ms) = req.timeout_ms {
         b = b.timeout(std::time::Duration::from_millis(ms));
@@ -424,46 +489,124 @@ const UPSTREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// headers and each wait for a chunk by `idle_timeout`, so the pre-headers phase inherited the
 /// 120s streaming budget. But the gateway's `FIRST_MSG_TIMEOUT` (`gateway.rs`) fails the request
 /// at **30s** and drops the slot, whose `Drop` calls `bridge.cancel` — so a pre-headers stall was
-/// aborted by the *gateway* 90s before this layer would have noticed it, and
-/// [`UPSTREAM_STALL_RETRIES`], written for exactly that stall, could never fire in production.
+/// aborted by the *gateway* 90s before this layer would have noticed it, and the stall retry
+/// written for exactly that case could never fire in production. *(That retry was removed
+/// outright on 2026-09-27 — see `UPSTREAM_TRANSPORT_RETRIES` — because a retry that re-sends the
+/// same prompt to the same host cannot outrun a bound that is simply too small. The split itself
+/// still stands: this constant bounds silence, `UPSTREAM_HEADER_TIMEOUT` bounds the wait for a
+/// reply, and only the second is subject to the gateway's first-message bound.)*
 ///
 /// Measured 2026-09-26, on the build that had just added the retry: ledger row 1600,
 /// `CANCELLED` at 30 019ms, `tokens_out = 0`, log `bridge produced nothing for 30000ms` bound to
 /// `request_id=12` — and **no `connection stalled` line in any log**, which is the proof that the
 /// pre-headers bound below was never reached.
 ///
-/// **The invariant is that `(UPSTREAM_STALL_RETRIES + 1) x` this must stay under the gateway's
-/// first-message bound**, or the retry becomes unreachable again. 10s x 2 = 20s leaves 10s of
-/// headroom inside the 30s gateway budget. `the_stall_budget_fits_inside_the_gateway_bound` pins
-/// that; raising either number without re-checking the other reintroduces the defect.
+/// **Sized from the request path's own measurement, and the previous 10s was too small.**
+/// `Slot::recv` logs `first_msg_ms`, stamped from *dispatch*, so it is the only in-path
+/// time-to-first-byte this system has. Measured 2026-09-27 over every real session (n=54; the
+/// mock session writes `first_msg_ms=0` 924 times and is excluded):
 ///
-/// 10s is also ~5x the expected header latency: an OpenAI-compatible SSE endpoint sends `200` +
-/// `text/event-stream` as soon as it accepts, before prompt processing, so headers normally
-/// arrive in well under a second. **That expectation is an assumption, not a measurement** — the
-/// ledger records no time-to-first-byte, which is why `Slot::recv` now logs it. If headers turn
-/// out to legitimately take longer, raise this *and* the gateway bound together, never this alone.
-const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(10);
+/// ```text
+/// p50 2106ms   p75 3622ms   p90 7126ms   p95 13396ms   p99 18626ms   max 18644ms
+/// ```
+///
+/// At 10s this bound was **manufacturing the stall it was written to survive**: 4/54 requests
+/// (7.4%) — 3/24 (12.5%) in the incident session — exceeded it and then *succeeded on the
+/// retry*. The bound aborted a healthy slow request, the retry re-sent the identical prompt, and
+/// the ledger recorded a `NETWORK` failure for a request that was never broken. Two recoveries
+/// were measured directly: attempt 2 delivered **2.80s** after the stall (request 4) and
+/// **8.60s** after it (request 16).
+///
+/// **20s is chosen because 0/54 requests ever needed more than 20s** — so a single attempt now
+/// covers every success this system has recorded, with no duplicate upstream call. It also
+/// leaves room for the engine's plan budget: see [`crate::core::engine::PLAN_BUDGET`], which is
+/// what keeps a *chain* of candidates inside the gateway's `FIRST_MSG_TIMEOUT`.
+///
+/// The pre-headers phase is still bounded separately from [`UPSTREAM_IDLE_TIMEOUT`], and the
+/// split remains load-bearing: this bounds the wait for a *response*, that bounds silence
+/// *within* a response. Only this one is subject to the gateway's first-message bound.
+/// `pub` because it is one term of a three-constant ordering that spans two modules: the engine's
+/// `PLAN_BUDGET` funds each admitted candidate with exactly this much, so the two cannot be tuned
+/// independently. See `the_plan_budget_fits_inside_the_gateway_bound`.
+pub const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How many *extra* attempts a **pre-output** stall gets.
+/// How long the upstream may take to produce its **first body byte** — measured from the moment
+/// the request is sent, so it encloses [`UPSTREAM_HEADER_TIMEOUT`] rather than following it.
 ///
-/// The bound is one, and the reason it is safe is narrower than "retrying is usually fine": a
-/// stall in the header phase has written **nothing** to the sink — no `Headers`, no `Line`, no
-/// `Error` — so the consumer cannot have seen output it would then receive twice. A stall that
-/// happens *after* headers is deliberately **not** retried, because the sink already carries a
-/// status the consumer has read and a second attempt would replay it; that case is reported
-/// instead. Retries never apply to a refusal either — [`EgressError::is_policy_refusal`] is
-/// decided before anything is dialled, so a denied host is denied once.
+/// **This constant is the second half of the 2026-09-27 incident, and the split above stopped one
+/// phase short.** [`UPSTREAM_HEADER_TIMEOUT`] took the *wait for headers* out of
+/// [`UPSTREAM_IDLE_TIMEOUT`] because that 120s streaming budget is 4x the gateway's
+/// `FIRST_MSG_TIMEOUT` — so the gateway's bound always fired first and the retry written for a
+/// pre-headers stall could never run. The **wait for the first chunk** was left in the 120s
+/// budget, where the identical argument applies and had the identical consequence: the gateway's
+/// 30s bound fired first, `Slot`'s `Drop` called `bridge.cancel`, `egress_port`'s cancel watcher
+/// aborted the driver, and the `lines` stream ended **cleanly with zero chunks** — which the
+/// engine faithfully reports as `Ended::Served` with an empty attempt chain and the ledger
+/// faithfully files as `CANCELLED` with `fallback_chain_json = "[]"`. The comment above claimed
+/// "only this one is subject to the gateway's first-message bound"; that was false, and this
+/// constant is the correction.
 ///
-/// What this buys: an intermittent upstream stall stops being a lost turn. Measured on
-/// 2026-09-26, two turns were lost to an upstream that went silent past the idle timeout with
-/// one provider and one key configured — so failover had nowhere to go, and the turn ended.
-/// A second attempt on a fresh request is the difference between that and a slow success.
+/// Measured 2026-09-27 on the live gateway, ledger row **1671**: `error_class = CANCELLED`,
+/// `latency_ms = 30005`, `fallback_chain_json = []`, `http_status = NULL`, and **no egress line of
+/// any kind** for the request. Each of those is forced by the path above and by nothing else:
+/// a pre-headers stall logs `upstream sent no response headers` at 20s, and any `>= 400` status
+/// becomes `HttpResponse { lines: None }`, which `interpreter.rs` turns into
+/// `Err(AttemptError::Transport)` — a *populated* chain. An empty chain with a `CANCELLED` class
+/// therefore requires a 2xx whose body never produced a chunk, ended by our own cancel. The
+/// sibling case (row 1600, `CANCELLED` at 30 019ms) is named in `UPSTREAM_HEADER_TIMEOUT`'s doc
+/// as a *pre-headers* stall; that reading was never measured against the chain, and this one was.
 ///
-/// The cost is bounded and stated: a genuine stall now costs at most
-/// `(UPSTREAM_STALL_RETRIES + 1) x UPSTREAM_IDLE_TIMEOUT` before it is reported, rather than
-/// `1 x`. Nothing else about the request changes — the retry re-runs the same allowlist and
-/// secret-host checks through [`build`], so it cannot reach a host the first attempt could not.
-const UPSTREAM_STALL_RETRIES: usize = 1;
+/// **Sized at the same 20s, from the same measurement.** `first_msg_ms` (`Slot::recv`) is stamped
+/// at dispatch and reaches the first *bridge message*, which is the first content delta — so it is
+/// an end-to-end measurement of exactly this phase, path overhead included. Over every real
+/// session (n=54) it reads p50 2106ms / p90 7126ms / p99 18626ms / max 18644ms, and 0/54 requests
+/// ever needed more than 20s. Bounding the phase as a whole is therefore what that calibration
+/// always meant; applying it to the header wait alone is what made it partial.
+///
+/// **The two are ordered, and the order is what makes the logs discriminate.** The header wait
+/// keeps its own sub-bound so a request that never got headers reports *that* (`upstream sent no
+/// response headers`) rather than this one, and
+/// `the_pre_first_byte_budget_encloses_the_header_budget` pins
+/// `UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= PLAN_BUDGET < FIRST_MSG_TIMEOUT` so
+/// the sub-bound cannot come to exceed the phase that contains it.
+///
+/// **Not retried inside the egress.** `Headers` is already on the sink by the time this expires,
+/// so a second dial would replay a status the consumer has read — the same argument the mid-stream
+/// idle arm states. The engine is where the recovery belongs: it sees an error with `emitted ==
+/// false`, so `attempt_disposition` advances to the next candidate, which is the failover this
+/// path could not previously reach because the gateway had already taken the request away.
+pub const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many *extra* attempts a **transport error** gets — and, deliberately, how many a header
+/// timeout gets: **none**.
+///
+/// **The retry used to be attached to the wrong arm, and that is what the 2026-09-27 incident
+/// measured.** In [`stream`], a header timeout looped and retried, while `Ok(Err(e))` — a real
+/// transport error — returned immediately. So a socket that reset got no second chance, and a
+/// slow-but-alive upstream got a retry that re-sent the *identical prompt to the identical host*
+/// and could only ever be as slow as the first attempt. The two arms had it exactly backwards.
+///
+/// The asymmetry is now justified by what a retry can actually change:
+///
+/// - **A transport error is a fresh roll.** The connection failed before any response, so the
+///   next attempt dials a *different* pooled connection and re-runs [`build`]'s allowlist and
+///   secret-host checks from the same inputs. This is where a retry has measured value.
+/// - **A header timeout is not a fresh roll.** The prompt and the host are unchanged, so a retry
+///   reproduces the same wait. Worse, it spends a second full [`UPSTREAM_HEADER_TIMEOUT`] that
+///   the plan budget has already allocated to the next candidate — which is precisely how
+///   requests 22/25/26/27 reached 30s and were cancelled by the gateway rather than failed by
+///   this layer.
+///
+/// Safe for the same reason it always was: a failure in the header phase has written **nothing**
+/// to the sink — no `Headers`, no `Line`, no `Error` — so the consumer cannot have seen output it
+/// would then receive twice. A failure *after* headers is still not retried, because the sink
+/// already carries a status the consumer has read. Retries never apply to a refusal either:
+/// [`EgressError::is_policy_refusal`] is decided before anything is dialled.
+///
+/// The cost is bounded and stated: a transport error costs at most
+/// `(UPSTREAM_TRANSPORT_RETRIES + 1)` dials, and each is a dial that failed immediately rather
+/// than a wait — so this retry cannot consume the plan budget the way the old one did.
+const UPSTREAM_TRANSPORT_RETRIES: usize = 1;
 
 /// Drive one streaming request and push its events into `sink`.
 ///
@@ -494,11 +637,15 @@ pub async fn stream(
     // "ended before reporting response headers". Measured 2026-09-24, found while giving the
     // refusal its own class (D46); the module comment above `egress_port`'s `None` arm claimed that
     // path was unreachable, and it was reachable for exactly this case.
-    // Retried, unlike the streaming phase below — see `UPSTREAM_STALL_RETRIES`, where the
-    // asymmetry is the safety argument rather than an oversight. `req` is cloned per attempt
-    // because `build` consumes it and the next attempt needs the same allowlist and
-    // secret-host checks to run again from the same inputs.
-    let mut attempt = 0usize;
+    // **One counter, and it counts transport dials only.** It used to count *header timeouts*,
+    // which is the arm whose retry was removed — see `UPSTREAM_TRANSPORT_RETRIES`, where the
+    // asymmetry between the two arms is the safety argument rather than an oversight. `req` is
+    // cloned per attempt because `build` consumes it and the next attempt needs the same allowlist
+    // and secret-host checks to run again from the same inputs.
+    //
+    // Counted, not subtracted: it can exceed the budget on the way out, and `panic = "abort"`
+    // makes an underflowing `usize` a dead daemon rather than a bad number in a log line.
+    let mut transport_attempt = 0usize;
     loop {
         let b = match build(state, req.clone()).await {
             Ok(b) => b,
@@ -510,10 +657,14 @@ pub async fn stream(
         // Bounded the same way as the chunks below: headers are progress too, and a server that
         // completes the handshake and then never answers is indistinguishable from a stall.
         // **The pre-headers wait is bounded by `header_timeout`, not `idle_timeout`.** Using the
-        // streaming budget here is what made `UPSTREAM_STALL_RETRIES` unreachable: 120s of silence
+        // streaming budget here is what made a pre-headers retry unreachable: 120s of silence
         // before a retry could even be considered, against a gateway that gives up at 30s. See
         // `UPSTREAM_HEADER_TIMEOUT` for the measurement and for the invariant that keeps the two
         // bounds ordered.
+        // Stamped *before* the send, so the deadline below encloses the header wait instead of
+        // following it. A deadline stamped after `send()` returns cannot bound a header stall at
+        // all — it would restart the clock exactly when the phase it is meant to bound ended.
+        let sent_at = Instant::now();
         let sent = tokio::time::timeout(state.header_timeout, b.send()).await;
         match sent {
             Ok(Ok(res)) => {
@@ -536,13 +687,49 @@ pub async fn stream(
                 }
                 let mut stream = res.bytes_stream();
                 let mut buf = String::new();
+                // **One deadline for the whole pre-first-byte phase, not a second full budget.**
+                // Two sequential budgets would let the header wait and the first byte add up past
+                // the gateway's bound — the wrong-unit shape
+                // `the_plan_budget_fits_inside_the_gateway_bound` exists to forbid. Stamped from
+                // `sent_at` so it encloses the header wait. See `UPSTREAM_FIRST_BYTE_TIMEOUT`.
+                let first_byte_deadline = sent_at + state.first_byte_timeout;
+                let mut saw_byte = false;
                 loop {
                     // Each wait for the next chunk is bounded, not the stream as a whole: a
-                    // provider that keeps sending is never cut off, however long it runs.
-                    let next = tokio::time::timeout(state.idle_timeout, stream.next()).await;
+                    // provider that keeps sending is never cut off, however long it runs. Before
+                    // the first byte, though, the bound is the *phase* deadline — because that is
+                    // the budget the gateway's `FIRST_MSG_TIMEOUT` competes with.
+                    let budget = if saw_byte {
+                        state.idle_timeout
+                    } else {
+                        first_byte_deadline.saturating_duration_since(Instant::now())
+                    };
+                    let next = tokio::time::timeout(budget, stream.next()).await;
                     let chunk = match next {
                         Ok(Some(c)) => c,
                         Ok(None) => break, // upstream closed the stream
+                        Err(_) if !saw_byte => {
+                            // **The arm that did not exist, and row 1671 is why.** Headers arrived
+                            // and the body never started. Bounded by `idle_timeout` this was 120s,
+                            // so the gateway's 30s bound always won the race and the request was
+                            // filed as a client abort with an empty chain.
+                            //
+                            // Not retried here; the engine is the recovery. No chunk reached the
+                            // sink, so `emitted` is false and the attempt advances to the next
+                            // candidate. See `UPSTREAM_FIRST_BYTE_TIMEOUT`.
+                            tracing::warn!(
+                                first_byte_secs = state.first_byte_timeout.as_secs(),
+                                elapsed_ms = sent_at.elapsed().as_millis() as u64,
+                                "upstream sent response headers but no body — abandoning the \
+                                 attempt",
+                            );
+                            let _ = sink.send(StreamEvent::error(format!(
+                                "upstream sent response headers but no body within {}s — \
+                                 abandoning the attempt",
+                                state.first_byte_timeout.as_secs()
+                            )));
+                            return Ok(());
+                        }
                         Err(_) => {
                             // Not retried: `Headers` is already on the sink and the consumer has
                             // read a status off it, so a second attempt would replay it. The
@@ -560,6 +747,18 @@ pub async fn stream(
                     };
                     match chunk {
                         Ok(bytes) => {
+                            if !saw_byte {
+                                saw_byte = true;
+                                // The instrument this phase never had. `first_msg_ms` measures the
+                                // same quantity end to end, but only for requests that *succeed* —
+                                // a body that never starts leaves no number anywhere, which is how
+                                // 120s of silence survived uncalibrated. Calibrate the next value
+                                // of `UPSTREAM_FIRST_BYTE_TIMEOUT` against this line.
+                                tracing::info!(
+                                    first_byte_ms = sent_at.elapsed().as_millis() as u64,
+                                    "upstream delivered its first body byte",
+                                );
+                            }
                             buf.push_str(&String::from_utf8_lossy(&bytes));
                             while let Some(pos) = buf.find('\n') {
                                 let line = buf[..pos].trim_end_matches('\r').to_string();
@@ -582,46 +781,90 @@ pub async fn stream(
                 return Ok(());
             }
             Ok(Err(e)) => {
+                // **The retry that has measured value, and it used to be missing from this arm.**
+                // A transport error means the connection failed before any response, so the next
+                // attempt dials a *different* pooled connection. That is a fresh roll; the header
+                // timeout below is not one.
+                transport_attempt += 1;
+                if transport_attempt <= UPSTREAM_TRANSPORT_RETRIES && retryable_transport(&e) {
+                    tracing::warn!(
+                        attempt = transport_attempt as u64,
+                        max_attempts = (UPSTREAM_TRANSPORT_RETRIES + 1) as u64,
+                        error = %e,
+                        "upstream transport error before any response — retrying on a fresh \
+                         connection",
+                    );
+                    continue;
+                }
                 let _ = sink.send(StreamEvent::error(e.to_string()));
                 return Err(e.into());
             }
             Err(_) => {
-                attempt += 1;
-                // The only trace a pre-output stall leaves anywhere. Without it the failure
-                // reached the ledger as a bare `NETWORK` and no line in any log, which is what
-                // made 2026-09-26's two lost turns take a database query to explain.
+                // **Not retried, and the absence is the fix rather than an omission.** A header
+                // timeout means the upstream accepted the connection and then sent nothing for
+                // `header_timeout`. The prompt and the host are unchanged, so a retry reproduces
+                // the same wait *and* spends a second full budget the plan had already allocated
+                // to the next candidate. That is exactly how requests 22/25/26/27 reached 30s and
+                // were cancelled by the gateway instead of failing here with a real class.
+                // Measured 2026-09-27 — see `UPSTREAM_TRANSPORT_RETRIES` for the full argument.
                 //
-                // Counted, not subtracted: `attempt` can exceed the budget on the way out, and
-                // `panic = "abort"` makes an underflowing `usize` a dead daemon rather than a
-                // bad number in a log line.
+                // Still the only trace a pre-output timeout leaves anywhere. Without it the
+                // failure reached the ledger as a bare `NETWORK` and no line in any log, which is
+                // what made 2026-09-26's two lost turns take a database query to explain.
                 tracing::warn!(
-                    attempt = attempt as u64,
-                    max_attempts = (UPSTREAM_STALL_RETRIES + 1) as u64,
-                    // The *header* budget, which is the one this arm actually waited out. Reporting
-                    // `idle_timeout` here named a number 12x the one that expired, so the line
-                    // misdescribed its own cause.
+                    // The *header* budget, which is the one this arm actually waited out.
+                    // Reporting `idle_timeout` here named a number 12x the one that expired, so
+                    // the line misdescribed its own cause.
                     header_secs = state.header_timeout.as_secs(),
-                    "upstream sent no response headers — connection stalled",
+                    "upstream sent no response headers — abandoning the attempt",
                 );
-                if attempt > UPSTREAM_STALL_RETRIES {
-                    let _ = sink.send(StreamEvent::error(format!(
-                        "upstream sent no response headers for {}s — abandoning the request",
-                        state.header_timeout.as_secs()
-                    )));
-                    return Ok(());
-                }
+                let _ = sink.send(StreamEvent::error(format!(
+                    "upstream sent no response headers for {}s — abandoning the request",
+                    state.header_timeout.as_secs()
+                )));
+                return Ok(());
             }
         }
     }
+}
+
+/// Whether a transport failure is worth one more dial on a fresh connection.
+///
+/// **The predicate is the retry's justification, so it is written as one rather than as
+/// "anything that is not a refusal".** `is_connect` and `is_request` are the failures a *new*
+/// connection can actually change: refused, reset, DNS, TLS, and a connection closed before the
+/// request was written. Each of those returns an error rather than waiting out a budget, so the
+/// retry costs the plan almost nothing.
+///
+/// **`is_timeout` is excluded, and that exclusion is load-bearing for the budget.** A connect
+/// timeout means the host is unreachable, and a second dial reproduces it — the same argument that
+/// removed the retry from the header-timeout arm, applied one layer down. It also matters
+/// arithmetically: `connect_timeout` is 10s, so retrying a connect timeout would make one
+/// candidate cost `2 x 10s` on top of its header budget and break the
+/// `UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET` ordering that `the_plan_budget_fits_inside_the_gateway_bound`
+/// pins. With timeouts excluded, a candidate's worst case is exactly one
+/// [`UPSTREAM_HEADER_TIMEOUT`], which is what that ordering assumes.
+///
+/// (The header budget is not a `reqwest::Error` at all — it is a `tokio::time::timeout`
+/// `Elapsed` — so this predicate can never accidentally re-enable the retry that
+/// [`UPSTREAM_TRANSPORT_RETRIES`] removed.)
+///
+/// **A body error is excluded deliberately.** By then the request has been written and partly
+/// consumed, so a second attempt duplicates work without the fresh-connection benefit that is the
+/// entire argument for retrying here.
+fn retryable_transport(e: &reqwest::Error) -> bool {
+    !e.is_timeout() && !e.is_body() && (e.is_connect() || e.is_request())
 }
 
 /// Where a `secret_ref` is resolved to the secret it names.
 ///
 /// **Pluggable for the same reason [`crate::core::gateway::KeyProvider`] is**, and that type's own
 /// note is the whole argument: the request path is the one place a provider key is used, so without
-/// a seam it cannot be exercised end to end without an OS keychain — which is to say it cannot be
-/// exercised in CI at all. Production passes [`vault::get`]; a test passes a closure and gets the
-/// whole route (gateway → router → adapter → egress → upstream) with no keychain in it.
+/// a seam it cannot be exercised end to end against the real vault. The vault is a file now, but its
+/// data dir is a process-global `OnceLock` (`vault.rs:290-292`), so a test could redirect it only
+/// once per process — and the first test to do so would decide the data dir for every other test in
+/// the binary. Production passes [`vault::get`]; a test passes a closure and gets the
+/// whole route (gateway → router → adapter → egress → upstream) with no vault in it.
 ///
 /// **It cannot be used to skip a check.** `check_secret_host` runs before this lookup and
 /// `inject_secret` runs after it, and neither consults this value. What moves is where the bytes
@@ -639,7 +882,7 @@ pub struct EgressState {
     image_client: reqwest::Client,
     pub allow: Arc<AllowList>,
     pub store: Arc<Store>,
-    /// How a `secret_ref` becomes its secret — [`vault::get`], the OS keychain, in production.
+    /// How a `secret_ref` becomes its secret — [`vault::get`] in production.
     secrets: SecretProvider,
     /// Invariant-3 lease: hosts returned in response bodies, valid briefly. A provider
     /// that returns an `imageUrl` on a CDN host the allowlist has never seen may have
@@ -660,6 +903,14 @@ pub struct EgressState {
     /// holds with the gateway's `FIRST_MSG_TIMEOUT`. A field for the same reason `idle_timeout`
     /// is one: the production budget is longer than any test should be asked to wait.
     header_timeout: Duration,
+    /// How long the upstream may take to produce its **first body byte**, measured from the send —
+    /// so this encloses `header_timeout` rather than following it.
+    ///
+    /// A third field for the same reason the other two are fields, and with a sharper edge here:
+    /// the defect this bound closes is *only observable as an ordering* between two budgets, so a
+    /// test that cannot set them independently cannot tell the fix from the bug. It defaults to
+    /// [`UPSTREAM_FIRST_BYTE_TIMEOUT`].
+    first_byte_timeout: Duration,
 }
 
 /// How long a provider-returned host stays fetchable (invariant 3 carve-out).
@@ -686,11 +937,11 @@ impl EgressState {
         Self::with_secret_provider(allow, store, Arc::new(vault::get))
     }
 
-    /// The same state, reading secrets from `secrets` instead of the keychain.
+    /// The same state, reading secrets from `secrets` instead of the vault.
     ///
     /// A second constructor rather than a changed signature: `new` has two production callers
     /// (`aiproviderd.rs`, `tauri/app.rs`) and four test ones, and none of them should have to name
-    /// the keychain to keep the behaviour they already had.
+    /// the vault to keep the behaviour they already had.
     pub fn with_secret_provider(
         allow: Arc<AllowList>,
         store: Arc<Store>,
@@ -717,7 +968,14 @@ impl EgressState {
                 .redirect(reqwest::redirect::Policy::custom(
                     move |attempt: reqwest::redirect::Attempt| {
                         let host = attempt.url().host_str().unwrap_or("").to_lowercase();
-                        if is_local(&host) || allow_clone.contains(&host) {
+                        // The scheme is re-checked on every hop, not only on the first request: a
+                        // permitted host that redirects `https` -> `http` would otherwise downgrade
+                        // a pre-signed URL to cleartext *after* the initial check had passed. The
+                        // credentialed client above sidesteps this entirely by never following a
+                        // redirect (`Policy::none`), which is the stronger answer where a key is
+                        // attached; here a redirect is legitimate, so the hop must be re-vetted.
+                        let secure = attempt.url().scheme() == "https" || is_local(&host);
+                        if secure && (is_local(&host) || allow_clone.contains(&host)) {
                             attempt.follow()
                         } else {
                             attempt.stop()
@@ -733,6 +991,7 @@ impl EgressState {
             returned_hosts: RwLock::new(HashMap::new()),
             idle_timeout: UPSTREAM_IDLE_TIMEOUT,
             header_timeout: UPSTREAM_HEADER_TIMEOUT,
+            first_byte_timeout: UPSTREAM_FIRST_BYTE_TIMEOUT,
         }
     }
 
@@ -830,6 +1089,59 @@ mod tests {
         let a = AllowList::default();
         assert!(check_url(&a, "http://127.0.0.1:11434/api").is_ok());
         assert!(check_url(&a, "http://localhost:1234/v1").is_ok());
+    }
+
+    /// **Cleartext to a remote host is refused — the test that fails without
+    /// `require_secure_scheme`.** The egress attaches a provider credential to the request
+    /// (`inject_secret`) and the body carries the prompt, so an `http://` base URL for a remote
+    /// provider puts both on the wire unencrypted. Measured 2026-09-27: nothing enforced this.
+    /// `check_url` checked the host only and `adapter-spec`'s schema accepted `http:`, so a user
+    /// who typed `http://` — a typo, or a copied internal URL — got a silent downgrade.
+    ///
+    /// Falsified before it was trusted: deleting the `require_secure_scheme(&url, host)?` call
+    /// from `check_url` reddens the assertions below and leaves the loopback ones green.
+    #[test]
+    fn cleartext_to_a_remote_host_is_refused_even_when_the_host_is_allowlisted() {
+        let a = allow_with("openrouter.ai");
+        // The host *is* registered, so this is not `HostDenied` — it is the scheme.
+        let err = check_url(&a, "http://openrouter.ai/api/v1").unwrap_err();
+        assert!(
+            matches!(&err, EgressError::InsecureScheme { .. }),
+            "expected InsecureScheme, got {err:?}"
+        );
+        // …and it is a *policy* refusal rather than a transport failure, so a caller does not
+        // report it as an unreachable provider — the D46 class, reached by a third route.
+        assert!(err.is_policy_refusal(), "a cleartext refusal is our decision, not the network's");
+        // The same host over https is untouched.
+        assert!(check_url(&a, "https://openrouter.ai/api/v1").is_ok());
+    }
+
+    /// The loopback carve-out, pinned — it is the whole reason the rule is a scheme *and* a host
+    /// check rather than "https only". Ollama is on 11434 and LM Studio on 1234, both cleartext,
+    /// and neither should need a TLS terminator to be usable.
+    #[test]
+    fn cleartext_stays_legal_on_loopback() {
+        let a = AllowList::default();
+        assert!(check_url(&a, "http://127.0.0.1:11434/api").is_ok());
+        assert!(check_url(&a, "http://localhost:1234/v1").is_ok());
+        assert!(check_url(&a, "http://[::1]:8080/v1").is_ok(), "IPv6 loopback is loopback");
+        // An unregistered remote host is still refused as `HostDenied` **first**, so the two
+        // refusals stay distinguishable instead of both presenting as a scheme problem.
+        let err = check_url(&a, "http://evil.example/x").unwrap_err();
+        assert!(matches!(&err, EgressError::HostDenied(_)), "got {err:?}");
+    }
+
+    /// One predicate, so the credentialed path, the image carve-out and the image redirect policy
+    /// cannot drift about which destinations are secure.
+    #[test]
+    fn the_secure_scheme_predicate_is_shared_and_host_aware() {
+        let https = reqwest::Url::parse("https://cdn.example/a.png").unwrap();
+        assert!(require_secure_scheme(&https, "cdn.example").is_ok());
+        let http_remote = reqwest::Url::parse("http://cdn.example/a.png").unwrap();
+        assert!(require_secure_scheme(&http_remote, "cdn.example").is_err());
+        // Same scheme, loopback host: permitted.
+        let http_local = reqwest::Url::parse("http://127.0.0.1:11434/a.png").unwrap();
+        assert!(require_secure_scheme(&http_local, "127.0.0.1").is_ok());
     }
 
     /// The audit flagged `is_local` as "trusts any port on localhost". It cannot: every caller
@@ -1075,7 +1387,7 @@ mod pairing_tests {
 ///
 /// **This module exists because a seam that compiles is not a seam that is used.** `build` could
 /// have gone on calling `vault::get` and every other test in this file would have stayed green:
-/// they pass `secret_ref: None` on purpose, so the keychain is never reached by any of them.
+/// they pass `secret_ref: None` on purpose, so the vault is never reached by any of them.
 #[cfg(test)]
 mod secret_provider_tests {
     use super::*;
@@ -1125,14 +1437,14 @@ mod secret_provider_tests {
     }
 
     /// **Both arms, because one arm alone cannot tell the two designs apart.** A provider answering
-    /// `None` and the real keychain answering `None` produce the *same* `SecretMissing`, so a
+    /// `None` and the real vault answering `None` produce the *same* `SecretMissing`, so a
     /// `Some`-only test would stay green against a `build` that ignored the seam entirely. The
     /// `None` arm pins that the provider is consulted, with the ref the request carried; the `Some`
     /// arm pins that its answer is believed.
     ///
     /// **Measured 2026-09-24, by reverting `build` to call `vault::get`:** the test reddens — and it
     /// reddens on the `None` arm's *recording* assertion, not on either `matches!`/`is_ok`. That is
-    /// the false pass this test was written to avoid, observed rather than argued: the keychain
+    /// the false pass this test was written to avoid, observed rather than argued: the vault
     /// answering `None` for an unknown ref is indistinguishable from an injected provider doing it.
     #[tokio::test]
     async fn an_injected_provider_is_what_resolves_a_secret_ref() {
@@ -1168,7 +1480,7 @@ mod secret_provider_tests {
         assert!(
             build(&supplying, req("key:k1")).await.is_ok(),
             "an injected secret must get past the lookup — if it does not, `build` is still reading \
-             the keychain and the seam is decoration"
+             the vault and the seam is decoration"
         );
         let _ = std::fs::remove_dir_all(&path);
     }
@@ -1194,11 +1506,18 @@ mod stall_tests {
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// Where the listener goes silent: before it writes any byte, or after it has written headers.
+    /// Where the listener goes silent: before it writes any byte, after headers only, or after
+    /// headers **and one body line**.
+    ///
+    /// The third shape is the one that matters for the 2026-09-27 second-half fix, and it is the
+    /// **control**: it is the only one that reaches the mid-stream idle budget rather than the
+    /// pre-first-byte deadline. A "fix" that simply capped every chunk wait would pass the other
+    /// two and cut off every slow-but-alive stream, so the control is what tells the two apart.
     #[derive(Clone, Copy)]
     enum Stall {
         BeforeHeaders,
         AfterHeaders,
+        AfterFirstByte,
     }
 
     /// How long a connection is held open without an answer. Comfortably longer than the tests'
@@ -1206,7 +1525,7 @@ mod stall_tests {
     /// failure under test. A socket closed early would surface as `Ok(Err(_))`, not as a stall.
     const HOLD: Duration = Duration::from_secs(2);
 
-    /// The budget the two tests run under. Two abandonment cycles at the production 120s is a
+    /// The budget the stall tests run under. A hold at the production 120s is a
     /// four-minute test, which is why [`EgressState::idle_timeout`] is a field at all.
     const TEST_IDLE: Duration = Duration::from_millis(120);
 
@@ -1230,12 +1549,45 @@ mod stall_tests {
                 // does. Measured 2026-09-26: the first run of this test failed on exactly that,
                 // with the retry already in place and working.
                 std::thread::spawn(move || {
-                    if matches!(mode, Stall::AfterHeaders) {
-                        // Status line and headers only. `send()` returns on headers, so this is
-                        // the shape that turns the stall into a mid-stream one.
-                        let _ = socket.write_all(
-                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n",
-                        );
+                    // Status line and headers first, for the two shapes that get that far.
+                    // `send()` returns on headers, so those are the shapes that turn the stall
+                    // into a post-headers one.
+                    let head: &[u8] = match mode {
+                        Stall::BeforeHeaders => b"",
+                        Stall::AfterHeaders => {
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n"
+                        }
+                        // Headers plus one complete SSE line, so the driver has demonstrably
+                        // started reading a body. This is the shape that must stay on the 120s
+                        // idle budget.
+                        Stall::AfterFirstByte => {
+                            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n\
+                              data: {\"x\":1}\n\n"
+                        }
+                    };
+                    // **Read the request before answering, and the ordering is load-bearing.**
+                    // The head used to be written on accept, without reading the request at all,
+                    // which races the client's request write: hyper can see a response before it has
+                    // finished writing, classify the dial as a pre-response transport error, and
+                    // retry — so `connections` read `2` and these tests failed **in isolation**, not
+                    // merely under load. Measured 2026-09-27: 4 of 10 single-threaded runs red
+                    // before this, 0 of 10 after. A real server always reads the request first, so
+                    // the old shape exercised a sequence the production path cannot produce: the
+                    // code under test was behaving correctly on an input the harness invented.
+                    let mut scratch = [0u8; 4096];
+                    let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+                    loop {
+                        match std::io::Read::read(&mut socket, &mut scratch) {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                if scratch[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if !head.is_empty() {
+                        let _ = socket.write_all(head);
                         let _ = socket.flush();
                     }
                     std::thread::sleep(HOLD);
@@ -1245,14 +1597,49 @@ mod stall_tests {
         (connections, format!("http://127.0.0.1:{port}/v1/chat/completions"))
     }
 
+    /// A listener that accepts, counts, and closes the socket **without writing a single byte**.
+    ///
+    /// This is the transport-error shape rather than the stall shape: the client sees the
+    /// connection end before any response, which is what a stale pooled connection looks like from
+    /// inside `reqwest`. The close is immediate, so unlike [`silent_listener`] there is no hold
+    /// thread — and the request carries no body (`req`), so there is no write race that could turn
+    /// this into an EPIPE and change which predicate the error matches.
+    fn closing_listener() -> (Arc<AtomicUsize>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counted = connections.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                match incoming {
+                    Ok(socket) => {
+                        counted.fetch_add(1, Ordering::SeqCst);
+                        drop(socket);
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        (connections, format!("http://127.0.0.1:{port}/v1/chat/completions"))
+    }
+
     /// A state whose silence budget is short enough to test, with no secret on the request so the
     /// only thing that can refuse it is the stall itself.
+    ///
+    /// **All three budgets are shrunk, and leaving one at its production default is not a harmless
+    /// omission — it silently changes which path a test exercises.** Measured 2026-09-27: the first
+    /// run of the pre-first-byte test failed with `messages: []` because `first_byte_timeout` was
+    /// left at 20s while [`HOLD`] is 2s, so the listener closed the socket before any budget could
+    /// expire and the stream ended with `Ok(None)` — a *clean* end that sends no error at all. That
+    /// is a third way to reach an empty attempt chain, and it is worth knowing about rather than
+    /// papering over: see `UPSTREAM_FIRST_BYTE_TIMEOUT`.
     fn state(dir: &std::path::Path) -> EgressState {
         let _ = std::fs::remove_dir_all(dir);
         let store = Arc::new(Store::open(dir).unwrap());
         let mut s = EgressState::new(Arc::new(AllowList::default()), store);
         s.idle_timeout = TEST_IDLE;
         s.header_timeout = TEST_IDLE;
+        s.first_byte_timeout = TEST_IDLE;
         s
     }
 
@@ -1281,9 +1668,20 @@ mod stall_tests {
         (messages, headers)
     }
 
+    /// **The retry is gone from this arm, and that is the fix rather than a lost safety net.**
+    ///
+    /// Inverted 2026-09-27 from `a_stall_before_headers_is_retried_once`. The old assertion
+    /// (`connections == 2`) encoded a policy that was then measured to be wrong: a header timeout
+    /// means the prompt and the host are unchanged, so the second attempt reproduces the same wait
+    /// *and* spends a budget the plan had already allocated to the next candidate. Requests
+    /// 22/25/26/27 are the production trace — 20s of retry, then a second candidate entered with
+    /// no budget left and cancelled by the gateway at 30s instead of failed here with a real class.
+    ///
+    /// The expectation stays a literal, for the reason the old test gave and which still holds:
+    /// deriving it from the constant makes the assertion a tautology.
     #[tokio::test]
-    async fn a_stall_before_headers_is_retried_once() {
-        let dir = std::env::temp_dir().join(format!("aip-stall-retry-{}", std::process::id()));
+    async fn a_stall_before_headers_is_not_retried() {
+        let dir = std::env::temp_dir().join(format!("aip-pre-noretry-{}", std::process::id()));
         let (connections, url) = silent_listener(Stall::BeforeHeaders);
         let s = state(&dir);
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1292,15 +1690,11 @@ mod stall_tests {
         assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
 
         let (messages, headers) = drain(&mut rx);
-        // **A literal `2`, not `UPSTREAM_STALL_RETRIES + 1`, and the difference is the test.**
-        // Deriving the expectation from the constant makes the assertion a tautology: set the
-        // budget to `0` and both sides move together, so the test stays green against a retry
-        // that does nothing. Measured 2026-09-26 — with the constant at `0` this test *passed*,
-        // which is precisely the false pass a derived expectation hides.
         assert_eq!(
             connections.load(Ordering::SeqCst),
-            2,
-            "a stall that emitted nothing must be re-sent once — that is the whole fix"
+            1,
+            "a pre-headers timeout must NOT be re-sent: the prompt and the host are unchanged, so \
+             the retry reproduces the same wait and steals the next candidate's budget"
         );
         assert!(!headers, "no status was ever received, so nothing can have been replayed");
         assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
@@ -1312,8 +1706,40 @@ mod stall_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **The arm that kept the retry, pinned end to end rather than through the predicate.**
+    ///
+    /// A listener that accepts and closes without answering is the shape a stale pooled connection
+    /// produces, and it is the case a fresh dial genuinely fixes: the next attempt opens a
+    /// *different* connection. [`retryable_transport`] is private and takes a `reqwest::Error`
+    /// that no test can construct, so the only honest way to pin this is to make a real one happen
+    /// and count the dials — a predicate test would prove the policy and not the wiring.
     #[tokio::test]
-    async fn a_stall_after_headers_is_not_retried() {
+    async fn a_transport_error_before_headers_is_retried_once() {
+        let dir = std::env::temp_dir().join(format!("aip-transport-retry-{}", std::process::id()));
+        let (connections, url) = closing_listener();
+        let s = state(&dir);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let _ = stream(&s, req(url), tx).await;
+        let _ = drain(&mut rx);
+
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "a connection that failed before any response must be dialled once more — a fresh \
+             connection is the one thing a retry can actually change"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **Renamed from `a_stall_after_headers_is_not_retried` on 2026-09-27, and the rename is the
+    /// finding.** That test drove `Stall::AfterHeaders` and asserted the message contained
+    /// `went silent` — i.e. it asserted the *mid-stream* arm fired for a shape that had received
+    /// no body at all. With the pre-first-byte deadline in place the same listener now takes the
+    /// missing-body arm, so the old assertion fails and the old name was describing the wrong
+    /// phase. The shape was always "before the first byte"; only the budget it landed on changed.
+    #[tokio::test]
+    async fn a_stall_before_the_first_byte_is_not_retried() {
         let dir = std::env::temp_dir().join(format!("aip-stall-noretry-{}", std::process::id()));
         let (connections, url) = silent_listener(Stall::AfterHeaders);
         let s = state(&dir);
@@ -1332,30 +1758,168 @@ mod stall_tests {
         );
         assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
         assert!(
-            messages[0].contains("went silent"),
-            "the mid-stream stall must say it was mid-stream: {}",
+            messages[0].contains("no body"),
+            "a body that never started must not be reported as a mid-stream silence: {}",
             messages[0]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The bound under test is only observable as an ordering, so all three budgets are set
+    /// apart here.**
+    ///
+    /// A harness where `header_timeout`, `first_byte_timeout` and `idle_timeout` are equal cannot
+    /// say which one expired — and that is not hypothetical: the suite already contained a
+    /// post-headers stall test, it ran all three at `TEST_IDLE`, and it therefore passed against
+    /// code whose first-chunk budget was 120s. Calibrating the instrument, not just the reading.
+    ///
+    /// **Falsified before it was trusted.** With the loop's budget reverted to
+    /// `state.idle_timeout` — the pre-fix behaviour, one line — this test fails with
+    /// `exactly one error reaches the consumer: []`: the listener's own 2s [`HOLD`] closes the
+    /// socket before the 30s idle budget can expire, and the stream ends *cleanly*, which is a
+    /// third route to an empty attempt chain. `a_stall_after_the_first_byte_keeps_the_idle_budget`
+    /// passes in both versions, which is what makes it a control rather than a second copy of this
+    /// test. `a_stall_before_the_first_byte_is_not_retried` also passes in both, and deliberately
+    /// so: `Err(_) if !saw_byte` selects on the *phase*, not on which budget expired, so that test
+    /// pins the classification while this one pins the budget.
+    #[tokio::test]
+    async fn a_body_that_never_starts_is_abandoned_on_the_first_byte_budget() {
+        let dir = std::env::temp_dir().join(format!("aip-firstbyte-{}", std::process::id()));
+        let (connections, url) = silent_listener(Stall::AfterHeaders);
+        let mut s = state(&dir);
+        // Headers *do* arrive, so the header budget must never be the one that fires.
+        s.header_timeout = Duration::from_secs(30);
+        // The bound under test. Against the pre-fix code the first chunk was bounded by
+        // `idle_timeout`, so this would sit on 30s and fail the watchdog below instead.
+        s.first_byte_timeout = Duration::from_millis(120);
+        s.idle_timeout = Duration::from_secs(30);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        let r = tokio::time::timeout(Duration::from_secs(5), stream(&s, req(url), tx))
+            .await
+            .expect("the pre-first-byte budget must abandon the attempt, not the watchdog");
+        let elapsed = started.elapsed();
+        assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
+
+        let (messages, headers) = drain(&mut rx);
+        assert!(headers, "the consumer must see the status before the body bound fires");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "not retried: the status is already on the sink"
+        );
+        assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
+        assert!(
+            messages[0].contains("no body"),
+            "the failure must name the phase that expired, not the mid-stream one: {}",
+            messages[0]
+        );
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "the 120ms first-byte budget must be what fired, not the 30s idle budget; took {elapsed:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **The control, and without it a "fix" that capped every chunk wait would pass this suite.**
+    ///
+    /// Here the body has demonstrably started, so the idle budget governs and the first-byte
+    /// deadline must be inert. The idle budget is set *below* the first-byte budget on purpose:
+    /// if the pre-first-byte deadline were still in force after the body started, this request
+    /// would be abandoned as a *missing body* well before the idle budget expired.
+    #[tokio::test]
+    async fn a_stall_after_the_first_byte_keeps_the_idle_budget() {
+        let dir = std::env::temp_dir().join(format!("aip-midstream-{}", std::process::id()));
+        let (connections, url) = silent_listener(Stall::AfterFirstByte);
+        let mut s = state(&dir);
+        s.header_timeout = Duration::from_secs(30);
+        s.first_byte_timeout = Duration::from_millis(120);
+        s.idle_timeout = Duration::from_millis(400);
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let started = Instant::now();
+        let r = stream(&s, req(url), tx).await;
+        let elapsed = started.elapsed();
+        assert!(r.is_ok(), "an abandoned stall is not an egress failure: {r:?}");
+
+        let (messages, headers) = drain(&mut rx);
+        assert!(headers, "the consumer must see the status");
+        assert_eq!(connections.load(Ordering::SeqCst), 1, "not retried");
+        assert_eq!(messages.len(), 1, "exactly one error reaches the consumer: {messages:?}");
+        assert!(
+            messages[0].contains("went silent"),
+            "once the body has started the mid-stream budget owns the silence, so the message \
+             must say so: {}",
+            messages[0]
+        );
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "the 400ms idle budget must be what fired, not the 120ms first-byte deadline; \
+             took {elapsed:?}"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **The ordering between the two budgets *is* the fix, so it gets a test of its own.**
     ///
-    /// `UPSTREAM_HEADER_TIMEOUT` only helps if the retry it enables can finish before the gateway
-    /// gives up. That is a relationship between two constants in two modules, and nothing else in
-    /// this suite would notice if someone raised one of them — the retry would simply go back to
-    /// being unreachable, silently, exactly as it was between 27b and now. So this asserts the
-    /// *relationship* rather than either number: a deliberate retune of both still passes, and only
-    /// a retune that breaks the ordering goes red.
+    /// **The ordering that matters is now a three-constant relationship, and the middle one is the
+    /// term nothing else in this suite would notice.**
+    ///
+    /// The previous form asserted `UPSTREAM_HEADER_TIMEOUT x (retries + 1) < FIRST_MSG_TIMEOUT` —
+    /// 10s x 2 = 20s < 30s, true, and **about the wrong unit**. `execute_text` walks the whole
+    /// *plan* (`engine.rs:964`), and with two candidates the real worst case was 40s against a 30s
+    /// bound, so the last candidate was always cut off mid-attempt. Ledger row 1652 carries both
+    /// entries naming `provider: agnes`, and the log at `03:14:37.515` shows entry 2 starting its
+    /// own `attempt=1` **18ms after** the gateway had already given up — the reset counter is the
+    /// proof that a second `stream` call had begun with no budget left.
+    ///
+    /// ```text
+    /// UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= PLAN_BUDGET < FIRST_MSG_TIMEOUT
+    ///          20s                          20s                    26s              30s
+    /// ```
+    ///
+    /// **The leftmost term was added hours after the two beside it, because this ordering was
+    /// still one constant short.** It ordered the *header wait* against the plan, but the first
+    /// body byte — the phase that encloses the header wait, and the one the gateway's bound is
+    /// actually racing — was bounded by nothing smaller than the 120s idle budget. So the middle
+    /// term was checked against a bound the request never had:
+    /// `UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET` was true and irrelevant, and ledger row 1671 is
+    /// what that cost. The added term makes the assertion cover the phase that can actually
+    /// overrun, and the `header <= per_attempt` clause keeps the sub-bound from silently
+    /// swallowing it.
+    ///
+    /// The left inequality is what makes `PLAN_BUDGET` a real bound rather than a hope: the engine
+    /// admits a candidate only when it can fund a full attempt, so no admitted candidate can run
+    /// past the plan. The right inequality is the original one, kept. A deliberate retune of all
+    /// three still passes; any single change that breaks an ordering goes red.
     #[test]
-    fn the_stall_budget_fits_inside_the_gateway_bound() {
-        let worst_case = UPSTREAM_HEADER_TIMEOUT * (UPSTREAM_STALL_RETRIES as u32 + 1);
+    fn the_plan_budget_fits_inside_the_gateway_bound() {
+        let header = UPSTREAM_HEADER_TIMEOUT;
+        // The phase that actually bounds one attempt is now the whole pre-first-byte window, not
+        // the header wait inside it: an attempt that gets headers and then no body costs the full
+        // `first_byte` budget, so that is the term the plan has to fund.
+        let per_attempt = UPSTREAM_FIRST_BYTE_TIMEOUT;
+        let plan = crate::core::engine::PLAN_BUDGET;
         let gateway_bound = crate::core::gateway::FIRST_MSG_TIMEOUT;
         assert!(
-            worst_case < gateway_bound,
-            "a pre-headers stall costs at most {worst_case:?} before this layer reports it, but the \
-             gateway abandons the request at {gateway_bound:?} — so the retry that budget pays for \
-             could never run. Lower UPSTREAM_HEADER_TIMEOUT, or raise FIRST_MSG_TIMEOUT with it."
+            header <= per_attempt,
+            "the header wait may cost {header:?} but the phase containing it is only \
+             {per_attempt:?}. A sub-bound larger than its enclosing phase can never fire, so the \
+             `upstream sent no response headers` line would become unreachable and every stall — \
+             including a genuine pre-headers one — would be reported as a missing body."
+        );
+        assert!(
+            per_attempt <= plan,
+            "one attempt may cost {per_attempt:?}, but the whole plan is budgeted {plan:?} — a \
+             candidate admitted for a full attempt could then overrun the plan. Raise PLAN_BUDGET \
+             or lower UPSTREAM_HEADER_TIMEOUT."
+        );
+        assert!(
+            plan < gateway_bound,
+            "the plan may spend {plan:?}, but the gateway abandons the request at \
+             {gateway_bound:?} — so the last candidate would be cut off mid-attempt, which is \
+             exactly the 2026-09-27 defect. Lower PLAN_BUDGET, or raise FIRST_MSG_TIMEOUT with it."
         );
     }
 }

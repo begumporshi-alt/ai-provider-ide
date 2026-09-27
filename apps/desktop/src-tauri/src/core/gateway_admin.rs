@@ -80,7 +80,7 @@ pub struct AppKeyView {
 
 /// What `POST /admin/keys` returns: the metadata **and the secret, exactly once**.
 ///
-/// The secret is the only copy that will ever exist — it is stored in the keychain, not in SQLite,
+/// The secret is the only copy that will ever exist — it is stored in the vault, not in SQLite,
 /// and this response is the one moment it crosses the wire. The UI copies it to the clipboard and
 /// must not persist it.
 #[derive(Serialize)]
@@ -125,11 +125,11 @@ fn require_store<'a>(core: &'a GatewayCore, route: &str) -> Result<&'a Arc<Store
 }
 
 /// Authenticate and resolve the store — the two things every admin route opens with.
-fn authorize(core: &GatewayCore, headers: &HeaderMap) -> Result<(), Box<Response>> {
+async fn authorize(core: &Arc<GatewayCore>, headers: &HeaderMap) -> Result<(), Box<Response>> {
     // Identity discarded: none of these routes dispatch a request, so none of them bill anyone.
     // The check is still made, because an unauthenticated answer is a statement that the route
     // exists — the reason the 404 and 405 refusals authenticate too.
-    check_gateway_key(core, headers, peer_ip(headers)).map_err(|r| Box::new(r.openai()))?;
+    check_gateway_key(core, headers, peer_ip(headers)).await.map_err(|r| Box::new(r.openai()))?;
     Ok(())
 }
 
@@ -145,7 +145,7 @@ fn admin_error(status: StatusCode, message: &str, code: Option<&str>) -> Respons
 /// This read and the keyed one are now the **same** read: `read_settings_object` is the single
 /// implementation of "absent and corrupt both mean `{}`", which until 26l existed twice.
 pub async fn settings_get_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/settings") {
@@ -167,7 +167,7 @@ pub async fn settings_set_h(
     headers: HeaderMap,
     Json(patch): Json<Value>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/settings") {
@@ -220,7 +220,7 @@ pub async fn settings_key_get_h(
     headers: HeaderMap,
     Path(key): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/settings/{key}") {
@@ -245,7 +245,7 @@ pub async fn settings_key_set_h(
     Path(key): Path<String>,
     Json(patch): Json<Value>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/settings/{key}") {
@@ -280,7 +280,7 @@ pub async fn settings_key_set_h(
 // ── GET /admin/keys ────────────────────────────────────────────────────────
 
 pub async fn keys_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/keys") {
@@ -315,7 +315,7 @@ pub async fn keys_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMa
 
 // ── POST /admin/keys ───────────────────────────────────────────────────────
 
-/// Create a per-app key: crypto-random secret -> keychain -> SQLite row -> returned once.
+/// Create a per-app key: crypto-random secret -> vault -> SQLite row -> returned once.
 ///
 /// The ordering is the IPC command's, and the rollbacks are why: a secret with no row is an
 /// unrevokable ghost, and a row with no secret is a credential nobody holds. There is no
@@ -325,7 +325,7 @@ pub async fn key_create_h(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/keys") {
@@ -351,12 +351,12 @@ pub async fn key_create_h(
     if let Err(e) = crate::core::vault::put(&account, &secret) {
         return admin_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("could not store the key in the keychain: {e}"),
-            Some("keychain_write_failed"),
+            &format!("could not store the key in the local secrets file: {e}"),
+            Some("vault_write_failed"),
         );
     }
     if let Err(e) = persist::gateway_key_insert(store, &id, &label) {
-        // Roll back the keychain entry: a secret with no row is an unrevokable ghost.
+        // Roll back the vault entry: a secret with no row is an unrevokable ghost.
         let _ = crate::core::vault::delete(&account);
         return admin_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -384,7 +384,7 @@ pub async fn key_revoke_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/keys/:id") {
@@ -414,7 +414,7 @@ pub async fn providers_list_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/providers") {
@@ -436,7 +436,7 @@ pub async fn provider_upsert_h(
     headers: HeaderMap,
     Json(p): Json<persist::ProviderRow>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/providers") {
@@ -461,7 +461,7 @@ pub async fn provider_delete_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/providers/{id}") {
@@ -478,7 +478,7 @@ pub async fn provider_delete_h(
             )
         }
     };
-    // §7 hygiene: the SQL cascade removed the key rows, so the keychain entries go too.
+    // §7 hygiene: the SQL cascade removed the key rows, so the vault entries go too.
     for account in secret_refs {
         let _ = crate::core::vault::delete(&account);
     }
@@ -490,7 +490,7 @@ pub async fn provider_delete_h(
 }
 
 pub async fn spend_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/spend") {
@@ -527,7 +527,7 @@ pub async fn spend_cap_set_h(
     headers: HeaderMap,
     Json(body): Json<SpendCapBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/spend/cap") {
@@ -547,7 +547,7 @@ pub async fn spend_cap_set_h(
 // ── Config CRUD: api-keys ──────────────────────────────────────────────────
 
 pub async fn api_keys_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/api-keys") {
@@ -569,7 +569,7 @@ pub async fn api_key_upsert_h(
     headers: HeaderMap,
     Json(k): Json<persist::ApiKeyRow>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/api-keys") {
@@ -591,7 +591,7 @@ pub async fn api_key_delete_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/api-keys/{id}") {
@@ -619,7 +619,7 @@ pub async fn manifests_list_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/manifests") {
@@ -641,7 +641,7 @@ pub async fn manifest_upsert_active_h(
     headers: HeaderMap,
     Json(m): Json<persist::ManifestRow>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/manifests") {
@@ -669,7 +669,7 @@ pub async fn manifest_activate_h(
     Path(id): Path<String>,
     Json(body): Json<ManifestActivateBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/manifests/{id}/activate") {
@@ -698,7 +698,7 @@ pub async fn manifest_stage_h(
     headers: HeaderMap,
     Json(m): Json<persist::ManifestRow>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/manifests/stage") {
@@ -729,7 +729,7 @@ pub async fn manifest_history_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/manifests/{id}/history") {
@@ -752,7 +752,7 @@ pub async fn models_cache_list_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/models-cache") {
@@ -781,7 +781,7 @@ pub async fn models_cache_replace_h(
     headers: HeaderMap,
     Json(body): Json<ModelsCacheReplaceBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/models-cache") {
@@ -801,7 +801,7 @@ pub async fn models_cache_replace_h(
 // ── Config CRUD: aliases ───────────────────────────────────────────────────
 
 pub async fn aliases_list_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/aliases") {
@@ -823,7 +823,7 @@ pub async fn aliases_replace_h(
     headers: HeaderMap,
     Json(rows): Json<Vec<persist::AliasRow>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/aliases") {
@@ -847,7 +847,7 @@ pub async fn ledger_recent_h(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/ledger") {
@@ -876,7 +876,7 @@ pub async fn ledger_append_h(
     headers: HeaderMap,
     Json(row): Json<persist::LedgerRow>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/ledger") {
@@ -934,7 +934,7 @@ pub async fn memory_enabled_get_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     (StatusCode::OK, Json(json!({ "enabled": core.memory_enabled() }))).into_response()
@@ -945,7 +945,7 @@ pub async fn memory_enabled_set_h(
     headers: HeaderMap,
     Json(body): Json<MemoryEnabledBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     core.set_memory_enabled(body.enabled);
@@ -965,7 +965,7 @@ pub async fn memory_list_h(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/memory") {
@@ -990,7 +990,7 @@ pub async fn memory_capture_h(
     headers: HeaderMap,
     Json(input): Json<memory::MemoryInput>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory") {
@@ -1013,7 +1013,7 @@ pub async fn memory_capture_batch_h(
     headers: HeaderMap,
     Json(items): Json<Vec<memory::MemoryInput>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/batch") {
@@ -1044,7 +1044,7 @@ pub async fn memory_recall_h(
     headers: HeaderMap,
     Json(body): Json<MemoryRecallBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/recall") {
@@ -1067,7 +1067,7 @@ pub async fn memory_forget_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/memory/{id}") {
@@ -1096,7 +1096,7 @@ pub async fn memory_update_h(
     Path(id): Path<String>,
     Json(body): Json<MemoryUpdateBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "PUT /admin/memory/{id}") {
@@ -1125,7 +1125,7 @@ pub async fn memory_set_pinned_h(
     Path(id): Path<String>,
     Json(body): Json<MemoryPinBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/{id}/pin") {
@@ -1158,7 +1158,7 @@ pub async fn memory_assign_scope_h(
     Path(id): Path<String>,
     Json(body): Json<MemoryScopeBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/{id}/scope") {
@@ -1206,7 +1206,7 @@ pub async fn memory_session_atoms_h(
     Path(session_id): Path<String>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/memory/session/{session_id}") {
@@ -1234,7 +1234,7 @@ pub async fn memory_session_atoms_h(
 /// `DELETE /admin/memory` — wipe the table. No scope filter, and that is the point: a partial
 /// clear would leave the operator unable to say what is still remembered.
 pub async fn memory_clear_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/memory") {
@@ -1253,7 +1253,7 @@ pub async fn memory_clear_h(State(core): State<Arc<GatewayCore>>, headers: Heade
 
 /// `GET /admin/memory/stats` — per-layer counts plus how many rows are actually injectable.
 pub async fn memory_stats_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/memory/stats") {
@@ -1282,7 +1282,7 @@ pub async fn memory_supersede_h(
     headers: HeaderMap,
     Json(body): Json<MemorySupersedeBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/supersede") {
@@ -1307,7 +1307,7 @@ pub async fn memory_unsupersede_h(
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/{id}/unsupersede") {
@@ -1329,7 +1329,7 @@ pub async fn memory_conflicts_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/memory/conflicts") {
@@ -1349,7 +1349,7 @@ pub async fn memory_conflicts_h(
 /// §6.2 retention. A POST rather than something the request path does: pruning there would add a
 /// second write to the hottest code in the app.
 pub async fn memory_prune_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/prune") {
@@ -1372,7 +1372,7 @@ pub async fn memory_principal_list_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/memory/principals") {
@@ -1401,7 +1401,7 @@ pub async fn memory_principal_set_h(
     headers: HeaderMap,
     Json(body): Json<PrincipalPolicyBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/memory/principals") {
@@ -1442,7 +1442,7 @@ pub async fn context_record_h(
     headers: HeaderMap,
     Json(body): Json<ContextRecordBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/context") {
@@ -1466,7 +1466,7 @@ pub async fn context_graph_h(
     headers: HeaderMap,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "GET /admin/context") {
@@ -1485,7 +1485,7 @@ pub async fn context_graph_h(
 }
 
 pub async fn context_clear_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "DELETE /admin/context") {
@@ -1511,7 +1511,7 @@ pub async fn context_clear_h(State(core): State<Arc<GatewayCore>>, headers: Head
 /// retention policies and one stats struct over both would hide which rule removed what. The
 /// separation is on IPC for that reason and is kept here.
 pub async fn context_prune_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     let store = match require_store(&core, "POST /admin/context/prune") {
@@ -1578,7 +1578,7 @@ fn tools_status(core: &GatewayCore, store: Option<&Arc<Store>>) -> ToolsStatus {
 }
 
 pub async fn tools_get_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     // The store is optional here, unlike most routes: a core with no store can still report the
@@ -1606,7 +1606,7 @@ pub async fn tools_set_h(
     headers: HeaderMap,
     Json(patch): Json<ToolsPatch>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     if let Some(on) = patch.enabled {
@@ -1679,7 +1679,7 @@ pub async fn workspace_root_set_h(
     headers: HeaderMap,
     Json(body): Json<WorkspaceRootBody>,
 ) -> Response {
-    if let Err(r) = authorize(&core, &headers) {
+    if let Err(r) = authorize(&core, &headers).await {
         return *r;
     }
     match crate::core::tools::validate_root(&std::path::PathBuf::from(&body.root)) {

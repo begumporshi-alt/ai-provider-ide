@@ -39,7 +39,12 @@ export interface ExecuteTextArgs {
 }
 
 export interface TextExecution {
-  /** The serving candidate (set once the first chunk arrives). */
+  /**
+   * The serving candidate — set once the candidate has delivered *output*, which is a text chunk
+   * **or** a tool call, whichever comes first. A turn whose entire output is a tool call yields no
+   * chunks at all, so a chunk-only definition of "served" reported a successful tool turn as if no
+   * provider had answered.
+   */
   served: () => Candidate | undefined;
   fallbackChain: () => AttemptOutcome[];
   chunks: AsyncIterable<string>;
@@ -86,6 +91,34 @@ export class ExecutionEngine {
           continue;
         }
         let emitted = false;
+        let toolCalls = 0;
+        // **A tool call is delivered output, so it marks the candidate as `served`.** `served` is
+        // what `wrapLedger` tests (`model-router.ts:429`) and what names the provider on the row,
+        // and it was being set from `chunks` alone — so a turn whose entire output is a tool call
+        // (zero chunks, one `onToolCall`) was filed `PARSE_ERROR` with no provider, while the very
+        // same request recorded `health.recordResult(key, "OK")` two lines below. Two records of
+        // one request, contradicting each other.
+        //
+        // **The gate is preserved exactly.** The interpreter only parses tool calls when a callback
+        // is present (`manifest-interpreter.ts:335-336`), so the wrapper is built only when the
+        // caller passed one — handing down a callback unconditionally would make every provider
+        // start emitting tool calls to callers that never asked for them.
+        //
+        // **`toolCalls` also ends failover.** `emitted` decides whether a mid-stream break can
+        // still fail over to the next candidate, and it was chunk-only — so a tool call delivered
+        // and then a break failed over, letting the next candidate re-issue the same tool call.
+        // The consistent generalisation: a delivered tool call also ends failover, so the wrapper
+        // counts it and the predicate below folds it in. `emitted` is still not set here because
+        // the two claims ("who answered" vs "can we still retry") are now unified at the predicate
+        // rather than conflated in one flag.
+        const callerOnToolCall = args.onToolCall;
+        const onToolCall = callerOnToolCall
+          ? (tc: ToolCall): void => {
+              if (!served) served = c;
+              toolCalls++;
+              callerOnToolCall(tc);
+            }
+          : undefined;
         try {
           const { adapter } = await self.adapters.forProvider(c.provider.id);
           for await (const chunk of adapter.generateText(
@@ -94,7 +127,7 @@ export class ExecutionEngine {
             // way the caller — the gateway bridge, which forwards it host-side — ever learns the
             // token counts. Dropping the caller's callback here left every gateway response
             // reporting `usage: null` even on requests that had usage.
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall: args.onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); } },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); } },
             args.signal,
           )) {
             if (!emitted) {
@@ -109,7 +142,9 @@ export class ExecutionEngine {
           // Mid-stream errors are drift-class (§2.10), never "OK from status 200"
           // (diff-review M2): a stream that already yielded text CANNOT be transparently
           // retried — the consumer would see duplicated output. Fail loud after first byte.
-          if (emitted) {
+          // A delivered tool call also ends failover: the consumer holds a tool call the next
+          // candidate would re-issue, so the predicate folds the tool-call count in.
+          if (emitted || toolCalls > 0) {
             const cls = e instanceof ManifestHttpError ? classify(e.status) === "OK" ? "PARSE_ERROR" : classify(e.status) : "NETWORK";
             fallbackChain.push({ candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 });
             throw e;

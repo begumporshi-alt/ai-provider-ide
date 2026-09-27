@@ -22,6 +22,8 @@
  * that property is the whole point of that file.
  */
 
+import { expectShape, type Guard } from "./host-boundary";
+
 export type AdminCall = { method: string; path: string; body?: unknown };
 
 const calls: AdminCall[] = [];
@@ -67,7 +69,11 @@ function defaultResponse(method: string, path: string): unknown {
     if (path.startsWith("/admin/tools")) {
       return { enabled: true, mutationEnabled: true, persistedEnabled: true };
     }
-    if (path.startsWith("/admin/memory/stats")) return { total: 0, byLayer: {}, injectable: 0 };
+    // The **full** `MemoryStats` shape. `store.ts` validates this response now, so a default that is
+    // merely convenient would throw for the wrong reason — `byLayer` was never read by anyone and is
+    // gone, and the five counts the guard requires are here.
+    if (path.startsWith("/admin/memory/stats"))
+      return { l0: 0, l1: 0, l2: 0, l3: 0, total: 0, bytes: 0, injectable: 0 };
     if (path.startsWith("/admin/context")) return { nodes: [], edges: [] };
     // A settings row is an **object**, not a collection: `GET /admin/settings` owns the `gateway`
     // row and the keyed form reaches every other row (`router`, `assistant`, `background`). The
@@ -116,4 +122,25 @@ export async function fetchAdmin(method: string, path: string, body?: unknown): 
 /** Present so a spec that clears the cached credential compiles against the same shape. */
 export function clearUiSession(): void {
   /* the fake holds no credential */
+}
+
+/**
+ * The `fetchAdminAs` half of the drop-in (audit M3 + M8).
+ *
+ * **This export is load-bearing, and its absence was silent.** `store.ts` reads `/admin/*` through
+ * `fetchAdminAs`, and three specs replace this module with this file. While the export was missing,
+ * vitest raised `No "fetchAdminAs" export is defined on the mock` for any spec that reached a
+ * converted read — and all three passed, because none of them did. A drop-in missing a function is
+ * not a drop-in; it is a trap that springs on the next spec written.
+ *
+ * It validates through the **real** `expectShape`, not a bypass, so a spec that seeds a wrong shape
+ * meets the same failure production would.
+ */
+export async function fetchAdminAs<T>(
+  method: string,
+  path: string,
+  guard: Guard<T>,
+  body?: unknown,
+): Promise<T> {
+  return expectShape(await fetchAdmin(method, path, body), guard, `${method} ${path}`);
 }

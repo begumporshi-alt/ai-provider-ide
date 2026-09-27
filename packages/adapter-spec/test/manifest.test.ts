@@ -47,6 +47,58 @@ describe("manifest grammar v1.1 (zod)", () => {
   });
 });
 
+/**
+ * The scheme rule, added 2026-09-27. `z.string().url()` accepts `http:`, so before this a baseUrl
+ * of `http://api.example.com/v1` validated cleanly and the egress then attached the provider
+ * credential — and the prompt — to a plaintext request. The Rust side is the enforcement point
+ * (`egress::require_secure_scheme`); this is the form-level refusal, so the operator learns at
+ * input time rather than at the first request.
+ *
+ * Falsified before it was trusted: reverting `baseUrl` to `z.string().url()` reddens the remote
+ * cases below and leaves the loopback ones green.
+ */
+describe("manifest grammar: baseUrl must be https unless loopback", () => {
+  const withBaseUrl = (baseUrl: string) =>
+    ADAPTER_MANIFEST_V1_1.safeParse({
+      ...validManifest,
+      provider: { ...validManifest.provider, baseUrl },
+    });
+
+  it("accepts https anywhere", () => {
+    expect(withBaseUrl("https://api.example.com/v1").success).toBe(true);
+  });
+
+  it("rejects cleartext to a remote host — the key would cross the network unencrypted", () => {
+    expect(withBaseUrl("http://api.example.com/v1").success).toBe(false);
+  });
+
+  it("keeps http legal for loopback — a primary use case (Ollama 11434, LM Studio 1234)", () => {
+    for (const u of [
+      "http://127.0.0.1:11434/api",
+      "http://127.0.0.2:11434/api",
+      "http://localhost:1234/v1",
+      "http://[::1]:8080/v1",
+    ]) {
+      expect(withBaseUrl(u).success, u).toBe(true);
+    }
+  });
+
+  it("does not mistake a lookalike host for loopback", () => {
+    for (const u of [
+      "http://127.0.0.1.evil.example/v1",
+      "http://127.0.0.1x/v1",
+      "http://128.0.0.1/v1",
+      "http://localhost.evil.example/v1",
+    ]) {
+      expect(withBaseUrl(u).success, u).toBe(false);
+    }
+  });
+
+  it("still rejects a non-URL (invariant 4 is unchanged)", () => {
+    expect(withBaseUrl("not a url").success).toBe(false);
+  });
+});
+
 describe("manifest grammar: adapter kind (§2.7)", () => {
   const codeBody = { source: "export default { listModels() {} }", entry: "adapter" as const };
 

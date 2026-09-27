@@ -26,7 +26,7 @@ export interface HttpPort {
   }>;
 }
 
-/** Keychain access, key-blind: values are opaque refs on the TS side. */
+/** Secret-store access, key-blind: values are opaque refs on the TS side. */
 export interface KeyVaultPort {
   put(label: string, secret: string): Promise<string>; // returns secretRef
   get(secretRef: string): Promise<string | undefined>;

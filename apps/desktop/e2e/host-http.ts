@@ -105,7 +105,7 @@ export class HostHttp implements HttpPort {
       if (r.secret === undefined || expected === undefined) {
         throw new EgressError(
           "secret_missing",
-          `secret ${req.secretRef} not found in keychain (re-enter the key)`,
+          `secret ${req.secretRef} not found in the local secrets file (re-enter the key)`,
         );
       }
       if (expected !== destHost.toLowerCase()) {

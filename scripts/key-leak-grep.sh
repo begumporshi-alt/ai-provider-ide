@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # CI key-leak guard (acceptance criterion 5, ARCHITECTURE.md invariants 1-2).
 # Fails if anything resembling a raw provider key literal appears in shipped source.
-# Real provider keys must live only in the OS keychain, referenced by secretRef.
+# Real provider keys must live only in the local secrets file, referenced by secretRef.
 # Exemptions are PATH-based (test/fixture files only) — a substring filter would
 # exempt any line containing "latest"/"greatest" (diff-review m7).
 set -euo pipefail

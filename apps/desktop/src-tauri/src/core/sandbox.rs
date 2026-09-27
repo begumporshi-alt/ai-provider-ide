@@ -257,17 +257,34 @@ const FORBIDDEN: &[(&str, &str)] = &[
 /// not guest input, so a pattern that fails to compile is a defect in this file that the tests
 /// catch immediately — where the reference's patterns could not fail at all. The alternative is
 /// twelve `Regex::new` calls per adapter construction for no observable benefit.
-fn forbidden_patterns() -> &'static [Regex] {
-    static CELL: OnceLock<Vec<Regex>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        FORBIDDEN
-            .iter()
-            .map(|(pattern, _)| {
-                Regex::new(pattern)
-                    .expect("a FORBIDDEN pattern must compile; see the table's tests")
+///
+/// **`Result` rather than `expect` (audit M2).** A pattern that will not compile is still a defect
+/// here, but it is a defect in a *constant*, and `panic = "abort"` is set for release — so the
+/// `expect` this replaces would have ended the process for every client rather than failing the one
+/// lint that touched it. The error travels out as a lint error, and `lint_code_source` counts it as
+/// a failure: a source this function cannot vet must not pass.
+fn forbidden_patterns() -> Result<&'static [Regex], String> {
+    static CELL: OnceLock<Result<Vec<Regex>, String>> = OnceLock::new();
+    CELL.get_or_init(|| compile_patterns(FORBIDDEN)).as_deref().map_err(|e| e.clone())
+}
+
+/// Compile a `(pattern, description)` table, reporting the first pattern that will not compile.
+///
+/// Split out of `forbidden_patterns` so the failure path is **reachable from a test**. `FORBIDDEN`
+/// is a constant, so no test can make it fail at runtime; without this seam the `Err` arm would be
+/// code nothing could ever execute, and an arm that nothing executes is where a "cannot happen"
+/// turns back into a panic on the next edit.
+fn compile_patterns(table: &[(&str, &str)]) -> Result<Vec<Regex>, String> {
+    table
+        .iter()
+        .map(|(pattern, _)| {
+            Regex::new(pattern).map_err(|e| {
+                format!(
+                    "internal: the forbidden-construct pattern {pattern:?} does not compile ({e})"
+                )
             })
-            .collect()
-    })
+        })
+        .collect()
 }
 
 /// Static checks a code adapter source must survive before it reaches QuickJS.
@@ -279,6 +296,10 @@ fn forbidden_patterns() -> &'static [Regex] {
 /// **The order of the checks is the reference's** — size, then the `export default` shape, then the
 /// constructs — because the messages are what a reviewer reads and a differently-ordered list
 /// would be a differently-worded rejection for the same source.
+///
+/// **A pattern that will not compile is reported, not panicked** (audit M2). This is the first
+/// thing a generated adapter touches, and refusing the source is both the safe direction and the
+/// one that names the fault instead of taking the gateway down with it.
 pub fn lint_code_source(source: &str) -> Vec<String> {
     let mut errors = Vec::new();
     if source.len() > SOURCE_LIMIT {
@@ -286,23 +307,35 @@ pub fn lint_code_source(source: &str) -> Vec<String> {
     }
     // The reference tests `export\s+default\s*\{` — whitespace-tolerant between the words and
     // before the brace, and nothing else. Not anchored, so a source may carry a comment first.
-    if !export_default_re().is_match(source) {
-        errors.push("must contain \"export default {\"".to_string());
-    }
-    let patterns = forbidden_patterns();
-    for (index, (_, js_source)) in FORBIDDEN.iter().enumerate() {
-        if patterns[index].is_match(source) {
-            errors.push(format!("forbidden construct: {js_source}"));
+    match export_default_re() {
+        Ok(re) => {
+            if !re.is_match(source) {
+                errors.push("must contain \"export default {\"".to_string());
+            }
         }
+        Err(e) => errors.push(e),
+    }
+    match forbidden_patterns() {
+        Ok(patterns) => {
+            for (index, (_, js_source)) in FORBIDDEN.iter().enumerate() {
+                if patterns[index].is_match(source) {
+                    errors.push(format!("forbidden construct: {js_source}"));
+                }
+            }
+        }
+        Err(e) => errors.push(e),
     }
     errors
 }
 
-fn export_default_re() -> &'static Regex {
-    static CELL: OnceLock<Regex> = OnceLock::new();
+fn export_default_re() -> Result<&'static Regex, String> {
+    static CELL: OnceLock<Result<Regex, String>> = OnceLock::new();
     CELL.get_or_init(|| {
-        Regex::new(r"export\s+default\s*\{").expect("the export-default pattern must compile")
+        Regex::new(r"export\s+default\s*\{")
+            .map_err(|e| format!("internal: the export-default pattern does not compile ({e})"))
     })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 /// One auth header as the manifest declares it.
@@ -611,16 +644,36 @@ pub fn js_to_string(v: &Value) -> String {
 /// computing it would mean a second implementation of decimal-to-shortest-digits, and the one
 /// already in `core::fmt` is the one that agrees with JavaScript.
 ///
-/// Non-finite values cannot arrive: `serde_json::Number` is always finite, so `NaN` and the
-/// infinities are unreachable from a parsed guest value and have no arm here.
+/// Non-finite values cannot arrive *from a parsed guest value* — `serde_json::Number` is always
+/// finite — but this function is total anyway (audit M2): it takes a bare `f64`, so that invariant
+/// belongs to its caller rather than to its signature, and `{:e}` renders `inf`/`-inf`/`NaN` with
+/// no exponent at all, which is exactly the input the parsing below would choke on.
 fn js_number_to_string(n: f64) -> String {
     if n == 0.0 {
         return "0".to_string(); // also covers -0.0, where JavaScript agrees
     }
+    // Spelled the way ECMAScript's `String(n)` spells them, so the arm is a real answer rather
+    // than a placeholder if a caller ever reaches it.
+    if !n.is_finite() {
+        return if n.is_nan() {
+            "NaN".to_string()
+        } else if n > 0.0 {
+            "Infinity".to_string()
+        } else {
+            "-Infinity".to_string()
+        };
+    }
     let scientific = format!("{n:e}");
-    let (mantissa, exponent) =
-        scientific.split_once('e').expect("Rust's {:e} always renders an exponent");
-    let exponent: i32 = exponent.parse().expect("Rust's {:e} always renders a decimal exponent");
+    // Total from here: the guard above is what makes "finite" a property of *this function*
+    // rather than a promise from its caller, and a finite `f64` always renders `<mantissa>e<n>`.
+    // The fallbacks keep the function total even if that ever stops holding; they cannot be
+    // reached for a finite input.
+    let Some((mantissa, exponent)) = scientific.split_once('e') else {
+        return scientific;
+    };
+    let Ok(exponent) = exponent.parse::<i32>() else {
+        return scientific;
+    };
     if exponent >= 21 || exponent <= -7 {
         if exponent >= 0 {
             format!("{mantissa}e+{exponent}")
@@ -793,7 +846,29 @@ mod tests {
             let expected = js_source.replace(r"\b", r"(?-u:\b)");
             assert_eq!(*pattern, expected, "the two columns have drifted for {js_source}");
         }
-        assert_eq!(forbidden_patterns().len(), FORBIDDEN.len());
+        assert_eq!(
+            forbidden_patterns().expect("the FORBIDDEN table compiles").len(),
+            FORBIDDEN.len()
+        );
+    }
+
+    /// Audit M2: a pattern that will not compile is **reported**, not panicked.
+    ///
+    /// `FORBIDDEN` is a constant, so it cannot be made to fail from a test — which is exactly why
+    /// `compile_patterns` exists as a separate function: this drives the same compiler the real
+    /// table goes through, so the `Err` arm is exercised rather than assumed. Under the
+    /// `Regex::new(..).expect(..)` this replaces, the input below aborted the process.
+    #[test]
+    fn an_uncompilable_pattern_is_reported_rather_than_panicking() {
+        let err = compile_patterns(&[("(unclosed", "a bad construct")])
+            .expect_err("an unclosed group must not compile");
+        assert!(err.contains("(unclosed"), "the message must name the pattern: {err}");
+        assert!(
+            err.starts_with("internal:"),
+            "a defect in this file must not read as a verdict on the source: {err}"
+        );
+        // The control: a good table still compiles, so the seam has not merely been made to fail.
+        assert_eq!(compile_patterns(&[("a", "a")]).expect("a compiles").len(), 1);
     }
 
     /* ------------------------------------------------------------- auth headers */
@@ -1287,6 +1362,23 @@ mod tests {
         assert_eq!(js_number_to_string(1.23456789e22), "1.23456789e+22");
         // `-0` prints as `"0"`, which is JavaScript's behaviour and not Rust's.
         assert_eq!(js_number_to_string(-0.0), "0");
+    }
+
+    /// Audit M2: the function is **total**. These inputs cannot arrive from a parsed guest value —
+    /// `serde_json::Number` is always finite — but the old body panicked on them rather than
+    /// answering, because `{:e}` renders each with no exponent at all and the two `expect`s it
+    /// carried were what turned that into a process-wide abort.
+    ///
+    /// Pinned rather than left to the doc comment: the whole point of making the function total is
+    /// that the property holds for the *function*, so a test on the function is the evidence.
+    #[test]
+    fn js_number_to_string_is_total_for_non_finite_input() {
+        assert_eq!(js_number_to_string(f64::INFINITY), "Infinity");
+        assert_eq!(js_number_to_string(f64::NEG_INFINITY), "-Infinity");
+        assert_eq!(js_number_to_string(f64::NAN), "NaN");
+        // The control: a finite value still takes the ordinary path, so the guard above has not
+        // swallowed the whole function.
+        assert_eq!(js_number_to_string(1e21), "1e+21");
     }
 
     #[test]

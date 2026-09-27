@@ -167,7 +167,7 @@ async function setup() {
   // than restated: both credential kinds now come from the same `.secrets.json` cache, so the
   // cache-vs-keychain distinction it explains may no longer hold. Re-measure before relying on it.
   // Which credential this is matters to the numbers, not just to auth: the master key is served
-  // from a bounded cache, while per-app keys are read from the keychain on every request
+  // from a bounded cache, while per-app keys are read from the vault on every request
   // (`gateway.rs:1374`). Measured 2026-09-24, the difference is **0.8 ms** (11.6 ms master vs
   // 12.4 ms per-app), not the several milliseconds the mechanism suggests — so record it rather
   // than assume it. Note also that `curl` reports a higher `/v1/models` than node does, because
@@ -188,7 +188,7 @@ async function setup() {
     providerId,
     realHost,
     tools: toolsOff ? "off  (streaming can be incremental)" : "on   (ProseGate holds text back)",
-    credential: isMaster ? "master key (cached)" : "per-app key (keychain read per request)",
+    credential: isMaster ? "master key (cached)" : "per-app key (vault read per request)",
   };
 }
 
@@ -213,7 +213,7 @@ async function main() {
   if (!await waitForHealth()) fail(`the gateway never answered /health on ${GW_PORT}`);
 
   // Warm-up. Two costs are being paid here and neither is steady-state: the master-key cache fill
-  // and the adapter's first touch. The cache fill is the one that matters — the keychain read is
+  // and the adapter's first touch. The cache fill is the one that matters — the vault read is
   // bounded by `MASTER_KEY_WAIT` (1500 ms, `gateway.rs:143`), and until it completes **every
   // authenticated route answers 503**, whatever credential is presented.
   //

@@ -8,11 +8,11 @@
 //! written for.
 //!
 //! **What this credential is.** An ordinary per-app key with a reserved id, minted on demand and
-//! stored in the same two places every app key is: the OS keychain (the secret) and the
+//! stored in the same two places every app key is: the vault (the secret) and the
 //! `gateway_keys` row (the authorisation). It therefore works in **both** processes that can serve
 //! the port — the in-app gateway and `aiproviderd` — because both install
 //! `vault_app_key_provider` (`gateway_cmds.rs:152`, `aiproviderd.rs:208`) against the same
-//! keychain and the same database. No auth path was widened to make this work.
+//! vault and the same database. No auth path was widened to make this work.
 //!
 //! **Why it is narrow.** It carries no provider credential, so invariant 2 is intact in the only
 //! place it was ever meant to bind: TypeScript still cannot read or send a *provider* secret. What
@@ -42,9 +42,9 @@ pub fn is_ui_session(id: &str) -> bool {
 
 /// Ensure the credential exists and return its secret.
 ///
-/// Idempotent, and the two halves are repaired independently: a keychain entry with no row is
-/// unusable (`vault_app_key_provider` only reads the keychain for ids that have an active row), and
-/// a row with no entry is a credential nobody holds. Either state is reachable — the keychain and
+/// Idempotent, and the two halves are repaired independently: a vault entry with no row is
+/// unusable (`vault_app_key_provider` only reads the vault for ids that have an active row), and
+/// a row with no entry is a credential nobody holds. Either state is reachable — the vault and
 /// SQLite do not fail together — so both are checked rather than assumed from the other.
 pub fn ensure(store: &Store) -> Result<String, String> {
     ensure_with(store, &|a| vault::get(a).ok().flatten(), &|a, s| {
@@ -52,9 +52,9 @@ pub fn ensure(store: &Store) -> Result<String, String> {
     })
 }
 
-/// The keychain halves are **parameters, not calls**.
+/// The vault halves are **parameters, not calls**.
 ///
-/// `vault::put` hits the real OS keychain, which CI has no access to — the same wall
+/// `vault::put` touches the real secrets file, which a test must not — the same wall
 /// `POST /admin/keys`'s happy path ran into. Injected here, so the whole lifecycle (mint, reuse,
 /// repair, revoke) is testable on all three CI platforms, and the module keeps no
 /// `cfg(target_os)` gate that would leave it uncompiled everywhere but macOS.
@@ -108,22 +108,23 @@ fn row_exists(store: &Store, id: &str) -> Result<bool, rusqlite::Error> {
 /// Revoke and forget the credential. Used when the gateway stops, so a token minted for one
 /// session cannot outlive it.
 ///
-/// The keychain half is a **parameter** for the same reason it is in `ensure_with` — `vault::delete`
-/// hits the real OS keychain, which CI has no access to. Both halves are best-effort: a keychain
-/// that will not answer must not stop the gateway from stopping.
+/// The vault half is a **parameter** for the same reason it is in `ensure_with` — `vault::delete`
+/// touches the real secrets file, which a test must not. Both halves are best-effort: a vault that
+/// will not answer must not stop the gateway from stopping.
 pub fn revoke_with(store: &Store, delete: &dyn Fn(&str)) {
     let account = format!("{APP_KEY_PREFIX}{UI_SESSION_ID}");
     delete(&account);
     let _ = persist::gateway_key_delete(store, UI_SESSION_ID);
     // The key provider re-reads the active ids per request, and the vault re-reads its file when
-    // the stamp changes (`vault::load`), so this takes effect on the next call with no restart —
-    // **including in the other process**, which is the half that used to be false. The vault was
-    // read once per process, so a deleted credential went on authenticating in any process that
-    // had already loaded it, while the process that minted the replacement could not serve it
-    // either. Both directions are fixed by the same re-read (26ae).
+    // the file's **content** changes (`vault::load` — a `(mtime, len)` stamp until audit M4), so
+    // this takes effect on the next call with no restart — **including in the other process**,
+    // which is the half that used to be false. The vault was read once per process, so a deleted
+    // credential went on authenticating in any process that had already loaded it, while the
+    // process that minted the replacement could not serve it either. Both directions are fixed by
+    // the same re-read (26ae).
 }
 
-/// `revoke_with` against the real keychain. The production half.
+/// `revoke_with` against the real vault. The production half.
 pub fn revoke(store: &Store) {
     revoke_with(store, &|account| {
         let _ = vault::delete(account);
@@ -168,10 +169,10 @@ mod tests {
         assert!(row_exists(&s, UI_SESSION_ID).unwrap(), "and the row is present");
     }
 
-    /// The row is what authorises the secret: `vault_app_key_provider` reads the keychain only for
+    /// The row is what authorises the secret: `vault_app_key_provider` reads the vault only for
     /// ids that have a live row, so a secret with no row authenticates nobody.
     #[test]
-    fn ensure_repairs_a_row_that_is_missing_but_the_keychain_holds_the_secret() {
+    fn ensure_repairs_a_row_that_is_missing_but_the_vault_holds_the_secret() {
         let s = tmp();
         let stored = std::cell::RefCell::new(std::collections::HashMap::<String, String>::new());
         let account = format!("{APP_KEY_PREFIX}{UI_SESSION_ID}");
@@ -184,14 +185,14 @@ mod tests {
         assert!(row_exists(&s, UI_SESSION_ID).unwrap(), "and the missing row is written");
     }
 
-    /// A keychain failure is an error, not a silently minted credential nobody can read back.
+    /// A vault write failure is an error, not a silently minted credential nobody can read back.
     #[test]
-    fn ensure_reports_a_keychain_failure_rather_than_returning_a_secret() {
+    fn ensure_reports_a_vault_write_failure_rather_than_returning_a_secret() {
         let s = tmp();
         let get = |_: &str| None;
-        let put = |_: &str, _: &str| Err("keychain unavailable".to_string());
+        let put = |_: &str, _: &str| Err("secrets file is not writable".to_string());
         let err = ensure_with(&s, &get, &put).unwrap_err();
-        assert!(err.contains("keychain"), "the failure names the keychain: {err}");
+        assert!(err.contains("secrets file"), "the failure names the vault: {err}");
     }
 
     #[test]
@@ -201,11 +202,11 @@ mod tests {
     }
 
     /// The other half of the lifecycle, and the reason `revoke` exists at all: a credential minted
-    /// for one gateway session must die with it, not linger in the keychain as a token that still
+    /// for one gateway session must die with it, not linger in the vault as a token that still
     /// authenticates after the operator pressed Stop.
     ///
     /// Asserted on the row, because the row is what the provider reads: a revoke that deleted only
-    /// the keychain entry would leave an id the provider still asks the keychain about.
+    /// the vault entry would leave an id the provider still asks the vault about.
     #[test]
     fn revoke_forgets_the_credential_and_the_next_session_mints_a_fresh_one() {
         let s = tmp();
@@ -220,7 +221,7 @@ mod tests {
         let first = ensure_with(&s, &get, &put).unwrap();
         assert!(row_exists(&s, UI_SESSION_ID).unwrap());
 
-        // The injected keychain delete does what the real one does: the entry is gone afterwards,
+        // The injected vault delete does what the real one does: the entry is gone afterwards,
         // so recording the account without removing it would test a revoke that did not revoke.
         revoke_with(&s, &|a: &str| {
             deleted.borrow_mut().push(a.to_string());
@@ -231,7 +232,7 @@ mod tests {
         assert_eq!(
             deleted.borrow().as_slice(),
             [format!("{APP_KEY_PREFIX}{UI_SESSION_ID}")],
-            "and the keychain half was deleted too — a row-only revoke leaves a live secret"
+            "and the vault half was deleted too — a row-only revoke leaves a live secret"
         );
 
         // The next session starts from nothing rather than inheriting the old secret.

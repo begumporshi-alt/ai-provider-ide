@@ -130,7 +130,44 @@ export const ADAPTER_MANIFEST_V1_1 = z
     kind: z.enum(["declarative", "code"]).default("declarative"),
     dialect: z.string().min(1),
     provider: z.object({
-      baseUrl: z.string().url(),
+      // **A provider credential must not cross the network in cleartext.** `z.string().url()`
+      // accepts `http:`, so before 2026-09-27 a baseUrl of `http://api.example.com/v1` validated
+      // cleanly and the egress then attached the key and the prompt to a plaintext request.
+      // `egress::require_secure_scheme` (Rust) is the enforcement point; this is the form-level
+      // refusal, so the operator learns at input time rather than at the first request. `http`
+      // stays legal for loopback, which is a primary use case — Ollama is on 11434, LM Studio on
+      // 1234 — and the predicate mirrors `egress::is_local` (the whole 127/8 block, plus
+      // `localhost` and `::1`).
+      baseUrl: z
+        .string()
+        .url()
+        .refine(
+          (v) => {
+            // **A validator must not throw.** `.refine` runs whether or not `.url()` passed, so an
+            // unguarded `new URL(v)` turned a *validation failure* into an exception — the caller
+            // got a `TypeError` instead of `{success:false}`, and the pre-existing "rejects a
+            // non-URL" case started throwing. `URL.canParse` would be tidier but is Safari 17+,
+            // and this bundle targets macOS 11. try/catch works everywhere.
+            let u: URL;
+            try {
+              u = new URL(v);
+            } catch {
+              return false; // not a URL at all; `.url()` has already reported it
+            }
+            if (u.protocol === "https:") return true;
+            // `new URL().hostname` serialises an IPv6 host **with** its brackets, so `[::1]` is
+            // the form that actually arrives here — `"::1"` alone would silently refuse every
+            // IPv6-loopback provider. Both are accepted, matching `egress::is_local`.
+            const h = u.hostname;
+            if (h === "localhost" || h === "::1" || h === "[::1]") return true;
+            const o = h.split(".");
+            return o.length === 4 && o[0] === "127" && o.every((p) => /^\d{1,3}$/.test(p) && +p <= 255);
+          },
+          {
+            message:
+              "baseUrl must be https unless the host is loopback — a provider key would otherwise cross the network in cleartext",
+          },
+        ),
       auth: z.object({
         headers: z.array(MANIFEST_ENDPOINT_AUTH_HEADER).min(1), // v1.1: multiple auth headers
       }),

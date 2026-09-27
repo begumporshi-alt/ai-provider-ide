@@ -5,7 +5,39 @@
  * calls one fixed host command (the invariant-12-safe replacement for a raw StorePort).
  */
 import { invoke } from "@tauri-apps/api/core";
-import { fetchAdmin } from "./lib/gateway-client";
+import { fetchAdmin, fetchAdminAs } from "./lib/gateway-client";
+import {
+  arrayOf,
+  expectShape,
+  expectShapeOr,
+  isObj,
+  parseHostJson,
+  parseHostJsonOr,
+} from "./lib/host-boundary";
+import {
+  isActivation,
+  isCaptured,
+  isContextGraph,
+  isEnabledFlag,
+  isGatewaySettings,
+  isGatewaySpendStatus,
+  isHostAliasRow,
+  isHostKeyRow,
+  isHostLedgerRow,
+  isHostManifestRow,
+  isHostModelRow,
+  isHostProviderRow,
+  isLiveContextPruneStats,
+  isMemory,
+  isMemoryConflict,
+  isMemoryPruneStats,
+  isMemoryStats,
+  isModality,
+  isMutationFlag,
+  isOk,
+  isPrincipalRow,
+  isVersioned,
+} from "./lib/host-guards";
 import {
   AdapterRuntime,
   DriftMonitor,
@@ -299,15 +331,21 @@ export async function approveRepair(
   // `POST /admin/manifests/stage` takes the row itself, not the IPC command's `{ m }` wrapper, and
   // answers `{ version }` because the version is computed host-side from the provider's max rather
   // than chosen here.
-  const { version } = (await fetchAdmin("POST", "/admin/manifests/stage", {
-    id: crypto.randomUUID(), providerId, version: 0, origin,
-    bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
-    contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
-    createdAt: Date.now(), isActive: false,
-  })) as { version: number };
-  const activated = (await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, {
-    version,
-  })) as { previousVersion: number | null };
+  const { version } = expectShape(
+    await fetchAdmin("POST", "/admin/manifests/stage", {
+      id: crypto.randomUUID(), providerId, version: 0, origin,
+      bodyJson: JSON.stringify({ ...manifest, provenance: { ...manifest.provenance, origin } }),
+      contractResultJson: JSON.stringify(entry.plan?.candidate?.contract ?? null),
+      createdAt: Date.now(), isActive: false,
+    }),
+    isVersioned,
+    "POST /admin/manifests/stage",
+  );
+  const activated = expectShape(
+    await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, { version }),
+    isActivation,
+    `POST /admin/manifests/${providerId}/activate`,
+  );
   const previous = activated.previousVersion;
   adapters.register(providerId, manifest); // hot-swap
   await setProviderStatus(providerId, "enabled");
@@ -324,20 +362,26 @@ export async function approveRepair(
 
 export async function rollbackManifest(providerId: string, version: number): Promise<void> {
   await fetchAdmin("POST", `/admin/manifests/${providerId}/activate`, { version });
-  const rows = (await fetchAdmin("GET", "/admin/manifests")) as HostManifestRow[];
+  const rows = await fetchAdminAs("GET", "/admin/manifests", arrayOf(isHostManifestRow));
   const row = rows.find((r) => r.providerId === providerId);
   if (row) {
-    adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
+    try {
+      adapters.register(providerId, JSON.parse(row.bodyJson) as AdapterManifest);
+    } catch {
+      // A corrupt manifest leaves the provider unregistered rather than throwing out of a
+      // rollback. This is the guarded twin of the register in `loadManifests` (audit M3).
+    }
   }
 }
 
 export async function listManifestHistory(providerId: string): Promise<HostManifestRow[]> {
   // `encodeURIComponent`: the provider id is a path segment here, and a slug with a `/` in it would
   // otherwise address a different route entirely rather than failing.
-  return (await fetchAdmin(
+  return await fetchAdminAs(
     "GET",
     `/admin/manifests/${encodeURIComponent(providerId)}/history`,
-  )) as HostManifestRow[];
+    arrayOf(isHostManifestRow),
+  );
 }
 
 let bootstrapped = false;
@@ -402,12 +446,12 @@ async function runBootstrap(): Promise<void> {
   let routerSettings: Record<string, unknown>;
   try {
     [providers, keys, models, manifests, aliases, routerSettings] = await Promise.all([
-      fetchAdmin("GET", "/admin/providers") as Promise<HostProviderRow[]>,
-      fetchAdmin("GET", "/admin/api-keys") as Promise<HostKeyRow[]>,
-      fetchAdmin("GET", "/admin/models-cache") as Promise<HostModelRow[]>,
-      fetchAdmin("GET", "/admin/manifests") as Promise<HostManifestRow[]>,
-      fetchAdmin("GET", "/admin/aliases") as Promise<HostAliasRow[]>,
-      fetchAdmin("GET", "/admin/settings/router") as Promise<Record<string, unknown>>,
+      fetchAdminAs("GET", "/admin/providers", arrayOf(isHostProviderRow)),
+      fetchAdminAs("GET", "/admin/api-keys", arrayOf(isHostKeyRow)),
+      fetchAdminAs("GET", "/admin/models-cache", arrayOf(isHostModelRow)),
+      fetchAdminAs("GET", "/admin/manifests", arrayOf(isHostManifestRow)),
+      fetchAdminAs("GET", "/admin/aliases", arrayOf(isHostAliasRow)),
+      fetchAdminAs("GET", "/admin/settings/router", isObj),
     ]);
   } catch (e) {
     // The gateway is a listener this app can start, not a precondition for opening it, so an
@@ -429,10 +473,16 @@ async function runBootstrap(): Promise<void> {
 
   const fetchedByProvider: Record<string, number> = {};
   for (const m of models) fetchedByProvider[m.providerId] = Math.max(fetchedByProvider[m.providerId] ?? 0, m.fetchedAt);
+  // A model whose modality this build does not understand is left out, not routed as text. The
+  // assertion that used to sit here let an unknown value through wearing a known type, where it
+  // then matched neither modality in the router (audit M8).
+  const classifiable = models.filter(
+    (m): m is HostModelRow & { modality: CatalogModel["modality"] } => isModality(m.modality),
+  );
   catalog.hydrate(
-    models.map((m) => ({
+    classifiable.map((m) => ({
       providerId: m.providerId, nativeId: m.nativeId,
-      modality: m.modality as CatalogModel["modality"],
+      modality: m.modality,
       contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
       pricing: parsePricingJson(m.pricingJson),
       supportsReasoning: parseCapabilitiesJson(m.capabilitiesJson)?.reasoning,
@@ -497,8 +547,8 @@ async function runBootstrap(): Promise<void> {
 
 async function refreshFromHost(): Promise<void> {
   const [providers, keys] = await Promise.all([
-    fetchAdmin("GET", "/admin/providers") as Promise<HostProviderRow[]>,
-    fetchAdmin("GET", "/admin/api-keys") as Promise<HostKeyRow[]>,
+    fetchAdminAs("GET", "/admin/providers", arrayOf(isHostProviderRow)),
+    fetchAdminAs("GET", "/admin/api-keys", arrayOf(isHostKeyRow)),
   ]);
   registry.hydrate(providers.map(hostToProvider), keys.map(hostToKey));
 }
@@ -634,13 +684,13 @@ export async function deleteProvider(id: string): Promise<void> {
  * **The vault write precedes the row insert, so this needs a rollback — and it did not have one.**
  * `registry.addKey` stores the secret under `key:<id>` first; the `POST /admin/api-keys` that
  * creates the matching row comes second and *throws* on any non-2xx (`sendAdmin`). When it threw,
- * the secret stayed in the keychain with no row to reach it: the keys list reads `api_keys`, so the
+ * the secret stayed in the vault with no row to reach it: the keys list reads `api_keys`, so the
  * entry could be neither seen nor revoked through any path in the app — the "unrevokable ghost"
  * the host's own `key_create_h` rollback exists to prevent, and the same guard `addProvider` eleven
  * lines up already had. This is that guard, on the path that strands a *credential* rather than
  * in-memory state.
  *
- * The rollback is best-effort, like the host's (`let _ = vault::delete(...)`): if the keychain
+ * The rollback is best-effort, like the host's (`let _ = vault::delete(...)`): if the vault
  * refuses, the original error is still the one the operator needs. `registry.deleteKey` drops the
  * vault entry **and** the in-memory record, so a failed add leaves nothing on either side.
  */
@@ -810,7 +860,7 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
 }
 
 export async function loadRecentLedger(): Promise<HostLedgerRow[]> {
-  return fetchAdmin("GET", "/admin/ledger?limit=200") as Promise<HostLedgerRow[]>;
+  return fetchAdminAs("GET", "/admin/ledger?limit=200", arrayOf(isHostLedgerRow));
 }
 
 // ---------- P4: context graph ----------
@@ -830,7 +880,7 @@ export async function recordContext(
 }
 
 export async function loadContextGraph(limit = 400): Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }> {
-  return fetchAdmin("GET", `/admin/context?limit=${limit}`) as Promise<{ nodes: HostContextNode[]; edges: HostContextEdge[] }>;
+  return fetchAdminAs("GET", `/admin/context?limit=${limit}`, isContextGraph);
 }
 
 export async function clearContextGraph(): Promise<void> {
@@ -1004,10 +1054,15 @@ export async function captureMemory(m: {
   layer: MemoryLayer; text: string;
   sessionId?: string | null; subject?: string | null; pinned?: boolean;
 }): Promise<Memory> {
-  return fetchAdmin("POST", "/admin/memory", {
-    layer: m.layer, text: m.text,
-    session_id: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
-  }) as Promise<Memory>;
+  return fetchAdminAs(
+    "POST",
+    "/admin/memory",
+    isMemory,
+    {
+      layer: m.layer, text: m.text,
+      session_id: m.sessionId ?? null, subject: m.subject ?? null, pinned: m.pinned ?? false,
+    },
+  );
 }
 
 /**
@@ -1024,7 +1079,9 @@ export async function captureMemories(
   items: Array<{ layer: MemoryLayer; text: string; session_id?: string | null; subject?: string | null; pinned?: boolean }>,
 ): Promise<number> {
   if (items.length === 0) return 0;
-  const res = await fetchAdmin("POST", "/admin/memory/batch", items) as { captured: number };
+  const res = expectShapeOr(await fetchAdmin("POST", "/admin/memory/batch", items), isCaptured, {
+    captured: 0,
+  });
   return res.captured;
 }
 
@@ -1032,16 +1089,22 @@ export async function captureMemories(
 export async function recallMemories(
   query: string, limit = 8, layers?: MemoryLayer[],
 ): Promise<Memory[]> {
-  return fetchAdmin("POST", "/admin/memory/recall", { query, limit, layers: layers ?? null }) as Promise<Memory[]>;
+  return fetchAdminAs("POST", "/admin/memory/recall", arrayOf(isMemory), {
+    query,
+    limit,
+    layers: layers ?? null,
+  });
 }
 
 export async function listMemories(layer?: MemoryLayer | null, limit = 200): Promise<Memory[]> {
   const qs = layer ? `?layer=${layer}&limit=${limit}` : `?limit=${limit}`;
-  return fetchAdmin("GET", `/admin/memory${qs}`) as Promise<Memory[]>;
+  return fetchAdminAs("GET", `/admin/memory${qs}`, arrayOf(isMemory));
 }
 
 export async function forgetMemory(id: string): Promise<boolean> {
-  const res = await fetchAdmin("DELETE", `/admin/memory/${id}`) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("DELETE", `/admin/memory/${id}`), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
@@ -1052,23 +1115,29 @@ export async function forgetMemory(id: string): Promise<boolean> {
  * Rejects on a pinned or L3 row — §6.4.5 forbids quietly replacing either.
  */
 export async function supersedeMemory(old: string, newId: string): Promise<boolean> {
-  const res = await fetchAdmin("POST", "/admin/memory/supersede", { old, new: newId }) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("POST", "/admin/memory/supersede", { old, new: newId }), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
 /** §6.4.3: undo a supersession. The row was never deleted, so this makes it reachable again. */
 export async function unsupersedeMemory(id: string): Promise<boolean> {
-  const res = await fetchAdmin("POST", `/admin/memory/${id}/unsupersede`) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/unsupersede`), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
 /** §6.4.5: what the Memory screen has to put in front of a human. */
 export async function memoryConflicts(): Promise<MemoryConflict[]> {
-  return fetchAdmin("GET", "/admin/memory/conflicts") as Promise<MemoryConflict[]>;
+  return fetchAdminAs("GET", "/admin/memory/conflicts", arrayOf(isMemoryConflict));
 }
 
 export async function setMemoryPinned(id: string, pinned: boolean): Promise<boolean> {
-  const res = await fetchAdmin("POST", `/admin/memory/${id}/pin`, { pinned }) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/pin`, { pinned }), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
@@ -1093,13 +1162,17 @@ export async function assignMemoryScope(
     scope.kind === "project"
       ? { kind: "project", project: scope.project, agent: scope.agent ?? null }
       : { kind: scope.kind, project: null, agent: null };
-  const res = await fetchAdmin("POST", `/admin/memory/${id}/scope`, payload) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("POST", `/admin/memory/${id}/scope`, payload), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
 /** Rewrite one memory's text. The layer is left alone — promotion is the caller's call. */
 export async function updateMemory(id: string, text: string): Promise<boolean> {
-  const res = await fetchAdmin("PUT", `/admin/memory/${id}`, { text }) as { ok: boolean };
+  const res = expectShapeOr(await fetchAdmin("PUT", `/admin/memory/${id}`, { text }), isOk, {
+    ok: false,
+  });
   return res.ok;
 }
 
@@ -1110,7 +1183,7 @@ export async function updateMemory(id: string, text: string): Promise<boolean> {
 export async function sessionMemories(
   sessionId: string, layer: MemoryLayer, limit = 200,
 ): Promise<Memory[]> {
-  return fetchAdmin("GET", `/admin/memory/session/${sessionId}?layer=${layer}&limit=${limit}`) as Promise<Memory[]>;
+  return fetchAdminAs("GET", `/admin/memory/session/${sessionId}?layer=${layer}&limit=${limit}`, arrayOf(isMemory));
 }
 
 export async function clearMemories(): Promise<void> {
@@ -1118,7 +1191,7 @@ export async function clearMemories(): Promise<void> {
 }
 
 export async function memoryStats(): Promise<MemoryStats> {
-  return fetchAdmin("GET", "/admin/memory/stats") as Promise<MemoryStats>;
+  return fetchAdminAs("GET", "/admin/memory/stats", isMemoryStats);
 }
 
 // ---------- capture queue (§3.3) ----------
@@ -1188,7 +1261,7 @@ export interface MemoryPruneStats {
 
 /** §6.2 retention for memories: L0 TTL + per-session ring, L1/L2 decay. Pinned and L3 are exempt. */
 export async function pruneMemories(): Promise<MemoryPruneStats> {
-  return fetchAdmin("POST", "/admin/memory/prune") as Promise<MemoryPruneStats>;
+  return fetchAdminAs("POST", "/admin/memory/prune", isMemoryPruneStats);
 }
 
 /** Live-context retention: turn ring per session, TTL on turns, TTL on idle sessions. */
@@ -1201,7 +1274,7 @@ export interface LiveContextPruneStats {
 export async function pruneLiveContext(): Promise<LiveContextPruneStats> {
   // `POST /admin/context/prune` bounds `live_context`; `POST /admin/memory/prune` above bounds
   // `memories`. Two routes because the retention policies are unrelated.
-  return (await fetchAdmin("POST", "/admin/context/prune")) as LiveContextPruneStats;
+  return await fetchAdminAs("POST", "/admin/context/prune", isLiveContextPruneStats);
 }
 
 /**
@@ -1216,7 +1289,7 @@ export interface PrincipalRow {
 }
 
 export async function memoryPrincipalList(): Promise<PrincipalRow[]> {
-  return fetchAdmin("GET", "/admin/memory/principals") as Promise<PrincipalRow[]>;
+  return fetchAdminAs("GET", "/admin/memory/principals", arrayOf(isPrincipalRow));
 }
 
 /**
@@ -1232,9 +1305,11 @@ export async function setMemoryPrincipal(
   principal: string,
   enabled: boolean | null,
 ): Promise<boolean> {
-  const res = (await fetchAdmin("POST", "/admin/memory/principals", { principal, enabled })) as {
-    ok: boolean;
-  };
+  const res = expectShapeOr(
+    await fetchAdmin("POST", "/admin/memory/principals", { principal, enabled }),
+    isOk,
+    { ok: false },
+  );
   return res.ok;
 }
 
@@ -1247,14 +1322,18 @@ export async function setMemoryPrincipal(
  * route is what makes the toggle follow the listener in use.
  */
 export async function gatewayMemoryEnabled(): Promise<boolean> {
-  const res = (await fetchAdmin("GET", "/admin/memory/enabled")) as { enabled: boolean };
+  const res = expectShapeOr(await fetchAdmin("GET", "/admin/memory/enabled"), isEnabledFlag, {
+    enabled: false,
+  });
   return res.enabled;
 }
 
 export async function setGatewayMemoryEnabled(enabled: boolean): Promise<boolean> {
-  const res = (await fetchAdmin("POST", "/admin/memory/enabled", { enabled })) as {
-    enabled: boolean;
-  };
+  const res = expectShapeOr(
+    await fetchAdmin("POST", "/admin/memory/enabled", { enabled }),
+    isEnabledFlag,
+    { enabled: false },
+  );
   return res.enabled;
 }
 
@@ -1286,7 +1365,7 @@ export async function gatewayStatus(): Promise<GatewayStatus> {
 }
 
 export async function gatewaySpendStatus(): Promise<GatewaySpendStatus> {
-  return fetchAdmin("GET", "/admin/spend") as Promise<GatewaySpendStatus>;
+  return fetchAdminAs("GET", "/admin/spend", isGatewaySpendStatus);
 }
 
 /** The login-item service: launchd's word on whether the agent is installed and up. */
@@ -1461,7 +1540,9 @@ export async function driftEventsList(limit?: number): Promise<DriftEventEntry[]
  * every launch looked like a bug rather than a policy.
  */
 export async function gatewayToolsEnabled(): Promise<boolean> {
-  const res = await fetchAdmin("GET", "/admin/tools") as { enabled: boolean };
+  const res = expectShapeOr(await fetchAdmin("GET", "/admin/tools"), isEnabledFlag, {
+    enabled: false,
+  });
   return res.enabled;
 }
 
@@ -1470,7 +1551,9 @@ export async function setGatewayToolsEnabled(enabled: boolean): Promise<void> {
 }
 
 export async function gatewayMutationEnabled(): Promise<boolean> {
-  const res = await fetchAdmin("GET", "/admin/tools") as { mutationEnabled: boolean };
+  const res = expectShapeOr(await fetchAdmin("GET", "/admin/tools"), isMutationFlag, {
+    mutationEnabled: false,
+  });
   return res.mutationEnabled;
 }
 
@@ -1499,11 +1582,10 @@ export interface GatewaySettings {
 export async function readGatewaySettings(): Promise<GatewaySettings> {
   const raw = await invoke<string | null>("settings_get", { key: "gateway" });
   if (!raw) return {};
-  try {
-    return JSON.parse(raw) as GatewaySettings;
-  } catch {
-    return {}; // a corrupt row must not take a screen down
-  }
+  // `parseHostJsonOr` keeps the existing contract, a corrupt row must not take a screen down,
+  // and adds the shape check the `as` skipped: `{ port: "8800" }` used to arrive typed as a
+  // number and reach the URL builder (audit M8).
+  return parseHostJsonOr(raw, isGatewaySettings, {}, "the `gateway` settings row");
 }
 
 /**
@@ -1566,7 +1648,11 @@ export async function importConfig(text: string): Promise<{ providers: number; k
   const { validateImport } = await import("@aiprovider/router-core");
   const report = validateImport(text);
   if (!report.ok) throw new Error(report.errors.join(" · "));
-  const applied = await invoke<{ providers: number; keys: number }>("config_import", { raw: JSON.parse(text) });
+  // Parsed through the boundary so a paste that is valid JSON but not an object fails with a
+  // named message rather than an `undefined` reaching the host (audit M3).
+  const applied = await invoke<{ providers: number; keys: number }>("config_import", {
+    raw: parseHostJson(text, isObj, "the imported config"),
+  });
   await refreshFromHost(); // registry now holds drafts + invalid keys (re-enter-key flow)
   return applied;
 }

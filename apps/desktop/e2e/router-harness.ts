@@ -3,7 +3,7 @@
  *
  * This is apps/desktop/src/store.ts with the Tauri host swapped for in-memory equivalents:
  * the real fetch-based HostHttp stands in for the Rust egress commands, and an in-memory
- * keychain stands in for the OS keyring. Everything above the ports — registry, adapter
+ * vault stands in for the vault. Everything above the ports — registry, adapter
  * runtime, catalog, ledger, router — is the production wiring, unchanged.
  *
  * The write-through actions mirror store.ts one-for-one minus the `invoke(...)` persistence
@@ -26,12 +26,12 @@ import {
 import { HostHttp, type EgressAuditEntry } from "./host-http.js";
 import { isConclusive, verdictFor } from "../src/lib/keys/verdict.js";
 
-/** In-memory keychain + the ref->provider join the Rust host does in SQLite. */
+/** In-memory vault + the ref->provider join the Rust host does in SQLite. */
 class HarnessVault implements KeyVaultPort {
   private readonly secrets = new Map<string, string>();
 
   async put(label: string, secret: string): Promise<string> {
-    // Mirrors the §4 keychain account format `key:<keyId>` (registry.addKey passes that label).
+    // Mirrors the §4 vault account format `key:<keyId>` (registry.addKey passes that label).
     this.secrets.set(label, secret);
     return label;
   }

@@ -54,5 +54,10 @@ export {
   type ConfigExport, type ExportProviderRow, type ExportKeyRow, type ExportManifestRow,
   type ExportAliasRow, type ExportSettingRow, type ImportReport,
 } from "./config.js";
-export { normalizeGatewayRequest, ensureToolCallIds, fixMissingToolResponses, stripOrphanedToolResults, sanitizeOpenAITools, type NormalizeOptions } from "./gateway-normalizer.js";
-export { detectClient, type ClientHint } from "./gateway-client-detector.js";
+// `gateway-normalizer.ts` and `gateway-client-detector.ts` are deliberately **not** re-exported.
+// Both were ported to Rust (`core/gateway_normalizer.rs`) and the port is what serves requests —
+// `core/router_bridge.rs` is the call site — so the TypeScript is kept only as the frozen reference
+// the port is measured against. Nothing in this repo imports either module except its own spec, and
+// they were re-exported here until 2026-09-27. An export with no importer is a promise the package
+// cannot keep: a consumer reaching for one would have been reaching for code no request path runs.
+// See the module header of `gateway-normalizer.ts` before changing anything in either file.

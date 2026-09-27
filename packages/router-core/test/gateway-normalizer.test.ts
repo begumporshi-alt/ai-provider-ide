@@ -1,6 +1,6 @@
 /**
- * Gateway normalizer tests (Phase 1 of gateway-flexibility plan).
- * Pure-function unit tests — no network, no I/O.
+ * Gateway normalizer tests — the frozen reference's own spec; see the module header for why this
+ * module is not on a production path. Pure functions, no I/O. Cited by line number — do not reflow.
  */
 import { describe, expect, it } from "vitest";
 // `fixMissingToolResponses` / `stripOrphanedToolResults` are covered through

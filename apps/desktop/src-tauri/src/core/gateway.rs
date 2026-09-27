@@ -45,14 +45,14 @@ pub const MAX_QUEUED: usize = 32;
 const MAX_TOTAL: usize = MAX_CONCURRENT + MAX_QUEUED;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
-/// OS keychain. Production passes the vault-backed closure.
+/// OS vault. Production passes the vault-backed closure.
 pub type KeyProvider = Arc<dyn Fn() -> Option<String> + Send + Sync + 'static>;
 
 /// R4: one active per-app key — its stable id *and* its secret.
 ///
 /// The secret is what auth compares. The id is what the memory layer needs (§4a: a principal has
 /// to be nameable by the operator). Returning both from one read is the whole reason identity is
-/// affordable at all: the provider costs one keychain round-trip per key, so a second call that
+/// affordable at all: the provider costs one vault round-trip per key, so a second call that
 /// asked only "which id was that secret?" would double the cost of every request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppKey {
@@ -61,7 +61,7 @@ pub struct AppKey {
     pub secret: String,
 }
 
-/// R4: active per-app keys (keychain-backed). Returns only NON-revoked keys, so
+/// R4: active per-app keys (vault-backed). Returns only NON-revoked keys, so
 /// revocation takes effect on the very next request without rotating anything else.
 pub type AppKeyProvider = Arc<dyn Fn() -> Vec<AppKey> + Send + Sync + 'static>;
 
@@ -134,9 +134,10 @@ pub fn vault_key_provider() -> KeyProvider {
 
 /// How long a request waits for the master key before answering without it.
 ///
-/// The lookup is a macOS keychain read, and that call can block *indefinitely*: when the item's
-/// ACL no longer matches the app's code signature — which is what every reinstall produces — the
-/// Security framework raises a SecurityAgent prompt and waits for a human. Unbounded, that does
+/// The lookup reads `<data_dir>/.secrets.json`, and that read can block *indefinitely*: `vault::get`
+/// serialises on the in-process `ops` mutex, which a concurrent `put`/`delete` holds across its own
+/// `File::lock` — and that lock waits without a timeout for as long as another process holds it.
+/// A slow or hung data directory blocks the same way. Unbounded, that does
 /// not fail one request, it wedges the entire HTTP surface: the listener keeps accepting
 /// connections and never answers one, and nothing is logged because the failure is a hang rather
 /// than an error. Bounded, it degrades to a 503 on the requests that need the key.
@@ -144,7 +145,7 @@ const MASTER_KEY_WAIT: Duration = Duration::from_millis(1500);
 
 /// Outcome of a master-key lookup.
 ///
-/// `Unavailable` is deliberately distinct from `Absent`. The first means "the keychain did not
+/// `Unavailable` is deliberately distinct from `Absent`. The first means "the vault did not
 /// answer"; the second means "no key has been configured". Collapsing them would tell a
 /// correctly-configured client that its key is wrong.
 #[derive(Debug, PartialEq, Eq)]
@@ -164,18 +165,17 @@ struct CacheState {
     loading: bool,
 }
 
-/// A cached, bounded, single-flight wrapper around the raw keychain lookup.
+/// A cached, bounded, single-flight wrapper around the raw vault lookup.
 ///
 /// Each property fixes a different half of the same bug:
-/// - **Cached** — the keychain is read once, not once per request. The old code re-read it on
+/// - **Cached** — the vault is read once, not once per request. The old code re-read it on
 ///   every request precisely so rotation would take effect immediately; `invalidate()` keeps that
 ///   guarantee by stamping each value with a generation that rotation bumps.
-/// - **Bounded** — no caller waits longer than `wait`, so a stalled keychain cannot hang the
+/// - **Bounded** — no caller waits longer than `wait`, so a stalled vault cannot hang the
 ///   request path.
-/// - **Single-flight** — concurrent callers share one in-flight load, so a stuck keychain occupies
+/// - **Single-flight** — concurrent callers share one in-flight load, so a stuck vault occupies
 ///   one thread instead of one per request. That thread is abandoned deliberately: nothing can
-///   cancel a blocking `SecKeychainFindGenericPassword`, and it frees itself once the prompt is
-///   answered.
+///   cancel a blocking `vault::get`, and it frees itself once the holder releases it.
 struct MasterKeyCache {
     inner: KeyProvider,
     wait: Duration,
@@ -197,7 +197,7 @@ impl MasterKeyCache {
         }
     }
 
-    /// Force the next `get` to re-read the keychain. Call after writing or deleting the key.
+    /// Force the next `get` to re-read the vault. Call after writing or deleting the key.
     fn invalidate(&self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
     }
@@ -224,7 +224,7 @@ impl MasterKeyCache {
                 let inner = Arc::clone(&self.inner);
                 let shared = Arc::clone(&self.shared);
                 std::thread::spawn(move || {
-                    // The only call that may block on the keychain, and never on a request path.
+                    // The only call that may block on the vault, and never on a request path.
                     let found = inner();
                     let (lock, ready) = &*shared;
                     let mut state = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -252,10 +252,10 @@ fn resolve(value: &Option<String>) -> MasterKeyLookup {
     }
 }
 
-/// Keychain account prefix for a per-app gateway key (audit R4).
+/// Vault account prefix for a per-app gateway key (audit R4).
 pub const APP_KEY_PREFIX: &str = "gwkey:";
 
-/// R4: secrets of every non-revoked per-app key, read from the keychain. Metadata (label,
+/// R4: secrets of every non-revoked per-app key, read from the vault. Metadata (label,
 /// revocation, last-used) lives in SQLite — see `persist.rs`.
 pub fn vault_app_key_provider(store: Arc<crate::core::store::Store>) -> AppKeyProvider {
     Arc::new(move || {
@@ -269,23 +269,23 @@ pub fn vault_app_key_provider(store: Arc<crate::core::store::Store>) -> AppKeyPr
     })
 }
 
-/// How long the memoised app-key map may be replayed without re-reading the keychain.
+/// How long the memoised app-key map may be replayed without re-reading the vault.
 ///
 /// This is a **backstop, not the primary invalidation**. The primary one is the active-key set
 /// (see `AppKeyCache`), which is re-read from SQLite on every request precisely so that creating
 /// and revoking a key still take effect on the very next call — the contract the provider's own
 /// comment promises. The TTL covers the one case SQLite cannot see: a secret changed or deleted
-/// in the keychain underneath an active row.
+/// in the vault underneath an active row.
 const APP_KEY_CACHE_TTL: Duration = Duration::from_secs(60);
 
 /// Memo over `app_key_provider`.
 ///
-/// Needed because the provider is one keychain read per key, and that call can block *indefinitely*
-/// on a macOS SecurityAgent prompt — see `MASTER_KEY_WAIT`. Uncached, a gateway with N app keys
-/// takes N blocking calls per request, so one stale keychain ACL stops the whole HTTP surface.
+/// Needed because the provider is one vault read per key, and that read can block *indefinitely*
+/// on the writer lock — see `MASTER_KEY_WAIT`. Uncached, a gateway with N app keys
+/// takes N blocking calls per request, so one stalled writer stops the whole HTTP surface.
 ///
 /// Keyed on the active **`(id, created_at)` stamps** rather than on time alone: those are read
-/// fresh from SQLite each request (one indexed scan, no keychain), so create and revoke invalidate
+/// fresh from SQLite each request (one indexed scan, no vault), so create and revoke invalidate
 /// the memo immediately. Keying on a bare TTL instead would have quietly broken revocation, which
 /// today takes effect on the very next request.
 ///
@@ -717,13 +717,13 @@ pub struct GatewayCore {
     failures: Mutex<HashMap<IpAddr, (u32, Instant)>>,
     bridge: Arc<dyn Bridge>,
     /// Bounded, cached, single-flight wrapper around the injected master-key lookup. Request paths
-    /// must go through this and never touch the keychain directly — see `MasterKeyCache`.
+    /// must go through this and never touch the vault directly — see `MasterKeyCache`.
     master_key: MasterKeyCache,
     /// R4: optional per-app key secrets. `None` = master key only (all existing tests).
     /// Behind a Mutex so it can be swapped after create/revoke without rebuilding the core.
     app_key_provider: Mutex<Option<AppKeyProvider>>,
     /// Memo over `app_key_provider` — see `AppKeyCache`. Without it, resolving a presented key
-    /// back to its id would cost a keychain read per key *per request*.
+    /// back to its id would cost a vault read per key *per request*.
     app_key_cache: Mutex<AppKeyCache>,
     /// R4: optional monthly spend gate. `None` = uncapped (all existing tests).
     spend_provider: Mutex<Option<SpendProvider>>,
@@ -886,7 +886,7 @@ impl GatewayCore {
         }
     }
 
-    /// Drop the cached master key so the next request re-reads the keychain.
+    /// Drop the cached master key so the next request re-reads the vault.
     ///
     /// Call this after writing or deleting the key. Caching the key would otherwise silently
     /// break rotation: the old key would keep working until the cache aged out, and
@@ -898,7 +898,7 @@ impl GatewayCore {
     /// Master-key state for the status surface.
     ///
     /// Goes through the bounded cache for the same reason requests do: `gateway_status` is polled
-    /// by the UI, and a raw keychain read here froze the Gateway screen whenever the keychain
+    /// by the UI, and a raw vault read here froze the Gateway screen whenever the vault
     /// stalled. Note the cache keeps its last value across a stall, so a key read once stays
     /// reported as present.
     pub fn master_key_state(&self) -> MasterKeyLookup {
@@ -907,7 +907,7 @@ impl GatewayCore {
 
     /// Rotate the master key, dropping the cached one as part of the same operation.
     ///
-    /// One method rather than two calls on purpose: a caller that wrote the keychain and forgot
+    /// One method rather than two calls on purpose: a caller that wrote the vault and forgot
     /// to invalidate would leave the old key working, silently. Returns the new key for one-time
     /// display (§3.3); the webview never sees it (invariant 10).
     pub fn rotate_master_key(&self) -> Result<String, String> {
@@ -949,11 +949,11 @@ impl GatewayCore {
     /// Returns empty when no provider is attached, so the master-key-only path costs nothing.
     pub fn app_keys(&self) -> Vec<AppKey> {
         // Clone the Arc out of the lock before calling it — never hold a mutex across a
-        // keychain read (which can block on a macOS security prompt).
+        // vault read (which can block on a macOS security prompt).
         let Some(provider) = self.app_key_provider.lock().ok().and_then(|g| g.clone()) else {
             return Vec::new();
         };
-        // Cheap and authoritative: one indexed SQLite scan, no keychain.
+        // Cheap and authoritative: one indexed SQLite scan, no vault.
         let active = self
             .store
             .as_ref()
@@ -1005,7 +1005,7 @@ impl GatewayCore {
     /// actually hand out, so leaving it unnameable would mean the busiest caller could never be
     /// governed: traffic presenting it with no `AIP-Agent` label would have no identity at all and
     /// would inherit whatever the operator had decided for everyone else. Cost is nil — the master
-    /// key is already cached, so this is a comparison against a value in memory, never a keychain
+    /// key is already cached, so this is a comparison against a value in memory, never a vault
     /// read.
     pub fn key_principal_for(&self, presented: &str) -> Option<String> {
         if presented.is_empty() {
@@ -1504,10 +1504,12 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
 /// `Err(response)` denies; `Ok(app_key_id)` allows — `Some` naming the per-app key that
 /// authenticated, `None` meaning the master key did.
 ///
-/// The master key comes from a bounded cache that `gateway_key_generate` / `gateway_key_revoke`
-/// invalidate, so rotation still kills the old key on the very next request (§3.3, criterion 8)
-/// — but without a keychain read per request. That read can block indefinitely, and unbounded it
-/// takes the entire HTTP surface down with it. Per-app keys are still read per request.
+/// **Async because two of its steps touch the database.** The master key comes from a bounded
+/// cache that `gateway_key_generate` / `gateway_key_revoke` invalidate, so rotation still kills the
+/// old key on the very next request (§3.3, criterion 8) — but without a vault read per request.
+/// The per-app key scan and the spend gate are *not* cached, so both are resolved on the blocking
+/// pool (`app_keys_blocking`, `spend_gate_blocking`) instead of stalling a reactor thread that
+/// every other in-flight request is queued behind.
 ///
 /// Accepts the master key OR any active per-app key (audit R4). Master is tried first because
 /// it is the common case; per-app secrets are only read when the master does not match, so
@@ -1522,8 +1524,8 @@ fn note_auth_failure(core: &GatewayCore, ip: IpAddr) {
 /// The identity is returned rather than recomputed by the caller: this is the one place that
 /// knows *which* credential matched, and a second lookup elsewhere would be a second authority
 /// free to drift from this one.
-fn check_gateway_key(
-    core: &GatewayCore,
+async fn check_gateway_key(
+    core: &Arc<GatewayCore>,
     headers: &HeaderMap,
     ip: IpAddr,
 ) -> Result<Option<String>, GateRefusal> {
@@ -1567,8 +1569,8 @@ fn check_gateway_key(
     if !matched {
         // R4: per-app key. Every comparison is constant-time, and we deliberately do NOT break
         // early on a match that is followed by more keys (no length/first-byte oracle).
-        // `app_keys` memoises the keychain reads, so this is not N of them per request.
-        for k in core.app_keys() {
+        // `app_keys` memoises the vault reads, so this is not N of them per request.
+        for k in app_keys_blocking(core).await {
             if constant_time_eq(presented, &k.secret) {
                 matched = true;
                 matched_app = Some(k.id);
@@ -1579,7 +1581,7 @@ fn check_gateway_key(
         core.failures.lock().unwrap().remove(&ip);
         // The identity is passed, not just the fact of authentication: a per-app cap can only be
         // enforced against the app that is actually asking. `None` is the master key.
-        if let Some(r) = spend_gate(core, matched_app.as_deref()) {
+        if let Some(r) = spend_gate_blocking(core, matched_app.clone()).await {
             return Err(r);
         }
         return Ok(matched_app);
@@ -1601,6 +1603,37 @@ fn check_gateway_key(
         openai_type: "invalid_request",
         openai_code: Some("invalid_api_key"),
     })
+}
+
+/// The active per-app keys, resolved off the reactor.
+///
+/// `GatewayCore::app_keys` scans `gateway_keys` and, on a memo miss, calls the injected provider —
+/// two blocking calls, on a path every authenticated request walks. The whole call hops to the
+/// blocking pool rather than occupying a reactor thread that other requests are queued behind.
+///
+/// A lost task (panicked or cancelled) yields the empty list, which fails **closed** in the
+/// direction that matters: no candidate matches, so the caller is refused rather than admitted.
+async fn app_keys_blocking(core: &Arc<GatewayCore>) -> Vec<AppKey> {
+    let core = Arc::clone(core);
+    tokio::task::spawn_blocking(move || core.app_keys()).await.unwrap_or_default()
+}
+
+/// The spend gate, evaluated off the reactor. The policy itself is `spend_gate`'s.
+///
+/// `spend_gate` answers `None` for both "no provider attached" (uncapped) and "within budget", so
+/// the join of the two `Result` layers has to preserve that: a lost task is *not* a refusal.
+/// Failing open is the safe direction here rather than the lax one — the alternative is refusing
+/// every request because a blocking task was dropped — and in release (`panic = "abort"`) a panic
+/// in that task ends the process instead of reaching this arm at all.
+async fn spend_gate_blocking(
+    core: &Arc<GatewayCore>,
+    app_key_id: Option<String>,
+) -> Option<GateRefusal> {
+    let core = Arc::clone(core);
+    tokio::task::spawn_blocking(move || spend_gate(&core, app_key_id.as_deref()))
+        .await
+        .ok()
+        .flatten()
 }
 
 /// R4: deny once a spend limit has been reached. Checked *after* auth so the caps (and the
@@ -1906,11 +1939,11 @@ pub fn copy_text(text: &str) -> Result<(), String> {
     cb.set_text(text.to_string()).map_err(|e| e.to_string())
 }
 
-/// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the keychain, return it
+/// Generate a fresh master key (`sk-aip-` + 32 hex), store it in the vault, return it
 /// exactly once for display (§3.3).
 ///
 /// Private deliberately. Rotation must go through `GatewayCore::rotate_master_key`, which drops
-/// the cached key as part of the same operation. A caller that wrote the keychain without
+/// the cached key as part of the same operation. A caller that wrote the vault without
 /// invalidating the cache would leave the OLD key working — silently, with no failing test,
 /// because the write itself succeeds.
 fn generate_master_key() -> Result<String, String> {

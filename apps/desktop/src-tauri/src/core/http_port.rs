@@ -3,7 +3,7 @@
 //!
 //! **Its own module, and the reason is the dependency direction.** `egress.rs` will implement this
 //! trait; `interpreter.rs` consumes it. Put the trait in `egress.rs` and the interpreter has to
-//! depend on the whole egress — the allowlist, the pairing database, the keychain vault — to name a
+//! depend on the whole egress — the allowlist, the pairing database, the vault — to name a
 //! type it only ever calls two methods on. Put it in `interpreter.rs` and egress has to depend on
 //! the interpreter, which is backwards: a host does not know what an adapter is. The trait sits
 //! between them and neither side names the other. It is the same split `adapter.rs` took, for the
@@ -46,7 +46,7 @@
 //!   (`egress.rs:235-239`), so a third variant here would be a variant no implementation may serve.
 //! - **No `StorePort` or `KeyVaultPort` counterpart.** Both are `throw`-only stubs on the
 //!   TypeScript side (`ipc-client.ts:196-224`) because the webview is key-blind and does not own
-//!   SQL. In Rust the host *is* the process holding the keychain and the database, so there is
+//!   SQL. In Rust the host *is* the process holding the vault and the database, so there is
 //!   nothing to port — the absence is the point.
 
 use std::collections::BTreeMap;
@@ -73,7 +73,7 @@ pub struct HttpRequest {
     pub headers: BTreeMap<String, String>,
     /// The serialised request body, when the call has one.
     pub body: Option<String>,
-    /// The keychain reference the host resolves, or `None` for a call that carries no secret.
+    /// The vault reference the host resolves, or `None` for a call that carries no secret.
     pub secret_ref: Option<String>,
     /// Ask for a line stream rather than a materialised body.
     ///

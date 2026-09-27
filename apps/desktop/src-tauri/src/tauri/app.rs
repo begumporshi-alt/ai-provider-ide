@@ -30,7 +30,7 @@ fn initial_allow_hosts(store: &store::Store) -> std::collections::HashSet<String
     hosts
 }
 
-/// §4 startup hygiene: probe every key's secret_ref against the keychain; on a miss mark the
+/// §4 startup hygiene: probe every key's secret_ref against the vault; on a miss mark the
 /// key 'invalid' so the Providers screen can run the re-enter-key flow (audit H7). The raw
 /// secret is never read out — only existence is checked, host-side.
 fn probe_key_refs(store: &store::Store) {
@@ -140,7 +140,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // L0 services: OS keychain (via keyring), egress gateway, sql-store.
+            // L0 services: the file vault, egress gateway, sql-store.
             //
             // Every step below is marked in `gateway.log` rather than `tracing`. A release GUI
             // build has no console, and a *hang* in this closure is worse than a failure: the
@@ -248,7 +248,7 @@ pub fn run() {
                     // a key would therefore be a surface that looks healthy and serves nothing,
                     // which is worse than no surface at all.
                     //
-                    // `Absent` only, never `Unavailable`: the second means the keychain did not
+                    // `Absent` only, never `Unavailable`: the second means the vault did not
                     // answer, and generating there would rotate a key that already exists.
                     if let Some(state) = handle
                         .try_state::<std::sync::Arc<crate::tauri::gateway_cmds::GatewayState>>()

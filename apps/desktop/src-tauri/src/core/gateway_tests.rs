@@ -269,7 +269,7 @@ fn gateway_test_store(tag: &str) -> (Arc<crate::core::store::Store>, std::path::
     (Arc::new(crate::core::store::Store::open(&dir).unwrap()), dir)
 }
 
-/// Key provider backed by a mutable slot — simulates rotate/revoke without the keychain.
+/// Key provider backed by a mutable slot — simulates rotate/revoke without the vault.
 fn test_core(key: Arc<Mutex<Option<String>>>) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
     let bridge = Arc::new(SynthBridge::new());
     let core =
@@ -352,7 +352,7 @@ async fn criterion8_rotation_kills_old_key_instantly() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    // rotate (overwrite keychain slot) — and drop the cached key, exactly as
+    // rotate (overwrite vault slot) — and drop the cached key, exactly as
     // `GatewayCore::rotate_master_key` does. The two steps are one operation in production
     // precisely so this cannot be half-done.
     *key.lock().unwrap() = Some("sk-aip-new".to_string());
@@ -1241,7 +1241,7 @@ async fn r4_unknown_key_still_rejected() {
 // ---------- §4a: app-key principal (deferred from Phase 1) ----------
 //
 // The design blocked this on "a cached id→secret map" because otherwise resolving a presented
-// key back to its id costs one keychain read per key *per request*. These tests pin the cache
+// key back to its id costs one vault read per key *per request*. These tests pin the cache
 // and, more importantly, that the cache does not break revocation.
 
 /// A core with a real store and a provider shaped like the vault-backed one: it filters by
@@ -1272,7 +1272,7 @@ fn key_core(
     (core, reads, dir)
 }
 
-/// The property the design was waiting for: N requests do not mean N keychain passes.
+/// The property the design was waiting for: N requests do not mean N vault passes.
 #[test]
 fn the_app_key_map_is_read_once_not_once_per_request() {
     let (core, reads, dir) = key_core("memo", &[("ak-1", "sk-aip-app1")]);
@@ -1280,7 +1280,7 @@ fn the_app_key_map_is_read_once_not_once_per_request() {
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
     assert_eq!(core.app_keys().len(), 1);
-    assert_eq!(reads.load(Ordering::SeqCst), 1, "three requests, one keychain pass");
+    assert_eq!(reads.load(Ordering::SeqCst), 1, "three requests, one vault pass");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -1315,7 +1315,7 @@ fn creating_a_key_invalidates_the_memo_on_the_next_request() {
 }
 
 /// The TTL is the backstop for the one case SQLite cannot see: a secret removed from the
-/// keychain out from under an active row. An expired memo must not be served.
+/// vault out from under an active row. An expired memo must not be served.
 #[test]
 fn the_memo_stops_being_served_once_its_ttl_expires() {
     let (core, reads, dir) = key_core("ttl", &[("ak-1", "sk-aip-app1")]);
@@ -1335,17 +1335,17 @@ fn the_memo_stops_being_served_once_its_ttl_expires() {
 /// its own `Bearer` token. A test that hands itself a credential cannot discover that its caller has
 /// none — and once the credential existed, the same gap moved: the mint was tested, the *acceptance*
 /// was not. So this one walks the real path end to end: mint through `ensure_with`, read the secret
-/// back out of the injected keychain the way `vault_app_key_provider` would, and present it.
+/// back out of the injected vault the way `vault_app_key_provider` would, and present it.
 #[test]
 fn the_ui_session_credential_authenticates_at_the_gate() {
     let dir = std::env::temp_dir().join(format!("aip-uisession-gate-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
 
-    // The keychain, injected: `vault::put` needs a real OS keychain CI does not have, and a test
-    // that skipped it would prove the mint without proving anyone can read the secret back.
-    let keychain: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
-    let (k1, k2) = (keychain.clone(), keychain.clone());
+    // The vault, injected: `vault::put` touches the real secrets file, which a test must not, and a
+    // test that skipped it would prove the mint without proving anyone can read the secret back.
+    let vault: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(HashMap::new()));
+    let (k1, k2) = (vault.clone(), vault.clone());
     let secret = crate::core::ui_session::ensure_with(
         &store,
         &move |account: &str| k1.lock().unwrap().get(account).cloned(),
@@ -1354,11 +1354,11 @@ fn the_ui_session_credential_authenticates_at_the_gate() {
             Ok(())
         },
     )
-    .expect("the mint must succeed with a working keychain");
+    .expect("the mint must succeed with a working vault");
 
     // A core whose provider is the production shape — active ids from SQLite, secrets from the
-    // keychain — with only the OS call replaced.
-    let (s2, kc) = (store.clone(), keychain.clone());
+    // vault — with only the vault call replaced.
+    let (s2, kc) = (store.clone(), vault.clone());
     let core = Arc::new(
         GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("sk-aip-master".into())))
             .with_app_keys(Arc::new(move || {
@@ -2154,7 +2154,7 @@ async fn a_silent_worker_fails_the_request_instead_of_hanging() {
 }
 
 /// A running server whose master-key lookup and key wait the test supplies, so a stalled
-/// keychain can be reproduced and the number of lookups counted.
+/// vault can be reproduced and the number of lookups counted.
 async fn start_with_key_lookup(lookup: KeyProvider, wait: Duration) -> TestServer {
     let bridge = Arc::new(SynthBridge::new());
     let core = Arc::new(GatewayCore::new_with_key_wait(bridge.clone(), lookup, wait));
@@ -2169,15 +2169,16 @@ async fn start_with_key_lookup(lookup: KeyProvider, wait: Duration) -> TestServe
     }
 }
 
-/// A keychain that never answers must not take the HTTP surface with it.
+/// A vault that never answers must not take the HTTP surface with it.
 ///
-/// This is what a reinstall produces: it invalidates the item's ACL, so the next read waits on
-/// a SecurityAgent prompt. The read used to happen inline on every request with no bound, so
-/// one stalled keychain wedged everything — the listener kept accepting connections and never
-/// answered one, `/v1/models` included, with nothing logged because the failure was a hang
+/// The vault can stall for real: `vault::get` serialises on the in-process `ops` mutex, which a
+/// concurrent `put`/`delete` holds across a blocking `File::lock`, and a cold read on an
+/// unresponsive data directory blocks too. The read used to happen inline on every request with no
+/// bound, so one stalled lookup wedged everything — the listener kept accepting connections and
+/// never answered one, `/v1/models` included, with nothing logged because the failure was a hang
 /// rather than an error.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stalled_keychain_answers_503_instead_of_hanging() {
+async fn a_stalled_vault_answers_503_instead_of_hanging() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let s = start_with_key_lookup(
@@ -2199,7 +2200,7 @@ async fn a_stalled_keychain_answers_503_instead_of_hanging() {
             .send(),
     )
     .await
-    .expect("the gateway must answer while the keychain is stalled — it hung instead")
+    .expect("the gateway must answer while the vault is stalled — it hung instead")
     .expect("request failed");
     let elapsed = started.elapsed();
 
@@ -2210,11 +2211,11 @@ async fn a_stalled_keychain_answers_503_instead_of_hanging() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "a stalled keychain must not be re-read once per request"
+        "a stalled vault must not be re-read once per request"
     );
 }
 
-/// The keychain is consulted once, not once per request. Reading it per request was what made
+/// The vault is consulted once, not once per request. Reading it per request was what made
 /// rotation instant, and that is now the cache's generation stamp instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_master_key_is_read_once_not_once_per_request() {
@@ -2239,18 +2240,14 @@ async fn the_master_key_is_read_once_not_once_per_request() {
             .unwrap();
         assert_eq!(res.status(), 200);
     }
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "three requests must not mean three keychain reads"
-    );
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "three requests must not mean three vault reads");
 }
 
-/// Concurrent callers share one in-flight read. Without this, a stalled keychain would park
+/// Concurrent callers share one in-flight read. Without this, a stalled vault would park
 /// one thread per request instead of one in total — and nothing can cancel a blocking
-/// `SecKeychainFindGenericPassword`.
+/// `vault::get`.
 #[tokio::test(flavor = "multi_thread")]
-async fn concurrent_requests_share_a_single_keychain_read() {
+async fn concurrent_requests_share_a_single_vault_read() {
     let calls = Arc::new(AtomicUsize::new(0));
     let seen = calls.clone();
     let s = start_with_key_lookup(
@@ -2275,17 +2272,17 @@ async fn concurrent_requests_share_a_single_keychain_read() {
     assert_eq!(
         calls.load(Ordering::SeqCst),
         1,
-        "eight concurrent requests must share one keychain read"
+        "eight concurrent requests must share one vault read"
     );
 }
 
 /// `Unavailable` and `Absent` must not collapse into each other.
 ///
-/// The first means "the keychain did not answer"; the second means "no key has been
+/// The first means "the vault did not answer"; the second means "no key has been
 /// configured". Both used to be `None`, and the request path reported both as 401 — telling a
 /// correctly-configured client that its credential was wrong.
 #[test]
-fn an_unanswered_keychain_is_not_reported_as_a_missing_key() {
+fn an_unanswered_vault_is_not_reported_as_a_missing_key() {
     let absent = MasterKeyCache::new(Arc::new(|| None), Duration::from_millis(500));
     assert_eq!(absent.get(), MasterKeyLookup::Absent);
 
@@ -3962,8 +3959,8 @@ async fn admin_keys_lists_an_empty_array_on_a_fresh_store() {
     assert_eq!(res.json::<Value>().await.unwrap(), json!([]));
 }
 
-/// Validation runs before the keychain, so this is reachable without one. The happy path is not
-/// tested here: `vault::put` writes to the real OS keychain, which a CI runner has no access to.
+/// Validation runs before the vault, so this is reachable without one. The happy path is not
+/// tested here: `vault::put` writes to the real secrets file, which a CI runner must not.
 #[tokio::test(flavor = "multi_thread")]
 async fn admin_key_create_refuses_a_missing_label() {
     let s = start_with_store().await;

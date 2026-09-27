@@ -42,6 +42,7 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use serde_json::Value;
@@ -330,6 +331,45 @@ pub fn min_retry_after_ms(attempts: &[AttemptOutcome]) -> u64 {
 /// §3.6: how many candidates one request may try when the caller names no budget.
 pub const MAX_ATTEMPTS_DEFAULT: usize = 6;
 
+/// The wall-clock budget for **one whole plan**, across every candidate it may try.
+///
+/// **This is the term that was missing, and its absence is the 2026-09-27 defect.** The egress
+/// layer bounds one attempt (`egress::UPSTREAM_HEADER_TIMEOUT`) and one candidate's retries, but
+/// nothing bounded the *plan* — and `execute_text` walks every candidate the plan offers. With two
+/// candidates that was `2 x 20s = 40s` of worst case against a gateway that abandons the request at
+/// `gateway::FIRST_MSG_TIMEOUT` (30s), so the last candidate was **always** cut off mid-attempt.
+/// The old invariant test pinned only one candidate's budget and so could not see it.
+///
+/// **26s is chosen so the plan is a real bound, not a hope.** Every admitted candidate is funded
+/// for a full `egress::UPSTREAM_HEADER_TIMEOUT` (20s) inside this budget, so nothing admitted can
+/// run past it; and `26s < 30s` leaves 4s for the pre-dispatch work this clock starts after
+/// (memory prepend, routing) plus scheduling slack. The three constants form one ordering —
+/// `20s <= 26s < 30s` — pinned by
+/// `egress::tests::the_plan_budget_fits_inside_the_gateway_bound`.
+///
+/// **Being below the gateway bound is also what makes the failure legible.** When this budget
+/// refuses a candidate the loop ends in [`Ended::Spent`], so the router records the real class
+/// from the attempt chain. Above the gateway bound the request is instead cancelled, and the
+/// router files it as `CANCELLED` — which is how four failed requests on 2026-09-27
+/// (rows 1652/1655/1656/1658, 30 010–30 025 ms) came to look like client aborts.
+pub const PLAN_BUDGET: Duration = Duration::from_secs(26);
+
+/// Whether a candidate may be started, given how long the plan has already run.
+///
+/// **The first candidate is always admitted.** Otherwise a budget smaller than one attempt would
+/// refuse every candidate and turn a slow request into an instant, silent failure — the budget
+/// would stop being a bound and start being an outage. The first candidate is the one that
+/// *defines* the plan's cost; the rule exists to stop the ones after it from overrunning.
+///
+/// **Every later candidate must be fundable in full**, which is what makes [`PLAN_BUDGET`] a bound
+/// rather than a scheduling hint: a candidate admitted here is guaranteed a whole
+/// `egress::UPSTREAM_HEADER_TIMEOUT` inside the budget, so the plan cannot exceed it. The
+/// alternative — admitting a candidate and cutting it short — is strictly worse: it spends the
+/// remaining time to reach a conclusion it already knew it could not reach.
+pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
+    is_first || elapsed + crate::core::egress::UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET
+}
+
 /// How many of a plan's candidates this request may actually try.
 ///
 /// `None` means "the caller named none" and takes [`MAX_ATTEMPTS_DEFAULT`]. `Some(0)` means
@@ -478,6 +518,11 @@ pub enum AttemptDisposition {
 /// reached the consumer the request can neither be retried nor quietly abandoned — the caller
 /// holds partial output, so the only honest end is the error itself. A cancelled stream that had
 /// already produced text therefore *rethrows* rather than stopping.
+///
+/// **`emitted` is folded with a tool-call count at the call site** (`engine.rs:execute_text`):
+/// a delivered tool call also ends failover, because the consumer holds a tool call the next
+/// candidate would re-issue. The predicate's contract is "did the candidate deliver *anything*",
+/// and the caller decides what "anything" counts as.
 pub fn attempt_disposition(emitted: bool, aborted: bool) -> AttemptDisposition {
     if emitted {
         AttemptDisposition::Rethrow
@@ -525,6 +570,11 @@ pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> Att
 /// a dependency between two functions, so
 /// `a_rethrown_failure_is_always_a_drift_class_so_skipping_health_cannot_lose_a_cooldown` states
 /// it rather than leaving it implied.
+///
+/// **A tool-call-then-break is also `Rethrow`** (the call site folds the tool-call count into
+/// `emitted`), and the same invariant covers it: a mid-stream break after a tool call classifies
+/// the same way as one after a chunk — by status and kind, not by what preceded it — so it is
+/// still a drift class.
 pub fn records_key_health(disposition: AttemptDisposition) -> bool {
     !matches!(disposition, AttemptDisposition::Rethrow)
 }
@@ -960,6 +1010,12 @@ pub async fn execute_text(
         Spent,
     }
 
+    // The plan's own clock, and the flag that keeps the *first attempted* candidate exempt from the
+    // budget. Stamped here rather than in the caller because this is the layer that knows how many
+    // candidates there are — see `PLAN_BUDGET`.
+    let plan_started = Instant::now();
+    let mut attempted_any = false;
+
     let ended = 'plan: {
         for candidate in args.plan.into_iter().take(budget) {
             // `:80`, checked *before* the permit is taken — see `candidate_gate`, which states the
@@ -975,6 +1031,20 @@ pub async fn execute_text(
                 attempts.push(labelled(saturated_outcome(), &candidate));
                 continue;
             }
+
+            // **The plan-level admission check, and it sits after the saturation skip on purpose.**
+            // A candidate the limiter skipped was never contacted and cost nothing, so it must not
+            // consume the first-attempt exemption — otherwise a saturated first provider would make
+            // the second one subject to a budget it never spent.
+            //
+            // Ending as `Spent` rather than `Cancelled` is the point: it carries the attempt chain,
+            // so the router records the class the attempts actually produced. Letting the request
+            // run on instead would let the gateway's bound fire first and file the row as
+            // `CANCELLED` — which is what made rows 1652/1655/1656/1658 look like client aborts.
+            if !candidate_is_affordable(plan_started.elapsed(), !attempted_any) {
+                break 'plan Ended::Spent;
+            }
+            attempted_any = true;
 
             // `:90` — a factory rejection lands in the same `catch` as a thrown `generateText`,
             // where it is not a `ManifestHttpError`, so it is `NETWORK`/`0` with no wait.
@@ -993,7 +1063,13 @@ pub async fn execute_text(
                 }
             };
 
+            // **`emitted` is chunk-only, and a tool call is output too.** A break after a tool call
+            // was delivered cannot be retried either — the consumer holds a tool call, not partial
+            // text, but the next candidate re-issuing it would be just as wrong. `tool_calls` counts
+            // what `forward_tool` delivered, and the predicate below folds them: a delivered tool
+            // call ends failover just as a delivered chunk does.
             let mut emitted = false;
+            let mut tool_calls = 0usize;
             let mut broke: Option<AttemptError> = None;
             let refused = {
                 // `:97` — the engine's own `onUsage` does double duty: it fills the box the ledger
@@ -1021,6 +1097,7 @@ pub async fn execute_text(
                 // exists. So the seam did not need changing and the call site did.
                 let mut caller_on_tool_call = args.on_tool_call.as_deref_mut();
                 let mut forward_tool = |tc: ToolCall| {
+                    tool_calls += 1;
                     if let Some(cb) = caller_on_tool_call.as_deref_mut() {
                         cb(tc);
                     }
@@ -1073,9 +1150,11 @@ pub async fn execute_text(
             };
 
             // One handler for both failure shapes, because `attempt_disposition` is what tells them
-            // apart — `emitted` is its whole input, and it is the predicate increment 6 pinned.
+            // apart — a delivered chunk or tool call is its whole input, and it is the predicate
+            // increment 6 pinned (and generalised to tool calls here).
             if let Some(e) = refused.or(broke) {
-                let disposition = attempt_disposition(emitted, cancel.is_cancelled());
+                let disposition =
+                    attempt_disposition(emitted || tool_calls > 0, cancel.is_cancelled());
                 let outcome = labelled(attempt_outcome(&e, disposition), &candidate);
                 if records_key_health(disposition) {
                     let (cls, retry_after_ms) = (outcome.cls, outcome.retry_after_ms);
@@ -1083,10 +1162,17 @@ pub async fn execute_text(
                 }
                 attempts.push(outcome);
                 match disposition {
-                    // Only reachable with `emitted`, so the sink already holds text and `served` is
-                    // this candidate. The original error travels, not the class.
+                    // Only reachable when something was delivered — a chunk (`emitted`) or a tool
+                    // call — so `served` is this candidate. The original error travels, not the
+                    // class.
                     AttemptDisposition::Rethrow => {
-                        break 'plan Ended::MidStream { error: e, served: candidate }
+                        if !emitted && tool_calls > 0 {
+                            tracing::info!(
+                                tool_calls,
+                                "rethrow on a tool call alone — failover ended, not advanced",
+                            );
+                        }
+                        break 'plan Ended::MidStream { error: e, served: candidate };
                     }
                     AttemptDisposition::Stop => break 'plan Ended::Cancelled,
                     AttemptDisposition::Next => continue,
@@ -2006,6 +2092,47 @@ mod tests {
         assert_eq!(attempt_budget(0, None), 0);
         assert_eq!(attempt_budget(3, Some(9)), 3);
         assert_eq!(attempt_budget(9, Some(3)), 3);
+    }
+
+    #[test]
+    fn the_plan_budget_admits_the_first_candidate_and_funds_the_rest() {
+        use crate::core::egress::UPSTREAM_HEADER_TIMEOUT as ATTEMPT;
+
+        // **The first candidate is always admitted, even past the budget.** Otherwise a budget
+        // below one attempt would refuse everything and turn a slow request into an instant,
+        // silent failure — the budget would stop being a bound and start being an outage.
+        assert!(candidate_is_affordable(Duration::ZERO, true));
+        assert!(
+            candidate_is_affordable(PLAN_BUDGET * 10, true),
+            "the first candidate defines the plan's cost; the rule exists for the ones after it"
+        );
+
+        // **Every later candidate must be fundable in full, and the boundary is exact.** The
+        // second candidate on the 2026-09-27 timeline arrives at 20s having spent a whole attempt,
+        // and `20s + 20s > 26s` is what refuses it — which is the fix. A candidate is admitted at
+        // the last instant that still fits, and refused one tick later.
+        assert!(
+            candidate_is_affordable(PLAN_BUDGET - ATTEMPT, false),
+            "a candidate that exactly fits the remaining budget must still be admitted"
+        );
+        assert!(
+            !candidate_is_affordable(PLAN_BUDGET - ATTEMPT + Duration::from_millis(1), false),
+            "one millisecond later it no longer fits, and admitting it would overrun the plan"
+        );
+
+        // The production timeline, stated as the case rather than as arithmetic: entry 1 spent a
+        // full header budget timing out, so entry 2 must be refused rather than cut off.
+        assert!(
+            !candidate_is_affordable(ATTEMPT, false),
+            "entry 2 after entry 1 burned a whole attempt is exactly requests 22/25/26/27"
+        );
+
+        // A *fast* failure leaves room, so a genuinely different provider still gets its chance —
+        // the retry on the transport arm and the failover to another host both depend on this.
+        assert!(
+            candidate_is_affordable(Duration::from_millis(200), false),
+            "a candidate refused in 200ms must leave the next one affordable"
+        );
     }
 
     #[test]

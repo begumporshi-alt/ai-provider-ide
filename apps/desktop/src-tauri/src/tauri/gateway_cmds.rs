@@ -223,16 +223,17 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     // capability fields that nobody should have to hand-maintain. Best-effort — a client
     // config we cannot write must never stop the gateway from serving.
     //
-    // Off this command's own thread. The keychain read inside is slow after a rebuild — macOS
-    // re-validates the ACL against the new code signature, measured at 18-39s — and inline it
-    // delayed `gateway_enable` by exactly that, so pressing Start hung for the same stretch.
+    // Off this command's own thread, because a vault read can block. `get` takes the in-process
+    // `ops` mutex, and `put`/`delete` hold that same mutex across a cross-process `File::lock`
+    // that never times out, so a read waits out a writer that is itself waiting on another
+    // process. Inline, that delay would hold up `gateway_enable`, so pressing Start would hang.
     //
-    // It also *races the startup probe*, which reads the same keychain on its own thread. Two
-    // concurrent reads contend for one ACL prompt and one of them comes back empty; the sync
-    // loses because it retrieves the secret while the probe only checks existence. The result
-    // was `no gateway key yet` on the first launch after every rebuild, so newly added models
-    // waited a launch to appear. Waiting the keychain out removes the race without having to
-    // order the two readers against each other.
+    // The sync also runs alongside the *startup probe*, which reads the same vault on its own
+    // thread. The sync retrieves the secret while the probe only checks existence, and on the
+    // first launch after a rebuild the sync was the one that came back empty — the user saw
+    // `no gateway key yet` and newly added models waited a launch to appear. Why the two readers
+    // contended is now unexplained: its old explanation belonged to the pre-27a keychain, which
+    // 27a removed. The retry below waits the key out whatever makes it late.
     if let Some(store) = app.try_state::<Arc<Store>>() {
         let sync_app = app.clone();
         let sync_store = store.inner().clone();
@@ -241,23 +242,25 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     Ok(bound)
 }
 
-/// How long to wait for the keychain to settle before reporting the sync as skipped.
+/// How long to wait for the vault to settle before reporting the sync as skipped.
 ///
-/// Sized against the measurement: the cold-ACL read took 39s, so 45s clears it with margin. The
-/// wait costs nothing — it is a sleeping thread, not a blocked command.
+/// **The bound is unsized.** It was picked to clear a pre-27a keychain read measured at 18-39s
+/// after a rebuild; 27a replaced the keychain with the file vault, and nothing measures the
+/// vault's slow path, so 45s is retained only because its cost is a sleeping thread rather than
+/// a blocked command — not because it is known to be right.
 const SYNC_KEY_WAIT: Duration = Duration::from_secs(45);
 const SYNC_KEY_POLL: Duration = Duration::from_secs(3);
 
-/// Whether a sync failure is the transient "keychain not ready" one rather than a real problem.
+/// Whether a sync failure is the transient "vault not ready" one rather than a real problem.
 ///
-/// Split out so the distinction is testable without a keychain. Getting it wrong in the
+/// Split out so the distinction is testable without a vault. Getting it wrong in the
 /// permissive direction would retry a genuine misconfiguration for the whole wait and then report
 /// it, which is how a real error hides behind a retry loop.
 fn is_key_not_ready(err: &str) -> bool {
     err == crate::tauri::workbuddy::NO_KEY_YET
 }
 
-/// Publish our entries, retrying while the keychain ACL settles.
+/// Publish our entries, retrying until the master key is ready.
 fn sync_workbuddy_with_retry(app: &AppHandle, store: &Arc<Store>) {
     let deadline = std::time::Instant::now() + SYNC_KEY_WAIT;
     loop {
@@ -291,7 +294,7 @@ pub fn gateway_disable(state: State<'_, Arc<GatewayState>>) -> Result<(), String
     state.core.set_running(false);
     // D51: the UI's session credential dies with the gateway, so a token minted for one session
     // cannot keep authenticating after Stop. Without this, `ui_session::ensure` next time finds the
-    // old secret still in the keychain and hands it back — a credential that outlived its gateway.
+    // old secret still in the vault and hands it back — a credential that outlived its gateway.
     if let Some(store) = state.core.store() {
         crate::core::ui_session::revoke(store);
     }
@@ -325,7 +328,7 @@ pub struct AppKeyCreated {
     pub label: String,
 }
 
-/// Create a per-app key: crypto-random secret -> keychain -> clipboard (shown once).
+/// Create a per-app key: crypto-random secret -> vault -> clipboard (shown once).
 /// The secret is never returned to the webview and never persisted to SQLite (invariant 14).
 #[tauri::command]
 pub fn gateway_app_key_create(
@@ -337,7 +340,7 @@ pub fn gateway_app_key_create(
     let account = format!("{}{}", gateway::APP_KEY_PREFIX, id);
     crate::core::vault::put(&account, &secret).map_err(|e| e.to_string())?;
     if let Err(e) = crate::core::persist::gateway_key_insert(&store, &id, &label) {
-        // Roll back the keychain entry: a secret with no row is an unrevokable ghost.
+        // Roll back the vault entry: a secret with no row is an unrevokable ghost.
         let _ = crate::core::vault::delete(&account);
         return Err(e.to_string());
     }

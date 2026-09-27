@@ -1,9 +1,10 @@
 /**
- * Gateway request normalizer (Phase 1 of gateway-flexibility plan).
- *
- * Sanitizes and normalizes every incoming request before it reaches the router core.
- * Pure functions — no I/O, fully testable.
- *
+ * Gateway request normalizer — the **frozen reference** for `core/gateway_normalizer.rs`, which
+ * serves requests (via `core/router_bridge.rs`). **Not on any production path**: `index.ts` no
+ * longer re-exports it, and nothing but its own spec imports it. Fix the Rust port, not this file:
+ * do not reflow it — the Rust port cites these lines by number (`:596-602`, `:513-516`).
+ * Sanitizes and normalizes every incoming request before it reaches the router core. Pure
+ * functions — no I/O, fully testable.
  * Pipeline (in order):
  *   1. Role normalization (developer->system, model->assistant, system->user for incompatible providers)
  *   2. Tool-call id safety (ensure every tool_call has an id)
@@ -11,7 +12,6 @@
  *   4. Tool schema sanitization (recursive JSON Schema cleanup)
  *   5. Message shape fixes (string->array content, input->messages promotion, etc.)
  *   6. Client-specific adaptations (Claude Code tool remapping, Codex Responses normalization, z.ai user-turn guarantee)
- *
  * Based on patterns from OmniRoute (https://github.com/diegosouzapw/OmniRoute).
  */
 

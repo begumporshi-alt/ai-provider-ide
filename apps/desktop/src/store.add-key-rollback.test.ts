@@ -1,7 +1,7 @@
 /**
  * Adding a key, and what happens when its row does not land (2026-09-27).
  *
- * `addKey` is a two-store write. The secret goes to the keychain inside `registry.addKey`, and the
+ * `addKey` is a two-store write. The secret goes to the vault inside `registry.addKey`, and the
  * `api_keys` row goes to the host on the very next line. The second can fail — a 500 from the FK to
  * `providers`, a dead gateway, a 401 — and until this change the first was **not undone** when it
  * did. The secret then sat in the vault under `key:<uuid>` with no row to reach it: the keys list

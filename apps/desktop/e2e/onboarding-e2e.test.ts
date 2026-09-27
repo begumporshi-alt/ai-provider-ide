@@ -14,7 +14,7 @@
  * gates, hot-swap registration — is real and deterministic while costing nothing.
  *
  * Every step mirrors apps/desktop/src/screens/Onboarding.tsx one-for-one; the only swap is the
- * host boundary (HostHttp for the Rust egress commands, HarnessVault for the keyring).
+ * host boundary (HostHttp for the Rust egress commands, HarnessVault for the secret store).
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {

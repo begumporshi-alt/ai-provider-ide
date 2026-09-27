@@ -121,7 +121,7 @@ pub fn provider_upsert(
     Ok(())
 }
 
-/// Delete the provider row and return the keychain accounts its keys used.
+/// Delete the provider row and return the vault accounts its keys used.
 ///
 /// The secrets are **returned, not deleted**: §7 hygiene says they go with the rows, but doing it
 /// here would make the caller unable to distinguish "no keys" from "cleanup failed", and the HTTP
@@ -1092,7 +1092,7 @@ pub fn manifest_activate(
 //     already tracks cost, so month-to-date is a single SUM.
 //
 // Split: metadata + revocation live in SQLite (auditable, survives restart); the secret lives
-// in the OS keychain and is shown once. So nothing here ever holds a credential.
+// in the vault and is shown once. So nothing here ever holds a credential.
 
 /// Ids of every non-revoked per-app key. Read per request so revocation is immediate.
 pub fn active_gateway_key_ids(store: &Store) -> Result<Vec<String>, CommandError> {
@@ -1187,7 +1187,7 @@ pub fn gateway_key_cap(store: &Store, id: &str) -> Option<i64> {
 }
 
 /// Register a key row. The caller generates the secret, copies it to the clipboard, and stores
-/// it in the keychain — this only records that it exists.
+/// it in the vault — this only records that it exists.
 pub fn gateway_key_insert(store: &Store, id: &str, label: &str) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute(
@@ -1209,7 +1209,7 @@ pub fn gateway_key_revoke(store: &Store, id: &str) -> Result<(), CommandError> {
     Ok(())
 }
 
-/// Hard delete (row + keychain entry). Prefer `revoke` — deleting loses the audit trail.
+/// Hard delete (row + vault entry). Prefer `revoke` — deleting loses the audit trail.
 pub fn gateway_key_delete(store: &Store, id: &str) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();
     conn.execute("DELETE FROM gateway_keys WHERE id=?1", params![id])?;
@@ -2000,7 +2000,7 @@ pub struct SettingRow {
 #[cfg(feature = "app")]
 #[tauri::command]
 pub fn config_export(store: State<'_, Arc<Store>>) -> Result<ExportSnapshot, CommandError> {
-    // Secrets NEVER leave the keychain: keys export as id/label/ref/hint only.
+    // Secrets NEVER leave the vault: keys export as id/label/ref/hint only.
     let conn = store.conn.lock().unwrap();
     Ok(config_export_rows(&conn)?)
 }

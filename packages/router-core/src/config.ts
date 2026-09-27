@@ -1,6 +1,6 @@
 /**
  * config export/import (spec req. 14): the full portable configuration — providers,
- * manifests, aliases, settings, and key REFERENCES — never keychain secrets. The import
+ * manifests, aliases, settings, and key REFERENCES — never vault secrets. The import
  * validator rejects any raw `secret` field (fail loud, don't silently drop), forces
  * providers to `draft` and keys to `invalid` so the re-enter-key flow runs on the new
  * machine (audit H7).

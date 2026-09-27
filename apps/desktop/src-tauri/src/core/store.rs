@@ -179,8 +179,8 @@ CREATE TABLE settings (
     (
         // 0002 — audit R4. Per-app gateway keys: one revocable credential per consuming app, so a
         // leaked or retired client can be cut off WITHOUT rotating the master key (which would
-        // break every other app). Metadata + revocation live here; the secret lives in the OS
-        // keychain under `gwkey:<id>` and is shown once, never persisted.
+        // break every other app). Metadata + revocation live here; the secret lives in the
+        // vault under `gwkey:<id>` and is shown once, never persisted.
         "0002_gateway_keys",
         r#"
 CREATE TABLE gateway_keys (
@@ -500,12 +500,64 @@ pub struct StoreInfo {
     pub schema_version: i64,
 }
 
+/// The blocking pool could not run a database closure — it panicked, or the runtime is shutting
+/// down. Under `panic = "abort"` (release) a panic has already ended the process, so in practice
+/// this is reachable in dev/test and during shutdown.
+#[derive(Debug, thiserror::Error)]
+#[error("blocking database task failed: {0}")]
+pub struct StoreTaskError(pub String);
+
+impl From<StoreTaskError> for String {
+    fn from(e: StoreTaskError) -> Self {
+        e.0
+    }
+}
+
 pub struct Store {
     pub conn: Mutex<Connection>,
     pub(crate) path: String,
 }
 
 impl Store {
+    /// Run a blocking database closure **off the async executor**.
+    ///
+    /// # Why this exists
+    ///
+    /// `conn` is a `std::sync::Mutex<Connection>` and every `persist::*` / `capture::*` /
+    /// `memory::*` / `session_context::*` helper takes that lock. Called directly from an `async`
+    /// handler — which is what the request path did — the call blocks a Tokio **worker thread** for
+    /// its whole duration, including any wait on the mutex behind a concurrent writer.
+    ///
+    /// The per-call cost is small (these are indexed reads, tens of microseconds). The hazard is
+    /// the **wait**: one long write — a ledger insert, a capture, a migration — serialises every
+    /// request that arrives during it, and each of those holds a worker while it waits. With the
+    /// gateway's 8-permit admission (`try_slot`) that is a latency cliff rather than a deadlock,
+    /// which is exactly the kind of degradation that never shows up in a test.
+    ///
+    /// # What this does and does not cover
+    ///
+    /// This is the **hot-path** fix: the per-request reads in the auth path, the egress secret/host
+    /// pairing check, the memory principal policy, and the spend gate are offloaded. The Tauri
+    /// **command** surface (`persist::*` called from `#[tauri::command]`) is deliberately *not*
+    /// offloaded — those run on their own thread, are not on the request path, and are already
+    /// synchronous by construction. Converting them would mean an async command surface for no
+    /// measured gain.
+    ///
+    /// The closure's own `Result` is returned in the `Ok` arm; the outer `Err` is the join failure.
+    pub async fn offload<T, E, F>(self: &std::sync::Arc<Self>, f: F) -> Result<T, E>
+    where
+        T: Send + 'static,
+        E: Send + 'static + From<StoreTaskError>,
+        F: FnOnce(&Store) -> Result<T, E> + Send + 'static,
+    {
+        let store = std::sync::Arc::clone(self);
+        // `?` converts the `JoinError` through `StoreTaskError` into the caller's error type, then
+        // yields the closure's own `Result<T, E>` as the tail expression.
+        tokio::task::spawn_blocking(move || f(&store))
+            .await
+            .map_err(|e| StoreTaskError(e.to_string()))?
+    }
+
     /// Open (or create) the DB in the app data dir with the §4 hygiene pragmas.
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         std::fs::create_dir_all(dir)?;

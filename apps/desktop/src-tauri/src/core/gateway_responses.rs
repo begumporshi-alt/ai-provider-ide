@@ -226,7 +226,7 @@ pub(crate) async fn responses_h(
     body: String,
 ) -> Response {
     // ?key= fallback for Gemini-style query auth is handled in gemini_h; Responses uses Bearer.
-    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         Ok(k) => k,
         // The Responses API error envelope is the OpenAI one, so this needs no translation.
         Err(r) => return r.openai(),

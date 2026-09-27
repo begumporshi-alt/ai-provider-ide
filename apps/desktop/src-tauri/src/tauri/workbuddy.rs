@@ -9,7 +9,7 @@
  * go stale the moment the gateway moves port or the key is rotated.
  *
  * So the gateway maintains its own entry: every launch (the gateway auto-restores, so this runs
- * on startup) rewrites it from the catalog and the keychain. Facts come from `models_cache`, so
+ * on startup) rewrites it from the catalog and the vault. Facts come from `models_cache`, so
  * they are the provider's, not our guesses.
  *
  * Scope discipline: we only ever touch entries that are ours. Anything else in the file — the
@@ -327,7 +327,7 @@ pub struct WorkbuddySyncResult {
     pub note: Option<String>,
 }
 
-/// Returned when the master key cannot be read from the keychain yet.
+/// Returned when the master key cannot be read from the vault yet.
 ///
 /// Transient, not fatal, and worth naming: the caller retries on this and only this, so a shared
 /// constant keeps the retry from silently decoupling if the wording ever changes.

@@ -9,7 +9,7 @@
  * happened.
  *
  * Composition is production (store.ts) with two host swaps: HostHttp for the Rust egress
- * commands and HarnessVault for the OS keyring. Nothing above the ports is a fake.
+ * commands and HarnessVault for the secret store. Nothing above the ports is a fake.
  */
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { SENTINEL } from "./host-http.js";

@@ -397,13 +397,17 @@ pub(crate) fn to_base36(mut n: u64) -> String {
     if n == 0 {
         return "0".to_string();
     }
-    let mut buf = Vec::new();
+    // Collected as `char` rather than `u8`, so the ASCII-ness of `DIGITS` never has to be
+    // asserted. The previous `String::from_utf8(buf).expect("base36 digits are ASCII")` was
+    // locally provable — but under `panic = "abort"` a provable panic is still a process-wide
+    // outage if the proof is ever wrong, and this version has no failure mode at all (audit M2).
+    let mut buf: Vec<char> = Vec::new();
     while n > 0 {
-        buf.push(DIGITS[(n % 36) as usize]);
+        buf.push(DIGITS[(n % 36) as usize] as char);
         n /= 36;
     }
     buf.reverse();
-    String::from_utf8(buf).expect("base36 digits are ASCII")
+    buf.into_iter().collect()
 }
 
 fn generate_tool_call_id(index: usize, name: &str, args_prefix: &str) -> String {
@@ -757,19 +761,19 @@ fn normalize_parameters(parameters: &Value) -> Value {
 }
 
 fn sanitize_openai_tool(tool: &Value) -> Value {
-    let mut out = match tool.as_object() {
-        Some(o) => Value::Object(o.clone()),
-        None => return tool.clone(),
+    // Cloned as a `Map` rather than wrapped in a `Value` and re-unwrapped below. The two `expect`s
+    // this replaces ("just built from an object", "checked is_object above") were both locally
+    // provable, but neither proof is worth a process-wide abort under `panic = "abort"` (audit
+    // M2), and holding the map directly leaves nothing to prove.
+    let Some(map) = tool.as_object() else {
+        return tool.clone();
     };
-    let obj = out.as_object_mut().expect("just built from an object");
+    let mut obj = map.clone();
 
-    let has_function_object = obj.get("function").map(|f| f.is_object()).unwrap_or(false);
-    if has_function_object {
-        let mut function = obj
-            .get("function")
-            .and_then(Value::as_object)
-            .cloned()
-            .expect("checked is_object above");
+    // `has_function_object` used to be computed first and then re-read to get the value; asking
+    // once and binding the answer removes the gap between the test and the use that the second
+    // `expect` existed to bridge.
+    if let Some(mut function) = obj.get("function").and_then(Value::as_object).cloned() {
         let params = function.get("parameters").cloned().unwrap_or(Value::Null);
         function.insert("parameters".into(), normalize_parameters(&params));
         obj.insert("function".into(), Value::Object(function));
@@ -779,7 +783,7 @@ fn sanitize_openai_tool(tool: &Value) -> Value {
         obj.insert("parameters".into(), normalize_parameters(&params));
     }
 
-    out
+    Value::Object(obj)
 }
 
 /// Sanitize a `tools` array. A non-array passes through untouched.

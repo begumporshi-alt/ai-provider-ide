@@ -21,6 +21,8 @@
 
 import { invoke } from "@tauri-apps/api/core";
 
+import { expectShape, isNum, isObj, parseHostJsonOr, type Guard } from "./host-boundary";
+
 let _cached: string | null = null;
 
 /** The session credential, minted on first call and held in memory only. */
@@ -34,6 +36,23 @@ export async function uiSessionKey(): Promise<string> {
 /** Drop the cached credential. Called on gateway stop so the next start mints a fresh one. */
 export function clearUiSession(): void {
   _cached = null;
+}
+
+/**
+ * A port as the `gateway` row may carry it, or `undefined` when the field is not a port at all.
+ *
+ * The host writes a **number**. A hand-edited row may hold digits as a string, and reading those is
+ * deliberate: the alternative is falling through to `8787`, which is the closed-port bug the comment
+ * below already records once — a fallback that dials a port the operator never configured is worse
+ * than one that honours the row. Anything else (a negative, a float, an out-of-range value, prose)
+ * is not a port and yields `undefined`.
+ *
+ * This is a **read with a named coercion**, not a cast: the old `as { port?: number }` claimed the
+ * field was already a number, so a string reached the URL template wearing a number's type.
+ */
+function portFrom(v: unknown): number | undefined {
+  const n = isNum(v) ? v : typeof v === "string" && /^\d+$/.test(v) ? Number(v) : Number.NaN;
+  return Number.isSafeInteger(n) && n > 0 && n <= 65535 ? n : undefined;
 }
 
 /**
@@ -56,8 +75,13 @@ export async function gatewayBaseUrl(): Promise<string> {
     return `http://127.0.0.1:${status.port}`;
   }
   const raw = await invoke<string | null>("settings_get", { key: "gateway" });
-  const s = raw ? (JSON.parse(raw) as { port?: number }) : {};
-  return `http://127.0.0.1:${s.port ?? 8787}`;
+  // **An unguarded `JSON.parse` here took down the whole admin surface** (audit M3). This function
+  // is awaited by `sendAdmin`, so a corrupt or hand-edited row threw inside *every* `/admin/*` call,
+  // and the failure read as a network fault rather than as one bad settings row. The port is a
+  // preference, not a fact: a row this build cannot read is a row it does not have, so fall through
+  // to the default rather than propagating a parse error out of the URL builder.
+  const row = raw ? parseHostJsonOr(raw, isObj, {}, "the `gateway` settings row") : {};
+  return `http://127.0.0.1:${portFrom(row.port) ?? 8787}`;
 }
 
 /** One authenticated `fetch()` to the admin surface.
@@ -124,4 +148,24 @@ async function sendAdmin(
   // 204 No Content returns empty; JSON.parse on "" throws, so guard it.
   if (res.status === 204) return undefined;
   return res.json();
+}
+
+/**
+ * One authenticated read, **validated at the boundary**.
+ *
+ * `fetchAdmin` answers `unknown` because the host is a separate process and TypeScript cannot check
+ * its shape. Reading that with `as` is what turned a host-side shape change into an `undefined` deep
+ * inside rendering (audit M8); this variant takes the guard instead, so a mismatch fails here, named,
+ * with the route in the message. Prefer it for every read whose result is consumed field-by-field.
+ *
+ * For a read of a flag or an optional blob, where a missing field is already the safe answer, use
+ * `expectShapeOr` so a shape the app does not recognise degrades instead of throwing.
+ */
+export async function fetchAdminAs<T>(
+  method: string,
+  path: string,
+  guard: Guard<T>,
+  body?: unknown,
+): Promise<T> {
+  return expectShape(await fetchAdmin(method, path, body), guard, `${method} ${path}`);
 }

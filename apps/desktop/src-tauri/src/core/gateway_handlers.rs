@@ -25,7 +25,7 @@ pub(crate) async fn chat_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         Ok(k) => k,
         Err(r) => return r.openai(),
     };
@@ -275,7 +275,7 @@ pub(crate) async fn chat_h(
 }
 
 pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
-    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         Ok(k) => k,
         Err(r) => return r.openai(),
     };
@@ -332,7 +332,7 @@ pub(crate) async fn unknown_route(
     // from a typo with no key at all, which is exactly what the invariant exists to prevent.
     //
     // Identity discarded on purpose: nothing is dispatched from here, so nothing is billed.
-    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         return r.openai();
     }
     tracing::warn!("unknown gateway route hit");
@@ -349,7 +349,7 @@ pub(crate) async fn method_not_allowed(
     headers: HeaderMap,
 ) -> Response {
     // Identity discarded on purpose: a 405 dispatches nothing.
-    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    if let Err(r) = check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         return r.openai();
     }
     err(
@@ -363,7 +363,7 @@ pub(crate) async fn image_h(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)) {
+    let app_key = match check_gateway_key(&core, &headers, peer_ip(&headers)).await {
         Ok(k) => k,
         Err(r) => return r.openai(),
     };

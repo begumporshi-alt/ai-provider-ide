@@ -440,6 +440,13 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           // is an answer. Writing "ok" here claimed a success for a request that never reached a
           // provider: the live ledger held 7 such rows, and the 99.5s / 83s latencies among them
           // are client timeouts, not answers. No provider is named because none produced a token.
+          //
+          // **"Served" means delivered output, and a tool call is output.** `served` is set from
+          // the first chunk *or* the first tool call (`execution-engine.ts`), so a turn whose
+          // entire output is a tool call is a success and lands in the `ok` arm below. Counting
+          // chunks alone sent it here: 11 of the 42 rows written since the 2026-09-27 deploy were
+          // `PARSE_ERROR`, and probing two of them (rows 1714/1715) showed both were healthy
+          // `finish_reason: "tool_calls"` answers that the client received correctly.
           await ledger.append({
             ts: Date.now(),
             modality,
