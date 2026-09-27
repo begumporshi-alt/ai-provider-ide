@@ -124,13 +124,12 @@ base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# macOS only: App Nap suppression. The worker webview is hidden, and macOS suspends JS in
-# hidden/backgrounded processes, which stalls the gateway. Pinned to the versions already in
-# Cargo.lock (pulled in transitively by Tauri) so this resolves without a network fetch.
-[target.'cfg(target_os = "macos")'.dependencies]
-objc2 = "0.6.4"
-objc2-foundation = { version = "0.3.2", features = ["NSProcessInfo", "NSString"] }
-
+# There is deliberately no macOS-only dependency block here. `objc2` / `objc2-foundation` were
+# declared for App Nap suppression on the hidden worker webview, and both went with that webview
+# when it was deleted (25f) — the code was removed but the manifest entry and its justification
+# were not. Removed 2026-09-27: `grep -rIn 'objc2|NSProcessInfo|beginActivity|App Nap'` over this
+# crate returned zero hits outside Cargo.lock, where the crates are present transitively via Tauri
+# and therefore say nothing about a *direct* dependency.
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

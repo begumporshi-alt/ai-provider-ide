@@ -93,15 +93,9 @@ importers:
       '@jitl/quickjs-singlefile-mjs-release-sync':
         specifier: ^0.32.0
         version: 0.32.0
-      eventsource-parser:
-        specifier: ^3.0.0
-        version: 3.1.1
       quickjs-emscripten-core:
         specifier: ^0.32.0
         version: 0.32.0
-      zod:
-        specifier: ^3.24.0
-        version: 3.25.76
     devDependencies:
       '@vitest/coverage-v8':
         specifier: ^4.1.11
@@ -694,10 +688,6 @@ packages:
 
   estree-walker@3.0.3:
     resolution: {integrity: sha512-7RUKfXgSMMkzt6ZuXmqapOurLGPPfgj6l9uRZ7lRGolvk0y2yocc35LdcxKC5PQZdn2DMqioAQ2NoWcrTKmm6g==}
-
-  eventsource-parser@3.1.1:
-    resolution: {integrity: sha512-EKN1vKAMcZ8MlYMpaNuxN6R9yakzH6uajHcHVTqWJzvu5pWw9DyhbP35HH8MVBQ+dZjAfDxk+A8NiR9KWaXiyQ==}
-    engines: {node: '>=18.0.0'}
 
   expect-type@1.4.0:
     resolution: {integrity: sha512-KfYbmpRm0VbLjEvVa9yGwCi9GI34xvi7A/HXYWQO65CSD2u3MczUJSuwXKFIxlGsgBQizV9q5J9NHj4VG0n+pA==}
@@ -1544,8 +1534,6 @@ snapshots:
   estree-walker@3.0.3:
     dependencies:
       '@types/estree': 1.0.9
-
-  eventsource-parser@3.1.1: {}
 
   expect-type@1.4.0: {}
 
