@@ -1,0 +1,1011 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AI-Provider Router IDE — Competitive Comparison</title>
+<style>
+  :root{
+    --bg:#f7f8fa; --panel:#ffffff; --ink:#12161c; --ink2:#4a5566; --ink3:#7b8798;
+    --line:#e3e7ee; --line2:#eef1f6;
+    --ours:#1f6feb; --ours-bg:#eaf2ff; --ours-line:#b6d2fb;
+    --good:#0f7b46; --good-bg:#e6f6ec; --good-line:#b7e3c8;
+    --warn:#9a6400; --warn-bg:#fff6e2; --warn-line:#f3dca4;
+    --bad:#b3261e; --bad-bg:#fdeceb; --bad-line:#f4c2be;
+    --accent:#6b3fa0; --rival:#b45309; --rival-bg:#fff4e8; --rival-line:#f2cf9f;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,monospace;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; background:var(--bg); color:var(--ink);
+    font:15px/1.6 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,Helvetica,Arial,sans-serif;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:1560px;margin:0 auto;padding:32px 28px 80px}
+
+  header.top{border-bottom:2px solid var(--ink);padding-bottom:20px;margin-bottom:8px}
+  .eyebrow{font:600 11px/1 var(--mono);letter-spacing:.14em;text-transform:uppercase;color:var(--ink3);margin-bottom:10px}
+  h1{margin:0 0 10px;font-size:31px;line-height:1.2;letter-spacing:-.02em;font-weight:700}
+  .sub{color:var(--ink2);font-size:15px;max-width:900px;margin:0}
+  .meta{margin-top:14px;display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+  .tag{font:600 11px/1 var(--mono);padding:5px 9px;border-radius:5px;border:1px solid var(--line);background:#fff;color:var(--ink2);letter-spacing:.03em}
+  .tag.meas{background:var(--ours-bg);border-color:var(--ours-line);color:#154c9e}
+
+  h2{font-size:20px;margin:44px 0 6px;letter-spacing:-.01em;font-weight:700;display:flex;align-items:baseline;gap:10px}
+  h2 .n{font:600 12px/1 var(--mono);color:var(--ink3);border:1px solid var(--line);background:#fff;padding:4px 7px;border-radius:5px}
+  .lede{color:var(--ink2);margin:0 0 18px;font-size:14px;max-width:1040px}
+
+  .verdict{display:grid;grid-template-columns:repeat(auto-fit,minmax(232px,1fr));gap:12px;margin-bottom:8px}
+  .vcard{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:15px 16px}
+  .vcard .k{font:600 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
+  .vcard .v{font-size:19px;font-weight:700;margin:7px 0 5px;letter-spacing:-.01em}
+  .vcard .d{font-size:12.5px;color:var(--ink2);line-height:1.5}
+
+  .scroller{overflow-x:auto;border:1px solid var(--line);border-radius:10px;background:var(--panel);
+    box-shadow:0 1px 2px rgba(16,24,40,.04)}
+  table{border-collapse:separate;border-spacing:0;width:100%;min-width:1440px;font-size:13.5px}
+  th,td{text-align:left;padding:11px 13px;border-bottom:1px solid var(--line2);vertical-align:top}
+  thead th{position:sticky;top:0;background:#fbfcfe;z-index:3;border-bottom:2px solid var(--line);
+    font:600 11.5px/1.35 -apple-system,sans-serif;color:var(--ink);letter-spacing:.01em}
+  tbody th{position:sticky;left:0;background:#fbfcfe;z-index:2;border-right:1px solid var(--line);
+    font-weight:600;width:206px;min-width:206px;font-size:12.5px;color:var(--ink)}
+  thead th.ours{background:var(--ours-bg);border-bottom:2px solid var(--ours-line);color:#154c9e}
+  thead th.rival{background:var(--rival-bg);border-bottom:2px solid var(--rival-line);color:#8a4400}
+  td.ours{background:#fafcff}
+  td.rival{background:#fffdf9}
+  tbody tr.sec th{background:#f1f4f9;color:var(--ink);font:600 10.5px/1 var(--mono);
+    letter-spacing:.12em;text-transform:uppercase;position:static}
+  tbody tr.sec td{background:#f1f4f9;font:600 10.5px/1 var(--mono);letter-spacing:.12em;
+    text-transform:uppercase;color:var(--ink3)}
+  tbody tr:hover td,tbody tr:hover th{background:#f4f7fb}
+  td.ours:hover{background:#eff5ff} td.rival:hover{background:#fff8ec}
+  .cname{font-weight:700;font-size:13.5px;display:block;margin-bottom:2px}
+  .csub{font:400 11px/1.35 var(--mono);color:var(--ink3)}
+
+  .y,.n,.p{display:inline-block;font:700 11px/1 var(--mono);padding:4px 7px;border-radius:5px;white-space:nowrap}
+  .y{background:var(--good-bg);color:var(--good);border:1px solid var(--good-line)}
+  .n{background:var(--bad-bg);color:var(--bad);border:1px solid var(--bad-line)}
+  .p{background:var(--warn-bg);color:var(--warn);border:1px solid var(--warn-line)}
+  .note{display:block;color:var(--ink3);font-size:11.5px;margin-top:3px;line-height:1.4}
+  b.num{font:600 12.5px/1 var(--mono)}
+
+  .bars{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:20px 22px}
+  .row{display:grid;grid-template-columns:212px 1fr 104px;gap:14px;align-items:center;padding:7px 0}
+  .row + .row{border-top:1px solid var(--line2)}
+  .rl{font-size:13px;font-weight:600}
+  .rl span{display:block;font:400 11px/1.3 var(--mono);color:var(--ink3);font-weight:400;margin-top:2px}
+  .track{background:#f0f3f8;border-radius:4px;height:22px;position:relative;overflow:hidden}
+  .fill{height:100%;border-radius:4px;display:flex;align-items:center;justify-content:flex-end;
+    padding-right:8px;color:#fff;font:700 11px/1 var(--mono)}
+  .rv{font:600 12px/1 var(--mono);text-align:right;color:var(--ink2)}
+  .rv small{display:block;font:400 10px/1.3 var(--mono);color:var(--ink3);font-weight:400;margin-top:3px}
+
+  .pc{display:grid;grid-template-columns:repeat(auto-fit,minmax(350px,1fr));gap:14px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;display:flex;flex-direction:column}
+  .card.mine{border:2px solid var(--ours);box-shadow:0 2px 10px rgba(31,111,235,.10)}
+  .card.rival{border:2px solid var(--rival);box-shadow:0 2px 10px rgba(180,83,9,.10)}
+  .ch{padding:13px 16px;border-bottom:1px solid var(--line);background:#fbfcfe}
+  .card.mine .ch{background:var(--ours-bg);border-bottom-color:var(--ours-line)}
+  .card.rival .ch{background:var(--rival-bg);border-bottom-color:var(--rival-line)}
+  .ch .t{font-weight:700;font-size:15px}
+  .ch .s{font:400 11px/1.3 var(--mono);color:var(--ink3);margin-top:3px}
+  .cb{padding:14px 16px;display:grid;grid-template-columns:1fr 1fr;gap:16px;flex:1}
+  .cb h4{margin:0 0 8px;font:600 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase}
+  .cb .pros h4{color:var(--good)} .cb .cons h4{color:var(--bad)}
+  ul{margin:0;padding-left:16px;font-size:12.5px;color:var(--ink2);line-height:1.55}
+  li{margin-bottom:6px} li:last-child{margin-bottom:0}
+  li strong{color:var(--ink);font-weight:600}
+  .foot{padding:10px 16px;border-top:1px solid var(--line);background:#fbfcfe;
+    font:400 11.5px/1.45 var(--mono);color:var(--ink3)}
+  .card.mine .foot{background:#fafcff} .card.rival .foot{background:#fffdf9}
+
+  .pick{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:12px}
+  .pk{background:var(--panel);border:1px solid var(--line);border-left:4px solid var(--accent);
+    border-radius:8px;padding:14px 16px}
+  .pk .who{font:600 10.5px/1 var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--ink3)}
+  .pk .what{font-weight:700;font-size:15px;margin:6px 0 5px}
+  .pk .why{font-size:12.5px;color:var(--ink2);line-height:1.5}
+
+  .callout{background:var(--warn-bg);border:1px solid var(--warn-line);border-left:4px solid var(--warn);
+    border-radius:8px;padding:14px 18px;margin:18px 0;font-size:13.5px;color:#5c3d00;line-height:1.6}
+  .callout b{color:#4a3100}
+  .callout.info{background:var(--ours-bg);border-color:var(--ours-line);border-left-color:var(--ours);color:#123a75}
+  .callout.info b{color:#0d2d5c}
+  .callout.crit{background:var(--bad-bg);border-color:var(--bad-line);border-left-color:var(--bad);color:#7d1a15}
+  .callout.crit b{color:#5c120e}
+
+  footer{margin-top:52px;padding-top:18px;border-top:1px solid var(--line);
+    font-size:12px;color:var(--ink3);line-height:1.65}
+  footer code{font:400 11.5px/1.5 var(--mono);background:#fff;border:1px solid var(--line);
+    padding:1px 5px;border-radius:4px;color:var(--ink2)}
+  .legend{display:flex;gap:14px;flex-wrap:wrap;margin:10px 0 0;font-size:12px;color:var(--ink2)}
+  .legend span{display:flex;align-items:center;gap:6px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header class="top">
+  <div class="eyebrow">Competitive analysis · AI gateway &amp; LLM router landscape</div>
+  <h1>AI-Provider Router IDE vs. the market</h1>
+  <p class="sub">A side-by-side comparison of our local router + gateway against seven leading alternatives,
+  across performance, features, pricing, protocol compatibility, security and maturity. Every number for our
+  own product was <strong>measured against the running gateway</strong>, not read from documentation.</p>
+  <div class="meta">
+    <span class="tag">Product v1.2.0 · Apache-2.0</span>
+    <span class="tag meas">◈ Gateway benchmarked live 2026-09-27</span>
+    <span class="tag">Loopback 127.0.0.1:8800</span>
+    <span class="tag">Competitor data: vendor docs &amp; analyst sources, Sept 2026</span>
+    <span class="tag">8 options compared</span>
+  </div>
+</header>
+
+<div class="callout info">
+  <b>How to read this.</b> Two provenance classes are kept strictly apart. <b>Measured</b> figures come from
+  probes run against the live gateway on this machine (150 iterations per endpoint, percentiles computed).
+  <b>Reported</b> figures come from vendor documentation, published benchmarks and 2026 analyst reviews — they
+  are cited, not reproduced as if we had verified them. Where our own product could not be measured on a
+  comparable basis, the comparison says so rather than extrapolating.
+</div>
+
+<div class="callout crit">
+  <b>Correction to the first version of this document.</b> OmniRoute was omitted and has been added. It is not a
+  peripheral entry — it is <b>the closest competitor on the list</b>, and its omission understated our exposure.
+  It is local-first, MIT, ships a desktop app, targets exactly our user, and at <b>70,689 stars in 226 days</b>
+  (≈313 stars/day) it has already overtaken LiteLLM. Its RTK+Caveman compression claims to cut prompt tokens
+  by 15–95% (≈89% average) — which attacks our single largest measured weakness head-on: the
+  <b>≈1,719 prompt tokens</b> of fixed context every one of our requests carries.
+</div>
+
+<!-- ============ VERDICT ============ -->
+<h2><span class="n">01</span> Verdict at a glance</h2>
+<p class="lede">One line each. The full evidence follows in sections 03–07.</p>
+<div class="verdict">
+  <div class="vcard">
+    <div class="k">Measured gateway overhead</div>
+    <div class="v">0.3 – 2.0 ms</div>
+    <div class="d">Our p50/p95 on gateway-local paths (catalog, auth, route lookup). Sub-millisecond median;
+      ~10–40× below LiteLLM's published proxy overhead — but on a single-user loopback, not at 1k RPS.</div>
+  </div>
+  <div class="vcard">
+    <div class="k">Strongest structural advantage</div>
+    <div class="v">Local-only, zero egress</div>
+    <div class="d">Binds 127.0.0.1, keys in a mode-600 file, no vendor account. Shared with OmniRoute and a
+      self-hosted LiteLLM — but neither ships a four-dialect inbound surface or a built-in memory layer.</div>
+  </div>
+  <div class="vcard">
+    <div class="k">Closest competitor</div>
+    <div class="v">OmniRoute</div>
+    <div class="d">Not LiteLLM. OmniRoute is local-first, MIT, desktop, agent-focused and free — the same niche.
+      359 providers, 17–19 routing strategies, MCP/A2A, token compression. Revision to the first draft of this
+      page, which named LiteLLM.</div>
+  </div>
+  <div class="vcard">
+    <div class="k">Largest gap vs. market</div>
+    <div class="v">No release, no users</div>
+    <div class="d">Zero adoption while OmniRoute adds ~313 stars/day. No downloadable build, macOS-only in
+      practice, no multi-user story. Breadth is not our binding constraint — distribution is.</div>
+  </div>
+</div>
+
+<!-- ============ MASTER TABLE ============ -->
+<h2><span class="n">02</span> Master comparison matrix</h2>
+<p class="lede">Eight options × seven dimensions. Scroll horizontally; the dimension column is pinned.
+<span class="y">Yes</span> full support · <span class="p">Partial</span> limited/conditional · <span class="n">No</span> absent.
+<span style="font-weight:700;color:#8a4400">OmniRoute is highlighted amber as the primary rival.</span></p>
+
+<div class="scroller">
+<table>
+<thead>
+<tr>
+  <th style="width:206px;min-width:206px">Dimension</th>
+  <th class="ours">AI-Provider Router IDE<br><span class="csub">ours · v1.2.0</span></th>
+  <th class="rival">OmniRoute<br><span class="csub">70,689★ · MIT · closest rival</span></th>
+  <th>LiteLLM<br><span class="csub">BerriAI · Python</span></th>
+  <th>OpenRouter<br><span class="csub">managed</span></th>
+  <th>Portkey<br><span class="csub">SaaS + OSS</span></th>
+  <th>Kong AI Gateway<br><span class="csub">Kong Inc.</span></th>
+  <th>Cloudflare AI Gateway<br><span class="csub">managed edge</span></th>
+  <th>Vercel AI Gateway<br><span class="csub">managed</span></th>
+</tr>
+</thead>
+<tbody>
+
+<tr class="sec"><th>Deployment &amp; platform</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Deployment model</th>
+  <td class="ours"><span class="cname">Local desktop + headless daemon</span>
+    <span class="y">Local-first</span>
+    <span class="note">Tauri app; <code>aiproviderd</code> runs hidden, auto-restores via settings. No server to provision.</span></td>
+  <td class="rival"><span class="y">Local-first</span>
+    <span class="note"><code>npm i -g omniroute</code> → <code>localhost:20128/v1</code>. Also Docker Compose, Electron desktop and PWA. Same local-first premise as ours.</span></td>
+  <td><span class="y">Self-host</span> + managed tier
+    <span class="note">Docker/K8s, Python proxy. You own uptime and upgrades.</span></td>
+  <td><span class="n">Managed only</span>
+    <span class="note">No self-host option — every request transits OpenRouter.</span></td>
+  <td><span class="p">SaaS-first, OSS available</span>
+    <span class="note">Open-source gateway can be self-hosted; full features shine managed.</span></td>
+  <td><span class="y">Self-host Enterprise</span> / Konnect SaaS
+    <span class="note">Nginx/OpenResty data plane. Heavy for LLM-only use.</span></td>
+  <td><span class="n">Managed only</span>
+    <span class="note">Runs on Cloudflare Workers at the edge.</span></td>
+  <td><span class="n">Managed only</span>
+    <span class="note">Vercel platform; Enterprise adds private VPC.</span></td>
+</tr>
+<tr>
+  <th>OS / platform support</th>
+  <td class="ours"><span class="p">macOS only in practice</span>
+    <span class="note">CI runs <code>macos-14</code>; Windows/Linux carry icons but are untested.</span></td>
+  <td class="rival"><span class="y">Cross-platform</span>
+    <span class="note">Node.js + Docker; verified on Windows 11 / Node 24.14.0. Runs wherever Node runs — a direct advantage over us.</span></td>
+  <td><span class="y">Any (Linux/Docker)</span></td>
+  <td><span class="y">Any (HTTP)</span></td>
+  <td><span class="y">Any (HTTP / Docker)</span></td>
+  <td><span class="y">Any (Linux/K8s)</span></td>
+  <td><span class="y">Any (HTTP)</span></td>
+  <td><span class="y">Any (HTTP)</span></td>
+</tr>
+<tr>
+  <th>Multi-user / team</th>
+  <td class="ours"><span class="n">No</span>
+    <span class="note">Single-user loopback. Master key + per-app keys, but no user identity or roles.</span></td>
+  <td class="rival"><span class="p">Basic</span>
+    <span class="note">JWT auth and a dashboard; no RBAC or roles documented. Rated "basic" governance by external review.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Virtual keys, teams, per-team budgets.</span></td>
+  <td><span class="p">Accounts only</span></td>
+  <td><span class="y">Yes</span> <span class="note">RBAC, workspaces, audit trails.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Enterprise SSO/OIDC (paid tier).</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span> <span class="note">SSO/SAML on Enterprise.</span></td>
+</tr>
+<tr>
+  <th>Network exposure</th>
+  <td class="ours"><span class="y">Loopback only</span>
+    <span class="note">Binds <code>127.0.0.1</code>. Not reachable off-machine by construction.</span></td>
+  <td class="rival"><span class="p">Local, but wider surface</span>
+    <span class="note">API binds <code>127.0.0.1</code> by default, but the dashboard is documented as reachable on LAN; Compose ships Redis <b>without</b> <code>requirepass</code> and warns against exposing it.</span></td>
+  <td><span class="y">Your VPC</span></td>
+  <td><span class="n">Third-party transit</span></td>
+  <td><span class="p">Configurable</span></td>
+  <td><span class="y">Your VPC</span></td>
+  <td><span class="n">Third-party transit</span></td>
+  <td><span class="n">Third-party transit</span></td>
+</tr>
+
+<tr class="sec"><th>Performance</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Gateway overhead (p50)</th>
+  <td class="ours"><b class="num">0.30 – 0.79 ms</b> <span class="y">Measured</span>
+    <span class="note">Route-existence 0.30 ms · catalog 0.43 ms · full auth+plan on a route miss 0.79 ms.</span></td>
+  <td class="rival"><span class="n">Not published</span>
+    <span class="note">No overhead metric in the README or docs. Node.js runtime with a compression stage in the hot path — an unquantified latency cost we cannot compare against.</span></td>
+  <td><b class="num">2 – 12 ms</b> <span class="p">Reported</span>
+    <span class="note">Vendor benchmark vs. mock upstream: 12 ms @1,036 RPS (2 inst); 2 ms @1,170 RPS (4 inst).</span></td>
+  <td colspan="5" style="color:var(--ink3);font-size:12.5px">Not published as a gateway-overhead metric by these vendors; end-to-end latency is dominated by the upstream model call in every case.</td>
+</tr>
+<tr>
+  <th>Gateway overhead (p95)</th>
+  <td class="ours"><b class="num">0.41 – 1.96 ms</b> <span class="y">Measured</span>
+    <span class="note">p99 stays ≤ 3.78 ms on the heaviest gateway-local path.</span></td>
+  <td class="rival"><span class="n">Not published</span></td>
+  <td><b class="num">8 – 29 ms</b> <span class="p">Reported</span>
+    <span class="note">29 ms @1,036 RPS (2 inst); 8 ms @1,170 RPS (4 inst, 4 CPU / 8 GB).</span></td>
+  <td colspan="5" style="color:var(--ink3);font-size:12.5px">—</td>
+</tr>
+<tr>
+  <th>Throughput ceiling</th>
+  <td class="ours"><span class="p">Single-user by design</span>
+    <span class="note">Gate: 8 concurrent + 32 queued; per-provider limiter 4 in-flight / 64 queued.
+    <b>Not verified at load</b> — live traffic has never reached the gate.</span></td>
+  <td class="rival"><span class="n">Not published</span>
+    <span class="note">No SLA, no production concurrency ceiling in the docs. Redis is present as the rate-limiter backend, which implies intent but no stated bound.</span></td>
+  <td><span class="y">~1.0–1.2k RPS / 4 inst</span>
+    <span class="note">3,000 RPS on large-prompt profile (132 workers, 33 pods).</span></td>
+  <td><span class="y">Managed scale</span></td>
+  <td><span class="p">Plan-capped</span> <span class="note">100K req/mo on Production.</span></td>
+  <td><span class="y">350+ RPS on 1 vCPU</span> <span class="note">~10 ms latency under load.</span></td>
+  <td><span class="y">Edge scale</span> <span class="note">100K/day free; 10M/mo paid.</span></td>
+  <td><span class="y">Managed scale</span></td>
+</tr>
+<tr>
+  <th>Streaming (SSE)</th>
+  <td class="ours"><span class="y">Yes</span> <span class="y">Measured</span>
+    <span class="note">TTFB 23 ms, <code>[DONE]</code> terminator sent, incremental chunking confirmed.</span></td>
+  <td class="rival"><span class="y">Yes</span>
+    <span class="note">Dedicated <code>open-sse/</code> workspace module and a long tail of SSE fixes — clearly a first-class concern.</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+</tr>
+<tr>
+  <th>Prompt-token overhead</th>
+  <td class="ours"><span class="n">≈1,719 tokens/request</span> <span class="y">Measured</span>
+    <span class="note">Fixed context carried and billed on <b>every</b> call. Our single largest cost weakness.</span></td>
+  <td class="rival"><span class="y">Compression: −15…95%</span> <span class="p">Vendor claim</span>
+    <span class="note">RTK+Caveman stack, ≈89% average claimed. No dataset, model list or reproduction steps published — treat as unverified. <b>Directly targets our weakness.</b></span></td>
+  <td><span class="p">None built in</span></td>
+  <td><span class="p">None</span></td>
+  <td><span class="p">None</span></td>
+  <td><span class="p">None</span></td>
+  <td><span class="p">None</span></td>
+  <td><span class="p">None</span></td>
+</tr>
+
+<tr class="sec"><th>Features</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Failover / fallback</th>
+  <td class="ours"><span class="y">Yes — 6 attempts</span>
+    <span class="note">Key-chain planning within a request; 1 s cooldown floor; breaker opens at 3 failures, half-open after 60 s; <code>Retry-After</code> synthesised on upstream 429.</span></td>
+  <td class="rival"><span class="y">Yes — quota-aware</span>
+    <span class="note">Auto-fallback ordered subscription → pay-per-use → free tier. 17–19 routing strategies (priority, cost-optimized, latency, quota-weighted, sticky round-robin, cache-optimized…). Exact trigger conditions are <b>not documented</b>.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Fallback chains, weighted LB, cost- &amp; latency-based routing in YAML.</span></td>
+  <td><span class="p">Automatic, opaque</span>
+    <span class="note">Provider fallbacks server-side; least granular control by design.</span></td>
+  <td><span class="y">Yes — conditional</span>
+    <span class="note">Content-aware model selection; fine-grained chains.</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span> <span class="note">Managed fallback + load balancing.</span></td>
+</tr>
+<tr>
+  <th>Cost / budget control</th>
+  <td class="ours"><span class="y">Spend caps</span>
+    <span class="note">Global + per-app-key caps, <code>402</code> on breach; per-request cost in SQLite ledger.</span></td>
+  <td class="rival"><span class="y">Quota pool tracking</span>
+    <span class="note">Tracks 35 recurring pool keys, 489 cataloged free-tier entries, 17 pools with positive monthly budget. Quota-aware rather than spend-capped — a different mechanism.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Per-team/user/model budgets in Postgres.</span></td>
+  <td><span class="p">Basic</span> <span class="note">Dashboard usage analytics.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Budget governance bundled in SaaS.</span></td>
+  <td><span class="p">Request-based only</span>
+    <span class="note">Token-level limiting needs the paid <em>AI Rate Limiting Advanced</em> plugin.</span></td>
+  <td><span class="p">Basic</span></td>
+  <td><span class="y">Yes</span> <span class="note">Spend monitoring, auto top-up.</span></td>
+</tr>
+<tr>
+  <th>Response / semantic cache</th>
+  <td class="ours"><span class="n">No</span>
+    <span class="note">Cache policy has no authority to serve from; no cache layer exists.</span></td>
+  <td class="rival"><span class="p">Partial</span>
+    <span class="note">A <code>cache-optimized</code> routing strategy exists and Redis is deployed, but no documented semantic cache.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Redis-backed semantic caching.</span></td>
+  <td><span class="p">Limited</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span> <span class="note">Nginx-level caching.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Prompt/response caching free.</span></td>
+  <td><span class="p">Via add-ons</span></td>
+</tr>
+<tr>
+  <th>Memory / context layer</th>
+  <td class="ours"><span class="y">Yes — built-in</span>
+    <span class="note">L0–L3 tiers, scoped atoms, SQLite FTS5 BM25 retrieval (not embeddings), 15 ms hard deadline so the model request never waits. Runs inside the gateway.</span></td>
+  <td class="rival"><span class="p">Optional sidecar</span>
+    <span class="note">Qdrant vector store available via <code>--profile memory</code>. Not on by default, and not the scoped-atom model we implement.</span></td>
+  <td><span class="n">No</span> <span class="note">Bring your own via external tooling.</span></td>
+  <td><span class="n">No</span></td>
+  <td><span class="n">No</span> <span class="note">Prompt management instead.</span></td>
+  <td><span class="n">No</span></td>
+  <td><span class="n">No</span></td>
+  <td><span class="n">No</span></td>
+</tr>
+<tr>
+  <th>Governance / RBAC / audit</th>
+  <td class="ours"><span class="n">No</span>
+    <span class="note">Auth is key-based only. Ledger + JSONL trails exist, but no roles, no user identity.</span></td>
+  <td class="rival"><span class="p">Basic, with caveats</span>
+    <span class="note">External review rates security maturity <b>below</b> managed SaaS: the default <code>JWT_SECRET</code> must be rotated or auth can be bypassed, and guardrails are described as <b>fail-open</b>.</span></td>
+  <td><span class="p">Basic</span></td>
+  <td><span class="p">Basic</span></td>
+  <td><span class="y">Strong</span> <span class="note">Purpose-built: RBAC, audit trails, guardrails, compliance-ready.</span></td>
+  <td><span class="y">Yes</span> <span class="note">Enterprise SSO/OIDC behind paid tier.</span></td>
+  <td><span class="p">Enterprise only</span></td>
+  <td><span class="p">Enterprise only</span> <span class="note">SSO/SAML, private VPC.</span></td>
+</tr>
+<tr>
+  <th>Extensibility</th>
+  <td class="ours"><span class="p">Manifest + 8 built-in tools</span>
+    <span class="note">Declarative adapter manifests; gateway-owned tools (web_search, http_fetch, file_read/write/list, shell, browser, delegate) engage when the client sends none.</span></td>
+  <td class="rival"><span class="y">MCP/A2A + 95 MCP tools</span>
+    <span class="note">95 tools (35 base), Agent-to-Agent protocol, works with Claude Code, Codex, Cursor, OpenCode, Cline, Copilot and 26+ more. <b>Clearly stronger than our 8.</b></span></td>
+  <td><span class="y">Python</span> <span class="note">Custom callbacks &amp; hooks in the AI team's native language.</span></td>
+  <td><span class="n">None</span></td>
+  <td><span class="y">Plugins / guardrails</span></td>
+  <td><span class="p">Lua plugins</span> <span class="note">Noted skills gap for Python-first AI teams.</span></td>
+  <td><span class="p">Workers ecosystem</span></td>
+  <td><span class="p">Vercel ecosystem</span></td>
+</tr>
+
+<tr class="sec"><th>Compatibility</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Inbound API dialects</th>
+  <td class="ours"><span class="y">4 dialects</span> <span class="y">Measured</span>
+    <span class="note">OpenAI <code>/v1/chat/completions</code> · Anthropic <code>/v1/messages</code> ·
+    <code>/v1/responses</code> · Gemini <code>/v1beta/…</code> (incl. <code>?key=</code>). Anthropic dialect returned 200 live.</span></td>
+  <td class="rival"><span class="p">OpenAI + /responses</span>
+    <span class="note">OpenAI-compatible <code>/v1</code> plus the Responses API, and MCP/A2A as additional surfaces. No native Anthropic or Gemini <b>inbound</b> dialect documented — we lead here.</span></td>
+  <td><span class="y">OpenAI-compatible</span></td>
+  <td><span class="y">OpenAI-compatible</span></td>
+  <td><span class="y">OpenAI-compatible</span></td>
+  <td><span class="p">AI Proxy plugins</span></td>
+  <td><span class="y">OpenAI-compatible</span></td>
+  <td><span class="y">OpenAI-compatible</span></td>
+</tr>
+<tr>
+  <th>Credential dialects accepted</th>
+  <td class="ours"><span class="y">4</span>
+    <span class="note"><code>Authorization: Bearer</code> · <code>x-api-key</code> · <code>x-goog-api-key</code> · query <code>?key=</code></span></td>
+  <td class="rival"><span class="p">Bearer / JWT</span>
+    <span class="note">Plus provider-side OAuth and cookie/session auth for web providers.</span></td>
+  <td><span class="p">Bearer / x-api-key</span></td>
+  <td><span class="p">Bearer</span></td>
+  <td><span class="p">Bearer / headers</span></td>
+  <td><span class="y">Configurable</span></td>
+  <td><span class="p">Provider-specific</span></td>
+  <td><span class="p">Bearer</span></td>
+</tr>
+<tr>
+  <th>Provider onboarding</th>
+  <td class="ours"><span class="y">Probe → identify → test wizard</span>
+    <span class="note">Declarative adapter manifest; unknown APIs discovered interactively. <b>Zero manifests shipped in-repo</b>; 3 built-in profiles + 2 dialect templates seed new ones.</span></td>
+  <td class="rival"><span class="y">359 providers (150+ free)</span>
+    <span class="note">1,200+ models. Catalog re-audited every two weeks — the count moved 231 → 271 → 290 → 352/359 within months, so treat any figure as a snapshot.</span></td>
+  <td><span class="y">100+ built-in</span></td>
+  <td><span class="y">400+ models</span></td>
+  <td><span class="y">Large catalog</span></td>
+  <td><span class="p">Manual service config</span></td>
+  <td><span class="p">Provider allowlist</span></td>
+  <td><span class="y">Hundreds of models</span></td>
+</tr>
+<tr>
+  <th>Endpoints beyond chat</th>
+  <td class="ours"><span class="p">Chat, images, count_tokens</span>
+    <span class="note"><b>No embeddings, no audio, no rerank.</b> Image route exists but needs a tagged image model; catalog currently tags none.</span></td>
+  <td class="rival"><span class="y">Broad</span> <span class="note">/v1/models, chat, responses, plus provider-mediated images/embeddings where the upstream supports it.</span></td>
+  <td><span class="y">Broad</span> <span class="note">Embeddings, images, audio, rerank.</span></td>
+  <td><span class="y">Broad</span></td>
+  <td><span class="y">Broad</span></td>
+  <td><span class="y">Broad (via plugins)</span></td>
+  <td><span class="y">Broad</span></td>
+  <td><span class="y">Broad</span></td>
+</tr>
+<tr>
+  <th>Tool / function calling</th>
+  <td class="ours"><span class="y">Pass-through + built-ins</span>
+    <span class="note">Client tools pass through untouched; gateway tool set engages only when the client sends none.</span></td>
+  <td class="rival"><span class="y">Pass-through + MCP</span></td>
+  <td><span class="y">Pass-through</span></td>
+  <td><span class="y">Pass-through</span></td>
+  <td><span class="y">Pass-through + MCP</span></td>
+  <td><span class="p">Limited</span></td>
+  <td><span class="y">Pass-through</span></td>
+  <td><span class="y">Pass-through</span></td>
+</tr>
+
+<tr class="sec"><th>Security</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Key storage</th>
+  <td class="ours"><span class="y">Local file, mode 600</span>
+    <span class="note"><code>&lt;data_dir&gt;/.secrets.json</code>. Not the OS keychain — increment 27a removed the <code>keyring</code> crate.</span></td>
+  <td class="rival"><span class="p">.env / data dir</span>
+    <span class="note">Keys in <code>.env</code>, persisted at <code>DATA_DIR=/app/data</code>. Docs warn not to commit; Compose redis has no <code>requirepass</code>.</span></td>
+  <td><span class="p">Env / secret manager</span></td>
+  <td><span class="n">Held by vendor</span></td>
+  <td><span class="p">Managed vault</span></td>
+  <td><span class="y">Your infra</span></td>
+  <td><span class="n">Held by vendor</span></td>
+  <td><span class="n">Held by vendor / BYOK</span></td>
+</tr>
+<tr>
+  <th>Data residency</th>
+  <td class="ours"><span class="y">Never leaves the machine</span>
+    <span class="note">Except the requests you make to providers you configure yourself.</span></td>
+  <td class="rival"><span class="p">Gateway local, destination varies</span>
+    <span class="note">The gateway is local, but quota-stitching routes prompts to whichever provider has headroom — including free tiers whose terms may permit training on prompts.</span></td>
+  <td><span class="y">Your network</span></td>
+  <td><span class="n">Transits vendor</span></td>
+  <td><span class="p">Configurable</span></td>
+  <td><span class="y">Your network</span></td>
+  <td><span class="n">Transits vendor</span></td>
+  <td><span class="n">Transits vendor</span></td>
+</tr>
+<tr>
+  <th>Brute-force protection</th>
+  <td class="ours"><span class="y">Yes — measured</span>
+    <span class="note">Backoff 0.55 → 1.05 → 2.03 → 4.03 → 8.04 → 16.04 → 32.01 s (doubling from 500 ms, capped 32 s).
+    <b>A valid key is never throttled</b> — verified: master key returned 200 inside an open window.</span></td>
+  <td class="rival"><span class="p">JWT + Redis rate limit</span>
+    <span class="note">Present, but external review flags the default <code>JWT_SECRET</code> as bypassable if unrotated and describes guardrails as <b>fail-open</b> — fail-permitting rather than fail-closing.</span></td>
+  <td><span class="p">Configurable</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span> <span class="note">Enterprise plugins.</span></td>
+  <td><span class="y">Yes</span> <span class="note">WAF, DDoS at edge.</span></td>
+  <td><span class="y">Yes</span></td>
+</tr>
+<tr>
+  <th>Compliance certifications</th>
+  <td class="ours"><span class="n">None</span>
+    <span class="note">No SOC 2 / HIPAA. Not applicable to a local tool, but decisive for regulated buyers.</span></td>
+  <td class="rival"><span class="n">None</span>
+    <span class="note">No SLA, no certs, no data-deletion or audit-retention policy published. Reviewers explicitly advise against customer-facing production use.</span></td>
+  <td><span class="p">Bring your own</span></td>
+  <td><span class="y">Vendor-held</span></td>
+  <td><span class="y">Compliance-ready</span> <span class="note">Strongest out-of-the-box story.</span></td>
+  <td><span class="y">Enterprise</span></td>
+  <td><span class="y">Enterprise</span></td>
+  <td><span class="y">Enterprise</span></td>
+</tr>
+<tr>
+  <th>Transport security</th>
+  <td class="ours"><span class="p">Loopback cleartext</span>
+    <span class="note">Plain HTTP on 127.0.0.1 — no TLS, no mTLS. Appropriate for loopback, a gap if ever exposed.</span></td>
+  <td class="rival"><span class="p">HTTP localhost</span>
+    <span class="note">API and WebSocket default to <code>127.0.0.1</code> (ports 20128/20129/20132), but the dashboard is documented as LAN-reachable.</span></td>
+  <td><span class="y">TLS terminable</span></td>
+  <td><span class="y">TLS</span></td>
+  <td><span class="y">TLS</span></td>
+  <td><span class="y">TLS / mTLS</span></td>
+  <td><span class="y">TLS</span></td>
+  <td><span class="y">TLS</span></td>
+</tr>
+
+<tr class="sec"><th>Pricing</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>License / cost to start</th>
+  <td class="ours"><span class="y">Apache-2.0 · $0</span>
+    <span class="note">Free and open source. No paid tier, no markup, no telemetry. You pay providers directly.</span></td>
+  <td class="rival"><span class="y">MIT · $0, "free forever"</span>
+    <span class="note">No gateway fee. <b>150+ providers with free tiers</b> — the core value proposition is stitching those into near-zero-cost capacity.</span></td>
+  <td><span class="y">MIT · $0 self-host</span>
+    <span class="note">Managed tier available. Zero per-request markup.</span></td>
+  <td><span class="p">Free to start</span>
+    <span class="note">5.5% fee on credit purchase (min $0.80); Business tier ~8% (Sept 2026).</span></td>
+  <td><span class="p">Free 10K req/mo</span>
+    <span class="note">Production $49/mo for 100K req; overage $9 per 100K up to 3M.</span></td>
+  <td><span class="p">OSS free / paid tiers</span>
+    <span class="note">Konnect ≈ $105/mo per gateway service + ≈ $34.25 per 1M requests + ≈ $720/mo infra.</span></td>
+  <td><span class="y">Core features free</span>
+    <span class="note">No per-call gateway fee. Workers Paid from $5/mo.</span></td>
+  <td><span class="y">$0 fixed fee</span>
+    <span class="note">Zero markup; $5/mo included credits. Vercel Pro $20/user/mo for team add-ons.</span></td>
+</tr>
+<tr>
+  <th>Cost at scale</th>
+  <td class="ours"><span class="y">$0 gateway</span>
+    <span class="note">Provider spend only. No request-based billing.</span></td>
+  <td class="rival"><span class="y">$0 gateway</span>
+    <span class="note">Provider spend only, and free-tier stitching can push that toward zero. <b>But:</b> free tiers are capped and unpredictable, and aggregating them sits in a terms-of-service grey area with a real account-ban risk.</span></td>
+  <td><span class="y">Infra only</span></td>
+  <td><span class="n">Markup compounds</span>
+    <span class="note">Common path is migrating off to self-host as volume grows.</span></td>
+  <td><span class="p">Plan + overage</span></td>
+  <td><span class="n">Highest</span>
+    <span class="note">Enterprise contracts frequently &gt; $50k/yr; per-request billing penalises agentic fan-out.</span></td>
+  <td><span class="y">Low</span>
+    <span class="note">≈ $8/mo for ~15M requests (Workers Paid). Log caps push heavy users to Enterprise.</span></td>
+  <td><span class="p">Usage + add-ons</span>
+    <span class="note">Enterprise typically ≈ $25k+/yr.</span></td>
+</tr>
+
+<tr class="sec"><th>Maturity &amp; adoption</th><td></td><td></td><td></td><td></td><td></td><td></td><td></td><td></td></tr>
+<tr>
+  <th>Public adoption</th>
+  <td class="ours"><span class="n">None yet</span>
+    <span class="note">No downloadable release — builds require Apple Developer ID signing + notarisation. No user reviews exist.</span></td>
+  <td class="rival"><span class="y">70,689 ★</span> <span class="note">10,048 forks; 612 open issues. Created 2026-02-13 — <b>≈313 stars/day over 226 days</b>, the fastest-growing entry here and already past LiteLLM.</span></td>
+  <td><span class="y">59,710 ★</span> <span class="note">11,816 forks; 5,319 open issues.</span></td>
+  <td><span class="y">Very large</span></td>
+  <td><span class="y">13,091 ★</span> <span class="note">1,316 forks; 279 open issues.</span></td>
+  <td><span class="y">Established vendor</span></td>
+  <td><span class="y">Large installed base</span></td>
+  <td><span class="y">Growing</span></td>
+</tr>
+<tr>
+  <th>Test coverage</th>
+  <td class="ours"><span class="y">≈1,134 Rust + TS + e2e</span>
+    <span class="note">Rust <code>#[test]</code> fns, vitest suites, Playwright browser tests. Gate includes clippy, rustfmt, typecheck, key-leak grep.</span></td>
+  <td class="rival"><span class="y">Yes, incl. router evals</span>
+    <span class="note"><code>eval:router</code>, <code>bench:compression</code>, <code>eval:compression</code>, <code>omniroute:verify</code> — router and compression are explicitly benchmarked.</span></td>
+  <td><span class="y">Large</span></td>
+  <td><span class="p">Closed</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="y">Yes</span></td>
+  <td><span class="p">Closed</span></td>
+  <td><span class="p">Closed</span></td>
+</tr>
+<tr>
+  <th>Release velocity</th>
+  <td class="ours"><span class="y">Active</span> <span class="note">Daily commits; v1.2.0.</span></td>
+  <td class="rival"><span class="y">Very active</span> <span class="note">v3.8.51; pushed 2026-09-27 — same day as our HEAD.</span></td>
+  <td><span class="y">Very active</span> <span class="note">Pushed 2026-09-27.</span></td>
+  <td><span class="y">Active</span></td>
+  <td><span class="p">Slower</span> <span class="note">OSS gateway last pushed 2026-05-25.</span></td>
+  <td><span class="y">Active</span></td>
+  <td><span class="y">Active</span></td>
+  <td><span class="y">Active</span></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<!-- ============ PERFORMANCE ============ -->
+<h2><span class="n">03</span> Performance — measured overhead</h2>
+<p class="lede">Gateway-local latency, 150 iterations per endpoint against the live listener on
+<code>127.0.0.1:8800</code>. These paths exclude the upstream model call, so they isolate the router's own work.
+LiteLLM's numbers are its published benchmark against a <strong>mock</strong> upstream on 4 CPU / 8 GB — the
+closest honest comparator available. OmniRoute publishes no overhead figure, so it is absent rather than estimated.</p>
+
+<div class="bars">
+  <div class="row">
+    <div class="rl">Route-existence check <span>ours · 404 unknown route</span></div>
+    <div class="track"><div class="fill" style="width:3%;background:var(--ours)">0.30</div></div>
+    <div class="rv">0.30 ms<small>p95 0.41</small></div>
+  </div>
+  <div class="row">
+    <div class="rl">Model catalog <span>ours · GET /v1/models, 200</span></div>
+    <div class="track"><div class="fill" style="width:4%;background:var(--ours)">0.43</div></div>
+    <div class="rv">0.43 ms<small>p95 0.67</small></div>
+  </div>
+  <div class="row">
+    <div class="rl">Auth + route plan (miss) <span>ours · full pipeline, 404</span></div>
+    <div class="track"><div class="fill" style="width:7%;background:var(--ours)">0.79</div></div>
+    <div class="rv">0.79 ms<small>p95 1.96</small></div>
+  </div>
+  <div class="row">
+    <div class="rl">LiteLLM proxy — 4 instances <span>reported · 1,170 RPS, mock upstream</span></div>
+    <div class="track"><div class="fill" style="width:18%;background:#8a6fb0">2</div></div>
+    <div class="rv">2 ms<small>p95 8</small></div>
+  </div>
+  <div class="row">
+    <div class="rl">LiteLLM proxy — 2 instances <span>reported · 1,036 RPS, mock upstream</span></div>
+    <div class="track"><div class="fill" style="width:100%;background:#6b3fa0">12</div></div>
+    <div class="rv">12 ms<small>p95 29</small></div>
+  </div>
+</div>
+
+<div class="callout">
+  <b>Caveat — do not read this as "we are 40× faster."</b> The two measurements are not like-for-like. Ours is a
+  single-user loopback listener with one provider configured and no upstream call; LiteLLM's is a Python proxy
+  sustained at &gt;1,000 RPS across 2–4 instances with Postgres and streaming enabled. What the comparison
+  legitimately shows is that <b>our architecture is not the bottleneck</b> — the router adds well under a
+  millisecond at the median, so end-to-end latency is essentially the provider's. Our throughput ceiling
+  remains <b>unverified at load</b>: live traffic has never reached the 8-concurrent / 32-queued gate.
+</div>
+
+<div class="callout crit">
+  <b>The performance question OmniRoute reframes.</b> Raw routing overhead is not where this contest is decided.
+  OmniRoute's RTK+Caveman compression claims 15–95% token savings (≈89% average) — unverified, with no published
+  dataset or reproduction — while <b>we add ≈1,719 prompt tokens of fixed context to every single request</b>,
+  measured. If even a fraction of that claim holds, OmniRoute is cheaper per request by an order of magnitude on
+  the axis that actually scales with usage. Reducing our fixed context overhead is the highest-leverage
+  performance work available to us, and it is cheap: it is prompt assembly, not architecture.
+</div>
+
+<p class="lede" style="margin-top:22px"><strong>End-to-end, with the provider call included:</strong> a live
+non-streaming chat returned <code>200</code> in <strong>2.64 s</strong> and a streaming request had
+<strong>23 ms to first byte</strong>.</p>
+
+<!-- ============ FEATURE RADAR ============ -->
+<h2><span class="n">04</span> Feature coverage</h2>
+<p class="lede">Support across the capabilities that typically decide a gateway choice.</p>
+
+<div class="scroller">
+<table style="min-width:1240px">
+<thead>
+<tr>
+  <th style="width:206px;min-width:206px">Capability</th>
+  <th class="ours">Ours</th><th class="rival">OmniRoute</th><th>LiteLLM</th><th>OpenRouter</th><th>Portkey</th><th>Kong AI</th><th>Cloudflare</th><th>Vercel</th>
+</tr>
+</thead>
+<tbody>
+<tr><th>Multi-provider routing</th><td class="ours"><span class="y">Yes</span></td><td class="rival"><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><th>Automatic failover</th><td class="ours"><span class="y">Yes</span></td><td class="rival"><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><th>Circuit breaker / cooldown</th><td class="ours"><span class="y">Yes</span></td><td class="rival"><span class="p">Undocumented</span></td><td><span class="y">Yes</span></td><td><span class="p">Managed</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="p">Managed</span></td><td><span class="p">Managed</span></td></tr>
+<tr><th>Spend caps / budgets</th><td class="ours"><span class="y">Yes</span></td><td class="rival"><span class="p">Quota pools</span></td><td><span class="y">Yes</span></td><td><span class="p">Basic</span></td><td><span class="y">Yes</span></td><td><span class="p">Paid plugin</span></td><td><span class="p">Basic</span></td><td><span class="y">Yes</span></td></tr>
+<tr><th>Response caching</th><td class="ours"><span class="n">No</span></td><td class="rival"><span class="p">Partial</span></td><td><span class="y">Yes</span></td><td><span class="p">Limited</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="p">Add-on</span></td></tr>
+<tr><th>Persistent memory layer</th><td class="ours"><span class="y">Built-in</span></td><td class="rival"><span class="p">Qdrant sidecar</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td></tr>
+<tr><th>Token compression</th><td class="ours"><span class="n">No</span></td><td class="rival"><span class="y">15–95%</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td></tr>
+<tr><th>Multi-dialect inbound</th><td class="ours"><span class="y">4 dialects</span></td><td class="rival"><span class="p">OpenAI + responses</span></td><td><span class="p">OpenAI</span></td><td><span class="p">OpenAI</span></td><td><span class="p">OpenAI</span></td><td><span class="p">Plugin</span></td><td><span class="p">OpenAI</span></td><td><span class="p">OpenAI</span></td></tr>
+<tr><th>MCP / A2A</th><td class="ours"><span class="n">No</span></td><td class="rival"><span class="y">95 MCP tools</span></td><td><span class="p">Via tooling</span></td><td><span class="n">No</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td><td><span class="p">Partial</span></td></tr>
+<tr><th>Embeddings / audio / rerank</th><td class="ours"><span class="n">No</span></td><td class="rival"><span class="y">Via providers</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td></tr>
+<tr><th>GUI / visual management</th><td class="ours"><span class="y">Full desktop IDE</span></td><td class="rival"><span class="y">Desktop + PWA</span></td><td><span class="p">Admin UI</span></td><td><span class="p">Dashboard</span></td><td><span class="p">Dashboard</span></td><td><span class="p">Kong Manager</span></td><td><span class="p">Dashboard</span></td><td><span class="p">Dashboard</span></td></tr>
+<tr><th>RBAC / governance</th><td class="ours"><span class="n">No</span></td><td class="rival"><span class="p">Basic / fail-open</span></td><td><span class="p">Basic</span></td><td><span class="p">Basic</span></td><td><span class="y">Strong</span></td><td><span class="y">Yes</span></td><td><span class="p">Enterprise</span></td><td><span class="p">Enterprise</span></td></tr>
+<tr><th>Self-hostable</th><td class="ours"><span class="y">Yes (local)</span></td><td class="rival"><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="y">Yes</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td></tr>
+<tr><th>Zero third-party data transit</th><td class="ours"><span class="y">Yes</span></td><td class="rival"><span class="p">Gateway local only</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="p">If self-hosted</span></td><td><span class="y">Yes</span></td><td><span class="n">No</span></td><td><span class="n">No</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<!-- ============ PROS / CONS ============ -->
+<h2><span class="n">05</span> Advantages and disadvantages, option by option</h2>
+<p class="lede">Honest ledger. Our own column lists gaps first, because those are the ones that decide
+whether to keep building. OmniRoute is listed second — it is the one to beat.</p>
+
+<div class="pc">
+
+  <div class="card mine">
+    <div class="ch"><div class="t">AI-Provider Router IDE</div><div class="s">ours · v1.2.0 · Apache-2.0 · $0</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Lowest measured overhead</strong> — sub-millisecond median on gateway-local paths.</li>
+        <li><strong>Truly local.</strong> Loopback bind, mode-600 secrets file, no vendor account, no telemetry.</li>
+        <li><strong>Four inbound dialects</strong> including Anthropic and Gemini, verified live — nobody else here does this.</li>
+        <li><strong>Built-in scoped memory layer</strong> (BM25/FTS5) with a 15 ms deadline; OmniRoute's is an optional Qdrant sidecar.</li>
+        <li><strong>Resilience primitives are real and measured:</strong> 6 attempts, 1 s cooldown floor, half-open breaker, 500 ms→32 s backoff.</li>
+        <li><strong>Security posture is conservative</strong> — no fail-open guardrails, no default-secret problem.</li>
+        <li><strong>Provider-agnostic onboarding</strong> — probe→identify→test wizard for unknown APIs.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Zero adoption.</strong> No release build; needs Apple notarisation. No reviews exist.</li>
+        <li><strong>macOS-only in practice</strong> — CI is <code>macos-14</code>; Win/Linux untested. OmniRoute runs everywhere.</li>
+        <li><strong>≈1,719 prompt tokens/request</strong> of fixed overhead, billed every call. OmniRoute compresses.</li>
+        <li><strong>Single-user.</strong> No RBAC, no roles, no user identity, no multi-tenant story.</li>
+        <li><strong>No response or semantic cache</strong> — every call is billed again.</li>
+        <li><strong>No MCP/A2A</strong> — OmniRoute has 95 MCP tools.</li>
+        <li><strong>No embeddings, audio or rerank</strong>; image route has no tagged model today.</li>
+        <li><strong>No Docker, no cloud, no TLS</strong> — cannot be deployed for a team.</li>
+        <li><strong>No compliance posture</strong> — no SOC 2 / HIPAA.</li>
+        <li><strong>Throughput ceiling unverified</strong> at load.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: a single developer on macOS who wants one local endpoint for every provider, with keys that never leave the machine.</div>
+  </div>
+
+  <div class="card rival">
+    <div class="ch"><div class="t">OmniRoute <span style="font-weight:600;font-size:11px;color:#8a4400">— closest rival</span></div><div class="s">MIT · 70,689★ · 359 providers · TypeScript</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Enormous momentum</strong> — 70,689★ in 226 days (≈313/day); already past LiteLLM.</li>
+        <li><strong>359 providers, 150+ with free tiers, 1,200+ models.</strong> Breadth we cannot match.</li>
+        <li><strong>Token compression (RTK+Caveman)</strong> — claimed 15–95%. Attacks our fixed-context cost directly.</li>
+        <li><strong>17–19 routing strategies</strong> with quota-aware auto-fallback.</li>
+        <li><strong>MCP/A2A with 95 tools</strong>; works with Claude Code, Codex, Cursor, Cline, Copilot and 26+ more.</li>
+        <li><strong>Cross-platform</strong> — Node.js and Docker, desktop app and PWA.</li>
+        <li><strong>Free forever, MIT, zero telemetry by default.</strong></li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Security maturity rated lowest in class.</strong> Default <code>JWT_SECRET</code> is bypassable unrotated; guardrails described as <b>fail-open</b>.</li>
+        <li><strong>Free-tier aggregation is a ToS grey area.</strong> Many free tiers are personal-use only; multi-account use breaches most platforms. <b>Account-ban risk is real.</b></li>
+        <li><strong>Compression is lossy</strong> — ~89% average may degrade precision reasoning and context-sensitive code.</li>
+        <li><strong>No published overhead, throughput or SLA.</strong> No compliance certs; reviewers advise against customer-facing production.</li>
+        <li><strong>Catalog churn</strong> — provider count moved 231→359 in months; not a stable contract.</li>
+        <li><strong>Compose ships Redis without <code>requirepass</code></strong>; dashboard is LAN-reachable.</li>
+        <li>No native Anthropic/Gemini <b>inbound</b> dialect; no built-in scoped memory.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: a developer who wants maximum free capacity and breadth, and accepts the terms-of-service and quality risk.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">LiteLLM</div><div class="s">BerriAI · MIT · 59,710★ · Python</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>100+ providers</strong> out of the box; de facto standard.</li>
+        <li><strong>Fully self-hostable</strong> — data stays in your VPC.</li>
+        <li><strong>Zero markup</strong>; per-team/user/model budgets in Postgres.</li>
+        <li><strong>Redis semantic caching</strong> and cost/latency-based routing.</li>
+        <li><strong>Python extensibility</strong> — native to AI teams.</li>
+        <li><strong>Huge community</strong>; very active development.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>You own operations</strong> — uptime, upgrades, observability.</li>
+        <li><strong>5,319 open issues</strong> — breadth comes with instability.</li>
+        <li><strong>Highest overhead</strong> of the measured set (12 ms p50 at 1k RPS).</li>
+        <li><strong>High memory usage</strong> at init and per request.</li>
+        <li>No persistent memory layer; no desktop GUI.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: engineering teams that want control, zero markup, and will operate infrastructure.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">OpenRouter</div><div class="s">managed only · 400+ models</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Fastest possible start</strong> — one key, hundreds of models.</li>
+        <li><strong>Automatic provider fallbacks</strong>, zero infrastructure.</li>
+        <li><strong>Largest single catalog</strong> (400+ models).</li>
+        <li>Free tier to begin; no ops burden at all.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>No self-host option</strong> — every request transits a third party.</li>
+        <li><strong>5.5% credit fee</strong> (min $0.80); ~8% on the Business tier.</li>
+        <li><strong>Least routing control</strong> — fallbacks are opaque by design.</li>
+        <li>Thinnest deep observability; unsuitable for data-sensitive workloads.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: prototypes and internal tools where speed beats control and data sensitivity is low.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">Portkey</div><div class="s">MIT · 13,091★ · SaaS + OSS</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Strongest governance story</strong> — RBAC, audit trails, guardrails, compliance-ready.</li>
+        <li><strong>Conditional, content-aware routing</strong> and fine-grained fallback chains.</li>
+        <li><strong>Native observability</strong> — request tracing, prompt management.</li>
+        <li><strong>Self-hostable</strong> open-source gateway.</li>
+        <li>Low memory footprint; CPU capped ~40% under load.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Plan caps bite</strong> — 10K req/mo free; $49/mo for 100K; $9 per 100K overage.</li>
+        <li><strong>SaaS-centric</strong> — full features shine only on the managed platform.</li>
+        <li><strong>OSS gateway slower to move</strong> — last pushed 2026-05-25.</li>
+        <li>No persistent memory layer.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: organisations that must satisfy compliance review and want governance without building it.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">Kong AI Gateway</div><div class="s">Kong Inc. · OSS / Konnect / Enterprise</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>~10 ms latency, 350+ RPS on 1 vCPU</strong> — proven data-plane performance.</li>
+        <li><strong>Mature enterprise platform</strong> — unified control plane for all traffic.</li>
+        <li><strong>Self-hostable</strong>; strong legacy protocol support.</li>
+        <li>Right choice if you already run Kong Enterprise.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Most expensive.</strong> ≈$105/mo per gateway service + ≈$34.25/1M requests + ≈$720/mo infra; Enterprise often &gt;$50k/yr.</li>
+        <li><strong>Per-request billing punishes agentic workloads</strong> — one agent turn can be 20+ calls.</li>
+        <li><strong>Lua extensibility</strong> — a real skills gap for Python-first AI teams.</li>
+        <li><strong>Token-level limiting is a paid plugin.</strong> Heavy footprint for LLM-only use.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: existing Kong Enterprise shops consolidating AI traffic onto one control plane.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">Cloudflare AI Gateway</div><div class="s">managed edge · core free</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Core features free with no per-call fee</strong> — cheapest viable managed option.</li>
+        <li><strong>Very cheap at volume</strong> — ≈$8/mo for ~15M requests on Workers Paid.</li>
+        <li>Free prompt/response caching, rate limiting, analytics.</li>
+        <li>Edge DDoS/WAF protection included.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Managed only</strong> — all traffic transits Cloudflare.</li>
+        <li><strong>Log caps are hard stops</strong> — 100K logs/mo free, 1M paid, ~10M storage per gateway; no paid overage.</li>
+        <li>Free tier limited to 100K requests/day and eligible models only.</li>
+        <li>Workers ecosystem lock-in; no memory layer.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: cost-sensitive teams already on Cloudflare who accept third-party transit.</div>
+  </div>
+
+  <div class="card">
+    <div class="ch"><div class="t">Vercel AI Gateway</div><div class="s">managed · zero markup</div></div>
+    <div class="cb">
+      <div class="pros"><h4>Advantages</h4><ul>
+        <li><strong>Zero markup</strong> — provider list price, BYOK included.</li>
+        <li><strong>No fixed monthly fee</strong>; $5/mo in included credits.</li>
+        <li>Retries, load balancing and managed fallback included.</li>
+        <li>Hundreds of models; clean observability and spend monitoring.</li>
+      </ul></div>
+      <div class="cons"><h4>Disadvantages</h4><ul>
+        <li><strong>Managed only</strong> — data transits Vercel.</li>
+        <li><strong>Free tier restricted</strong> to eligible models with lower rate limits.</li>
+        <li><strong>Team add-ons need Vercel Pro at $20/user/mo</strong>; Enterprise ≈$25k+/yr.</li>
+        <li>Free credits stop once you purchase credits; ecosystem lock-in.</li>
+      </ul></div>
+    </div>
+    <div class="foot">Best for: Vercel-native teams that want zero markup without operating a proxy.</div>
+  </div>
+
+</div>
+
+<!-- ============ DECISION ============ -->
+<h2><span class="n">06</span> Which to choose</h2>
+<p class="lede">A decision rule, not a ranking. The right answer depends on which constraint is binding.</p>
+<div class="pick">
+  <div class="pk"><div class="who">If data must never leave your machine</div>
+    <div class="what">Ours, OmniRoute, or self-hosted LiteLLM</div>
+    <div class="why">All three run locally. Ours needs no server and never leaves loopback; OmniRoute is local
+    but routes prompts to whichever provider has quota, including free tiers; LiteLLM stays in your VPC.</div></div>
+  <div class="pk"><div class="who">If squeezing cost toward zero matters most</div>
+    <div class="what">OmniRoute</div>
+    <div class="why">150+ free providers stitched automatically, plus compression. Accept the ToS grey area,
+    lossy compression and ban risk — and keep it out of anything customer-facing.</div></div>
+  <div class="pk"><div class="who">If you need a team, roles and audit</div>
+    <div class="what">Portkey</div>
+    <div class="why">The only option here with RBAC and compliance-ready logging out of the box. LiteLLM can
+    reach the same bar, but you assemble it yourself.</div></div>
+  <div class="pk"><div class="who">If you want breadth with no ops</div>
+    <div class="what">OpenRouter</div>
+    <div class="why">One key, hundreds of models, automatic fallbacks. Accept the 5.5% credit fee and third-party
+    transit; migrate to self-host when the markup compounds.</div></div>
+  <div class="pk"><div class="who">If cost at scale is the binding constraint</div>
+    <div class="what">Cloudflare AI Gateway</div>
+    <div class="why">No per-call fee and roughly $8/mo at ~15M requests. Watch the log-retention caps — they are
+    hard stops, not overages.</div></div>
+  <div class="pk"><div class="who">If you are one developer on macOS</div>
+    <div class="what">Ours — with eyes open</div>
+    <div class="why">Sub-millisecond routing, four API dialects, a real memory layer, a GUI, and keys in a
+    mode-600 file. OmniRoute beats us on breadth, platform reach and cost; we beat it on dialect coverage,
+    built-in memory and security conservatism.</div></div>
+</div>
+
+<div class="callout crit">
+  <b>Revised positioning.</b> An earlier draft of this page argued our niche was "zero-ops single-machine with a
+  memory layer" and named LiteLLM as the sharpest competitor. <b>OmniRoute occupies that exact niche</b>, ships
+  it cross-platform, and is growing at ~313 stars/day. Our remaining differentiators are narrower than the draft
+  implied: <b>four inbound dialects</b> (they have OpenAI + responses), <b>built-in scoped memory</b> (they have
+  an optional Qdrant sidecar), <b>measured sub-millisecond overhead</b> (they publish nothing), and
+  <b>conservative security</b> (theirs is rated fail-open with a bypassable default secret). Those are real, but
+  they are refinements — not a category. The binding constraints on us are unchanged and now more urgent:
+  <b>no distributable release</b>, <b>macOS-only</b>, and <b>≈1,719 tokens of fixed context per request</b>.
+</div>
+
+<!-- ============ METHOD ============ -->
+<h2><span class="n">07</span> Methodology &amp; provenance</h2>
+<p class="lede">What was measured, what was read, and what remains unverified.</p>
+<div class="scroller">
+<table style="min-width:900px">
+<thead><tr><th style="width:206px;min-width:206px">Claim</th><th>Provenance</th><th>Notes</th></tr></thead>
+<tbody>
+<tr><th>Ours — gateway latency</th><td><span class="y">Measured</span></td>
+  <td>150 iterations per endpoint against the live listener on <code>127.0.0.1:8800</code>, loopback, one provider configured. Percentiles computed from raw samples. Proxy environment variables unset.</td></tr>
+<tr><th>Ours — live chat 2.64 s, TTFB 23 ms</th><td><span class="y">Measured</span></td>
+  <td>Single non-streaming and single streaming request. Upstream-dominated; not a throughput measurement.</td></tr>
+<tr><th>Ours — 1,719 prompt tokens/request</th><td><span class="y">Measured</span></td>
+  <td>Reported by the gateway's own usage block on a live completion. Consistent with the September 22 finding of ~1,700–1,900 fixed overhead.</td></tr>
+<tr><th>Ours — auth backoff curve</th><td><span class="y">Measured</span></td>
+  <td>Reproduced by repeated unauthenticated requests: 0.55/1.05/2.03/4.03/8.04/16.04/32.01 s. Confirms the documented doubling from 500 ms capped at 32 s.</td></tr>
+<tr><th>Ours — code-level capabilities</th><td><span class="y">Verified in source</span></td>
+  <td>Read from <code>packages/router-core</code>, <code>apps/desktop/src-tauri/src</code> and
+  <code>packages/adapter-spec</code> with file-level evidence — not from <code>docs/</code>, which is specification and can run ahead of the implementation.</td></tr>
+<tr><th>Ours — absence claims</th><td><span class="y">Verified by search</span></td>
+  <td>No embeddings route registered (route table is chat / images / messages / count_tokens / responses /
+  Gemini / models / health + admin). No RBAC, no response cache. Memory retrieval is BM25 via SQLite FTS5,
+  explicitly not embeddings.</td></tr>
+<tr><th>Ours — throughput ceiling</th><td><span class="n">Unverified</span></td>
+  <td>The 8-concurrent / 32-queued gate has never been reached by live traffic; upstream rate-limits first.</td></tr>
+<tr><th>OmniRoute — stars, forks, growth</th><td><span class="y">Live API</span></td>
+  <td>Fetched from the GitHub API on 2026-09-27: 70,689★ / 10,048 forks / 612 open issues, created 2026-02-13.
+  ≈313 stars/day over 226 days.</td></tr>
+<tr><th>OmniRoute — features &amp; counts</th><td><span class="p">Vendor README + 2026 reviews</span></td>
+  <td>359 providers / 150+ free / 1,200+ models / 17–19 routing strategies / 95 MCP tools. The README states both
+  352 and 359 providers; the count is re-audited fortnightly and has moved repeatedly. Treat as a snapshot.</td></tr>
+<tr><th>OmniRoute — compression 15–95%</th><td><span class="n">Unverified vendor claim</span></td>
+  <td>No dataset, model list, error bars or reproduction steps published. Flagged as a claim, not a result,
+  everywhere it appears.</td></tr>
+<tr><th>OmniRoute — security criticisms</th><td><span class="p">Third-party review</span></td>
+  <td>Fail-open guardrails, bypassable default <code>JWT_SECRET</code>, ToS/ban risk on free-tier aggregation,
+  Redis without <code>requirepass</code>. Sourced from 2026 analyst reviews, not independently tested here.</td></tr>
+<tr><th>Competitor — LiteLLM overhead</th><td><span class="p">Vendor benchmark</span></td>
+  <td>Published figures against a <b>mock</b> upstream on 4 CPU / 8 GB with Postgres, Locust, streaming on.
+  Not independently reproduced here.</td></tr>
+<tr><th>Competitor — pricing</th><td><span class="p">Vendor docs &amp; 2026 analyst reviews</span></td>
+  <td>Captured September 2026. Gateway pricing changes frequently — verify before committing.</td></tr>
+<tr><th>Competitor — user reviews</th><td><span class="n">Not available</span></td>
+  <td>No comparable third-party review corpus (G2/Gartner) was retrieved. Adoption is proxied by GitHub traction
+  and vendor-published testimonials, which are self-selected. Treat "user reviews" as the weakest column in
+  this comparison.</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="legend">
+  <span><span class="y">Yes</span> full support</span>
+  <span><span class="p">Partial</span> limited or conditional</span>
+  <span><span class="n">No</span> absent</span>
+  <span><b class="num">Measured</b> probed on the running gateway</span>
+  <span><b class="num">Reported</b> from vendor or analyst sources</span>
+</div>
+
+<footer>
+  Generated 2026-09-27 · revised to add OmniRoute · Product: AI-Provider Router IDE v1.2.0 (Apache-2.0) ·
+  Benchmarks run against the local gateway on <code>127.0.0.1:8800</code> with one provider configured.<br>
+  Competitor pricing and features reflect vendor documentation and 2026 analyst reviews as of September 2026 and
+  change frequently — verify against current vendor docs before making a procurement decision. OmniRoute's
+  provider count and compression figures are vendor claims on a fast-moving project. Credentials were read from
+  the local secrets file for benchmarking only and are not reproduced in this document.
+</footer>
+
+</div>
+</body>
+</html>
