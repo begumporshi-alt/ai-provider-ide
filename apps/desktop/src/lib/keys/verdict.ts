@@ -16,6 +16,8 @@
  * needs unit tests has to live outside a component.
  */
 
+import { detectClientGate, clientGateNotice } from "@aiprovider/router-core";
+
 /** `active | cooldown | invalid` are storable; `unverified` deliberately is not. */
 export type KeyVerdict = "active" | "cooldown" | "invalid" | "unverified";
 
@@ -40,6 +42,15 @@ export function verdictFor(r: PingResult): KeyVerdict {
   // No HTTP response at all — DNS, TLS, timeout, offline, or a manifest with no listModels
   // endpoint. `pingKey` uses 0 for every one of those.
   if (r.status === 0) return "unverified";
+  // **A 401/403 is not evidence about the key when the provider never read the key.** Some
+  // gateways refuse the *client* first; measured 2026-09-29, `agentrouter.org` answers
+  // `401 unauthorized_client_error` to any unrecognised `User-Agent` and only judges the
+  // credential once the client is accepted. Classifying that as `invalid` did two wrong things at
+  // once: it took a working key out of rotation (`HealthTracker.isKeyUsable`, and the catalog
+  // refresh considers `active` keys only) and it told the operator their key had been rejected.
+  // `unverified` is the honest verdict — it means "leave the status alone" — and the notice below
+  // carries the real cause. See `client-gate.ts` for the measurement.
+  if (detectClientGate(r.status, r.message)) return "unverified";
   // The only two answers that are evidence about the credential itself.
   if (r.status === 401 || r.status === 403) return "invalid";
   // 5xx is the provider failing; 400/404/422 usually mean our request or base URL is wrong. Neither
@@ -62,6 +73,11 @@ export function isConclusive(v: KeyVerdict): v is Exclude<KeyVerdict, "unverifie
  * the truth to drift.
  */
 export function verdictNotice(label: string, r: PingResult): string {
+  // Checked before the switch, because the gate's whole point is that the ordinary `invalid`
+  // wording would be a lie here: `verdictFor` has already declined to call this key bad, and this
+  // line has to agree with it. The gate is quoted by its own marker rather than paraphrased.
+  const gate = detectClientGate(r.status, r.message);
+  if (gate) return `${label}: ${clientGateNotice(gate)}`;
   const verdict = verdictFor(r);
   const detail = r.message ? ` — ${r.message}` : "";
   switch (verdict) {

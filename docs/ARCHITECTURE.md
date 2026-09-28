@@ -624,9 +624,15 @@ CREATE TABLE models_cache (
   pricing_json      TEXT,                -- {prompt,completion} micro-USD per 1M tokens
   fetched_at        INTEGER NOT NULL,
   raw_json          TEXT,                -- unused: never written, never read
+  origin            TEXT NOT NULL DEFAULT 'discovered'
+                    CHECK (origin IN ('discovered','manual')),  -- added by migration 0018
   UNIQUE (provider_id, native_id)
 );
 CREATE INDEX idx_models_provider_modality ON models_cache(provider_id, modality);
+-- `origin` decides whether a refresh may delete the row. A `discovered` row is the provider's own
+-- /models listing and is replaced wholesale on every refresh; a `manual` row was typed in by the
+-- operator and is re-sent with the payload instead. Without the distinction, the first Refresh
+-- after a manual add erased it — see `ModelCatalog.refreshProvider`.
 
 CREATE TABLE model_aliases (             -- NO FK to models_cache: a cache refresh must not
   alias           TEXT NOT NULL,         -- destroy the failover map; dangling native_model_id

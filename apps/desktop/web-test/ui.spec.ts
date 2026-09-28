@@ -19,10 +19,16 @@ async function store<T>(page: Page, key: string): Promise<T> {
   return page.evaluate((k) => (window as unknown as { __webTest: { store: Store } }).__webTest.store[k]!(), key) as Promise<T>;
 }
 
-/** Providers → Add Provider → guided setup, then type the three fields and start. */
+/**
+ * Providers → Set up automatically, then type the three fields and start.
+ *
+ * This drives `Onboarding.tsx` — probe → fingerprint → template-or-AI — and not the manual modal,
+ * which is a different flow with different labels. It used to reach the wizard through an
+ * "Any other provider — guided setup" entry inside `AddProviderModal`; that entry no longer exists,
+ * and until the Providers screen grew its own button the wizard had no entrance at all.
+ */
 async function startWizard(page: Page, name: string, baseUrl: string, key: string): Promise<void> {
-  await page.getByRole("button", { name: /Add Provider/ }).click();
-  await page.getByText("Any other provider — guided setup").click();
+  await page.getByRole("button", { name: "Set up automatically" }).click();
   await page.getByPlaceholder("My provider").fill(name);
   await page.getByPlaceholder("https://api.example.com/v1").fill(baseUrl);
   await page.getByPlaceholder("sk-…").fill(key);
@@ -54,7 +60,10 @@ async function sendInAssistant(page: Page, model: RegExp, prompt: string, answer
 
 test("zero-config wizard: connect an OpenAI-compatible provider and route through it", async ({ page }) => {
   await page.goto(APP);
-  await expect(page.getByText("Add Provider")).toBeVisible();
+  // The empty store renders the first-run hero, whose primary action is now the auto wizard. This
+  // used to assert the hero's "Add Provider" button — that label is the manual path's now, and it
+  // only renders once a provider exists.
+  await expect(page.getByText("Connect your first provider")).toBeVisible();
 
   await startWizard(page, "Mock Oracle", ORACLE_BASE, ORACLE_KEY);
 

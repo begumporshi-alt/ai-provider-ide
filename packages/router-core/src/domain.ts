@@ -48,6 +48,15 @@ export interface CatalogModel {
    * actually says so, never by default.
    */
   supportsReasoning?: boolean;
+  /**
+   * Where the row came from: the provider's own `/models` listing, or the operator's keyboard.
+   *
+   * Carried in memory **and** persisted, because it decides whether a refresh may delete the row.
+   * `refreshProvider` replaces a provider's discovered set wholesale; a manual row has to survive
+   * that, or the first Refresh after a manual add silently erases it. Optional so every existing
+   * discovered row keeps its meaning without being rewritten — `undefined` means `discovered`.
+   */
+  origin?: "discovered" | "manual";
 }
 
 export interface AliasEntry {

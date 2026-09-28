@@ -65,6 +65,54 @@ describe("key verdicts", () => {
     });
   });
 
+  /**
+   * A gateway that refuses the client before reading the credential. The body below is quoted
+   * verbatim from `agentrouter.org`, measured 2026-09-29: the *same* dummy key returns this body
+   * with no recognised `User-Agent`, and a real "invalid token" once the client is accepted.
+   * So this response is evidence about the client and none at all about the key.
+   */
+  describe("a client gate is not a rejected key", () => {
+    const GATE_BODY =
+      '{"error":{"message":"unauthorized client detected, contact support for assistance at ' +
+      'https://discord.gg/HgekCyHJqB"},"message":"UNAUTHENTICATED","success":false,' +
+      '"type":"unauthorized_client_error"}';
+    const gatePing = (status = 401): PingResult =>
+      ping({ status, message: `HTTP ${status}: ${GATE_BODY}` });
+
+    it("leaves the key alone rather than pulling it out of rotation", () => {
+      expect(verdictFor(gatePing(401))).toBe("unverified");
+      expect(verdictFor(gatePing(403))).toBe("unverified");
+      // The consequence that matters: an `unverified` verdict is never written, so the key stays
+      // usable. Asserted through `isConclusive` because that is the gate the writer actually uses.
+      expect(isConclusive(verdictFor(gatePing(401)))).toBe(false);
+    });
+
+    it("says the client was refused, and does not claim the key was rejected", () => {
+      const s = verdictNotice("key-01", gatePing());
+      expect(s).toContain("refused this client");
+      expect(s).toContain("before reading the credential");
+      expect(s).toContain("left as it was");
+      expect(s).toContain("unauthorized_client_error");
+      // The specific misreport: the operator was told the provider rejected their key.
+      expect(s).not.toContain("rejected this key");
+      expect(s).not.toContain("out of rotation");
+    });
+
+    it("still blames the key when the 401 is really about the credential", () => {
+      // The guard against over-reach: no gate marker, so this stays a credential verdict.
+      expect(verdictFor(ping({ status: 401, message: "HTTP 401: no auth credentials" }))).toBe("invalid");
+      expect(verdictFor(ping({ status: 401, message: '{"error":"invalid api key"}' }))).toBe("invalid");
+    });
+
+    it("only treats a refusal as a gate, never a body that merely mentions the phrase", () => {
+      // A 200 or a 500 carrying this prose is not a refusal, so it is not a client gate. Without
+      // the status guard the phrase alone would suppress a genuine credential verdict.
+      expect(verdictFor(ping({ ok: true, status: 200, message: GATE_BODY }))).toBe("active");
+      expect(verdictFor(ping({ status: 500, message: GATE_BODY }))).toBe("unverified");
+      expect(verdictNotice("k", ping({ ok: true, status: 200 }))).toBe("k: valid");
+    });
+  });
+
   describe("isConclusive", () => {
     it("lets only the three storable verdicts overwrite a status", () => {
       expect(isConclusive("active")).toBe(true);

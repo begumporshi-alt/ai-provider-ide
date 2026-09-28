@@ -422,6 +422,17 @@ pub struct ModelRow {
     /// unpersisted capability is one the gateway cannot report to a client.
     #[serde(default)]
     pub capabilities_json: Option<String>,
+    /// `discovered` (the provider's own /models listing) or `manual` (typed in by the operator).
+    ///
+    /// Defaults to `discovered` so an older writer that never sends the field keeps its meaning.
+    /// It is not an `Option`: the distinction has no third state, and a NULL here would be a row
+    /// that the refresh path cannot decide whether to delete.
+    #[serde(default = "default_model_origin")]
+    pub origin: String,
+}
+
+fn default_model_origin() -> String {
+    "discovered".to_string()
 }
 
 pub fn models_cache_replace_rows(
@@ -468,20 +479,51 @@ fn replace_models(
     rows: &[ModelRow],
 ) -> rusqlite::Result<()> {
     let tx = conn.transaction()?;
-    tx.execute("DELETE FROM models_cache WHERE provider_id = ?1", params![provider_id])?;
+    // Rows the provider itself listed are replaced wholesale. `manual` rows are the operator's,
+    // not the provider's, and are left standing: the caller re-sends them in the same payload, so
+    // they are refreshed rather than deleted. Deleting them here would make the first Refresh
+    // after a manual add erase it.
+    tx.execute(
+        "DELETE FROM models_cache WHERE provider_id = ?1 AND origin <> 'manual'",
+        params![provider_id],
+    )?;
+    // A manual row is deleted only when the payload no longer carries it — that is how removing a
+    // model in the UI reaches the database. The payload is the provider's whole model set, both
+    // origins, so this is the one place a stale manual row can be dropped.
+    let manual_ids: Vec<&str> =
+        rows.iter().filter(|r| r.origin == "manual").map(|r| r.native_id.as_str()).collect();
+    {
+        let mut sql_params: Vec<rusqlite::types::Value> =
+            vec![rusqlite::types::Value::Text(provider_id.to_string())];
+        let sql = if manual_ids.is_empty() {
+            "DELETE FROM models_cache WHERE provider_id = ?1 AND origin = 'manual'".to_string()
+        } else {
+            // One placeholder per manual id; `?1` is the provider id, already first in `sql_params`.
+            let placeholders =
+                std::iter::repeat_n("?", manual_ids.len()).collect::<Vec<_>>().join(",");
+            for id in &manual_ids {
+                sql_params.push(rusqlite::types::Value::Text((*id).to_string()));
+            }
+            format!(
+                "DELETE FROM models_cache WHERE provider_id = ?1 AND origin = 'manual'
+                   AND native_id NOT IN ({placeholders})"
+            )
+        };
+        tx.execute(&sql, rusqlite::params_from_iter(sql_params))?;
+    }
     for r in rows {
         let id = format!("{}:{}", r.provider_id, r.native_id);
         tx.execute(
-            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)
-             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6, pricing_json=?7, capabilities_json=?8",
-            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at, r.pricing_json, r.capabilities_json],
+            "INSERT INTO models_cache (id, provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json, origin) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)
+             ON CONFLICT(provider_id, native_id) DO UPDATE SET modality=?4, context_window=?5, fetched_at=?6, pricing_json=?7, capabilities_json=?8, origin=?9",
+            params![id, r.provider_id, r.native_id, r.modality, r.context_window, r.fetched_at, r.pricing_json, r.capabilities_json, r.origin],
         )?;
     }
     tx.commit()
 }
 
 fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
-    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json FROM models_cache")?;
+    let mut stmt = conn.prepare("SELECT provider_id, native_id, modality, context_window, fetched_at, pricing_json, capabilities_json, origin FROM models_cache")?;
     let rows = stmt.query_map([], |r| {
         Ok(ModelRow {
             provider_id: r.get(0)?,
@@ -491,6 +533,7 @@ fn list_models(conn: &rusqlite::Connection) -> rusqlite::Result<Vec<ModelRow>> {
             fetched_at: r.get(4)?,
             pricing_json: r.get(5)?,
             capabilities_json: r.get(6)?,
+            origin: r.get::<_, String>(7).unwrap_or_else(|_| "discovered".to_string()),
         })
     })?;
     rows.collect::<Result<Vec<_>, _>>()
@@ -1435,6 +1478,7 @@ mod persist_tests {
                     fetched_at: 1,
                     pricing_json: Some(r#"{"prompt":150000,"completion":600000}"#.into()),
                     capabilities_json: Some(r#"{"reasoning":false}"#.into()),
+                    origin: "discovered".to_string(),
                 },
                 ModelRow {
                     provider_id: "p".into(),
@@ -1444,6 +1488,7 @@ mod persist_tests {
                     fetched_at: 1,
                     pricing_json: None,
                     capabilities_json: None,
+                    origin: "discovered".to_string(),
                 },
             ];
             replace_models(&mut conn, "p", &rows).unwrap();
@@ -1471,6 +1516,7 @@ mod persist_tests {
                 fetched_at: 2,
                 pricing_json: None,
                 capabilities_json: None,
+                origin: "discovered".to_string(),
             }];
             replace_models(&mut conn, "p", &refreshed).unwrap();
             let back = list_models(&conn).unwrap();
@@ -1481,6 +1527,55 @@ mod persist_tests {
                 "a refresh with no capability data must clear it, not leave a stale claim"
             );
             assert_eq!(back[0].fetched_at, 2);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A model the operator typed in must outlive the refresh that replaces the provider's listing.
+    ///
+    /// This is the whole reason `origin` exists. The caller sends the provider's complete model set
+    /// — manual rows included — and deletes nothing it still carries, so a manual entry is refreshed
+    /// rather than erased. Before the column, `replace_models` deleted by provider id alone and the
+    /// first Refresh after a manual add silently destroyed it.
+    #[cfg(feature = "app")]
+    #[test]
+    fn a_manual_model_survives_the_refresh_and_a_discovered_one_does_not() {
+        let (store, dir) = tmp_store("manual-models");
+        {
+            let mut conn = store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) VALUES ('p','s','n','https://x.test','enabled',1,1)",
+                [],
+            ).unwrap();
+
+            let row = |native_id: &str, origin: &str| ModelRow {
+                provider_id: "p".into(),
+                native_id: native_id.into(),
+                modality: "text".into(),
+                context_window: None,
+                fetched_at: 1,
+                pricing_json: None,
+                capabilities_json: None,
+                origin: origin.to_string(),
+            };
+
+            replace_models(&mut conn, "p", &[row("listed", "discovered"), row("typed", "manual")])
+                .unwrap();
+
+            // A refresh carries both rows again, as the real caller does.
+            replace_models(&mut conn, "p", &[row("typed", "manual")]).unwrap();
+            let back = list_models(&conn).unwrap();
+            assert_eq!(back.len(), 1, "only what the payload still carries should remain");
+            assert_eq!(back[0].native_id, "typed");
+            assert_eq!(back[0].origin, "manual");
+
+            // Dropped from the payload: removing a model in the UI is the payload shrinking, and
+            // that has to reach the database rather than leaving the row behind forever.
+            replace_models(&mut conn, "p", &[]).unwrap();
+            assert!(
+                list_models(&conn).unwrap().is_empty(),
+                "a manual row absent from the payload must be deleted"
+            );
         }
         let _ = std::fs::remove_dir_all(&dir);
     }

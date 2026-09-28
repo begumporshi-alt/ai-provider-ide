@@ -37,6 +37,7 @@ export * from "./domain.js";
 export * from "./errors.js";
 export * from "./redaction.js";
 export { runProbes, type ProbeReport, type ProbeAttempt } from "./probe-runner.js";
+export { detectClientGate, clientGateNotice } from "./client-gate.js";
 export { fingerprint, type FingerprintResult } from "./fingerprinter.js";
 export { runContractSuite, type ContractReport, type ContractCheck, type ContractOptions } from "./contract-suite.js";
 export {

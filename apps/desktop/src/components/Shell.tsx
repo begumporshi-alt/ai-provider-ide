@@ -8,7 +8,13 @@ import { bootDegradedReason, registry, router } from "../store";
 import { StatusDot } from "../components/atoms";
 
 const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
-  { group: "Providers", items: [{ id: "providers", label: "AI Providers" }] },
+  {
+    group: "Providers",
+    items: [
+      { id: "providers", label: "AI Providers" },
+      { id: "onboarding", label: "Auto setup" },
+    ],
+  },
   {
     group: "Tools",
     items: [

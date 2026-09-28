@@ -1461,3 +1461,55 @@ that is not drift (then the rethrown path needs its own health record).
 - **Revisit if:** the vault grows enough accounts that a whole-map write per `put` is the cost that
   matters (then option 3), or a profile shows `Cache::ops` on the request path.
 
+## 2026-09-29 — A gateway that gates on the client is answered per provider, not by impersonating one
+
+- **Decision:** outbound provider requests send `User-Agent: AI-Provider-Router/<version>`, set once on
+  the credentialed `reqwest::Client` in `egress.rs`. A gateway that will only serve particular clients
+  is satisfied by a **per-provider** header the operator enters — `listModels.headers` and
+  `generateText.headers` in that provider's manifest, exposed as the manual form's **Custom headers**
+  field and offered by auto setup when its probe meets a gate. The product does **not** ship a
+  recognised third-party client's UA as a default, and does not apply one automatically on detecting a
+  gate.
+- **Why:** measured 2026-09-29 against `agentrouter.org`, holding the credential constant and varying
+  only `User-Agent`:
+
+  | `User-Agent` | Response |
+  |---|---|
+  | *(none)*, `curl/8.7.1`, a browser UA, `totally-made-up-client/9.9` | `401 unauthorized_client_error` — "unauthorized client detected" |
+  | `claude-cli/2.0.0 (external, cli)`, `zcode`, `codex_cli_rs/0.1.0`, `opencode/1.0`, `cline/1.0`, `roo-code/1.0` | `401 new_api_error` — "无效的令牌" (invalid token) |
+
+  The second row is the finding: with the client accepted, the *same* dummy key is judged on its
+  merits. So the first row is evidence about the client and none at all about the key — and the app was
+  sending **no `User-Agent` whatsoever**, so it sat in the first row permanently while reporting "the
+  provider rejected this key" and taking a working key out of rotation. The gate is an **allowlist of
+  client families, not a blocklist of bots**: `Mozilla/5.0`, `curl/8.7.1` and `claude-code/0.1.0` are
+  all refused, so "send a plausible browser UA" is not a fix and would not have been an honest one.
+- **Options considered:**
+  1. Ship a recognised client's UA (e.g. `claude-cli/…`) as the transport default (rejected — opens such
+     gateways by impersonation, for every provider, without the operator asking; and a UA is a claim
+     about which client is calling, so defaulting to a false one is a false statement in every request
+     this product makes).
+  2. Leave the UA unset and document the workaround (rejected — the app then remains unable to reach
+     these gateways, and "no UA" is already non-conformant: RFC 9110 §10.1.5 says one should be sent).
+  3. Per-provider headers only, with no transport default (rejected — correct for the gate, but it
+     leaves every request anonymous, which is the state that produced this defect).
+  4. **An honest default plus a visible per-provider override** (chosen).
+- **Rationale:** the two halves answer different questions. *Who is calling* is a property of this
+  product, so it belongs on the transport and must be true. *Which client a given gateway will serve*
+  is a property of that gateway, so it belongs in that gateway's manifest, where it is visible, editable
+  and the operator's decision. Conflating them is what made the defect invisible: the refusal arrived
+  as a `401` indistinguishable from a bad key, because nothing recorded *why* the client was refused.
+  The same measurement therefore also bought the diagnosis — `detectClientGate` (`client-gate.ts`),
+  which both the key test and the probe consult, and which classifies such a `401` as `unverified`
+  (leave the key alone) rather than `invalid`.
+- **Consequence:** `LIST_MODELS_ENDPOINT` gained a `headers` field. It had none, so `GET /models` could
+  not carry a UA even though `POST /chat/completions` could — and `listModels` is the call every probe,
+  ping and catalog refresh makes, so a header reaching only `generateText` would leave such a provider
+  unreachable while appearing configured. `list_headers` in `interpreter.rs` is deliberately *not*
+  `json_headers`: the latter inserts `content-type: application/json` unconditionally, which is wrong
+  for a bodyless GET and would have changed the catalogue request as a side effect.
+- **Revisit if:** a provider requires a client identity for a reason other than gating (then a
+  per-endpoint header may be the wrong granularity and the manifest needs a provider-level block); or
+  the marker list in `client-gate.ts` produces a false positive, which would tell an operator a rejected
+  key is fine — the direction this deliberately does not fail in.
+

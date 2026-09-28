@@ -142,7 +142,28 @@ pnpm typecheck                                        # all workspaces
 pnpm test                                             # unit tests
 pnpm --filter ai-provider-router-desktop web-test     # the browser harness
 cargo test --manifest-path apps/desktop/src-tauri/Cargo.toml
+
+pnpm dev:up                                           # build + install the gateway, then run the app
+pnpm dev:up:service                                   # the same, without launching the app
+pnpm dev:up:release                                   # packaged app: tauri build + install from the bundle
 ```
+
+**`pnpm dev:up` exists because `pnpm dev` alone is not enough to test a change that touches Rust.**
+The app and the installed LaunchAgent resolve to the *same* data directory and the *same* port —
+`tauri.conf.json`'s `identifier` is what `app.path().app_data_dir()` returns, and
+`bin/aiproviderd.rs::data_dir()` computes the identical path from the same string. A service left
+running from older source therefore keeps answering the app on `127.0.0.1:8800`, on every admin
+route, **with no error** — it just behaves like the old code. A verified, green change then looks
+broken on first run, and nothing in the logs says why. `dev:up` closes that gap by replacing the
+*installed* copy, not only the one under `target/`.
+
+One constraint is worth knowing before you debug it: **`launchctl bootstrap` requires an Aqua
+session.** From a shell spawned by an editor, a CI job or an agent, it fails with
+`5: Input/output error`, whose own text names the cause ("this process has no GUI session"). So the
+first-time install has to run from Terminal.app or from the app's Control screen. `dev:up` detects
+this: when launchd already holds the job it replaces the binary and `kickstart`s instead, which
+works from any session, and it never `bootout`s a working gateway to reach a `bootstrap` that may
+fail. A refused install therefore leaves a running gateway alone.
 
 Three environment facts that produce misleading failures if you get them wrong:
 
@@ -150,7 +171,7 @@ Three environment facts that produce misleading failures if you get them wrong:
   `crypto is not defined`, which looks exactly like a regression. The preflight checks the major version because
   probing for `globalThis.crypto` does not detect Node 18.
 - **`./node_modules/.bin/tsc`, never `npx tsc`.** `npx` may resolve a different compiler than the pinned 6.0.3.
-- **Unset the five proxy variables on any probe *and* on the app.** `HTTP_PROXY HTTPS_PROXY http_proxy
+- **Unset the six proxy variables on any probe *and* on the app.** `HTTP_PROXY HTTPS_PROXY http_proxy
   https_proxy ALL_PROXY all_proxy` — the sandbox proxy turns every outbound call into `502 upstream connect
   failed`, which looks like a broken upstream rather than a proxy that should not be there. A *partial* unset is
   worse: `curl` then returns `000`, which reads like a crash. `ci-local.sh:43` does this for the gate.

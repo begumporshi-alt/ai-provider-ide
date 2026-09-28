@@ -9,6 +9,9 @@
  *   anthropic-compat: a /messages or /v1/messages endpoint exists AND no chat-completions
  *   openapi:         an OpenAPI document was found (Phase 3: recorded as evidence; deriving a
  *                    manifest from the spec is the Phase 4 generator's job)
+ *   client-gate:     the gateway refused the CLIENT on every path (2026-09-29). Checked first,
+ *                    because a uniform refusal makes every "endpoint exists" reading above vacuous
+ *                    rather than merely unhelpful — see the early return in `fingerprint`.
  */
 
 import type { AdapterManifest } from "@aiprovider/adapter-spec";
@@ -19,6 +22,14 @@ export interface FingerprintResult {
   dialect: BuiltinTemplateId | "unknown";
   template?: AdapterManifest;
   evidence: string[];
+  /**
+   * Set when the probe met a **client gate** — the provider refused the caller before reading any
+   * credential, so the probe learned nothing about the provider's dialect.
+   *
+   * Carried out of here rather than left in `evidence` because the caller has to *act* on it: the
+   * remedy is a per-provider request header, which no dialect template can supply.
+   */
+  clientGate?: string;
 }
 
 interface Hit {
@@ -49,6 +60,24 @@ export function fingerprint(report: ProbeReport): FingerprintResult {
   const models = h["models"];
   const chat = h["chat/completions"];
   const messages = h["messages"];
+
+  // **A client gate is checked first, because it invalidates every other reading.**
+  //
+  // A gateway that refuses the caller answers the same `401` on every path, so `exists` is true for
+  // all of them and says nothing — `/chat/completions` and `/messages` "exist" on a host that would
+  // answer identically for `/anything`. Reporting those as dialect evidence would be worse than
+  // reporting nothing: it would hand the operator (and the generator) two confident facts, both of
+  // which are artefacts of the refusal. Measured 2026-09-29 on `agentrouter.org`, where all nine
+  // probe paths return the gate and the previous code still emitted "chat/completions endpoint
+  // exists" and "messages endpoint exists".
+  const gated = report.attempts.find((a) => a.clientGate);
+  if (gated) {
+    evidence.push(
+      `the gateway refused this client (${gated.clientGate}) on ${gated.path} — it did not ` +
+        `evaluate any credential, and no endpoint signal from this probe is trustworthy`,
+    );
+    return { dialect: "unknown", evidence, clientGate: gated.clientGate };
+  }
 
   const modelsListLooksRight = Boolean(
     models?.ok &&

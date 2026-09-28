@@ -229,7 +229,7 @@ impl ManifestInterpreter {
                 HttpRequest {
                     url: join_url(&self.view.provider.base_url, &ep.path),
                     method: HttpMethod::Get,
-                    headers: auth_headers(&self.view.provider.auth.headers),
+                    headers: list_headers(&self.view, &ep.headers, &self.ctx.vars),
                     body: None,
                     secret_ref: Some(secret_ref.to_string()),
                     stream: false,
@@ -645,6 +645,25 @@ fn json_headers(
 ) -> BTreeMap<String, String> {
     let mut headers = auth_headers(&view.provider.auth.headers);
     headers.insert("content-type".to_string(), "application/json".to_string());
+    for (k, v) in render_headers(endpoint, vars) {
+        headers.insert(k, v);
+    }
+    headers
+}
+
+/// `provider.auth.headers`, then the endpoint's own static headers — in that order.
+///
+/// **Deliberately not [`json_headers`].** That one inserts `content-type: application/json`
+/// unconditionally, which is correct for a POST body and wrong for this GET: `list_models` has no
+/// body, and the source's `listModels` sent no `content-type` either (`manifest-interpreter.ts:280`
+/// passes `authHeaders` alone). Sharing one helper would have changed the request the catalogue
+/// call makes, which is a different change from the one this exists for.
+fn list_headers(
+    view: &ManifestView,
+    endpoint: &BTreeMap<String, String>,
+    vars: &Map<String, Value>,
+) -> BTreeMap<String, String> {
+    let mut headers = auth_headers(&view.provider.auth.headers);
     for (k, v) in render_headers(endpoint, vars) {
         headers.insert(k, v);
     }
@@ -1691,6 +1710,50 @@ mod tests {
 
         assert!(interp.list_models("key:k1", &Cancel::new()).await.unwrap().is_empty());
         assert!(http.requests().is_empty(), "no endpoint means no request at all");
+    }
+
+    /// **The catalogue call must carry the manifest's own headers.** This is the field a
+    /// client-gate gateway needs, and `list_models` is the call the ping, the probe and the catalog
+    /// refresh all make — so a header that reached only `generate_text` would leave such a provider
+    /// unreachable while looking configured. Measured 2026-09-29 on `agentrouter.org`, which answers
+    /// `401 unauthorized_client_error` to `GET /v1/models` for any unrecognised `User-Agent`.
+    #[tokio::test]
+    async fn the_catalogue_call_carries_the_manifests_endpoint_headers() {
+        let mut manifest = openai_manifest();
+        manifest["endpoints"]["listModels"]["headers"] =
+            json!({ "user-agent": "claude-cli/2.0.0 (external, cli)" });
+        let http = FakeHttp::new(vec![Scripted::text(200, r#"{"data":[{"id":"m"}]}"#)]);
+        let interp = interpreter(&manifest, http.clone());
+
+        interp.list_models("key:k1", &Cancel::new()).await.unwrap();
+
+        let req = http.only_request();
+        assert_eq!(req.headers["user-agent"], "claude-cli/2.0.0 (external, cli)");
+        // The auth header is still there — the merge is an overlay, not a replacement.
+        assert_eq!(req.headers["Authorization"], "Bearer {{secret}}");
+        // **And `content-type` is absent, which is the whole reason this does not reuse
+        // `json_headers`.** That helper inserts it unconditionally; this GET has no body, and the
+        // source's `listModels` sent none either. Sharing one helper would have changed the request
+        // the catalogue call makes — a different change from the one this test exists for.
+        assert!(
+            !req.headers.contains_key("content-type"),
+            "a bodyless GET must not claim a JSON body"
+        );
+    }
+
+    /// An endpoint with no headers of its own must reach the port with exactly the auth header and
+    /// nothing else — the pre-amendment request, unchanged. Without this, a merge that always
+    /// materialised an empty map would look identical to one that never ran.
+    #[tokio::test]
+    async fn a_manifest_without_endpoint_headers_sends_the_auth_header_alone() {
+        let http = FakeHttp::new(vec![Scripted::text(200, r#"{"data":[{"id":"m"}]}"#)]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+
+        interp.list_models("key:k1", &Cancel::new()).await.unwrap();
+
+        let req = http.only_request();
+        assert_eq!(req.headers.len(), 1, "got {:?}", req.headers);
+        assert_eq!(req.headers["Authorization"], "Bearer {{secret}}");
     }
 
     #[tokio::test]

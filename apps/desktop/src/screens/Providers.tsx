@@ -7,11 +7,10 @@
  * "the auto-wizard arrives in Phase 3" note — never fake the wizard.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router-core";
 import {
-  addKey, addProvider, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
+  addKey, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
   generatorAuditList, listManifestHistory, pendingRepairs, registry, rollbackManifest, setKeyStatus,
-  setProviderStatus, testKey, refreshCatalog, uniqueSlug,
+  setProviderStatus, testKey, refreshCatalog,
 } from "../store";
 import type { DriftEventEntry, GeneratorAuditEntry, HostManifestRow } from "../store";
 import { useUi } from "../ui-state";
@@ -19,20 +18,19 @@ import {
   Button, Field, KeyFingerprint, Modal, StatusBadge, StatusDot, healthOf, inputCls, inputStyle,
 } from "../components/atoms";
 import { TrailWriteWarning } from "../components/TrailWriteWarning";
+// The add wizard and the editor moved out: they share a connection form and a model list, and a
+// second copy of either is how the manifest this used to hand-assemble drifted from its template.
+import { AddProviderModal, EditProviderModal } from "../components/ProviderSetup";
 import { verdictNotice } from "../lib/keys/verdict";
-import {
-  authHeaderFor, buildManualManifest, type ManualDialect,
-} from "../lib/providers/manual-manifest";
 import { clock, dayKey } from "../lib/memory/timeline";
 
-const KNOWN = Object.keys(PROVIDER_PROFILES); // openrouter | opencode | b.ai
-
 export function ProvidersScreen() {
-  const { bump } = useUi();
+  const { bump, go } = useUi();
   const tick = useUi((s) => s.tick);
   const providers = useMemo(() => registry.listProviders(), [tick]);
   const keyCount = providers.reduce((n, p) => n + registry.keysOf(p.id).length, 0);
   const [adding, setAdding] = useState(false);
+  const [editing, setEditing] = useState<string | null>(null);
   const [addingKeyFor, setAddingKeyFor] = useState<string | null>(null);
   const [testing, setTesting] = useState<string | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<{ kind: "provider" | "key"; id: string; name: string } | null>(null);
@@ -49,11 +47,16 @@ export function ProvidersScreen() {
             </p>
           )}
         </div>
-        {providers.length > 0 && <Button variant="primary" onClick={() => setAdding(true)}>+ Add Provider</Button>}
+        {providers.length > 0 && (
+          <div className="flex gap-2">
+            <Button variant="primary" onClick={() => go("onboarding")}>Set up automatically</Button>
+            <Button onClick={() => setAdding(true)}>+ Add Provider</Button>
+          </div>
+        )}
       </div>
 
       {providers.length === 0 ? (
-        <FirstRunHero onAdd={() => setAdding(true)} />
+        <FirstRunHero onAdd={() => setAdding(true)} onAuto={() => go("onboarding")} />
       ) : (
         <div className="flex flex-col gap-3">
           {providers.map((p) => {
@@ -102,6 +105,15 @@ export function ProvidersScreen() {
                         Check health
                       </Button>
                     )}
+                    {/* Offered in every state, including `draft`: a provider added by hand and
+                        abandoned part-way through the wizard has no other way to be finished. */}
+                    <Button
+                      variant="ghost"
+                      ariaLabel={`Edit ${p.name}`}
+                      onClick={() => setEditing(p.id)}
+                    >
+                      Edit
+                    </Button>
                     <Button variant="ghost" onClick={() => setConfirmDelete({ kind: "provider", id: p.id, name: p.name })}>
                       Remove
                     </Button>
@@ -181,6 +193,13 @@ export function ProvidersScreen() {
       <NoticeBar />
       {repairing && <RepairModal providerId={repairing} onClose={() => { setRepairing(null); bump(); }} />}
       {adding && <AddProviderModal onClose={() => setAdding(false)} onDone={() => { setAdding(false); bump(); }} />}
+      {editing && (
+        <EditProviderModal
+          providerId={editing}
+          onClose={() => setEditing(null)}
+          onDone={() => bump()}
+        />
+      )}
       {addingKeyFor && (
         <AddKeyModal
           providerName={registry.getProvider(addingKeyFor)?.name ?? ""}
@@ -220,194 +239,26 @@ export function ProvidersScreen() {
   );
 }
 
-function FirstRunHero({ onAdd }: { onAdd: () => void }) {
+function FirstRunHero({ onAdd, onAuto }: { onAdd: () => void; onAuto: () => void }) {
   return (
     <div className="rounded-md border p-8 text-center" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
       <h2 className="text-[18px] font-semibold">Connect your first provider</h2>
       <p className="mx-auto mt-2 max-w-md text-[13px]" style={{ color: "var(--text-dim)" }}>
-        OpenRouter, OpenCode Zen and b.ai live in about two minutes. Keys are stored in a local
-        secrets file that only your user account can read (mode 600), never in the database, and
-        nothing leaves your machine except requests to the providers you configure.
+        Auto setup asks for three things — a name, the base URL and an API key — then probes the
+        API, works out which dialect it speaks and builds the adapter for you. It works with any
+        provider, including ones nobody has written a template for. The well-known dialects need no
+        AI, so the very first provider can be set up with nothing configured yet.
       </p>
-      <div className="mt-5 flex justify-center">
-        <Button variant="primary" onClick={onAdd}>Add Provider</Button>
+      <p className="mx-auto mt-2 max-w-md text-[12px]" style={{ color: "var(--text-faint)" }}>
+        OpenRouter, OpenCode Zen and b.ai also have one-click presets in the manual flow. Keys are
+        stored in a local secrets file that only your user account can read (mode 600), never in the
+        database, and nothing leaves your machine except requests to the providers you configure.
+      </p>
+      <div className="mt-5 flex justify-center gap-2">
+        <Button variant="primary" onClick={onAuto}>Set up automatically</Button>
+        <Button onClick={onAdd}>Add manually</Button>
       </div>
     </div>
-  );
-}
-
-function AddProviderModal({ onClose, onDone }: { onClose: () => void; onDone: () => void }) {
-
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const [mode, setMode] = useState<"known" | "manual">("known");
-
-  // Manual mode fields
-  const [manualName, setManualName] = useState("");
-  const [manualUrl, setManualUrl] = useState("");
-  const [manualAuth, setManualAuth] = useState<"bearer" | "x-api-key" | "custom">("bearer");
-  const [manualAuthHeader, setManualAuthHeader] = useState("Authorization");
-  const [manualAuthPrefix, setManualAuthPrefix] = useState("Bearer");
-  const [manualDialect, setManualDialect] = useState("openai-chat-v1");
-
-  // Derives from the builtin template for the chosen dialect. The hand-written body this replaces
-  // had drifted from it in four ways at once — no `responseMap.toolCalls`, no
-  // `stream.chunkMap.toolCalls`, no `stream.toolCallStream`, and a dialect label that did not
-  // change the paths — so every custom provider silently dropped tool calls and an Anthropic one
-  // was wired to OpenAI paths. See `lib/providers/manual-manifest.ts`.
-  function buildManifest(): AdapterManifest {
-    return buildManualManifest({
-      url: manualUrl.trim(),
-      dialect: manualDialect as ManualDialect,
-      authHeader: authHeaderFor(manualAuth, manualAuthHeader, manualAuthPrefix),
-    });
-  }
-
-  const manualValid =
-    mode === "manual" &&
-    manualName.trim().length > 1 &&
-    /^https?:\/\//.test(manualUrl.trim()) &&
-    (manualAuth !== "custom" || (manualAuthHeader.trim().length > 0));
-
-  async function addKnown(s: string) {
-    setBusy(true);
-    try {
-      const manifest = PROVIDER_PROFILES[s]!() as AdapterManifest;
-      await addProvider({
-        slug: s,
-        name: { openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s] ?? s,
-        type: "builtin",
-        baseUrl: manifest.provider.baseUrl,
-        manifest,
-      });
-      onDone();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function addManual() {
-    if (!manualValid) return;
-    setBusy(true);
-    setError(null);
-    try {
-      const manifest = buildManifest();
-      const slug = uniqueSlug(manualName.trim());
-      await addProvider({
-        slug,
-        name: manualName.trim(),
-        type: "manifest",
-        baseUrl: manualUrl.trim(),
-        manifest,
-      });
-      onDone();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  return (
-    <Modal title="Add Provider" onClose={onClose}>
-      <div className="mb-3 flex gap-1 rounded border p-1" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-        {(["known", "manual"] as const).map((m) => (
-          <button
-            key={m}
-            onClick={() => { setMode(m); setError(null); }}
-            className={`flex-1 rounded px-3 py-1 text-[12px] font-medium transition-colors ${
-              mode === m ? "text-white" : "text-inherit"
-            }`}
-            style={mode === m ? { background: "var(--accent)", color: "white" } : {}}
-          >
-            {m === "known" ? "Quick add" : "Manual"}
-          </button>
-        ))}
-      </div>
-
-      {mode === "known" ? (
-        <div className="mb-3 grid gap-2">
-          {KNOWN.map((s) => (
-            <button
-              key={s}
-              disabled={busy}
-              onClick={() => addKnown(s)}
-              className="flex items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110 disabled:opacity-50"
-              style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-            >
-              <span className="text-[13px] font-medium">
-                {{ openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s]}
-              </span>
-              <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
-                {PROVIDER_PROFILES[s]!().provider.baseUrl}
-              </span>
-            </button>
-          ))}
-        </div>
-      ) : (
-        <div className="mb-3 space-y-3">
-          <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-            Add any OpenAI- or Anthropic-compatible provider. The adapter manifest is generated automatically.
-          </p>
-          <Field label="Name">
-            <input className={inputCls} style={inputStyle} value={manualName} onChange={(e) => setManualName(e.target.value)} placeholder="My Provider" autoFocus />
-          </Field>
-          <Field label="Base URL">
-            <input className={`${inputCls} mono`} style={inputStyle} value={manualUrl} onChange={(e) => setManualUrl(e.target.value)} placeholder="https://api.example.com" />
-          </Field>
-          <Field label="Auth type">
-            <select className={inputCls} style={inputStyle} value={manualAuth} onChange={(e) => setManualAuth(e.target.value as any)}>
-              <option value="bearer">Bearer token (Authorization: Bearer …)</option>
-              <option value="x-api-key">x-api-key header</option>
-              <option value="custom">Custom header</option>
-            </select>
-          </Field>
-          {manualAuth === "custom" && (
-            <>
-              <Field label="Header name">
-                <input className={inputCls} style={inputStyle} value={manualAuthHeader} onChange={(e) => setManualAuthHeader(e.target.value)} placeholder="X-Custom-Auth" />
-              </Field>
-              <Field label="Prefix (optional)">
-                <input className={inputCls} style={inputStyle} value={manualAuthPrefix} onChange={(e) => setManualAuthPrefix(e.target.value)} placeholder="e.g. Token" />
-              </Field>
-            </>
-          )}
-          <Field label="Dialect">
-            <select className={inputCls} style={inputStyle} value={manualDialect} onChange={(e) => setManualDialect(e.target.value)}>
-              <option value="openai-chat-v1">openai-chat-v1</option>
-              <option value="anthropic-messages-v1">anthropic-messages-v1</option>
-            </select>
-          </Field>
-        </div>
-      )}
-
-      {mode === "manual" && (
-        <div className="mt-3">
-          <Button variant="primary" disabled={!manualValid || busy} onClick={addManual}>
-            {busy ? "Adding…" : "Add provider"}
-          </Button>
-        </div>
-      )}
-
-      {mode === "known" && (
-        <button
-          className="mt-2 flex w-full items-center justify-between rounded border px-3 py-2 text-left hover:brightness-110"
-          style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-          onClick={() => {
-            onClose();
-            useUi.getState().go("onboarding");
-          }}
-        >
-          <span className="text-[13px] font-medium">Any other provider — guided setup</span>
-          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>probe → identify → test → enable</span>
-        </button>
-      )}
-
-      {error && <p className="mt-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
-      {busy && <p className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>Registering…</p>}
-    </Modal>
   );
 }
 

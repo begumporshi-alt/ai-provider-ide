@@ -11,6 +11,56 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ## [Unreleased]
 
+### Added
+
+- **A provider can be set up with its models, and each model can be tested before you commit to
+  it.** Adding a provider by hand previously recorded a name, a URL and an auth scheme and nothing
+  else — no model was ever entered, so a provider whose `/models` endpoint is missing, incomplete or
+  gated was installed with an empty catalog and could not serve a request. The manual flow is now
+  three steps: **Connection → API key → Models**. Models can be fetched from the provider or typed
+  in by hand (id, text/image, optional context window), and each row has a **Test** button that
+  sends one real request and reports what came back. A provider can also be **edited** after it
+  exists, from an Edit button on its card.
+
+  Two details worth knowing. The wizard creates the provider at the end of step 1 rather than at the
+  end of the flow, because a model can only be tested by sending it a request and a request needs a
+  key — abandoning the wizard leaves a visible draft provider you can remove or finish, rather than
+  a form that cannot answer the question it is asking. And a hand-typed model is stored with
+  `origin: 'manual'` (migration 0018, `models_cache.origin`), because a catalog refresh replaces a
+  provider's discovered rows wholesale: without that distinction the first Refresh would silently
+  erase exactly the models the operator added because the provider never listed them.
+
+- **A provider can carry custom request headers, and they reach every endpoint — including the model
+  list.** Some gateways serve only a set of recognised clients and refuse everything else before they
+  look at the key. `agentrouter.org` is one: measured 2026-09-29, holding the credential constant and
+  varying only `User-Agent`, an unrecognised client gets
+  `401 unauthorized_client_error` ("unauthorized client detected") on every path, while
+  `claude-cli/2.0.0 (external, cli)` or a UA containing `zcode` gets a real answer about the key.
+  There was nowhere to put such a header: the manifest grammar allowed per-endpoint headers on
+  `generateText` and `generateImage` but **not on `listModels`**, and `listModels` is the call every
+  probe, key test and catalog refresh makes — so a gateway of this kind was unreachable even with
+  text generation configured correctly.
+
+  `LIST_MODELS_ENDPOINT` now carries `headers` (both interpreters merge it, and the Rust read model
+  gained the field), the manual form has a **Custom headers** field that applies to every endpoint,
+  and auto setup offers the same field when it meets a gate. Two details: the field refuses a header
+  named like the auth header, because the endpoint merge would replace the `{{secret}}` sentinel and
+  the request would then be refused by `EgressError::SentinelMissing` — a correct refusal that looks
+  like a credential fault; and editing a provider hydrates the field from its stored manifest
+  (`headersToLines`, minus the template's own headers), because `save()` rebuilds the manifest
+  whenever anything differs and an empty box would have deleted them while the operator was editing
+  the provider's *name*.
+
+- **Outbound provider requests now identify the client.** `egress.rs` built both reqwest clients
+  without `user_agent()`, and nothing in `interpreter.rs`, the TS `ManifestInterpreter` or any
+  manifest set one, so the app sent **no `User-Agent` at all** — non-conformant (RFC 9110 §10.1.5
+  says one should be sent) and, on the gateway above, the direct cause of the refusal. The
+  credentialed client now sends `AI-Provider-Router/<version>`, which covers both request paths
+  (`EgressState::new` is what the app and the `aiproviderd` gateway each construct). It is the honest
+  name and **not** a client these gateways already trust: opening them by impersonation, for every
+  provider, is not a default this product should apply on the operator's behalf. A per-provider
+  header overrides it, which is what the field above is for.
+
 ### Changed
 
 - **The gateway no longer advertises tools it will refuse.** Four of the eight agent tools
@@ -33,6 +83,150 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   the in-app Assistant. See `DECISIONS.md` 2026-09-27.
 
 ### Fixed
+
+- **A gateway that refused the *client* was reported as a provider that rejected the *key*, and the
+  key was taken out of rotation for a decision the provider never made.** Adding `agentrouter.org`
+  produced `key-01: the provider rejected this key — HTTP 401: {"error":{"message":"unauthorized
+  client detected, contact support for assistance at https://discord.gg/HgekCyHJqB"},...}. It is out
+  of rotation until you enable it.` Every word of that is wrong in a specific way. The provider did
+  not reject the key — measured, it answers `unauthorized_client_error` to *any* unrecognised client
+  and only reads the credential once the client is accepted, at which point the same dummy key is
+  judged normally as `无效的令牌`. `verdictFor` mapped every `401`/`403` to `invalid`, and `invalid`
+  is conclusive: `store.ts` writes it and `HealthTracker.isKeyUsable` then keeps the key out of
+  rotation, so a working credential was disabled by a request that never examined it.
+
+  A `401`/`403` whose body names a *client* problem is now classified `unverified` — the verdict that
+  means "leave the status alone" — and the notice says the client was refused and the key was never
+  judged. Detection lives in one place (`client-gate.ts`), because the desktop key test and the probe
+  both need it and two copies of one rule is this repository's most reliable defect. The marker list
+  is deliberately two strings long, both quoted from the measured response, and the module says what
+  that costs: a gateway that words its refusal differently is not recognised and falls back to
+  blaming the key, which is the status quo — the opposite direction would tell an operator their
+  rejected key is fine. Four tests; falsified by disabling the detector, which reproduced the
+  operator's message character for character.
+
+- **Auto setup could not diagnose a client gate, and reported it as a fingerprint failure.**
+  `runProbes` sent only `accept`, and `ProbeAttempt` recorded no body for a non-2xx response, so a
+  gateway that refuses the caller looked exactly like one that refuses the key: nine `401`s with no
+  shape. `fingerprint` then returned `unknown` — and, worse, still emitted "chat/completions endpoint
+  exists" and "messages endpoint exists", which are vacuous on a host that answers `401` to every
+  path, and handed the operator two confident facts that were artefacts of the refusal. The probe now
+  reads a refusal body far enough to ask one question of it, keeps only the matched marker (never the
+  body — `shapeOf` strips values, so the signal would not have survived redaction anyway), and
+  `fingerprint` checks for a gate **first**, because a uniform refusal invalidates every other
+  reading.
+
+  The gate is now a configuration answer rather than a dead end. `runProbes` accepts extra headers,
+  `OnboardingInput` carries them, and the wizard shows a panel naming the marker with a header field
+  and **Retry with these headers** — which re-probes with them and keeps them on the provider, so
+  they are used for every later request too. The generator is deliberately *not* run for a gate: it
+  would spend calls on a refusal that is already explained, and it cannot know which client the
+  gateway will accept. The failed provider row is deleted before the retry, because `start()` always
+  creates a fresh pending provider and retrying without that would leave one abandoned row per press.
+
+- **The automatic provider setup — probe, fingerprint, AI-written adapter, contract tests — was
+  built, tested, and had no way in.** `Onboarding.tsx` implements the whole pipeline: create the
+  provider, probe it, classify it with the deterministic `fingerprint`, and either instantiate the
+  built-in template or — when no known dialect matches — run best-of-N AI candidate generation
+  gated by schema → lint → free contract checks, with a Tier-2 sandboxed code adapter as the last
+  resort. It is covered by `e2e/onboarding-e2e.test.ts` and by the live-UI harness. And
+  `go("onboarding")` appeared **nowhere** in the app: the string existed only in the `ScreenId`
+  union and the render branch in `App.tsx`, and the sidebar's `NAV` carried no entry. A screen that
+  is implemented, tested and unreachable is indistinguishable to a user from a feature that was
+  never built — the only provider flow anyone could find was the manual modal.
+
+  The Providers screen now offers **Set up automatically**, from the first-run hero and from the
+  header, and the sidebar carries **Auto setup** — which also gives an interrupted wizard a way
+  back, since it persists its session and offers to resume. The manual flow keeps its own entry
+  point and its Quick-add presets; the two buttons are deliberately worded differently so neither
+  the user nor a test has to guess which flow a label means.
+
+  Two live-UI specs had been reaching the wizard through an "Any other provider — guided setup"
+  entry inside `AddProviderModal` that no longer exists in any component, so `web-test` cannot have
+  been passing; they now navigate through the new button. `smoke.spec.ts`'s hand-copied
+  `NAV_LABELS` gains the new item, which puts the screen under both the "every screen renders
+  without an uncaught error" guard and the "no screen calls a command the shim does not implement"
+  guard.
+
+- **`?seed=systemai` could not boot the app, so every spec that used it timed out.** The seed's
+  model rows carried five fields; `HostModelRow` declares seven, and `isHostModelRow` guards
+  `pricingJson` and `capabilitiesJson` with `nullable` — which, unlike `maybe`, rejects an **absent**
+  key (`host-boundary.ts:52`). So `arrayOf(isHostModelRow)` failed, `fetchAdminAs` threw
+  `HostShapeError: GET /admin/models-cache: the host sent a shape this build does not understand`,
+  and the app rendered its "App data could not be opened" card instead of the shell. Every
+  `?seed=systemai` spec then failed on its first `getByRole` — 13 smoke tests, all of `memory.spec.ts`,
+  `audit-log`, `agent-graph`, `app-budget` and `trail-health` — and each burned the full 120 s test
+  timeout rather than reporting a boot failure.
+
+  `SeedInput.models` is now host-shaped and **requires** both JSON columns, so the next omission is a
+  compile error naming every offending row rather than a boot failure in an unrelated spec; the seven
+  rows were given `pricingJson: null, capabilitiesJson: null`. Measured: the smoke spec's "AI
+  Providers" render check went from a 2 m 11 s timeout to **1.1 s**, and `smoke.spec.ts` from
+  never finishing to **14 passed in 22.5 s**.
+
+- **`pnpm web-test` could not start its own server, so the live-UI suite never ran.** Playwright's
+  `webServer` availability check resolves `http://127.0.0.1:1430/web-test/` through the ambient
+  `HTTP_PROXY` / `HTTPS_PROXY` / `ALL_PROXY` variables, and a proxy that cannot reach a loopback
+  address answers `404`. Playwright therefore waited its full 60 s and reported `Timed out waiting
+  60000ms from config.webServer` — while vite was listening on the port and answering `200` to
+  every other client. Measured on 2026-09-28: vite ready in **849 ms**, `curl` and Node's
+  `http.get` both `200` on that exact URL, Playwright `404`; and the same suite green in **842 ms**
+  with the six variables unset. The `web-test` script now unsets them itself, so the gate no longer
+  depends on the shell it happens to be invoked from.
+
+- **A provider whose base URL was missing its API path reported the symptom, never the cause.**
+  A "New API"/One-API gateway serves an HTML single-page app from `/` and every unknown path — at
+  **status 200** — while the real API lives under `/v1`. With `baseUrl` set to the bare host, all
+  three of the wizard's probes hit the SPA and were parsed as JSON: **Fetch from provider** reported
+  `JSON Parse error: Unrecognized token '<'`, the **key test** reported the same, and **Test** on a
+  model reported *"answered with an empty response — the request succeeded but no content came
+  back"*. Three different messages, one misconfiguration, and none of them named the URL or the
+  likely remedy. Reproduced live on 2026-09-28: `api.hcnsec.cn/models` → `200 text/html`,
+  `api.hcnsec.cn/v1/models` → `401 application/json`.
+
+  Bodies are now parsed through `jsonBody(raw, url)`, which on a non-JSON body reports the URL it
+  asked, quotes the first 80 characters of what came back, and — when the body opens with `<` —
+  says the base URL is most likely missing its API path and suggests `https://<host>/v1`. The
+  streaming path gets the same treatment: the first non-blank SSE line is checked for `<`, so an
+  HTML body is named rather than read as a stream that ended cleanly. Guarded at all four parse
+  sites (`listModels`, non-stream `generateText`, `generateImage`, the SSE loop). Four tests in
+  `packages/router-core/test/non-json-body.test.ts`; the two guard tests were falsified against the
+  unguarded interpreter.
+
+  The wizard's Base URL field also asked for the wrong shape: its placeholder was
+  `https://api.example.com` while onboarding's has read `https://api.example.com/v1` since the
+  profile flow was written — the manual path was the one out of step, and the field takes the value
+  **verbatim** (`buildManualManifest` assigns it to `provider.baseUrl` unchanged, while the template
+  appends `/models` and `/chat/completions`). It now matches onboarding and carries a one-line hint.
+
+- **Onboarding's first write left a ghost provider behind when the host refused it.**
+  `createPendingProvider` added the provider to the registry and *then* wrote it host-side, with no
+  rollback — while `addProvider` eleven lines up has had one since 26j, and the note above `addKey`
+  names the same hazard for a credential. A refused write (the gateway down, a 401, a duplicate slug)
+  therefore left a provider the host had never heard of: `addKey` ran against an id the host did not
+  know, and every probe was refused for a host the allowlist never received — surfacing as "could not
+  identify this API", a claim about the API produced by a local bookkeeping failure. It now removes
+  the record it just added. `deleteProvider` rather than `refreshFromHost`: an unreachable host fails
+  the resync too, which would leave the ghost in exactly the case that created it.
+
+- **A provider added after the app started was refused on every request — `HTTP 599`, "host not
+  allowlisted" — because the app process and the gateway each keep their own egress allowlist and
+  only one of them was being maintained.** The app seeds its list once, in `setup()`
+  (`tauri::app::initial_allow_hosts`). Provider CRUD from the webview goes over HTTP to the admin
+  route, and `app.rs` **probes the port and delegates to the launchd agent when the agent already
+  holds it** — so with the service installed that route recomputed the *agent's* list and left the
+  app's untouched. The app's list was only ever correct when the app itself had bound the port,
+  because then its embedded gateway shares the same `Arc`. Reproduced live on 2026-09-28: provider
+  `vice` at `vyceai.com`, status `pending`, created 21:05 into an app started 20:54 — every request
+  refused before any upstream dial, so the ledger held no row for it at all and a stale cache in a
+  second process read as a network fault.
+
+  `EgressState` now re-derives its list from `providers` before deciding (`refresh_allow`, called
+  from `build` and `fetch_image`), so the refusal cannot be made on a stale list. The webview gains
+  nothing by this: the rows are host-written (invariant 12) and its only way to add one is the
+  gateway's authenticated admin route, which already widened the gateway's list. Two tests pin it —
+  one asserted through `build`, so deleting the call site fails rather than passing on a helper, and
+  one asserting a `draft` provider's host is still refused.
 
 - **A successful turn whose only output was a tool call was recorded as `PARSE_ERROR`.** Tool calls
   travel by `on_tool_call`, never through the text sink, so a tool-call turn delivered zero chunks —

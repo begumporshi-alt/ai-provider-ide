@@ -73,6 +73,10 @@ export const isHostModelRow = shape<HostModelRow>({
   fetchedAt: isNum,
   pricingJson: nullable(isStr),
   capabilitiesJson: nullable(isStr),
+  // Optional, not `isStr`: the column is new, and a host binary built before it must not fail
+  // this guard. Failing it would drop *every* row, so the catalog would come up empty rather
+  // than merely unlabelled.
+  origin: maybe(isStr),
 });
 
 export const isHostManifestRow = shape<HostManifestRow>({

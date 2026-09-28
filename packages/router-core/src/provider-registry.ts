@@ -38,6 +38,24 @@ export class ProviderRegistry {
     this.providers.set(id, { ...p, rotationStrategy, updatedAt: Date.now() });
   }
 
+  /**
+   * Rename a provider, or point it at a different base URL.
+   *
+   * The slug is deliberately NOT part of this: it is the identity a client sends in
+   * `provider/model`, and it is baked into every persisted catalog row's `providerId` key and
+   * every alias. Renaming the display name must not silently re-home those.
+   */
+  renameProvider(id: string, patch: { name?: string; baseUrl?: string }): void {
+    const p = this.providers.get(id);
+    if (!p) throw new Error(`unknown provider ${id}`);
+    this.providers.set(id, {
+      ...p,
+      ...(patch.name !== undefined ? { name: patch.name } : {}),
+      ...(patch.baseUrl !== undefined ? { baseUrl: patch.baseUrl } : {}),
+      updatedAt: Date.now(),
+    });
+  }
+
   getProvider(id: string): ProviderRecord | undefined {
     return this.providers.get(id);
   }

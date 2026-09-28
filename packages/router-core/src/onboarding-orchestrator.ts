@@ -30,6 +30,16 @@ export interface OnboardingInput {
   name: string;
   baseUrl: string;
   docsUrl?: string;
+  /**
+   * Request headers to send on every probe, and to carry into the manifest setup registers.
+   *
+   * This is how a **client gate** is answered during setup. Such a gateway refuses the caller before
+   * it reads any credential, so the probe cannot see past it — and the probe runs before any
+   * manifest exists, so a per-provider header has nowhere else to live at this point. Measured
+   * 2026-09-29 on `agentrouter.org`, which answers `401 unauthorized_client_error` to every path
+   * unless the `User-Agent` names a client it serves.
+   */
+  extraHeaders?: Record<string, string>;
 }
 
 /** What may be persisted/shown — the API key is NOT here by design (§2.3). */
@@ -79,7 +89,7 @@ export class OnboardingOrchestrator {
       contract: undefined,
       failureReason: undefined,
     });
-    const report = await runProbes(this.http, input.baseUrl);
+    const report = await runProbes(this.http, input.baseUrl, undefined, undefined, input.extraHeaders);
     await this.transition("fingerprinting", { probeReport: report });
     return report;
   }
@@ -90,9 +100,18 @@ export class OnboardingOrchestrator {
     if (result.dialect === "unknown" || !result.template) {
       await this.transition("failed", {
         fingerprint: result,
-        failureReason:
-          "No known dialect matched the probe results. Deterministic setup covers OpenAI- and Anthropic-compatible APIs. " +
-          "AI-assisted adapter generation arrives in Phase 4 (unlocks after your first provider is live).",
+        // **A client gate gets its own sentence, because the generic one would be wrong twice.**
+        // "No known dialect matched" invites the operator to conclude their provider is unsupported,
+        // and — worse — to go looking at their key, which the provider never read. What actually
+        // happened is that the caller was refused, and the remedy is a header, not a different
+        // provider.
+        failureReason: result.clientGate
+          ? `The gateway refused this client before reading any credential (${result.clientGate}). ` +
+            `No probe result is usable, so the dialect could not be determined. This gateway serves ` +
+            `only specific clients — add the User-Agent it expects under the provider's custom ` +
+            `headers and run auto setup again.`
+          : "No known dialect matched the probe results. Deterministic setup covers OpenAI- and Anthropic-compatible APIs. " +
+            "AI-assisted adapter generation arrives in Phase 4 (unlocks after your first provider is live).",
       });
       return result;
     }

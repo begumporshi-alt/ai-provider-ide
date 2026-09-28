@@ -21,6 +21,7 @@ const APP = "/web-test/";
 /** Sidebar labels in order, taken straight from `components/Shell.tsx`. */
 const NAV_LABELS = [
   "AI Providers",
+  "Auto setup",
   "Model Browser",
   "Assistant",
   "Activity",

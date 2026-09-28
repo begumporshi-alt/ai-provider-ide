@@ -339,6 +339,10 @@ async fn build(
     state: &EgressState,
     req: EgressRequest,
 ) -> Result<reqwest::RequestBuilder, EgressError> {
+    // Before `check_url`, because the decision it makes is only as good as the list it reads — and
+    // this process's list is seeded once at startup while the rows are written by whichever process
+    // owns the port. See `refresh_allow` for the failure that produced.
+    state.refresh_allow();
     let url = check_url(&state.allow, &req.url)?;
     let host = url.host_str().unwrap_or("");
     // The port of any local provider is allowed, but a NON-local key may only ever meet a
@@ -431,6 +435,8 @@ pub async fn fetch_image(
     state: &EgressState,
     req: ImageFetchRequest,
 ) -> Result<ImageFetchResponse, EgressError> {
+    // Same reason as `build`: this path consults the allowlist too, so it needs the same refresh.
+    state.refresh_allow();
     let url = reqwest::Url::parse(&req.url).map_err(|e| EgressError::BadUrl(e.to_string()))?;
     let host = url.host_str().unwrap_or("");
     image_host_allowed(state, host)?;
@@ -930,11 +936,65 @@ const POOL_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 /// but whose peer has gone away, so the failure surfaces as a reset rather than as silence.
 const TCP_KEEPALIVE: Duration = Duration::from_secs(60);
 
+/// What this client calls itself on every outbound provider request.
+///
+/// **Before this existed the app sent no `User-Agent` at all** — neither here, nor in
+/// `interpreter.rs`'s `json_headers`/`auth_headers`, nor in the TS `ManifestInterpreter`. RFC 9110
+/// §10.1.5 says a UA *should* be sent, and some gateways require one: measured 2026-09-29,
+/// `agentrouter.org` answers `401 unauthorized_client_error` ("unauthorized client detected") to
+/// `GET /v1/models` for *any* unrecognised client — including no UA, `curl`, and a browser UA —
+/// and only then examines the key. So the absence of this header made the whole provider
+/// unreachable, and made it *look* like a rejected credential.
+///
+/// **Deliberately the honest name, not a client the gateway already trusts.** Naming a recognised
+/// third-party client here would open such gateways by impersonation, for every provider, without
+/// the operator asking. A gateway that wants a specific client identity is a per-provider fact, so
+/// it belongs in that provider's manifest `headers` (which is why `listModels` grew one), where it
+/// is visible and the operator's own decision. This default is overridable exactly that way: a
+/// per-request header wins over the client default.
+const DEFAULT_USER_AGENT: &str = concat!("AI-Provider-Router/", env!("CARGO_PKG_VERSION"));
+
 impl EgressState {
     /// Connect budget per §3.6; redirect policy vetoes any off-allowlist hop (Blocker 1 of
     /// the Phase 1 diff review).
     pub fn new(allow: Arc<AllowList>, store: Arc<Store>) -> Self {
         Self::with_secret_provider(allow, store, Arc::new(vault::get))
+    }
+
+    /// Re-derive the allowlist from the provider rows before deciding anything.
+    ///
+    /// **The list is a cache and the database is its authority, but this process had no path from
+    /// one to the other after startup.** `tauri::app::initial_allow_hosts` seeds it once, in
+    /// `setup()`. Provider CRUD from the webview then goes over HTTP to the admin route — and which
+    /// process answers that is what decides whether the list is maintained. `app.rs` probes the port
+    /// and **delegates to the launchd agent when the agent already holds it**, so with the service
+    /// installed the admin route recomputes the *agent's* list and leaves this one untouched. The
+    /// app's own list is only updated when the app is the process that bound the port, because then
+    /// the embedded gateway shares this very `Arc`.
+    ///
+    /// The visible symptom is a provider added after the app launched being refused on every
+    /// request: `HostDenied` out of `check_url`, which the operator reads as `HTTP 599` and "host
+    /// not allowlisted" — a message naming a network fault that is really a stale cache in a second
+    /// process. Reproduced live on 2026-09-28: provider `vice` at `vyceai.com`, status `pending`,
+    /// created 21:05 into an app started 20:54. The refusal happens *before* any upstream dial, so
+    /// the ledger held no row for it at all.
+    ///
+    /// **Refreshing on the request path rather than only on CRUD is the point.** A refresh the
+    /// caller must remember is one a caller can forget, and the writer here is a different process
+    /// that would have to be told. It also self-heals: a row changed by the agent, or by a second
+    /// window, is picked up without a restart.
+    ///
+    /// It grants the webview nothing. [`crate::core::persist::recompute_allow`] reads `providers`,
+    /// which only the host writes (invariant 12), and the webview's sole way to add a row is the
+    /// gateway's authenticated admin route — which already widens the gateway's list. The webview
+    /// still cannot name a destination, which is what the note above `egress_stream` promises.
+    ///
+    /// Safe to re-derive wholesale because `recompute_allow` replaces the set and nothing in
+    /// production adds a host that is not a provider's: the only other `AllowList::allow` callers
+    /// are test fixtures. Loopback needs no entry at all — [`host_is_permitted`] admits it before it
+    /// consults the list.
+    fn refresh_allow(&self) {
+        crate::core::persist::recompute_allow(&self.allow, &self.store);
     }
 
     /// The same state, reading secrets from `secrets` instead of the vault.
@@ -951,6 +1011,10 @@ impl EgressState {
         Self {
             client: reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
+                // Identify this client. A per-request `user-agent` in the manifest's endpoint
+                // headers overrides it, which is the escape hatch for a gateway that demands a
+                // specific one — see `DEFAULT_USER_AGENT`.
+                .user_agent(DEFAULT_USER_AGENT)
                 // v1: never follow redirects. API providers don't 3xx on these endpoints, and
                 // reqwest re-sends auth headers (incl. x-api-key, which its default policy does
                 // NOT strip cross-host) to the redirect target — that would exfiltrate the key
@@ -1668,6 +1732,69 @@ mod stall_tests {
         (messages, headers)
     }
 
+    /// **The app process's allowlist is a cache, and the database is its authority.**
+    ///
+    /// It was seeded once in `setup()` and nothing recomputed it afterwards, because the admin route
+    /// that owns provider CRUD is answered by whichever process holds the port — and with the
+    /// launchd agent installed that is the *agent*, not the app (`tauri::app` probes the port and
+    /// delegates). A provider added after the app launched was therefore refused here on every
+    /// request as `HostDenied`, surfacing to the operator as `HTTP 599` and "host not allowlisted".
+    /// Reproduced live on 2026-09-28; see `refresh_allow`.
+    ///
+    /// **Asserted through `build`, not through `refresh_allow`.** The property is "the refusal cannot
+    /// be made on a stale list", and a test of the helper alone would stay green after the call site
+    /// was deleted — which is exactly how this defect reached a live session.
+    ///
+    /// `build` returns a builder rather than sending, so the allowlist decision is asserted without
+    /// touching the network. The host is `.invalid`, which is reserved and could never resolve.
+    #[tokio::test]
+    async fn a_provider_added_after_startup_is_not_refused_by_a_stale_allowlist() {
+        let dir = std::env::temp_dir().join(format!("aip-stale-allow-{}", std::process::id()));
+        let s = state(&dir); // an empty allowlist: the state a freshly-started app is in
+        {
+            let conn = s.store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) \
+                 VALUES ('p','vice','Vice','https://stale-cache-probe.invalid','pending',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        assert!(
+            !s.allow.contains("stale-cache-probe.invalid"),
+            "precondition: the cache must be the stale one this test is about"
+        );
+        let out =
+            build(&s, req("https://stale-cache-probe.invalid/v1/chat/completions".into())).await;
+        assert!(
+            out.is_ok(),
+            "a stale cache must not refuse a host the database admits: {:?}",
+            out.err()
+        );
+    }
+
+    /// The other half, so the fix cannot be "refresh" spelled as "allow everything": re-deriving
+    /// must not admit a host the rows do not grant. A `draft` provider stays refused — invariant 3,
+    /// "the provider row must exist and be allowlisted before probing".
+    #[tokio::test]
+    async fn refreshing_does_not_admit_a_draft_provider() {
+        let dir = std::env::temp_dir().join(format!("aip-stale-draft-{}", std::process::id()));
+        let s = state(&dir);
+        {
+            let conn = s.store.conn.lock().unwrap();
+            conn.execute(
+                "INSERT INTO providers (id,slug,name,base_url,status,created_at,updated_at) \
+                 VALUES ('p','d','D','https://draft-cache-probe.invalid','draft',1,1)",
+                [],
+            )
+            .unwrap();
+        }
+        let err = build(&s, req("https://draft-cache-probe.invalid/v1/chat/completions".into()))
+            .await
+            .expect_err("a draft provider's host must stay refused");
+        assert!(matches!(err, EgressError::HostDenied(_)), "got {err:?}");
+    }
+
     /// **The retry is gone from this arm, and that is the fix rather than a lost safety net.**
     ///
     /// Inverted 2026-09-27 from `a_stall_before_headers_is_retried_once`. The old assertion
@@ -1921,5 +2048,144 @@ mod stall_tests {
              {gateway_bound:?} — so the last candidate would be cut off mid-attempt, which is \
              exactly the 2026-09-27 defect. Lower PLAN_BUDGET, or raise FIRST_MSG_TIMEOUT with it."
         );
+    }
+}
+
+/// What this client calls itself on the wire.
+///
+/// **Asserted against the bytes, not against the builder.** `user_agent()` on a `reqwest::Client`
+/// is applied by hyper at write time, so it is invisible to every in-process double — including the
+/// `HttpPort` fakes the interpreter's own tests use, which record the headers the *interpreter*
+/// built and know nothing about what the transport adds. A test that inspected the builder would
+/// prove it was configured, which is not the claim; the claim is that a header crossed the socket.
+/// The listener below reads the request head for exactly that reason.
+///
+/// Measured 2026-09-29: before this, **no `User-Agent` was sent at all** — not by this client, not
+/// by `interpreter.rs`, not by the TS `ManifestInterpreter`. That absence is what made
+/// `agentrouter.org` unreachable, and it made the refusal look like a rejected credential.
+#[cfg(test)]
+mod user_agent_tests {
+    use super::*;
+
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::Mutex;
+
+    /// A listener that captures the raw request head and answers `200 {}`.
+    fn capturing_listener() -> (Arc<Mutex<String>>, String) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = Arc::new(Mutex::new(String::new()));
+        let out = captured.clone();
+        std::thread::spawn(move || {
+            for incoming in listener.incoming() {
+                let mut socket = match incoming {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                // Read the head before answering, for the reason `stall_tests` records: a server
+                // that writes a response before reading the request races the client's write, and
+                // hyper can classify the dial as a transport error and retry.
+                let mut head: Vec<u8> = Vec::new();
+                let mut scratch = [0u8; 4096];
+                let _ = socket.set_read_timeout(Some(Duration::from_millis(500)));
+                loop {
+                    match socket.read(&mut scratch) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            head.extend_from_slice(&scratch[..n]);
+                            if scratch[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                                break;
+                            }
+                        }
+                    }
+                }
+                *out.lock().unwrap() = String::from_utf8_lossy(&head).to_string();
+                let _ = socket.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\n\r\n{}",
+                );
+                let _ = socket.flush();
+            }
+        });
+        (captured, format!("http://127.0.0.1:{port}/v1/models"))
+    }
+
+    fn state(dir: &std::path::Path) -> EgressState {
+        let _ = std::fs::remove_dir_all(dir);
+        // An empty allowlist: loopback is permitted by `is_local`, which is the host under test.
+        EgressState::new(Arc::new(AllowList::default()), Arc::new(Store::open(dir).unwrap()))
+    }
+
+    fn req(url: String, headers: &[(&str, &str)]) -> EgressRequest {
+        EgressRequest {
+            url,
+            method: "GET".to_string(),
+            headers: headers.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
+            body: None,
+            secret_ref: None,
+            timeout_ms: None,
+        }
+    }
+
+    /// The header line for `name`, case-insensitively, as it appeared in the head.
+    fn header_line(head: &str, name: &str) -> Option<String> {
+        head.lines()
+            .find(|l| {
+                l.to_ascii_lowercase().starts_with(&format!("{}:", name.to_ascii_lowercase()))
+            })
+            .map(|l| l.trim().to_string())
+    }
+
+    #[tokio::test]
+    async fn an_outbound_request_identifies_the_client() {
+        let dir = std::env::temp_dir().join(format!("aip-ua-{}", std::process::id()));
+        let s = state(&dir);
+        let (captured, url) = capturing_listener();
+
+        request(&s, req(url, &[])).await.expect("the listener answers 200");
+
+        let head = captured.lock().unwrap().clone();
+        let line = header_line(&head, "user-agent").unwrap_or_else(|| {
+            panic!("no User-Agent crossed the socket; the request head was:\n{head}")
+        });
+        // Case-insensitive on the *name*: hyper normalises header names to lowercase on the wire,
+        // which is correct — HTTP/1.1 field names are case-insensitive. The value is asserted
+        // exactly, because the value is the part that identifies the client.
+        assert_eq!(
+            line.split_once(':').map(|(_, v)| v.trim()),
+            Some(DEFAULT_USER_AGENT),
+            "got {line:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A per-provider header wins — this is the escape hatch, and it is load-bearing.**
+    ///
+    /// The default is the honest name, which a client-gate gateway will refuse. The only thing that
+    /// makes such a gateway reachable is that a `user-agent` on the manifest's endpoint headers
+    /// replaces the client default rather than being ignored in its favour. If reqwest applied the
+    /// default on top, the whole custom-headers feature would be inert for the one header it was
+    /// built for, and every test above would still pass.
+    #[tokio::test]
+    async fn a_manifest_header_overrides_the_client_default() {
+        let dir = std::env::temp_dir().join(format!("aip-ua-override-{}", std::process::id()));
+        let s = state(&dir);
+        let (captured, url) = capturing_listener();
+
+        request(&s, req(url, &[("user-agent", "claude-cli/2.0.0 (external, cli)")]))
+            .await
+            .expect("the listener answers 200");
+
+        let head = captured.lock().unwrap().clone();
+        assert_eq!(
+            header_line(&head, "user-agent").as_deref(),
+            Some("user-agent: claude-cli/2.0.0 (external, cli)"),
+            "the manifest's header must replace the default, not sit behind it"
+        );
+        assert!(
+            !head.contains(DEFAULT_USER_AGENT),
+            "the default must be gone, not merely joined by a second header:\n{head}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

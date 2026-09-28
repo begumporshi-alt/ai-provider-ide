@@ -103,8 +103,19 @@ pub struct Endpoints {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ListModelsEndpoint {
     pub path: String,
+    /// Per-endpoint static request headers (v1.1 amendment 2026-09-29). Defaulted to empty rather
+    /// than `Option` for the same reason [`TextEndpoint::headers`] is: `render_headers` maps
+    /// `undefined` and `{}` to the same empty map, so the two spellings are one input.
+    ///
+    /// This is the field a client-identity gate needs. `agentrouter.org` answers
+    /// `401 unauthorized_client_error` on `GET /v1/models` for any unrecognised `User-Agent`,
+    /// *before* it looks at the key — and `list_models` is the call the ping, the catalogue
+    /// refresh and every probe make, so the provider is otherwise entirely unreachable.
+    #[serde(default)]
+    pub headers: BTreeMap<String, String>,
     pub map: ModelMap,
 }
 

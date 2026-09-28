@@ -39,6 +39,15 @@ export const MANIFEST_ENDPOINT_AUTH_HEADER = z.object({
 export const LIST_MODELS_ENDPOINT = z.object({
   method: z.literal("GET"),
   path: z.string(),
+  // Per-endpoint static request headers (v1.1 amendment 2026-09-29). Until this existed the
+  // catalogue call carried **only** the auth headers, so a gateway that gates on client identity
+  // could not be satisfied on `/models` even when `generateText` could. Measured on
+  // `agentrouter.org`: `GET /v1/models` with no recognised `User-Agent` answers
+  // `401 unauthorized_client_error` ("unauthorized client detected") regardless of the key, and
+  // the same key is then judged normally once the header is present. That gateway is the
+  // motivating case, and `listModels` is the call every probe, ping and catalog refresh makes —
+  // so without this the whole provider is unreachable while `generateText` looks configured.
+  headers: z.record(z.string()).optional(),
   pagination: z
     .object({ style: z.enum(["none", "openai-cursor"]).default("none") })
     .optional(),

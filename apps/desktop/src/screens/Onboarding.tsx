@@ -27,6 +27,7 @@ import {
 import { useUi } from "../ui-state";
 import { Button, Field, StatusDot, inputCls, inputStyle } from "../components/atoms";
 import { CodeCandidateReview } from "../components/CodeCandidateReview";
+import { parseHeaderLines, withRequestHeaders } from "../lib/providers/manual-manifest";
 
 type Step = 0 | 1 | 2 | 3 | 4; // Connect → Probe → Identify → Test → Review
 
@@ -64,6 +65,20 @@ export function OnboardingScreen() {
   const orchRef = useRef<OnboardingOrchestrator | null>(null);
   const [resumable, setResumable] = useState<(OnboardingSessionData & { rowId?: number }) | null>(null);
   const [prefill, setPrefill] = useState<OnboardingSessionData["input"] | null>(null);
+  /**
+   * The client-gate marker, when the probe met one — and the header text the operator is entering
+   * to answer it. Held as one pair because neither means anything without the other: the marker
+   * explains why we stopped, the field is the only way forward.
+   */
+  const [gate, setGate] = useState<string | null>(null);
+  const [gateHeader, setGateHeader] = useState("");
+  /**
+   * The input of the run in flight, so a gate retry can repeat it.
+   *
+   * A ref rather than state: the retry reads it at click time and nothing renders from it, so
+   * putting it in state would add a render that changes no pixels.
+   */
+  const lastInput = useRef<{ name: string; baseUrl: string; apiKey: string; docsUrl?: string } | null>(null);
 
   // resume support (§2.1): offer the latest non-terminal session
   useEffect(() => {
@@ -318,10 +333,21 @@ export function OnboardingScreen() {
     }
   }
 
-  async function start(input: { name: string; baseUrl: string; apiKey: string; docsUrl?: string }) {
+  async function start(
+    input: { name: string; baseUrl: string; apiKey: string; docsUrl?: string },
+    /**
+     * Headers to probe with, and to carry into the manifest setup registers.
+     *
+     * Supplied on a retry after a client gate, or on resume when one was already entered. The probe
+     * runs before any manifest exists, so this is the only channel by which a header can reach it.
+     */
+    extraHeaders?: Record<string, string>,
+  ) {
     setBusy(true);
     setError(null);
     setProbeLog([]);
+    setGate(null);
+    lastInput.current = input;
     try {
       // provider row first (pending = host allowlisted for probes), then the key (vault).
       const providerId = await createPendingProvider(input.name, input.baseUrl);
@@ -330,7 +356,7 @@ export function OnboardingScreen() {
       const orch = new OnboardingOrchestrator(getHttpPort(), persistence);
       orchRef.current = orch;
       setStep(1);
-      await orch.start({ name: input.name, baseUrl: input.baseUrl, docsUrl: input.docsUrl });
+      await orch.start({ name: input.name, baseUrl: input.baseUrl, docsUrl: input.docsUrl, extraHeaders });
       setProbeLog(orch.session.probeReport?.attempts ?? []);
       setStep(2);
       const fp = await orch.identify();
@@ -339,6 +365,20 @@ export function OnboardingScreen() {
       if (fp.dialect === "unknown" || !fp.template) {
         setStep(2);
         setBusy(false);
+        // **A client gate is a configuration answer, not a "we cannot support this" answer.**
+        // Handing it to the generator would spend calls on a request whose refusal is already
+        // explained, and the generator cannot know which client this gateway will accept — that is
+        // the operator's knowledge. So we stop and offer the one thing that can move it: the
+        // header field. Measured 2026-09-29: `agentrouter.org` gates on `User-Agent` and reads the
+        // key only once the client is accepted.
+        if (fp.clientGate) {
+          setGate(fp.clientGate);
+          // Seeded only when empty, so a second gate does not wipe what the operator just typed —
+          // a retry that fails should leave their text where they left it.
+          setGateHeader((h) => h || "user-agent: ");
+          setError(orch.session.failureReason ?? "the gateway refused this client");
+          return;
+        }
         if (!router.systemAiAvailable().available) {
           setError(orch.session.failureReason ?? "could not identify this API");
         } else {
@@ -348,10 +388,13 @@ export function OnboardingScreen() {
         return;
       }
       // register the template manifest on the pending provider, then free contract checks
-      adapters.register(providerId, fp.template);
+      // The operator's headers ride along, so the provider is not merely *identified* with them and
+      // then left unable to make a request without them.
+      const template = withRequestHeaders(fp.template, extraHeaders ?? {});
+      adapters.register(providerId, template);
       await fetchAdmin("POST", "/admin/manifests", {
         id: crypto.randomUUID(), providerId, version: 1, origin: "builtin-template",
-        bodyJson: JSON.stringify(fp.template), contractResultJson: null,
+        bodyJson: JSON.stringify(template), contractResultJson: null,
         createdAt: Date.now(), isActive: true,
       });
       setStep(3);
@@ -366,6 +409,33 @@ export function OnboardingScreen() {
       setError(String((e as Error).message ?? e));
       setBusy(false);
     }
+  }
+
+  /**
+   * Answer a client gate: probe again with the operator's headers.
+   *
+   * **The failed provider row is removed first.** `start()` always creates a fresh pending provider,
+   * so retrying without this would leave the abandoned attempt behind on every press — a row the
+   * operator never asked for, with no key and no manifest, cluttering the list they are about to
+   * look at. `createPendingProvider` has the same rollback for its own failure path, for the same
+   * reason.
+   */
+  async function retryWithGateHeader() {
+    const input = lastInput.current;
+    if (!input) return;
+    const { headers, problems } = parseHeaderLines(gateHeader);
+    if (problems.length) {
+      setError(`Custom headers: ${problems.join("; ")}.`);
+      return;
+    }
+    if (Object.keys(headers).length === 0) {
+      setError("Enter at least one header, for example: user-agent: claude-cli/2.0.0 (external, cli)");
+      return;
+    }
+    const failed = refs.current?.providerId;
+    if (failed) await deleteProvider(failed).catch(() => undefined);
+    setGate(null);
+    await start(input, headers);
   }
 
   async function runPaidChecks() {
@@ -609,6 +679,41 @@ export function OnboardingScreen() {
             </Button>
           </div>
         </Section>
+      )}
+
+      {/*
+        The client-gate panel. Rendered outside the step machine on purpose: the wizard's ordinary
+        error line is suppressed at step 2, and step 2 is exactly where a gate lands. A message that
+        the step machine can hide is a message the operator will not see.
+      */}
+      {gate && (
+        <div className="mt-3">
+          <Section title="This gateway refused our client">
+            <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>
+            <p className="mb-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
+              The gateway answered <code>{gate}</code> without looking at your key, so nothing is
+              wrong with the key itself. Name a client it serves and auto setup will probe again —
+              the header is kept on the provider, so it is used for every later request too.
+            </p>
+            <Field label="Request headers">
+              <textarea
+                className={`${inputCls} mono`} style={{ ...inputStyle, minHeight: "4.5rem" }}
+                value={gateHeader}
+                onChange={(e) => setGateHeader(e.target.value)}
+                placeholder={"user-agent: claude-cli/2.0.0 (external, cli)"}
+                spellCheck={false}
+              />
+            </Field>
+            <div className="mt-3 flex gap-2">
+              <Button variant="primary" disabled={busy} onClick={() => void retryWithGateHeader()}>
+                Retry with these headers
+              </Button>
+              <Button variant="danger" disabled={busy} onClick={() => void cancel()}>
+                Discard
+              </Button>
+            </div>
+          </Section>
+        </div>
       )}
 
       {error && step !== 2 && (

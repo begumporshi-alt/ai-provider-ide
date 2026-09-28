@@ -13,7 +13,9 @@
  */
 import { describe, expect, it } from "vitest";
 import { BUILTIN_TEMPLATES } from "@aiprovider/router-core";
-import { authHeaderFor, buildManualManifest, type ManualDialect } from "./manual-manifest";
+import {
+  authHeaderFor, buildManualManifest, headersToLines, parseHeaderLines, type ManualDialect,
+} from "./manual-manifest";
 
 const URL = "https://api.example.com/v1";
 
@@ -92,5 +94,85 @@ describe("authHeaderFor", () => {
 
   it("treats an empty custom prefix as no prefix, not an empty one", () => {
     expect(authHeaderFor("custom", "X-Custom", "")).toEqual({ name: "X-Custom", prefix: undefined });
+  });
+});
+
+/**
+ * Custom request headers — the capability that makes a client-gate gateway reachable.
+ *
+ * The property that matters is not that a header is written somewhere, but that it reaches **every**
+ * endpoint. Measured 2026-09-29 on `agentrouter.org`: `GET /v1/models` answers
+ * `401 unauthorized_client_error` for any unrecognised `User-Agent`, and that is the call the ping,
+ * the probe and the catalog refresh all make. A header on `generateText` alone would leave the
+ * provider unusable while looking fully configured — the exact shape of silent failure this file
+ * already exists to guard against.
+ */
+describe("custom headers", () => {
+  const UA = { "user-agent": "claude-cli/2.0.0 (external, cli)" };
+  const withHeaders = (dialect: ManualDialect) =>
+    buildManualManifest({
+      url: URL, dialect, authHeader: { name: "Authorization", prefix: "Bearer" }, extraHeaders: UA,
+    });
+
+  it("reaches the model list, not only text generation", () => {
+    const m = withHeaders("openai-chat-v1");
+    expect(m.endpoints.listModels?.headers).toEqual(UA);
+    expect(m.endpoints.generateText?.headers).toEqual(UA);
+  });
+
+  it("merges over the template's headers rather than replacing them", () => {
+    // The anthropic template carries `anthropic-version`, which the dialect requires. Replacing the
+    // map instead of merging would drop it, and the provider would start failing for a second,
+    // unrelated reason.
+    const m = withHeaders("anthropic-messages-v1");
+    expect(m.endpoints.generateText?.headers).toEqual({
+      "anthropic-version": "2023-06-01",
+      ...UA,
+    });
+  });
+
+  it("leaves the manifest identical to the template when nothing is entered", () => {
+    // The no-op case, asserted so the merge cannot quietly add an empty `headers` key that would
+    // make every existing provider look edited.
+    const m = buildManualManifest({
+      url: URL, dialect: "openai-chat-v1", authHeader: { name: "Authorization", prefix: "Bearer" },
+    });
+    expect(m.endpoints.listModels?.headers).toBeUndefined();
+  });
+
+  it("survives a round trip through the form, and does not promote template headers into it", () => {
+    for (const dialect of ["openai-chat-v1", "anthropic-messages-v1"] as ManualDialect[]) {
+      const lines = headersToLines(withHeaders(dialect), dialect);
+      expect(lines, dialect).toBe('user-agent: claude-cli/2.0.0 (external, cli)');
+      // Re-parsing the hydrated text must rebuild the same headers — this is what stops an edit
+      // that touches only the provider's name from deleting them.
+      expect(parseHeaderLines(lines).headers, dialect).toEqual(UA);
+    }
+  });
+});
+
+describe("parseHeaderLines", () => {
+  it("reads one pair per line and ignores blanks and comments", () => {
+    const { headers, problems } = parseHeaderLines(
+      "# relay gateway\nuser-agent: claude-cli/2.0.0 (external, cli)\n\nx-app: cli\n",
+    );
+    expect(problems).toEqual([]);
+    expect(headers).toEqual({ "user-agent": "claude-cli/2.0.0 (external, cli)", "x-app": "cli" });
+  });
+
+  it("keeps colons inside a value", () => {
+    // A UA and a URL both contain colons, so splitting on the first colon is the only correct read.
+    expect(parseHeaderLines("referer: https://a.test/x").headers).toEqual({ referer: "https://a.test/x" });
+  });
+
+  it("reports a line it cannot read instead of inventing a separator", () => {
+    const { headers, problems } = parseHeaderLines("user-agent claude-cli/2.0.0");
+    expect(headers).toEqual({});
+    expect(problems).toHaveLength(1);
+    expect(problems[0]).toContain("Name: value");
+  });
+
+  it("accepts an empty value, which is a header being cleared", () => {
+    expect(parseHeaderLines("x-empty:").headers).toEqual({ "x-empty": "" });
   });
 });

@@ -25,6 +25,34 @@ git config core.hooksPath scripts/git-hooks
 is why the check is a hook and not a gate step, since `pnpm ci:local` regenerates the book and would
 pass while the staged copy stayed contaminated.
 
+## Running it
+
+The app is a client of a local gateway, and the two are separate processes that resolve to the
+**same** data directory and the **same** port. `pnpm dev` starts only the app, so a change that
+touches Rust is tested against whichever gateway is *already installed* — which keeps answering on
+that port, on every admin route, **with no error**. It just behaves like the old code. Use the one
+command instead:
+
+```bash
+pnpm dev:up            # build + install the gateway, then run the app
+pnpm dev:up:service    # the same, without launching the app
+pnpm dev:up:release    # packaged app: tauri build, then install from the bundle
+```
+
+`dev:up` builds `aiproviderd`, backs up the installed binary and the database, replaces the
+*installed* copy rather than only the one under `target/`, restarts the login item, and verifies by
+reading launchd's state and probing `127.0.0.1:8800/health` — not by trusting an exit code. It is
+safe to re-run; nothing is deleted.
+
+One constraint worth knowing before you debug it: **`launchctl bootstrap` requires an Aqua (GUI)
+session.** A shell spawned by an editor, a CI job or an agent has none, and `bootstrap` there fails
+with `5: Input/output error`. The *first* install therefore has to run from Terminal.app or from the
+app's Control screen. Once launchd holds the job, `dev:up` replaces the binary and `kickstart`s
+instead, which works from any session — and it never `bootout`s a working gateway to reach a
+`bootstrap` that may fail.
+
+Rationale and the environment facts that produce misleading failures: `docs/dev-book/05-workflow.md`.
+
 ## The gate
 
 ```bash

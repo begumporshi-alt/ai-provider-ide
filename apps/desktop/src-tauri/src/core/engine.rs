@@ -2641,6 +2641,7 @@ mod tests {
             fetched_at: 0,
             pricing_json: None,
             capabilities_json: None,
+            origin: "discovered".to_string(),
         }
     }
 

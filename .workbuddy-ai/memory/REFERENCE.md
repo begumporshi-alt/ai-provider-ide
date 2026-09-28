@@ -4407,7 +4407,12 @@ links 51 files / 127 links; `book.html` 12 chapters / 204 ids / 621.2 KB.
    function** (`gateway.rs`, right after `MUTATING_TOOLS`), with the method delegating. Two callers need the
    same answer and only one has a core — the webview path via `is_tools_mutation_enabled`, the Rust path via
    the host's bool. Same split as `webview_ready`; two spellings of a refusal message is how the two paths come
-   to disagree about which tools are refused.
+   to disagree about which tools are refused. **It is not hypothetical (2026-09-28):** the two hosts answer
+   `tools_mutation_enabled()` from different authorities — `bin/aiproviderd.rs:91` returns the constant
+   `false`, `tauri/gateway_cmds.rs:66` returns the persisted `gateway.mutationEnabled`, and that row is
+   `true` on this machine. So the gateway advertises 4 tools under `aiproviderd` and 8 under the app, for
+   the same configuration. The 39.5% prompt-token cut measured on 09-28 is therefore a property of the
+   *service*, not of the build. Ask which host before quoting a tool-set figure.
 3. **Is `ready` always `true`?** Yes, for any `Beat` — the deliberate opposite of `webview_ready`. Nothing
    suspends a task in this process, which is exactly why `Bridge::ready` has no default body (D35).
 
@@ -5645,3 +5650,118 @@ code").
 
 
 
+
+## Running the app locally — rebuild + the installed service (2026-09-28)
+
+**Before testing any change that touches Rust, refresh the installed headless service too.**
+
+`tauri.conf.json` `identifier` is `dev.aiprovider.router`, and the app's data dir comes from
+`app.path().app_data_dir()` (`tauri/app.rs:150`) — so the app and the LaunchAgent resolve to the
+**same** `~/Library/Application Support/dev.aiprovider.router`: one `ai-provider-router.db`, one
+port (`SERVICE_DEFAULT_PORT = 8800`). The app does not get a private copy.
+
+So a running service built from older source keeps serving the app. It answers the same admin
+routes, so nothing errors — it just behaves like the old code, which is how a verified fix looks
+broken on first run.
+
+Sequence that works:
+1. `cargo build --bin aiproviderd`
+2. Back up `bin/aiproviderd` and the DB (`.pre-00NN-<ts>.bak`) — the installer keeps `.bak-<ts>`
+   copies itself, so this matches local convention.
+3. `install -m 755 target/debug/aiproviderd <data_dir>/bin/aiproviderd`
+4. `launchctl kickstart -k gui/$(id -u)/dev.aiprovider.router`
+5. **Verify the durable artifact**, not the build: `sqlite3 <db> "SELECT version,name FROM
+   schema_version ORDER BY version DESC LIMIT 3"` and `PRAGMA table_info(<table>)`. A green cargo
+   build says nothing about whether the running binary migrated your database.
+6. `pnpm dev` (→ `tauri dev`) for the app itself; it compiles the Rust app target and serves vite.
+
+`ps` is **denied** in the sandbox — use `launchctl print gui/$(id -u)/dev.aiprovider.router`
+(`state = running`, `pid = ...`). `launchctl list` prints 0 lines non-interactively.
+Logs: `<data_dir>/aiproviderd.log` and `.err.log`.
+
+**`scripts/dev-up.sh` (→ `pnpm dev:up`) does steps 1–5 as one command**; `--no-run` stops before
+`pnpm dev`, `--release` builds the packaged app first. Three facts that each cost a pass:
+- **`install` boots out before it bootstraps** (`service.rs:348`, then `:349`), so on a machine whose
+  job is registered it tears a working gateway down and can leave the label **unloaded** when
+  `bootstrap` fails — which is what a non-Aqua shell does, every time. The script therefore reads
+  `launchctl print` first and `kickstart`s when launchd holds the job; `install` is only for the
+  no-job case. Recovering an unloaded job from a non-GUI shell is impossible (`bootstrap gui/501`,
+  `bootstrap user/501`, `load -w`, an unsandboxed retry and `osascript … Terminal` → TCC `-10004`
+  all failed): **Terminal.app or nothing.**
+- **`tauri build` must be addressed through the desktop package.** The root has no `tauri` script and
+  an **empty** `node_modules/.bin` — `@tauri-apps/cli` is a dependency of `apps/desktop`. Use
+  `pnpm --filter ai-provider-router-desktop tauri build --bundles app` (`ci-local.sh:100`); the
+  default bundle set also asks for a DMG and `hdiutil` fails sandboxed.
+- **`sqlite3 .backup` for the DB snapshot, never `cp`.** A live WAL database copied with `cp` omits
+  the rows written most recently — the backup looks fine and is missing exactly the newest data.
+
+## Two egress allowlists — one per process, and the port owner decides which is maintained
+- **The app process and the gateway each hold their own `Arc<AllowList>`.** The app seeds its own
+  **once** in `setup()` (`tauri/app.rs:176`, `initial_allow_hosts`: `base_url` where status is
+  `pending|enabled|repairing`). The gateway recomputes at startup (`bin/aiproviderd.rs:378`) and on
+  every admin CRUD (`gateway_admin.rs:454` and `:487`).
+- **`app.rs:221-243` probes the port and delegates when the launchd agent already holds it** — so
+  with the service installed, `/admin/providers` is answered by the agent, the agent's list is
+  updated, and **the app's list goes stale**. The app's list is correct only when the app itself bound
+  the port, because then its embedded gateway shares the `Arc`. A provider added after the app started
+  is then refused by the app's `egress_stream` as `HostDenied`, surfacing as `HTTP 599` plus "host not
+  allowlisted" — a message that names a network fault and describes a stale cache. Fixed 2026-09-28:
+  `EgressState::refresh_allow()` re-derives from `providers`, called from `build` (the `check_url`
+  choke point, so it covers `request` *and* `stream`) and `fetch_image`.
+- **A refusal precedes any upstream dial, so it leaves no ledger row.** A request that never happened
+  is invisible to the one place that records requests — when the symptom is "the model did not
+  answer", read the log and the allowlist, not the ledger.
+- `AllowList` is replaced **wholesale** by `recompute_allow` (`*cur = desired`). Safe because nothing
+  in production adds a non-provider host, and `host_is_permitted` admits loopback **before** it
+  consults the list.
+- The webview never calls `provider_upsert`: the Tauri command is registered (`commands.rs:626`) but
+  `store.trail-writes.test.ts:266` asserts the invoke count is **0**. Provider CRUD has been HTTP-only
+  since the pure-HTTP migration, which is what left the command with no caller.
+
+## Client gates — a `401` that is about the caller, not the key
+
+- **`agentrouter.org` (a "New API" relay) serves an allowlist of client families, and refuses
+  everything else with `401 unauthorized_client_error` *before* reading the credential.** Measured
+  2026-09-29, credential held constant, only `User-Agent` varied. **Accepted:** `claude-cli/2.0.0
+  (external, cli)`, `zcode` (any case, any position — `XzcodeX` passes), `codex_cli_rs/0.1.0`,
+  `opencode/1.0`, `cline/1.0`, `roo-code/1.0`. **Refused:** no UA, `curl/8.7.1`, `Mozilla/5.0 …`,
+  a made-up UA, `claude-code/0.1.0`, `claude-cli/2.0.0` without the parenthetical, `z-code`,
+  `cursor/1.0`, `gemini-cli/0.1.0`, `kilo/1.0`. So it is an **allowlist, not a bot blocklist** —
+  "send a browser UA" is not a fix.
+- **The proof it is about the client:** with an accepted UA, the *same dummy key* returns
+  `401 new_api_error` / `无效的令牌` — a real judgement about the key. Without one, the key is never
+  read. Therefore a gate `401` is evidence about the client and **none** about the key.
+- **`GET /models` (no `/v1`) returns the HTML SPA at 200 regardless of UA** — the same shape as
+  Hcnsec. The base URL must be `https://agentrouter.org/v1`.
+- `detectClientGate` (`packages/router-core/src/client-gate.ts`) is the **single authority** for this
+  rule; `lib/keys/verdict.ts` and `probe-runner.ts` both call it. The marker list is two strings,
+  quoted from the measured body, on purpose: a miss falls back to blaming the key (the status quo),
+  while a false positive would tell an operator a rejected key is fine.
+- **A gate `401` must classify as `unverified`, never `invalid`** — `invalid` is conclusive, so
+  `store.ts` writes it and `HealthTracker.isKeyUsable` keeps the key out of rotation. Classifying a
+  gate as `invalid` disables a working credential on the strength of a request that never examined it.
+- **`LIST_MODELS_ENDPOINT` had no `headers` field** until 2026-09-29 (only `generateText` and
+  `generateImage` did), so `GET /models` could not carry a client header at all — and `listModels` is
+  what every probe, ping and catalog refresh calls. A header reaching only `generateText` leaves such
+  a provider unreachable while looking configured.
+- **`list_headers` (`interpreter.rs`) is deliberately not `json_headers`**: the latter inserts
+  `content-type: application/json` unconditionally, which is wrong for a bodyless GET and would have
+  changed the catalogue request as a side effect.
+- **The app sent no `User-Agent` at all** until 2026-09-29 — not in `egress.rs`, `interpreter.rs`, the
+  TS `ManifestInterpreter`, or any manifest. Now `DEFAULT_USER_AGENT =
+  "AI-Provider-Router/<CARGO_PKG_VERSION>"` on the credentialed client in `egress.rs`, which covers
+  both paths (`EgressState::new` is what the app and `aiproviderd` each construct). **The honest name
+  is deliberate**: shipping a recognised third-party client's UA would open such gateways by
+  impersonation, for every provider, unasked. The override belongs per provider, in its manifest.
+- **Two transport facts, both verified empirically (2026-09-29):** hyper **lowercases header names on
+  the wire** (`User-Agent:` arrives as `user-agent:` — assert the value, match the name
+  case-insensitively); and **reqwest honours a per-request `user-agent` over the client default**,
+  which is what makes the per-provider override work at all.
+- **The engine's taxonomy is still unfixed**: `ErrorClass` classifies a gate `401` as `AUTH_FAILED`,
+  so the execution engine rotates every key (all fail identically) and `ledger.error_class` fills with
+  `AUTH_FAILED` rows — which `DRIFT_CLASSES` counts as drift. Adding a class is a cross-language
+  contract change (`ALL_CLASSES` is a **fixed-size** array in `engine.rs`), deliberately not
+  half-done.
+- **A probe that cannot fire is indistinguishable from a fix that works.** The first falsification of
+  `list_headers` used a condition that was `false || false` in the fixture, so it never triggered and
+  the suite stayed green. Check the probe's condition against the fixture before trusting a green.

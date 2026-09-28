@@ -32,6 +32,43 @@ function readCachedTokens(u: Record<string, unknown>): number | undefined {
   return undefined;
 }
 
+/**
+ * Parse a `200` body, and when it is not JSON say **what it was** rather than what the parser
+ * thought of it.
+ *
+ * **Measured 2026-09-28, from a live report.** `https://api.hcnsec.cn` — the host with no `/v1` —
+ * answers *every* unknown path, `/models` and `/chat/completions` alike, with its marketing SPA at
+ * **status 200** and `content-type: text/html`, while `https://api.hcnsec.cn/v1/models` answers
+ * `401` JSON. The operator therefore met a bare `SyntaxError` — "JSON Parse error: Unrecognized
+ * token '<'" — which names neither the provider, the URL, nor the remedy, for a mistake one path
+ * segment long. The second provider on the same machine had the identical shape.
+ *
+ * **The `status >= 400` guard at every call site cannot catch this**, and that is the whole reason
+ * this function exists: the wrong answer arrives as a *success*. Only the body says so.
+ */
+export function jsonBody(raw: string, url: string): unknown {
+  try {
+    return JSON.parse(raw);
+  } catch {
+    // One line, whitespace collapsed, so a multi-line HTML document does not become a paragraph in
+    // an error toast.
+    const head = raw.slice(0, 80).replace(/\s+/g, " ").trim();
+    if (/^\s*</.test(raw)) throw new Error(htmlNotJson(url, head));
+    throw new Error(`${url} did not answer with JSON. It began: "${head}"`);
+  }
+}
+
+/**
+ * The single spelling of "this is HTML, you probably meant `/v1`", shared by the parse path and the
+ * SSE path. Two spellings of one diagnosis is how the two come to disagree about the remedy.
+ */
+export function htmlNotJson(url: string, head: string): string {
+  return (
+    `${url} answered with an HTML page rather than JSON. The base URL is most likely missing its ` +
+    `API path — many providers serve the API under "/v1", so try "https://<host>/v1". It began: "${head}"`
+  );
+}
+
 export interface HttpPortLike {
   request(req: {
     url: string;
@@ -236,15 +273,25 @@ export class ManifestInterpreter implements AdapterInstance {
     // NOTE: v1.1 declares openai-cursor pagination; the cursor selector is not yet frozen in
     // the grammar, so we fetch the first page now. Phase 3 extends this once the cursor
     // selector is pinned in DECISIONS.md.
+    const url = joinUrl(this.m.provider.baseUrl, ep.path);
     const res = await this.ctx.http.request({
-      url: joinUrl(this.m.provider.baseUrl, ep.path),
+      url,
       method: "GET",
-      headers: authHeaders(this.m),
+      // Auth headers, then the endpoint's own static headers — the same order and the same merge
+      // as `generateText` (`:338`). No `content-type`: this GET carries no body, and the catalogue
+      // call has never sent one.
+      //
+      // The per-endpoint map is what lets a client-identity gate be satisfied. `agentrouter.org`
+      // answers `401 unauthorized_client_error` on `GET /v1/models` for any unrecognised
+      // `User-Agent` *before* it reads the key, and this is the call every ping, probe and catalog
+      // refresh makes — so without it the provider is unreachable even when text generation is
+      // configured correctly.
+      headers: { ...authHeaders(this.m), ...renderHeaders(ep.headers, this.ctx.vars) },
       secretRef,
       signal,
     });
     if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
-    const json: unknown = JSON.parse(await res.text());
+    const json: unknown = jsonBody(await res.text(), url);
     const models: ModelEntry[] = [];
     const raws = ep.map.raw ? selectAll(json, ep.map.raw) : [];
     const items = selectAll(json, ep.map.models);
@@ -293,8 +340,9 @@ export class ManifestInterpreter implements AdapterInstance {
     if (args.stream && wantsUsage) {
       body["stream_options"] = { include_usage: true };
     }
+    const url = joinUrl(this.m.provider.baseUrl, ep.path);
     const res = await this.ctx.http.request({
-      url: joinUrl(this.m.provider.baseUrl, ep.path),
+      url,
       method: "POST",
       headers: { ...authHeaders(this.m), "content-type": "application/json", ...renderHeaders(ep.headers, this.ctx.vars) },
       body: JSON.stringify(body),
@@ -304,7 +352,7 @@ export class ManifestInterpreter implements AdapterInstance {
     if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
 
     if (!args.stream || !ep.stream) {
-      const json: unknown = JSON.parse(await res.text());
+      const json: unknown = jsonBody(await res.text(), url);
       const text = selectOne(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
       if (ep.responseMap.toolCalls) emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls));
@@ -342,9 +390,21 @@ export class ManifestInterpreter implements AdapterInstance {
     // try/finally so the reassembled tool calls are reported on EVERY exit path, including
     // the early `return`s below (stopWhen, finish_reason, [DONE]).
     try {
+      // **A body that is not SSE at all yields no `data:` lines, so the loop below skips every one
+      // and the generator ends having said nothing.** The caller then reports "answered with an
+      // empty response — the request succeeded but no content came back", which asserts a success
+      // that did not happen: measured 2026-09-28, the "answer" was the provider's HTML SPA at status
+      // 200. The first non-empty line is enough to tell the two apart — SSE opens with `data:`, an
+      // event name or a comment, and HTML opens with `<`.
+      let sawFirstLine = false;
       for await (const line of res.lines) {
         if (signal?.aborted) return;
         const trimmed = line.trim();
+        if (!trimmed) continue;
+        if (!sawFirstLine) {
+          sawFirstLine = true;
+          if (trimmed.startsWith("<")) throw new Error(htmlNotJson(url, trimmed.slice(0, 80)));
+        }
         if (!trimmed.startsWith("data:")) continue;
         const payload = trimmed.slice(5).trim();
         if (payload === "[DONE]") return;
@@ -450,8 +510,10 @@ export class ManifestInterpreter implements AdapterInstance {
       size: args.size,
       ...this.ctx.vars,
     });
+    // `endpointUrl`, not `url`: line below binds `url` to the provider's returned imageUrl.
+    const endpointUrl = joinUrl(this.m.provider.baseUrl, ep.path);
     const res = await this.ctx.http.request({
-      url: joinUrl(this.m.provider.baseUrl, ep.path),
+      url: endpointUrl,
       method: "POST",
       headers: { ...authHeaders(this.m), "content-type": "application/json", ...renderHeaders(ep.headers, this.ctx.vars) },
       body: JSON.stringify(body),
@@ -459,7 +521,7 @@ export class ManifestInterpreter implements AdapterInstance {
       signal,
     });
     if (res.status >= 400) return { ok: false, status: res.status, errorBody: await res.text() };
-    const json: unknown = JSON.parse(await res.text());
+    const json: unknown = jsonBody(await res.text(), endpointUrl);
     const b64 = ep.responseMap.imageB64 ? selectOne(json, ep.responseMap.imageB64) : undefined;
     const url = ep.responseMap.imageUrl ? selectOne(json, ep.responseMap.imageUrl) : undefined;
     return {

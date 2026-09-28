@@ -9,6 +9,12 @@ import type { HttpPort, KeyVaultPort } from "../src/ports.js";
 export interface ScriptedResponse {
   status?: number;
   body?: unknown; // JSON body for non-stream
+  /**
+   * A literal body, for the shapes `JSON.stringify` cannot produce — an HTML error page or a
+   * marketing SPA, which is what a wrong path usually returns at status 200. Takes precedence
+   * over `body`.
+   */
+  raw?: string;
   lines?: string[]; // raw SSE lines for stream
   headers?: Record<string, string>;
 }
@@ -29,7 +35,7 @@ export class FakeHttp implements HttpPort {
     }
     const res = this.responder(req.url, { method: req.method, body: req.body, secretRef: req.secretRef }) ?? { status: 404 };
     const status = res.status ?? 200;
-    const bodyText = res.lines ? "" : JSON.stringify(res.body ?? {});
+    const bodyText = res.lines ? "" : (res.raw ?? JSON.stringify(res.body ?? {}));
     return {
       status,
       headers: res.headers ?? {},

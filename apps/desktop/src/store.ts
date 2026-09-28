@@ -5,6 +5,7 @@
  * calls one fixed host command (the invariant-12-safe replacement for a raw StorePort).
  */
 import { invoke } from "@tauri-apps/api/core";
+import type { Modality } from "@aiprovider/adapter-spec";
 import { fetchAdmin, fetchAdminAs } from "./lib/gateway-client";
 import {
   arrayOf,
@@ -80,6 +81,12 @@ export interface HostKeyRow {
 export interface HostModelRow {
   providerId: string; nativeId: string; modality: string; contextWindow: number | null; fetchedAt: number;
   pricingJson: string | null; capabilitiesJson: string | null;
+  /**
+   * `discovered` or `manual`. Optional because it arrives from the host, and a stale host that
+   * predates the column must not empty the whole catalog — a row with no origin is a discovered
+   * row, which is what every row was before manual entries existed.
+   */
+  origin?: string;
 }
 
 /**
@@ -486,6 +493,9 @@ async function runBootstrap(): Promise<void> {
       contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
       pricing: parsePricingJson(m.pricingJson),
       supportsReasoning: parseCapabilitiesJson(m.capabilitiesJson)?.reasoning,
+      // Carried through, not defaulted: a manual row that hydrated as `discovered` would be
+      // deleted by the next refresh, which is the exact loss this column exists to prevent.
+      origin: m.origin === "manual" ? ("manual" as const) : ("discovered" as const),
     })),
     fetchedByProvider,
   );
@@ -774,11 +784,18 @@ export async function modelContextCount(): Promise<number> {
   return invoke<number>("router_model_context_count");
 }
 
-export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
-  const n = await catalog.refreshProvider(providerId, signal);
-  await fetchAdmin("POST", "/admin/models-cache", {
-    providerId,
-    rows: catalog.all().filter((m) => m.providerId === providerId).map((m) => ({
+/**
+ * The rows the host should hold for one provider — **both** origins.
+ *
+ * Manual rows ride along in the same payload as discovered ones. That is what keeps them alive:
+ * the host's replace deletes a provider's discovered rows and then inserts this payload, so the
+ * only way a manual model survives a refresh is by being re-sent with it.
+ */
+function catalogRowsFor(providerId: string) {
+  return catalog
+    .all()
+    .filter((m) => m.providerId === providerId)
+    .map((m) => ({
       providerId: m.providerId, nativeId: m.nativeId, modality: m.modality,
       contextWindow: m.contextWindow ?? null, fetchedAt: m.fetchedAt,
       // Persisted alongside the row: the catalog is fetched once per 24h, so a launch that
@@ -787,14 +804,179 @@ export async function refreshCatalog(providerId: string, signal?: AbortSignal): 
       pricingJson: m.pricing ? JSON.stringify(m.pricing) : null,
       capabilitiesJson:
         m.supportsReasoning === undefined ? null : JSON.stringify({ reasoning: m.supportsReasoning }),
-    })),
+      origin: m.origin === "manual" ? "manual" : "discovered",
+    }));
+}
+
+/**
+ * Write the provider's model set to the host without re-listing it.
+ *
+ * Split out of `refreshCatalog` so a manual add or remove can persist too. Without this a manual
+ * model existed only in memory, and a provider with no working `/models` endpoint — the exact case
+ * that makes manual entry necessary — had no path to the database at all, because `refreshCatalog`
+ * throws before it writes when the listing fails.
+ */
+export async function persistCatalog(providerId: string): Promise<void> {
+  await fetchAdmin("POST", "/admin/models-cache", {
+    providerId,
+    rows: catalogRowsFor(providerId),
   });
   catalog.deriveAutoAliases();
   await persistAliases();
   // After the catalog changes, not before: the host's window cache is derived from it, and
   // publishing stale windows would be worse than publishing none.
   void publishModelContext();
+}
+
+export async function refreshCatalog(providerId: string, signal?: AbortSignal): Promise<number> {
+  const n = await catalog.refreshProvider(providerId, signal);
+  await persistCatalog(providerId);
   return n;
+}
+
+/**
+ * Add or update a model the operator typed in by hand.
+ *
+ * Persists through `persistCatalog` rather than `refreshCatalog` on purpose: a refresh re-lists the
+ * provider, and a provider being set up manually often has no usable `/models` endpoint yet —
+ * which is the reason the operator is typing the model in.
+ */
+export async function addManualModel(input: {
+  providerId: string;
+  nativeId: string;
+  modality: Modality;
+  contextWindow?: number;
+}): Promise<void> {
+  catalog.upsertManual(input);
+  await persistCatalog(input.providerId);
+}
+
+/** Remove a hand-added model. Never touches a discovered row. */
+export async function removeManualModel(providerId: string, nativeId: string): Promise<boolean> {
+  const removed = catalog.removeManual(providerId, nativeId);
+  if (removed) await persistCatalog(providerId);
+  return removed;
+}
+
+/** What one model test concluded. */
+export interface ModelTestResult {
+  ok: boolean;
+  ms: number;
+  message: string;
+  /** The first characters of the reply, so "it answered" is distinguishable from "it answered this". */
+  preview?: string;
+}
+
+const MODEL_TEST_PROMPT = "Reply with the single word: ok";
+const MODEL_TEST_MAX_TOKENS = 16;
+
+/**
+ * Send one real request to one model and report whether it answered.
+ *
+ * **This goes through the provider's adapter, not through `router.generateText`.** The router's
+ * planner only builds candidates from providers whose status is `enabled` (route-planner.ts), and a
+ * provider being set up is `draft` until its first key lands and `pending` after — so a test routed
+ * through the router would answer "no route for model" on every provider this feature exists to
+ * help, which is a claim about our own allowlist and not about the model at all.
+ *
+ * An empty reply is reported as a failure rather than a success. A model that streams back nothing
+ * is not working, and an empty transcript is exactly what a dropped response looks like — so
+ * treating it as a pass would make this test agree with the bug it should be catching.
+ */
+export async function testModel(
+  providerId: string,
+  nativeId: string,
+  signal?: AbortSignal,
+): Promise<ModelTestResult> {
+  const keys = registry.keysOf(providerId).filter((k) => k.status === "active");
+  if (keys.length === 0) {
+    throw new Error("this provider has no active key — add and enable one first");
+  }
+  const { adapter } = await adapters.forProvider(providerId);
+  const t0 = Date.now();
+  let lastErr: unknown;
+  for (const k of keys) {
+    try {
+      let out = "";
+      // Consumed to the end rather than abandoned after the first chunk: the generator owns an
+      // in-flight HTTP stream, and breaking out of a `for await` leaves it to be collected
+      // whenever the socket next decides to close.
+      for await (const chunk of adapter.generateText(
+        k.secretRef,
+        {
+          model: nativeId,
+          messages: [{ role: "user", content: MODEL_TEST_PROMPT }],
+          stream: true,
+          maxTokens: MODEL_TEST_MAX_TOKENS,
+        },
+        signal,
+      )) {
+        out += chunk;
+      }
+      const text = out.trim();
+      const ms = Date.now() - t0;
+      if (!text) {
+        return {
+          ok: false,
+          ms,
+          message: `${nativeId} answered with an empty response — the request succeeded but no content came back`,
+        };
+      }
+      return { ok: true, ms, message: `${nativeId} replied in ${ms} ms`, preview: text.slice(0, 120) };
+    } catch (e) {
+      lastErr = e;
+      // Try the provider's next active key before concluding: a single cooled or revoked key is
+      // not a verdict on the model.
+    }
+  }
+  const ms = Date.now() - t0;
+  const err = lastErr as { status?: number; message?: string } | undefined;
+  const detail = err?.message ?? String(lastErr);
+  return {
+    ok: false,
+    ms,
+    message: `${nativeId} did not answer${typeof err?.status === "number" ? ` (HTTP ${err.status})` : ""} — ${detail}`,
+  };
+}
+
+/**
+ * Edit an existing provider: its name, its base URL, and the connection shape (auth + dialect).
+ *
+ * A changed connection shape is written as a **new manifest version**, not an update in place. The
+ * manifest table is the audit trail drift repair and rollback read, so overwriting v1 would destroy
+ * the only record of how this provider was originally wired. `origin: "user-edited"` is the row's
+ * own provenance — see the note in `addProvider` about why it must not be a constant.
+ */
+export async function updateProvider(input: {
+  id: string;
+  name?: string;
+  baseUrl?: string;
+  manifest?: AdapterManifest;
+}): Promise<ProviderRecord> {
+  const p = registry.getProvider(input.id);
+  if (!p) throw new Error(`unknown provider ${input.id}`);
+
+  const name = input.name?.trim();
+  const baseUrl = input.baseUrl?.trim();
+  registry.renameProvider(input.id, {
+    ...(name ? { name } : {}),
+    ...(baseUrl ? { baseUrl } : {}),
+  });
+  const fresh = registry.getProvider(input.id)!;
+  await fetchAdmin("POST", "/admin/providers", providerToHost(fresh));
+
+  if (input.manifest) {
+    adapters.register(input.id, input.manifest);
+    const history = await listManifestHistory(input.id).catch(() => [] as HostManifestRow[]);
+    const nextVersion = history.reduce((max, h) => Math.max(max, h.version), 0) + 1;
+    await fetchAdmin("POST", "/admin/manifests", {
+      id: crypto.randomUUID(), providerId: input.id, version: nextVersion,
+      origin: input.manifest.provenance.origin,
+      bodyJson: JSON.stringify(input.manifest), contractResultJson: null,
+      createdAt: Date.now(), isActive: true,
+    });
+  }
+  return fresh;
 }
 
 /** The third-party client we keep in sync (WorkBuddy), as the host sees it. */
@@ -855,7 +1037,24 @@ export async function createPendingProvider(name: string, baseUrl: string): Prom
     id: crypto.randomUUID(), slug, name, type: "manifest",
     baseUrl, status: "pending", rotationStrategy: "round_robin",
   });
-  await fetchAdmin("POST", "/admin/providers", providerToHost(p));
+  try {
+    await fetchAdmin("POST", "/admin/providers", providerToHost(p));
+  } catch (e) {
+    // **The same rollback `addProvider` has, and it was missing here.** The host write is what makes
+    // a provider real, so a refused one (the gateway down, a 401, a duplicate slug) left a provider
+    // in the registry that the host had never heard of. Onboarding then reported the ghost's
+    // *consequences* rather than the cause: `addKey` is called with this id immediately afterwards,
+    // and the orchestrator's probes are refused for a host the allowlist never received. `pending`
+    // is precisely what makes those probes reachable, so a ghost is a provider that can never be
+    // probed — and the operator is shown "could not identify this API", which is a claim about the
+    // API.
+    //
+    // `deleteProvider`, not `refreshFromHost` as `addProvider` uses: when the host is *unreachable*
+    // the resync fails too, so a resync-based rollback would leave the ghost in exactly the case
+    // that created it. Removing the record we just added cannot fail that way.
+    await registry.deleteProvider(p.id).catch(() => undefined);
+    throw e;
+  }
   return p.id;
 }
 

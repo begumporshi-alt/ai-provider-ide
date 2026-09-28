@@ -105,12 +105,20 @@ export function Button({
   );
 }
 
-export function Modal({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+/**
+ * `width` exists because a modal that lists models is not the same shape as one that asks for a
+ * single field, and the previous fixed 440px made every wide one scroll internally. `max-h` and
+ * `overflow` are on the panel rather than the caller so a long body scrolls inside the dialog
+ * instead of pushing its footer off screen.
+ */
+export function Modal({
+  title, onClose, children, width = 440,
+}: { title: string; onClose: () => void; children: ReactNode; width?: number }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60" onMouseDown={onClose}>
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onMouseDown={onClose}>
       <div
-        className="w-[440px] rounded-lg border p-4 shadow-2xl"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        className="max-h-[85vh] overflow-y-auto rounded-lg border p-4 shadow-2xl"
+        style={{ width, background: "var(--surface)", borderColor: "var(--border)" }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">

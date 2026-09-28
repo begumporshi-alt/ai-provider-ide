@@ -4579,11 +4579,22 @@ when a provider is added; measured, `manifests.contract_result_json` is `NULL`. 
 was an unexported closure with no test at all.
 
 **The fix.** The manifest is now *derived*: `lib/providers/manual-manifest.ts::buildManualManifest()`
-takes `BUILTIN_TEMPLATES[dialect]` and overrides only dialect, auth and provenance. One authority
+takes `BUILTIN_TEMPLATES[dialect]` and overrides dialect, auth and provenance. One authority
 instead of two, so the manual path cannot drift from the template again — which is the property whose
 absence caused all four omissions. `store.ts::addProvider` also takes `origin` from the manifest's own
 provenance rather than the hardcoded `"builtin-template"`: measured, a hand-added provider's row
 claimed `builtin-template` while its body said `user-edited`, both spellings on one row.
+
+> **Corrected 2026-09-29 — "only" is no longer accurate, and the exception is deliberate.** The
+> sentence above read "overrides **only** dialect, auth and provenance" when it was written. A manual
+> provider may now also carry the operator's **custom request headers**, applied to every endpoint via
+> `withRequestHeaders` — the capability that makes a client-gate gateway reachable (see `DECISIONS.md`
+> 2026-09-29). The exception does not weaken the parity property this section is about, and the
+> distinction is worth stating: the other three overrides *replace* a template decision, while this one
+> is **additive and conditional** — `withRequestHeaders` returns the manifest untouched when there is
+> nothing to add, so an endpoint with no custom headers stays byte-identical to the template. That
+> byte-parity is asserted, not assumed: `leaves the manifest identical to the template when nothing is
+> entered` exists because the first implementation materialised an empty `headers: {}` and broke it.
 
 **The test is a parity test, not a string test.** Six tests in `manual-manifest.test.ts`. The
 load-bearing assertion compares the manual manifest's `path`, `requestTemplate`, `responseMap`,

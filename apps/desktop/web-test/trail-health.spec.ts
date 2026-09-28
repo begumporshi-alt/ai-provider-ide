@@ -114,10 +114,9 @@ test("a repair that was recorded leaves both cards quiet", async ({ page }) => {
   await expect(page.getByText(WARNING)).toHaveCount(0);
 });
 
-/** Providers → Add Provider → guided setup. Copied from `ui.spec.ts`, which keeps its own local copy. */
+/** Providers → Set up automatically. Copied from `ui.spec.ts`, which keeps its own local copy. */
 async function startWizard(page: Page, name: string, baseUrl: string, key: string): Promise<void> {
-  await page.getByRole("button", { name: /Add Provider/ }).click();
-  await page.getByText("Any other provider — guided setup").click();
+  await page.getByRole("button", { name: "Set up automatically" }).click();
   await page.getByPlaceholder("My provider").fill(name);
   await page.getByPlaceholder("https://api.example.com/v1").fill(baseUrl);
   await page.getByPlaceholder("sk-…").fill(key);

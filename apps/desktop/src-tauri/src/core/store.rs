@@ -337,6 +337,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0015_ledger_cached_tokens", backfill_ledger_cached_tokens),
     ("0016_ledger_app_key", backfill_ledger_app_key),
     ("0017_gateway_key_cap", backfill_gateway_key_cap),
+    ("0018_manual_models", add_manual_models_origin),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -951,6 +952,29 @@ fn backfill_gateway_key_cap(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<
     Ok(())
 }
 
+/// Where a `models_cache` row came from: the provider's own `/models` listing (`discovered`) or
+/// the operator's keyboard (`manual`).
+///
+/// This is a schema change carried by the *data* migration list on purpose. The runner numbers
+/// the two lists as one sequence and skips by version, not by name, so appending a seventh entry
+/// to `MIGRATIONS` would shift every data migration up by one — an existing database sitting at
+/// version 17 would re-run 0017 and never apply this step. Appending here gives the new step
+/// version 18, which is the next one any existing database is missing.
+///
+/// Without the column a hand-typed model is indistinguishable from a discovered one, and the
+/// refresh path deletes a provider's rows wholesale (`DELETE FROM models_cache WHERE
+/// provider_id = ?`), so the first Refresh would silently erase every model the operator had
+/// typed in.
+fn add_manual_models_origin(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "models_cache", "origin")? {
+        tx.execute_batch(
+            "ALTER TABLE models_cache ADD COLUMN origin TEXT NOT NULL DEFAULT 'discovered'
+               CHECK (origin IN ('discovered','manual'));",
+        )?;
+    }
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -1058,11 +1082,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0017 data migrations.
-        assert_eq!(info.schema_version, 17);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0018 data migrations.
+        assert_eq!(info.schema_version, 18);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(17, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(18, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

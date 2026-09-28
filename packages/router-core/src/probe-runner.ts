@@ -7,6 +7,7 @@
  */
 
 import type { HttpPortLike } from "./manifest-interpreter.js";
+import { detectClientGate } from "./client-gate.js";
 import { shapeOf, sizeCap } from "./redaction.js";
 
 export interface ProbeAttempt {
@@ -18,6 +19,17 @@ export interface ProbeAttempt {
   bodyShape?: unknown; // redacted {key: type} shape of a JSON body, if parseable
   ms: number;
   error?: string;
+  /**
+   * The marker that identified this response as a **client gate** — the provider refused the caller
+   * without reading a credential. See `client-gate.ts` for the measurement.
+   *
+   * A derived boolean-or-marker, never the body: the marker is a fixed string this repo names, and
+   * the surrounding response text is discarded exactly as it is for every other attempt. This is
+   * the one fact about an error body the probe needs, and `shapeOf` cannot carry it — values are
+   * stripped to types, so `"unauthorized client detected"` would arrive as `"string"` and the
+   * signal would be gone by the time anything could act on it.
+   */
+  clientGate?: string;
 }
 
 export interface ProbeReport {
@@ -50,6 +62,15 @@ export async function runProbes(
   baseUrl: string,
   onAttempt?: (a: ProbeAttempt) => void,
   signal?: AbortSignal,
+  /**
+   * Extra request headers for every probe.
+   *
+   * **The probe has no manifest, so this is the only way a client-identity header can reach it.**
+   * A gateway that gates on the caller refuses the probe for exactly the reason it would refuse a
+   * real request, and without this the operator has no way to get past it during setup: the remedy
+   * would have to be applied by hand to a provider that setup has not finished creating.
+   */
+  extraHeaders?: Record<string, string>,
 ): Promise<ProbeReport> {
   const attempts: ProbeAttempt[] = [];
   let openapiShape: unknown;
@@ -61,7 +82,7 @@ export async function runProbes(
       const res = await http.request({
         url: baseUrl.replace(/\/+$/, "") + path,
         method,
-        headers: { accept: "application/json, text/plain, */*" },
+        headers: { accept: "application/json, text/plain, */*", ...extraHeaders },
         body,
         signal,
       });
@@ -85,6 +106,19 @@ export async function runProbes(
         } catch {
           // non-JSON body: nothing recorded (values never persist)
         }
+      } else if (res.status && res.status >= 400) {
+        // **The refusal body is read, and only to ask one question of it.**
+        //
+        // Until this existed, error bodies were discarded unread, so a gateway that refused the
+        // *client* was indistinguishable from one that refused the *key* — both were a `401` with no
+        // shape. That is why auto setup could not diagnose `agentrouter.org`: it reported a bad key
+        // for a request whose key was never examined.
+        //
+        // The body does not survive this: only the marker `detectClientGate` matched is kept, and
+        // it is a fixed string from a list this repo names. Nothing else from the text is recorded,
+        // which keeps §2.3's "no bodies persisted" intact.
+        const raw = (await res.text()).slice(0, BODY_CAP);
+        attempt.clientGate = detectClientGate(res.status, raw);
       }
     } catch (e) {
       attempt.error = String((e as Error)?.message ?? e).slice(0, 200);

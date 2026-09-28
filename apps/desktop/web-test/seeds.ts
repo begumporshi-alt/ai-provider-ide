@@ -27,7 +27,22 @@ export const OR_ROUTER_KEY = "sk-or-router-works";
 export interface SeedInput {
   providers?: { id: string; slug: string; name: string; type: string; baseUrl: string; status: string; rotationStrategy: string; createdAt: number; updatedAt: number }[];
   keys?: { id: string; providerId: string; label: string; secretRef: string; secret?: string; secretHint: string | null; status: string; priority: number; cooldownUntil: number | null; addedAt: number; lastUsedAt: number | null; lastTestedAt: number | null }[];
-  models?: { providerId: string; nativeId: string; modality: string; contextWindow: number | null; fetchedAt: number }[];
+  /**
+   * Deliberately host-shaped, and the two JSON columns are **required**.
+   *
+   * `HostModelRow` declares `pricingJson` and `capabilitiesJson` as non-optional, and
+   * `isHostModelRow` guards them with `nullable`, not `maybe` — so a row that omits either fails
+   * the guard, `arrayOf` fails with it, and the boot dies on "App data could not be opened /
+   * HostShapeError: GET /admin/models-cache". These fixtures omitted both, and every
+   * `?seed=systemai` spec failed at boot because of it. Requiring them here makes the next
+   * omission a compile error rather than a boot failure in another spec.
+   */
+  models?: {
+    providerId: string; nativeId: string; modality: string;
+    contextWindow: number | null; fetchedAt: number;
+    pricingJson: string | null; capabilitiesJson: string | null;
+    origin?: string;
+  }[];
   aliases?: { alias: string; providerId: string; nativeModelId: string; priority: number }[];
   manifests?: { id: string; providerId: string; version: number; origin: string; bodyJson: string; contractResultJson: string | null; createdAt: number; isActive: boolean }[];
   settings?: Record<string, string>;
@@ -86,11 +101,20 @@ function systemAi(): SeedInput {
       },
     ],
     models: [
-      { providerId, nativeId: "oracle-mini", modality: "text", contextWindow: 8192, fetchedAt: now },
-      { providerId, nativeId: "oracle-flash", modality: "text", contextWindow: 8192, fetchedAt: now },
+      {
+        providerId, nativeId: "oracle-mini", modality: "text", contextWindow: 8192, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
+      {
+        providerId, nativeId: "oracle-flash", modality: "text", contextWindow: 8192, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
       // Image model: "sd-" matches the openai-compat modality rule, so the Assistant's
       // Image tab lists it and the interpreter routes /images/generations.
-      { providerId, nativeId: "sd-oracle-1", modality: "image", contextWindow: null, fetchedAt: now },
+      {
+        providerId, nativeId: "sd-oracle-1", modality: "image", contextWindow: null, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
     ],
     aliases: [
       { alias: "sysai/oracle-mini", providerId, nativeModelId: "oracle-mini", priority: 1 },
@@ -147,10 +171,22 @@ function orRouter(): SeedInput {
     ],
     // The pre-fix cache: every namespaced id tagged text, so the Image tab has nothing.
     models: [
-      { providerId, nativeId: "openai/gpt-5-image", modality: "text", contextWindow: null, fetchedAt: now },
-      { providerId, nativeId: "google/gemini-2.5-flash-image", modality: "text", contextWindow: null, fetchedAt: now },
-      { providerId, nativeId: "openrouter/auto", modality: "text", contextWindow: null, fetchedAt: now },
-      { providerId, nativeId: "openai/gpt-4o", modality: "text", contextWindow: null, fetchedAt: now },
+      {
+        providerId, nativeId: "openai/gpt-5-image", modality: "text", contextWindow: null, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
+      {
+        providerId, nativeId: "google/gemini-2.5-flash-image", modality: "text", contextWindow: null, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
+      {
+        providerId, nativeId: "openrouter/auto", modality: "text", contextWindow: null, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
+      {
+        providerId, nativeId: "openai/gpt-4o", modality: "text", contextWindow: null, fetchedAt: now,
+        pricingJson: null, capabilitiesJson: null,
+      },
     ],
     settings: {
       router: JSON.stringify({ failoverEnabled: true, systemAi: null }),
