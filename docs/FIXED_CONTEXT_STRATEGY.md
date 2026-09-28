@@ -1,7 +1,10 @@
 # Fixed context overhead — diagnosis and strategy
 
-**Status:** diagnosis complete and evidence-backed; implementation not started.
-**Date:** 2026-09-27. **Gateway probed:** live on `127.0.0.1:8800`, one provider (`agnes`).
+**Status:** Options 1 and 3 shipped and committed. **Re-measured live after the change: 1,721 → 1,042
+prompt tokens (−679, −39.5%).** Option 2's egress `cache_control` marker is implemented but opt-in,
+has no webview writer, and is inert on `agnes` (probed — it reports no cache fields at all).
+**Date:** 2026-09-27; updated and re-measured 2026-09-28. **Gateway probed:** live on
+`127.0.0.1:8800`, one provider (`agnes`).
 
 ## 1. The problem, measured
 
@@ -12,6 +15,12 @@ Every gateway request carries a large, constant prompt payload that is billed on
 | Client declares **no** tools → gateway supplies its registry | **1,721** |
 | Client declares **one** tool → gateway registry suppressed | **534** |
 | **Cost of the gateway tool set** | **≈1,187 tokens — 69% of the prompt** |
+| After Options 1+3 (2026-09-28, service rebuilt and restarted) | **1,042** |
+| **Cost of the gateway tool set, after** | **508 tokens — 49% of the prompt** |
+
+The 1,042 figure replicated five times with byte-identical usage; the 534 control reproduced twice.
+Half the attempts in both arms failed with upstream `NETWORK` errors — the provider was flaky
+throughout, which is a property of the run, not of the change.
 
 The 1,721 figure reproduces the September 22 finding (~1,700–1,900) and today's independent
 measurement (1,719 / 1,721), so it is stable, not a sampling artefact.
@@ -23,10 +32,12 @@ keywords my estimate omitted — the two methods agree.
 ## 2. Root cause, in code
 
 ```
-router_bridge.rs:289   ToolOwnership::Gateway => registry_to_openai(agent_tools())
+router_bridge.rs:289   ToolOwnership::Gateway => registry_to_openai(&gateway_tool_set(mutation))
 ```
 
-- `agent_tools()` (`tool_registry.rs:49`) returns **all eight** tools, unfiltered.
+- `agent_tools()` (`tool_registry.rs:49`) returns **all eight** tools, unfiltered — that was the
+  defect. `gateway_tool_set` (`tool_registry.rs:70`) now filters out `MUTATING_TOOLS` when mutation
+  is off, and `router_bridge.rs:289` calls it.
 - `registry_to_openai` (`tool_registry.rs:58`) renders every one of them.
 - Ownership is decided in `bridge_policy.rs:191` (`decide_tool_ownership`): the gateway registry is
   attached whenever the client declared none and `gateway_tools_enabled` is on — **which defaults
@@ -54,7 +65,7 @@ measurement pass before optimising** — see §6.
 Estimates below are computed from the schema character counts, scaled by 1.142 to match the
 measured 1,187. Measured figures are labelled as such.
 
-### Option 1 — Stop advertising tools that will be refused ★ recommended first
+### Option 1 — Stop advertising tools that will be refused ★ implemented
 
 Filter `agent_tools()` by `MUTATING_TOOLS` at `router_bridge.rs:289` when
 `tools_mutation_enabled` is off.
@@ -64,6 +75,10 @@ Filter `agent_tools()` by `MUTATING_TOOLS` at `router_bridge.rs:289` when
 - **Risk: low.** Behaviour changes only while mutation is off, which is the default. Operators who
   enable mutation see no change at all.
 - Keep `gateway_tool_refusal` as defence in depth — a model can still hallucinate a tool name.
+- **Falsified before trusting:** reverting the filter in `gateway_tool_set` to `.filter(|t| true)`
+  makes `the_gateway_supplies_its_registry_only_when_the_client_brought_none` fail with
+  `a refused tool reached the wire with mutation off: ["read_file", "write_file", …]`.
+  Restoring the filter makes it pass. See `router_bridge.rs` tests.
 
 ### Option 2 — Provider prompt caching on the stable prefix ★ highest ceiling
 
@@ -81,15 +96,16 @@ can hit. The intent is in the code; the marker is not.
 
 ### Option 3 — Trim the tool descriptions
 
-The eight descriptions total ~1,203 characters (~352 tokens scaled). Several are 170–200 characters
-of prose explaining usage conventions the model does not need (`search_files`, `read_file`,
-`run_command`, `edit_file`).
+The eight descriptions total 3,272 characters. Several are 170–200 characters of prose explaining
+usage conventions the model does not need (`search_files`, `read_file`, `run_command`, `edit_file`).
+Measured after the trim: descriptions are now 2,954 characters, a **318-character (~26%) reduction**.
+The `no_description_exceeds_the_trim_budget` test caps each at 160 chars.
 
-- **Saves ≈176 tokens** at a 50% trim.
-- **Risk: very low.** The `every_tool_is_described` test (`tool_registry.rs:218`) requires >20
-  characters, which any real description clears.
-- Small, but nearly free — and it compounds with Option 2, since a shorter cached block is cheaper
-  to write once and cheaper to read.
+- **Saves ≈82 tokens** at the measured 26% trim (318 chars ÷ 3.9 × 1.142 scale factor).
+- **Risk: very low.** The `every_tool_is_described` test requires >20 characters per description.
+- The 26% saving compounds with Option 1 — the 4 mutating tools that are dropped when mutation is
+  off also carry 1,036 characters of description, so the combined filter+trim effect on the full
+  registry is larger than either alone.
 
 ### Option 4 — Let the client opt out
 
@@ -110,8 +126,17 @@ insufficient.
 
 ## 5. Recommendation
 
-Do **1 and 3 together** — both are small, both are safe, and together they take 1,721 → **~940
-tokens, a ~45% cut** with no architectural change.
+Do **1 and 3 together** — done, and **measured rather than estimated**: the predicted post-change
+figure was ~1,033 tokens; the live gateway reports **1,042**, five replicates, no variance. That is
+**−679 tokens, a 39.5% cut**, with no architectural change. The 534-token control is unchanged, so
+the whole delta is the registry.
+
+> **The saving is conditional on mutation being off, and the two hosts disagree about what "off"
+> means.** `bin/aiproviderd.rs:91` hardcodes `tools_mutation_enabled() -> false`, so the headless
+> service always narrows. The desktop host (`tauri/gateway_cmds.rs:66`) reads the persisted setting
+> instead — and on this machine the `gateway` row says `"mutationEnabled": true`. Run the app with
+> that row and the gateway advertises all eight again, and the 39.5% cut becomes 0%. One switch,
+> two readers, one of them a constant. See §6.4.
 
 Then do **2**: it is the only option that changes the *billing model* rather than the token count,
 and it is the durable answer to OmniRoute's compression claim — a cached prefix is not re-billed at
@@ -131,18 +156,44 @@ Defer **5**.
    creating the reference cycle that `gateway.rs:816-821` exists to avoid.
 3. **Does `agnes` even honour `cache_control`?** Option 2's payoff depends on upstream support;
    verify against the actual configured provider before building per-dialect markers.
+   **Probed 2026-09-28: agnes does not report any cache fields.** Three requests were made
+   through the live gateway — a short prompt with `cache_control` on the system block, and two
+   consecutive 5,215-token prompts without it. All three returned `usage` with only
+   `prompt_tokens` and `completion_tokens`; `cached_tokens`, `cache_read_input_tokens` and
+   `cache_creation_input_tokens` are all absent. `raw_keys: ["completion_tokens",
+   "prompt_tokens"]` confirms the upstream's usage object carries no cache sub-object. **Option 2
+   has zero effect on the `agnes` provider as configured.** Revisit when a provider with prefix
+   caching (Anthropic, OpenAI with ≥1024-token prefixes) is added.
+
+4. **The mutation toggle has two readers and one of them is a constant.** `aiproviderd` hardcodes
+   `tools_mutation_enabled() -> false` (`bin/aiproviderd.rs:91`), while the desktop host reads the
+   persisted `gateway.mutationEnabled` (`tauri/gateway_cmds.rs:66`). The row on this machine is
+   `true`. So Option 1's measured 39.5% holds on the headless service unconditionally and on the app
+   **only while the operator leaves mutation off**. Either make the service read the row or make the
+   row follow the service — today they disagree, and the saving depends on which one you ask.
+5. **`promptCacheEnabled` has no writer.** `RouterSettings::from_value` reads it
+   (`router.rs:335`) and the bridge passes it (`router_bridge.rs:368`), but a repo-wide search finds
+   **zero** occurrences outside Rust — no webview toggle, no command. It is reachable only by
+   editing the `router` settings row by hand. Combined with §6.3 (agnes reports no cache fields),
+   Option 2 is currently inert end-to-end: the flag exists, nothing sets it, and nothing upstream
+   would honour it.
 
 ## 7. Evidence
 
 | Claim | Provenance |
 |---|---|
 | 1,721 vs 534 prompt tokens | Measured, live gateway, identical message |
+| 1,042 after Options 1+3 | Measured 2026-09-28, rebuilt `aiproviderd` restarted, 5 replicates, no variance |
+| 534 control unchanged after the change | Measured 2026-09-28, 2 replicates — the delta is the registry, not drift |
+| `gateway.mutationEnabled` is `true` on this machine | `settings` row read from the live DB; `aiproviderd` ignores it (`bin/aiproviderd.rs:91`) |
 | ~1,039-token schema estimate | Computed from `tool_registry.rs:84-198` |
+| Option 3 saves 318 chars (26%) | Measured post-trim; `the_narrowed_set_stays_under_55pct_of_full` pins it |
 | All 8 tools attached unconditionally | `router_bridge.rs:289`, `tool_registry.rs:49,58` |
 | Mutation off by default; 4 tools refused | `gateway.rs:812,825`; `router.rs:266` |
 | `tool_choice:"none"` overridden to `"auto"` | `bridge_policy.rs:213` |
 | No `cache_control` emitted on egress | Searched `src/` — only test fixtures in `gateway_anthropic.rs` |
 
-The 534-token baseline has one confirming sample; the provider returned intermittent
-`NETWORK`/`SERVER_ERROR` during repeat attempts, so it is not yet replicated. Treat it as
-indicative until §6.1 is done.
+The 534-token baseline has three confirming samples now (one on 09-27, two on 09-28), all identical.
+The provider returned intermittent `NETWORK`/`SERVER_ERROR` throughout both runs — roughly half of
+all attempts failed — so replication is thin, but the failures are upstream and uncorrelated with
+the variable under test. Treat 534 as stable-but-thin until §6.1 is done.

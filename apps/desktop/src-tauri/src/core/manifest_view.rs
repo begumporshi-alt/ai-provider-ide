@@ -59,6 +59,14 @@ pub struct ManifestView {
     pub limits: Option<Limits>,
 }
 
+/// The dialect whose request bodies use the OpenAI `tools`/`messages` shape.
+///
+/// Used by `interpreter.rs` to decide whether a `cache_control` marker is meaningful. An
+/// `openai-chat-v1` manifest speaks to an OpenAI-compatible endpoint; the `cache_control` field
+/// there is non-standard and must be gated by the operator. An `anthropic-chat` manifest already
+/// uses the content-block shape where `cache_control` is a first-class field.
+pub const OPENAI_CHAT_V1: &str = "openai-chat-v1";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Provider {

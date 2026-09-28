@@ -410,6 +410,7 @@ impl ManifestInterpreter {
                 response_format,
                 on_tool_call,
                 on_usage,
+                prompt_cache_enabled,
             } = args;
 
             let Some(ep) = self.view.endpoints.generate_text.as_ref() else {
@@ -468,6 +469,62 @@ impl ManifestInterpreter {
                     "stream_options".to_string(),
                     serde_json::json!({ "include_usage": true }),
                 );
+            }
+
+            // **Egress cache-control marker (Option 2).**
+            //
+            // When `prompt_cache_enabled` is set, mark the *last* system message block with
+            // `cache_control: {"type":"ephemeral"}` so a provider with prefix caching (OpenAI,
+            // Anthropic) will bill the repeated block at reduced price.
+            //
+            // **Why this is opt-in and off by default.** The marker is meaningless to a provider
+            // that does not implement prefix caching and may be rejected by a strict gateway.
+            // The read side (`ledger.cached_tokens`, `usage.cached_tokens`) is already in place
+            // (`manifest.rs::read_cached_tokens`); this controls only the *write* side.
+            //
+            // **Two shapes, keyed on the system message's current form.**
+            // - If the system message's `content` is a JSON *string*, it is converted to an
+            //   Anthropic-style content-block array with the marker attached. This is the
+            //   transformation `gateway_anthropic.rs` already performs on *ingress*; here we
+            //   do it on *egress* so the marker survives to the upstream.
+            // - If the content is already a block array (the shape `Claude Code` sends on
+            //   ingress), the marker is appended to the last block in-place.
+            //
+            // The marker is **not** applied when `messages` is empty or carries no system
+            // message — there is nothing to cache. A non-system message is never marked;
+            // prefix caching is on the stable prefix, which is the system block.
+            if prompt_cache_enabled {
+                // `get_mut` yields `Option<&mut Value>`; the `Some` is what skips a body that
+                // carries no `messages` key at all rather than panicking on it.
+                if let Some(Value::Array(msgs)) = body.get_mut("messages") {
+                    // Find the last message with `role == "system"`.
+                    let sys_idx = msgs
+                        .iter()
+                        .enumerate()
+                        .rev()
+                        .find(|(_, m)| m.get("role").and_then(Value::as_str) == Some("system"))
+                        .map(|(i, _)| i);
+                    if let Some(idx) = sys_idx {
+                        let marker = serde_json::json!({ "type": "ephemeral" });
+                        match &mut msgs[idx]["content"] {
+                            // String form: wrap into a block array and attach the marker.
+                            Value::String(text) => {
+                                msgs[idx]["content"] = serde_json::json!([{
+                                    "type": "text",
+                                    "text": text,
+                                    "cache_control": marker,
+                                }]);
+                            }
+                            // Array form: append the marker to the last block.
+                            Value::Array(blocks) => {
+                                if let Some(last) = blocks.last_mut() {
+                                    last["cache_control"] = marker.clone();
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
             }
 
             let res = self
@@ -1387,6 +1444,9 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
+            // provider — reports no cache fields either way (measured 2026-09-28).
+            prompt_cache_enabled: false,
         }
     }
 

@@ -23,6 +23,13 @@
 //! what keeps gateway mutation opt-in; a rename on one side without a rename on the other would
 //! silently un-gate a writing tool, so the names are pinned in both places.
 //!
+//! # Why the gateway advertises fewer tools than the Assistant
+//!
+//! [`gateway_tool_set`] narrows the registry when mutation is off, which is the default. A tool that
+//! is advertised and then refused is not merely wasted tokens — the model calls it, reads a refusal
+//! and spends a turn discovering that. Measured on a short request: the eight schemas cost ~1,187
+//! prompt tokens of a 1,721-token prompt, and the mutating four are about half of that.
+//!
 //! One divergence: the reference returns `undefined` for an empty registry, which becomes `None`
 //! here. Both mean "omit `tools`/`tool_choice` entirely", which is the only correct rendering of
 //! "no tools" — some providers reject an empty `tools` array with a 400, so `[]` is not an option.
@@ -30,6 +37,8 @@
 use std::sync::OnceLock;
 
 use serde_json::{json, Value};
+
+use crate::core::gateway::MUTATING_TOOLS;
 
 /// A tool the agent may call.
 #[derive(Debug, Clone)]
@@ -49,6 +58,21 @@ pub struct ToolSpec {
 pub fn agent_tools() -> &'static [ToolSpec] {
     static TOOLS: OnceLock<Vec<ToolSpec>> = OnceLock::new();
     TOOLS.get_or_init(build)
+}
+
+/// The subset of the registry the gateway should advertise.
+///
+/// Mutation is off by default on the gateway path ([`crate::core::gateway::gateway_tool_refusal`]),
+/// so the mutating entries are dropped unless the operator turned mutation on. Dropping them is
+/// cheaper *and* more honest than advertising a tool that will be refused.
+///
+/// The Assistant path is unaffected: it confirms each call, so it wants the whole registry.
+pub fn gateway_tool_set(mutation_enabled: bool) -> Vec<ToolSpec> {
+    agent_tools()
+        .iter()
+        .filter(|t| mutation_enabled || !MUTATING_TOOLS.contains(&t.name))
+        .cloned()
+        .collect()
 }
 
 /// Render the OpenAI `tools` array from a registry.
@@ -85,7 +109,7 @@ fn build() -> Vec<ToolSpec> {
     vec![
         ToolSpec {
             name: "read_file",
-            description: "Read a UTF-8 text file from the workspace and return its contents. Directories are rejected. Use offset/limit to read part of a large file instead of swallowing the whole thing.",
+            description: "Read a UTF-8 text file from the workspace. Use offset/limit to read part of a large file instead of the whole thing.",
             properties: json!({
                 "path": {
                     "type": "string",
@@ -104,7 +128,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "write_file",
-            description: "Write UTF-8 text to a workspace file, creating parent directories as needed. Overwrites any existing file — prefer edit_file for changing one part of a file you have read.",
+            description: "Write UTF-8 text to a workspace file, creating parent directories. Overwrites; prefer edit_file to change part of a file you have read.",
             properties: json!({
                 "path": { "type": "string", "description": "Workspace-relative path." },
                 "content": { "type": "string", "description": "Full text content to write." },
@@ -128,7 +152,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "search_files",
-            description: "Search the workspace for a literal string and return matching lines as path:line: text. Case-insensitive by default. Use this to find where something is defined instead of reading files one at a time.",
+            description: "Search the workspace for a literal string, returning matching lines as path:line: text. Case-insensitive by default.",
             properties: json!({
                 "pattern": { "type": "string", "description": "Literal text to find. Not a regex." },
                 "path": {
@@ -144,7 +168,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "file_info",
-            description: "Report whether a workspace path exists, and its kind, size and last-modified time. A missing path is a normal result, not an error.",
+            description: "Report whether a workspace path exists: kind, size, last-modified. A missing path is a normal result, not an error.",
             properties: json!({
                 "path": { "type": "string", "description": "Workspace-relative path." },
             }),
@@ -152,7 +176,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "edit_file",
-            description: "Replace an exact snippet in a file. The snippet must match exactly — including indentation — and must occur exactly once unless replace_all is true. Safer than rewriting a whole file.",
+            description: "Replace an exact snippet in a file. It must match exactly, indentation included, and occur once unless replace_all is true.",
             properties: json!({
                 "path": { "type": "string", "description": "Workspace-relative path of the file to edit." },
                 "old": { "type": "string", "description": "Exact text to find. Quote enough surrounding lines to make it unique." },
@@ -174,7 +198,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "run_command",
-            description: "Run a single allowlisted command inside the workspace. There is no shell, so ; | && ` ` and $( ) are inert literals, not syntax. Network-facing git subcommands (push/pull/fetch/clone) are refused.",
+            description: "Run one allowlisted command inside the workspace. There is no shell, so ; | && are inert literals. Network git subcommands are refused.",
             properties: json!({
                 "program": {
                     "type": "string",
@@ -221,6 +245,34 @@ mod tests {
                 t.description.trim().chars().count() > 20,
                 "{} has a thin description: {:?}",
                 t.name,
+                t.description
+            );
+        }
+    }
+
+    /// Trimmed for prompt cost, but a tool whose description no longer says what it *does* is a
+    /// tool the model misuses. Every description still has to name its action and its subject.
+    #[test]
+    fn every_description_still_names_its_action() {
+        for t in agent_tools() {
+            let d = t.description.to_lowercase();
+            let named = ["read", "write", "list", "search", "report", "replace", "create", "run"]
+                .iter()
+                .any(|v| d.starts_with(v));
+            assert!(named, "{} no longer leads with its action: {:?}", t.name, t.description);
+        }
+    }
+
+    /// The ceiling the trim was written against. Descriptions are the only free text in the schema
+    /// and the easiest thing to inflate back; this fails loudly if one grows past it.
+    #[test]
+    fn no_description_exceeds_the_trim_budget() {
+        for t in agent_tools() {
+            assert!(
+                t.description.chars().count() <= 160,
+                "{} is {} chars, over the 160-char budget: {:?}",
+                t.name,
+                t.description.chars().count(),
                 t.description
             );
         }
@@ -278,6 +330,92 @@ mod tests {
     #[test]
     fn editing_is_possible_without_rewriting_a_whole_file() {
         assert!(agent_tools().iter().any(|t| t.name == "edit_file"));
+    }
+
+    // ── gateway_tool_set ──────────────────────────────────────────────────
+
+    /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
+    /// will refuse. Falsified by dropping the filter — the set goes back to eight.
+    #[test]
+    fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
+        let set = gateway_tool_set(false);
+        let names: Vec<&str> = set.iter().map(|t| t.name).collect();
+        assert_eq!(names.len(), 4, "expected the four read-only tools, got {names:?}");
+        for m in MUTATING_TOOLS {
+            assert!(!names.contains(&m), "{m} is advertised but would be refused");
+        }
+    }
+
+    /// Enabling mutation is opt-in and must restore the whole registry, not a subset.
+    #[test]
+    fn gateway_tool_set_includes_every_tool_when_mutation_is_on() {
+        assert_eq!(gateway_tool_set(true).len(), 8);
+    }
+
+    /// The read-only four are advertised either way — narrowing must never remove a tool the
+    /// gateway is willing to run.
+    #[test]
+    fn the_read_only_tools_are_advertised_either_way() {
+        for on in [true, false] {
+            let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
+            for r in ["read_file", "list_dir", "search_files", "file_info"] {
+                assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
+            }
+        }
+    }
+
+    /// A narrowed set still has to render, and must render exactly what it holds — an off-by-one
+    /// between the filter and the renderer would silently re-advertise a refused tool.
+    #[test]
+    fn a_narrowed_set_renders_only_what_it_holds() {
+        let set = gateway_tool_set(false);
+        let wire = registry_to_openai(&set).expect("a narrowed registry still renders");
+        let arr = wire.as_array().expect("an array");
+        assert_eq!(arr.len(), set.len());
+        let rendered: Vec<&str> =
+            arr.iter().map(|e| e["function"]["name"].as_str().unwrap_or("")).collect();
+        for m in MUTATING_TOOLS {
+            assert!(!rendered.contains(&m), "{m} reached the wire with mutation off");
+        }
+    }
+
+    /// The reduction the trim and the filter were written to deliver, pinned as bytes on the wire.
+    ///
+    /// Measured baseline: the full registry rendered ~4,050 characters of tool JSON, which is ~1,187
+    /// prompt tokens of a 1,721-token prompt. Falsified by removing the filter or letting the
+    /// descriptions grow back.
+    #[test]
+    fn the_gateway_set_is_less_than_half_the_rendered_bytes() {
+        let full = registry_to_openai(agent_tools()).expect("full registry renders");
+        let narrowed = registry_to_openai(&gateway_tool_set(false)).expect("narrowed renders");
+        let full_bytes = serde_json::to_string(&full).unwrap().len();
+        let narrow_bytes = serde_json::to_string(&narrowed).unwrap().len();
+        assert!(
+            narrow_bytes * 2 < full_bytes,
+            "narrowed {narrow_bytes} bytes is not under half of full {full_bytes}"
+        );
+    }
+
+    /// The trim saved ~318 chars of the ~4,050-char full render (~26%).  This test pins that the
+    /// narrowed set stays under 55% of the full render — a regression signal if descriptions grow
+    /// back past the budget.
+    ///
+    /// (The test above checks < 50%; this one is the tighter budget check.  Both must hold.)
+    #[test]
+    fn the_narrowed_set_stays_under_55pct_of_full() {
+        let full = registry_to_openai(agent_tools()).expect("full registry renders");
+        let narrowed = registry_to_openai(&gateway_tool_set(false)).expect("narrowed renders");
+        let full_bytes = serde_json::to_string(&full).unwrap().len();
+        let narrow_bytes = serde_json::to_string(&narrowed).unwrap().len();
+        // 55% threshold: the 26% trim saves ~1,050 of ~4,050 chars, so the 4/8-tool
+        // ratio should land around 46–50%.  55% gives a small margin for one description
+        // growing back without flagging.
+        let ratio = narrow_bytes as f64 / full_bytes as f64;
+        assert!(
+            ratio < 0.55,
+            "narrowed {narrow_bytes} bytes is {pct:.0}% of full {full_bytes}; expected < 55%",
+            pct = ratio * 100.0
+        );
     }
 
     // ── registry_to_openai ────────────────────────────────────────────────

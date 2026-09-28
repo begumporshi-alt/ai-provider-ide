@@ -72,7 +72,7 @@ use crate::core::gateway_normalizer::{detect_client, normalize_gateway_request, 
 use crate::core::router::{
     CallOptions, ImageRequest, ModelRouter, RouterError, RouterSettings, RouterStore,
 };
-use crate::core::tool_registry::{agent_tools, registry_to_openai};
+use crate::core::tool_registry::{gateway_tool_set, registry_to_openai};
 use crate::core::tool_wire::to_wire_tool_calls;
 use crate::core::tools::{tool_run, ToolRunRequest};
 
@@ -286,7 +286,9 @@ impl Job {
             self.host.tools_enabled(),
         );
         let tools = match ownership {
-            ToolOwnership::Gateway => registry_to_openai(agent_tools()),
+            ToolOwnership::Gateway => {
+                registry_to_openai(&gateway_tool_set(self.host.tools_mutation_enabled()))
+            }
             _ => client_tools,
         };
         let tool_choice = tool_choice_for(ownership, body.get("tool_choice").cloned());
@@ -363,6 +365,7 @@ impl Job {
                     on_tool_call: Some(&mut on_tool_call),
                     on_usage: Some(&mut on_usage),
                     max_attempts: None,
+                    prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };
                 self.router().generate_text(text_req, &opts, cancel, &mut on_chunk).await
             };
@@ -993,6 +996,12 @@ mod tests {
         fn gateway_tools() -> Self {
             Self { tools_enabled: true, ..Self::off() }
         }
+
+        /// Gateway tools with mutation turned on — the operator opted in, so the registry the
+        /// gateway advertises is the whole one.
+        fn gateway_tools_mutating() -> Self {
+            Self { tools_enabled: true, mutation_enabled: true, root: None }
+        }
     }
 
     impl BridgeHost for Host {
@@ -1361,10 +1370,16 @@ mod tests {
         let gateway = Scripted::text(vec![ScriptedTurn::saying(&["ok"])]);
         drain(&bridge_with(gateway.clone(), Host::gateway_tools()), chat("m1")).await;
         let supplied = gateway.tools_seen(0).expect("the gateway supplied tools");
+        let names = tool_names(&supplied);
         assert!(
-            tool_names(&supplied).iter().any(|n| n == "write_file"),
-            "the registry is what goes on the wire: {:?}",
-            tool_names(&supplied)
+            names.iter().any(|n| n == "read_file"),
+            "the registry is what goes on the wire: {names:?}"
+        );
+        // Mutation is off by default, and a tool the gateway will refuse must not be advertised:
+        // the model would call it and spend a turn reading a refusal.
+        assert!(
+            !names.iter().any(|n| n == "write_file"),
+            "a refused tool reached the wire with mutation off: {names:?}"
         );
 
         let client = Scripted::text(vec![ScriptedTurn::saying(&["ok"])]);
@@ -1376,6 +1391,22 @@ mod tests {
             tool_names(&forwarded),
             vec!["client_side_thing"],
             "the toggle cannot override a client that declared its own tools"
+        );
+    }
+
+    /// When the operator enables mutation the gateway must advertise the mutating tools, not a
+    /// subset. The `gateway_tool_set` unit test already pins the filter; this pins that the
+    /// *unfiltered* set reaches the wire.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_gateway_advertises_all_tools_when_mutation_is_on() {
+        let gateway = Scripted::text(vec![ScriptedTurn::saying(&["ok"])]);
+        drain(&bridge_with(gateway.clone(), Host::gateway_tools_mutating()), chat("m1")).await;
+        let supplied = gateway.tools_seen(0).expect("the gateway supplied tools");
+        let names = tool_names(&supplied);
+        assert_eq!(names.len(), 8, "mutation on should restore the full registry: {names:?}");
+        assert!(
+            names.iter().any(|n| n == "write_file"),
+            "write_file should be advertised when mutation is on: {names:?}"
         );
     }
 

@@ -599,6 +599,7 @@ mod tests {
                     response_format: None,
                     on_tool_call: None,
                     on_usage: None,
+                    prompt_cache_enabled: false,
                 },
                 &cancel,
             )
@@ -713,6 +714,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            prompt_cache_enabled: false,
         };
         let json: Value = serde_json::from_str(&text_args_json(&args, None)).expect("valid JSON");
         assert!(json.get("maxTokens").is_none(), "{json}");
@@ -788,6 +790,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            prompt_cache_enabled: false,
         }
     }
 

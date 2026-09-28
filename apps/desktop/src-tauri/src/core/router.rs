@@ -255,6 +255,15 @@ pub struct RouterSettings {
     /// does not, so the service needs a persisted value and the app does not. Unifying them means
     /// making the app's toggle write this key too, which is a UI change rather than a host one.
     pub gateway_tools_enabled: bool,
+    /// Mark the last system message block with `cache_control: {"type":"ephemeral"}` on egress
+    /// so a provider with prefix caching bills repeated prompt blocks at reduced price.
+    ///
+    /// **Defaults to `false`** — the marker is meaningless to a provider that does not
+    /// implement prefix caching and may be rejected by some gateways. The read side
+    /// (`ledger.cached_tokens`) is already in place; this flag controls the write side only.
+    ///
+    /// The webview writes this key as `promptCacheEnabled` in the `router` settings row.
+    pub prompt_cache_enabled: bool,
 }
 
 impl Default for RouterSettings {
@@ -264,6 +273,7 @@ impl Default for RouterSettings {
             system_ai: None,
             per_provider_concurrency: Value::from(PER_PROVIDER_DEFAULT),
             gateway_tools_enabled: true,
+            prompt_cache_enabled: false,
         }
     }
 }
@@ -319,6 +329,12 @@ impl RouterSettings {
                 .get("gatewayToolsEnabled")
                 .and_then(Value::as_bool)
                 .unwrap_or(default.gateway_tools_enabled),
+            // `promptCacheEnabled` is opt-in; absent or malformed is "off", which is the
+            // pre-existing behaviour (no `cache_control` marker on egress).
+            prompt_cache_enabled: v
+                .get("promptCacheEnabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(default.prompt_cache_enabled),
         }
     }
 }
@@ -344,6 +360,18 @@ pub struct TextRequest<'a> {
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
+    /// Whether to mark the system prompt with `cache_control` on egress so a provider with
+    /// prefix caching bills the repeated block at reduced price.
+    ///
+    /// **Opt-in and off by default.** A provider that does not support `cache_control` ignores
+    /// the field (OpenAI-compatible) or may reject it (some gateways). The flag exists so an
+    /// operator can turn it on for a provider known to honour it without changing the behaviour
+    /// of providers that do not.
+    ///
+    /// The read side (`ledger.cached_tokens`, `usage.cached_tokens`) is already implemented —
+    /// `manifest.rs::read_cached_tokens` handles both OpenAI's `prompt_tokens_details.cached_tokens`
+    /// and Anthropic's `cache_read_input_tokens`. This flag controls the *write* side only.
+    pub prompt_cache_enabled: bool,
 }
 
 /// One request to `generate_image`. The port of `ImageRequest` (`ports.ts:130-133`).
@@ -891,6 +919,7 @@ impl<'a> ModelRouter<'a> {
             on_tool_call,
             on_usage,
             max_attempts,
+            prompt_cache_enabled,
         } = req;
 
         // **`Delivered` counts text chunks and tool calls both, and the row is only honest if it
@@ -959,6 +988,7 @@ impl<'a> ModelRouter<'a> {
                 on_tool_call: Some(&mut forward_tool),
                 on_usage: Some(&mut forward_usage),
                 max_attempts,
+                prompt_cache_enabled,
             };
             execute_text(
                 self.adapters,
@@ -1331,6 +1361,10 @@ impl<'a> ModelRouter<'a> {
                 on_tool_call: None,
                 on_usage: None,
                 max_attempts: None,
+                // Read from the router settings rather than hardcoded off, so the operator's
+                // toggle governs this path too. `CompleteRequest` carries no flag of its own:
+                // it is the System-AI/generator path, and a second switch would only drift.
+                prompt_cache_enabled: self.settings.prompt_cache_enabled,
             };
             // Scoped so the sink's borrow of `text` ends before the text is read.
             let mut text = String::new();
@@ -1996,6 +2030,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             max_attempts: None,
+            prompt_cache_enabled: false,
         }
     }
 

@@ -13,6 +13,16 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Changed
 
+- **The gateway no longer advertises tools it will refuse.** Four of the eight agent tools
+  (`write_file`, `edit_file`, `mkdir`, `run_command`) are refused at call time while gateway
+  mutation is off, which is the default — but all eight schemas went out on every request from
+  every client that brought none. The gateway now advertises only the four it will actually run
+  (`gateway_tool_set`), and the eight descriptions were trimmed by 318 characters (26%).
+  **Measured on the live gateway: 1,721 → 1,042 prompt tokens, a 39.5% cut**, with the
+  tools-suppressed control unchanged at 534 — so the whole delta is the registry. The saving is
+  conditional on mutation being off; see `FIXED_CONTEXT_STRATEGY.md` §6.4 for why the two hosts
+  disagree about that. Applies to the `aiproviderd` gateway and the in-app Assistant.
+
 - **A key excluded by the auth breaker is no longer excluded forever.** Three consecutive auth
   failures opened a breaker that only a *successful* attempt could clear — and an open breaker meant
   the key was never tried again, so no success could ever arrive to clear it. A credential rotated

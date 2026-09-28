@@ -876,6 +876,9 @@ pub struct ExecuteTextArgs<'a> {
     pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     pub max_attempts: Option<usize>,
+    /// Mark the last system message block with `cache_control` on egress. See
+    /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
+    pub prompt_cache_enabled: bool,
 }
 
 /// A served text request. The Rust port of the three readers on `TextExecution`
@@ -1113,6 +1116,7 @@ pub async fn execute_text(
                     response_format: args.response_format.as_ref(),
                     on_tool_call: Some(&mut forward_tool),
                     on_usage: Some(&mut record_usage),
+                    prompt_cache_enabled: args.prompt_cache_enabled,
                 };
 
                 // **The `let` is load-bearing, not stylistic.** `Result<BoxStream<…>, _>` is a
@@ -3180,6 +3184,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             max_attempts: None,
+            prompt_cache_enabled: false,
         }
     }
 

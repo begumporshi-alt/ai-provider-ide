@@ -159,6 +159,11 @@ pub struct TextArgs<'a> {
     pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     /// Called once with whatever usage the upstream reported, if it reported anything at all.
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    /// Mark the last system message block with `cache_control: {"type":"ephemeral"}` on egress.
+    /// Off by default; a provider without prefix caching will ignore or reject the field, so
+    /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
+    /// note.
+    pub prompt_cache_enabled: bool,
 }
 
 /// One model as the catalogue reported it — the port of `ModelEntry`
@@ -451,6 +456,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            prompt_cache_enabled: false,
         }
     }
 
