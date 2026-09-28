@@ -5765,3 +5765,20 @@ Logs: `<data_dir>/aiproviderd.log` and `.err.log`.
 - **A probe that cannot fire is indistinguishable from a fix that works.** The first falsification of
   `list_headers` used a condition that was `false || false` in the fixture, so it never triggered and
   the suite stayed green. Check the probe's condition against the fixture before trusting a green.
+
+## Committing and pushing — the shape this repo actually has (measured 2026-09-29)
+
+- **Direct to `main`. No branch, no PR.** History is linear on `main`, remote is `origin/main`. A tool
+  that defaults to branch + pull request does not match this repo; pushing the current branch is the
+  whole procedure. "Commit and push" means exactly that here.
+- **Check `git log origin/main..HEAD` before pushing.** A push carries every unpushed commit, not just
+  the one you just made — on 2026-09-29 it also carried `17d5c92`, which had been sitting since it was
+  written.
+- **Run `pnpm key-leak-grep` first.** The repo is public; it is a gate step, not a formality.
+- **`git diff --stat` excludes untracked files.** A commit's own line count can be far larger
+  (2,201 → 3,990 on 2026-09-29, 45 → 54 files). Both numbers are correct; the difference is the new
+  files, which `git diff` does not see at all. Do not report it as a discrepancy.
+- **The pre-commit hook counts occurrences, not lines.** `scripts/git-hooks/pre-commit` refuses a
+  staged `docs/dev-book/book.html` carrying any `data-page-node-id`; repair is
+  `git checkout -- <file> && node scripts/build-dev-book.mjs && git add <file>`.
+- **Verify the push against the remote, not the cache:** `git ls-remote origin refs/heads/main`.
