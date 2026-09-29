@@ -10,10 +10,12 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
 import {
+  BUILTIN_TEMPLATES,
   OnboardingOrchestrator,
   generateCandidates,
   generateCodeCandidate,
   runContractSuite,
+  type BuiltinTemplateId,
   type CandidateProgress,
   type ContractReport,
   type OnboardingSessionData,
@@ -63,6 +65,16 @@ export function OnboardingScreen() {
   const [offerCode, setOfferCode] = useState(false);
   const refs = useRef<WizardRefs | null>(null);
   const orchRef = useRef<OnboardingOrchestrator | null>(null);
+  // The abort handle for the pipeline in flight. Cancel presses it, so a half-open host mid-probe
+  // no longer locks the wizard for the full request-timeout chain.
+  const abortRef = useRef<AbortController | null>(null);
+  // The request headers the current run probes with (a client-gate answer rides here). The
+  // dialect override at Review re-registers a template and must keep them — a manifest that
+  // dropped the gate header would identify fine and then fail its first real request.
+  const extraHeadersRef = useRef<Record<string, string> | undefined>(undefined);
+  // Dialect override (Review step): "" keeps the detected answer.
+  const [override, setOverride] = useState<BuiltinTemplateId | "">("");
+  const [overriding, setOverriding] = useState(false);
   const [resumable, setResumable] = useState<(OnboardingSessionData & { rowId?: number }) | null>(null);
   const [prefill, setPrefill] = useState<OnboardingSessionData["input"] | null>(null);
   /**
@@ -97,6 +109,10 @@ export function OnboardingScreen() {
   }, []);
 
   const sessionRowId = useRef<number | null>(null);
+  // Set when a session save fails (e.g. the pre-D78 state CHECK rejecting `failed`): the wizard
+  // still works, but "resume after restart" quietly would not — an operator deserves to know
+  // that before they close the window mid-setup.
+  const [saveWarn, setSaveWarn] = useState(false);
   const persistence = useMemo(
     () => ({
       save: async (d: OnboardingSessionData) => {
@@ -121,7 +137,10 @@ export function OnboardingScreen() {
           .then((id) => {
             sessionRowId.current = id;
           })
-          .catch(() => undefined);
+          .catch((e) => {
+            console.error("onboarding_save failed:", e);
+            setSaveWarn(true);
+          });
       },
       loadLatest: async () => null,
     }),
@@ -202,6 +221,7 @@ export function OnboardingScreen() {
 
   const cancel = useCallback(
     async (silent = false) => {
+      abortRef.current?.abort();
       const r = refs.current;
       if (r) {
         await deleteProvider(r.providerId).catch(() => undefined);
@@ -348,15 +368,26 @@ export function OnboardingScreen() {
     setProbeLog([]);
     setGate(null);
     lastInput.current = input;
+    const ac = new AbortController();
+    abortRef.current = ac;
+    extraHeadersRef.current = extraHeaders;
+    setOverride("");
     try {
       // provider row first (pending = host allowlisted for probes), then the key (vault).
+      // refs is filled immediately after the row exists — not after the key — so a failure in
+      // between still rolls the row back (the catch below owns cleanup for this whole window).
       const providerId = await createPendingProvider(input.name, input.baseUrl);
+      refs.current = { providerId, keyLabel: "key-01", secret: input.apiKey };
       const key = await addKey(providerId, "key-01", input.apiKey);
       refs.current = { providerId, keyLabel: key.label, secret: input.apiKey };
       const orch = new OnboardingOrchestrator(getHttpPort(), persistence);
       orchRef.current = orch;
       setStep(1);
-      await orch.start({ name: input.name, baseUrl: input.baseUrl, docsUrl: input.docsUrl, extraHeaders });
+      await orch.start(
+        { name: input.name, baseUrl: input.baseUrl, docsUrl: input.docsUrl, extraHeaders },
+        // stream each attempt as it lands: the log now fills during the probe, not after it
+        { onAttempt: (a) => setProbeLog((prev) => [...prev, a]), signal: ac.signal },
+      );
       setProbeLog(orch.session.probeReport?.attempts ?? []);
       setStep(2);
       const fp = await orch.identify();
@@ -406,6 +437,25 @@ export function OnboardingScreen() {
       setContract(freeReport);
       setBusy(false);
     } catch (e) {
+      if (ac.signal.aborted) {
+        // A user abort: cancel() already deleted the rows and navigated home — this handler must
+        // not paint an error over that, nor roll back rows it no longer owns.
+        return;
+      }
+      // **Any other failure rolls the attempt back.** The provider row and stored key were created
+      // for this run alone (pending, never enabled); leaving them behind stranded an orphan the
+      // operator never asked for. Same contract as createPendingProvider's own rollback and the
+      // gate-retry path. The wizard resets to Connect with the input prefilled so a retry is one
+      // key entry away.
+      const r = refs.current;
+      if (r) await deleteProvider(r.providerId).catch(() => undefined);
+      refs.current = null;
+      orchRef.current = null;
+      setContract(null);
+      setDialect("");
+      setEvidence([]);
+      setPrefill({ name: input.name, baseUrl: input.baseUrl, docsUrl: input.docsUrl });
+      setStep(0);
       setError(String((e as Error).message ?? e));
       setBusy(false);
     }
@@ -459,8 +509,58 @@ export function OnboardingScreen() {
     }
   }
 
-  async function enableProvider() {
+  /**
+   * The operator overrides the detected dialect at Review: re-register the chosen built-in
+   * template and walk back to the contract step for real checks against it.
+   *
+   * Auto setup can meet a host that serves both dialects and answers the wrong one first —
+   * `identify()` itself documents such a host — so "the wizard decided, live with it" is not an
+   * acceptable end state. The gate headers ride along, or the re-registered manifest would pass
+   * identification and fail its first real request.
+   */
+  async function applyDialectOverride(templateId: BuiltinTemplateId) {
     const r = refs.current;
+    const orch = orchRef.current;
+    const factory = BUILTIN_TEMPLATES[templateId];
+    if (!r || !orch || !factory) return;
+    setOverriding(true);
+    setError(null);
+    try {
+      const template = withRequestHeaders(
+        factory(orch.session.input.baseUrl),
+        extraHeadersRef.current ?? {},
+      );
+      adapters.register(r.providerId, template);
+      await fetchAdmin("POST", "/admin/manifests", {
+        id: crypto.randomUUID(), providerId: r.providerId, version: 1, origin: "builtin-template",
+        bodyJson: JSON.stringify(template), contractResultJson: null,
+        createdAt: Date.now(), isActive: true,
+      });
+      await orch.resume({
+        ...orch.session,
+        manifest: template,
+        fingerprint: {
+          dialect: templateId,
+          template,
+          evidence: [
+            ...(orch.session.fingerprint?.evidence ?? []),
+            `overridden by operator: forced the ${templateId} template`,
+          ],
+        },
+      });
+      setDialect(templateId);
+      setOverride("");
+      setContract(null);
+      setStep(3);
+      await runFreeChecks(r.providerId, r.keyLabel);
+    } catch (e) {
+      setError(String((e as Error).message ?? e));
+    } finally {
+      setOverriding(false);
+    }
+  }
+
+  async function enableProvider() {    const r = refs.current;
     const orch = orchRef.current;
     if (!r || !orch) return;
     setBusy(true);
@@ -491,7 +591,9 @@ export function OnboardingScreen() {
       <div className="mb-4 flex items-center gap-3">
         <h1 className="text-[20px] font-semibold">Add Provider — guided setup</h1>
         <div className="ml-auto flex gap-2">
-          <Button onClick={() => void cancel()} disabled={busy && step < 4}>Cancel</Button>
+          {/* Always enabled: aborting is the only way out of a slow probe, and cancel() deletes
+              everything the attempt created either way. */}
+          <Button onClick={() => void cancel()}>Cancel</Button>
         </div>
       </div>
 
@@ -513,11 +615,18 @@ export function OnboardingScreen() {
         ))}
       </div>
 
+      {saveWarn && step > 0 && (
+        <p className="mb-3 text-[12px]" style={{ color: "var(--warn)" }} role="status">
+          Note: this session could not be saved, so it will not be offered for resume if you close
+          the app. Setup itself continues to work.
+        </p>
+      )}
+
       {resumable && step === 0 && !busy && (
         <div className="mb-4 rounded border p-3" style={{ borderColor: "var(--info)", background: "var(--surface)" }}>
           <p className="mb-2 text-[13px]">
-            An unfinished setup for <b>{resumable.input.name}</b> ({resumable.input.baseUrl}) was saved — state:{" "}
-            <span className="mono">{resumable.state}</span>. Its provider entry and key are already stored.
+            An unfinished setup for <b>{resumable.input.name}</b> ({resumable.input.baseUrl}) — {STATE_COPY[resumable.state] ?? resumable.state}. Its
+            provider entry and key are already stored.
           </p>
           <div className="flex gap-2">
             <Button onClick={() => void resumeSession(resumable)}>Resume setup</Button>
@@ -678,6 +787,34 @@ export function OnboardingScreen() {
               Discard
             </Button>
           </div>
+          {/* The one override auto setup offers, and deliberately the only place it is needed:
+              detection ran, the operator has seen its answer, and "looks wrong" is now an informed
+              judgement rather than a guess. Re-checks against the chosen template before enabling. */}
+          <div className="mt-3 border-t pt-3" style={{ borderColor: "var(--border)" }}>
+            <p className="mb-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+              Detected the wrong dialect? Some hosts serve both and answer the wrong one first. Pick
+              the other built-in and the free checks run again against it before anything enables.
+            </p>
+            <div className="flex items-center gap-2">
+              <select
+                className={inputCls}
+                style={inputStyle}
+                value={override}
+                onChange={(e) => setOverride(e.target.value as BuiltinTemplateId | "")}
+                aria-label="Override dialect"
+              >
+                <option value="">keep detected: {dialect}</option>
+                <option value="openai-compat">OpenAI-compatible (openai-chat-v1)</option>
+                <option value="anthropic-compat">Anthropic-compatible (anthropic-messages-v1)</option>
+              </select>
+              <Button
+                disabled={!override || overriding || busy}
+                onClick={() => void applyDialectOverride(override as BuiltinTemplateId)}
+              >
+                {overriding ? "Re-testing…" : "Re-test with this dialect"}
+              </Button>
+            </div>
+          </div>
         </Section>
       )}
 
@@ -736,27 +873,36 @@ function ConnectForm({
   const [docsUrl, setDocsUrl] = useState(initial?.docsUrl ?? "");
   const valid = name.trim().length > 1 && /^https?:\/\//.test(baseUrl) && apiKey.trim().length > 8;
   return (
-    <Section title="Connect">
-      <p className="mb-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
-        Name, base URL and an API key. The key goes straight to a local secrets file; the IDE probes the API
-        (free requests only) to figure out how it behaves.
-      </p>
-      <Field label="Name">
-        <input className={inputCls} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="My provider" autoFocus />
-      </Field>
-      <Field label="Base URL">
-        <input className={`${inputCls} mono`} style={inputStyle} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
-      </Field>
-      <Field label="API key (stored in a local secrets file)">
-        <input className={`${inputCls} mono`} style={inputStyle} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
-      </Field>
-      <Field label="Docs URL (optional)">
-        <input className={`${inputCls} mono`} style={inputStyle} value={docsUrl} onChange={(e) => setDocsUrl(e.target.value)} placeholder="https://docs.example.com/api" />
-      </Field>
-      <Button variant="primary" disabled={!valid || busy} onClick={() => onStart({ name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), docsUrl: docsUrl.trim() || undefined })}>
-        {busy ? "Working…" : "Start setup"}
-      </Button>
-    </Section>
+    // A form, so Enter submits — the manual wizard's model input already did, and half the
+    // keyboard surface submitting while the other half ignores it is how forms teach guessing.
+    <form
+      onSubmit={(e) => {
+        e.preventDefault();
+        if (valid && !busy) onStart({ name: name.trim(), baseUrl: baseUrl.trim(), apiKey: apiKey.trim(), docsUrl: docsUrl.trim() || undefined });
+      }}
+    >
+      <Section title="Connect">
+        <p className="mb-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
+          Name, base URL and an API key. The key goes straight to a local secrets file; the IDE probes the API
+          (free requests only) to figure out how it behaves.
+        </p>
+        <Field label="Name">
+          <input className={inputCls} style={inputStyle} value={name} onChange={(e) => setName(e.target.value)} placeholder="My provider" autoFocus />
+        </Field>
+        <Field label="Base URL">
+          <input className={`${inputCls} mono`} style={inputStyle} value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)} placeholder="https://api.example.com/v1" />
+        </Field>
+        <Field label="API key (stored in a local secrets file)">
+          <input className={`${inputCls} mono`} style={inputStyle} type="password" value={apiKey} onChange={(e) => setApiKey(e.target.value)} placeholder="sk-…" />
+        </Field>
+        <Field label="Docs URL (optional)">
+          <input className={`${inputCls} mono`} style={inputStyle} value={docsUrl} onChange={(e) => setDocsUrl(e.target.value)} placeholder="https://docs.example.com/api" />
+        </Field>
+        <Button variant="primary" type="submit" disabled={!valid || busy}>
+          {busy ? "Working…" : "Start setup"}
+        </Button>
+      </Section>
+    </form>
   );
 }
 
@@ -802,7 +948,7 @@ function AiPath({
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-[12px] font-semibold">Candidate {id}</span>
                 {c?.manifest && c.freePasses > 0 && (
-                  <span className="rounded px-1 text-[10px]" style={{ background: "var(--success)", color: "#0b0d10", fontWeight: 600 }}>
+                  <span className="rounded px-1 text-[10px]" style={{ background: "var(--success)", color: "var(--bg)", fontWeight: 600 }}>
                     {bestUsable === id ? "★ recommended" : "usable"}
                   </span>
                 )}
@@ -858,6 +1004,22 @@ function AiPath({
     </div>
   );
 }
+
+/**
+ * What a saved session's machine state means to a person, for the resume panel — the raw state
+ * string (`fingerprinting`) is this module's own vocabulary, not the operator's.
+ */
+const STATE_COPY: Partial<Record<OnboardingSessionData["state"], string>> = {
+  collect_input: "it stopped at the connection form",
+  probing: "it was still probing the API",
+  fingerprinting: "it was identifying the API's dialect",
+  template_instantiated: "the dialect was identified",
+  ai_generating: "adapter generation was running",
+  linting: "adapter generation was running",
+  contract_testing: "it was running the contract checks",
+  pending_registration: "it was waiting for your review",
+  human_confirmation: "it was waiting for your review",
+};
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
