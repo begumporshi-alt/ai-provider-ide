@@ -12,6 +12,12 @@ import { useUi } from "../ui-state";
 import { bareEntry, hasFailoverCarrier } from "../lib/models/selectable";
 import { Button, EmptyState, StatusDot } from "../components/atoms";
 
+/** Micro-USD per 1M tokens → a compact dollar figure (1200000 → "1.20"). */
+function fmt(micros: number): string {
+  const usd = micros / 1_000_000;
+  return usd >= 100 ? usd.toFixed(0) : usd.toFixed(2);
+}
+
 export function ModelsScreen() {
   const tick = useUi((s) => s.tick);
   const { bump } = useUi();
@@ -25,6 +31,10 @@ export function ModelsScreen() {
   // survive every floor rather than being hidden by one.
   const [minContext, setMinContext] = useState<number>(0);
   const [reasoningOnly, setReasoningOnly] = useState(false);
+  // Free = pricing known AND zero; Paid = pricing known AND non-zero. Unknown pricing (the
+  // provider never reported it) matches only "any" — an unreported price is not a free model,
+  // the same rule the pricing column's "—" follows.
+  const [pricingFilter, setPricingFilter] = useState<"any" | "free" | "paid">("any");
   const [sort, setSort] = useState<"name" | "context">("name");
   // Which models the gateway publishes into the connected client (WorkBuddy). Owned by the
   // host, because that is where the client's config file is written.
@@ -101,6 +111,12 @@ export function ModelsScreen() {
       // pricing column renders "—" rather than "$0.00" for unknown.
       .filter((m) => !minContext || (m.contextWindow ?? Infinity) >= minContext)
       .filter((m) => !reasoningOnly || m.supportsReasoning === true)
+      .filter((m) =>
+        pricingFilter === "any" ||
+        (pricingFilter === "free"
+          ? m.pricing !== undefined && m.pricing.prompt === 0 && m.pricing.completion === 0
+          : m.pricing !== undefined && (m.pricing.prompt > 0 || m.pricing.completion > 0)),
+      )
       .filter((m) => !q || m.nativeId.toLowerCase().includes(q.toLowerCase()) || slugOf(m.providerId).includes(q.toLowerCase()))
       .map((m) => ({ ...m, slug: slugOf(m.providerId) }))
       .sort((a, b) =>
@@ -117,7 +133,7 @@ export function ModelsScreen() {
       }));
     // `tick` is a real input here, not decoration: `bareFor` reads `catalog.aliases` and provider
     // status, and neither is captured by the identity of `modalityRows`.
-  }, [modalityRows, q, providerFilter, originFilter, minContext, reasoningOnly, sort, tick]);
+  }, [modalityRows, q, providerFilter, originFilter, minContext, reasoningOnly, pricingFilter, sort, tick]);
 
   /**
    * The id a row's Default button writes, and the id the "default" badge matches.
@@ -201,6 +217,17 @@ export function ModelsScreen() {
           <option value={128_000}>≥ 128k</option>
           <option value={400_000}>≥ 400k</option>
         </select>
+        <select
+          value={pricingFilter}
+          onChange={(e) => setPricingFilter(e.target.value as typeof pricingFilter)}
+          className="rounded border px-2 py-1"
+          style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+          aria-label="Filter by pricing"
+        >
+          <option value="any">Any pricing</option>
+          <option value="free">Free</option>
+          <option value="paid">Paid</option>
+        </select>
         <label className="flex cursor-pointer items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
           <input type="checkbox" checked={reasoningOnly} onChange={(e) => setReasoningOnly(e.target.checked)} />
           Reasoning only
@@ -226,6 +253,7 @@ export function ModelsScreen() {
           <thead>
             <tr className="h-[30px] text-left text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
               <th className="font-medium">Model</th>
+              <th className="w-28 font-medium">Price / 1M</th>
               <th className="w-20 font-medium">Context</th>
               <th className="w-40 font-medium">Provider</th>
               <th className="w-24 font-medium">Default</th>
@@ -252,6 +280,13 @@ export function ModelsScreen() {
                       {m.failover ? "failover" : "routed"}
                     </span>
                   )}
+                </td>
+                <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
+                  {m.pricing
+                    ? m.pricing.prompt === 0 && m.pricing.completion === 0
+                      ? "free"
+                      : `$${fmt(m.pricing.prompt)} / $${fmt(m.pricing.completion)}`
+                    : "—"}
                 </td>
                 <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
                   {m.contextWindow ? `${Math.round(m.contextWindow / 1000)}k` : "—"}
