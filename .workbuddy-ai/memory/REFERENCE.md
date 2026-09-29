@@ -5782,3 +5782,171 @@ Logs: `<data_dir>/aiproviderd.log` and `.err.log`.
   staged `docs/dev-book/book.html` carrying any `data-page-node-id`; repair is
   `git checkout -- <file> && node scripts/build-dev-book.mjs && git add <file>`.
 - **Verify the push against the remote, not the cache:** `git ls-remote origin refs/heads/main`.
+
+## Bare ids, aliases, and why `failoverEnabled` was inert (measured 2026-09-29)
+
+**The defect.** `failoverEnabled: true` did nothing for any model the UI could offer. Both pickers
+mapped the catalog to `slug/native`, and `resolveWanted` pins a qualified id to exactly one provider
+by design. The attempt loop has no `break` on a non-retryable class (`execution-engine.ts:83-175`), so
+**the plan *is* the retry policy** — `isRetryableWithNextKey` is consumed only by `health-tracker.ts`
+for key cooldowns, never to stop failover. With a one-entry plan there is nothing to advance to.
+`MAX_ATTEMPTS_DEFAULT = 6` and `model-router.ts` does not override it, so a 2-candidate plan really
+does get 2 attempts.
+
+**A bare id's carriers are decided by the ALIAS MAP, not the catalog.** In `resolveWanted`:
+
+```ts
+const aliasRows = ctx.aliases.filter((a) => a.alias === model).sort((a, b) => a.priority - b.priority);
+for (const a of aliasRows) out.push({ providerId: a.providerId, nativeId: a.nativeModelId });
+if (!qualified && aliasRows.length === 0) { /* catalog scan for m.nativeId === model */ }
+```
+
+So **an alias can *narrow* a bare id to one provider** — the catalog scan is skipped entirely when an
+alias matches. `ARCHITECTURE.md:501` states this ("a bare ID resolves through `model_aliases`") and
+`08-flows.md:57` repeats it ("a bare ID resolves through the alias map"). Counting catalog rows to
+answer "can this id fail over?" is therefore wrong, and it is the same class of defect as offering an
+option that cannot serve — a label that overstates reach.
+
+**The alias table is write-once, and that is why `deepseek-v4-flash` resolves to one provider.**
+
+- `persistAliases` (`store.ts:595-597`) writes **four** fields — `alias, providerId, nativeModelId,
+  priority` — and **drops `auto`**.
+- Boot reloads them as `catalog.setAliases(aliases.map((a) => ({ ...a, auto: false })))`
+  (`store.ts:526`), so **every persisted row reads as manual**.
+- `deriveAutoAliases` (`model-catalog.ts:148,152`) builds `const manual = new Set(this.aliases.filter(a
+  => !a.auto).map(a => a.alias))` and then `if (provIds.size < 2 || manual.has(native)) continue` — so a
+  native id that already has a row is **never re-derived**, even though `refreshStaleCatalogs` calls
+  `deriveAutoAliases()` after every refresh.
+
+Live evidence: `model_aliases` holds **3** rows. `agnes-3.0-flash` has two (agnes 100, vice 101) and
+fans out; `deepseek-v4-flash` has **one** (vice, 101) while the catalog carries it on **two** enabled
+providers — `vice` (`origin='discovered'`) and `agent-routerv2` (`origin='manual'`, added later). The
+manual row's late arrival is the whole reason it has no alias: the table was derived before that row
+existed and can never catch up. **Not fixed** — reported to the user as a separate scope.
+
+**What this means for the incident.** `agent-routerv2/deepseek-v4-flash` → 1 candidate → `400`
+`content-blocked` on ~29% of prompts → the request fails. The bare `deepseek-v4-flash` → alias →
+**vice**, which serves it (verified live: `POST https://vyceai.com/chat/completions` → `200`,
+`prompt_tokens: 3`). So the user's requests succeed after the fix — **by alias routing, not by
+failover.** Genuine failover is available only for models with no narrowing alias
+(`agnes-3.0-flash` is one).
+
+## Probing a third-party host: the method must match the route (measured 2026-09-29)
+
+- **A GET cannot find a POST-only route.** Probing `vyceai.com/chat/completions` with curl's default
+  GET returned the SPA's `200` HTML; read as "no such route", that was wrong. Re-probing with
+  `-X POST -H 'content-type: application/json' -d '{}'` returned `401 {"code":"invalid_api_key"}` — a
+  real route. Same for `/v1/messages` and `/v1/responses`.
+- **Calibrate against a nonsense path first.** `vyceai.com/nonsense-route-xyz` → `200` HTML proves the
+  host serves an SPA fallback for unknown paths, so `200` HTML means "unknown route" and only a JSON
+  error means "real route". Without that control every reading is ambiguous.
+- **Both spellings exist on this host**: `/models` and `/v1/models` both answer `401`;
+  `/chat/completions` and `/v1/chat/completions` are both real. So "add `/v1` to the base URL" was not
+  a fix, and the task built on it was dropped.
+- **`vice`'s configuration is correct as it stands.** `providers.base_url = https://vyceai.com`, the
+  active manifest's `provider.baseUrl` matches it, and its paths are `/models` + `/chat/completions`.
+  Evidence it works: `models_cache` rows are `origin='discovered'` (so `/models` succeeded on
+  2026-09-28 23:41:56), and ledger `2440` recorded `vice/gpt-6-luna` as **ok** in 8,541 ms with an
+  empty fallback chain. Vice's key is `key-01` / `key:c979d7a5-…`, and its manifest auth is
+  `Authorization: Bearer` (no literal secret in the manifest — checked).
+
+## Shell: a gate chained behind a grep never runs (2026-09-29)
+
+`grep … && echo "=== tsc ===" && tsc --noEmit; echo "exit=$?"` printed `typecheck exit=1` and **tsc
+had not run at all** — `grep` returned 1 (the `\|` false-zero), `&&` short-circuited, and `$?` was
+grep's status wearing the gate's name. Run a gate as its own command, or use `;` and read each status
+separately.
+
+## Recall & scope — detail (moved out of MEMORY.md 2026-09-29 to stay under the 8,000 B cap)
+
+- **Paths differ on one axis: scope**; atoms are born unscoped and `assign_scope` is the only way in —
+  drain must NOT auto-bind. Derive identity from identity, never from place.
+- **A per-principal master-switch row beats the client's `AIP-Memory` header.**
+- **`superseded_at` (0014) hides rows from recall/session/injectable, but NOT from `list`.**
+
+## The alias table's second writer, and the classification that replaced a migration (2026-09-29)
+
+The authorised recommendation — *"persist `auto`, or have `refreshStaleCatalogs` re-derive auto rows
+while preserving genuine manual ones"* — carries a premise: **the auto/manual distinction is
+knowable.** Scoping it falsified the premise, and the falsification changed the fix.
+
+### `model_aliases` has two writers
+
+- `persistAliases` (`apps/desktop/src/store.ts:595`) — writes the **derived** rows.
+- **`config_import` (`apps/desktop/src-tauri/src/core/persist.rs:2316-2319`) — `INSERT OR IGNORE INTO
+  model_aliases`, the aliases out of an imported snapshot.** Those rows are **authored**.
+
+Schema, measured (`sqlite3 .schema model_aliases`): four columns — `alias, provider_id,
+native_model_id, priority`, `PRIMARY KEY (alias, provider_id)` — and **no provenance column**. (There
+is also no FK to `models_cache`, deliberately: `AUDIT_REPORT.md:209`, *"cache refresh must not destroy
+the failover map"*.)
+
+Two consequences, and both killed the obvious fixes:
+
+1. **"Boot prunes the table to the derived set" is wrong** — it destroys imported aliases. That is the
+   version of the TS-only fix that was about to be written.
+2. **Persisting `auto` is not obviously right either.** A migration must pick **one** default for
+   **two** populations: `DEFAULT 1` (derived) prunes every imported row already sitting in a user's
+   database; `DEFAULT 0` (manual) reproduces the incident on every existing install. **A row that
+   predates the column stays ambiguous either way** — so the column buys a correct future, not a
+   correct present.
+
+> **The generalisable rule: a migration cannot disambiguate legacy data it has no basis to
+> disambiguate — it can only guess, and the guess is wrong for one population.** When the ambiguity is
+> resolvable from data you already have, resolve it there.
+
+### What shipped instead: classify by whether the derivation could have *emitted* the row
+
+`ModelCatalog.hydrateAliases(rows)` (`packages/router-core/src/model-catalog.ts`):
+
+```ts
+const authored = rows.filter((r) => !this.derivationEmits(r));
+this.aliases = authored.map((r) => ({ ...r, auto: false }));
+this.deriveAutoAliases();
+return !this.holdsExactly(rows);   // did the rebuild move the table?
+
+private derivationEmits(r: AliasEntry): boolean {
+  return r.alias === r.nativeModelId &&
+    this.models.some((m) => m.providerId === r.providerId && m.nativeId === r.nativeModelId);
+}
+```
+
+`deriveAutoAliases` emits **only** bare rows on a carrying provider, so the two populations are
+**exactly disjoint** on that predicate — it is a definition, not a heuristic. Rows inside the set are
+re-derived; a row outside it is kept *and kept as `auto: false`*, which is what leaves its id alone.
+
+**Deliberately untouched:** `deriveAutoAliases`'s `manual.has(native)` guard and `setAliases`'s
+meaning. Preserving the documented "manual entries win" rule is what stops this being a semantic bet
+on a feature that does not exist — see drift **D77**.
+
+**Wire-up** (`store.ts` boot, ~`:525`): `if (catalog.hydrateAliases(aliases)) { await
+persistAliases().catch(() => undefined); }` — one branch for both the empty and the non-empty table,
+and the write happens only when the rebuild moved something. `refreshStaleCatalogs` and
+`persistCatalog` keep their unconditional derive+persist.
+
+### The residual, named
+
+A hand-authored row shaped exactly like a derived one (bare, on a carrying provider) is re-derived, so
+a priority pin on it would be lost. Nothing can author one today: `setAliases` has only test-fixture
+callers (`acceptance-e2e.test.ts:101`, `drift-repair-e2e.test.ts:209`) and boot. Drift **D76** records
+it and states what must happen when an alias editor lands.
+
+### Falsification, on a byte-identical snapshot
+
+`cp` the fixed file → `shasum -a 256` → probe → `cp` back → `cmp` → confirm no residue with the
+**Grep tool**.
+
+| Probe | Result |
+|---|---|
+| Pre-fix load — `this.aliases = rows.map((r) => ({ ...r, auto: false }))`, no classification | **3 red**: incident rows (`['pB']` vs `['pA','pB']`), incident plan (1 candidate vs 2), and the authored-row test |
+| Carrier half dropped — `return r.alias === r.nativeModelId` | **1 red**: the pin test, where the operator's `pZ` row was silently replaced by a two-carrier derivation |
+| Change-report neutered — `return false` | **1 red**: the write-suppression test. This is the one that would have failed **silently in production** — the healing write would simply never happen |
+
+### Why the test lives in `router-core` and not in the web-test suite
+
+The defect is in the boot *sequence*, but the only interesting step of that sequence is
+`hydrateAliases`, which needs `this.models` — so the method owns the step and the unit test drives the
+real `buildPlan` against it. `seeds.ts` could not have caught the incident anyway: all 7 seeded
+`nativeId`s are declared once each and share one `providerId`, so no seeded id has two carriers and
+`offersBareId` is false for every one. A seed that reproduced it would need two providers carrying one
+native id, which no existing spec has.
