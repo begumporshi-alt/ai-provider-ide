@@ -25,6 +25,12 @@ export interface DriftEvidence {
   models: string[];
   windowMs: number;
   detectedAt: number;
+  /**
+   * The trigger was the operator's "Check health" button, not the drift monitor — so `errors`
+   * and `models` are placeholder zeros, not a measurement, and a reader must not quote them as
+   * one ("0 drift-class errors across 0 models" read like an observation; it was never made).
+   */
+  manual?: boolean;
 }
 
 export interface DriftMonitorDeps {

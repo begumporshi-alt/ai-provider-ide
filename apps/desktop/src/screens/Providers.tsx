@@ -9,8 +9,8 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addKey, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
-  generatorAuditList, listManifestHistory, pendingRepairs, registry, rollbackManifest, setKeyStatus,
-  setProviderStatus, testKey, refreshCatalog,
+  generatorAuditList, ledger, listManifestHistory, pendingRepairs, registry, rollbackManifest,
+  setKeyStatus, setProviderStatus, testKey, refreshCatalog,
 } from "../store";
 import type { DriftEventEntry, GeneratorAuditEntry, HostManifestRow } from "../store";
 import { useUi } from "../ui-state";
@@ -22,6 +22,7 @@ import { TrailWriteWarning } from "../components/TrailWriteWarning";
 // second copy of either is how the manifest this used to hand-assemble drifted from its template.
 import { AddProviderModal, EditProviderModal } from "../components/ProviderSetup";
 import { verdictNotice } from "../lib/keys/verdict";
+import { PROVIDER_PROFILE_LABELS } from "@aiprovider/router-core";
 import { clock, dayKey } from "../lib/memory/timeline";
 
 export function ProvidersScreen() {
@@ -32,9 +33,29 @@ export function ProvidersScreen() {
   const [adding, setAdding] = useState(false);
   const [editing, setEditing] = useState<string | null>(null);
   const [addingKeyFor, setAddingKeyFor] = useState<string | null>(null);
-  const [testing, setTesting] = useState<string | null>(null);
+  // A Set, not a single id: "Test all keys" runs several tests at once, and a single slot let the
+  // first test to finish clear the second one's spinner while its request was still in flight.
+  const [testing, setTesting] = useState<Set<string>>(new Set());
   const [confirmDelete, setConfirmDelete] = useState<{ kind: "provider" | "key"; id: string; name: string } | null>(null);
   const [repairing, setRepairing] = useState<string | null>(null);
+
+  /** One key test, shared by the per-row button and "Test all keys". */
+  const runTest = useCallback(async (providerId: string, keyId: string, label: string) => {
+    setTesting((prev) => new Set(prev).add(keyId));
+    try {
+      const r = await testKey(keyId);
+      setNotice(verdictNotice(label, r));
+      if (r.ok) await refreshCatalog(providerId).catch(() => undefined);
+    } catch (e) {
+      setNotice(`${label}: ${(e as Error).message}`);
+    }
+    setTesting((prev) => {
+      const n = new Set(prev);
+      n.delete(keyId);
+      return n;
+    });
+    bump();
+  }, [bump]);
 
   return (
     <div className="mx-auto max-w-3xl">
@@ -80,6 +101,7 @@ export function ProvidersScreen() {
                     <label className="flex cursor-pointer items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
                       <input
                         type="checkbox"
+                        aria-label={`Enable ${p.name}`}
                         checked={p.status === "enabled"}
                         onChange={async (e) => {
                           await setProviderStatus(p.id, e.target.checked ? "enabled" : "disabled");
@@ -101,6 +123,9 @@ export function ProvidersScreen() {
                       <Button variant="ghost" onClick={() => void buildRepairPlan({
                         providerId: p.id, providerSlug: p.slug,
                         errors: 0, models: [], windowMs: 0, detectedAt: Date.now(),
+                        // the zeros below are placeholders, and this flag is what stops the repair
+                        // modal from quoting them as if the monitor had measured them
+                        manual: true,
                       }).then(() => { setRepairing(p.id); bump(); })}>
                         Check health
                       </Button>
@@ -135,29 +160,31 @@ export function ProvidersScreen() {
                   <tbody>
                     {keys.map((k) => {
                       const kh = healthOf(k);
+                      // Last-test age is the part of the badge a dot cannot say: "Healthy" can mean
+                      // "verified a minute ago" or "never verified at all". Usage comes from the
+                      // ledger's in-memory window — recent traffic, not all history.
+                      const tested = relativeAge(k.lastTestedAt);
+                      const keyEntries = ledger.query({ providerId: p.id }).filter((e) => e.keyId === k.id);
+                      const lastUsed = keyEntries[0]?.ts;
+                      const used = relativeAge(lastUsed);
                       return (
                         <tr key={k.id} className="h-[38px] border-t" style={{ borderColor: "var(--border)" }}>
                           <td className="w-6"><StatusDot health={kh} /></td>
-                          <td className="text-[13px]">{k.label}</td>
+                          <td className="text-[13px]">
+                            {k.label}
+                            <span className="block text-[10px]" style={{ color: "var(--text-faint)" }}>
+                              {tested || "never tested"}
+                              {used && ` · last used ${used} · ${keyEntries.length} recent request${keyEntries.length === 1 ? "" : "s"}`}
+                            </span>
+                          </td>
                           <td className="w-[120px]"><KeyFingerprint hint={k.secretHint} /></td>
                           <td className="w-[110px]"><StatusBadge health={kh} /></td>
                           <td className="w-[140px] text-right">
                             <Button
-                              onClick={async () => {
-                                setTesting(k.id);
-                                try {
-                                  const r = await testKey(k.id);
-                                  setNotice(verdictNotice(k.label, r));
-                                  if (r.ok) await refreshCatalog(p.id).catch(() => undefined);
-                                } catch (e) {
-                                  setNotice(`${k.label}: ${(e as Error).message}`);
-                                }
-                                setTesting(null);
-                                bump();
-                              }}
-                              disabled={testing === k.id}
+                              onClick={() => void runTest(p.id, k.id, k.label)}
+                              disabled={testing.has(k.id)}
                             >
-                              {testing === k.id ? "Testing…" : "Test"}
+                              {testing.has(k.id) ? "Testing…" : "Test"}
                             </Button>
                             <Button
                               variant="ghost"
@@ -177,8 +204,24 @@ export function ProvidersScreen() {
                     })}
                   </tbody>
                 </table>
-                <div className="mt-2">
+                <div className="mt-2 flex gap-2">
                   <Button variant="ghost" onClick={() => setAddingKeyFor(p.id)}>+ Add key</Button>
+                  {keys.length > 1 && (
+                    <Button
+                      variant="ghost"
+                      disabled={keys.every((k) => testing.has(k.id))}
+                      onClick={() => {
+                        // Sequential on purpose: several simultaneous pings against one provider
+                        // is exactly the burst a rate limiter punishes, and the per-key spinner
+                        // state already renders the progress.
+                        void (async () => {
+                          for (const k of keys) await runTest(p.id, k.id, k.label);
+                        })();
+                      }}
+                    >
+                      Test all keys
+                    </Button>
+                  )}
                 </div>
               </section>
             );
@@ -239,6 +282,12 @@ export function ProvidersScreen() {
   );
 }
 
+// Derived, not hardcoded: the hero once named three of the four profiles, and prose that
+// restates a constant is prose that drifts the day the constant grows.
+const PRESET_NAMES = PROVIDER_PROFILE_LABELS
+  ? Object.values(PROVIDER_PROFILE_LABELS)
+  : [];
+
 function FirstRunHero({ onAdd, onAuto }: { onAdd: () => void; onAuto: () => void }) {
   return (
     <div className="rounded-md border p-8 text-center" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
@@ -250,7 +299,7 @@ function FirstRunHero({ onAdd, onAuto }: { onAdd: () => void; onAuto: () => void
         AI, so the very first provider can be set up with nothing configured yet.
       </p>
       <p className="mx-auto mt-2 max-w-md text-[12px]" style={{ color: "var(--text-faint)" }}>
-        OpenRouter, OpenCode Zen and b.ai also have one-click presets in the manual flow. Keys are
+        {PRESET_NAMES.join(", ")} also have one-click presets in the manual flow. Keys are
         stored in a local secrets file that only your user account can read (mode 600), never in the
         database, and nothing leaves your machine except requests to the providers you configure.
       </p>
@@ -272,36 +321,37 @@ function AddKeyModal({
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const submit = async () => {
+    if (busy || !secret.trim() || !label.trim()) return;
+    setBusy(true);
+    setError(null);
+    try {
+      await onSubmit(label.trim(), secret.trim());
+      onDone();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
   return (
     <Modal title={`Add key — ${providerName}`} onClose={onClose}>
-      <Field label="Label">
-        <input className={inputCls} style={inputStyle} value={label} onChange={(e) => setLabel(e.target.value)} />
-      </Field>
-      <Field label="API key (stored in a local secrets file)">
-        <input className={`${inputCls} mono`} type="password" style={inputStyle} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="sk-…" autoFocus />
-      </Field>
-      {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
-      <div className="flex justify-end gap-2">
-        <Button onClick={onClose}>Cancel</Button>
-        <Button
-          variant="primary"
-          disabled={busy || !secret.trim() || !label.trim()}
-          onClick={async () => {
-            setBusy(true);
-            setError(null);
-            try {
-              await onSubmit(label.trim(), secret.trim());
-              onDone();
-            } catch (e) {
-              setError((e as Error).message);
-            } finally {
-              setBusy(false);
-            }
-          }}
-        >
-          {busy ? "Storing…" : "Add key"}
-        </Button>
-      </div>
+      {/* A form, so Enter adds — the manual wizard's key step behaves the same way. */}
+      <form onSubmit={(e) => { e.preventDefault(); void submit(); }}>
+        <Field label="Label">
+          <input className={inputCls} style={inputStyle} value={label} onChange={(e) => setLabel(e.target.value)} />
+        </Field>
+        <Field label="API key (stored in a local secrets file)">
+          <input className={`${inputCls} mono`} type="password" style={inputStyle} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="sk-…" autoFocus />
+        </Field>
+        {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }} role="alert">{error}</p>}
+        <div className="flex justify-end gap-2">
+          <Button onClick={onClose}>Cancel</Button>
+          <Button variant="primary" type="submit" disabled={busy || !secret.trim() || !label.trim()}>
+            {busy ? "Storing…" : "Add key"}
+          </Button>
+        </div>
+      </form>
     </Modal>
   );
 }
@@ -322,6 +372,19 @@ let noticeListener: ((s: string) => void) | null = null;
 function setNotice(s: string) {
   noticeListener?.(s);
 }
+
+/** Age in conversation units, or undefined when there is no timestamp to speak of. */
+function relativeAge(ts: number | null | undefined): string | undefined {
+  if (!ts) return undefined;
+  const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (s < 60) return "just now";
+  const m = Math.round(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.round(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.round(h / 24)}d ago`;
+}
+
 function NoticeBar() {
   const [msg, setMsg] = useState<string | null>(null);
   useEffect(() => {
@@ -335,7 +398,11 @@ function NoticeBar() {
   }, []);
   if (!msg) return null;
   return (
-    <div className="fixed bottom-4 right-4 rounded border px-3 py-2 text-[12px] shadow-lg" style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}>
+    <div
+      className="fixed bottom-4 right-4 rounded border px-3 py-2 text-[12px] shadow-lg"
+      style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+      role="status"
+    >
       {msg}
     </div>
   );
@@ -367,7 +434,9 @@ function RepairModal({ providerId, onClose }: { providerId: string; onClose: () 
             <ul className="list-disc pl-5 text-[12px]" style={{ color: "var(--text-dim)" }}>
               {plan
                 ? plan.evidence.map((e, i) => <li key={i}>{e}</li>)
-                : [`${entry.evidence.errors} drift-class errors across ${entry.evidence.models.length} models in the last 15 min`]}
+                : entry.evidence.manual
+                  ? ["Started by a manual health check — no drift event is behind it. The checks below re-probed the adapter directly."]
+                  : [`${entry.evidence.errors} drift-class errors across ${entry.evidence.models.length} models in the last 15 min`]}
             </ul>
           </div>
           {checks.length > 0 && (
@@ -399,7 +468,9 @@ function RepairModal({ providerId, onClose }: { providerId: string; onClose: () 
               }}>
                 Approve & apply
               </Button>
-              <Button variant="danger" onClick={async () => { setBusy(true); await setProviderStatus(providerId, "enabled"); setBusy(false); onClose(); }}>
+              {/* The conservative choice, styled as one: `danger` here inverted the semantics —
+                  the destructive action on the card is plainer than the keep-everything one. */}
+              <Button onClick={async () => { setBusy(true); await setProviderStatus(providerId, "enabled"); setBusy(false); onClose(); }}>
                 Keep current adapter
               </Button>
             </div>
