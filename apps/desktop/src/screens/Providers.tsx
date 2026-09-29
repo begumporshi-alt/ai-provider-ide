@@ -9,6 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addKey, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
+  duplicateKeyHintExists, setProviderRotation,
   generatorAuditList, ledger, listManifestHistory, pendingRepairs, registry, rollbackManifest,
   setKeyStatus, setProviderStatus, testKey, refreshCatalog,
 } from "../store";
@@ -97,6 +98,23 @@ export function ProvidersScreen() {
                   <StatusDot health={health} />
                   <span className="text-[14px] font-semibold">{p.name}</span>
                   <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{p.baseUrl}</span>
+                  {/* Rotation lives beside the keys it governs — it was configurable in Settings
+                      only, which read as a global fact rather than a per-provider choice. */}
+                  <select
+                    className="mono rounded border px-1 py-0.5 text-[10px]"
+                    style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
+                    value={p.rotationStrategy}
+                    aria-label={`Rotation strategy for ${p.name}`}
+                    onChange={async (e) => {
+                      await setProviderRotation(p.id, e.target.value as typeof p.rotationStrategy);
+                      bump();
+                    }}
+                  >
+                    <option value="round_robin">round robin</option>
+                    <option value="lru">least recently used</option>
+                    <option value="priority">priority</option>
+                    <option value="cost_spread">cost spread</option>
+                  </select>
                   <div className="ml-auto flex items-center gap-2">
                     <label className="flex cursor-pointer items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
                       <input
@@ -245,6 +263,7 @@ export function ProvidersScreen() {
       )}
       {addingKeyFor && (
         <AddKeyModal
+          providerId={addingKeyFor}
           providerName={registry.getProvider(addingKeyFor)?.name ?? ""}
           onClose={() => setAddingKeyFor(null)}
           onDone={() => { setAddingKeyFor(null); bump(); }}
@@ -312,15 +331,16 @@ function FirstRunHero({ onAdd, onAuto }: { onAdd: () => void; onAuto: () => void
 }
 
 function AddKeyModal({
-  providerName, onClose, onDone, onSubmit,
+  providerId, providerName, onClose, onDone, onSubmit,
 }: {
-  providerName: string; onClose: () => void; onDone: () => void;
+  providerId: string; providerName: string; onClose: () => void; onDone: () => void;
   onSubmit: (label: string, secret: string) => Promise<void>;
 }) {
   const [label, setLabel] = useState("key-01");
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const duplicate = secret.trim().length >= 4 && duplicateKeyHintExists(providerId, secret);
   const submit = async () => {
     if (busy || !secret.trim() || !label.trim()) return;
     setBusy(true);
@@ -344,6 +364,13 @@ function AddKeyModal({
         <Field label="API key (stored in a local secrets file)">
           <input className={`${inputCls} mono`} type="password" style={inputStyle} value={secret} onChange={(e) => setSecret(e.target.value)} placeholder="sk-…" autoFocus />
         </Field>
+        {duplicate && (
+          <p className="mb-2 text-[12px]" style={{ color: "var(--warn)" }} role="status">
+            A key ending in the same four characters is already stored on this provider. If this
+            is the same secret pasted twice, the copy adds nothing to rotation — continue only if
+            the match is coincidence.
+          </p>
+        )}
         {error && <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }} role="alert">{error}</p>}
         <div className="flex justify-end gap-2">
           <Button onClick={onClose}>Cancel</Button>

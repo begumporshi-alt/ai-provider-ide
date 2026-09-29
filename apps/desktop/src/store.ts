@@ -717,6 +717,20 @@ export async function deleteProvider(id: string): Promise<void> {
  * refuses, the original error is still the one the operator needs. `registry.deleteKey` drops the
  * vault entry **and** the in-memory record, so a failed add leaves nothing on either side.
  */
+/**
+ * Whether a key with the same fingerprint hint already exists on the provider.
+ *
+ * The hint is the secret's last 4 characters — the only trace of a secret the webview ever
+ * holds, so it is the only thing a duplicate check can compare without breaking key-blindness
+ * (invariant 6). Four characters can collide by chance, so this is a *warning*, never a block:
+ * the operator sees "same last 4" and decides.
+ */
+export function duplicateKeyHintExists(providerId: string, secret: string): boolean {
+  const hint = secret.trim().slice(-4);
+  if (hint.length < 4) return false;
+  return registry.keysOf(providerId).some((k) => k.secretHint === hint);
+}
+
 export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
   const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });
