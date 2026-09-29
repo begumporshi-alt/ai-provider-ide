@@ -53,6 +53,11 @@ const MATRIX: Array<{ method: "GET" | "POST"; path: string; body?: string }> = [
   { method: "GET", path: "/openapi.json" },
   { method: "GET", path: "/v1/openapi.json" },
   { method: "GET", path: "/docs" },
+  // Gemini's native surface. The catalogue lives at /v1beta/models, and a generateContent
+  // route is the dialect's one unambiguous existence signal — an unauthenticated host answers
+  // 400 ("API key not valid"), which proves the route without spending anything.
+  { method: "GET", path: "/v1beta/models" },
+  { method: "POST", path: "/v1beta/models/probe-model:generateContent", body: "{}" },
 ];
 
 const BODY_CAP = 8 * 1024; // read at most this much of any probe body

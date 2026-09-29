@@ -7,6 +7,9 @@
  *   openai-compat:   a model list ({data:[{id,…}]}) at /models or /v1/models
  *                    AND a chat-completions endpoint that exists (any status — 401/405 proves it)
  *   anthropic-compat: a /messages or /v1/messages endpoint exists AND no chat-completions
+ *   gemini-compat:   a generateContent route exists, or the catalogue is shaped {models:[…]}
+ *                    (2026-09-29 — the dialect needs {{model}} in the path, hence the
+ *                    dedicated probe)
  *   openapi:         an OpenAPI document was found (Phase 3: recorded as evidence; deriving a
  *                    manifest from the spec is the Phase 4 generator's job)
  *   client-gate:     the gateway refused the CLIENT on every path (2026-09-29). Checked first,
@@ -41,8 +44,13 @@ interface Hit {
 function analyze(report: ProbeReport): Record<string, Hit> {
   const out: Record<string, Hit> = {};
   for (const a of report.attempts) {
-    // normalize /v1/x and /x to x
-    const key = a.path.replace(/^\/v1\//, "/").replace(/^\//, "");
+    // normalize /v1/x, /v1beta/x and /x to x — and keep the generateContent route distinguishable
+    // under models/, where Gemini's dial lives
+    const key = a.path
+      .replace(/^\/v1beta\/models\//, "models/")
+      .replace(/^\/v1beta\//, "/")
+      .replace(/^\/v1\//, "/")
+      .replace(/^\//, "");
     if (a.status === null) continue; // network error — no signal
     const exists = a.status !== 404 && a.status < 500;
     const ok = a.status >= 200 && a.status < 300;
@@ -60,6 +68,7 @@ export function fingerprint(report: ProbeReport): FingerprintResult {
   const models = h["models"];
   const chat = h["chat/completions"];
   const messages = h["messages"];
+  const generateContent = h["models/probe-model:generateContent"];
 
   // **A client gate is checked first, because it invalidates every other reading.**
   //
@@ -93,6 +102,13 @@ export function fingerprint(report: ProbeReport): FingerprintResult {
   }
   if (chat?.exists) evidence.push(`chat/completions endpoint exists (HTTP ${chat.ok ? "200" : "reachable"})`);
   if (messages?.exists) evidence.push("messages endpoint exists");
+  const geminiListLooksRight = Boolean(
+    models?.ok &&
+      models.modelsShape &&
+      JSON.stringify(models.modelsShape).includes("models"),
+  );
+  if (generateContent?.exists) evidence.push("generateContent endpoint exists (Gemini dialect)");
+  else if (geminiListLooksRight) evidence.push("model list responded with a {models:[…]} shape (Gemini catalogue)");
   if (report.openapiShape) evidence.push("OpenAPI document found");
 
   // openai-compat: model list with the right shape + chat/completions exists.
@@ -102,6 +118,12 @@ export function fingerprint(report: ProbeReport): FingerprintResult {
   // anthropic-compat: messages endpoint, no OpenAI chat surface.
   if (messages?.exists && !chat?.exists) {
     return { dialect: "anthropic-compat", template: BUILTIN_TEMPLATES["anthropic-compat"](report.baseUrl), evidence };
+  }
+  // gemini-compat: a generateContent route is the dialect's one unambiguous signal; a catalogue
+  // shaped {models:[…]} is the corroborating one. Checked after openai/anthropic — a host that
+  // serves OpenAI routes is openai-compat even if it also proxies Gemini.
+  if (generateContent?.exists || geminiListLooksRight) {
+    return { dialect: "gemini-compat", template: BUILTIN_TEMPLATES["gemini-compat"](report.baseUrl), evidence };
   }
   // OpenAI-shaped model list alone is still a strong openai signal (chat may 404 OPTIONS on
   // some gateways); template it and let the contract suite decide.

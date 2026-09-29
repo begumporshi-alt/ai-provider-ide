@@ -24,10 +24,17 @@
  */
 import { BUILTIN_TEMPLATES, type AdapterManifest } from "@aiprovider/router-core";
 
-/** The two dialects the custom form offers. Mirrors the `<select>` in `Providers.tsx`. */
-export type ManualDialect = "openai-chat-v1" | "anthropic-messages-v1";
+/** The three dialects the custom form offers. Mirrors the `<select>` in `ProvidersSetup.tsx`. */
+export type ManualDialect = "openai-chat-v1" | "anthropic-messages-v1" | "gemini-generate-v1";
 
-export type ManualAuthChoice = "bearer" | "x-api-key" | "custom";
+/** The builtin template each dialect is built from — one mapping, owned beside the templates. */
+const TEMPLATE_FOR_DIALECT: Record<ManualDialect, keyof typeof BUILTIN_TEMPLATES> = {
+  "openai-chat-v1": "openai-compat",
+  "anthropic-messages-v1": "anthropic-compat",
+  "gemini-generate-v1": "gemini-compat",
+};
+
+export type ManualAuthChoice = "bearer" | "x-api-key" | "x-goog-api-key" | "custom";
 
 /** One `provider.auth.headers` entry: a header name, and the prefix its value carries. */
 export type ManualAuthHeader = { name: string; prefix?: string };
@@ -76,6 +83,8 @@ export function authHeaderFor(
   prefix: string,
 ): ManualAuthHeader {
   if (auth === "x-api-key") return { name: "x-api-key" };
+  // Gemini reads the credential from this header, never from a Bearer prefix.
+  if (auth === "x-goog-api-key") return { name: "x-goog-api-key" };
   if (auth === "custom") return { name: header, prefix: prefix || undefined };
   return { name: "Authorization", prefix: "Bearer" };
 }
@@ -95,10 +104,7 @@ export function authHeaderFor(
  * it.
  */
 export function headersToLines(m: AdapterManifest, dialect: ManualDialect): string {
-  const template =
-    dialect === "anthropic-messages-v1"
-      ? BUILTIN_TEMPLATES["anthropic-compat"]("https://unused.invalid")
-      : BUILTIN_TEMPLATES["openai-compat"]("https://unused.invalid");
+  const template = BUILTIN_TEMPLATES[TEMPLATE_FOR_DIALECT[dialect]]("https://unused.invalid");
   const own = new Set(
     [
       ...Object.keys(template.endpoints.listModels?.headers ?? {}),
@@ -172,10 +178,7 @@ export function buildManualManifest(input: {
   extraHeaders?: Record<string, string>;
   now?: string;
 }): AdapterManifest {
-  const base =
-    input.dialect === "anthropic-messages-v1"
-      ? BUILTIN_TEMPLATES["anthropic-compat"](input.url)
-      : BUILTIN_TEMPLATES["openai-compat"](input.url);
+  const base = BUILTIN_TEMPLATES[TEMPLATE_FOR_DIALECT[input.dialect]](input.url);
 
   const extra = input.extraHeaders ?? {};
 

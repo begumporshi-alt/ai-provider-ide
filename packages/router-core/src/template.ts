@@ -33,8 +33,13 @@ export function renderTemplate<V extends Record<string, TemplateValue>>(
         throw new Error(`template placeholder {{${key}}} is required but missing for field ${field}`);
       }
       out[field] = value;
+    } else if (tpl !== null && typeof tpl === "object") {
+      // Nested JSON structure (Gemini nests its knobs under `generationConfig`): resolve
+      // placeholders inside too, so a dialect can shape its request without flattening facts
+      // about its own body into the grammar. Same values map, so no new trust surface.
+      out[field] = renderTemplate(tpl as Record<string, unknown>, values);
     } else {
-      out[field] = tpl; // JSON literal (number, bool, object, array)
+      out[field] = tpl; // JSON literal (number, bool)
     }
   }
   return out;

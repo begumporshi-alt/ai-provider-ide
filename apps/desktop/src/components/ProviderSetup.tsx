@@ -30,7 +30,7 @@ import {
 // the source of truth.
 const KNOWN = Object.keys(PROVIDER_PROFILES);
 
-type AuthChoice = "bearer" | "x-api-key" | "custom";
+type AuthChoice = "bearer" | "x-api-key" | "x-goog-api-key" | "custom";
 
 /** Everything the connection step collects. Shared by add and edit. */
 interface ConnectionDraft {
@@ -116,9 +116,18 @@ function ConnectionFields({
           placeholder="https://api.example.com/v1"
         />
         <span className="mt-1 block text-[11px] leading-snug" style={{ color: "var(--text-faint)" }}>
-          Include the API path. Most providers serve the API under <code>/v1</code> — use
-          <code> https://host/v1</code>, not <code>https://host</code>. Endpoint paths such as
-          <code> /models</code> are appended to this.
+          {d.dialect === "gemini-generate-v1" ? (
+            <>
+              Gemini-native hosts take the <b>host root</b> — <code>https://generativelanguage.googleapis.com</code>,
+              no path. The <code>/v1beta</code> prefix and the model path are the template's.
+            </>
+          ) : (
+            <>
+              Include the API path. Most providers serve the API under <code>/v1</code> — use
+              <code> https://host/v1</code>, not <code>https://host</code>. Endpoint paths such as
+              <code> /models</code> are appended to this.
+            </>
+          )}
         </span>
       </Field>
       <Field label="Auth type">
@@ -128,6 +137,7 @@ function ConnectionFields({
         >
           <option value="bearer">Bearer token (Authorization: Bearer …)</option>
           <option value="x-api-key">x-api-key header</option>
+          <option value="x-goog-api-key">x-goog-api-key header (Gemini)</option>
           <option value="custom">Custom header</option>
         </select>
       </Field>
@@ -156,6 +166,8 @@ function ConnectionFields({
         >
           <option value="openai-chat-v1">openai-chat-v1</option>
           <option value="anthropic-messages-v1">anthropic-messages-v1</option>
+          {/* The dialect that dials the model in the path; the baseUrl is the HOST ROOT for it. */}
+          <option value="gemini-generate-v1">gemini-generate-v1</option>
         </select>
       </Field>
       <Field label="Custom headers (optional)">
@@ -694,7 +706,11 @@ export function EditProviderModal({
         const name = header?.name ?? "";
         const prefix = header?.prefix ?? "";
         const dialect =
-          m.dialect === "anthropic-messages-v1" ? "anthropic-messages-v1" : "openai-chat-v1";
+          m.dialect === "anthropic-messages-v1"
+            ? "anthropic-messages-v1"
+            : m.dialect === "gemini-generate-v1"
+              ? "gemini-generate-v1"
+              : "openai-chat-v1";
         setDraft((d) => ({
           ...d,
           auth:

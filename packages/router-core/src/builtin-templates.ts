@@ -1,6 +1,6 @@
 /**
- * builtin-templates (ARCHITECTURE.md L1) — static dialect manifests for the two grammars the
- * v1.1 spec freezes: openai-compat and anthropic-compat. Provider profiles are thin overlays
+ * builtin-templates (ARCHITECTURE.md L1) — static dialect manifests for the grammars the
+ * v1.1 spec freezes: openai-compat, anthropic-compat and gemini-compat. Provider profiles are thin overlays
  * (baseUrl + quirks) on top. These are DATA, not code paths — a new OpenAI-compatible provider
  * is a profile or a wizard entry, never a release.
  */
@@ -140,9 +140,69 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
   };
 }
 
+/**
+ * Gemini's native GenerateContent dialect. The model rides in the PATH (`{{model}}`), streaming
+ * happens at a different endpoint (`:streamGenerateContent?alt=sse`) than the unary call, and the
+ * usage block speaks its own field names — all three are grammar features this dialect is the
+ * reason for. Text only, no tools in v1: function calling exists upstream but its parts-framing
+ * has no declarative mapping yet, so the template simply never reports tool calls.
+ */
+function geminiCompat(baseUrl: string): AdapterManifest {
+  return {
+    manifestVersion: 1,
+    kind: "declarative",
+    dialect: "gemini-generate-v1",
+    provider: {
+      baseUrl,
+      auth: { headers: [{ name: "x-goog-api-key" }] },
+    },
+    endpoints: {
+      // `name` entries look like `models/gemini-2.0-flash`, which is exactly the path segment
+      // `{{model}}` needs — `/v1beta/{{model}}:generateContent` reassembles without surgery.
+      listModels: { method: "GET", path: "/v1beta/models", map: { models: "$.models[*].name", raw: "$.models[*]" } },
+      generateText: {
+        method: "POST",
+        path: "/v1beta/{{model}}:generateContent",
+        streamPath: "/v1beta/{{model}}:streamGenerateContent?alt=sse",
+        requestTemplate: {
+          // GenerationConfig carries the knobs the dialect names differently; `maxOutputTokens`
+          // is required to be nested, not top-level.
+          contents: "{{messages}}",
+          generationConfig: {
+            maxOutputTokens: "{{maxTokens?}}",
+            temperature: "{{temperature?}}",
+          },
+        },
+        responseMap: {
+          // `parts` is an array; selectText joins the text parts the same way it does for
+          // Anthropic's content blocks.
+          text: "$.candidates[0].content.parts",
+          usage: "$.usageMetadata",
+          usageKeys: {
+            prompt: "promptTokenCount",
+            completion: "candidatesTokenCount",
+            cached: "cachedContentTokenCount",
+          },
+        },
+        stream: {
+          protocol: "sse",
+          chunkMap: { delta: "$.candidates[0].content.parts" },
+          errorMap: { "$.error": "PASS_THROUGH" },
+          // No [DONE] sentinel: the server closes the SSE when the turn is over, and
+          // finishReason arrives on the last content chunk.
+          stopWhen: { path: "$.candidates[0].finishReason", equals: "STOP" },
+        },
+      },
+    },
+    capabilities: { text: true, image: false },
+    provenance: { origin: "builtin-template", generatorModel: null, createdAt: "1970-01-01T00:00:00Z" },
+  };
+}
+
 export const BUILTIN_TEMPLATES = {
   "openai-compat": openaiCompat,
   "anthropic-compat": anthropicCompat,
+  "gemini-compat": geminiCompat,
 } as const;
 
 export type BuiltinTemplateId = keyof typeof BUILTIN_TEMPLATES;
@@ -233,6 +293,7 @@ export const PROVIDER_PROFILE_LABELS: Record<string, string> = {
 const TEMPLATE_BY_DIALECT: Record<string, BuiltinTemplateId> = {
   "openai-chat-v1": "openai-compat",
   "anthropic-messages-v1": "anthropic-compat",
+  "gemini-generate-v1": "gemini-compat",
 };
 
 export function profileForBaseUrl(

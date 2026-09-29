@@ -86,13 +86,38 @@ const TOOL_CALL_STREAM = z.object({
 
 export const GENERATE_TEXT_ENDPOINT = z.object({
   method: z.literal("POST"),
+  // May carry a `{{model}}` placeholder (Gemini dials `/v1beta/models/{model}:generateContent`);
+  // the interpreter substitutes the caller's model, URL-encoded. `streamPath` (below) carries one
+  // the same way.
   path: z.string(),
   headers: z.record(z.string()).optional(), // per-endpoint static request headers (v1.1)
-  requestTemplate: z.record(z.string()), // values are "{{x}}", "{{x?}}", or literals
+  // Values are "{{x}}", "{{x?}}", literals, or NESTED STRUCTURES containing them (Gemini's
+  // generationConfig): renderTemplate resolves placeholders at any depth. Top-level keys stay
+  // whitelist-bound (REQUEST_FIELD_WHITELIST); nesting adds shape, not trust.
+  requestTemplate: z.record(z.unknown()),
+  // **A dialect may stream at a different endpoint than it dials unarily.** Gemini's unary
+  // generateText is `:generateContent`; its SSE stream is
+  // `:streamGenerateContent?alt=sse` — same endpoint family, different path, and no body field
+  // can express that difference. When the caller asks to stream and this is set, the
+  // interpreter dials this path instead of `path`.
+  streamPath: z.string().optional(),
   // `toolCalls` (v1.1 amendment 2026-09-17): where a real tool call sits in the response.
   // Optional and dialect-specific — a manifest that omits it simply never reports tool
   // calls, which is the pre-amendment behaviour.
-  responseMap: z.object({ text: Selector, usage: Selector.optional(), toolCalls: Selector.optional() }),
+  responseMap: z.object({
+    text: Selector,
+    usage: Selector.optional(),
+    toolCalls: Selector.optional(),
+    // **The usage block's own field names, when the dialect does not speak OpenAI's.** The
+    // interpreter reads `prompt_tokens` / `completion_tokens` off whatever object `usage`
+    // selects; Gemini's usageMetadata says `promptTokenCount` / `candidatesTokenCount`. A
+    // dialect without this override simply has OpenAI field names — and one with unmatched
+    // names would report zero tokens forever, silently zeroing cost and defeating any spend cap.
+    // Values are FIELD NAMES inside the usage object, not `$` selectors.
+    usageKeys: z
+      .object({ prompt: z.string(), completion: z.string(), cached: z.string().optional() })
+      .optional(),
+  }),
   stream: z
     .object({
       protocol: z.literal("sse"),

@@ -132,7 +132,14 @@ pub struct ModelMap {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TextEndpoint {
+    /// May carry a `{{model}}` placeholder (Gemini dials `/v1beta/models/{model}:generateContent`);
+    /// the interpreter substitutes the caller's model, URL-encoded.
     pub path: String,
+    /// A dialect may stream at a different endpoint than it dials unarily (Gemini:
+    /// `:generateContent` vs `:streamGenerateContent?alt=sse`). When the caller asks to stream
+    /// and this is set, the interpreter dials this path instead of `path`.
+    #[serde(default)]
+    pub stream_path: Option<String>,
     /// Per-endpoint static request headers (v1.1). Defaulted to empty rather than `Option`:
     /// `renderHeaders` returns `{}` for `undefined` and for `{}` alike, so the two inputs are the
     /// same input and two spellings of one state would be a distinction with no reader.
@@ -158,6 +165,21 @@ pub struct ResponseMap {
     /// reports them, which is the pre-amendment behaviour.
     #[serde(default)]
     pub tool_calls: Option<String>,
+    /// The usage block's own field names, when the dialect does not speak OpenAI's
+    /// (`prompt_tokens` / `completion_tokens`). Gemini's usageMetadata says
+    /// `promptTokenCount` / `candidatesTokenCount`; without this override such a dialect
+    /// reported zero tokens forever. Field NAMES inside the usage object, not `$` selectors.
+    #[serde(default)]
+    pub usage_keys: Option<UsageKeys>,
+}
+
+/// The usage field names a dialect names its counts by. See [`ResponseMap::usage_keys`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct UsageKeys {
+    pub prompt: String,
+    pub completion: String,
+    #[serde(default)]
+    pub cached: Option<String>,
 }
 
 /// The SSE shape (v1.1).

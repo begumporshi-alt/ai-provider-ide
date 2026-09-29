@@ -97,9 +97,10 @@ describe("A7 zero-AI onboarding bootstrap", () => {
     const orch = new OnboardingOrchestrator(harness.http, memoryPersistence());
     const report = await orch.start({ name: "Mock Provider", baseUrl: MOCK_BASE });
 
-    // Every probe crossed real HTTP; the OpenAI surface answered.
-    expect(report.attempts).toHaveLength(9);
-    expect(report.attempts.filter((a) => a.status !== null)).toHaveLength(9);
+    // Every probe crossed real HTTP; the OpenAI surface answered. (11 attempts since the
+    // gemini-compat additions — the matrix also asks /v1beta/models and :generateContent.)
+    expect(report.attempts).toHaveLength(11);
+    expect(report.attempts.filter((a) => a.status !== null)).toHaveLength(11);
     expect(report.attempts.find((a) => a.path === "/models")!.status).toBe(200);
     expect(report.attempts.find((a) => a.path === "/chat/completions")!.status).toBe(200);
 

@@ -806,6 +806,7 @@ export function OnboardingScreen() {
                 <option value="">keep detected: {dialect}</option>
                 <option value="openai-compat">OpenAI-compatible (openai-chat-v1)</option>
                 <option value="anthropic-compat">Anthropic-compatible (anthropic-messages-v1)</option>
+                <option value="gemini-compat">Gemini-native (gemini-generate-v1)</option>
               </select>
               <Button
                 disabled={!override || overriding || busy}

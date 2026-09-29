@@ -213,7 +213,11 @@ const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
  * A scalar path is still returned unchanged, so every non-anthropic manifest is unaffected.
  */
 function selectText(json: unknown, path: string): string | undefined {
-  const v = selectOne(json, path);
+  return joinTextParts(selectOne(json, path));
+}
+
+/** Join a selected value into text — a string as-is, a mixed block array by its text parts. */
+function joinTextParts(v: unknown): string | undefined {
   if (typeof v === "string") return v;
   if (!Array.isArray(v)) return undefined;
   const parts: string[] = [];
@@ -229,6 +233,39 @@ function selectText(json: unknown, path: string): string | undefined {
     if (typeof o.text === "string") parts.push(o.text);
   }
   return parts.length ? parts.join("") : undefined;
+}
+
+/**
+ * Substitute `{{model}}` in an endpoint path (Gemini dials `/v1beta/models/{model}:generateContent`).
+ *
+ * Everything encodeURIComponent encodes is encoded EXCEPT `/`: Gemini's own catalogue names its
+ * models `models/gemini-2.0-flash`, and the slash is the path — encoding it would produce
+ * `models%2Fgemini-…` and a 404. The ids come from the provider's own catalogue through the
+ * manifest's own mapping, and the substitution cannot cross hosts (no scheme or authority is in
+ * the substituted segment's reach), so a hostile id can at most redirect a request to another
+ * endpoint of the same provider it came from.
+ */
+function renderPath(path: string, model: string): string {
+  // split/join, not replaceAll: this package compiles under the desktop app's older lib target
+  return path.split("{{model}}").join(encodeURIComponent(model).split("%2F").join("/"));
+}
+
+/**
+ * Read a usage block with dialect-specific field names.
+ *
+ * The field names were hardcoded OpenAI-style, so Gemini's `usageMetadata`
+ * (`promptTokenCount` / `candidatesTokenCount`) reported zero tokens forever — silently zeroing
+ * cost and defeating any spend cap. A manifest without `usageKeys` keeps the OpenAI names.
+ */
+function usageOf(
+  u: Record<string, unknown>,
+  keys?: { prompt: string; completion: string; cached?: string },
+): { pt?: number; ct?: number; cc?: number } {
+  const num = (v: unknown) => (typeof v === "number" ? v : undefined);
+  const pt = num(u[keys?.prompt ?? "prompt_tokens"]);
+  const ct = num(u[keys?.completion ?? "completion_tokens"]);
+  const cc = keys?.cached ? num(u[keys.cached]) : readCachedTokens(u);
+  return { pt, ct, cc };
 }
 
 function joinUrl(baseUrl: string, path: string): string {
@@ -388,7 +425,10 @@ export class ManifestInterpreter implements AdapterInstance {
     if (args.stream && wantsUsage) {
       body["stream_options"] = { include_usage: true };
     }
-    const url = joinUrl(this.m.provider.baseUrl, ep.path);
+    // A dialect may stream at a different endpoint than it dials unarily (Gemini:
+    // `:generateContent` vs `:streamGenerateContent?alt=sse`).
+    const dialedPath = args.stream && ep.streamPath ? ep.streamPath : ep.path;
+    const url = joinUrl(this.m.provider.baseUrl, renderPath(dialedPath, args.model));
     const res = await this.ctx.http.request({
       url,
       method: "POST",
@@ -408,9 +448,7 @@ export class ManifestInterpreter implements AdapterInstance {
       if (args.onUsage && ep.responseMap.usage) {
         const u = selectOne(json, ep.responseMap.usage) as Record<string, unknown> | undefined;
         if (u && typeof u === "object") {
-          const pt = u["prompt_tokens"];
-          const ct = u["completion_tokens"];
-          const cc = readCachedTokens(u);
+          const { pt, ct, cc } = usageOf(u, ep.responseMap.usageKeys);
           // `cc !== undefined` is part of the guard, not an afterthought: a provider that reports
           // ONLY cache fields still has something to record, and dropping the whole callback for
           // want of a `prompt_tokens` would lose the one number this path exists to capture.
@@ -491,15 +529,15 @@ export class ManifestInterpreter implements AdapterInstance {
             collectToolCallDeltas(pending, selectOne(json, ep.stream.chunkMap.toolCalls));
           }
         }
-        const delta = selectOne(json, ep.stream.chunkMap.delta);
-        if (typeof delta === "string" && delta) yield delta;
+        // A chunk delta may be a block ARRAY, not a string (Gemini's parts): join it the same
+        // way the unary path does, or a dialect whose delta is structured yields nothing.
+        const delta = joinTextParts(selectOne(json, ep.stream.chunkMap.delta));
+        if (delta) yield delta;
         // Collect usage whenever present on any chunk (OpenAI: on final choice; Anthropic: on message_delta).
         if (ep.responseMap.usage) {
           const chunkUsage = selectOne(json, ep.responseMap.usage) as Record<string, unknown> | undefined;
           if (chunkUsage && typeof chunkUsage === "object") {
-            const pt = chunkUsage["prompt_tokens"];
-            const ct = chunkUsage["completion_tokens"];
-            const cc = readCachedTokens(chunkUsage);
+            const { pt, ct, cc } = usageOf(chunkUsage, ep.responseMap.usageKeys);
             if (typeof pt === "number" || typeof ct === "number" || cc !== undefined) {
               lastUsage = {
                 ...(lastUsage ?? {}),
@@ -559,7 +597,7 @@ export class ManifestInterpreter implements AdapterInstance {
       ...this.ctx.vars,
     });
     // `endpointUrl`, not `url`: line below binds `url` to the provider's returned imageUrl.
-    const endpointUrl = joinUrl(this.m.provider.baseUrl, ep.path);
+    const endpointUrl = joinUrl(this.m.provider.baseUrl, renderPath(ep.path, args.model));
     const res = await this.ctx.http.request({
       url: endpointUrl,
       method: "POST",

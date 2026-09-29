@@ -228,6 +228,61 @@ pub fn anthropic_compat(base_url: &str) -> Value {
     })
 }
 
+/// The Gemini native GenerateContent dialect (`builtin-templates.ts` `geminiCompat`).
+///
+/// The three grammar features this dialect is the reason for: `{{model}}` in the endpoint path,
+/// `streamPath` (its SSE stream lives at a different endpoint than the unary call), and
+/// `usageKeys` (its usageMetadata does not speak OpenAI's field names). The model ids from its
+/// own catalogue carry their `models/` prefix, which is exactly the path segment `{{model}}`
+/// needs. Base url is the HOST ROOT — the `/v1beta` prefix lives in the paths.
+pub fn gemini_compat(base_url: &str) -> Value {
+    json!({
+        "manifestVersion": 1,
+        "kind": "declarative",
+        "dialect": "gemini-generate-v1",
+        "provider": {
+            "baseUrl": base_url,
+            "auth": { "headers": [{ "name": "x-goog-api-key" }] }
+        },
+        "endpoints": {
+            "listModels": {
+                "method": "GET",
+                "path": "/v1beta/models",
+                "map": { "models": "$.models[*].name", "raw": "$.models[*]" }
+            },
+            "generateText": {
+                "method": "POST",
+                "path": "/v1beta/{{model}}:generateContent",
+                "streamPath": "/v1beta/{{model}}:streamGenerateContent?alt=sse",
+                "requestTemplate": {
+                    "contents": "{{messages}}",
+                    "generationConfig": {
+                        "maxOutputTokens": "{{maxTokens?}}",
+                        "temperature": "{{temperature?}}"
+                    }
+                },
+                "responseMap": {
+                    "text": "$.candidates[0].content.parts",
+                    "usage": "$.usageMetadata",
+                    "usageKeys": {
+                        "prompt": "promptTokenCount",
+                        "completion": "candidatesTokenCount",
+                        "cached": "cachedContentTokenCount"
+                    }
+                },
+                "stream": {
+                    "protocol": "sse",
+                    "chunkMap": { "delta": "$.candidates[0].content.parts" },
+                    "errorMap": { "$.error": "PASS_THROUGH" },
+                    "stopWhen": { "path": "$.candidates[0].finishReason", "equals": "STOP" }
+                }
+            }
+        },
+        "capabilities": { "text": true, "image": false },
+        "provenance": provenance()
+    })
+}
+
 fn provenance() -> Value {
     json!({
         "origin": "builtin-template",

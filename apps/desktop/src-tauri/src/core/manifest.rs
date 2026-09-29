@@ -233,6 +233,27 @@ impl From<&ManifestHttpError> for AttemptError {
 ///
 /// An empty `path` yields a trailing `/`, which is what the source produces and what a
 /// `GET https://host/` request needs.
+/// Substitute `{{model}}` in an endpoint path (Gemini dials `/v1beta/models/{model}:generateContent`).
+/// The TS mirror is `manifest-interpreter.ts` `renderPath`; both URL-encode the model.
+pub fn render_path(path: &str, model: &str) -> String {
+    path.replace("{{model}}", &urlencode_component(model))
+}
+
+/// Percent-encode a path segment the way `encodeURIComponent` does (the reserved set it leaves
+/// alone: `A-Z a-z 0-9 - _ . ! ~ * ' ( )`).
+fn urlencode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        let keep = b.is_ascii_alphanumeric() || b == b'/' || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        if keep {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 pub fn join_url(base_url: &str, path: &str) -> String {
     let base = base_url.trim_end_matches('/');
     if path.starts_with('/') {

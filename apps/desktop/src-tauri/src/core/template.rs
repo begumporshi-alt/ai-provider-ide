@@ -116,8 +116,15 @@ pub fn render_template(
     let mut out = Map::new();
 
     for (field, tpl) in template {
-        // A non-string template value is a JSON literal — a number, a bool, an object, an array —
-        // and is copied through untouched. Only strings can carry a placeholder.
+        // A nested object resolves recursively (Gemini nests its knobs under generationConfig):
+        // same values map, so nesting adds shape, not trust. Arrays and scalars are literals.
+        if let Value::Object(nested) = tpl {
+            let rendered = render_template(nested, values)?;
+            out.insert(field.clone(), Value::Object(rendered));
+            continue;
+        }
+        // A non-string template value is a JSON literal — a number, a bool, an array — and is
+        // copied through untouched. Only strings can carry a placeholder.
         let Value::String(text) = tpl else {
             out.insert(field.clone(), tpl.clone());
             continue;

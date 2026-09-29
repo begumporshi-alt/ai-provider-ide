@@ -90,14 +90,15 @@ use crate::core::http_port::{HttpError, HttpMethod, HttpPort, HttpRequest, HttpR
 use crate::core::jsonpath::{select_all, select_one, JsonPathError};
 use crate::core::manifest::{
     auth_headers, collect_tool_call_deltas, emit_tool_calls, join_url, js_string_coerce,
-    read_cached_tokens, render_headers, retry_after_from, truncate_utf16, ManifestHttpError,
-    PendingCalls,
+    read_cached_tokens, render_headers, render_path, retry_after_from, truncate_utf16,
+    ManifestHttpError, PendingCalls,
 };
 use crate::core::manifest_view::{
     Capabilities, Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallStream,
 };
 use crate::core::modality;
 use crate::core::template::{is_js_whitespace, render_template};
+use crate::core::manifest_view::UsageKeys;
 use crate::core::usage::UsageTokens;
 
 /// The dialect whose servers omit usage on a stream unless they are asked for it.
@@ -353,7 +354,7 @@ impl ManifestInterpreter {
             .http
             .request(
                 HttpRequest {
-                    url: join_url(&self.view.provider.base_url, &ep.path),
+                    url: join_url(&self.view.provider.base_url, &render_path(&ep.path, &args.model)),
                     method: HttpMethod::Post,
                     headers: json_headers(&self.view, &ep.headers, &self.ctx.vars),
                     body: Some(serialize(&body)),
@@ -431,6 +432,9 @@ impl ManifestInterpreter {
             let wants_usage = wants_usage(&self.view, ep);
 
             let mut values = Map::new();
+            // A dialect may put the model in the PATH (`{{model}}`), so the segment survives the
+            // move into the template values.
+            let model_for_path = model.clone();
             values.insert("model".to_string(), Value::String(model));
             values.insert("messages".to_string(), Value::Array(messages.to_vec()));
             values.insert("stream".to_string(), Value::Bool(stream));
@@ -527,12 +531,18 @@ impl ManifestInterpreter {
                 }
             }
 
+            // A dialect may stream at a different endpoint than it dials unarily (Gemini:
+            // `:generateContent` vs `:streamGenerateContent?alt=sse`).
+            let dialed_path = match (streaming, ep.stream_path.as_deref()) {
+                (true, Some(p)) => p,
+                _ => &ep.path,
+            };
             let res = self
                 .ctx
                 .http
                 .request(
                     HttpRequest {
-                        url: join_url(&self.view.provider.base_url, &ep.path),
+                        url: join_url(&self.view.provider.base_url, &render_path(dialed_path, &model_for_path)),
                         method: HttpMethod::Post,
                         headers: json_headers(&self.view, &ep.headers, &self.ctx.vars),
                         body: Some(serialize(&body)),
@@ -798,6 +808,42 @@ fn attempt_error_from(e: HttpError) -> AttemptError {
 }
 
 /// Read a unary text response and hand back the one-chunk stream.
+/// Read a response's text, allowing the path to point at a **mixed block array** rather than a
+/// string (Anthropic's `content`, Gemini's `parts`). Rust mirror of the TS `selectText`, which
+/// exists because which block leads is the provider's choice — `$.content[0].text` is `undefined`
+/// on a perfectly good reasoning-model response.
+fn select_text(json: &Value, path: &str) -> Result<Option<String>, JsonPathError> {
+    const TEXT_BLOCK_TYPES: [&str; 3] = ["text", "input_text", "output_text"];
+    let v = match select_one(json, path)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    if let Some(s) = v.as_str() {
+        return Ok(Some(s.to_string()));
+    }
+    let Value::Array(items) = v else {
+        return Ok(None);
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for item in items.iter() {
+        if let Some(s) = item.as_str() {
+            parts.push(s.to_string());
+            continue;
+        }
+        let Some(o) = item.as_object() else { continue };
+        // An untyped block with a `text` field is still text (some dialects omit `type`).
+        if let Some(t) = o.get("type").and_then(Value::as_str) {
+            if !TEXT_BLOCK_TYPES.contains(&t) {
+                continue;
+            }
+        }
+        if let Some(t) = o.get("text").and_then(Value::as_str) {
+            parts.push(t.to_string());
+        }
+    }
+    Ok(if parts.is_empty() { None } else { Some(parts.join("")) })
+}
+
 fn unary_text<'a>(
     ep: &TextEndpoint,
     body: &str,
@@ -808,10 +854,7 @@ fn unary_text<'a>(
 
     // `if (typeof text === "string") yield text;` — a miss yields nothing, and an empty string *is*
     // yielded, because the guard is on the type and not on truthiness.
-    let chunk = select_one(&json, &ep.response_map.text)
-        .map_err(|_| AttemptError::Transport)?
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let chunk = select_text(&json, &ep.response_map.text).map_err(|_| AttemptError::Transport)?;
 
     // The selector runs whenever the manifest declares the path, even with no callback — it is an
     // argument, so it is evaluated before `emitToolCalls` can return early.
@@ -829,7 +872,7 @@ fn unary_text<'a>(
     // source's `if (args.onUsage && ep.responseMap.usage)`.
     let usage = match (&ep.response_map.usage, on_usage.is_some()) {
         (Some(path), true) => match select_one(&json, path).map_err(|_| AttemptError::Transport)? {
-            Some(Value::Object(map)) => read_usage(map),
+            Some(Value::Object(map)) => read_usage(map, ep.response_map.usage_keys.as_ref()),
             _ => None,
         },
         _ => None,
@@ -843,10 +886,20 @@ fn unary_text<'a>(
 /// The three-part guard is the source's (`:321`): a provider that reports **only** cache fields
 /// still has something to record, and dropping the whole callback for want of `prompt_tokens` would
 /// lose the one number migration 0015 exists to capture.
-fn read_usage(map: &Map<String, Value>) -> Option<UsageTokens> {
-    let prompt = map.get("prompt_tokens").and_then(Value::as_u64);
-    let completion = map.get("completion_tokens").and_then(Value::as_u64);
-    let cached = read_cached_tokens(map);
+fn read_usage(map: &Map<String, Value>, keys: Option<&UsageKeys>) -> Option<UsageTokens> {
+    // Field names default to OpenAI's; a dialect with `usageKeys` names its own (Gemini's
+    // usageMetadata says promptTokenCount / candidatesTokenCount — the hardcoded names reported
+    // zero tokens forever for such a dialect).
+    let (pk, ck) = match keys {
+        Some(k) => (k.prompt.as_str(), k.completion.as_str()),
+        None => ("prompt_tokens", "completion_tokens"),
+    };
+    let prompt = map.get(pk).and_then(Value::as_u64);
+    let completion = map.get(ck).and_then(Value::as_u64);
+    let cached = match keys.and_then(|k| k.cached.as_deref()) {
+        Some(name) => map.get(name).and_then(Value::as_u64),
+        None => read_cached_tokens(map),
+    };
     if prompt.is_none() && completion.is_none() && cached.is_none() {
         return None;
     }
@@ -870,6 +923,8 @@ struct StreamPlan {
     stop_when: Option<Condition>,
     finish: Option<String>,
     usage_path: Option<String>,
+    /// The usage block's own field names, when the dialect does not speak OpenAI's.
+    usage_keys: Option<UsageKeys>,
     want_tool_calls: bool,
     wants_usage: bool,
 }
@@ -884,6 +939,7 @@ impl StreamPlan {
             stop_when: spec.stop_when.clone(),
             finish: spec.finish.clone(),
             usage_path: ep.response_map.usage.clone(),
+            usage_keys: ep.response_map.usage_keys.clone(),
             // `Boolean(args.onToolCall && (chunkMap.toolCalls || tcs))` — no sink, no work.
             want_tool_calls: has_tool_sink
                 && (spec.chunk_map.tool_calls.is_some() || spec.tool_call_stream.is_some()),
@@ -1028,13 +1084,11 @@ impl TextStream<'_> {
             }
         }
 
-        // ---- the text delta.
-        let delta = match select_one(&json, &self.plan.delta) {
-            Ok(found) => found
-                .and_then(Value::as_str)
-                // `&& delta` — truthiness again, so an empty delta is not yielded.
-                .filter(|s| !s.is_empty())
-                .map(str::to_string),
+        // ---- the text delta. A block ARRAY (Gemini's parts), not only a string — joined the
+        // same way the unary path joins it, or a structured delta yields nothing at all.
+        let delta = match select_text(&json, &self.plan.delta) {
+            // `&& delta` — truthiness again, so an empty delta is not yielded.
+            Ok(d) => d.filter(|s| !s.is_empty()),
             Err(_) => return LineStep::Fail,
         };
 
@@ -1045,9 +1099,16 @@ impl TextStream<'_> {
                 Err(_) => return LineStep::Fail,
             };
             if let Some(Value::Object(map)) = selected {
-                let prompt = map.get("prompt_tokens").and_then(Value::as_u64);
-                let completion = map.get("completion_tokens").and_then(Value::as_u64);
-                let cached = read_cached_tokens(map);
+                let (pk, ck) = match self.plan.usage_keys.as_ref() {
+                    Some(k) => (k.prompt.as_str(), k.completion.as_str()),
+                    None => ("prompt_tokens", "completion_tokens"),
+                };
+                let prompt = map.get(pk).and_then(Value::as_u64);
+                let completion = map.get(ck).and_then(Value::as_u64);
+                let cached = match self.plan.usage_keys.as_ref().and_then(|k| k.cached.as_deref()) {
+                    Some(name) => map.get(name).and_then(Value::as_u64),
+                    None => read_cached_tokens(map),
+                };
                 if prompt.is_some() || completion.is_some() || cached.is_some() {
                     let previous = self.last_usage.unwrap_or_default();
                     self.last_usage = Some(PartialUsage {
@@ -2153,6 +2214,57 @@ mod tests {
         assert_eq!(out, vec![Ok("done".to_string())], "the trailing chunks carry no delta");
         let usage = seen.lock().unwrap().expect("the trailing usage chunk was read");
         assert_eq!(usage.counts(), (120, 34));
+    }
+
+    /// The Gemini dialect exercises all three grammar features at once: `{{model}}` in the path
+    /// (with the catalogue's own `models/` prefix kept literal), `usageKeys` (its usageMetadata
+    /// does not speak OpenAI's field names — the hardcoded names reported 0/0 forever), and a
+    /// text response that is a block ARRAY (`select_text`).
+    #[tokio::test]
+    async fn a_gemini_dialect_dials_the_model_in_the_path_and_reads_its_own_usage_names() {
+        let manifest = crate::core::builtin_templates::gemini_compat("https://g.test");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"candidates":[{"content":{"parts":[{"text":"hello"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":10,"candidatesTokenCount":4}}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+
+        let seen: Arc<Mutex<Option<UsageTokens>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let mut on_usage = move |u: UsageTokens| *sink.lock().unwrap() = Some(u);
+        let mut args = text_args("models/gemini-2.0-flash");
+        args.stream = false;
+        args.on_usage = Some(&mut on_usage);
+
+        let out = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        assert_eq!(out, vec![Ok("hello".to_string())], "the parts ARRAY is joined as text");
+        assert_eq!(
+            http.only_request().url,
+            "https://g.test/v1beta/models/gemini-2.0-flash:generateContent",
+            "the model rides in the path, slash kept literal"
+        );
+        let usage = seen.lock().unwrap().expect("the dialect's usage names were read");
+        assert_eq!(usage.counts(), (10, 4));
+    }
+
+    /// Streaming dials `streamPath`, not `path` — Gemini's SSE stream lives at a different
+    /// endpoint than its unary call, and no body field can express that difference.
+    #[tokio::test]
+    async fn a_gemini_stream_dials_the_stream_path() {
+        let manifest = crate::core::builtin_templates::gemini_compat("https://g.test");
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            r#"data: {"candidates":[{"content":{"parts":[{"text":"Hi"}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[{"text":" there"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":9,"candidatesTokenCount":3}}"#,
+        ])]);
+        let interp = interpreter(&manifest, http.clone());
+
+        let out = drain(interp.generate_text("key:k1", text_args("models/gemini-2.0-flash"), &Cancel::new()).await.unwrap()).await;
+
+        assert_eq!(out, vec![Ok("Hi".to_string()), Ok(" there".to_string())]);
+        let url = http.only_request().url;
+        assert!(url.contains(":streamGenerateContent?alt=sse"), "streaming dialed {url}");
+        assert!(url.contains("/models/gemini-2.0-flash:"));
     }
 
     /// `finish_reason` of the literal string `"null"` is not a finish — the source's
