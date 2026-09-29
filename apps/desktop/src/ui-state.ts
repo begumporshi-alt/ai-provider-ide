@@ -6,11 +6,20 @@ import { create } from "zustand";
 
 export type ScreenId = "providers" | "models" | "assistant" | "activity" | "context" | "history" | "skills" | "agents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
+export interface OnboardingPrefill {
+  name: string;
+  baseUrl: string;
+  docsUrl?: string;
+}
+
 interface UiState {
   screen: ScreenId;
   tick: number;
+  /** One-shot Connect-form prefill for the auto-setup wizard (e.g. "re-run setup against a new URL"). */
+  onboardingPrefill?: OnboardingPrefill;
   go: (s: ScreenId) => void;
   bump: () => void;
+  setOnboardingPrefill: (p?: OnboardingPrefill) => void;
 }
 
 export const useUi = create<UiState>((set) => ({
@@ -18,4 +27,5 @@ export const useUi = create<UiState>((set) => ({
   tick: 0,
   go: (screen) => set({ screen }),
   bump: () => set((s) => ({ tick: s.tick + 1 })),
+  setOnboardingPrefill: (onboardingPrefill) => set({ onboardingPrefill }),
 }));

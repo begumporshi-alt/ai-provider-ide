@@ -92,6 +92,16 @@ export function OnboardingScreen() {
    */
   const lastInput = useRef<{ name: string; baseUrl: string; apiKey: string; docsUrl?: string } | null>(null);
 
+  // A navigation handoff (e.g. the editor's "re-run setup against the new URL") prefills the
+  // Connect form once and is consumed — a stale prefill must not haunt a later visit.
+  useEffect(() => {
+    const handed = useUi.getState().onboardingPrefill;
+    if (handed) {
+      setPrefill(handed);
+      useUi.getState().setOnboardingPrefill(undefined);
+    }
+  }, []);
+
   // resume support (§2.1): offer the latest non-terminal session
   useEffect(() => {
     invoke<{ id: number; inputJson: string; detailJson: string | null; state: string } | null>("onboarding_latest_active")

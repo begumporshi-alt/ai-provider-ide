@@ -17,9 +17,10 @@ import { useEffect, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
 import { PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, type AdapterManifest } from "@aiprovider/router-core";
 import {
-  adapters, addKey, addManualModel, addProvider, catalog, refreshCatalog, registry,
+  adapters, addKey, duplicateKeyHintExists, addManualModel, addProvider, catalog, refreshCatalog, registry,
   removeManualModel, setProviderStatus, testModel, uniqueSlug, updateProvider,
 } from "../store";
+import { useUi } from "../ui-state";
 import { Button, Field, Modal, inputCls, inputStyle } from "./atoms";
 import {
   authHeaderFor, buildManualManifest, headersToLines, parseHeaderLines, type ManualDialect,
@@ -622,6 +623,12 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
               onChange={(e) => setKeySecret(e.target.value)} placeholder="sk-…" autoFocus
             />
           </Field>
+          {keySecret.trim().length >= 4 && duplicateKeyHintExists(providerId!, keySecret) && (
+            <p className="mb-2 text-[12px]" style={{ color: "var(--warn)" }} role="status">
+              A key ending in the same four characters is already stored on this provider — the
+              same secret pasted twice adds nothing to rotation.
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <Button onClick={() => setStep("models")}>Skip for now</Button>
             <Button variant="primary" disabled={busy || !keySecret.trim()} onClick={() => void saveKey()}>
@@ -678,6 +685,11 @@ export function EditProviderModal({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<string | null>(null);
+  // Set when a save changed the base URL: the modal then STAYS OPEN to offer a re-run of auto
+  // setup against the new host, because a repointed provider with stale dialect/auth wiring is
+  // discovered today only through request failures.
+  const [urlChanged, setUrlChanged] = useState<string | null>(null);
+  const originalUrl = p?.baseUrl ?? "";
 
   /**
    * Load the connection the provider *actually* has before offering to save it.
@@ -760,7 +772,16 @@ export function EditProviderModal({
         baseUrl: draft.url,
         ...(changed ? { manifest: next } : {}),
       });
-      setSaved(changed ? "Saved — the connection change was written as a new adapter version." : "Saved.");
+      if (draft.url.trim() !== originalUrl) {
+        // A repointed provider carries a manifest built for the OLD host — its dialect, auth
+        // header and endpoint paths were derived from it. Stay open and offer the one flow that
+        // re-derives them; closing here would hide the gap behind a green "Saved."
+        setUrlChanged(draft.url.trim());
+        setSaved("Saved — the connection change was written as a new adapter version.");
+        onDone();
+        return;
+      }
+      setSaved("Saved.");
       onDone();
     } catch (e) {
       setError((e as Error).message);
@@ -792,8 +813,30 @@ export function EditProviderModal({
         <ModelsPanel providerId={providerId} />
       </div>
 
+      {urlChanged && (
+        <div className="mt-3 rounded border p-3" style={{ borderColor: "var(--warn)", background: "var(--surface-2)" }} role="status">
+          <p className="mb-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+            The base URL changed — but this provider's adapter was derived from the old host, so
+            its dialect, auth header and endpoint paths may no longer fit. Auto setup can re-derive
+            them against the new URL before anything routes there.
+          </p>
+          <div className="flex gap-2">
+            <Button
+              variant="primary"
+              onClick={() => {
+                useUi.getState().setOnboardingPrefill({ name: draft.name, baseUrl: urlChanged });
+                onClose();
+                useUi.getState().go("onboarding");
+              }}
+            >
+              Re-run auto setup against the new URL
+            </Button>
+            <Button onClick={onClose}>Close anyway</Button>
+          </div>
+        </div>
+      )}
       {error && <p className="mt-2 text-[12px]" style={{ color: "var(--danger)" }} role="alert">{error}</p>}
-      {saved && <p className="mt-2 text-[12px]" style={{ color: "var(--success)" }} role="status">{saved}</p>}
+      {saved && !urlChanged && <p className="mt-2 text-[12px]" style={{ color: "var(--success)" }} role="status">{saved}</p>}
     </Modal>
   );
 }
