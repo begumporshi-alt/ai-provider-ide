@@ -731,6 +731,23 @@ export function duplicateKeyHintExists(providerId: string, secret: string): bool
   return registry.keysOf(providerId).some((k) => k.secretHint === hint);
 }
 
+/**
+ * The next serial key label for a provider — `key-01`, `key-02`, …
+ *
+ * Key labels were left to the operator's keyboard, and the numbering promptly drifted: the same
+ * provider ended up with `Key-02` and `key-03` and no `key-01` in sight. The default is now
+ * derived from the highest existing serial, so "Add key" always proposes the next one — the
+ * operator can still rename it, they just no longer have to invent it.
+ */
+export function nextKeyLabel(providerId: string): string {
+  const serials = registry
+    .keysOf(providerId)
+    .map((k) => Number(/^key-(\d+)$/i.exec(k.label)?.[1] ?? NaN))
+    .filter((n) => Number.isFinite(n));
+  const next = (serials.length ? Math.max(...serials) : 0) + 1;
+  return `key-${String(next).padStart(2, "0")}`;
+}
+
 export async function addKey(providerId: string, label: string, secret: string): Promise<ApiKeyRecord> {
   const provider = registry.getProvider(providerId);
   const k = await registry.addKey({ providerId, label, secret });

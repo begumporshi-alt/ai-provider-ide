@@ -17,7 +17,7 @@ import { useEffect, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
 import { PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, type AdapterManifest } from "@aiprovider/router-core";
 import {
-  adapters, addKey, duplicateKeyHintExists, addManualModel, addProvider, catalog, refreshCatalog, registry,
+  adapters, addKey, addManualModel, addProvider, catalog, duplicateKeyHintExists, nextKeyLabel, refreshCatalog, registry,
   removeManualModel, setProviderStatus, testModel, uniqueSlug, updateProvider,
 } from "../store";
 import { useUi } from "../ui-state";
@@ -449,7 +449,7 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
   const [step, setStep] = useState<Step>("connection");
   const [draft, setDraft] = useState<ConnectionDraft>(emptyDraft());
   const [providerId, setProviderId] = useState<string | null>(null);
-  const [keyLabel, setKeyLabel] = useState("key-01");
+  const [keyLabel, setKeyLabel] = useState(() => (providerId ? nextKeyLabel(providerId) : "key-01"));
   const [keySecret, setKeySecret] = useState("");
   // Owned here, reported by `ModelsPanel`: counting during render would freeze at the value the
   // step had when it opened, and "Finish & enable" would never become reachable.
@@ -488,6 +488,9 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
         manifest: draftManifest(draft),
       });
       setProviderId(p.id);
+      // The serial default must be computed when the step OPENS, not at component mount — the
+      // provider row (and therefore its key list) does not exist yet when the modal first renders.
+      setKeyLabel(nextKeyLabel(providerId!));
       setStep("key");
     } catch (e) {
       setError((e as Error).message);

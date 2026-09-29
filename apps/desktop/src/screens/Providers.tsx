@@ -9,7 +9,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addKey, approveRepair, buildRepairPlan, deleteKey, deleteProvider, driftEventsList,
-  duplicateKeyHintExists, setProviderRotation,
+  duplicateKeyHintExists, nextKeyLabel, setProviderRotation,
   generatorAuditList, ledger, listManifestHistory, pendingRepairs, registry, rollbackManifest,
   setKeyStatus, setProviderStatus, testKey, refreshCatalog,
 } from "../store";
@@ -96,12 +96,14 @@ export function ProvidersScreen() {
               >
                 <header className="mb-2 flex items-center gap-2">
                   <StatusDot health={health} />
-                  <span className="text-[14px] font-semibold">{p.name}</span>
-                  <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{p.baseUrl}</span>
+                  <span className="shrink-0 text-[14px] font-semibold">{p.name}</span>
+                  <span className="mono min-w-0 flex-1 truncate text-[11px]" style={{ color: "var(--text-faint)" }} title={p.baseUrl}>
+                    {p.baseUrl}
+                  </span>
                   {/* Rotation lives beside the keys it governs — it was configurable in Settings
                       only, which read as a global fact rather than a per-provider choice. */}
                   <select
-                    className="mono rounded border px-1 py-0.5 text-[10px]"
+                    className="mono shrink-0 rounded border px-1 py-0.5 text-[10px]"
                     style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
                     value={p.rotationStrategy}
                     aria-label={`Rotation strategy for ${p.name}`}
@@ -115,52 +117,45 @@ export function ProvidersScreen() {
                     <option value="priority">priority</option>
                     <option value="cost_spread">cost spread</option>
                   </select>
-                  <div className="ml-auto flex items-center gap-2">
-                    <label className="flex cursor-pointer items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
-                      <input
-                        type="checkbox"
-                        aria-label={`Enable ${p.name}`}
-                        checked={p.status === "enabled"}
-                        onChange={async (e) => {
-                          await setProviderStatus(p.id, e.target.checked ? "enabled" : "disabled");
-                          if (e.target.checked) refreshCatalog(p.id).catch(() => undefined);
-                          bump();
-                        }}
-                      />
-                      Enabled
-                    </label>
-                    {p.status === "repairing" && (
-                      <Button variant="primary" onClick={() => setRepairing(p.id)}>
-                        {repair?.plan ? "Review repair…" : "Repair…"}
-                      </Button>
-                    )}
-                    {/* Offered for `repairing` too — it is the only way out. `pendingRepairs` is
-                        in-memory, so a provider still `repairing` after a restart has no entry and
-                        no plan, and until now also had no button that could start one. */}
-                    {p.status !== "draft" && (
-                      <Button variant="ghost" onClick={() => void buildRepairPlan({
-                        providerId: p.id, providerSlug: p.slug,
-                        errors: 0, models: [], windowMs: 0, detectedAt: Date.now(),
-                        // the zeros below are placeholders, and this flag is what stops the repair
-                        // modal from quoting them as if the monitor had measured them
-                        manual: true,
-                      }).then(() => { setRepairing(p.id); bump(); })}>
-                        Check health
-                      </Button>
-                    )}
-                    {/* Offered in every state, including `draft`: a provider added by hand and
-                        abandoned part-way through the wizard has no other way to be finished. */}
-                    <Button
-                      variant="ghost"
-                      ariaLabel={`Edit ${p.name}`}
-                      onClick={() => setEditing(p.id)}
-                    >
-                      Edit
-                    </Button>
-                    <Button variant="ghost" onClick={() => setConfirmDelete({ kind: "provider", id: p.id, name: p.name })}>
-                      Remove
-                    </Button>
-                  </div>
+                  <label className="flex shrink-0 cursor-pointer items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
+                    <input
+                      type="checkbox"
+                      aria-label={`Enable ${p.name}`}
+                      checked={p.status === "enabled"}
+                      onChange={async (e) => {
+                        await setProviderStatus(p.id, e.target.checked ? "enabled" : "disabled");
+                        if (e.target.checked) refreshCatalog(p.id).catch(() => undefined);
+                        bump();
+                      }}
+                    />
+                    Enabled
+                  </label>
+                  {/* The card's secondary actions collapse into a menu: four labelled buttons plus a
+                      select plus a checkbox overflowed the header on a normal window and pushed the
+                      layout to wrap. The two things that toggle state stay visible; the three that
+                      open something do not need to be. */}
+                  <CardMenu
+                    label={`Actions for ${p.name}`}
+                    items={[
+                      ...(p.status === "repairing"
+                        ? [{ label: repair?.plan ? "Review repair…" : "Repair…", onClick: () => setRepairing(p.id) }]
+                        : []),
+                      ...(p.status !== "draft"
+                        ? [{
+                            label: "Check health",
+                            // the zeros below are placeholders, and the `manual` flag is what stops
+                            // the repair modal from quoting them as if the monitor had measured them
+                            onClick: () => void buildRepairPlan({
+                              providerId: p.id, providerSlug: p.slug,
+                              errors: 0, models: [], windowMs: 0, detectedAt: Date.now(),
+                              manual: true,
+                            }).then(() => { setRepairing(p.id); bump(); }),
+                          }]
+                        : []),
+                      { label: "Edit", onClick: () => setEditing(p.id) },
+                      { label: "Remove", danger: true, onClick: () => setConfirmDelete({ kind: "provider", id: p.id, name: p.name }) },
+                    ]}
+                  />
                 </header>
                 {p.status === "repairing" && (
                   <p className="mb-2 text-[12px]" style={{ color: "var(--warn)" }}>
@@ -336,7 +331,8 @@ function AddKeyModal({
   providerId: string; providerName: string; onClose: () => void; onDone: () => void;
   onSubmit: (label: string, secret: string) => Promise<void>;
 }) {
-  const [label, setLabel] = useState("key-01");
+  // The next serial, not a fixed "key-01" — the operator renames only when they want to.
+  const [label, setLabel] = useState(() => nextKeyLabel(providerId));
   const [secret, setSecret] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -398,6 +394,46 @@ function TryInAssistant() {
 let noticeListener: ((s: string) => void) | null = null;
 function setNotice(s: string) {
   noticeListener?.(s);
+}
+
+/**
+ * The card's "⋯" action menu: a trigger, a click-away backdrop, a small panel. No portal, no
+ * focus trap — three items do not need the machinery, and the screen owns its menu state.
+ */
+function CardMenu({ label, items }: { label: string; items: { label: string; danger?: boolean; onClick: () => void }[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="relative shrink-0">
+      <Button variant="ghost" ariaLabel={label} onClick={() => setOpen((o) => !o)}>
+        ⋯
+      </Button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div
+            className="absolute right-0 top-7 z-50 w-44 rounded border py-1 shadow-lg"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            role="menu"
+          >
+            {items.map((it) => (
+              <button
+                key={it.label}
+                role="menuitem"
+                className="block w-full px-3 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
+                style={{ color: it.danger ? "var(--danger)" : "var(--text)" }}
+                onClick={() => {
+                  setOpen(false);
+                  it.onClick();
+                }}
+              >
+                {it.label}
+              </button>
+            ))}
+          </div>
+        </>
+      )}
+    </div>
+  );
 }
 
 /** Age in conversation units, or undefined when there is no timestamp to speak of. */
