@@ -8,7 +8,10 @@ export {
 } from "./code-candidate.js";
 export { selectAll, selectOne, parsePath } from "./jsonpath.js";
 export { renderTemplate } from "./template.js";
-export { BUILTIN_TEMPLATES, PROVIDER_PROFILES, type BuiltinTemplateId } from "./builtin-templates.js";
+export {
+  BUILTIN_TEMPLATES, PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, profileForBaseUrl,
+  type BuiltinTemplateId,
+} from "./builtin-templates.js";
 export { ProviderRegistry } from "./provider-registry.js";
 export { HealthTracker } from "./health-tracker.js";
 export { buildPlan, orderKeys, type Candidate, type PlanContext, type PlanInput } from "./route-planner.js";

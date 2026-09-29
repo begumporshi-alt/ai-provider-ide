@@ -11,6 +11,7 @@ import type { AdapterManifest } from "@aiprovider/adapter-spec";
 import type { HttpPortLike } from "./manifest-interpreter.js";
 import { runProbes, type ProbeReport } from "./probe-runner.js";
 import { fingerprint, type FingerprintResult } from "./fingerprinter.js";
+import { profileForBaseUrl } from "./builtin-templates.js";
 import type { ContractReport } from "./contract-suite.js";
 
 export type OnboardingState =
@@ -98,6 +99,37 @@ export class OnboardingOrchestrator {
     if (!this.data.probeReport) throw new Error("probe report missing — run start() first");
     const result = fingerprint(this.data.probeReport);
     if (result.dialect === "unknown" || !result.template) {
+      // **A host already measured beats a probe that provably cannot decide.**
+      //
+      // A gateway serving *both* `/messages` and `/chat/completions` defeats the anthropic rule
+      // ("a messages endpoint exists AND no chat-completions") by construction, so the verdict is
+      // `unknown` no matter how well the probe went. Measured 2026-09-29: `agentrouter.org` returns
+      // `401` on both routes once the client-gate header is supplied, both therefore "exist", and
+      // no unauthenticated signal is left to break the tie.
+      //
+      // So this does not try to break it. It answers a question that does have an answer — is this
+      // a host whose dialect we have already measured? — and uses that profile instead of a guess.
+      //
+      // A client gate is deliberately excluded. It means the probe never reached the provider, so
+      // the operator still has a header to supply, and the gate panel is where they supply it;
+      // resolving the dialect now would present a working-looking provider that cannot be reached.
+      const known = result.clientGate ? undefined : profileForBaseUrl(this.data.input.baseUrl);
+      if (known) {
+        const resolved: FingerprintResult = {
+          dialect: known.templateId,
+          template: known.manifest,
+          evidence: [
+            ...result.evidence,
+            `no probe result decided the dialect, but this host is a known provider (${known.slug}) ` +
+              `whose route has already been measured — using its built-in profile`,
+          ],
+        };
+        await this.transition("template_instantiated", {
+          fingerprint: resolved,
+          manifest: known.manifest,
+        });
+        return resolved;
+      }
       await this.transition("failed", {
         fingerprint: result,
         // **A client gate gets its own sentence, because the generic one would be wrong twice.**

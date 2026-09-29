@@ -169,4 +169,97 @@ export const PROVIDER_PROFILES: Record<string, () => AdapterManifest> = {
     }),
   opencode: () => openaiCompat("https://opencode.ai/zen/v1", { imageEndpoint: false }),
   "b.ai": () => anthropicCompat("https://api.b.ai/v1"),
+  /**
+   * AgentRouter — an aggregator serving **both** dialects on one host. That single fact is why it
+   * cannot be fingerprinted (see `profileForBaseUrl`) and why its dialect is pinned here instead.
+   *
+   * Measured 2026-09-29 against `agentrouter.org`:
+   *
+   *  - `GET /v1/models` → `{data:[{id, …, supported_endpoint_types:[…]}]}`; each model names the
+   *    endpoints it serves, and `deepseek-v4-flash` lists `["openai","anthropic"]`.
+   *  - `POST /v1/messages` (anthropic) → `200` with a real `content` block array.
+   *  - `POST /v1/chat/completions` (openai) → `200` whose `content` is **`""`**, with the model's
+   *    output in `reasoning_content`. An openai-compat manifest reads text from
+   *    `$.choices[0].message.content`, so this route yields empty text through this product.
+   *
+   * The Anthropic route is therefore the one that works, and that is what this profile pins.
+   *
+   * **It deliberately carries no `User-Agent`.** The gateway refuses an unrecognised client with
+   * `401 unauthorized_client_error` before reading any credential, and a header naming a client it
+   * does accept clears that. *Which* client to name is the operator's decision, not a default this
+   * product should apply on their behalf — the same line `client-gate.ts` draws when it declines to
+   * name a User-Agent in its notice. Auto setup collects it from the operator at the gate panel and
+   * applies it to every endpoint; the provider edit form keeps it from then on.
+   */
+  agentrouter: () => anthropicCompat("https://agentrouter.org/v1"),
 };
+
+/** Display names for the profiles above — one source of truth, so the add form cannot drift. */
+export const PROVIDER_PROFILE_LABELS: Record<string, string> = {
+  openrouter: "OpenRouter",
+  opencode: "OpenCode Zen",
+  "b.ai": "b.ai",
+  agentrouter: "AgentRouter",
+};
+
+/**
+ * The profile whose base-URL **host** matches `baseUrl`, if there is one.
+ *
+ * # Why a host lookup exists at all
+ *
+ * The dialect fingerprinter decides from unauthenticated probes, and there is a shape it provably
+ * cannot decide: a host that serves both `/messages` and `/chat/completions`. Its anthropic rule is
+ * "a messages endpoint exists **and** no chat-completions" — a negative test, which a dual-dialect
+ * aggregator fails by construction. Measured 2026-09-29: probing `agentrouter.org` with the
+ * client-gate header supplied returns `401` on both routes, so both "exist", and the verdict is
+ * `unknown` with the evidence `["chat/completions endpoint exists","messages endpoint exists"]`.
+ *
+ * Nothing in an unauthenticated probe can break that tie, so this does not try. It answers a
+ * different, answerable question instead: *is this a host whose dialect we have already measured?*
+ * For those, the measured answer beats a guess.
+ *
+ * # The match is on the whole hostname, never a suffix
+ *
+ * `agentrouter.org.evil.test` is a different host and must not match `agentrouter.org`. Comparing
+ * whole hostnames after `URL` parsing is what makes that true — a `endsWith`/`includes` test would
+ * hand a lookalike the profile's wiring.
+ */
+/**
+ * Which builtin template a profile was built from, by the dialect string on its manifest.
+ *
+ * Two entries, kept here beside the templates that define those strings rather than in the caller:
+ * a caller that mapped dialects to template ids would hold a copy of a fact this module owns.
+ */
+const TEMPLATE_BY_DIALECT: Record<string, BuiltinTemplateId> = {
+  "openai-chat-v1": "openai-compat",
+  "anthropic-messages-v1": "anthropic-compat",
+};
+
+export function profileForBaseUrl(
+  baseUrl: string,
+): { slug: string; templateId: BuiltinTemplateId; manifest: AdapterManifest } | undefined {
+  let host: string;
+  try {
+    host = new URL(baseUrl).hostname.toLowerCase();
+  } catch {
+    return undefined; // not a URL — the caller validates separately, and a guess helps nobody
+  }
+  for (const slug of Object.keys(PROVIDER_PROFILES)) {
+    const build = PROVIDER_PROFILES[slug]!;
+    let profileHost: string;
+    try {
+      profileHost = new URL(build().provider.baseUrl).hostname.toLowerCase();
+    } catch {
+      continue;
+    }
+    if (profileHost !== host) continue;
+    const manifest = build();
+    const templateId = TEMPLATE_BY_DIALECT[manifest.dialect];
+    // A profile whose dialect has no template is a wiring error, not a runtime condition — but it
+    // is answered with "no profile" rather than a throw, because this runs inside setup, where the
+    // cost of being wrong is a wizard that cannot be completed at all.
+    if (!templateId) continue;
+    return { slug, templateId, manifest };
+  }
+  return undefined;
+}

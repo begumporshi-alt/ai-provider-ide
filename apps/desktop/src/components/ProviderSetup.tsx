@@ -15,7 +15,7 @@
  */
 import { useEffect, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
-import { PROVIDER_PROFILES, type AdapterManifest } from "@aiprovider/router-core";
+import { PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, type AdapterManifest } from "@aiprovider/router-core";
 import {
   adapters, addKey, addManualModel, addProvider, catalog, refreshCatalog, registry,
   removeManualModel, setProviderStatus, testModel, uniqueSlug, updateProvider,
@@ -25,7 +25,10 @@ import {
   authHeaderFor, buildManualManifest, headersToLines, parseHeaderLines, type ManualDialect,
 } from "../lib/providers/manual-manifest";
 
-const KNOWN = Object.keys(PROVIDER_PROFILES); // openrouter | opencode | b.ai
+// One entry per builtin profile. Display names come from `PROVIDER_PROFILE_LABELS` rather than a
+// second copy here: the two lists drifted the moment a profile was added, and only one of them was
+// the source of truth.
+const KNOWN = Object.keys(PROVIDER_PROFILES);
 
 type AuthChoice = "bearer" | "x-api-key" | "custom";
 
@@ -445,7 +448,7 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
       const manifest = PROVIDER_PROFILES[s]!() as AdapterManifest;
       await addProvider({
         slug: s,
-        name: { openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s] ?? s,
+        name: PROVIDER_PROFILE_LABELS[s] ?? s,
         type: "builtin",
         baseUrl: manifest.provider.baseUrl,
         manifest,
@@ -528,7 +531,7 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
               style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
             >
               <span className="text-[13px] font-medium">
-                {{ openrouter: "OpenRouter", opencode: "OpenCode Zen", "b.ai": "b.ai" }[s]}
+                {PROVIDER_PROFILE_LABELS[s] ?? s}
               </span>
               <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>
                 {PROVIDER_PROFILES[s]!().provider.baseUrl}
