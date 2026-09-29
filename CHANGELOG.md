@@ -84,6 +84,37 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Fixed
 
+- **`failoverEnabled` was inert for every model the UI could offer.** A qualified id
+  (`slug/native`) resolves to exactly one provider — deliberately, so a pinned provider is never
+  silently rerouted — and that was the **only** form any picker produced: `Assistant.tsx` and
+  `Settings.tsx` both mapped the catalog to `slug/native`, and `Models.tsx`'s Default button wrote
+  the same. So with `settings.router.failoverEnabled` set to `true`, a request for
+  `agent-routerv2/deepseek-v4-flash` recorded a **one-entry** fallback chain
+  (`[{"provider":"agent-routerv2","key":"key-01","cls":"BAD_REQUEST_SCHEMA"}]`) against a provider
+  that failed ~29% of its requests — while `vice` carried the same model and serves it (measured
+  live: `POST https://vyceai.com/chat/completions`, `model: deepseek-v4-flash` → `200`). The attempt
+  loop has no `break` on a non-retryable class, so the plan *is* the retry policy: there was never a
+  second candidate, and the reason was the id's form.
+
+  `lib/models/selectable.ts` is now the single authority for what a picker offers, and all three
+  call sites read it. It offers the bare id alongside the qualified ones — the form `Gateway.tsx`
+  already documented ("a bare id to let the router pick + fail over"), which was simply unreachable.
+
+  **The carrier set is resolved the way the planner resolves it, not the way the catalog lists it.**
+  `ARCHITECTURE.md:501` says a bare ID "resolves through `model_aliases`", and `resolveWanted` skips
+  the catalog scan entirely when an alias matches. On this machine the persisted alias
+  `deepseek-v4-flash → vice` therefore narrows the bare id to **one** provider even though two
+  enabled providers carry it. A first version of the module counted catalog rows and would have
+  labelled that entry "any provider (failover)" while the planner pinned it — the defect being
+  fixed, one layer down. `bareCarriers` mirrors the planner's precedence and every label is derived
+  from the resolved set, so an alias-narrowed entry reads `· router default (vice)` instead, and the
+  Model Browser marks it `routed` rather than `failover`.
+
+  Twenty tests, and the fixture carries the **real** alias rows — an earlier draft passed
+  `aliases: []`, which is not the shape production has and hid exactly this. Falsified twice:
+  disabling the bare-id emission reddens the 5 tests that assert it exists; making `bareCarriers`
+  ignore aliases reddens the 5 that assert precedence and label honesty.
+
 - **A gateway that refused the *client* was reported as a provider that rejected the *key*, and the
   key was taken out of rotation for a decision the provider never made.** Adding `agentrouter.org`
   produced `key-01: the provider rejected this key — HTTP 401: {"error":{"message":"unauthorized

@@ -12,6 +12,7 @@ import {
   persistRouterSettings, registry, router, setProviderRotation,
 } from "../store";
 import type { CrashReport } from "../store";
+import { selectableModels } from "../lib/models/selectable";
 import { useUi } from "../ui-state";
 import { StatusDot } from "../components/atoms";
 
@@ -368,6 +369,14 @@ function RotationRow({ provider, onChanged }: { provider: ProviderRecord; onChan
   );
 }
 
+/**
+ * The router-wide default model.
+ *
+ * Offers both id forms for the same reason the chat picker does — see
+ * `lib/models/selectable.ts`. The default is what every unqualified request falls back to, so
+ * pinning it to one provider here would make `failoverEnabled` inert for the whole app rather than
+ * for one conversation.
+ */
 function DefaultModelPicker({ modality }: { modality: "text" | "image" }) {
   const tick = useUi((s) => s.tick);
   const { bump } = useUi();
@@ -376,7 +385,8 @@ function DefaultModelPicker({ modality }: { modality: "text" | "image" }) {
   const options = useMemo(() => {
     void tick;
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
-    return catalog.forModality(modality).map((m) => `${slugOf(m.providerId)}/${m.nativeId}`);
+    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+    return selectableModels(catalog.forModality(modality), catalog.aliases, slugOf, isEnabled);
   }, [tick, modality]);
   return (
     <select
@@ -390,8 +400,8 @@ function DefaultModelPicker({ modality }: { modality: "text" | "image" }) {
       }}
     >
       <option value="">none</option>
-      {value && !options.includes(value) && <option value={value}>{value}</option>}
-      {options.map((o) => <option key={o} value={o}>{o}</option>)}
+      {value && !options.some((o) => o.id === value) && <option value={value}>{value}</option>}
+      {options.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
     </select>
   );
 }

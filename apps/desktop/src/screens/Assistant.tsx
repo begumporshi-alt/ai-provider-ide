@@ -6,6 +6,7 @@
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { catalog, listSkills, registry, router } from "../store";
+import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
@@ -519,16 +520,32 @@ export function AssistantScreen() {
   );
 }
 
+/**
+ * The model chooser.
+ *
+ * It offers **two forms** of an id, and the difference is not cosmetic — see
+ * `lib/models/selectable.ts`. A qualified `slug/native` pins one provider; a bare native id lets
+ * the router plan every enabled carrier, which is the only form `failoverEnabled` can act on.
+ * Until this used `selectableModels`, every option was qualified, so `failoverEnabled: true` was
+ * inert here and a provider failing ~29% of requests ended the request instead of failing over.
+ *
+ * `tick` rather than `registry.listProviders().length`: the option list now depends on provider
+ * *status* (a bare entry is withheld when only one carrier is enabled), and a length is blind to a
+ * status change. `Settings.tsx` already reads `tick` for exactly this reason.
+ */
 function ModelPicker({ value, onChange, modality }: { value: string; onChange: (v: string) => void; modality: "text" | "image" }) {
+  const tick = useUi((s) => s.tick);
   const models = useMemo(() => {
+    void tick;
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
-    return catalog.forModality(modality).map((m) => `${slugOf(m.providerId)}/${m.nativeId}`);
-  }, [modality, registry.listProviders().length]);
+    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+    return selectableModels(catalog.forModality(modality), catalog.aliases, slugOf, isEnabled);
+  }, [tick, modality]);
   if (!models.length) return <span className="text-[12px] text-zinc-500">no {modality} models — connect a provider</span>;
   return (
     <select value={value} onChange={(e) => onChange(e.target.value)} className="rounded border px-2 py-1 text-[12px]" style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}>
-      {!models.includes(value) && <option value={value}>{value || "pick a model…"}</option>}
-      {models.map((m) => <option key={m} value={m}>{m}</option>)}
+      {!models.some((m) => m.id === value) && <option value={value}>{value || "pick a model…"}</option>}
+      {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
     </select>
   );
 }

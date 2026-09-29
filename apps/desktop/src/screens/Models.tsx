@@ -9,6 +9,7 @@ import {
   workbuddyStatus, workbuddySetModels,
 } from "../store";
 import { useUi } from "../ui-state";
+import { bareEntry, hasFailoverCarrier } from "../lib/models/selectable";
 import { Button, EmptyState, StatusDot } from "../components/atoms";
 
 export function ModelsScreen() {
@@ -58,16 +59,59 @@ export function ModelsScreen() {
     bump();
   };
 
-  const rows = useMemo(() => {
+  /**
+   * The catalog rows for this modality, **before** the search box and the provider filter.
+   *
+   * The failover question is a property of the whole catalog, so it must not be answered from
+   * `rows`: filtering to one provider would hide the second carrier and the marker would vanish
+   * with it, which is exactly the fact the operator is looking for.
+   */
+  const modalityRows = useMemo(() => {
     void tick;
+    return catalog.forModality(tab);
+  }, [tick, tab]);
+
+  const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+
+  /**
+   * The router-chosen option for a native id, or `null` when a qualified id is the only form.
+   *
+   * Read by the marker, the badge and the Default button, so all three agree on one id — and it is
+   * the same function the chat and settings pickers use, rather than a restatement of its rule.
+   * `catalog.aliases` matters: an alias can narrow a bare id to one provider, so the marker's word
+   * and the button's id must come from one answer.
+   */
+  const bareFor = (nativeId: string) =>
+    bareEntry(modalityRows, catalog.aliases, nativeId, isEnabled, (pid) => registry.getProvider(pid)?.slug ?? pid);
+
+  const rows = useMemo(() => {
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
-    return catalog
-      .forModality(tab)
+    return modalityRows
       .filter((m) => providerFilter === "all" || m.providerId === providerFilter)
       .filter((m) => !q || m.nativeId.toLowerCase().includes(q.toLowerCase()) || slugOf(m.providerId).includes(q.toLowerCase()))
       .map((m) => ({ ...m, slug: slugOf(m.providerId) }))
-      .sort((a, b) => a.slug.localeCompare(b.slug) || a.nativeId.localeCompare(b.nativeId));
-  }, [tick, tab, q, providerFilter]);
+      .sort((a, b) => a.slug.localeCompare(b.slug) || a.nativeId.localeCompare(b.nativeId))
+      // Resolved once per row rather than repeatedly in the JSX, so the marker, the badge and the
+      // button cannot read three different answers inside one render.
+      .map((m) => ({
+        ...m,
+        bare: bareFor(m.nativeId),
+        failover: hasFailoverCarrier(modalityRows, catalog.aliases, m.nativeId, isEnabled),
+      }));
+    // `tick` is a real input here, not decoration: `bareFor` reads `catalog.aliases` and provider
+    // status, and neither is captured by the identity of `modalityRows`.
+  }, [modalityRows, q, providerFilter, tick]);
+
+  /**
+   * The id a row's Default button writes, and the id the "default" badge matches.
+   *
+   * **One function, read twice.** The badge and the button must name the same string, or the badge
+   * can never light up for a row whose button writes the bare form — two spellings of one id is how
+   * they drift. And it must be an id the pickers actually offer, or Settings would render the
+   * stored default as an unlisted fallback option: hence `bareEntry` rather than a second rule.
+   */
+  const defaultIdFor = (m: { slug: string; nativeId: string; bare: { id: string } | null }) =>
+    m.bare?.id ?? `${m.slug}/${m.nativeId}`;
 
   const defaults = router.settings as typeof router.settings & { defaults?: Partial<Record<Modality, string>> };
   const defaultFor = defaults.defaults?.[tab] ?? "";
@@ -134,10 +178,25 @@ export function ModelsScreen() {
           <tbody>
             {rows.map((m) => (
               <tr key={`${m.providerId}:${m.nativeId}`} className="h-[38px] border-t" style={{ borderColor: "var(--border)" }}>
-                <td className="mono text-[12px]">{m.slug}/{m.nativeId}</td>
+                <td className="mono text-[12px]">
+                  {m.slug}/{m.nativeId}
+                  {m.bare && (
+                    <span
+                      className="ml-2 rounded px-1.5 py-0.5 text-[10px]"
+                      style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
+                      title={
+                        m.failover
+                          ? "Another enabled provider also serves this model, so its default is the bare id and the router can fail over to it."
+                          : `The router routes this model to one provider (${m.bare.label}), so its default is the bare id rather than a pinned provider.`
+                      }
+                    >
+                      {m.failover ? "failover" : "routed"}
+                    </span>
+                  )}
+                </td>
                 <td className="text-[12px]" style={{ color: "var(--text-dim)" }}>{registry.getProvider(m.providerId)?.name}</td>
                 <td>
-                  {defaultFor === `${m.slug}/${m.nativeId}` && (
+                  {defaultFor === defaultIdFor(m) && (
                     <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>default</span>
                   )}
                 </td>
@@ -160,7 +219,7 @@ export function ModelsScreen() {
                 <td className="text-right">
                   <Button
                     onClick={() => {
-                      defaults.defaults = { ...(defaults.defaults ?? {}), [tab]: `${m.slug}/${m.nativeId}` };
+                      defaults.defaults = { ...(defaults.defaults ?? {}), [tab]: defaultIdFor(m) };
                       persistRouterSettings();
                       bump();
                     }}
