@@ -2,7 +2,7 @@
  * Shared atoms (UI_UX_PLAN.md component inventory, Phase 2a subset): the single health
  * vocabulary, StatusDot/Badge, masked KeyFingerprint, EmptyState, Modal, buttons.
  */
-import { type ReactNode } from "react";
+import { type ReactNode, useEffect, useRef } from "react";
 
 export type Health =
   | "healthy" | "testing" | "degraded" | "rate-limited" | "cooling-down"
@@ -41,6 +41,10 @@ export function StatusDot({ health, pulse }: { health: Health; pulse?: boolean }
     <span
       className={`inline-block h-2 w-2 shrink-0 rounded-full ${DOT_CLASS[health]} ${pulse ? "animate-pulse" : ""}`}
       title={HEALTH_LABEL[health]}
+      // The dot is colour + hover title otherwise: invisible to a screen reader and to anyone
+      // who never hovers. The label is the accessible name, not decoration.
+      role="img"
+      aria-label={HEALTH_LABEL[health]}
     />
   );
 }
@@ -58,13 +62,13 @@ export function StatusBadge({ health }: { health: Health }) {
 
 /** Identity without secrets: masked display everywhere (invariant 6). */
 export function KeyFingerprint({ hint }: { hint?: string }) {
-  return <span className="mono text-[12px] text-zinc-400">••••{hint ?? "?????"}</span>;
+  return <span className="mono text-[12px]" style={{ color: "var(--text-dim)" }}>••••{hint ?? "?????"}</span>;
 }
 
 export function EmptyState({ title, action }: { title: string; action?: ReactNode }) {
   return (
     <div className="flex flex-col items-center justify-center gap-3 rounded-md border border-dashed py-10" style={{ borderColor: "var(--border)" }}>
-      <p className="text-sm text-zinc-400">{title}</p>
+      <p className="text-sm" style={{ color: "var(--text-dim)" }}>{title}</p>
       {action}
     </div>
   );
@@ -87,7 +91,7 @@ export function Button({
 }) {
   const styles: Record<string, React.CSSProperties> = {
     default: { background: "var(--surface-2)", border: "1px solid var(--border)", color: "var(--text)" },
-    primary: { background: "var(--accent)", border: "1px solid var(--accent)", color: "#0b0d10", fontWeight: 600 },
+    primary: { background: "var(--accent)", border: "1px solid var(--accent)", color: "var(--bg)", fontWeight: 600 },
     danger: { background: "transparent", border: "1px solid var(--danger)", color: "var(--danger)" },
     ghost: { background: "transparent", border: "1px solid transparent", color: "var(--text-dim)" },
   };
@@ -114,16 +118,39 @@ export function Button({
 export function Modal({
   title, onClose, children, width = 440,
 }: { title: string; onClose: () => void; children: ReactNode; width?: number }) {
+  // Escape closes, and the panel takes focus on open so Escape has somewhere to land. No focus
+  // trap yet — the next consumer that needs one should add it with a noted decision, not silently.
+  const panelRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    panelRef.current?.focus();
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 p-4" onMouseDown={onClose}>
       <div
-        className="max-h-[85vh] overflow-y-auto rounded-lg border p-4 shadow-2xl"
+        ref={panelRef}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        tabIndex={-1}
+        className="max-h-[85vh] overflow-y-auto rounded-lg border p-4 shadow-2xl outline-none"
         style={{ width, background: "var(--surface)", borderColor: "var(--border)" }}
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-sm font-semibold">{title}</h2>
-          <button className="text-zinc-500 hover:text-zinc-300" onClick={onClose} aria-label="Close">✕</button>
+          <button
+            className="transition-opacity hover:opacity-80"
+            style={{ color: "var(--text-faint)" }}
+            onClick={onClose}
+            aria-label="Close"
+          >
+            ✕
+          </button>
         </div>
         {children}
       </div>
@@ -134,7 +161,7 @@ export function Modal({
 export function Field({ label, children }: { label: string; children: ReactNode }) {
   return (
     <label className="mb-3 block">
-      <span className="mb-1 block text-[11px] uppercase tracking-wide text-zinc-500">{label}</span>
+      <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>{label}</span>
       {children}
     </label>
   );

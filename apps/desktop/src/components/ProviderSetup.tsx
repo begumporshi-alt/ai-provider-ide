@@ -115,7 +115,7 @@ function ConnectionFields({
           onChange={(e) => setD({ url: e.target.value })}
           placeholder="https://api.example.com/v1"
         />
-        <span className="mt-1 block text-[11px] leading-snug text-zinc-500">
+        <span className="mt-1 block text-[11px] leading-snug" style={{ color: "var(--text-faint)" }}>
           Include the API path. Most providers serve the API under <code>/v1</code> — use
           <code> https://host/v1</code>, not <code>https://host</code>. Endpoint paths such as
           <code> /models</code> are appended to this.
@@ -166,7 +166,7 @@ function ConnectionFields({
           placeholder={"user-agent: claude-cli/2.0.0 (external, cli)"}
           spellCheck={false}
         />
-        <span className="mt-1 block text-[11px] leading-snug text-zinc-500">
+        <span className="mt-1 block text-[11px] leading-snug" style={{ color: "var(--text-faint)" }}>
           One <code>Name: value</code> per line, sent on <strong>every</strong> request to this
           provider — including the model list. Some gateways refuse a client they do not recognise
           with <code>401</code> before they look at the key; this is where you tell them who you are.
@@ -512,10 +512,8 @@ export function AddProviderModal({ onClose, onDone }: { onClose: () => void; onD
             <button
               key={m}
               onClick={() => { setMode(m); setError(null); }}
-              className={`flex-1 rounded px-3 py-1 text-[12px] font-medium transition-colors ${
-                mode === m ? "text-white" : "text-inherit"
-              }`}
-              style={mode === m ? { background: "var(--accent)", color: "white" } : {}}
+              className="flex-1 rounded px-3 py-1 text-[12px] font-medium transition-colors"
+              style={mode === m ? { background: "var(--accent)", color: "var(--bg)" } : {}}
             >
               {m === "known" ? "Quick add" : "Manual"}
             </button>
