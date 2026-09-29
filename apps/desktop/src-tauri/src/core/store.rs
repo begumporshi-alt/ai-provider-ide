@@ -338,6 +338,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0016_ledger_app_key", backfill_ledger_app_key),
     ("0017_gateway_key_cap", backfill_gateway_key_cap),
     ("0018_manual_models", add_manual_models_origin),
+    ("0019_onboarding_failed_state", rebuild_onboarding_failed_state),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -975,6 +976,104 @@ fn add_manual_models_origin(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<
     Ok(())
 }
 
+/// The onboarding wizard's `failed` terminal state was silently unrecordable.
+///
+/// 0001 created `onboarding_sessions.state` with a CHECK listing every state the machine can
+/// visit *except* `failed` — the one state a broken setup most needs to persist. Every save of a
+/// failed session raised a CHECK violation, the wizard swallowed it, and the session sat at
+/// `fingerprinting` forever: the resume panel kept offering a setup that had in fact already
+/// ended, with no failure reason anywhere. Four real operator attempts hit exactly this on
+/// 2026-09-29 before the cause was found.
+///
+/// SQLite cannot alter a CHECK constraint, so the table is rebuilt. Three details matter:
+///
+///  - The guard is a live probe insert, not a schema guess: if a `state='failed'` row is already
+///    accepted, the rebuild is skipped — idempotent by construction.
+///  - The rebuild renames the old table away FIRST. `ALTER TABLE ... RENAME` rewrites
+///    foreign-key references, so `generator_audit.session_id` follows to the `_d78` copy; the
+///    copy is dropped only after its links have been re-attached to the rebuilt table. Dropping
+///    the original in place would have fired `ON DELETE SET NULL` against every audit row.
+///  - Audit rows are captured before the rename and restored after, because the current writer
+///    happens to never populate `session_id` — but the column and its FK exist, so a future
+///    writer (or a hand-edited row) must survive this migration.
+fn rebuild_onboarding_failed_state(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    let probe = tx.execute(
+        "INSERT INTO onboarding_sessions (created_at, updated_at, input_json, state)
+         VALUES (0, 0, '{}', 'failed')",
+        [],
+    );
+    match probe {
+        Ok(_) => {
+            // already permissive — remove the probe row and stop
+            tx.execute(
+                "DELETE FROM onboarding_sessions
+                  WHERE created_at = 0 AND updated_at = 0 AND input_json = '{}' AND state = 'failed'",
+                [],
+            )?;
+            Ok(())
+        }
+        // the expected case: the CHECK rejects 'failed' and the table must be rebuilt.
+        // SQLite rolls the failed statement back, not the transaction, so continuing is safe.
+        Err(rusqlite::Error::SqliteFailure(e, _))
+            if e.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            let mut detached: Vec<(i64, i64)> = Vec::new();
+            {
+                let mut stmt =
+                    tx.prepare("SELECT id, session_id FROM generator_audit WHERE session_id IS NOT NULL")?;
+                let mut rows = stmt.query([])?;
+                while let Some(row) = rows.next()? {
+                    detached.push((row.get(0)?, row.get(1)?));
+                }
+            }
+            tx.execute("UPDATE generator_audit SET session_id = NULL WHERE session_id IS NOT NULL", [])?;
+            // Drop-then-rename, not rename-then-drop: `ALTER TABLE RENAME` rewrites the
+            // referencing FK to follow the old table, so renaming first would leave
+            // generator_audit pointing at a table that is about to be dropped. Dropping first
+            // leaves the reference textually intact but dangling for one statement — and the
+            // rebuilt table then reuses the name, so the same reference resolves to it again.
+            tx.execute_batch(
+                r#"
+CREATE TABLE onboarding_sessions_fixed (
+  id                         INTEGER PRIMARY KEY,
+  created_at                 INTEGER NOT NULL,
+  updated_at                 INTEGER NOT NULL,
+  input_json                 TEXT NOT NULL,
+  probe_report_redacted_json TEXT,
+  candidates_json            TEXT,
+  state                      TEXT NOT NULL
+                             CHECK (state IN ('collect_input','probing','fingerprinting',
+                               'template_instantiated','ai_generating','linting',
+                               'contract_testing','pending_registration',
+                               'human_confirmation','enabled','failed')),
+  outcome                    TEXT
+);
+
+INSERT INTO onboarding_sessions_fixed
+  SELECT id, created_at, updated_at, input_json, probe_report_redacted_json,
+         candidates_json, state, outcome
+  FROM onboarding_sessions;
+
+DROP TABLE onboarding_sessions;
+
+ALTER TABLE onboarding_sessions_fixed RENAME TO onboarding_sessions;
+
+CREATE INDEX idx_onboarding_recent ON onboarding_sessions(updated_at DESC);
+"#,
+            )?;
+            // ids are preserved by the copy, so the captured links re-attach exactly
+            for (audit_id, session_id) in detached {
+                tx.execute(
+                    "UPDATE generator_audit SET session_id = ?2 WHERE id = ?1",
+                    rusqlite::params![audit_id, session_id],
+                )?;
+            }
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -1075,6 +1174,65 @@ mod tests {
         s.migrate().expect("live-context migration is idempotent");
     }
 
+    /// A failed setup must be recordable (D78): 0001's CHECK omitted `'failed'`, so every save of
+    /// a failed session was rejected and the wizard's resume panel kept offering a setup that had
+    /// already ended. The rebuild must also leave the generator_audit FK honest.
+    #[test]
+    fn onboarding_failed_state_is_recordable_and_audit_links_survive() {
+        let dir = std::env::temp_dir().join(format!("aip-d78-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+        let conn = s.conn.lock().unwrap();
+
+        // the terminal state that motivated the migration is now accepted
+        conn.execute(
+            "INSERT INTO onboarding_sessions (created_at, updated_at, input_json, state, outcome)
+             VALUES (1, 1, '{\"name\":\"x\"}', 'failed', 'failed')",
+            [],
+        )
+        .expect("state='failed' is recordable");
+        // and the CHECK still means something
+        assert!(
+            conn.execute(
+                "INSERT INTO onboarding_sessions (created_at, updated_at, input_json, state)
+                 VALUES (1, 1, '{}', 'bogus_state')",
+                [],
+            )
+            .is_err(),
+            "an unknown state is still rejected"
+        );
+
+        // the rebuild rewired generator_audit's FK — verify the link actually enforces now
+        conn.execute(
+            "INSERT INTO providers (id, slug, name, base_url, status, created_at, updated_at)
+             VALUES ('p1','p1','P','https://x.test','enabled',1,1)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO onboarding_sessions (created_at, updated_at, input_json, state)
+             VALUES (2, 2, '{}', 'enabled')",
+            [],
+        )
+        .unwrap();
+        let session_id: i64 = conn.query_row("SELECT MAX(id) FROM onboarding_sessions", [], |r| r.get(0)).unwrap();
+        conn.execute(
+            "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash, session_id)
+             VALUES (1, 'm', 1, 1, 'h', ?1)",
+            rusqlite::params![session_id],
+        )
+        .expect("generator_audit can reference onboarding_sessions after the rebuild");
+        assert!(
+            conn.execute(
+                "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash, session_id)
+                 VALUES (1, 'm', 1, 1, 'h', 999999)",
+                [],
+            )
+            .is_err(),
+            "a dangling audit session link is rejected"
+        );
+    }
+
     #[test]
     fn migrations_apply_once_and_are_idempotent() {
         let dir = std::env::temp_dir().join(format!("aip-test-{}", std::process::id()));
@@ -1082,11 +1240,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0018 data migrations.
-        assert_eq!(info.schema_version, 18);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0019 data migrations.
+        assert_eq!(info.schema_version, 19);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(18, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(19, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
