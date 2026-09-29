@@ -168,6 +168,9 @@ export const ledger = new UsageLedger({
             provider: a.candidate.provider.slug,
             key: a.candidate.key.label,
             cls: a.cls,
+            // the provider's own words for the refusal, when it gave any — Activity quotes them
+            // so a 400 content-policy block reads "content-blocked", not "schema"
+            ...(a.reason ? { reason: a.reason } : {}),
           })))
         : null,
     });

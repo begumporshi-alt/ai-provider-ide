@@ -1537,6 +1537,12 @@ fn chain_json(attempts: &[AttemptOutcome]) -> Option<String> {
                 entry.insert("key".to_string(), Value::String(label.key_label.clone()));
             }
             entry.insert("cls".to_string(), Value::String(a.cls.as_str().to_string()));
+            // The provider's own words for the refusal, when it gave any. Display-only: Activity
+            // shows `[provider · key → cls]` and now, when present, the reason a 400 actually
+            // carried — "content-blocked" instead of a bare "schema" that named our request.
+            if let Some(reason) = &a.reason {
+                entry.insert("reason".to_string(), Value::String(reason.clone()));
+            }
             Value::Object(entry)
         })
         .collect();
@@ -1998,7 +2004,7 @@ mod tests {
     }
 
     fn refusal(status: u16) -> AttemptError {
-        AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None }
+        AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None, body: None }
     }
 
     fn chunks(words: &[&str]) -> Result<Vec<String>, AttemptError> {
@@ -2298,7 +2304,7 @@ mod tests {
         let store = one_provider();
         // Empty chunks (no text), one tool call delivered, then a transport error mid-stream.
         let brk =
-            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None };
+            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None, body: None };
         let adapter = Scripted::new(vec![chunks(&[])])
             .with_tools(vec![vec![ToolCall {
                 id: Some("call_1".to_string()),
@@ -3438,6 +3444,7 @@ mod tests {
                 provider_slug: "openrouter".into(),
                 key_label: "primary".into(),
             }),
+            reason: None,
         }];
         let parsed = chain_json(&attempts).unwrap();
         let value: Value = serde_json::from_str(&parsed).unwrap();
@@ -3458,7 +3465,7 @@ mod tests {
             status: 0,
             retry_after_ms: None,
             label: None,
-        }];
+        reason: None, }];
         let value: Value = serde_json::from_str(&chain_json(&attempts).unwrap()).unwrap();
         assert_eq!(value[0], json!({ "cls": "NETWORK" }));
     }
@@ -3473,6 +3480,7 @@ mod tests {
                 provider_slug: slug.to_string(),
                 key_label: "k".to_string(),
             }),
+            reason: None,
         };
         let value: Value = serde_json::from_str(
             &chain_json(&[

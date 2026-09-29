@@ -207,14 +207,25 @@ impl fmt::Display for ManifestHttpError {
 
 impl std::error::Error for ManifestHttpError {}
 
-/// The projection the engine sees: status, kind and wait, without the body.
+/// The projection the engine sees: status, kind, wait — and now a truncated body.
+///
+/// The body used to be dropped here, which is why a gated 401 classified as `AUTH_FAILED` and an
+/// upstream `content-blocked` 400 reached the operator as "schema": the facts that contradict the
+/// status live only in the body, and the projection was the last place they were in hand.
+/// Truncated to the same 400 units the error message keeps, so a large error page never rides
+/// through the engine.
 ///
 /// A non-`ManifestHttpError` failure has no counterpart here on purpose — the source's
 /// `instanceof` folds every other error into the same branch as a transport failure, which is
 /// [`AttemptError::Transport`], and the caller decides that by not calling this.
 impl From<&ManifestHttpError> for AttemptError {
     fn from(e: &ManifestHttpError) -> Self {
-        AttemptError::Http { status: e.status, kind: e.kind, retry_after_ms: e.retry_after_ms }
+        AttemptError::Http {
+            status: e.status,
+            kind: e.kind,
+            retry_after_ms: e.retry_after_ms,
+            body: Some(truncate_utf16(&e.body, MESSAGE_BODY_LIMIT)),
+        }
     }
 }
 
@@ -1004,7 +1015,10 @@ mod tests {
     /// The projection the engine consumes keeps the three fields classification needs and drops the
     /// body — which is the whole reason the two types are different.
     #[test]
-    fn the_engine_projection_drops_the_body_and_keeps_the_rest() {
+    fn the_engine_projection_carries_a_truncated_body() {
+        // The body used to be dropped here, which is why a gated 401 read as `AUTH_FAILED` and an
+        // upstream `content-blocked` 400 read as "schema": the facts that contradict the status
+        // live only in the body. It now rides, truncated to the error-message limit.
         let e = ManifestHttpError::new(429, "slow down", FailureKind::MidStream, Some(1_000));
         let projected: AttemptError = (&e).into();
 
@@ -1013,8 +1027,13 @@ mod tests {
             AttemptError::Http {
                 status: 429,
                 kind: FailureKind::MidStream,
-                retry_after_ms: Some(1_000)
+                retry_after_ms: Some(1_000),
+                body: Some("slow down".to_string())
             }
         );
+        let big = ManifestHttpError::new(400, &"x".repeat(10_000), FailureKind::Response, None);
+        let projected = AttemptError::from(&big);
+        let AttemptError::Http { body, .. } = projected else { unreachable!() };
+        assert_eq!(body.unwrap().chars().count(), MESSAGE_BODY_LIMIT as usize);
     }
 }

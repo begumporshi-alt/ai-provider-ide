@@ -733,6 +733,7 @@ mod tests {
             cls: if status == 429 { ErrorClass::RateLimited } else { ErrorClass::Network },
             status,
             retry_after_ms,
+            reason: None,
             label: Some(AttemptLabel { provider_slug: "p1".into(), key_label: "k1".into() }),
         }
     }
@@ -1186,6 +1187,7 @@ mod tests {
                 status: 200,
                 kind: FailureKind::MidStream,
                 retry_after_ms: None,
+                body: None,
             },
             served: candidate(),
             attempts: vec![attempt(429, None)],
@@ -1607,6 +1609,7 @@ mod tests {
             status: 429,
             kind: FailureKind::Response,
             retry_after_ms: Some(30_000),
+            body: None,
         })]);
         let bridge = bridge_with(adapter, Host::gateway_tools());
 
@@ -1631,7 +1634,7 @@ mod tests {
         // attributed to the client. `200` is a real value on this path: the *request* succeeded and
         // the *stream* broke.
         let adapter = Scripted::text(vec![ScriptedTurn::saying(&["partial"]).then_breaking(
-            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None },
+            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None, body: None },
         )]);
         let bridge = bridge_with(adapter, Host::gateway_tools());
 

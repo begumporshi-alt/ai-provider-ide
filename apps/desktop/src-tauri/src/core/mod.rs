@@ -32,6 +32,7 @@ pub mod assistant_stream;
 pub mod bridge_policy;
 pub mod builtin_templates;
 pub mod capture;
+pub mod client_gate;
 pub mod code_adapter;
 pub mod compress;
 pub mod context;

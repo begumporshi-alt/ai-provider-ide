@@ -1143,6 +1143,7 @@ impl Stream for TextStream<'_> {
                             status: 200,
                             kind: FailureKind::MidStream,
                             retry_after_ms: None,
+                            body: None,
                         })));
                     }
                 },
@@ -2199,6 +2200,7 @@ mod tests {
                 status: 200,
                 kind: FailureKind::MidStream,
                 retry_after_ms: None,
+                body: None,
             }),
             "the request succeeded and the stream broke, so the status is 200"
         );
@@ -2406,6 +2408,7 @@ mod tests {
                 status: 429,
                 kind: FailureKind::Response,
                 retry_after_ms: Some(30_000),
+                body: Some("rate limited".to_string()),
             }
         );
         assert!(http.only_request().stream, "it was asked for as a stream");

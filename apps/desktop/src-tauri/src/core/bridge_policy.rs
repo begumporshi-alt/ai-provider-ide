@@ -371,6 +371,7 @@ mod tests {
             cls: if status == 429 { ErrorClass::RateLimited } else { ErrorClass::Network },
             status,
             retry_after_ms,
+            reason: None,
             label: Some(AttemptLabel { provider_slug: "agnes".into(), key_label: "key-01".into() }),
         }
     }

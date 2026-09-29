@@ -81,8 +81,8 @@ export function ActivityScreen() {
         cost: costFor(p.providerId, p.model, p.costEstimateMicros),
         fallbacks: (() => {
           try {
-            const arr = JSON.parse(p.fallbackChainJson ?? "[]") as { provider: string; key: string; cls: string }[];
-            return arr.map((a) => `${a.provider} · ${a.key} → ${a.cls}`);
+            const arr = JSON.parse(p.fallbackChainJson ?? "[]") as { provider: string; key: string; cls: string; reason?: string }[];
+            return arr.map((a) => `${a.provider} · ${a.key} → ${a.cls}${a.reason ? ` (${a.reason})` : ""}`);
           } catch {
             return [];
           }

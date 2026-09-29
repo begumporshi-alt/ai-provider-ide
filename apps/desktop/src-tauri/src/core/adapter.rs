@@ -492,6 +492,7 @@ mod tests {
                 status: 429,
                 kind: FailureKind::Response,
                 retry_after_ms: Some(30_000),
+                body: None,
             }),
             ..TextDouble::serving(&[])
         };
@@ -524,6 +525,7 @@ mod tests {
                     status: 200,
                     kind: FailureKind::MidStream,
                     retry_after_ms: None,
+                    body: None,
                 }),
             ],
             ..TextDouble::serving(&[])
@@ -545,9 +547,9 @@ mod tests {
         // entirely on that — `RateLimited` cools a key, `ParseError` does not. A seam that collapsed
         // the two kinds into one would make the distinction unrecoverable downstream.
         let response =
-            AttemptError::Http { status: 429, kind: FailureKind::Response, retry_after_ms: None };
+            AttemptError::Http { status: 429, kind: FailureKind::Response, retry_after_ms: None, body: None };
         let mid_stream =
-            AttemptError::Http { status: 429, kind: FailureKind::MidStream, retry_after_ms: None };
+            AttemptError::Http { status: 429, kind: FailureKind::MidStream, retry_after_ms: None, body: None };
 
         assert_eq!(classify_attempt_error(&response), ErrorClass::RateLimited);
         assert_eq!(classify_attempt_error(&mid_stream), ErrorClass::ParseError);

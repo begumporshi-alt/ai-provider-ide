@@ -8,7 +8,7 @@
 import { ManifestHttpError } from "./manifest-interpreter.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
-import { classify, type ErrorClass } from "./errors.js";
+import { classify, classifyHttp, reasonFromBody, type ErrorClass } from "./errors.js";
 import { COOLDOWN_FLOOR_MS, type HealthTracker } from "./health-tracker.js";
 import type { ProviderLimiter } from "./concurrency.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
@@ -18,6 +18,12 @@ export interface AttemptOutcome {
   cls: ErrorClass;
   status: number;
   retryAfterMs?: number;
+  /**
+   * The provider's own words for the refusal, when it gave any (`reasonFromBody` — a 400
+   * content-policy block says "content-blocked", not "schema"). Display-only: the class decides
+   * behaviour, this decides what the operator reads.
+   */
+  reason?: string;
 }
 
 export interface ExecuteTextArgs {
@@ -145,14 +151,17 @@ export class ExecutionEngine {
           // A delivered tool call also ends failover: the consumer holds a tool call the next
           // candidate would re-issue, so the predicate folds the tool-call count in.
           if (emitted || toolCalls > 0) {
-            const cls = e instanceof ManifestHttpError ? classify(e.status) === "OK" ? "PARSE_ERROR" : classify(e.status) : "NETWORK";
+            const cls = e instanceof ManifestHttpError ? classify(e.status) === "OK" ? "PARSE_ERROR" : classifyHttp(e.status, e.body) : "NETWORK";
             fallbackChain.push({ candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 });
             throw e;
           }
+          // classifyHttp, not classify: with the body in hand a 401 can be recognised as a client
+          // gate (`CLIENT_GATE` — the provider refused the caller, not the key) and a 402 as
+          // billing rather than a network fault. The mid-stream arm keeps its precedence.
           const cls = e instanceof ManifestHttpError
             ? e.kind === "mid-stream" || classify(e.status) === "OK"
               ? "PARSE_ERROR"
-              : classify(e.status)
+              : classifyHttp(e.status, e.body)
             : "NETWORK";
           const outcome: AttemptOutcome = {
             candidate: c,
@@ -162,6 +171,9 @@ export class ExecutionEngine {
             // tracker's 1000ms floor, so a key that asked for a minute is retried a second later —
             // straight back into the window it was told to wait out.
             retryAfterMs: e instanceof ManifestHttpError ? e.retryAfterMs : undefined,
+            // The provider's own words for the refusal (e.g. "content-blocked") — the class token
+            // alone used to discard them, so an operator read "schema" for a content-policy block.
+            reason: e instanceof ManifestHttpError ? reasonFromBody(e.body) : undefined,
           };
           fallbackChain.push(outcome);
           self.health.recordResult(c.key, cls, outcome.retryAfterMs);
@@ -231,7 +243,11 @@ export class ExecutionEngine {
 
 export class AllAttemptsFailedError extends Error {
   constructor(readonly model: string, readonly chain: AttemptOutcome[]) {
-    const detail = chain.map((a) => `${a.candidate.provider.slug}/${a.candidate.key.label}:${a.cls}`).join(" -> ");
+    // The reason rides in the detail when a provider gave one — `[p1/k1:BAD_REQUEST_SCHEMA
+    // (content-blocked: …)]` instead of a bare class token that named our request, not theirs.
+    const detail = chain
+      .map((a) => `${a.candidate.provider.slug}/${a.candidate.key.label}:${a.cls}${a.reason ? ` (${a.reason})` : ""}`)
+      .join(" -> ");
     super(`all attempts failed for ${model} [${detail || "empty plan"}]`);
   }
 

@@ -90,6 +90,20 @@ pub enum ErrorClass {
     Timeout,
     /// No usable status: a transport failure, or a status this taxonomy does not name.
     Network,
+    /// **A 401/403 whose body names a client refusal** (`client_gate.rs`): the provider refused
+    /// the *caller* and never read the credential. Folding it into `AuthFailed` was wrong twice
+    /// over — the loop rotated through every other key of the provider (none of which would be
+    /// read either, measured 2026-09-29 on `agentrouter.org`) and three failures opened an auth
+    /// breaker on a healthy key. Not drift (nothing about the provider changed), not
+    /// key-retryable (the client identity is per-request, not per-key), not evidence against the
+    /// key. The operator's remedy is a header, which is auto setup's gate panel.
+    ClientGate,
+    /// 402 — the provider answered, the transport is fine, and the budget pool is empty. Filed
+    /// `Network` before, which counted a billing condition against the provider's network health
+    /// and sent the loop hunting for a "better connected" provider. Not drift, not key-retryable
+    /// (the pool does not refill per key); failover to the next *provider* still applies, which
+    /// is the only remedy a 402 has.
+    Billing,
     /// **Refused by this process before anything was dialled.** See [`AttemptError::Blocked`].
     ///
     /// Its own class because the alternative is a lie with a direction: folded into `Network`, it
@@ -108,14 +122,19 @@ pub enum ErrorClass {
 
 /// A body signal that overrides what the status alone would say.
 ///
-/// Only `400` consults it, and only to distinguish "your request is malformed" from "that model
-/// does not exist" — the latter is drift and must not burn a key.
+/// `400` consults it to distinguish "your request is malformed" from "that model does not exist" —
+/// the latter is drift and must not burn a key. `401`/`403` consult [`BodyHint::ClientGate`] for
+/// the same reason with the polarity reversed: the status *over*-blames the key, and the body is
+/// the only place the provider says so.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyHint {
     /// The body says the request does not match the schema.
     Schema,
     /// The body says the model or endpoint is not there.
     NotFound,
+    /// The body names a **client** refusal (`client_gate.rs` mirrors the TypeScript markers): the
+    /// provider answered 401/403 without reading the credential.
+    ClientGate,
 }
 
 /// Every class, so completeness is checkable rather than assumed.
@@ -124,7 +143,7 @@ pub enum BodyHint {
 /// union spelled out verbatim. A variant added without a spelling fails there — which is the
 /// point: the wire spellings are a cross-language contract, and a new class that quietly
 /// rendered as `{:?}` would be a spelling nobody agreed to.
-pub const ALL_CLASSES: [ErrorClass; 10] = [
+pub const ALL_CLASSES: [ErrorClass; 12] = [
     ErrorClass::AuthFailed,
     ErrorClass::RateLimited,
     ErrorClass::NotFound,
@@ -133,6 +152,8 @@ pub const ALL_CLASSES: [ErrorClass; 10] = [
     ErrorClass::ServerError,
     ErrorClass::Timeout,
     ErrorClass::Network,
+    ErrorClass::ClientGate,
+    ErrorClass::Billing,
     ErrorClass::EgressDenied,
     ErrorClass::Ok,
 ];
@@ -169,6 +190,8 @@ impl ErrorClass {
             ErrorClass::ServerError => "SERVER_ERROR",
             ErrorClass::Timeout => "TIMEOUT",
             ErrorClass::Network => "NETWORK",
+            ErrorClass::ClientGate => "CLIENT_GATE",
+            ErrorClass::Billing => "BILLING",
             // The one spelling the TypeScript union does not have — see `ErrorClass::EgressDenied`.
             ErrorClass::EgressDenied => "EGRESS_DENIED",
             ErrorClass::Ok => "OK",
@@ -179,14 +202,20 @@ impl ErrorClass {
 /// Map an HTTP status, plus an optional body signal, to its class.
 ///
 /// The arms are ordered and the fallthrough is load-bearing: any status this taxonomy does not
-/// name — `402`, `418`, a `3xx` — classifies as [`ErrorClass::Network`]. That is the TypeScript
-/// behaviour and the tests pin it, because "unknown status is a transport failure" is a
-/// decision, not an accident.
+/// name — `409`, `418`, a `3xx` — classifies as [`ErrorClass::Network`]. That is the TypeScript
+/// behaviour and the tests pin it, because "unknown status is a transport failure" is a decision,
+/// not an accident. (`402` left that bucket deliberately — see [`ErrorClass::Billing`].)
 pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
     if (200..300).contains(&status) {
         return ErrorClass::Ok;
     }
     if status == 401 || status == 403 {
+        // A gate hint is the body contradicting the status: the provider answered 401/403 without
+        // reading the credential, so "this key is bad" is exactly wrong. Without the hint the
+        // status quo stands — an unrecognised refusal blames the key (client_gate.rs).
+        if body_hint == Some(BodyHint::ClientGate) {
+            return ErrorClass::ClientGate;
+        }
         return ErrorClass::AuthFailed;
     }
     if status == 429 {
@@ -204,10 +233,49 @@ pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
     if status == 408 {
         return ErrorClass::Timeout;
     }
+    if status == 402 {
+        return ErrorClass::Billing;
+    }
     if status >= 500 {
         return ErrorClass::ServerError;
     }
     ErrorClass::Network
+}
+
+/// The provider's own words for why it refused, short enough for a chain entry.
+///
+/// Rust mirror of `errors.ts:reasonFromBody` — one of the pair a reader compares. Before this
+/// existed the classifier kept only the class token, so an upstream
+/// `400 {"error":{"code":"content-blocked",…}}` reached the operator as "schema" — a word about
+/// *our* request shape, for a refusal that was about the provider's content policy.
+pub fn reason_from_body(body: Option<&str>) -> Option<String> {
+    let body = body?;
+    let mut reason = match serde_json::from_str::<serde_json::Value>(body) {
+        Ok(v) => v
+            .get("error")
+            .and_then(|e| {
+                let code = e.get("code").and_then(|c| c.as_str());
+                let message = e.get("message").and_then(|m| m.as_str());
+                match (code, message) {
+                    (Some(c), Some(m)) => Some(format!("{c}: {m}")),
+                    (Some(c), None) => Some(c.to_string()),
+                    (None, Some(m)) => Some(m.to_string()),
+                    (None, None) => None,
+                }
+            }),
+        Err(_) => None,
+    };
+    if reason.is_none() {
+        reason = Some(body.to_string());
+    }
+    let reason = reason.unwrap();
+    // char-counted, not byte-counted: a CJK error message (the measurement saw 无效的令牌) would
+    // panic on a byte slice that splits a code point.
+    Some(if reason.chars().count() > 120 {
+        format!("{}…", reason.chars().take(117).collect::<String>())
+    } else {
+        reason
+    })
 }
 
 /// Errors where the next **key of the same provider** might work.
@@ -278,6 +346,11 @@ pub struct AttemptOutcome {
     pub status: u16,
     /// What the provider asked us to wait, when it said so at all.
     pub retry_after_ms: Option<u64>,
+    /// The provider's own words for the refusal (`reason_from_body` — a 400 content-policy block
+    /// says "content-blocked", not "schema"). Display-only: the class decides behaviour, this
+    /// decides what the operator reads. `chain_json` carries it into `fallback_chain_json` when
+    /// present.
+    pub reason: Option<String>,
     /// Who tried, when the outcome came from a candidate at all.
     ///
     /// `None` is "unknown" and stays unknown. The three constructors below default to it, and the
@@ -419,6 +492,12 @@ pub enum AttemptError {
         kind: FailureKind,
         /// What the provider asked us to wait, when the header was readable at all.
         retry_after_ms: Option<u64>,
+        /// A truncated slice of the refusal body, when one was read.
+        ///
+        /// The status alone cannot tell a client gate from a bad key, nor a content-policy block
+        /// from a schema error — both of those facts live only here. Truncated at the projection
+        /// boundary (`manifest.rs`) so a large error page never rides through the engine.
+        body: Option<String>,
     },
     /// No HTTP answer: a transport failure, a timeout, or an adapter fault.
     Transport,
@@ -487,11 +566,14 @@ pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
         // not `Network` — nothing was dialled — and it is not any status class, because there was no
         // status. See `AttemptError::Blocked`.
         AttemptError::Blocked { .. } => ErrorClass::EgressDenied,
-        AttemptError::Http { status, kind, .. } => {
+        AttemptError::Http { status, kind, body, .. } => {
             if *kind == FailureKind::MidStream {
                 return ErrorClass::ParseError;
             }
-            match classify(*status, None) {
+            // The body can contradict the status: a gated 401 is `ClientGate`, not `AuthFailed`.
+            let hint = crate::core::client_gate::detect_client_gate(*status, body.as_deref())
+                .map(|_| BodyHint::ClientGate);
+            match classify(*status, hint) {
                 ErrorClass::Ok => ErrorClass::ParseError,
                 other => other,
             }
@@ -556,6 +638,10 @@ pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> Att
             AttemptDisposition::Rethrow => None,
             _ => e.retry_after_ms(),
         },
+        reason: match e {
+            AttemptError::Http { body, .. } => reason_from_body(body.as_deref()),
+            _ => None,
+        },
         // Attached by the loop, which is the only place that holds the candidate.
         label: None,
     }
@@ -589,7 +675,7 @@ pub fn records_key_health(disposition: AttemptDisposition) -> bool {
 /// **It is recorded in the chain and deliberately *not* in key health.** The provider is busy, not
 /// the key bad; cooling the key would punish it for a limit the provider imposed on everyone.
 pub fn saturated_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None, label: None }
+    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None, reason: None, label: None }
 }
 
 /// What the loop does with one candidate before calling the adapter.
@@ -640,7 +726,7 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
 /// **keeps nothing else the error carried** — not the status, not the `Retry-After`. See
 /// [`execute_image`] for why that is faithful and what it costs.
 pub fn transport_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None, label: None }
+    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None, reason: None, label: None }
 }
 
 /// What one image request is asked to do. The Rust port of `executeImage`'s argument
@@ -756,9 +842,19 @@ pub async fn execute_image(
                     // no field for it; see the doc comment above and D22.
                     Ok(reply) => labelled(
                         AttemptOutcome {
-                            cls: classify(reply.status, None),
+                            // `classify`, not `classify_attempt_error`: the reply is a *value*,
+                            // not an error, so the gate hint comes straight from its body.
+                            cls: {
+                                let hint = crate::core::client_gate::detect_client_gate(
+                                    reply.status,
+                                    reply.error_body.as_deref(),
+                                )
+                                .map(|_| BodyHint::ClientGate);
+                                classify(reply.status, hint)
+                            },
                             status: reply.status,
                             retry_after_ms: None,
+                            reason: reason_from_body(reply.error_body.as_deref()),
                             label: None,
                         },
                         &candidate,
@@ -830,12 +926,16 @@ impl AllAttemptsFailed {
     /// is a statement about a caller-built chain rather than a second rule: a chain that cannot
     /// name its attempts says so, and does not forge a name to fill the space.
     pub fn describe(&self) -> String {
+        // The reason rides in the entry when a provider gave one — `[p1/k1:BAD_REQUEST_SCHEMA
+        // (content-blocked: …)]` instead of a bare class token that named our request, not theirs.
+        // Mirrors `execution-engine.ts`'s AllAttemptsFailedError, which does the same.
         let detail = self
             .chain
             .iter()
-            .map(|a| match &a.label {
-                Some(l) => format!("{}/{}:{}", l.provider_slug, l.key_label, a.cls.as_str()),
-                None => format!("{}:{}", a.cls.as_str(), a.status),
+            .map(|a| match (&a.label, &a.reason) {
+                (Some(l), Some(r)) => format!("{}/{}:{} ({})", l.provider_slug, l.key_label, a.cls.as_str(), r),
+                (Some(l), None) => format!("{}/{}:{}", l.provider_slug, l.key_label, a.cls.as_str()),
+                (None, _) => format!("{}:{}", a.cls.as_str(), a.status),
             })
             .collect::<Vec<_>>()
             .join(" -> ");
@@ -1450,7 +1550,13 @@ impl HealthTracker {
             | ErrorClass::Network
             // A refusal by our own egress says nothing about the key — every key of a provider dials
             // the same host, so cooling this one would burn a good credential for a policy decision.
-            | ErrorClass::EgressDenied => {}
+            | ErrorClass::EgressDenied
+            // **The whole point of the class**: a client gate refused the caller without reading
+            // any credential, so counting it here would open the breaker on a healthy key — the
+            // exact defect `CLIENT_GATE` exists to prevent.
+            | ErrorClass::ClientGate
+            // A budget pool is per-provider, not per-key; rotating keys cannot refill it.
+            | ErrorClass::Billing => {}
         }
     }
 
@@ -1493,7 +1599,7 @@ mod tests {
     use crate::core::persist::ModelRow;
 
     fn outcome(cls: ErrorClass, status: u16, retry_after_ms: Option<u64>) -> AttemptOutcome {
-        AttemptOutcome { cls, status, retry_after_ms, label: None }
+        AttemptOutcome { cls, status, retry_after_ms, reason: None, label: None }
     }
 
     /// The same, with the identity the loops attach. Used by the `describe` tests, which are the
@@ -1513,6 +1619,7 @@ mod tests {
                 provider_slug: slug.to_string(),
                 key_label: key_label.to_string(),
             }),
+            reason: None,
         }
     }
 
@@ -1546,12 +1653,48 @@ mod tests {
 
     #[test]
     fn an_unnamed_status_is_a_transport_failure_rather_than_a_guess() {
-        // Pinned because it is a decision, not an accident: 402 (payment required) and a 3xx
-        // redirect are both "not named by this taxonomy", and the TypeScript falls through to
-        // NETWORK for them. A future port that "improved" this would change failover behaviour.
-        assert_eq!(classify(402, None), ErrorClass::Network);
+        // Pinned because it is a decision, not an accident: a 3xx redirect is "not named by this
+        // taxonomy", and the TypeScript falls through to NETWORK for it. 402 left that bucket on
+        // 2026-09-29 — a budget-pool answer is the provider speaking, not the transport failing —
+        // and is pinned separately below.
         assert_eq!(classify(301, None), ErrorClass::Network);
         assert_eq!(classify(0, None), ErrorClass::Network);
+    }
+
+    #[test]
+    fn a_client_gate_is_not_an_auth_failure_and_billing_is_not_a_network_fault() {
+        // Measured 2026-09-29 on agentrouter.org: a 401 whose body names the client rotates
+        // through every key of the provider and opens auth breakers on healthy keys, because none
+        // of the keys is ever read. And a 402 counted a full budget pool against the provider's
+        // network health.
+        assert_eq!(classify(401, Some(BodyHint::ClientGate)), ErrorClass::ClientGate);
+        assert_eq!(classify(403, Some(BodyHint::ClientGate)), ErrorClass::ClientGate);
+        // without the body naming it, the status quo stands
+        assert_eq!(classify(401, None), ErrorClass::AuthFailed);
+        assert_eq!(classify(402, None), ErrorClass::Billing);
+        // neither is drift (nothing about the provider changed) ...
+        assert!(!ErrorClass::ClientGate.is_drift());
+        assert!(!ErrorClass::Billing.is_drift());
+        // ... and neither is retried with the next key (the client identity and the pool are
+        // per-request facts, not per-key ones)
+        assert!(!is_retryable_with_next_key(ErrorClass::ClientGate));
+        assert!(!is_retryable_with_next_key(ErrorClass::Billing));
+    }
+
+    #[test]
+    fn the_reason_is_the_providers_own_words_truncated() {
+        assert_eq!(
+            reason_from_body(Some(r#"{"error":{"code":"content-blocked","message":"content-blocked (request id: x)"}}"#)).as_deref(),
+            Some("content-blocked: content-blocked (request id: x)"),
+        );
+        // not JSON: the raw text is still the provider's own words
+        assert_eq!(reason_from_body(Some("plain refusal")).as_deref(), Some("plain refusal"));
+        // char-counted truncation: a CJK message must not panic on a split code point
+        let long = "无".repeat(200);
+        let got = reason_from_body(Some(&long)).unwrap();
+        assert!(got.chars().count() <= 120);
+        assert!(got.ends_with('…'));
+        assert_eq!(reason_from_body(None), None);
     }
 
     #[test]
@@ -2032,11 +2175,13 @@ mod tests {
 
     // ---------- increment 4: the attempt budget and the terminal error ----------
 
-    /// The TypeScript union, verbatim from `errors.ts:5-14`.
+    /// The TypeScript union, verbatim from `errors.ts`.
     ///
     /// Spelled out rather than derived from anything, so a variant added to `ErrorClass` without
-    /// a wire spelling fails here instead of quietly rendering as its `Debug` form.
-    const TS_SPELLINGS: [&str; 9] = [
+    /// a wire spelling fails here instead of quietly rendering as its `Debug` form. `CLIENT_GATE`
+    /// and `BILLING` joined both unions on 2026-09-29: a gated 401 is not about the key, and a
+    /// 402 is not about the network.
+    const TS_SPELLINGS: [&str; 11] = [
         "AUTH_FAILED",
         "RATE_LIMITED",
         "NOT_FOUND",
@@ -2045,6 +2190,8 @@ mod tests {
         "SERVER_ERROR",
         "TIMEOUT",
         "NETWORK",
+        "CLIENT_GATE",
+        "BILLING",
         "OK",
     ];
 
@@ -2254,7 +2401,7 @@ mod tests {
     // ---------- increment 6: the per-attempt policy ----------
 
     fn http(status: u16, kind: FailureKind, retry_after_ms: Option<u64>) -> AttemptError {
-        AttemptError::Http { status, kind, retry_after_ms }
+        AttemptError::Http { status, kind, retry_after_ms, body: None }
     }
 
     /// Every status the taxonomy names, plus the two bands it falls through on.
@@ -2799,10 +2946,12 @@ mod tests {
             vec![("p1".to_string(), "k1".to_string()), ("p2".to_string(), "k2".to_string())],
             "the second attempt's label must be its own, not the first's"
         );
-        // And the whole error message now names both, which it could not before increment 13a.
+        // And the whole error message now names both, which it could not before increment 13a —
+        // and now quotes each provider's own refusal word as well.
         assert_eq!(
             err.describe(),
-            "all attempts failed for as-the-caller-typed-it [p1/k1:NOT_FOUND -> p2/k2:RATE_LIMITED]"
+            "all attempts failed for as-the-caller-typed-it \
+             [p1/k1:NOT_FOUND (refused) -> p2/k2:RATE_LIMITED (refused)]"
         );
     }
 
@@ -2931,6 +3080,7 @@ mod tests {
             status: 429,
             kind: FailureKind::Response,
             retry_after_ms: Some(30_000),
+            body: None,
         })]);
         let health = HealthTracker::new();
 
@@ -3217,19 +3367,19 @@ mod tests {
     /// A **response-phase** refusal, as the script records it: the attempt answered with a failure
     /// before a single byte, so the loop may retry it.
     fn refused(status: u16) -> TextReply {
-        Err(AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None })
+        Err(AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None, body: None })
     }
 
     /// A **mid-stream** break, as the script records it: one item of an otherwise-answered stream.
     /// The type is the *stream's*, not the script's — that is the two-phase split written down.
     fn broke(status: u16) -> Result<String, AttemptError> {
-        Err(AttemptError::Http { status, kind: FailureKind::MidStream, retry_after_ms: None })
+        Err(AttemptError::Http { status, kind: FailureKind::MidStream, retry_after_ms: None, body: None })
     }
 
     /// The same error value, for comparing against what the loop carried out. `AttemptError` is
     /// `PartialEq` precisely so a test can assert the *original* travelled rather than a summary.
     fn http_error(status: u16, kind: FailureKind) -> AttemptError {
-        AttemptError::Http { status, kind, retry_after_ms: None }
+        AttemptError::Http { status, kind, retry_after_ms: None, body: None }
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -3290,6 +3440,7 @@ mod tests {
                 status: 429,
                 kind: FailureKind::Response,
                 retry_after_ms: Some(30_000),
+                body: None,
             }),
             chunks_of(&["ok"]),
         ])
@@ -3540,6 +3691,7 @@ mod tests {
                 status: 429,
                 kind: FailureKind::Response,
                 retry_after_ms: Some(1_500),
+                body: None,
             }),
         ])
         .shared();
