@@ -18,6 +18,14 @@ export function ModelsScreen() {
   const [tab, setTab] = useState<Modality>("text");
   const [q, setQ] = useState("");
   const [providerFilter, setProviderFilter] = useState<string>("all");
+  // Where a row came from — the provider's own listing or the operator's keyboard. Undefined on
+  // rows written before the origin column existed means discovered.
+  const [originFilter, setOriginFilter] = useState<"all" | "discovered" | "manual">("all");
+  // Catalogue rows whose context window is known can be filtered by floor; unknown-context rows
+  // survive every floor rather than being hidden by one.
+  const [minContext, setMinContext] = useState<number>(0);
+  const [reasoningOnly, setReasoningOnly] = useState(false);
+  const [sort, setSort] = useState<"name" | "context">("name");
   // Which models the gateway publishes into the connected client (WorkBuddy). Owned by the
   // host, because that is where the client's config file is written.
   const [published, setPublished] = useState<string[]>([]);
@@ -88,9 +96,18 @@ export function ModelsScreen() {
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
     return modalityRows
       .filter((m) => providerFilter === "all" || m.providerId === providerFilter)
+      .filter((m) => originFilter === "all" || (m.origin ?? "discovered") === originFilter)
+      // Unknown context (`undefined`) is not "zero" — it survives every floor, the same way the
+      // pricing column renders "—" rather than "$0.00" for unknown.
+      .filter((m) => !minContext || (m.contextWindow ?? Infinity) >= minContext)
+      .filter((m) => !reasoningOnly || m.supportsReasoning === true)
       .filter((m) => !q || m.nativeId.toLowerCase().includes(q.toLowerCase()) || slugOf(m.providerId).includes(q.toLowerCase()))
       .map((m) => ({ ...m, slug: slugOf(m.providerId) }))
-      .sort((a, b) => a.slug.localeCompare(b.slug) || a.nativeId.localeCompare(b.nativeId))
+      .sort((a, b) =>
+        sort === "context"
+          ? (b.contextWindow ?? 0) - (a.contextWindow ?? 0) || a.slug.localeCompare(b.slug)
+          : a.slug.localeCompare(b.slug) || a.nativeId.localeCompare(b.nativeId),
+      )
       // Resolved once per row rather than repeatedly in the JSX, so the marker, the badge and the
       // button cannot read three different answers inside one render.
       .map((m) => ({
@@ -100,7 +117,7 @@ export function ModelsScreen() {
       }));
     // `tick` is a real input here, not decoration: `bareFor` reads `catalog.aliases` and provider
     // status, and neither is captured by the identity of `modalityRows`.
-  }, [modalityRows, q, providerFilter, tick]);
+  }, [modalityRows, q, providerFilter, originFilter, minContext, reasoningOnly, sort, tick]);
 
   /**
    * The id a row's Default button writes, and the id the "default" badge matches.
@@ -159,6 +176,47 @@ export function ModelsScreen() {
         ))}
       </div>
 
+      <div className="mb-3 flex flex-wrap items-center gap-2 text-[12px]">
+        <select
+          value={originFilter}
+          onChange={(e) => setOriginFilter(e.target.value as typeof originFilter)}
+          className="rounded border px-2 py-1"
+          style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+          aria-label="Filter by origin"
+        >
+          <option value="all">Any origin</option>
+          <option value="discovered">Discovered</option>
+          <option value="manual">Manual</option>
+        </select>
+        <select
+          value={minContext}
+          onChange={(e) => setMinContext(Number(e.target.value))}
+          className="rounded border px-2 py-1"
+          style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+          aria-label="Filter by context window"
+        >
+          <option value={0}>Any context</option>
+          <option value={8_000}>≥ 8k</option>
+          <option value={32_000}>≥ 32k</option>
+          <option value={128_000}>≥ 128k</option>
+          <option value={400_000}>≥ 400k</option>
+        </select>
+        <label className="flex cursor-pointer items-center gap-1.5" style={{ color: "var(--text-dim)" }}>
+          <input type="checkbox" checked={reasoningOnly} onChange={(e) => setReasoningOnly(e.target.checked)} />
+          Reasoning only
+        </label>
+        <select
+          value={sort}
+          onChange={(e) => setSort(e.target.value as typeof sort)}
+          className="ml-auto rounded border px-2 py-1"
+          style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+          aria-label="Sort"
+        >
+          <option value="name">Sort: name</option>
+          <option value="context">Sort: context window</option>
+        </select>
+      </div>
+
       {rows.length === 0 ? (
         <EmptyState
           title={providers.length ? "No models discovered yet — press Refresh on a provider, or add a key and test it." : "No models yet — connect a provider to populate your catalog."}
@@ -168,6 +226,7 @@ export function ModelsScreen() {
           <thead>
             <tr className="h-[30px] text-left text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
               <th className="font-medium">Model</th>
+              <th className="w-20 font-medium">Context</th>
               <th className="w-40 font-medium">Provider</th>
               <th className="w-24 font-medium">Default</th>
               <th className="w-20 font-medium">Client</th>
@@ -193,6 +252,9 @@ export function ModelsScreen() {
                       {m.failover ? "failover" : "routed"}
                     </span>
                   )}
+                </td>
+                <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
+                  {m.contextWindow ? `${Math.round(m.contextWindow / 1000)}k` : "—"}
                 </td>
                 <td className="text-[12px]" style={{ color: "var(--text-dim)" }}>{registry.getProvider(m.providerId)?.name}</td>
                 <td>

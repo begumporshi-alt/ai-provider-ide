@@ -535,18 +535,85 @@ export function AssistantScreen() {
  */
 function ModelPicker({ value, onChange, modality }: { value: string; onChange: (v: string) => void; modality: "text" | "image" }) {
   const tick = useUi((s) => s.tick);
+  const [open, setOpen] = useState(false);
+  const [q, setQ] = useState("");
   const models = useMemo(() => {
     void tick;
     const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
     const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
     return selectableModels(catalog.forModality(modality), catalog.aliases, slugOf, isEnabled);
   }, [tick, modality]);
-  if (!models.length) return <span className="text-[12px] text-zinc-500">no {modality} models — connect a provider</span>;
+  const filtered = useMemo(
+    () => models.filter((m) => !q || m.id.toLowerCase().includes(q.toLowerCase())),
+    [models, q],
+  );
+  const current = models.find((m) => m.id === value)?.label ?? value;
+  if (!models.length) return <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>no {modality} models — connect a provider</span>;
   return (
-    <select value={value} onChange={(e) => onChange(e.target.value)} className="rounded border px-2 py-1 text-[12px]" style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}>
-      {!models.some((m) => m.id === value) && <option value={value}>{value || "pick a model…"}</option>}
-      {models.map((m) => <option key={m.id} value={m.id}>{m.label}</option>)}
-    </select>
+    <div className="relative">
+      {/* A native select cannot be searched, and the catalog outgrew one: dozens of qualified ids
+          plus their bare forms scroll past the visible options. A picker panel with a search box
+          keeps the same ids and adds the one thing a select never had. */}
+      <button
+        type="button"
+        onClick={() => { setOpen((o) => !o); setQ(""); }}
+        aria-label={`Model: ${current} — open picker`}
+        aria-expanded={open}
+        className="flex max-w-[340px] items-center gap-2 rounded border px-2 py-1 text-[12px]"
+        style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+      >
+        <span className="mono truncate">{current || "pick a model…"}</span>
+        <span style={{ color: "var(--text-faint)" }}>▾</span>
+      </button>
+      {open && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          <div
+            className="absolute left-0 top-8 z-50 w-[380px] rounded border p-2 shadow-lg"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            role="listbox"
+            aria-label="Pick a model"
+          >
+            <input
+              autoFocus
+              value={q}
+              onChange={(e) => setQ(e.target.value)}
+              placeholder="Search by model or provider slug…"
+              className="mb-2 w-full rounded border px-2 py-1 text-[12px] outline-none"
+              style={{ background: "var(--bg)", borderColor: "var(--border)" }}
+            />
+            <div className="max-h-64 overflow-y-auto">
+              {filtered.map((m) => (
+                <button
+                  key={m.id}
+                  role="option"
+                  aria-selected={m.id === value}
+                  className="mono block w-full truncate rounded px-2 py-1.5 text-left text-[12px] transition-colors hover:opacity-80"
+                  style={{
+                    background: m.id === value ? "var(--surface)" : "transparent",
+                    color: m.id === value ? "var(--text)" : "var(--text-dim)",
+                  }}
+                  onClick={() => {
+                    onChange(m.id);
+                    setOpen(false);
+                  }}
+                >
+                  {m.label}
+                </button>
+              ))}
+              {filtered.length === 0 && (
+                <p className="px-2 py-3 text-[12px]" style={{ color: "var(--text-faint)" }}>
+                  No model matches “{q}”.
+                </p>
+              )}
+            </div>
+            <p className="mt-1 px-2 text-[10px]" style={{ color: "var(--text-faint)" }}>
+              {filtered.length} of {models.length} models
+            </p>
+          </div>
+        </>
+      )}
+    </div>
   );
 }
 
