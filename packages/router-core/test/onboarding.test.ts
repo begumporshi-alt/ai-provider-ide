@@ -164,6 +164,31 @@ describe("onboarding-orchestrator (state machine, §2.1)", () => {
     await orch.setContract({ checks: [{ name: "auth", pass: false, paid: false, detail: "401" }], allPassed: false, freePassed: false });
     await expect(orch.confirmRegistration()).rejects.toThrow(/free contract checks did not pass/);
   });
+
+  it("streams each probe attempt via onAttempt as it lands", async () => {
+    const { orch } = makeOrch((url) => OPENAI_SERVER(url));
+    const seen: string[] = [];
+    await orch.start(
+      { name: "Example", baseUrl: "https://api.example.com/v1" },
+      { onAttempt: (a) => seen.push(`${a.method} ${a.path}`) },
+    );
+    // the full matrix streamed, in matrix order, not as one batch after the fact
+    expect(seen.length).toBe(orch.session.probeReport!.attempts.length);
+    expect(seen).toContain("GET /models");
+    expect(seen[0]).toBe("GET /models");
+  });
+
+  it("an aborted probe rejects start() instead of returning a partial matrix", async () => {
+    const { orch } = makeOrch((url) => OPENAI_SERVER(url));
+    const ac = new AbortController();
+    ac.abort();
+    await expect(
+      orch.start({ name: "Example", baseUrl: "https://api.example.com/v1" }, { signal: ac.signal }),
+    ).rejects.toThrow();
+    // the partial report must not be persisted as a usable probe result
+    expect(orch.session.state).toBe("probing");
+    expect(orch.session.probeReport).toBeUndefined();
+  });
 });
 
 describe("redaction (§2.3)", () => {

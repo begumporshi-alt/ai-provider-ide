@@ -9,7 +9,7 @@
 
 import type { AdapterManifest } from "@aiprovider/adapter-spec";
 import type { HttpPortLike } from "./manifest-interpreter.js";
-import { runProbes, type ProbeReport } from "./probe-runner.js";
+import { runProbes, type ProbeAttempt, type ProbeReport } from "./probe-runner.js";
 import { fingerprint, type FingerprintResult } from "./fingerprinter.js";
 import { profileForBaseUrl } from "./builtin-templates.js";
 import type { ContractReport } from "./contract-suite.js";
@@ -78,7 +78,19 @@ export class OnboardingOrchestrator {
     await this.persistence.save(this.data);
   }
 
-  async start(input: OnboardingInput): Promise<ProbeReport> {
+  /**
+   * Options for the probe phase.
+   *
+   * `onAttempt` streams each probe result as it lands, so the wizard can render the attempt log
+   * live instead of after the whole matrix finishes (up to 9 sequential requests). `signal` lets
+   * the operator cancel mid-probe: `runProbes` returns a partial report when aborted, so this
+   * re-raises the abort itself — a partial matrix must never reach the fingerprinter and masquerade
+   * as a decided dialect.
+   */
+  async start(
+    input: OnboardingInput,
+    opts?: { onAttempt?: (a: ProbeAttempt) => void; signal?: AbortSignal },
+  ): Promise<ProbeReport> {
     if (!input.name.trim() || !/^https?:\/\//.test(input.baseUrl)) {
       throw new Error("name and an http(s) base URL are required");
     }
@@ -90,7 +102,8 @@ export class OnboardingOrchestrator {
       contract: undefined,
       failureReason: undefined,
     });
-    const report = await runProbes(this.http, input.baseUrl, undefined, undefined, input.extraHeaders);
+    const report = await runProbes(this.http, input.baseUrl, opts?.onAttempt, opts?.signal, input.extraHeaders);
+    opts?.signal?.throwIfAborted();
     await this.transition("fingerprinting", { probeReport: report });
     return report;
   }
