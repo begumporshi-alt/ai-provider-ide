@@ -98,7 +98,12 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           tool_choice: "{{toolChoice?}}",
         },
         responseMap: {
-          text: "$.content[0].text",
+          // **The path is the block ARRAY, not block 0.** `content` is a mixed array and which
+          // block leads is the provider's choice; a reasoning model puts its `thinking` block
+          // first, so `$.content[0].text` is `undefined` on a perfectly good response and the
+          // caller receives empty text. Measured 2026-09-29 on `agentrouter.org`. The interpreter
+          // selects the text blocks — see `selectText`.
+          text: "$.content",
           usage: "$.usage",
           // Non-stream: `content` is a MIXED array (text blocks + tool_use blocks). The
           // jsonpath subset has no filter expressions, so the interpreter filters by

@@ -66,7 +66,9 @@ describe("buildManualManifest", () => {
   it("wires the Anthropic dialect to Anthropic paths, not just an Anthropic label", () => {
     const ep = gen("anthropic-messages-v1");
     expect(ep.path).toBe("/messages");
-    expect(ep.responseMap.text).toBe("$.content[0].text");
+    // The block ARRAY, not block 0: a reasoning model puts its `thinking` block first, so
+    // `content[0].text` is undefined on a response that does contain text. See `selectText`.
+    expect(ep.responseMap.text).toBe("$.content");
     // The multi-event framing a tool call arrives in on that dialect.
     expect(ep.stream?.toolCallStream).toBeDefined();
   });

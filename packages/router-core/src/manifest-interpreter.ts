@@ -183,6 +183,54 @@ function emitToolCalls(sink: ((call: ToolCall) => void) | undefined, raw: unknow
   }
 }
 
+/**
+ * Block types that carry model **text**. Anthropic's `content` mixes these with `thinking` and
+ * tool blocks, and a reasoning model puts its `thinking` block FIRST.
+ */
+const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
+
+/**
+ * Read a response's text, allowing the path to point at a **mixed block array** rather than a
+ * single scalar.
+ *
+ * # Why `content[0]` is not enough
+ *
+ * The anthropic dialect's `content` is an array of blocks, and which block is first is the
+ * provider's choice. Measured 2026-09-29 against `agentrouter.org` (`deepseek-v4-flash`, extended
+ * thinking on): the response was `content:[{type:"thinking",…},{type:"text",text:"ok"}]` — the
+ * thinking block leads, so the template's old `$.content[0].text` resolved to `undefined` and the
+ * interpreter yielded **nothing at all**. The request succeeded, the text was present in the body,
+ * and the caller received an empty message. A silent empty is the worst available failure: nothing
+ * downstream can tell it apart from a model that chose to say nothing.
+ *
+ * # Why this is a generalisation, not a special case
+ *
+ * `toolCalls` already points at this same mixed array (`"$.content"`), and `emitToolCalls` selects
+ * from it by block type. Text now does the same thing by the field each block carries: a text block
+ * has `text`, a thinking block has `thinking`, a tool block has `input`. The two selectors are
+ * therefore symmetric, and neither needs a filter expression the JSONPath subset does not have.
+ *
+ * A scalar path is still returned unchanged, so every non-anthropic manifest is unaffected.
+ */
+function selectText(json: unknown, path: string): string | undefined {
+  const v = selectOne(json, path);
+  if (typeof v === "string") return v;
+  if (!Array.isArray(v)) return undefined;
+  const parts: string[] = [];
+  for (const item of v) {
+    if (typeof item === "string") {
+      parts.push(item);
+      continue;
+    }
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    // An untyped block with a `text` field is still text (some dialects omit `type`).
+    if (typeof o.type === "string" && !TEXT_BLOCK_TYPES.has(o.type)) continue;
+    if (typeof o.text === "string") parts.push(o.text);
+  }
+  return parts.length ? parts.join("") : undefined;
+}
+
 function joinUrl(baseUrl: string, path: string): string {
   return baseUrl.replace(/\/+$/, "") + (path.startsWith("/") ? path : `/${path}`);
 }
@@ -353,7 +401,7 @@ export class ManifestInterpreter implements AdapterInstance {
 
     if (!args.stream || !ep.stream) {
       const json: unknown = jsonBody(await res.text(), url);
-      const text = selectOne(json, ep.responseMap.text);
+      const text = selectText(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
       if (ep.responseMap.toolCalls) emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls));
       // Non-stream: pick up usage from the response body directly.
