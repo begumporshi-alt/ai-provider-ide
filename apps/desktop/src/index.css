@@ -41,3 +41,19 @@ html, body, #root {
 ::-webkit-scrollbar { width: 10px; height: 10px; }
 ::-webkit-scrollbar-thumb { background: var(--surface-2); border-radius: 5px; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* Spinner for in-flight wizard work. Token-coloured, one size — a spinner is a
+   "something is happening" signal, not a design element, so it does not scale. */
+@keyframes aip-spin {
+  to { transform: rotate(360deg); }
+}
+.spinner {
+  display: inline-block;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border);
+  border-top-color: var(--info);
+  border-radius: 50%;
+  animation: aip-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}

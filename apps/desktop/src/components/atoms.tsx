@@ -49,6 +49,20 @@ export function StatusDot({ health, pulse }: { health: Health; pulse?: boolean }
   );
 }
 
+/**
+ * In-flight marker for wizard work (probing, identifying, generating, checking). A line of
+ * `Spinner + text` is the whole pattern — the text names the phase, the spinner says it is
+ * alive. Pulse is for the same job on a dot; a spinner is for a sentence.
+ */
+export function Spinner({ label }: { label?: string }) {
+  return (
+    <span className="inline-flex items-center gap-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+      <span className="spinner" role="status" aria-label={label ? `${label} — in progress` : "in progress"} />
+      {label}
+    </span>
+  );
+}
+
 export function StatusBadge({ health }: { health: Health }) {
   return (
     <span

@@ -27,7 +27,7 @@ import {
   recordGeneratorAudit, refreshCatalog, registry, setProviderStatus, router,
 } from "../store";
 import { useUi } from "../ui-state";
-import { Button, Field, StatusDot, inputCls, inputStyle } from "../components/atoms";
+import { Button, Field, Spinner, StatusDot, inputCls, inputStyle } from "../components/atoms";
 import { CodeCandidateReview } from "../components/CodeCandidateReview";
 import { parseHeaderLines, withRequestHeaders } from "../lib/providers/manual-manifest";
 
@@ -655,14 +655,20 @@ export function OnboardingScreen() {
 
       {step === 1 && (
         <Section title="Checking how this API behaves…">
+          {busy && <div className="mb-2"><Spinner label="Sending free probes — each attempt appears as it lands…" /></div>}
           <ul className="mono space-y-0.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
             {probeLog.map((a, i) => (
               <li key={i}>
                 {a.status === null ? "✕" : a.status < 300 ? "✓" : a.status === 404 ? "–" : "•"} {a.method} {a.path} → {a.status ?? a.error}
               </li>
             ))}
-            {busy && <li>probing…</li>}
           </ul>
+        </Section>
+      )}
+
+      {step === 2 && busy && !dialect && (
+        <Section title="Identification">
+          <Spinner label="Identifying the API's dialect from the probe results…" />
         </Section>
       )}
 
@@ -708,11 +714,14 @@ export function OnboardingScreen() {
                     is registered.
                   </p>
                   <Button
-                    disabled={busy}
+                    disabled={busy || codeGenerating}
                     onClick={() => void runCodeGenerator()}
                   >
                     Generate a sandboxed code adapter
                   </Button>
+                  {codeGenerating && (
+                    <div className="mt-2"><Spinner label="Writing and sandbox-testing the code adapter…" /></div>
+                  )}
                 </div>
               )}
               {(codeGenerating || codeCandidate) && (
@@ -737,6 +746,16 @@ export function OnboardingScreen() {
             </>
           )}
         </Section>
+      )}
+
+      {step === 3 && !contract && busy && (
+        <Section title="Contract tests">
+          <Spinner label="Running the free contract checks against the adapter…" />
+        </Section>
+      )}
+
+      {step === 3 && contract && busy && (
+        <div className="mb-2"><Spinner label="Re-running the contract checks…" /></div>
       )}
 
       {step === 3 && contract && (
@@ -791,7 +810,7 @@ export function OnboardingScreen() {
           </ul>
           <div className="flex gap-2">
             <Button variant="primary" disabled={busy} onClick={() => void enableProvider()}>
-              Approve & enable provider
+              {busy ? "Enabling…" : "Approve & enable provider"}
             </Button>
             <Button variant="danger" disabled={busy} onClick={() => void cancel()}>
               Discard
@@ -941,6 +960,11 @@ function AiPath({
   const bestUsable = best?.manifest && best.freePasses > 0 ? best.id : null;
   return (
     <div>
+      {generating && (
+        <div className="mb-3">
+          <Spinner label="Generating candidate adapters with System AI — this can take a minute…" />
+        </div>
+      )}
       <ul className="mb-3 space-y-1 text-[12px]">
         {milestones.map((m) => (
           <li key={m.label} className="flex items-center gap-2">
@@ -964,7 +988,12 @@ function AiPath({
                   </span>
                 )}
               </div>
-              {!c && stage && <div className="text-[11px]" style={{ color: "var(--text-dim)" }}>{stage === "parsing" ? "asking System AI…" : `${stage}…`}</div>}
+              {!c && stage && (
+                <div className="flex items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
+                  <span className="spinner" style={{ width: 9, height: 9 }} />
+                  {stage === "parsing" ? "asking System AI…" : `${stage}…`}
+                </div>
+              )}
               {!c && !stage && generating && <div className="text-[11px]" style={{ color: "var(--text-faint)" }}>queued</div>}
               {c && !c.manifest && (
                 <div className="text-[11px]" style={{ color: "var(--danger)" }}>
