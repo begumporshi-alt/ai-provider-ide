@@ -84,6 +84,37 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Fixed
 
+- **The alias table was write-once, so the bare id the fix below offers could still have nobody to
+  fail over to.** `model_aliases` has **two** writers — `persistAliases` writes derived rows, and
+  `config_import` (`persist.rs`, `INSERT OR IGNORE`) merges the aliases out of an imported snapshot —
+  and four columns, none of them recording which is which. Boot loaded the whole table as operator
+  intent (`store.ts` mapped every row to `auto: false`), and `deriveAutoAliases` honours
+  `auto: false` by **leaving that id alone**. So a derived row could never be re-derived, and a
+  carrier that appeared after the last derivation could never join an alias that already existed.
+  Measured 2026-09-29: `deepseek-v4-flash` carried by two enabled providers (`agent-routerv2`,
+  `vice`) with **one** alias row (`vice`) — which is why the request below had nothing to fail over
+  to even once its id's form was fixed. `agnes-3.0-flash`, which has a row per carrier, was
+  unaffected and so was the model that made the defect invisible.
+
+  `ModelCatalog.hydrateAliases` recovers the distinction by definition rather than by guesswork: a
+  derived row is one the derivation *emits*, and `deriveAutoAliases` emits only bare rows
+  (`alias === nativeModelId`) on a provider whose catalog carries that native id. Rows inside that
+  set are re-derived; a row outside it cannot have come from a derivation, so it is kept and keeps
+  its id — which is what preserves a `config_import`ed alias. The method also reports whether the
+  rebuild moved the table, so a launch that changes nothing no longer rewrites the rows the gateway
+  is reading.
+
+  A provenance column was the other candidate and was rejected on evidence rather than taste: a
+  migration would have to pick one default for two populations at once, so a row that predates it
+  stays ambiguous either way, while this classification is exact for every row that can exist. The
+  residual is narrow and named — a hand-authored row shaped exactly like a derived one would be
+  re-derived — and nothing can author one today, because there is no alias editor. See
+  `docs/dev-book/07-drift-register.md` D76.
+
+  Five tests in `packages/router-core/test/model-catalog.test.ts`, falsified three times: restoring
+  the pre-fix load reddens the incident pair (rows and plan); dropping the carrier half of the
+  predicate reddens the pin test; neutering the change-report reddens the write-suppression test.
+
 - **`failoverEnabled` was inert for every model the UI could offer.** A qualified id
   (`slug/native`) resolves to exactly one provider — deliberately, so a pinned provider is never
   silently rerouted — and that was the **only** form any picker produced: `Assistant.tsx` and

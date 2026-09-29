@@ -136,6 +136,66 @@ export class ModelCatalog {
   }
 
   /**
+   * Adopt the alias table the host persisted, rebuild the derived rows from the catalog, and report
+   * whether the table moved — so the caller can skip a write when the cache was already in step.
+   *
+   * # Why boot cannot simply trust the table
+   *
+   * `persistAliases` writes derived rows, but it is not the only writer: `config_import` merges the
+   * aliases out of an imported snapshot (`persist.rs`, `INSERT OR IGNORE INTO model_aliases`). So the
+   * table holds a mixture of *derived* and *authored* rows, and records no provenance — four columns,
+   * none of them saying which. Loading all of it as operator intent made every derived row suppress
+   * its own id from ever being re-derived, because `deriveAutoAliases` honours `auto: false` by
+   * leaving that id alone. The table became write-once.
+   *
+   * Measured 2026-09-29: `deepseek-v4-flash` was carried by two enabled providers and had one alias
+   * row, so the bare id resolved to a single provider and `failoverEnabled` had nothing to fail over
+   * to — a second carrier could never join an alias that already existed.
+   *
+   * # How a row is classified
+   *
+   * A derived row is one the derivation *emits*, and `deriveAutoAliases` emits only bare rows:
+   * `alias === nativeModelId`, on a provider whose catalog carries that native id. A row outside that
+   * set cannot have come from a derivation, so it is kept — and kept as `auto: false`, which is what
+   * leaves its id alone. That is a definition rather than a heuristic: the two populations are
+   * exactly disjoint on it.
+   *
+   * The residual ambiguity is narrow and worth naming. A hand-authored row shaped exactly like a
+   * derived one — bare, on a carrying provider — is re-derived, so a priority pin on it would be
+   * lost. Nothing can author such a row today (there is no alias editor), and a row that predates
+   * this method is indistinguishable from a derived one *even with* a provenance column, because a
+   * migration would have to guess a default for both populations at once. That is why this is a
+   * classification and not a migration. See `docs/dev-book/07-drift-register.md` D76.
+   */
+  hydrateAliases(rows: AliasEntry[]): boolean {
+    const authored = rows.filter((r) => !this.derivationEmits(r));
+    this.aliases = authored.map((r) => ({ ...r, auto: false }));
+    this.deriveAutoAliases();
+    return !this.holdsExactly(rows);
+  }
+
+  /** Would `deriveAutoAliases` emit this row? Only bare rows, on a provider that carries the id. */
+  private derivationEmits(r: AliasEntry): boolean {
+    return (
+      r.alias === r.nativeModelId &&
+      this.models.some((m) => m.providerId === r.providerId && m.nativeId === r.nativeModelId)
+    );
+  }
+
+  /**
+   * Does `aliases` hold exactly `rows`? Order-insensitive, and `auto` is deliberately not part of a
+   * row's identity: the same rows derived or reloaded are the same table, and the flag is provenance
+   * the host does not store.
+   */
+  private holdsExactly(rows: AliasEntry[]): boolean {
+    const key = (a: AliasEntry) =>
+      `${a.alias}\u0000${a.providerId}\u0000${a.nativeModelId}\u0000${a.priority}`;
+    const mine = new Set(this.aliases.map(key));
+    const theirs = new Set(rows.map(key));
+    return mine.size === theirs.size && [...theirs].every((k) => mine.has(k));
+  }
+
+  /**
    * Alias auto-derivation (§Phase 1 acceptance): identical native IDs across providers get a
    * bare alias whose rows follow alias priority; qualified IDs always resolve directly.
    */

@@ -1513,3 +1513,34 @@ that is not drift (then the rethrown path needs its own health record).
   the marker list in `client-gate.ts` produces a false positive, which would tell an operator a rejected
   key is fine — the direction this deliberately does not fail in.
 
+## 2026-09-29 — The alias table is classified, not migrated
+
+- **Decision:** keep `model_aliases` at four columns and recover the derived/authored distinction by
+  **classification at load time** — a derived row is one `deriveAutoAliases` could have *emitted*
+  (bare, on a provider whose catalog carries the id) — rather than adding a provenance column and a
+  migration. `ModelCatalog.hydrateAliases` performs the classification and reports whether the rebuild
+  moved the table.
+- **Options considered:**
+  1. **Persist `auto`** (migration 0019, plus `AliasRow`, `aliases_replace_rows`, `aliases_rows`, the
+     `config_import` insert and the version assertion). Rejected for now: the migration must pick one
+     `DEFAULT` for **two** populations at once, so every row that already exists stays ambiguous
+     either way — `DEFAULT 1` prunes imported aliases, `DEFAULT 0` reproduces the incident on every
+     existing install. It buys a correct future and not a correct present.
+  2. **Boot re-derives and prunes to the derived set** (the simplest TS-only fix). Rejected: it
+     destroys the rows written by `config_import`, which is this table's *second* writer and the reason
+     it is not a pure cache.
+  3. **Classification** (chosen).
+- **Rationale:** the table is not a cache — two producers, no provenance column — but the two
+  populations are *exactly disjoint* on the producer's output shape, so the distinction is recoverable
+  from data already present. Resolving an ambiguity where the data can resolve it beats asking a
+  migration to guess. `deriveAutoAliases`'s `manual.has(native)` guard and `setAliases`'s meaning are
+  deliberately untouched: no code path authors an alias today, so weakening a documented rule would be
+  a semantic bet on a feature that does not exist (register D77).
+- **Consequence:** the bare id `deepseek-v4-flash` now derives a row per carrier, so `failoverEnabled`
+  has something to fail over to. The residual is named rather than hidden — a hand-authored row shaped
+  exactly like a derived one would be re-derived, and nothing can author one until an alias editor
+  lands (register D76 records that editor's obligation to persist `auto` in the same change).
+- **Revisit if:** an alias editor ships (then take option 1, and classify the existing rows at
+  migration time with this same predicate); or `deriveAutoAliases`'s output shape widens, so that
+  "bare, on a carrying provider" no longer separates the two populations.
+

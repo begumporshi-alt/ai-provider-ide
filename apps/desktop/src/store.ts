@@ -522,21 +522,31 @@ async function runBootstrap(): Promise<void> {
     }
   }
 
-  if (aliases.length) {
-    catalog.setAliases(aliases.map((a) => ({ ...a, auto: false })));
-  } else {
-    catalog.deriveAutoAliases();
-    // Best-effort, and deliberately the same shape as the call in `refreshStaleCatalogs` below.
-    //
-    // The alias table is a **derived cache**: it is rebuilt from the catalog whenever it is empty, so
-    // a write that does not land costs one re-derivation and nothing else — which is why swallowing
-    // it is honest rather than convenient.
-    //
-    // Unguarded, it made the boot path depend on a listener that is not there on a fresh install
-    // (the app only restores its own gateway once it has been enabled at least once). Measured:
-    // the app came up as "App data could not be opened / TypeError: Failed to fetch" — a
-    // corrupt-database screen, with its restore-from-backup advice, for a gateway that is simply off.
-    // `web-test/gateway-off.spec.ts` is the guard.
+  // The alias table is a derived cache with a **second writer**, and the database cannot tell them
+  // apart: `persistAliases` writes derived rows, while `config_import` (Rust) merges the aliases out
+  // of an imported snapshot — four columns, none of them recording which. `hydrateAliases` recovers
+  // the distinction by definition (a derived row is one the derivation emits), re-derives those, and
+  // keeps the rest.
+  //
+  // Loading the whole table as operator intent is what made it write-once. `deriveAutoAliases`
+  // honours `auto: false` by leaving that id alone, so a row loaded as manual could never be
+  // re-derived, and a carrier that appeared after the last derivation could never join an alias that
+  // already existed. Measured 2026-09-29: `deepseek-v4-flash` carried by two enabled providers, one
+  // alias row, no failover.
+  //
+  // Written back only when the rebuild moved the table, so a launch that changes nothing does not
+  // rewrite the rows the gateway is reading.
+  //
+  // Best-effort, and deliberately the same shape as the call in `refreshStaleCatalogs` below: a write
+  // that does not land costs one re-derivation and nothing else, which is why swallowing it is honest
+  // rather than convenient.
+  //
+  // Unguarded, it made the boot path depend on a listener that is not there on a fresh install (the
+  // app only restores its own gateway once it has been enabled at least once). Measured: the app came
+  // up as "App data could not be opened / TypeError: Failed to fetch" — a corrupt-database screen,
+  // with its restore-from-backup advice, for a gateway that is simply off.
+  // `web-test/gateway-off.spec.ts` is the guard.
+  if (catalog.hydrateAliases(aliases)) {
     await persistAliases().catch(() => undefined);
   }
 

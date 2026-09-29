@@ -9,8 +9,11 @@
 import { describe, expect, it } from "vitest";
 import { AdapterRuntime } from "../src/adapter-runtime.js";
 import { BUILTIN_TEMPLATES } from "../src/builtin-templates.js";
+import { HealthTracker } from "../src/health-tracker.js";
 import { ModelCatalog } from "../src/model-catalog.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
+import { buildPlan, type PlanContext } from "../src/route-planner.js";
+import type { AliasEntry } from "../src/domain.js";
 import { FakeHttp, FakeVault } from "./fakes.js";
 
 const PROVIDER_ID = "p1";
@@ -120,5 +123,138 @@ describe("manual catalog entries", () => {
     );
     expect(catalog.manualOf(PROVIDER_ID).map((m) => m.nativeId)).toEqual(["typed"]);
     expect(catalog.all()).toHaveLength(2);
+  });
+});
+
+// ---------------------------------------------------------------------------------------------
+// Alias auto-derivation, and the cache that defeated it.
+//
+// `model_aliases` has **two** writers and four columns. `persistAliases` writes derived rows;
+// `config_import` (`persist.rs`, `INSERT OR IGNORE`) merges the aliases out of an imported
+// snapshot; and no column records which is which. Boot loaded all of it as operator intent, and
+// `deriveAutoAliases` honours that by leaving the id alone — so a derived row could never be
+// re-derived and the table was write-once.
+//
+// Measured on this machine 2026-09-29: `deepseek-v4-flash` carried by two enabled providers
+// (`agent-routerv2`, `vice`), one alias row (`vice`), no failover.
+// ---------------------------------------------------------------------------------------------
+
+const A = "pA";
+const B = "pB";
+const BASE_A = "https://a.example/v1";
+const BASE_B = "https://b.example/v1";
+const SHARED = "shared";
+
+/**
+ * Two enabled providers, each with an active key and its own `/models` listing.
+ *
+ * The one-provider `harness` above cannot express the behaviour under test: an alias exists only
+ * where two providers advertise the same native id, and the whole defect is that a cached row hid
+ * the second carrier.
+ */
+async function twoProviders(listedA: string[], listedB: string[]) {
+  const http = new FakeHttp((url) =>
+    url.includes("/models")
+      ? { status: 200, body: { data: (url.startsWith(BASE_A) ? listedA : listedB).map((id) => ({ id })) } }
+      : undefined,
+  );
+  const registry = new ProviderRegistry(new FakeVault());
+  const adapters = new AdapterRuntime(http);
+  const catalog = new ModelCatalog(registry, adapters);
+
+  registry.hydrate(
+    [
+      { id: A, baseUrl: BASE_A },
+      { id: B, baseUrl: BASE_B },
+    ].map((p) => ({
+      id: p.id, slug: p.id.toLowerCase(), name: p.id, type: "manifest" as const,
+      baseUrl: p.baseUrl, status: "enabled" as const, rotationStrategy: "priority" as const,
+      createdAt: 0, updatedAt: 0,
+    })),
+    [],
+  );
+  await registry.addKey({ providerId: A, label: "ka", secret: "sk-test-aaaa" });
+  await registry.addKey({ providerId: B, label: "kb", secret: "sk-test-bbbb" });
+  adapters.register(A, BUILTIN_TEMPLATES["openai-compat"](BASE_A));
+  adapters.register(B, BUILTIN_TEMPLATES["openai-compat"](BASE_B));
+  return { catalog, registry };
+}
+
+/** Both providers carry `shared`, so the derivation owes a bare alias for it. */
+async function withShared() {
+  const h = await twoProviders([SHARED], [SHARED]);
+  await h.catalog.refreshProvider(A);
+  await h.catalog.refreshProvider(B);
+  return h;
+}
+
+/** A `PlanContext` over the live catalog, so a claim about routing is made by the planner. */
+function planCtx(catalog: ModelCatalog, registry: ProviderRegistry): PlanContext {
+  return {
+    providers: registry.listProviders(),
+    keysFor: (pid) => registry.keysOf(pid),
+    catalog: () => catalog.all(),
+    aliases: catalog.aliases,
+    health: new HealthTracker(),
+    nextKeyCursor: () => 0,
+  };
+}
+
+/**
+ * A row as `/admin/aliases` returns it. No `auto` field: the column does not exist, which is the
+ * reason the distinction has to be recovered rather than read.
+ */
+function hostRow(alias: string, providerId: string, nativeModelId: string, priority = 1): AliasEntry {
+  return { alias, providerId, nativeModelId, priority };
+}
+
+describe("alias auto-derivation across a boot", () => {
+  it("the incident: a cached row does not stop the second carrier being derived", async () => {
+    const { catalog } = await withShared();
+
+    // The table as the incident left it: one row, for the carrier configured second.
+    catalog.hydrateAliases([hostRow(SHARED, B, SHARED, 101)]);
+
+    const rows = catalog.aliases.filter((a) => a.alias === SHARED);
+    expect(rows.map((r) => r.providerId).sort()).toEqual([A, B]);
+  });
+
+  it("so the bare id plans through both providers — the failover the incident lacked", async () => {
+    const { catalog, registry } = await withShared();
+    catalog.hydrateAliases([hostRow(SHARED, B, SHARED, 101)]);
+
+    const plan = buildPlan({ model: SHARED, modality: "text" }, planCtx(catalog, registry));
+    expect(plan.map((c) => c.provider.id).sort()).toEqual([A, B]);
+  });
+
+  it("keeps a row the derivation could not have emitted, and lets it own its id", async () => {
+    const { catalog } = await withShared();
+
+    // The shape `config_import` writes and the web-test seed ships: a *qualified* alias, so
+    // `alias !== nativeModelId` and no derivation ever produces it.
+    const authored = hostRow("sysai/oracle-mini", A, "oracle-mini");
+    catalog.hydrateAliases([hostRow(SHARED, B, SHARED, 101), authored]);
+
+    expect(catalog.aliases).toContainEqual({ ...authored, auto: false });
+    // The documented rule (`domain.ts`: "manual entries win") is untouched by the fix above: the
+    // kept row still suppresses derivation for the id it names.
+    expect(catalog.aliases.filter((a) => a.alias === SHARED)).toHaveLength(2);
+  });
+
+  it("keeps a bare row for a provider that does not carry the id — a pin, not a derivation", async () => {
+    const { catalog } = await withShared();
+
+    const pin = hostRow(SHARED, "pZ", SHARED, 1);
+    catalog.hydrateAliases([pin]);
+
+    // Kept, and its id is left alone: one row, not the two the catalog would otherwise derive.
+    expect(catalog.aliases).toEqual([{ ...pin, auto: false }]);
+  });
+
+  it("reports whether it moved the table, so a launch that changes nothing writes nothing", async () => {
+    const { catalog } = await withShared();
+
+    expect(catalog.hydrateAliases([])).toBe(true); // empty cache, two rows owed
+    expect(catalog.hydrateAliases(catalog.aliases.map((a) => ({ ...a })))).toBe(false);
   });
 });
