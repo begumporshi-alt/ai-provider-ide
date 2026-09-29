@@ -5950,3 +5950,107 @@ real `buildPlan` against it. `seeds.ts` could not have caught the incident anywa
 `nativeId`s are declared once each and share one `providerId`, so no seeded id has two carriers and
 `offersBareId` is false for every one. A seed that reproduced it would need two providers carrying one
 native id, which no existing spec has.
+
+---
+
+## The dual-dialect host, the thinking block, and why auto setup could not reach agentrouter (2026-09-29)
+
+### The measurements (all live, `agentrouter.org`, `deepseek-v4-flash` unless noted)
+
+| Probe | Result |
+|---|---|
+| `GET /v1/models`, no `User-Agent` | `401 unauthorized_client_error` — *"unauthorized client detected … discord.gg/…"* |
+| `GET /v1/models`, UA `claude-cli/2.0.18 (external, cli)` | `401 new_api_error` — *"未提供令牌"* (no token) — **the gate is cleared and the key is now judged** |
+| `GET /models` (bare), any UA | `200` **HTML** — the marketing dashboard. Not a model list; `runProbes` `JSON.parse`s it, fails, records no shape |
+| `GET /v1/models`, UA **+ key** | `200` `{data:[{id,object,supported_endpoint_types}]}` — `deepseek-v4-flash` → `["openai","anthropic"]`, `claude-opus-4-8` → `["anthropic","openai"]`, `gpt-6-astra` → `["openai"]` |
+| `POST /v1/messages`, UA + key | `200` `content:[{type:"thinking",…},{type:"text",text:"ok"}]`, `stop_reason:"end_turn"` — **thinking block first** |
+| `POST /v1/chat/completions`, UA + key | `200` `choices[0].message.content: ""`, output in `reasoning_content` — **empty through `openaiCompat`** |
+| `POST /v1/messages`, `stream:true` | thinking deltas `{"delta":{"thinking":"…","type":"thinking_delta"}}`; one `text_delta` `{"delta":{"text":"ok","type":"text_delta"}}` — **streaming was already correct** |
+| `POST /v1/messages`, model `claude-opus-4-8` | `402` *"Budget pool quota has been exhausted"* — the key's budget pool, not a defect |
+
+**Both routes silently return empty text through our templates.** That is the headline: no amount of
+onboarding work would have produced a working provider until the Anthropic one was fixed.
+
+### The two selectors are now symmetric
+
+`responseMap.toolCalls` has always been `"$.content"` — the mixed block array — with
+`emitToolCalls` selecting by block type. `text` was `"$.content[0].text"`, a positional read. The fix
+points `text` at the same array and lets `selectText` select by *what each block carries*: a text
+block has `text`, a thinking block has `thinking`, a tool block has `input`. No filter expression is
+needed, which matters because the JSONPath subset (`jsonpath.ts`) deliberately has none — no `..`, no
+filters, no functions.
+
+```ts
+const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
+// selectText: scalar → returned as-is; array → join the blocks carrying a string `text`
+// whose type is absent or a text type. `thinking` / `tool_use` blocks have no `text` field,
+// so they cannot be mistaken for the answer.
+```
+
+`selectText` returns `undefined` for an array with no text block, so a thinking-only response yields
+**nothing** rather than leaking the model's scratchpad into the transcript — a worse failure than the
+empty one being fixed, and pinned by its own test.
+
+### Why a profile, and not a fingerprinter fix
+
+`fingerprinter.ts:103` classifies anthropic as `messages?.exists && !chat?.exists`. A host serving
+both fails that by construction, and **no unauthenticated signal breaks the tie**: §2.2's probes are
+deliberately free-only and carry no credential, so `/v1/models` is a `401` and the model list — which
+would have said `supported_endpoint_types` — is invisible. Relaxing the rule to `messages.exists`
+alone was rejected: `/messages` is a plausible path on a non-Anthropic host (a chat-history route), so
+dropping the negative test would misclassify some OpenAI-compatible providers as Anthropic — a silent,
+provider-wide break bought for one host.
+
+So the fallback answers a *different* question: **is this a host whose dialect we have already
+measured?** `profileForBaseUrl` matches `new URL(baseUrl).hostname` against each profile's own
+base-URL host, compared **whole** — `agentrouter.org.evil.test` is a different host and must not
+match, which is what a suffix test would have got wrong. `identify()` consults it only when the
+fingerprint is inconclusive **and there is no client gate**.
+
+### The client gate is excluded on purpose
+
+A gate means the probe never reached the provider — nothing about the host has been confirmed, only
+that the caller was refused. Resolving the dialect then would register a provider that looks
+configured and cannot be reached, which is precisely the failure mode this repository treats as the
+worst available. The operator still owes a header, and the gate panel is where they supply it.
+
+For the same reason the `agentrouter` profile carries **no `User-Agent`**. `client-gate.ts:66-73`
+states the line: *"which client a gateway will accept is a per-gateway fact, and impersonating a
+recognised one is the operator's decision to make, not a default this product should apply on their
+behalf."* The profile supplies the **dialect** — the fact that was measured — and not the
+**impersonation**, which is the operator's. ZCode hardcodes `claude-cli/…`; this product does not, and
+that is a deliberate difference rather than an oversight.
+
+### Falsification — three probes, one at a time, `shasum`-verified snapshot
+
+| Probe | Result |
+|---|---|
+| Template selector reverted to `$.content[0].text` | **3 red** — `expected '' to be 'ok'` (the incident, reproduced), multi-block concat, and the profile's selector assertion |
+| `selectText`'s array handling neutered (`return undefined` before it) | **4 red** — a *different* set, including the plain leading-text case; the thinking-only and openai-scalar tests stayed green |
+| Profile fallback disabled (`known = undefined`) | **1 red** — profile resolution only; the unknown-host control stayed green |
+
+Each restore `cmp`-verified byte-identical against the snapshot. The two selector probes failing
+**different sets** is the evidence that both halves are load-bearing rather than one covering for the
+other.
+
+### Residuals
+
+- **An unmeasured dual-dialect host is still unclassifiable.** The profile path covers hosts that have
+  been measured; the general fix is to offer the operator the two dialects when both surfaces answer,
+  which is the same "ask the human" shape the gate panel uses. Register **D80**.
+- **`onboarding_sessions.state`'s `CHECK` omits `'failed'`** (`store.rs:155-158`), so a failed setup
+  cannot record its own failure — `onboarding_latest_active` (`persist.rs:814`) even filters on a
+  state the table cannot hold. Proven: `INSERT … 'failed'` → `CHECK constraint failed`; the control
+  `'fingerprinting'` inserts. Widening a `CHECK` needs a table rebuild, so it is a migration, not a
+  drive-by. Register **D78**.
+- **`config_import`'s `detailJson` round-trip** works (`persist.rs` maps it to
+  `probe_report_redacted_json` on both write and read) but the column name describes one field of the
+  blob it carries; `candidates_json` is never written. Naming drift, not a defect.
+
+### Where the evidence lives
+
+`onboarding_sessions` in `~/Library/Application Support/dev.aiprovider.router/ai-provider-router.db`
+holds the operator's real attempts, including `input_json` with any `extraHeaders` they entered. Four
+sessions for this host (ids 9–12), all parked at `fingerprinting`, were what showed the gate was
+**not** the remaining blocker. Note the table is `manifests`, not `adapter_manifests`, and it has no
+`detail_json` column — the read path `COALESCE(probe_report_redacted_json,'null')` supplies that name.
