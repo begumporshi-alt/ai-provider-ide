@@ -1544,3 +1544,39 @@ that is not drift (then the rethrown path needs its own health record).
   migration time with this same predicate); or `deriveAutoAliases`'s output shape widens, so that
   "bare, on a carrying provider" no longer separates the two populations.
 
+## 2026-09-29 — A measured host beats a probe that cannot decide
+
+- **Decision:** when the dialect fingerprinter returns `unknown` and the provider's base URL matches a
+  host whose dialect has already been measured, resolve it from that profile (`PROVIDER_PROFILES` +
+  `profileForBaseUrl`) instead of guessing or failing. A **client gate is excluded** from the fallback.
+- **Options considered:**
+  1. **Relax the anthropic rule** from `messages.exists && !chat.exists` to `messages.exists` when both
+     are present. Rejected: `/messages` is a plausible path on a non-Anthropic host (a chat-history
+     route), so dropping the negative test would classify some OpenAI-compatible providers as
+     Anthropic — a silent, provider-wide break bought in exchange for one host. The negative test
+     exists for a reason; an aggregator is simply what it cannot express.
+  2. **Ask the operator to choose the dialect** when both surfaces answer. Not rejected — deferred. It
+     is the general fix and the right shape (only the operator knows which dialect their provider
+     means), but it is a new panel and a new wizard step; the measured-host case is answerable without
+     asking anyone.
+  3. **Probe with the credential**, so the model list becomes visible. Rejected: §2.2's probes are
+     deliberately free-only and unauthenticated, and a fingerprint that needs a key could not
+     bootstrap a fresh install.
+  4. **A measured-host profile** (chosen), with the ambiguity prompt recorded as the general follow-up
+     (register D80).
+- **Rationale:** the probe's verdict is not wrong, it is *undecidable* — a host serving both dialects
+  satisfies neither branch, and no unauthenticated signal breaks the tie. Where a fact has already been
+  measured, reusing it beats both guessing and refusing. Matching on the **whole hostname**, never a
+  suffix, is what stops the lookup from handing a lookalike host a profile's wiring.
+- **Consequence:** `agentrouter` joins `PROVIDER_PROFILES`, pinned to its Anthropic route because the
+  OpenAI one answers `200` with `content: ""` and its output in `reasoning_content` — empty text
+  through this product. The profile carries **no `User-Agent`**: the gateway refuses an unrecognised
+  client before it reads any credential, and which client to name is the operator's decision, not a
+  default this product applies on their behalf. That is the same line `client-gate.ts` draws when it
+  declines to name one, and it keeps the gate panel as the place the header is supplied. An
+  *unmeasured* dual-dialect host is still unclassifiable — that residual is D80's open half.
+- **Revisit if:** option 2 lands (then the profile becomes a pre-fill for the choice rather than a
+  silent resolution, and the fallback should narrow to hosts whose profile the operator can see); or a
+  dual-dialect host is measured whose Anthropic route is the *broken* one, which would make "prefer
+  Anthropic" a per-host fact rather than a default worth holding.
+

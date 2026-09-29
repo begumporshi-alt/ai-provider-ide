@@ -84,6 +84,46 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Fixed
 
+- **A reasoning model's answer was silently dropped on the non-streaming Anthropic path, because the
+  template read block 0.** `content` is a mixed block array and the *provider* decides the order:
+  measured 2026-09-29 against `agentrouter.org` (`deepseek-v4-flash`, extended thinking on), a
+  perfectly good `200` answered
+  `content:[{type:"thinking",…},{type:"text",text:"ok"}]`. The anthropic template's `text` selector
+  was `$.content[0].text`, which on that body is `undefined` — so `manifest-interpreter` yielded
+  **nothing at all**. The request succeeded, the text was in the response, and the caller received an
+  empty message. Nothing downstream can tell that apart from a model that chose to say nothing, which
+  is what makes it the worst available failure.
+
+  The streaming path was already correct, and that is what hid this: there, text and reasoning are
+  separated by *field name* (`delta.text` vs `delta.thinking`), so `chunkMap.delta` never saw a
+  thinking delta. The two paths disagreed and the non-streaming one was wrong. `responseMap.text` now
+  points at the block **array** (`$.content`) — exactly as `toolCalls` already did — and the
+  interpreter selects the blocks that carry a string `text`, so a `thinking` or `tool_use` block
+  cannot be mistaken for the answer. A scalar path is still returned unchanged, so every other
+  dialect is untouched.
+
+- **A provider speaking both dialects could not be set up automatically, and the wizard's own
+  explanation for that was wrong.** The dialect fingerprinter classifies `anthropic-compat` as "a
+  `/messages` endpoint exists **and no** `/chat/completions`" — a negative test, which a host serving
+  both fails by construction. `agentrouter.org` is such a host: `GET /v1/models` advertises
+  `supported_endpoint_types:["openai","anthropic"]`, and once the client-gate header is supplied
+  every probed path answers `401`, so both routes "exist" and no unauthenticated signal is left to
+  break the tie. Measured verdict: `unknown` — with the operator told *"Deterministic setup covers
+  OpenAI- and Anthropic-compatible APIs"* about a provider that is both.
+
+  **Auto setup now recognises a host it has already measured.** `PROVIDER_PROFILES` gains
+  `agentrouter`, pinned to the Anthropic route — the OpenAI one answers `200` with `content: ""` and
+  the model's output in `reasoning_content`, so it returns empty text through this product — and
+  `profileForBaseUrl` matches it by whole hostname, so `agentrouter.org.evil.test` is a different
+  host and does not match. `OnboardingOrchestrator.identify` falls back to the profile when the probe
+  is inconclusive. A **client gate is deliberately excluded**: it means the probe never reached the
+  provider, so the operator still owes a header and the gate panel is where they supply it. The
+  profile names no `User-Agent`, for the same reason `client-gate.ts` declines to — which client to
+  impersonate is the operator's decision, not a default this product applies on their behalf.
+
+  The class is not closed: an *unmeasured* dual-dialect host is still unclassifiable, and that
+  residual is recorded in the drift register rather than papered over.
+
 - **The alias table was write-once, so the bare id the fix below offers could still have nobody to
   fail over to.** `model_aliases` has **two** writers — `persistAliases` writes derived rows, and
   `config_import` (`persist.rs`, `INSERT OR IGNORE`) merges the aliases out of an imported snapshot —
