@@ -11,6 +11,7 @@ import { renderTemplate } from "./template.js";
 import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
+import { shapeMessageContent, textOfContent } from "./content-parts.js";
 
 /**
  * Cached-prompt tokens from a usage block, in whichever dialect reports them.
@@ -288,7 +289,9 @@ function normalizeDialectMessages(
     const target = roleMap[role];
     if (target === null) {
       // Hoist: this dialect takes system messages as a top-level param, not in the messages array.
-      const content = typeof m.content === "string" ? m.content : String(m.content ?? "");
+      // `textOfContent`, not `String(...)`: a system message may carry parts, and `String([{…}])`
+      // renders `[object Object]` — which would have been sent to the provider as the system prompt.
+      const content = textOfContent(m.content);
       if (content) systemParts.push(content);
       continue;
     }
@@ -542,9 +545,20 @@ export class ManifestInterpreter implements AdapterInstance {
       ep.messagesRoleMap,
       ep.systemField,
     );
+    // v1.1 amendment (2026-10-01): render any content-part arrays into this dialect's own shapes.
+    // Applied AFTER role normalization (a hoisted system message is text by then) and before the
+    // body template, because `{{messages}}` is a whole-structure substitution: whatever parts
+    // survive to here are what the provider receives. A manifest that declares no templates leaves
+    // the parts untouched — see `renderContentParts`.
+    const dialectMessages = shapeMessageContent(
+      messages,
+      ep.contentPartTemplates,
+      ep.contentField,
+      renderTemplate,
+    );
     const templateValues: Record<string, unknown> = {
       model: args.model,
-      messages,
+      messages: dialectMessages,
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
       temperature: args.temperature,

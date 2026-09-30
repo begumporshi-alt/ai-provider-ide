@@ -180,3 +180,76 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     expect(finish).toBe("tool_use");
   });
 });
+
+/**
+ * Multimodal forwarding (v1.1 amendment 2026-10-01).
+ *
+ * The same request — one user turn carrying text and a PNG — through all three dialects, asserted on
+ * the body that actually goes on the wire. This is the test that makes the `contentPartTemplates`
+ * declaration real: each dialect's block is checked for its own nesting, because the differences are
+ * exactly where a hand-written mapping goes wrong (`{type,url}` vs `{type,image_url:{url}}` differ by
+ * one level; Gemini has no `type` field at all).
+ */
+const PNG_1PX = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==";
+const MULTIMODAL = [
+  {
+    role: "user",
+    content: [
+      { type: "text", text: "what is this?" },
+      { type: "image", mediaType: "image/png", dataBase64: PNG_1PX },
+    ],
+  },
+];
+
+describe("multimodal content parts reach each dialect in its own shape", () => {
+  it("openai-compat: image_url carrying a data URI", async () => {
+    const { interp, lastBody } = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(interp, { model: "gpt-4o", messages: MULTIMODAL, stream: false });
+    const msgs = lastBody()!.messages as Array<{ role: string; content: unknown }>;
+    expect(msgs[0]!.content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1PX}` } },
+    ]);
+  });
+
+  it("anthropic-compat: a base64 source block, media type beside the bytes", async () => {
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: MULTIMODAL, stream: false });
+    const msgs = lastBody()!.messages as Array<{ role: string; content: unknown }>;
+    expect(msgs[0]!.content).toEqual([
+      { type: "text", text: "what is this?" },
+      { type: "image", source: { type: "base64", media_type: "image/png", data: PNG_1PX } },
+    ]);
+  });
+
+  it("gemini-compat: inlineData with no type field", async () => {
+    const { interp, lastBody } = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(interp, { model: "models/gemini-2.0-flash", messages: MULTIMODAL, stream: false });
+    const contents = lastBody()!.contents as Array<{ role: string; parts: unknown[] }>;
+    expect(contents[0]!.parts).toEqual([
+      { text: "what is this?" },
+      { inlineData: { mimeType: "image/png", data: PNG_1PX } },
+    ]);
+  });
+
+  it("a hoisted system message carrying parts becomes text, not '[object Object]'", async () => {
+    // Anthropic takes the system prompt as a top-level string. A parts-shaped system message used to
+    // render as `[object Object]` — the provider would receive that as its instructions.
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, {
+      model: "claude-x",
+      messages: [{ role: "system", content: [{ type: "text", text: "be terse" }] }, ...MULTIMODAL],
+      stream: false,
+    });
+    expect(lastBody()!.system).toBe("be terse");
+  });
+
+  it("a text-only string turn keeps its plain-string shape", async () => {
+    // Nothing about supporting attachments may upgrade an ordinary message into an array: a dialect
+    // without part templates handles a string and only a string.
+    const { interp, lastBody } = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(interp, { model: "gpt-4o", messages: [{ role: "user", content: "plain" }], stream: false });
+    expect((lastBody()!.messages as Array<{ content: unknown }>)[0]!.content).toBe("plain");
+  });
+});
+

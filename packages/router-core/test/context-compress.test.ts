@@ -20,6 +20,7 @@ import {
   promptBudget,
   SUMMARY_LABEL,
 } from "../src/context-compress.js";
+import { textOfContent } from "../src/content-parts.js";
 
 const msg = (
   role: ChatMessage["role"],
@@ -203,10 +204,10 @@ describe("compressWithSummary", () => {
     expect(r.messages).toContainEqual(system);
     expect(r.messages).toContainEqual(newQ);
     const summary = r.messages.find(
-      (m) => m.role === "system" && m.content.includes(SUMMARY_LABEL),
+      (m) => m.role === "system" && textOfContent(m.content).includes(SUMMARY_LABEL),
     );
     expect(summary).toBeDefined();
-    expect(summary!.content).toContain("They asked something earlier.");
+    expect(textOfContent(summary!.content)).toContain("They asked something earlier.");
   });
 
   it("hands the summarizer exactly the messages that were dropped", async () => {
@@ -224,7 +225,7 @@ describe("compressWithSummary", () => {
       throw new Error("summarizer unavailable");
     });
     expect(r.messages).toEqual([system, newQ]);
-    expect(r.messages.some((m) => m.content.includes(SUMMARY_LABEL))).toBe(false);
+    expect(r.messages.some((m) => textOfContent(m.content).includes(SUMMARY_LABEL))).toBe(false);
   });
 
   it("falls back when the summarizer returns nothing usable", async () => {
@@ -251,7 +252,7 @@ describe("compressWithSummary", () => {
     const budget = estimateTokens([system, q1, q2]) - estimateTokens([q1]) + 40;
     const r = await compressWithSummary([system, q1, q2], budget, async () => "summary text");
     const summaryIdx = r.messages.findIndex(
-      (m) => m.role === "system" && m.content.includes(SUMMARY_LABEL),
+      (m) => m.role === "system" && textOfContent(m.content).includes(SUMMARY_LABEL),
     );
     const lastIdx = r.messages.findIndex((m) => m === q2);
     expect(summaryIdx).toBeGreaterThanOrEqual(0);
@@ -271,7 +272,7 @@ describe("compressWithSummary", () => {
     expect(r.messages[r.messages.length - 1]).toBe(q3);
     // The summary survived the re-fit that removed q2.
     expect(
-      r.messages.some((m) => m.role === "system" && m.content.includes(SUMMARY_LABEL)),
+      r.messages.some((m) => m.role === "system" && textOfContent(m.content).includes(SUMMARY_LABEL)),
     ).toBe(true);
   });
 });

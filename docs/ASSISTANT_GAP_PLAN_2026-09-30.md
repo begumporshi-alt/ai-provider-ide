@@ -20,6 +20,36 @@ ChatGPT/Claude web chat surfaces.
   so a past edit's diff is reconstructible). `search_files` results group by file. 21 new unit tests
   + a new e2e (`tool-result-rendering.spec.ts`); web-test 119/119.
   Not done in this pass: clickable `path:line` file links (needs a root-confined host opener).
+- **Phase 3 (composer) — DONE (2026-10-01).** The composer grew up: auto-growing box, an attach
+  button/drag-drop/paste, image chips with thumbnails, a slash-command menu (`/clear` `/model`
+  `/image` `/compact`) and `@file` references that list the workspace and inline a file's contents
+  into the send. `ChatMessage.content` is now `string | ContentPart[]`, with each dialect's wire
+  shape declared in the manifest (`contentPartTemplates`) rather than branched in the interpreter —
+  OpenAI's `image_url` data URI, Anthropic's base64 `source`, Gemini's `inlineData`. Image attach is
+  gated on the model declaring vision, and the three states are kept apart (`true`/`false`/absent)
+  so "this provider publishes no capabilities" never reads as "your model cannot see".
+  New files: `components/Composer.tsx`, `lib/chat/slash.ts`, `lib/chat/mentions.ts`,
+  `lib/chat/slash-mentions.test.ts` (29 unit tests), `packages/router-core/src/content-parts.ts`
+  + its 18 tests, `web-test/composer.spec.ts` (10 e2e). Verified: workspace typecheck clean, 742
+  unit tests (23 + 373 + 346), vite build, 149/149 web-test.
+  **Found and fixed while verifying:**
+  (a) **Gemini requests carried no conversation at all.** The gemini-compat template put `{{messages}}`
+  into `contents`, and each message kept the field name `content` — a field Gemini's generateContent
+  API does not read (its message shape is `{role, parts}`). Every Gemini request was sending an empty
+  `contents[]` as far as the provider was concerned. Fixed with a declarative `contentField: "parts"`
+  plus the accompanying shape change (a string content becomes a one-part array), and pinned by a
+  dialect test.
+  (b) An image was measured as its base64 by the token estimator, which is what the compressor uses to
+  decide how much conversation to drop — so one picture would have cost thousands of phantom tokens and
+  compressed real turns away. `textOfContent` now flattens an image to a one-token marker.
+  (c) `list_dir` returns a *formatted* listing (`file <path>` / `dir  <path>`), not bare paths; the
+  parser is now `parseListing` in `lib/chat/mentions.ts` with tests, rather than a whitespace split
+  that a path with a space would break.
+  (d) Two of my own: the interpreter was handed the message *array* where a message's *content* was
+  expected (parts silently unrendered), and `textOfContent` had lost the circular-JSON guard the old
+  helper had. Both were caught by the new tests, not by review.
+  **Not done in this pass:** Gemini's *tool* shapes (`functionCall`/`functionResponse`) remain
+  unmodelled — a separate pre-existing gap, unchanged here.
 - **Phase 4 (in-screen session management) — DONE (2026-09-30).** A session bar at the top of the
   Assistant: the current session's title (click to rename, persisted through `session_titles`), a
   **＋ New** button that swaps the recorder and clears the transcript, and a **Sessions ▾** switcher
@@ -175,6 +205,9 @@ a `search_files` result groups by file.
 ---
 
 ## Phase 3 — Composer (attachments · vision input · slash commands · auto-resize)
+
+**Status: DONE (2026-10-01)** — see the Status section above for what shipped, the four defects found
+while verifying, and the one gap left (Gemini tool shapes).
 
 **Why third.** A 2-row textarea with Enter-to-send blocks real multimodal use: you cannot send an image
 *into* the text chat for vision models, and cannot attach a file to context.

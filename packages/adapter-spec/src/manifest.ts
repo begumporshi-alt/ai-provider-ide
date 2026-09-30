@@ -138,6 +138,26 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
   // When absent, hoisted system content is dropped — a dialect without a system channel
   // simply cannot accept one.
   systemField: z.string().optional(),
+  // v1.1 amendment (2026-10-01): declarative rendering of multimodal content parts.
+  //
+  // Keyed by the *internal* part type (`"text"`, `"image"`), each value is a request-body fragment
+  // whose placeholders are resolved per part: `{{text}}` for a text part, and `{{mediaType}}`,
+  // `{{dataBase64}}` or `{{dataUri}}` for an image. Values are nested structures, so a dialect's own
+  // wrapping is expressible (`source.data` for Anthropic, `inlineData.data` for Gemini) without the
+  // interpreter knowing any dialect by name.
+  //
+  // The three dialects carry an image in three shapes — OpenAI an `image_url.url` data URI, Anthropic
+  // a base64 `source` block, Gemini `inlineData` — which is precisely the case `messagesRoleMap`
+  // already answers for roles: **the grammar carries the mapping, the interpreter applies it.** A
+  // manifest that declares nothing passes parts through unchanged, and nothing is dropped: an
+  // undeclared dialect may reject the request, but it will not silently lose the user's image.
+  contentPartTemplates: z.record(z.string(), z.record(z.unknown())).optional(),
+  // The field name this dialect uses for a message's content. Absent means the universal `content`;
+  // Gemini declares `"parts"`, which is also a *shape* difference — its parts must be an array even
+  // when the message is one line of text — so the interpreter wraps a string in a text part when
+  // this is declared. A rename without that wrapping would produce `parts: "hi"`, which no provider
+  // accepts; the two belong to one declaration.
+  contentField: z.string().optional(),
   // v1.1 amendment (2026-09-30): declarative `tool_choice` translation.
   // Maps the internal OpenAI tool_choice forms ("none", "auto", "function") to the dialect's own.
   // A `null` value means "omit tool_choice entirely for this form". A string is a literal value

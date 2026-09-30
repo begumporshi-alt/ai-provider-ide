@@ -93,7 +93,7 @@ export interface HostModelRow {
  * Capabilities come back as a JSON string. Unknown stays unknown — never assumed either way,
  * because a client acts on this flag.
  */
-function parseCapabilitiesJson(v: string | null | undefined): { reasoning?: boolean } | undefined {
+function parseCapabilitiesJson(v: string | null | undefined): { reasoning?: boolean; vision?: boolean } | undefined {
   if (!v) return undefined;
   try {
     return JSON.parse(v) as { reasoning?: boolean };
@@ -496,6 +496,9 @@ async function runBootstrap(): Promise<void> {
       contextWindow: m.contextWindow ?? undefined, fetchedAt: m.fetchedAt,
       pricing: parsePricingJson(m.pricingJson),
       supportsReasoning: parseCapabilitiesJson(m.capabilitiesJson)?.reasoning,
+      // Same column, second fact. Vision gates the composer's image attach, and `undefined` stays
+      // undefined: a provider that never mentioned modalities is silent, not a "no".
+      supportsVision: parseCapabilitiesJson(m.capabilitiesJson)?.vision,
       // Carried through, not defaulted: a manual row that hydrated as `discovered` would be
       // deleted by the next refresh, which is the exact loss this column exists to prevent.
       origin: m.origin === "manual" ? ("manual" as const) : ("discovered" as const),
@@ -846,8 +849,12 @@ function catalogRowsFor(providerId: string) {
       // only hydrates would otherwise price every request as unknown — and would have no idea
       // what the model can do.
       pricingJson: m.pricing ? JSON.stringify(m.pricing) : null,
+      // Written together, and `null` only when NEITHER fact is known — writing `{reasoning:undefined}`
+      // would drop the key (JSON) and lose a vision flag that was known.
       capabilitiesJson:
-        m.supportsReasoning === undefined ? null : JSON.stringify({ reasoning: m.supportsReasoning }),
+        m.supportsReasoning === undefined && m.supportsVision === undefined
+          ? null
+          : JSON.stringify({ reasoning: m.supportsReasoning, vision: m.supportsVision }),
       origin: m.origin === "manual" ? "manual" : "discovered",
     }));
 }

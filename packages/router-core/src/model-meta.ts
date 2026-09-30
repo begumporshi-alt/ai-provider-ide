@@ -49,3 +49,46 @@ export function parseReasoningSupport(raw: unknown): boolean | undefined {
   if (typeof flag === "boolean") return flag;
   return undefined;
 }
+
+/** Does a modality list mention image input? `["image"]`, `["text","image"]`, … */
+function mentionsImageInput(v: unknown): boolean {
+  return Array.isArray(v) && v.some((m) => typeof m === "string" && /image/i.test(m));
+}
+
+/**
+ * Whether the model accepts images as **input**, or `undefined` when the provider does not say.
+ *
+ * `undefined` is NOT false, for the same reason as reasoning support: a catalog that never mentions
+ * modalities is silent about vision, and reporting that silence as "cannot see" would disable image
+ * input for providers that support it perfectly well. The UI keeps the two apart — it gates image
+ * attachment on a positive declaration and says which case it is, rather than presenting a greyed-out
+ * button with no explanation.
+ *
+ * Read from the shapes providers actually publish:
+ *  - OpenRouter: `architecture.input_modalities` — output modalities are deliberately NOT read, since
+ *    a model that *generates* images need not accept them
+ *  - generic OpenAI-compatible extensions: `input_modalities`, `modalities`
+ *  - explicit flags: `supports_vision`, `vision`, `capabilities.vision`
+ *
+ * Text-only is a positive answer rather than a fallback: an entry publishing
+ * `input_modalities: ["text"]` is declaring that images are not accepted, and that returns `false`.
+ */
+export function parseVisionSupport(raw: unknown): boolean | undefined {
+  if (!raw || typeof raw !== "object") return undefined;
+  const r = raw as Record<string, unknown>;
+  const arch = r.architecture;
+  if (arch && typeof arch === "object") {
+    const inputs = (arch as Record<string, unknown>).input_modalities;
+    if (Array.isArray(inputs)) return mentionsImageInput(inputs);
+  }
+  if (Array.isArray(r.input_modalities)) return mentionsImageInput(r.input_modalities);
+  if (Array.isArray(r.modalities)) return mentionsImageInput(r.modalities);
+  const caps = r.capabilities;
+  if (caps && typeof caps === "object") {
+    const flag = (caps as Record<string, unknown>).vision;
+    if (typeof flag === "boolean") return flag;
+  }
+  const direct = r.supports_vision ?? r.vision ?? r.supportsVision;
+  if (typeof direct === "boolean") return direct;
+  return undefined;
+}

@@ -22,6 +22,8 @@ import { fetchAdmin } from "../lib/gateway-client";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
+import { Composer, type Attachment, type InlinedText } from "../components/Composer";
+import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
@@ -35,7 +37,9 @@ import {
   type ToolCallRef,
 } from "../lib/tools/render";
 import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core";
-import { estimateTokens, DEFAULT_CONTEXT_WINDOW } from "@aiprovider/router-core";
+import {
+  estimateTokens, DEFAULT_CONTEXT_WINDOW, userContent, textOfContent, compressWithSummary, type CatalogModel,
+} from "@aiprovider/router-core";
 import { listLedger } from "../store";
 import { formatCost } from "../lib/ledger/format";
 import { shortcutFor } from "../lib/keys/shortcuts";
@@ -55,6 +59,15 @@ interface Msg {
   tool_calls?: unknown;
   /** Set on a tool result turn, linking it to its originating call. */
   tool_call_id?: string;
+  /**
+   * Images this user turn was sent with (P3). Kept on the transcript, not only on the request,
+   * because a follow-up turn has to replay them: "what about the second one?" is unanswerable if the
+   * picture vanished from history the moment it was sent. The bytes are already in memory (they came
+   * from the composer), so this costs no extra read.
+   */
+  attachments?: Attachment[];
+  /** Names of workspace files inlined into this turn, for the transcript's own labelling. */
+  inlined?: InlinedText[];
 }
 
 /** Monotonic within a session; combined with a timestamp so a resumed transcript cannot collide
@@ -88,10 +101,14 @@ function withIds(msgs: ReadonlyArray<Omit<Msg, "id">>): Msg[] {
  */
 function replayHistory(msgs: Msg[]): ChatMessage[] {
   return msgs
-    .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls))
+    // A turn carrying an image has text too (the question), so the filter's usual test still holds;
+    // an image-only turn is kept by the second clause rather than dropped as "empty".
+    .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls) || (m.attachments?.length ?? 0) > 0)
     .map((m) => ({
       role: m.role,
-      content: m.content,
+      // Rebuilt as content parts so the image travels with its turn. `userContent` returns a plain
+      // string when there are no attachments, which is what keeps an ordinary turn a string.
+      content: userContent(m.content, (m.attachments ?? []).map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
       ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
       ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
     })) as ChatMessage[];
@@ -727,6 +744,7 @@ export function AssistantScreen() {
           defaultRoot={defaultRoot}
           onRootChange={setRoot}
           onEditPrompts={() => setEditingPrompt("system")}
+          onSwitchToImageTab={() => setTab("image")}
           active={tab === "text"}
         />
       </div>
@@ -761,9 +779,28 @@ export function AssistantScreen() {
  * *status* (a bare entry is withheld when only one carrier is enabled), and a length is blind to a
  * status change. `Settings.tsx` already reads `tick` for exactly this reason.
  */
-function ModelPicker({ value, onChange, modality }: { value: string; onChange: (v: string) => void; modality: "text" | "image" }) {
+function ModelPicker({
+  value,
+  onChange,
+  modality,
+  openNonce = 0,
+}: {
+  value: string;
+  onChange: (v: string) => void;
+  modality: "text" | "image";
+  /** Bumped from outside (`/model`) to open the panel; the picker keeps ownership of its own state. */
+  openNonce?: number;
+}) {
   const tick = useUi((s) => s.tick);
   const [open, setOpen] = useState(false);
+  // Opening on a *change* of the nonce, not on a truthy value: the second `/model` has to open it
+  // again, and a boolean would already be true by then.
+  const seenNonce = useRef(openNonce);
+  useEffect(() => {
+    if (openNonce === seenNonce.current) return;
+    seenNonce.current = openNonce;
+    setOpen(true);
+  }, [openNonce]);
   const [q, setQ] = useState("");
   const models = useMemo(() => {
     void tick;
@@ -916,6 +953,7 @@ function Chat({
   defaultRoot,
   onRootChange,
   onEditPrompts,
+  onSwitchToImageTab,
   active,
 }: {
   noTools: boolean;
@@ -937,6 +975,8 @@ function Chat({
   defaultRoot: string | null;
   onRootChange: (v: string) => void;
   onEditPrompts: () => void;
+  /** Switch the AssistantScreen to the Image tab (`/image`). */
+  onSwitchToImageTab: () => void;
   /** Whether this panel is the visible tab. Keyboard actions are gated on it: the Image tab keeps
    *  `Chat` mounted but `hidden`, so a shortcut bound here would otherwise fire (and focus an
    *  invisible composer) while the user is looking at the Image tab. */
@@ -965,7 +1005,14 @@ function Chat({
   const [finishReason, setFinishReason] = useState<string | undefined>(undefined);
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [input, setInput] = useState("");
+  // The draft itself lives in `Composer` (it also owns attachments and the two menus). This is a
+  // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
+  // context meter's estimate of what the next send will contain, and nothing else.
+  const [draftText, setDraftText] = useState("");
+  /** A one-line notice: a refused attachment, a mention that matched nothing. */
+  const [notice, setNotice] = useState<string | null>(null);
+  /** Bumped by `/model` to open the picker, which owns its own open state. */
+  const [pickerNonce, setPickerNonce] = useState(0);
   const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (ok: boolean) => void } | null>(null);
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
@@ -1191,7 +1238,7 @@ function Chat({
   // the estimate, both by nature: the recalled memory block (computed at send time) and, in agent
   // mode, the tool definitions.
   const currentPromptTokens = useMemo(() => {
-    if (!input.trim() && msgs.length === 0) return 0;
+    if (!draftText.trim() && msgs.length === 0) return 0;
     const systemText = agentMode
       ? agentSystem(root, agentSystemPrompt) + skillsBlock
       : noTools
@@ -1200,10 +1247,10 @@ function Chat({
     const all: ChatMessage[] = [
       ...(systemText ? [{ role: "system" as const, content: systemText }] : []),
       ...replayHistory(msgs),
-      ...(input.trim() ? [{ role: "user" as const, content: input }] : []),
+      ...(draftText.trim() ? [{ role: "user" as const, content: draftText }] : []),
     ];
     return estimateTokens(all);
-  }, [msgs, input, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
+  }, [msgs, draftText, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
   // P7: context meter — fraction of the window consumed.
   const contextUsedRatio = Math.min(1, currentPromptTokens / modelWindow);
   // Join each tool result to the call that declared it, so the transcript can render an
@@ -1258,10 +1305,22 @@ function Chat({
    * prefix for a retry or an edit. The user turn and the assistant placeholder are appended here;
    * callers must not append them themselves.
    */
-  async function runTurn(text: string, baseMsgs: Msg[]) {
+  async function runTurn(
+    text: string,
+    baseMsgs: Msg[],
+    attachments: Attachment[] = [],
+    inlined: InlinedText[] = [],
+  ) {
     const trimmed = text.trim();
-    if (!trimmed || busy || !chosen) return;
-    const userMsg: Msg = { id: newMsgId(), role: "user", content: trimmed };
+    // An image-only turn is a real turn: the composer allows sending one, so the guard must too.
+    if ((!trimmed && attachments.length === 0) || busy || !chosen) return;
+    const userMsg: Msg = {
+      id: newMsgId(),
+      role: "user",
+      content: trimmed,
+      ...(attachments.length ? { attachments } : {}),
+      ...(inlined.length ? { inlined } : {}),
+    };
     const assistantMsg: Msg = { id: newMsgId(), role: "assistant", content: "" };
     setMsgs([...baseMsgs, userMsg, assistantMsg]);
     // A send, retry or edit is a deliberate action: re-anchor to the bottom even if the user had
@@ -1307,7 +1366,13 @@ function Chat({
       if (recalled.length > 0) recordRecall(userNode, recalled);
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
-      const history: ChatMessage[] = [...replayHistory(baseMsgs), { role: "user", content: trimmed }];
+      const history: ChatMessage[] = [
+        ...replayHistory(baseMsgs),
+        {
+          role: "user",
+          content: userContent(trimmed, attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
+        },
+      ];
       try {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
@@ -1347,7 +1412,10 @@ function Chat({
           fullMessages.map((m) => ({
             id: newMsgId(),
             role: m.role as Msg["role"],
-            content: m.content,
+            // `textOfContent`: the agent loop's transcript includes the user turn we sent, which
+            // carries parts when it had images. The transcript stores text; the images stay on the
+            // turn that owns them (and the graph records the text, as before).
+            content: textOfContent(m.content),
             ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
             ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
           })),
@@ -1418,7 +1486,12 @@ function Chat({
             ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
             ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
             ...history,
-            { role: "user" as const, content: trimmed },
+            // The user's own turn, as parts when it carries images — `userContent` returns a plain
+            // string otherwise, so an ordinary message is still an ordinary message.
+            {
+              role: "user" as const,
+              content: userContent(trimmed, attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
+            },
           ],
           onFinish: setFinishReason,
           // P7: per-request params, and the provider's own token report for the meter's tooltip
@@ -1488,12 +1561,14 @@ function Chat({
     }
   }
 
-  /** Fresh send from the composer. Clears the input, then runs against the whole transcript. */
-  function send() {
-    const text = input.trim();
-    if (!text || busy || !chosen) return;
-    setInput("");
-    void runTurn(text, msgs);
+  /**
+   * A fresh send from the composer, which has already resolved the draft: mentions expanded,
+   * attachments read. Nothing to clear here — the composer owns the text it just handed over, and
+   * clearing it here too is how the two would drift.
+   */
+  function send(text: string, attachments: Attachment[], inlined: InlinedText[]) {
+    if (busy || !chosen) return;
+    void runTurn(text, msgs, attachments, inlined);
   }
 
   function copyMessage(m: Msg) {
@@ -1643,6 +1718,82 @@ function Chat({
   }
 
   const ok = trace && !trace.error && trace.fallbacks.length === 0;
+  /**
+   * Whether the chosen model accepts images, read from the catalog.
+   *
+   * Three states reach the UI and all three matter: `true` enables attachment, `false` refuses it,
+   * and `undefined` (a catalog that never mentioned modalities) refuses it *and says so differently*
+   * — the user of a provider that simply does not publish capabilities should read "unknown", not
+   * "cannot", or they will conclude their model is worse than it is.
+   */
+  const chosenVision = useMemo(() => {
+    if (!chosen) return undefined;
+    const nativeId = chosen.includes("/") ? chosen.split("/")[1]! : chosen;
+    const row = catalog.all().find((m: CatalogModel) => m.nativeId === nativeId && m.modality === "text");
+    return row?.supportsVision;
+  }, [chosen, tick]);
+
+  /**
+   * The workspace tools, for `@`-mentions. `null` when there is no usable root, which is what the
+   * composer turns into "set a workspace root to reference files with @" rather than an empty menu.
+   */
+  const mentionHost = useMemo(
+    () => (root.trim() && !rootError ? createTauriToolHost(root.trim()) : null),
+    [root, rootError],
+  );
+
+  const listWorkspaceFiles = useCallback(async (): Promise<MentionCandidate[]> => {
+    if (!mentionHost) return [];
+    // `list_dir` recursive, matched on PATH: an `@` reference names a file, and a content search
+    // would offer files whose *contents* mention the typed word — a different question. The listing
+    // is a formatted string (`file <path>`), so it is parsed by `parseListing` rather than split on
+    // whitespace, which a path containing a space would break.
+    const res = await mentionHost.run("list_dir", { path: ".", recursive: true });
+    if (!res.ok) return [];
+    return parseListing(res.output).slice(0, 2000);
+  }, [mentionHost]);
+
+  const readWorkspaceFile = useCallback(
+    async (path: string): Promise<string | null> => {
+      if (!mentionHost) return null;
+      const res = await mentionHost.run("read_file", { path });
+      return res.ok ? res.output : null;
+    },
+    [mentionHost],
+  );
+
+  /**
+   * `/compact`: summarise the older turns now instead of waiting for the router to do it when the
+   * next request no longer fits.
+   *
+   * It reuses the same compressor the router applies on the way out (`compressWithSummary`), so the
+   * result is the shape the model would have seen anyway — a labelled summary plus the recent turns.
+   * The difference is that the user asked for it, and can watch the transcript shrink.
+   */
+  const compactNow = useCallback(async () => {
+    if (busy || msgs.length === 0) return;
+    setNotice(null);
+    const budget = Math.max(256, Math.floor(modelWindow * 0.75));
+    try {
+      const result = await compressWithSummary(replayHistory(msgs), budget, createSummarizer(chosen));
+      if (!result.compressed) {
+        setNotice("Nothing to compact — the conversation already fits in the context window.");
+        return;
+      }
+      const kept: Msg[] = result.messages.map((m) => ({
+        id: newMsgId(),
+        role: m.role as Msg["role"],
+        content: textOfContent(m.content),
+        ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
+        ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+      }));
+      setMsgs(kept);
+      setNotice(`Compacted ${result.dropped} earlier message${result.dropped === 1 ? "" : "s"} into a summary.`);
+    } catch (e) {
+      setNotice(`Could not compact: ${(e as Error).message}`);
+    }
+  }, [busy, msgs, modelWindow, chosen]);
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
       {/* Session bar (Phase 4): which conversation this is, what it is called, and how to start or
@@ -1728,7 +1879,7 @@ function Chat({
       </div>
 
       <div className="mb-2 flex items-center gap-2">
-        <ModelPicker modality="text" value={chosen} onChange={setModel} />
+        <ModelPicker modality="text" value={chosen} onChange={setModel} openNonce={pickerNonce} />
         <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{chosen || "—"}</span>
         {/* The switches are under the title now (AssistantScreen) — this row is per-request
             only: what this message is sent to. */}
@@ -1818,7 +1969,32 @@ function Chat({
                 <AssistantContent raw={m.content} />
               )
             ) : (
-              <Markdown source={m.content} />
+              <>
+                {/* P3: what this turn was sent with, above the text — the images are part of the
+                    question, and a transcript that showed only the words would misrepresent what the
+                    model was asked. */}
+                {(m.attachments?.length ?? 0) > 0 && (
+                  <div className="mb-1 flex flex-wrap gap-1.5">
+                    {m.attachments!.map((a) => (
+                      <img
+                        key={a.id}
+                        alt={a.name}
+                        src={`data:${a.mediaType};base64,${a.dataBase64}`}
+                        title={`${a.name} · ${Math.max(1, Math.round(a.bytes / 1024))} KB`}
+                        className="max-h-32 rounded border"
+                        style={{ borderColor: "var(--border)" }}
+                        data-testid="sent-image"
+                      />
+                    ))}
+                  </div>
+                )}
+                <Markdown source={m.content} />
+                {(m.inlined?.length ?? 0) > 0 && (
+                  <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }}>
+                    inlined {m.inlined!.map((f) => f.path).join(", ")}
+                  </p>
+                )}
+              </>
             )}
             {editingId !== m.id && (
               <MessageActions
@@ -1975,27 +2151,33 @@ function Chat({
         </span>
       </div>
 
-      <div className="mt-2 flex items-end gap-2">
-        <textarea
-          ref={inputRef}
-          value={input}
-          rows={2}
-          onChange={(e) => setInput(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === "Enter" && !e.shiftKey) {
-              e.preventDefault();
-              void send();
-            }
-          }}
-          placeholder={agentMode ? "Describe a task for the agent… (Enter to send)" : "Send a message through the router… (Enter to send)"}
-          className={`${inputCls} resize-none`}
-          style={inputStyle}
+
+      {/* P3: the composer owns the draft, the attachments and the two menus. It is disabled — not
+          hidden — when the turn cannot run, so the reason stays visible next to a live box. */}
+      {(notice || (agentMode && (!root.trim() || !!rootError))) && (
+        <p className="mt-2 text-[11px]" style={{ color: notice ? "var(--warn)" : "var(--danger)" }} data-testid="composer-notice">
+          {notice ?? "Set a workspace root before using agent mode."}
+        </p>
+      )}
+      <div className="mt-2">
+        <Composer
+          textareaRef={inputRef}
+          busy={busy}
+          agentMode={agentMode}
+          vision={chosenVision}
+          modelLabel={chosen || "the current model"}
+          onSend={send}
+          onStop={() => abortRef.current?.abort()}
+          onClear={newChat}
+          onOpenModelPicker={() => setPickerNonce((n) => n + 1)}
+          onSwitchToImageTab={onSwitchToImageTab}
+          onCompact={() => void compactNow()}
+          listFiles={mentionHost ? listWorkspaceFiles : null}
+          readFile={mentionHost ? readWorkspaceFile : null}
+          onNotice={setNotice}
+          onDraftChange={setDraftText}
+          sendDisabled={!chosen || (agentMode && (!root.trim() || !!rootError))}
         />
-        {busy ? (
-          <Button variant="danger" onClick={() => abortRef.current?.abort()}>■ Stop</Button>
-        ) : (
-          <Button variant="primary" disabled={!chosen || (agentMode && (!root.trim() || !!rootError))} onClick={() => void send()}>Send</Button>
-        )}
       </div>
 
       {pendingConfirm && (

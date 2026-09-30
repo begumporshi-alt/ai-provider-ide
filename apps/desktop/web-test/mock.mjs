@@ -148,6 +148,15 @@ async function oracle(req, res, path) {
     const stream = body.stream === true;
     const tools = Array.isArray(body.tools) && body.tools.length > 0;
     const sawToolResult = messages.some((m) => m.role === "tool");
+    // Multimodal: count the image parts this dialect received. Reported in the reply so a spec can
+    // assert that the image actually arrived — a body-only assertion would pass even if the reply
+    // path dropped it, and this is the same statement the acceptance criterion makes ("a vision
+    // model describes it").
+    const imageParts = messages.reduce(
+      (n, m) =>
+        n + (Array.isArray(m.content) ? m.content.filter((p) => typeof p?.type === "string" && /image/i.test(p.type)).length : 0),
+      0,
+    );
 
     let content;
     let toolCall;
@@ -179,7 +188,9 @@ async function oracle(req, res, path) {
     } else {
       content = tools && sawToolResult
         ? "Done. Here is what I found in the workspace."
-        : `Hello from ${body.model ?? "oracle"}`;
+        : imageParts > 0
+          ? `Seen ${imageParts} image${imageParts === 1 ? "" : "s"} in this request.`
+          : `Hello from ${body.model ?? "oracle"}`;
     }
 
     if (!stream) {

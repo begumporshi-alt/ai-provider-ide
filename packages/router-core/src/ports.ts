@@ -57,13 +57,37 @@ export interface ToolCall {
 }
 
 /**
+ * One piece of a multimodal message.
+ *
+ * Deliberately **dialect-neutral**: these shapes are ours, and each dialect's own wire shape is
+ * produced from a template the manifest declares (`contentPartTemplates`). Putting OpenAI's
+ * `image_url` or Anthropic's `source.base64` in this union would make one type mean three things at
+ * once and force every future dialect to translate through whichever one won.
+ *
+ * `dataBase64` carries the bytes with no data-URI prefix: the prefix is dialect syntax
+ * (`data:<media>/<type>;base64,`) and belongs in the template, not in the value.
+ */
+export type ContentPart =
+  | { type: "text"; text: string }
+  | { type: "image"; mediaType: string; dataBase64: string };
+
+/**
  * One turn in a chat request. Permissive on purpose: the router never interprets these, it
  * forwards them verbatim, and the tool dialects disagree on the extra fields
  * (`tool_call_id` for a result, `tool_calls` on the assistant turn that requested them).
+ *
+ * `content` is a **string or an array of parts**. The array form exists for image input; the plain
+ * string stays the common case and is what every existing caller sends. Widening it was a
+ * deliberate decision (ASSISTANT_GAP_PLAN Phase 3) over the alternative of inlining a data URI into
+ * the string: that puts megabytes into the message, corrupts token accounting (base64 counts as
+ * tokens), and can express neither multiple images nor the order of text and images.
+ *
+ * Anything that needs "the text of this message" goes through `textOfContent` — an image part is
+ * not text, and must never be measured by the length of its base64.
  */
 export type ChatMessage = {
   role: "user" | "assistant" | "system" | "tool";
-  content: string;
+  content: string | ContentPart[];
   /** Set on role "tool": which call this result answers. */
   tool_call_id?: string;
   /** Set on role "assistant" when the turn requested calls; must be replayed or most

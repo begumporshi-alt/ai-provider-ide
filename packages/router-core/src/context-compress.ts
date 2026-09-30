@@ -27,6 +27,7 @@
  *    in the same turn — and providers reject a result whose originating call was dropped.
  */
 import type { ChatMessage } from "./ports.js";
+import { textOfContent } from "./content-parts.js";
 
 /**
  * Fallback window when the catalog published none. Matches the host's `DEFAULT_WINDOW_TOKENS`
@@ -68,34 +69,14 @@ export interface CompressResult {
 /**
  * Text of one message, as an estimate-able string.
  *
- * ` ChatMessage.content` is typed `string`, but the gateway forwards a client's JSON verbatim
- * and multimodal requests send an *array* of content parts. Treating that as `""` would
- * estimate zero tokens for what is often the largest message in the request, so anything that
- * is not a string is measured by its serialised size instead.
+ * `content` may be an array of parts (image input, or a gateway client's verbatim JSON), so this
+ * defers to `textOfContent` — which is also what every other "give me the text" site in the router
+ * now uses. The important part of that helper is what an image becomes: a one-token marker rather
+ * than its base64, because this function decides how much conversation the compressor drops. Counting
+ * a picture as its byte length would have the compressor discard real turns to make room for it.
  */
 function contentText(m: ChatMessage): string {
-  const c = (m as { content?: unknown }).content;
-  if (typeof c === "string") return c;
-  if (c == null) return "";
-  if (Array.isArray(c)) {
-    return c
-      .map((p) => {
-        if (typeof p === "string") return p;
-        const t = (p as { text?: unknown } | null)?.text;
-        if (typeof t === "string") return t;
-        try {
-          return JSON.stringify(p ?? "");
-        } catch {
-          return "";
-        }
-      })
-      .join(" ");
-  }
-  try {
-    return JSON.stringify(c);
-  } catch {
-    return "";
-  }
+  return textOfContent((m as { content?: unknown }).content);
 }
 
 export function estimateMessageTokens(m: ChatMessage): number {

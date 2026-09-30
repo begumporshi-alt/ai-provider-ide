@@ -36,6 +36,12 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
           system: "system",
           tool: "tool",
         },
+        // v1.1 amendment (2026-10-01): OpenAI carries an image as an `image_url` whose url IS the
+        // data URI, so this dialect uses `{{dataUri}}` while Anthropic uses the bare bytes.
+        contentPartTemplates: {
+          text: { type: "text", text: "{{text}}" },
+          image: { type: "image_url", image_url: { url: "{{dataUri}}" } },
+        },
         responseMap: {
           text: "$.choices[0].message.content",
           usage: "$.usage",
@@ -122,6 +128,16 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           tool: "user",
         },
         systemField: "system",
+        // v1.1 amendment (2026-10-01): Anthropic carries an image as a base64 `source` block and a
+        // text part as a plain `{type:"text",text}`. There is no data-URI here — the media type and
+        // the bytes are separate fields, which is why `ContentPart` keeps them separate too.
+        contentPartTemplates: {
+          text: { type: "text", text: "{{text}}" },
+          image: {
+            type: "image",
+            source: { type: "base64", media_type: "{{mediaType}}", data: "{{dataBase64}}" },
+          },
+        },
         toolChoiceMap: {
           // "none" = never call tools → Anthropic's const "none"
           none: { type: "const", value: "none" },
@@ -230,6 +246,19 @@ function geminiCompat(baseUrl: string): AdapterManifest {
           // Gemini wraps tool results as `user` turns.
           tool: "user",
         },
+        // v1.1 amendment (2026-10-01): Gemini's parts carry no `type` at all — the shape itself is
+        // the discriminator (`{text}` vs `{inlineData}`), which is why these are per-part templates
+        // rather than one fixed structure with a type field to fill in.
+        contentPartTemplates: {
+          text: { text: "{{text}}" },
+          image: { inlineData: { mimeType: "{{mediaType}}", data: "{{dataBase64}}" } },
+        },
+        // Gemini names a message's content `parts`, and it must be an array of parts even for plain
+        // text. Without this declaration every Gemini request carried `content` — a field its
+        // generateContent API does not read — so it received no conversation at all. Found while
+        // wiring image input (2026-10-01); the *tool* shapes (functionCall/functionResponse) are
+        // still unmodelled — a separate gap, unchanged here.
+        contentField: "parts",
         // Declared (even though empty) so the interpreter knows system hoisting is a no-op
         // rather than "this dialect has no role map at all".
         responseMap: {

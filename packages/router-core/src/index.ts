@@ -18,7 +18,16 @@ export { buildPlan, orderKeys, type Candidate, type PlanContext, type PlanInput 
 export { ExecutionEngine, AllAttemptsFailedError, MAX_ATTEMPTS_DEFAULT, type AttemptOutcome, type TextExecution } from "./execution-engine.js";
 export { ProviderLimiter, PER_PROVIDER_DEFAULT, MAX_PER_PROVIDER, clampConcurrency } from "./concurrency.js";
 export { parsePricing, estimateCostMicros, priceRank, type PricingMicros } from "./pricing.js";
-export { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
+export { parseContextWindow, parseReasoningSupport, parseVisionSupport } from "./model-meta.js";
+export {
+  textOfContent,
+  renderContentParts,
+  shapeMessageContent,
+  userContent,
+  countImageParts,
+  IMAGE_PLACEHOLDER,
+  type ContentPartTemplates,
+} from "./content-parts.js";
 export {
   compressMessages,
   compressWithSummary,

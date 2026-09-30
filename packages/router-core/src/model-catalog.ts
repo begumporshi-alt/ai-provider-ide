@@ -8,7 +8,7 @@ import type { AdapterRuntime } from "./adapter-runtime.js";
 import type { ProviderRegistry } from "./provider-registry.js";
 import type { ModelEntry } from "./manifest-interpreter.js";
 import { parsePricing, type PricingMicros } from "./pricing.js";
-import { parseContextWindow, parseReasoningSupport } from "./model-meta.js";
+import { parseContextWindow, parseReasoningSupport, parseVisionSupport } from "./model-meta.js";
 
 const TTL_MS = 24 * 60 * 60 * 1000;
 
@@ -120,6 +120,7 @@ export class ModelCatalog {
         // budget and whether the model reasons. Persisted with the row (see model-meta.ts).
         contextWindow: parseContextWindow(e.raw),
         supportsReasoning: parseReasoningSupport(e.raw),
+        supportsVision: parseVisionSupport(e.raw),
       });
     }
     this.fetchedAt.set(providerId, now);

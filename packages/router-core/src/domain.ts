@@ -49,6 +49,12 @@ export interface CatalogModel {
    */
   supportsReasoning?: boolean;
   /**
+   * Whether the provider says this model accepts **images as input**. `undefined` = unknown, which
+   * stays distinct from `false`: the composer gates image attachment on a positive declaration and
+   * tells the user which of the two it is (model-meta.ts `parseVisionSupport`).
+   */
+  supportsVision?: boolean;
+  /**
    * Where the row came from: the provider's own `/models` listing, or the operator's keyboard.
    *
    * Carried in memory **and** persisted, because it decides whether a refresh may delete the row.

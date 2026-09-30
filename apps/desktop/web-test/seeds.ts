@@ -110,6 +110,13 @@ function systemAi(): SeedInput {
         capabilitiesJson: null,
       },
       {
+        providerId, nativeId: "oracle-vision", modality: "text", contextWindow: 8192, fetchedAt: now,
+        // Declares image input, which is what the composer's attach gate reads. The three states
+        // (`true` / `false` / absent) are all reachable in this seed: this model, `oracle-flash`
+        // below with an explicit text-only declaration, and the ones that publish no capabilities.
+        pricingJson: null, capabilitiesJson: JSON.stringify({ vision: true }),
+      },
+      {
         providerId, nativeId: "oracle-flash", modality: "text", contextWindow: 8192, fetchedAt: now,
         // Deliberately left unpriced — the readout must not invent a cost for a model whose
         // provider published none.
