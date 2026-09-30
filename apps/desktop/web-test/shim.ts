@@ -258,6 +258,16 @@ const MEMORY_LAYERS = ["L0", "L1", "L2", "L3"];
  * project/agent columns are NULL until something explicitly binds it.
  */
 const DEFAULT_SCOPE = { user: "", project: null, agent: null, global: false };
+
+/**
+ * The real host sends `Memory.pinned` as a boolean (Rust `bool`), but this shim stores it as the
+ * SQL-ish 0/1 its SQLite emulation uses — so the app's `isMemory` guard, which requires a bool,
+ * rejected every row and the screen swallowed the rejection into an empty state. Convert at the
+ * wire boundary (the dispatch return) and nowhere else: internal storage stays numeric because the
+ * specs read raw rows and assert `pinned === 1`.
+ */
+const wireMemory = (m: Row): Row => ({ ...m, pinned: Boolean(m.pinned) });
+
 const STEP_KINDS = ["assistant", "tool_call", "tool_result", "done", "denied"];
 /** context.rs caps a repeated edge's weight so one hot pair cannot swamp the layout. */
 const MAX_WEIGHT = 50;
@@ -1425,7 +1435,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         // them in on touch so the Memory screen's `ScopeSelect` doesn't read `.global` of undefined.
         if (!seen.scope) seen.scope = { ...DEFAULT_SCOPE };
         if (seen.superseded_at === undefined) seen.superseded_at = null;
-        return { ...seen };
+        return wireMemory(seen);
       }
       const row: Row = {
         id: `m-${layer}-${memories.length + 1}-${now}`, layer, text,
@@ -1435,7 +1445,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         superseded_at: null,
       };
       memories.push(row);
-      return { ...row };
+      return wireMemory(row);
     }
     case "memory_capture_batch": {
       // `toRustArgs` renames only top-level keys, so the caller's spelling survives inside `items`
@@ -1524,7 +1534,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         bandOf(a) - bandOf(b) ||
         recencyOf(b) - recencyOf(a) ||
         (rank[String(a.m.layer)] ?? 9) - (rank[String(b.m.layer)] ?? 9));
-      return scored.slice(0, limit).map((x) => ({ ...x.m, score: x.score }));
+      return scored.slice(0, limit).map((x) => wireMemory({ ...x.m, score: x.score }));
     }
     case "memory_list": {
       const limit = (args.limit as number) ?? 200;
@@ -1534,7 +1544,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         .filter((m) => !layer || m.layer === layer)
         .sort((a, b) =>
           (b.pinned as number) - (a.pinned as number) || (b.updated_at as number) - (a.updated_at as number))
-        .slice(0, limit);
+        .slice(0, limit)
+        .map(wireMemory);
     }
     case "memory_forget": {
       const at = memories.findIndex((m) => m.id === args.id);
@@ -1566,7 +1577,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return memories
         .filter((m) => m.session_id === sessionId && m.layer === layer)
         .sort((a, b) => (a.created_at as number) - (b.created_at as number))
-        .slice(0, limit);
+        .slice(0, limit)
+        .map(wireMemory);
     }
     case "memory_clear":
       memories.length = 0;
