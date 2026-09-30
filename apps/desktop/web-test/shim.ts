@@ -89,6 +89,13 @@ let auditSeq = 0;
 // rejection rules — so a screen that renders here renders for the same reasons it will there.
 const contextNodes: Row[] = [];
 const contextEdges: Row[] = [];
+/**
+ * The `session_titles` sidecar (migration 0020 in the Rust host). The History screen and the
+ * Assistant's session bar both read a session's title through it, and both write it via
+ * `history_rename_session` — which this shim did not implement until the session bar needed it, so
+ * renaming worked in the app and silently did nothing here.
+ */
+const sessionTitles = new Map<string, string>();
 const skills: Row[] = [];
 const agentRuns: Row[] = [];
 const agentSteps: Row[] = [];
@@ -360,6 +367,7 @@ interface Snapshot {
   secrets: [string, string][];
   contextNodes: Row[];
   contextEdges: Row[];
+  sessionTitles: [string, string][];
   skills: Row[];
   agentRuns: Row[];
   agentSteps: Row[];
@@ -381,6 +389,7 @@ function snapshot(): Snapshot {
     secrets: [...secrets.entries()],
     contextNodes: [...contextNodes],
     contextEdges: [...contextEdges],
+    sessionTitles: [...sessionTitles.entries()],
     skills: [...skills],
     agentRuns: [...agentRuns],
     agentSteps: [...agentSteps],
@@ -415,6 +424,8 @@ function restore(s: Snapshot): void {
   contextNodes.push(...(s.contextNodes ?? []));
   contextEdges.length = 0;
   contextEdges.push(...(s.contextEdges ?? []));
+  sessionTitles.clear();
+  for (const [k, v] of s.sessionTitles ?? []) sessionTitles.set(k, v);
   skills.length = 0;
   skills.push(...(s.skills ?? []));
   agentRuns.length = 0;
@@ -1053,6 +1064,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
           turns: ns.filter((n) => n.kind === "message").length,
           tool_calls: ns.filter((n) => n.kind === "skill").length,
           preview: "",
+          title: sessionTitles.get(session_id) ?? null,
           model: null as string | null,
         };
       });
@@ -1083,6 +1095,32 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         r.model = models.get(r.session_id) ?? null;
       }
       return page;
+    }
+    case "history_rename_session": {
+      // `toRustArgs` has already renamed `sessionId` → `session_id`, matching the Rust signature.
+      const sid = String(args.session_id ?? "");
+      const title = String(args.title ?? "");
+      if (!sid) throw new Error("history_rename_session: missing session_id");
+      // An empty title clears the custom name, exactly as the host's upsert does.
+      if (title) sessionTitles.set(sid, title);
+      else sessionTitles.delete(sid);
+      return null;
+    }
+    case "history_delete_session": {
+      const sid = String(args.session_id ?? "");
+      if (!sid) throw new Error("history_delete_session: missing session_id");
+      sessionTitles.delete(sid);
+      for (let i = contextNodes.length - 1; i >= 0; i--) {
+        if (String(contextNodes[i]!.session_id ?? "") === sid) contextNodes.splice(i, 1);
+      }
+      // An edge whose endpoint no longer exists is a dangling row — the host's schema would not
+      // hold one, so the emulation must not either.
+      const live = new Set(contextNodes.map((n) => String(n.id)));
+      for (let i = contextEdges.length - 1; i >= 0; i--) {
+        const e = contextEdges[i]!;
+        if (!live.has(String(e.from_id)) || !live.has(String(e.to_id))) contextEdges.splice(i, 1);
+      }
+      return null;
     }
     case "history_timeline": {
       const sessionId = String(args.session_id ?? "");
