@@ -13,8 +13,8 @@
  *
  * The screen therefore renders, never reconstructs.
  */
-import { useEffect, useMemo, useState } from "react";
-import { EmptyState } from "../components/atoms";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { EmptyState, inputCls, inputStyle } from "../components/atoms";
 import { DiffView } from "../components/DiffView";
 import {
   fileChangeFor,
@@ -100,6 +100,13 @@ export function HistoryScreen() {
   const [error, setError] = useState<string | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [draftTitle, setDraftTitle] = useState<string>("");
+  // P8: conversation search. Client-side over the loaded page of sessions — `history_sessions`
+  // returns 300 rows and there is no host-side search, so filtering here is what makes the list
+  // answerable at all. It searches what the list actually shows (title, preview, model, id), not the
+  // node text of a session: matching a word that is nowhere on screen would produce a result the
+  // user cannot explain.
+  const [q, setQ] = useState("");
+  const searchRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     loadHistorySessions(300).then(setSessions).catch((e: unknown) => setError(String(e)));
@@ -182,16 +189,52 @@ export function HistoryScreen() {
     loadHistoryTimeline(selected).then(setTimeline).catch((e: unknown) => setError(String(e)));
   }, [selected]);
 
+  // P8: the search filter, applied before grouping so the day headings describe what is visible
+  // rather than the whole store.
+  const filtered = useMemo(() => {
+    const needle = q.trim().toLowerCase();
+    if (!needle) return sessions;
+    return sessions.filter((s) =>
+      [s.title ?? "", s.preview, s.model ?? "", s.session_id].some((f) => f.toLowerCase().includes(needle)),
+    );
+  }, [sessions, q]);
+
+  // Keep the selection inside the visible list. Without this, filtering to one session leaves the
+  // detail pane showing a different, now-hidden one — the list would say "this is what matched" and
+  // the pane beside it would contradict that.
+  useEffect(() => {
+    if (filtered.length === 0) return;
+    if (selected !== null && filtered.some((s) => s.session_id === selected)) return;
+    setSelected(filtered[0]!.session_id);
+  }, [filtered, selected]);
+
+  // P8: the palette's "Search conversations" lands here and focuses the box (⌘K → type → Enter).
+  // The request is claimed here, so it survives the mount that the navigation causes.
+  //
+  // It is NOT claimed until the box exists, which is what `sessions` in the dependency list is
+  // about: on the frame this screen mounts, the list has not loaded, so it renders the empty state
+  // and there is no input to focus. Consuming the intent then would drop the request on the floor —
+  // the command would navigate and silently not focus anything, which is the exact failure the
+  // pending/consume shape was chosen to avoid.
+  const pendingIntent = useUi((s) => s.pendingIntent);
+  const consumeIntent = useUi((s) => s.consumeIntent);
+  useEffect(() => {
+    if (pendingIntent?.kind !== "focus-history-search") return;
+    if (!searchRef.current) return;
+    consumeIntent();
+    searchRef.current.focus();
+  }, [pendingIntent, consumeIntent, sessions]);
+
   const grouped = useMemo(() => {
     const out: { label: string; items: HistorySession[] }[] = [];
-    for (const s of sessions) {
+    for (const s of filtered) {
       const label = dayLabel(s.started_ts);
       const last = out[out.length - 1];
       if (last && last.label === label) last.items.push(s);
       else out.push({ label, items: [s] });
     }
     return out;
-  }, [sessions]);
+  }, [filtered]);
 
   const turns = useMemo(() => toTurns(timeline?.entries ?? []), [timeline]);
   // Join each tool entry to the call that declared it. The timeline stores the assistant turn's
@@ -221,12 +264,37 @@ export function HistoryScreen() {
       <div className="w-[290px] shrink-0">
         <div className="mb-3 flex items-baseline gap-3">
           <h1 className="text-[20px] font-semibold">History</h1>
+          {/* "3 of 41" while filtering, because the count is what makes the filter honest: it says
+              both what is shown and how much is hidden, where a bare "3" would read as a store that
+              lost rows. */}
           <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-            {sessions.length} session{sessions.length === 1 ? "" : "s"}
+            {q.trim() ? `${filtered.length} of ${sessions.length}` : sessions.length} session{sessions.length === 1 ? "" : "s"}
           </span>
         </div>
 
-        <div className="overflow-y-auto pr-1" style={{ maxHeight: "calc(100vh - 160px)" }}>
+        <input
+          ref={searchRef}
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Escape" && q) {
+              e.stopPropagation();
+              setQ("");
+            }
+          }}
+          placeholder="Search titles, text and models…"
+          aria-label="Search conversations"
+          className={`${inputCls} mb-3`}
+          style={inputStyle}
+        />
+
+        <div className="overflow-y-auto pr-1" style={{ maxHeight: "calc(100vh - 210px)" }}>
+          {grouped.length === 0 && (
+            <p className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+              No session matches “{q.trim()}”. Search covers the titles, the preview text and the
+              model of each session.
+            </p>
+          )}
           {grouped.map((g) => (
             <div key={g.label} className="mb-3">
               <div

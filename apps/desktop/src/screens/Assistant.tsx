@@ -38,6 +38,7 @@ import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core
 import { estimateTokens, DEFAULT_CONTEXT_WINDOW } from "@aiprovider/router-core";
 import { listLedger } from "../store";
 import { formatCost } from "../lib/ledger/format";
+import { shortcutFor } from "../lib/keys/shortcuts";
 import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 import {
@@ -726,6 +727,7 @@ export function AssistantScreen() {
           defaultRoot={defaultRoot}
           onRootChange={setRoot}
           onEditPrompts={() => setEditingPrompt("system")}
+          active={tab === "text"}
         />
       </div>
       <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
@@ -914,6 +916,7 @@ function Chat({
   defaultRoot,
   onRootChange,
   onEditPrompts,
+  active,
 }: {
   noTools: boolean;
   agentMode: boolean;
@@ -934,8 +937,15 @@ function Chat({
   defaultRoot: string | null;
   onRootChange: (v: string) => void;
   onEditPrompts: () => void;
+  /** Whether this panel is the visible tab. Keyboard actions are gated on it: the Image tab keeps
+   *  `Chat` mounted but `hidden`, so a shortcut bound here would otherwise fire (and focus an
+   *  invisible composer) while the user is looking at the Image tab. */
+  active: boolean;
 }) {
   const tick = useUi((s) => s.tick);
+  // P8: the composer, so a shortcut (and the palette's "Focus the composer") can put the caret in
+  // it without reaching into the DOM by id.
+  const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [model, setModel] = useState("");
   const [msgs, setMsgs] = useState<Msg[]>(() => {
     const resume = useUi.getState().resumeTranscript;
@@ -1055,6 +1065,72 @@ function Chat({
   useEffect(() => {
     refreshUsageTotals();
   }, [tick, refreshUsageTotals]);
+
+  // P8: keep the palette honest about "New chat" — it is refused while a turn runs (same reason
+  // `newChat` guards on `busy`: re-entering the loop mid-stream interleaves two runs into one
+  // transcript), so the palette needs to know.
+  const setAssistantBusy = useUi((s) => s.setAssistantBusy);
+  useEffect(() => {
+    setAssistantBusy(busy);
+  }, [busy, setAssistantBusy]);
+  // Cleared on unmount and only on unmount, so leaving the Assistant does not leave a stale "a turn
+  // is running" behind for the palette to report on another screen.
+  useEffect(() => () => setAssistantBusy(false), [setAssistantBusy]);
+
+  // P8: the palette's one-shot intents. The request is *claimed* here — consumed only once this
+  // component has decided it is the addressee — so a command fired from another screen survives the
+  // mount that navigation causes, and is not replayed on some later mount because it is gone.
+  const pendingIntent = useUi((s) => s.pendingIntent);
+  const consumeIntent = useUi((s) => s.consumeIntent);
+  // The latest `newChat`, read through a ref so the effect below does not re-bind on every render
+  // (`newChat` closes over `busy` and the recorder, so it is a new function each time).
+  const latestNewChat = useRef(newChat);
+  latestNewChat.current = newChat;
+  useEffect(() => {
+    if (pendingIntent?.kind === "new-chat") {
+      consumeIntent();
+      latestNewChat.current();
+    } else if (pendingIntent?.kind === "focus-composer") {
+      consumeIntent();
+      inputRef.current?.focus();
+    }
+    // An intent addressed at another screen is left alone: whoever owns it is responsible for
+    // clearing it, and clearing it here would drop a request that screen has not seen yet.
+  }, [pendingIntent, consumeIntent]);
+
+  // P8: the Assistant's own keys — new chat and stop. They live here rather than in the global host
+  // because only this component knows whether a turn is running, and a "stop" that fired with
+  // nothing to stop would be a shortcut that lies about what it did.
+  //
+  // The handler reads through refs and is bound once per `active` change: its dependencies are
+  // `busy`, `newChat` and the abort controller, all of which change constantly while streaming.
+  const keyActions = useRef<{ newChat: () => void; stop: () => void; busy: boolean }>({
+    newChat, stop: () => undefined, busy,
+  });
+  keyActions.current = { newChat, stop: () => abortRef.current?.abort(), busy };
+  useEffect(() => {
+    if (!active) return;
+    const onKey = (e: KeyboardEvent) => {
+      // A dialog owns Escape. The check works because this listener is registered before the
+      // dialog's own (the Assistant is mounted first), so at this moment the store still reports the
+      // overlay as open — and Escape must dismiss the dialog rather than cancel the run behind it.
+      if (useUi.getState().overlay !== null) return;
+      const hit = shortcutFor(e);
+      if (!hit) return;
+      const actions = keyActions.current;
+      if (hit.id === "new-chat") {
+        e.preventDefault();
+        actions.newChat();
+      } else if (hit.id === "stop" && actions.busy) {
+        // Only while a turn is running: otherwise Escape keeps whatever meaning it had (the inline
+        // message editor's cancel, for one) instead of being swallowed by the Assistant.
+        e.preventDefault();
+        actions.stop();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [active]);
 
   // Surface the live sandbox allowlist once when agent mode is first enabled.
   useEffect(() => {
@@ -1378,6 +1454,12 @@ function Chat({
           provider: registry.getProvider(a.candidate.provider.id)?.name ?? a.candidate.provider.slug,
           key: a.candidate.key.label, cls: a.cls,
         })),
+        // **A stream the user stopped is not a success**, and this path reaches here without
+        // throwing: the engine's loop returns on an aborted signal rather than raising, so the
+        // `catch` below never sees it and the trace printed `✓ 680ms` for a cancelled request. That
+        // reads as "the model finished early" — the user's own action attributed to the provider.
+        // The partial text is still kept (a partial turn is a turn), but the line says who ended it.
+        ...(ac.signal.aborted ? { error: "stopped by you" } : {}),
       });
     } catch (e) {
       if (ac.signal.aborted) {
@@ -1895,6 +1977,7 @@ function Chat({
 
       <div className="mt-2 flex items-end gap-2">
         <textarea
+          ref={inputRef}
           value={input}
           rows={2}
           onChange={(e) => setInput(e.target.value)}

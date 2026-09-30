@@ -56,6 +56,28 @@ ChatGPT/Claude web chat surfaces.
   and `≥ …` when only some of the traffic could be.
   **Not done in this pass:** reasoning-effort control — `TextRequest` carries no such field and no
   manifest declares one, so it is a router-core change rather than a UI knob.
+- **Phase 8 (navigation & shortcuts) — DONE (2026-09-30).** A keyboard layer with one table behind
+  both the binder and the help sheet (`lib/keys/shortcuts.ts`, 11 unit tests): `mod+K` command
+  palette, `mod+/` shortcut sheet, `mod+Shift+O` new chat, `Escape` stop. A command palette that
+  lists every screen plus three real actions ("New chat", "Focus the composer", "Search
+  conversations"), says "already open" for the current screen, and **disables "New chat" while a
+  turn is running** rather than offering a command that silently no-ops. Conversation search on
+  History: client-side over the loaded page of sessions, matching title/preview/model, with a
+  "3 of 41" count so the filter cannot read as a store that lost rows. New e2e
+  `shortcuts.spec.ts` (11 tests). Verified: workspace typecheck clean, 690 unit tests
+  (23 + 350 + 317), vite build, 139/139 web-test.
+  **Found and fixed while verifying:**
+  (a) **A stream the user stopped was reported as `✓`.** The engine's stream loop *returns* on an
+  aborted signal rather than throwing, so the plain-chat path took its success branch and printed a
+  green check with a partial answer — the user's own action attributed to the provider. The trace
+  now says "stopped by you", matching what the agent path already did.
+  (b) `lib/nav.ts` is now the single screen list: `Shell` and the palette both render it, and
+  `smoke.spec.ts` walks it instead of a hand-copied array — the copy would have gone stale silently
+  the first time a screen was added, leaving that screen never smoke-tested.
+  (c) The harness could not test "while a turn is running" at all: the mock answered instantly, so
+  the state was over before a key could arrive. It now supports an opt-in `slow:` prompt that streams
+  over ~5 s.
+  **Not done in this pass:** resizable panels (listed as optional in the phase).
 - **Web-test picker debt — FIXED (2026-09-30).** The `web-test` specs drove the model picker via
   `getByRole("combobox")`, which stopped matching in commit `721c115` (searchable picker). All
   four specs now use a shared `web-test/model-picker.ts` helper. Full suite went 86→101 passing;
@@ -63,8 +85,10 @@ ChatGPT/Claude web chat surfaces.
 - **Superseded note:** an earlier version of this section listed 17 pre-existing web-test failures
   (Memory, trail-health, drift-history). They are gone — the suite is 127/127 green as of Phase 7,
   so whatever fixed them landed with the intervening commits (Phase 4/6 and the picker work).
-- **Remaining:** Phase 3 (composer/attachments), Phase 5 (agent approval modes / plan mode / change
-  review — needs more attention than a cheap phase), Phase 8 (shortcuts, command palette).
+- **Remaining:** Phase 3 (composer/attachments — the multimodal `ContentPart` decision is already
+  taken in its section, so it is implementation work now) and Phase 5 (agent approval modes / plan
+  mode / change review — the largest and riskiest, deliberately left for a session with attention
+  to spare).
 
 ## What already exists (baseline — do not rebuild)
 

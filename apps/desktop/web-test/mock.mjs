@@ -95,6 +95,11 @@ function notFound(res) {
   res.end(JSON.stringify({ error: "not found" }));
 }
 
+/** Await inside the mock's streaming loop, for the `slow:` mode documented at its use site. */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function readBody(req) {
   return new Promise((resolve) => {
     let s = "";
@@ -227,9 +232,18 @@ async function oracle(req, res, path) {
         choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
       })}\n\n`);
     } else {
-      const words = content.split(" ");
+      // A `slow:` prefix on the user's message makes the reply take a few seconds instead of
+      // finishing before the browser can breathe. Requested explicitly rather than applied to
+      // everything, because most specs want the answer and a delay for them all would only make the
+      // suite slower. It exists for the tests that need a turn to still be RUNNING while they act —
+      // cancelling one, or checking that a dialog's Escape does not cancel one — where an
+      // instantaneous reply is untestable: the turn is over by the time the key arrives.
+      const words = /^slow:/i.test(String(last))
+        ? Array.from({ length: 40 }, (_, i) => `tick${i}`)
+        : content.split(" ");
       for (const w of words) {
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: w + " " } }] })}\n\n`);
+        if (words.length > 20) await sleep(120);
       }
     }
     // Streamed usage, on request. This is OpenAI's documented shape and the shape the interpreter

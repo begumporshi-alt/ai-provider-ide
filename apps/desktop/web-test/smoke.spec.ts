@@ -15,25 +15,19 @@
  * targeted seeded test for Memory fills that gap. Adding more is cheap and obvious.
  */
 import { expect, test } from "@playwright/test";
+import { NAV } from "../src/lib/nav";
 
 const APP = "/web-test/";
 
-/** Sidebar labels in order, taken straight from `components/Shell.tsx`. */
-const NAV_LABELS = [
-  "AI Providers",
-  "Auto setup",
-  "Model Browser",
-  "Assistant",
-  "Activity",
-  "Context",
-  "History",
-  "Skills",
-  "Agents",
-  "Memory",
-  "Control",
-  "Router Settings",
-  "Local Gateway",
-];
+/**
+ * Sidebar labels, imported from the app's own nav list.
+ *
+ * This was a hand-copied array ("taken straight from `components/Shell.tsx`") — a mirror that only
+ * stays correct while someone remembers to update it, and whose failure mode is silent: add a
+ * screen, forget the copy, and the screen is never smoke-tested while the suite still reports
+ * green. `lib/nav.ts` is pure data with a type-only import, so the spec can read the real list.
+ */
+const NAV_LABELS = NAV.flatMap((g) => g.items.map((i) => i.label));
 
 test.describe("smoke", () => {
   for (const label of NAV_LABELS) {

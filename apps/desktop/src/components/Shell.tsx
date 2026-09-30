@@ -1,42 +1,16 @@
 /**
  * Sidebar shell (UI_UX_PLAN.md): grouped nav PROVIDERS / TOOLS / SYSTEM, 220px,
  * tonal elevation, and the persistent `● Router healthy` chip.
+ *
+ * The nav list itself lives in `lib/nav.ts` — the command palette renders the same screens, and the
+ * shortcut host lives in this component's tree — so this file is now only the chrome.
  */
 import { type ReactNode } from "react";
-import { useUi, type ScreenId } from "../ui-state";
+import { useUi } from "../ui-state";
 import { bootDegradedReason, registry, router } from "../store";
 import { StatusDot } from "../components/atoms";
-
-const NAV: { group: string; items: { id: ScreenId; label: string }[] }[] = [
-  {
-    group: "Providers",
-    items: [
-      { id: "providers", label: "AI Providers" },
-      { id: "onboarding", label: "Auto setup" },
-    ],
-  },
-  {
-    group: "Tools",
-    items: [
-      { id: "models", label: "Model Browser" },
-      { id: "assistant", label: "Assistant" },
-      { id: "activity", label: "Activity" },
-      { id: "context", label: "Context" },
-      { id: "history", label: "History" },
-      { id: "skills", label: "Skills" },
-      { id: "agents", label: "Agents" },
-      { id: "memory", label: "Memory" },
-    ],
-  },
-  {
-    group: "System",
-    items: [
-      { id: "control", label: "Control" },
-      { id: "settings", label: "Router Settings" },
-      { id: "gateway", label: "Local Gateway" },
-    ],
-  },
-];
+import { ShortcutHost } from "../components/ShortcutHost";
+import { NAV } from "../lib/nav";
 
 export function Shell({ children }: { children: ReactNode }) {
   const { screen, go, tick } = useUi();
@@ -100,6 +74,10 @@ export function Shell({ children }: { children: ReactNode }) {
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">{children}</div>
       </main>
+      {/* Rendered here rather than in each screen: the palette navigates between screens, and its
+          listener has to exist on all of them. `Shell` is the only component that is always
+          mounted once the app is up. */}
+      <ShortcutHost />
     </div>
   );
 }
