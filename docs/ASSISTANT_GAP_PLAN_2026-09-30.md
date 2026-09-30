@@ -11,6 +11,15 @@ ChatGPT/Claude web chat surfaces.
   delete-from-here). `Msg.id` + `newMsgId`/`withIds`; `send()` refactored into `runTurn(text,
   baseMsgs)` shared by send/retry/edit; pure index helpers `retryPoint`/`editPoint` in
   `lib/chat/actions.ts` (6 unit tests). 283 unit tests green, typecheck + vite build clean.
+- **Phase 2 (diff / tool-result rendering) — DONE (2026-09-30).** `lib/tools/diff.ts` (bounded
+  line-level LCS, pure + tested) and `lib/tools/render.ts` (pairs a tool result with the call that
+  declared it — the arguments live on the assistant turn — and decides the view). `DiffView`
+  component with added/removed colouring, copy button, and an honest truncation cap. Wired into the
+  Assistant's live tool calls (`AgentLive`) and its completed transcript (`ToolResultBubble`), and
+  into the History timeline (`HistoryTool`; the timeline stores the assistant turn's `tool_calls`,
+  so a past edit's diff is reconstructible). `search_files` results group by file. 21 new unit tests
+  + a new e2e (`tool-result-rendering.spec.ts`); web-test 119/119.
+  Not done in this pass: clickable `path:line` file links (needs a root-confined host opener).
 - **Phase 6 (cheap trio) — DONE (2026-09-30).** Sticky auto-scroll + "jump to latest" pill;
   Chat/Image panels now stay mounted and hide with CSS (fixes transcript loss on tab switch AND
   the orphaned in-flight run / missing Stop); image tab got a working Stop via AbortController +

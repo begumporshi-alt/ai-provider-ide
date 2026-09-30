@@ -17,6 +17,14 @@ import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream"
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import { toolCallName } from "../lib/tools/wire";
+import { DiffView } from "../components/DiffView";
+import {
+  fileChangeFor,
+  groupSearchMatches,
+  indexToolCalls,
+  isSearchResult,
+  type ToolCallRef,
+} from "../lib/tools/render";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
@@ -815,6 +823,10 @@ function Chat({
 
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
+  // Join each tool result to the call that declared it, so the transcript can render an
+  // `edit_file`/`write_file` as the change itself. The arguments live on the assistant turn, not
+  // the tool turn, so this pairing is the only way the completed transcript can show a diff.
+  const callById = useMemo(() => indexToolCalls(msgs), [msgs]);
 
   // Per-call confirmation gate: suspend the loop until the user allows or denies.
   const confirmGate = useCallback(
@@ -1212,7 +1224,7 @@ function Chat({
                 </div>
               </div>
             ) : m.role === "tool" ? (
-              <ToolResultBubble content={m.content} />
+              <ToolResultBubble content={m.content} call={m.tool_call_id ? callById.get(m.tool_call_id) : undefined} />
             ) : m.role === "assistant" ? (
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive raw={streamedText} items={agentItems} />
@@ -1368,13 +1380,30 @@ function MessageActions({
 }
 
 /** Compact, collapsible view of a tool-result turn persisted in the transcript. */
-function ToolResultBubble({ content }: { content: string }) {
+function ToolResultBubble({ content, call }: { content: string; call?: ToolCallRef }) {
   const [open, setOpen] = useState(false);
   // An empty result used to render as "tool result · " with nothing after it — indistinguishable
   // from a collapsed result the user simply had not opened, and the reason a run could end with
   // "the tool results came back empty" and no clue why. Say it outright.
   const empty = content.trim().length === 0;
   const preview = content.replace(/\n/g, " ").slice(0, 70);
+
+  // A file mutation renders as the change itself. This is why the result is paired with its call:
+  // the arguments are on the assistant turn, so without the pairing the tool turn is just text.
+  const change = call ? fileChangeFor(call.name, call.args) : null;
+  if (change) {
+    return (
+      <div>
+        <DiffView change={change} />
+        {!empty && (
+          <div className="mono text-[10px]" style={{ color: "var(--text-faint)" }}>{preview}{content.length > 70 ? "…" : ""}</div>
+        )}
+      </div>
+    );
+  }
+
+  const groups = call && isSearchResult(call.name) ? groupSearchMatches(content) : [];
+
   return (
     <div className="rounded border px-2.5 py-1.5" style={{ borderColor: empty ? "var(--warn)" : "var(--border)", background: "var(--surface-2)" }}>
       <button className="mono text-[11px]" style={{ color: "var(--text-dim)" }} onClick={() => setOpen((v) => !v)}>
@@ -1383,7 +1412,26 @@ function ToolResultBubble({ content }: { content: string }) {
       </button>
       {open && (
         <div className="mono mt-1 max-h-60 overflow-auto text-[11px]" style={{ color: "var(--text)" }}>
-          {empty ? "(no output — the tool returned nothing, and said nothing about why)" : <Markdown source={content} />}
+          {empty ? (
+            "(no output — the tool returned nothing, and said nothing about why)"
+          ) : groups.length > 0 ? (
+            // A search result is a list of hits; grouping by file is what makes it readable
+            // instead of one undifferentiated run of `path:line: text`.
+            <div className="space-y-1">
+              {groups.map((g) => (
+                <div key={g.file}>
+                  <div style={{ color: "var(--text-dim)" }}>
+                    {g.file} <span style={{ color: "var(--text-faint)" }}>({g.hits.length})</span>
+                  </div>
+                  {g.hits.map((h, i) => (
+                    <div key={i} className="break-all pl-3" style={{ color: "var(--text-dim)" }}>{h}</div>
+                  ))}
+                </div>
+              ))}
+            </div>
+          ) : (
+            <Markdown source={content} />
+          )}
         </div>
       )}
     </div>
@@ -1397,22 +1445,34 @@ function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
   return (
     <>
       <Markdown source={raw || "…"} />
-      {items.map((it, i) => (
-        <div key={i} className="mt-2 rounded border px-2.5 py-2" style={{ borderColor: colorOf(it.status), background: "var(--surface-2)" }}>
-          <div className="mono text-[11px]" style={{ color: "var(--text)" }}>
-            {it.status === "calling" ? "▶ running" : it.status === "denied" ? "✕ denied" : it.status === "ok" ? "✓ ran" : "⚠ error"} · {it.name}
-          </div>
-          {Object.entries(it.args).map(([k, v]) => (
-            <div key={k} className="mono mt-1 break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
-              <span style={{ color: "var(--text-faint)" }}>{k}: </span>
-              {typeof v === "string" ? (v.length > 300 ? `${v.slice(0, 300)}…` : v) : JSON.stringify(v)}
+      {items.map((it, i) => {
+        const change = fileChangeFor(it.name, it.args);
+        return (
+          <div key={i} className="mt-2 rounded border px-2.5 py-2" style={{ borderColor: colorOf(it.status), background: "var(--surface-2)" }}>
+            <div className="mono text-[11px]" style={{ color: "var(--text)" }}>
+              {it.status === "calling" ? "▶ running" : it.status === "denied" ? "✕ denied" : it.status === "ok" ? "✓ ran" : "⚠ error"} · {it.name}
             </div>
-          ))}
-          {it.result !== undefined && (
-            <pre className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{it.result}</pre>
-          )}
-        </div>
-      ))}
+            {change ? (
+              <div className="mt-1">
+                <DiffView change={change} />
+              </div>
+            ) : (
+              Object.entries(it.args).map(([k, v]) => (
+                <div key={k} className="mono mt-1 break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
+                  <span style={{ color: "var(--text-faint)" }}>{k}: </span>
+                  {typeof v === "string" ? (v.length > 300 ? `${v.slice(0, 300)}…` : v) : JSON.stringify(v)}
+                </div>
+              ))
+            )}
+            {it.result !== undefined &&
+              (change ? (
+                <div className="mono mt-1 text-[10px]" style={{ color: "var(--text-faint)" }}>{it.result}</div>
+              ) : (
+                <pre className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{it.result}</pre>
+              ))}
+          </div>
+        );
+      })}
     </>
   );
 }

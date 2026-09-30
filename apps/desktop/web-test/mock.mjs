@@ -159,6 +159,13 @@ async function oracle(req, res, path) {
       // so this is what proves the bridge forwards the reason instead of a blank result.
       toolCall = { name: "read_file", arguments: JSON.stringify({ path: "nope.txt" }) };
       content = "";
+    } else if (tools && !sawToolResult && /edit/i.test(last)) {
+      // Agent mode, MUTATION variant: an edit_file call against the shim's virtual FS
+      // (`README.md` holds "hello\nworld\n"). The transcript must render this as a diff — the
+      // added/removed lines — rather than a JSON argument blob, which is what the tool-result
+      // rendering spec asserts.
+      toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "world", new: "there" }) };
+      content = "";
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.

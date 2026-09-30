@@ -15,6 +15,14 @@
  */
 import { useEffect, useMemo, useState } from "react";
 import { EmptyState } from "../components/atoms";
+import { DiffView } from "../components/DiffView";
+import {
+  fileChangeFor,
+  groupSearchMatches,
+  isSearchResult,
+  parseStoredToolCalls,
+  type ToolCallRef,
+} from "../lib/tools/render";
 import { useUi } from "../ui-state";
 import {
   loadHistorySessions,
@@ -186,6 +194,17 @@ export function HistoryScreen() {
   }, [sessions]);
 
   const turns = useMemo(() => toTurns(timeline?.entries ?? []), [timeline]);
+  // Join each tool entry to the call that declared it. The timeline stores the assistant turn's
+  // `tool_calls` as JSON, so its arguments are recoverable — which is what lets a past `edit_file`
+  // be shown as the diff it was, not as an opaque result line.
+  const callById = useMemo(() => {
+    const m = new Map<string, ToolCallRef>();
+    for (const e of timeline?.entries ?? []) {
+      if (e.kind !== "assistant" || !e.tool_calls) continue;
+      for (const { id, ref } of parseStoredToolCalls(e.tool_calls)) m.set(id, ref);
+    }
+    return m;
+  }, [timeline]);
   const current = sessions.find((s) => s.session_id === selected) ?? null;
 
   if (sessions.length === 0 && !error) {
@@ -447,24 +466,7 @@ export function HistoryScreen() {
                   ) : (
                     <>
                       <Dot kind="tool" />
-                      <div className="rounded border px-2 py-1.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-                        <div className="flex items-center gap-2">
-                          <span className="mono text-[11px]" style={{ color: KIND_COLOR.tool }}>
-                            {e.text}
-                          </span>
-                          <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
-                            {KIND_LABEL.tool}
-                          </span>
-                        </div>
-                        {e.detail && (
-                          <pre
-                            className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]"
-                            style={{ color: "var(--text-dim)" }}
-                          >
-                            {e.detail}
-                          </pre>
-                        )}
-                      </div>
+                      <HistoryTool entry={e} call={e.tool_call_id ? callById.get(e.tool_call_id) : undefined} />
                     </>
                   )}
                 </div>
@@ -473,6 +475,53 @@ export function HistoryScreen() {
           ))}
         </ol>
       </div>
+    </div>
+  );
+}
+
+/**
+ * One tool entry in the timeline. A file mutation is shown as the change itself, the same
+ * rendering the Assistant uses — the timeline stores the assistant turn's `tool_calls`, so the
+ * arguments survive and the diff is reconstructible from a past session.
+ */
+function HistoryTool({ entry, call }: { entry: TimelineEntry; call?: ToolCallRef }) {
+  const change = call ? fileChangeFor(call.name, call.args) : null;
+  if (change) return <DiffView change={change} defaultOpen={false} />;
+
+  const groups = call && isSearchResult(call.name) && entry.detail ? groupSearchMatches(entry.detail) : [];
+
+  return (
+    <div className="rounded border px-2 py-1.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+      <div className="flex items-center gap-2">
+        <span className="mono text-[11px]" style={{ color: KIND_COLOR.tool }}>
+          {entry.text}
+        </span>
+        <span className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+          {KIND_LABEL.tool}
+        </span>
+      </div>
+      {entry.detail &&
+        (groups.length > 0 ? (
+          <div className="mono mt-1 text-[11px]" style={{ color: "var(--text-dim)" }}>
+            {groups.map((g) => (
+              <div key={g.file}>
+                <div>
+                  {g.file} <span style={{ color: "var(--text-faint)" }}>({g.hits.length})</span>
+                </div>
+                {g.hits.map((h, i) => (
+                  <div key={i} className="break-all pl-3">{h}</div>
+                ))}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <pre
+            className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]"
+            style={{ color: "var(--text-dim)" }}
+          >
+            {entry.detail}
+          </pre>
+        ))}
     </div>
   );
 }
