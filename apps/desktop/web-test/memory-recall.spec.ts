@@ -8,6 +8,7 @@
  * injects the recalled block as a system message; that is what we assert on.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickModel } from "./model-picker";
 
 const APP = "/web-test/";
 
@@ -38,13 +39,7 @@ async function seedL1(page: Page, text: string): Promise<string> {
 
 /** Pick the seed-provided text model. The systemai seed publishes `sysai/oracle-mini`. */
 async function selectModel(page: Page): Promise<void> {
-  const combo = page.getByRole("combobox");
-  const value = await combo
-    .locator("option")
-    .filter({ hasText: /oracle-mini/ })
-    .first()
-    .evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
 }
 
 /** Last body sent to /chat/completions — the model request. */

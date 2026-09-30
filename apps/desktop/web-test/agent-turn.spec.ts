@@ -12,6 +12,7 @@
  * FS, with the same path-confinement rules as tools.rs.
  */
 import { expect, test } from "@playwright/test";
+import { pickModel } from "./model-picker";
 
 const APP = "/web-test/";
 
@@ -21,9 +22,7 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
 
   // --- set up the Assistant for agent mode -------------------------------------------
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
 
   // The "tell the model it has no tools" toggle is disabled in agent mode by design — exercise it
   // off first to make sure the controls change, then flip on agent mode.
@@ -100,9 +99,7 @@ test("agent turn: a failed tool call shows the host's reason, not a blank result
   await page.goto(`${APP}?seed=systemai`);
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
 
@@ -135,9 +132,7 @@ test("agent turn: an unrecorded ending shows the status it was, not a closed ses
   await page.goto(`${APP}?seed=systemai`);
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
 
@@ -189,9 +184,7 @@ test("agent turn: a run that was never recorded is reported once, not once per w
   await page.goto(`${APP}?seed=systemai`);
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
 

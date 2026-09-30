@@ -13,6 +13,7 @@
  * The graph is a record of what happened — a turn counted twice is a graph that lies.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { pickModel } from "./model-picker";
 
 const APP = "/web-test/";
 
@@ -32,13 +33,7 @@ async function nodes(page: Page): Promise<NodeRow[]> {
 /** Open the Assistant in agent mode with a model and a workspace root. */
 async function openAgent(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  const combo = page.getByRole("combobox");
-  const value = await combo
-    .locator("option")
-    .filter({ hasText: /oracle-mini/ })
-    .first()
-    .evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
 }

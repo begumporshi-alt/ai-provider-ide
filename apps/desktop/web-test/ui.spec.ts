@@ -9,6 +9,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { EXOTIC_BASE, EXOTIC_KEY, MOCK_ORIGIN, ORACLE_BASE, ORACLE_KEY } from "./seeds";
+import { pickModel, pickerButton } from "./model-picker";
 
 const APP = "/web-test/";
 
@@ -41,11 +42,7 @@ async function startWizard(page: Page, name: string, baseUrl: string, key: strin
  */
 async function sendInAssistant(page: Page, model: RegExp, prompt: string, answer: RegExp): Promise<string> {
   await page.getByRole("button", { name: "Assistant" }).click();
-  // selectOption needs a concrete string, and the option label carries the provider slug
-  // (`slug/nativeId`), which the caller shouldn't have to know — match on text, select by value.
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: model }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, model);
   await page.getByPlaceholder(/Send a message through the router/).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
   const box = page.locator("div.whitespace-pre-wrap").filter({ hasText: answer }).last();
@@ -170,9 +167,7 @@ test("image URL from a provider is fetched through egress and rendered", async (
   await page.getByRole("button", { name: "Image" }).click();
   await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
 
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /sd-oracle-1/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /sd-oracle-1/);
   await page.getByRole("button", { name: "Generate" }).click();
 
   // The provider answered with a URL on the mock's origin; the UI must have pulled its bytes
@@ -228,9 +223,7 @@ test("OpenRouter: image models are discovered from provider metadata, not their 
   await page.getByRole("button", { name: "Assistant" }).click();
   await page.getByRole("button", { name: "Image" }).click();
   await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /openai\/gpt-5-image/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /openai\/gpt-5-image/);
   await page.getByRole("button", { name: "Generate" }).click();
 
   const img = page.locator('img[alt="generated"]');
@@ -438,9 +431,7 @@ test("assistant: agent mode refuses to send without a workspace root", async ({ 
 
   // Pick the only model the seeded provider advertises — matches the option whose label carries
   // the provider slug (same approach sendInAssistant uses).
-  const combo = page.getByRole("combobox");
-  const value = await combo.locator("option").filter({ hasText: /oracle-mini/ }).first().evaluate((o) => (o as HTMLOptionElement).value);
-  await combo.selectOption(value);
+  await pickModel(page, /oracle-mini/);
 
   // Flip agent mode on. The root is now filled in for you — the host's default workspace — so a
   // fresh screen is usable instead of dead on arrival.
@@ -475,7 +466,7 @@ test("assistant: agent mode, memory and the no-tools switch sit under the title"
   const agent = page.getByLabel("agent mode");
   const memory = page.getByLabel("memory");
   const noTools = page.getByLabel("tell the model it has no tools");
-  const picker = page.getByRole("combobox");
+  const picker = pickerButton(page);
 
   await expect(agent).toBeVisible();
   await expect(memory).toBeVisible();
