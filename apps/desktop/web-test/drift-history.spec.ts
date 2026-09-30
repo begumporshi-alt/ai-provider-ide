@@ -19,6 +19,7 @@
  *      in separate tests, each also asserting the *other's* copy is absent.
  */
 import { expect, test, type Page } from "@playwright/test";
+import { cardAction } from "./card-menu";
 
 const APP = "/web-test/";
 
@@ -289,7 +290,7 @@ test("a provider stranded in repairing says no repair is running, then reports w
 
   // The way out has to exist too, or telling the truth is a dead end: until now `Check health` was
   // hidden for a `repairing` provider, which left the stranded state unreachable through the UI.
-  await page.getByRole("button", { name: "Check health" }).click();
+  await cardAction(page, "Check health");
 
   // Now the failure itself, kept rather than swallowed — with the host's own words naming the cause.
   //

@@ -28,6 +28,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { EXOTIC_BASE, EXOTIC_KEY } from "./seeds";
+import { cardAction } from "./card-menu";
 
 const APP = "/web-test/";
 
@@ -58,7 +59,7 @@ const WARNING = /could not be recorded — this history is incomplete/;
  */
 async function stageRepair(page: Page): Promise<void> {
   await page.goto(`${APP}?seed=systemai`);
-  await page.getByRole("button", { name: "Check health" }).click();
+  await cardAction(page, "Check health");
   await expect(page.getByRole("button", { name: "Approve & apply" })).toBeVisible({ timeout: 30_000 });
 }
 
@@ -198,7 +199,7 @@ test("a generation the repair path could not record is reported on the generatio
 
   // Scoped to the drifted provider. The oracle fingerprints as a known dialect, so its own Check
   // health returns a deterministic plan and never reaches the AI round.
-  await card(page, "Exotic ND").getByRole("button", { name: "Check health" }).click();
+  await cardAction(page, "Check health", card(page, "Exotic ND"));
 
   /**
    * The plan's own evidence, and the proof the AI round ran rather than being skipped: this line is
