@@ -5,7 +5,16 @@
  * expandable per-attempt route trace. Acceptance criterion 4: text + image end-to-end.
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { catalog, listSkills, registry, router } from "../store";
+import {
+  catalog,
+  listSkills,
+  registry,
+  router,
+  loadHistorySessions,
+  resumeSession,
+  setSessionTitle as saveSessionTitle,
+  type HistorySession,
+} from "../store";
 import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
@@ -762,6 +771,14 @@ function Chat({
   const ctxRef = useRef<Recorder | null>(null);
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
+  // Phase 4 — the session bar. `sessionId` has to be state, not read once: a New chat and a resume
+  // both swap the recorder underneath, and the title is keyed by whichever session is current.
+  const [sessionId, setSessionId] = useState(() => ctxRef.current!.sessionId);
+  const [sessionTitle, setSessionTitle] = useState("");
+  const [renaming, setRenaming] = useState(false);
+  const [titleDraft, setTitleDraft] = useState("");
+  const [switcherOpen, setSwitcherOpen] = useState(false);
+  const [sessions, setSessions] = useState<HistorySession[]>([]);
   // P6: the run currently being recorded, and the iteration count the loop reports when it ends.
   const runIdRef = useRef<string | null>(null);
   const iterationsRef = useRef(0);
@@ -1138,9 +1155,180 @@ function Chat({
     setFinishReason(undefined);
   }
 
+  // ---- Phase 4: session bar -------------------------------------------------------------
+
+  const refreshSessions = useCallback(() => {
+    void loadHistorySessions(50).then(setSessions).catch(() => undefined);
+  }, []);
+
+  // Keep the list fresh, and adopt the current session's stored title whenever it changes.
+  useEffect(() => {
+    refreshSessions();
+  }, [refreshSessions, sessionId, tick]);
+
+  // Adopt the current session's stored title — but only ONCE per session. Re-adopting on every
+  // `sessions` change clobbered a title the user had just typed (the list is refreshed
+  // asynchronously, so it is briefly stale), which is why the guard is a "loaded for" ref rather
+  // than a plain dependency.
+  const titleLoadedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (renaming) return;
+    if (titleLoadedFor.current === sessionId) return;
+    const mine = sessions.find((s) => s.session_id === sessionId);
+    // An empty list means "not loaded yet", not "untitled" — wait for the list to arrive.
+    if (!mine && sessions.length === 0) return;
+    titleLoadedFor.current = sessionId;
+    setSessionTitle(mine?.title ?? "");
+  }, [sessions, sessionId, renaming]);
+
+  /**
+   * Start a fresh conversation. The recorder is replaced, not merely cleared, so the new turns are
+   * recorded under a new session id — otherwise the abandoned thread would keep growing.
+   */
+  function newChat() {
+    if (busy) return; // an in-flight turn is not something to discard on a stray click
+    const rec = startSession();
+    ctxRef.current = rec;
+    lastNodeRef.current = null;
+    setSessionId(rec.sessionId);
+    setMsgs([]);
+    setTrace(null);
+    setFinishReason(undefined);
+    setAgentItems([]);
+    setStreamedText("");
+    setEditingId(null);
+    setEditDraft("");
+    setSessionTitle("");
+    setSwitcherOpen(false);
+    useUi.getState().setResumeTranscript(undefined);
+  }
+
+  /**
+   * Resume a past session. Its transcript is seeded for context, but the recorder starts *fresh*:
+   * reusing the old id would restart the node sequence from 1 and upsert over that session's
+   * existing nodes. Same semantics as History's "Continue in Assistant".
+   */
+  async function openSession(sid: string) {
+    if (busy) return;
+    setSwitcherOpen(false);
+    let resumed: Awaited<ReturnType<typeof resumeSession>>;
+    try {
+      resumed = await resumeSession(sid);
+    } catch {
+      return; // an unreadable session is not worth an error wall; leave the transcript as it was
+    }
+    const rec = startSession();
+    ctxRef.current = rec;
+    lastNodeRef.current = null;
+    setSessionId(rec.sessionId);
+    setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+    setTrace(null);
+    setFinishReason(undefined);
+    setEditingId(null);
+    // Carry the resumed thread's name into the bar, so it is clear WHICH conversation was opened.
+    // The recorder is still a new session, so this label is deliberately transient: editing it
+    // writes a title for the continuation.
+    titleLoadedFor.current = rec.sessionId;
+    setSessionTitle(sessions.find((s) => s.session_id === sid)?.title ?? "");
+  }
+
+  function commitTitle() {
+    const t = titleDraft.trim();
+    setRenaming(false);
+    // Mark this session as adopted BEFORE the list refreshes, so the loading effect cannot adopt
+    // the still-stale (pre-rename) value and undo what the user just typed.
+    titleLoadedFor.current = sessionId;
+    setSessionTitle(t);
+    // Fire and forget: a failed rename must not block the screen, and the History screen will show
+    // the stored value on its next read either way.
+    void saveSessionTitle(sessionId, t).then(refreshSessions).catch(() => undefined);
+  }
+
   const ok = trace && !trace.error && trace.fallbacks.length === 0;
   return (
     <div className="flex min-h-0 flex-1 flex-col">
+      {/* Session bar (Phase 4): which conversation this is, what it is called, and how to start or
+          switch one without leaving the screen. */}
+      <div className="mb-2 flex items-center gap-2">
+        {renaming ? (
+          <input
+            autoFocus
+            value={titleDraft}
+            onChange={(e) => setTitleDraft(e.target.value)}
+            onBlur={commitTitle}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") commitTitle();
+              if (e.key === "Escape") setRenaming(false);
+            }}
+            placeholder="name this session…"
+            aria-label="Session title"
+            className="min-w-0 flex-1 rounded border px-2 py-0.5 text-[12px]"
+            style={inputStyle}
+          />
+        ) : (
+          <button
+            type="button"
+            className="min-w-0 flex-1 truncate text-left text-[12px]"
+            style={{ color: sessionTitle ? "var(--text)" : "var(--text-faint)" }}
+            onClick={() => {
+              setTitleDraft(sessionTitle);
+              setRenaming(true);
+            }}
+            title="Click to name this session"
+          >
+            {sessionTitle || "untitled session — click to name it"}
+          </button>
+        )}
+        <div className="relative shrink-0">
+          <Button
+            variant="ghost"
+            ariaLabel="Switch session"
+            onClick={() => {
+              refreshSessions();
+              setSwitcherOpen((v) => !v);
+            }}
+          >
+            Sessions ▾
+          </Button>
+          {switcherOpen && (
+            <>
+              <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
+              <div
+                className="absolute right-0 top-8 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
+                style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+                role="menu"
+                aria-label="Recent sessions"
+              >
+                {sessions.length === 0 ? (
+                  <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+                    No sessions recorded yet — this one appears once a turn is sent.
+                  </p>
+                ) : (
+                  sessions.map((s) => (
+                    <button
+                      key={s.session_id}
+                      role="menuitem"
+                      className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
+                      style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
+                      onClick={() => void openSession(s.session_id)}
+                      title={s.title || s.preview}
+                    >
+                      <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
+                      <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
+                        {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
+                      </span>
+                    </button>
+                  ))
+                )}
+              </div>
+            </>
+          )}
+        </div>
+        <Button variant="ghost" onClick={newChat} disabled={busy} ariaLabel="Start a new chat">
+          ＋ New
+        </Button>
+      </div>
+
       <div className="mb-2 flex items-center gap-2">
         <ModelPicker modality="text" value={chosen} onChange={setModel} />
         <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{chosen || "—"}</span>

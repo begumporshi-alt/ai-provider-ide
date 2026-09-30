@@ -20,6 +20,15 @@ ChatGPT/Claude web chat surfaces.
   so a past edit's diff is reconstructible). `search_files` results group by file. 21 new unit tests
   + a new e2e (`tool-result-rendering.spec.ts`); web-test 119/119.
   Not done in this pass: clickable `path:line` file links (needs a root-confined host opener).
+- **Phase 4 (in-screen session management) — DONE (2026-09-30).** A session bar at the top of the
+  Assistant: the current session's title (click to rename, persisted through `session_titles`), a
+  **＋ New** button that swaps the recorder and clears the transcript, and a **Sessions ▾** switcher
+  that resumes a past conversation in place. Resuming seeds the transcript but starts a *fresh*
+  recorder — reusing the old session id would restart the node sequence and upsert over that
+  session's existing nodes. New e2e `assistant-session.spec.ts`.
+  **Surfaced and fixed a harness gap:** the browser shim never implemented `history_rename_session`
+  / `history_delete_session`, and `history_sessions` had no `title` field — so rename/delete worked
+  in the app (verified only by Rust tests) and silently did nothing in the browser harness.
 - **Phase 6 (cheap trio) — DONE (2026-09-30).** Sticky auto-scroll + "jump to latest" pill;
   Chat/Image panels now stay mounted and hide with CSS (fixes transcript loss on tab switch AND
   the orphaned in-flight run / missing Stop); image tab got a working Stop via AbortController +
