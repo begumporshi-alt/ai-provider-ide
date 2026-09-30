@@ -47,6 +47,28 @@ const CLIENT_GATE_MARKERS = ["unauthorized_client_error", "unauthorized client"]
 const GATE_STATUSES: ReadonlySet<number> = new Set([401, 403]);
 
 /**
+ * Markers in a 400 body that name a **model or endpoint** that does not exist, rather than a
+ * request that is malformed. The distinction is drift vs. drift — both are failures of the manifest
+ * or alias, not of the key — but classifying a "model not found" as `BAD_REQUEST_SCHEMA` misleads
+ * the operator into thinking their request shape is wrong when the real problem is that the
+ * provider does not serve that model over that path.
+ *
+ * Case-insensitive. Narrow and provider-measured, not speculative: each entry is a phrase a real
+ * 400 response uses to say "that model is not available here". A body that merely mentions the
+ * word "model" is not evidence.
+ */
+const MODEL_NOT_FOUND_MARKERS = [
+  "model not found",
+  "model does not exist",
+  "does not exist",
+  "model not exist",
+  "the model does not exist",
+  "invalid model",
+  "unknown model",
+  "does not support model",
+] as const;
+
+/**
  * Whether a response is a client gate, and which marker identified it.
  *
  * Returns the matched marker so the caller can quote the provider's own words rather than
@@ -61,6 +83,21 @@ export function detectClientGate(status: number, body: string | undefined | null
   if (!body) return undefined;
   const hay = body.toLowerCase();
   return CLIENT_GATE_MARKERS.find((m) => hay.includes(m));
+}
+
+/**
+ * Whether a 400 response body names a **model that does not exist** on this provider, rather than
+ * a malformed request. Returns the matched marker (or undefined) so the caller can quote the
+ * provider's own words in the chain entry.
+ *
+ * A non-400 status returns `undefined`: "model not found" is a 400-class signal, not a 404-class
+ * one on every provider (some gatekeepers return 400 for anything they refuse before routing).
+ */
+export function detectNotFound(status: number, body: string | undefined | null): string | undefined {
+  if (status !== 400) return undefined;
+  if (!body) return undefined;
+  const hay = body.toLowerCase();
+  return MODEL_NOT_FOUND_MARKERS.find((m) => hay.includes(m));
 }
 
 /**

@@ -125,6 +125,9 @@ export interface TextArgs {
    * provider never emitted a usage block.
    */
   onUsage?: (usage: UsageTokens) => void;
+  /** Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
+   *  `responseFinish` selector. Absent if the provider never emitted one. */
+  onFinish?: (reason: string | undefined) => void;
 }
 
 /** Streaming reassembly buffer: `arguments` arrives as fragments, one fragment per chunk. */
@@ -248,6 +251,136 @@ function joinTextParts(v: unknown): string | undefined {
 function renderPath(path: string, model: string): string {
   // split/join, not replaceAll: this package compiles under the desktop app's older lib target
   return path.split("{{model}}").join(encodeURIComponent(model).split("%2F").join("/"));
+}
+
+/**
+ * Translate the internal OpenAI role vocabulary to the dialect's own, per the manifest's
+ * `messagesRoleMap`. A `null` map value hoists those messages' content into the dialect's system
+ * field (declared by `systemField`); a string value remaps the role inline. When the map is absent,
+ * messages pass through untouched (the OpenAI dialect).
+ *
+ * # Why this is declarative, not a code branch
+ *
+ * The three dialects disagree on message shape in ways no single `if dialect === …` branch
+ * captures cleanly, and a fourth dialect would only force another branch. The grammar carries
+ * the per-dialect role mapping; the interpreter reads it and applies it — one loop for all dialects,
+ * zero branches. A new dialect adds a row to the map and a `systemField` declaration (or omits
+ * them for pass-through) and needs no interpreter change.
+ */
+function normalizeDialectMessages(
+  messages: unknown[],
+  roleMap: Record<string, string | null> | undefined,
+  systemField: string | undefined,
+): { messages: unknown[]; systemContent: string | undefined } {
+  if (!roleMap) {
+    // Pass-through: OpenAI dialect, or a manifest that omits the map.
+    return { messages, systemContent: undefined };
+  }
+  const out: unknown[] = [];
+  let systemParts: string[] = [];
+  for (const msg of messages) {
+    if (!msg || typeof msg !== "object") {
+      out.push(msg);
+      continue;
+    }
+    const m = msg as Record<string, unknown>;
+    const role = typeof m.role === "string" ? m.role : "user";
+    const target = roleMap[role];
+    if (target === null) {
+      // Hoist: this dialect takes system messages as a top-level param, not in the messages array.
+      const content = typeof m.content === "string" ? m.content : String(m.content ?? "");
+      if (content) systemParts.push(content);
+      continue;
+    }
+    if (target === undefined) {
+      // Role not in the map — pass through verbatim. A dialect that declares a map but omits a
+      // role is saying "I speak this role natively too".
+      out.push(msg);
+      continue;
+    }
+    const translated: Record<string, unknown> = { ...m, role: target };
+    // `tool_call_id` is an OpenAI concept — Anthropic and Gemini model tool results as plain
+    // `user` turns and reject the field. Drop it when the role is being translated away from
+    // `tool` (i.e. the dialect does not natively carry `tool_call_id`). When the role is pass-
+    // through (OpenAI dialect), the field survives.
+    if (target !== "tool" && typeof translated.tool_call_id !== "undefined") {
+      delete translated.tool_call_id;
+    }
+    out.push(translated);
+  }
+  const systemContent = systemParts.length ? systemParts.join("\n\n") : undefined;
+  // When the dialect declares neither a map nor a system field, it has no system channel —
+  // and hoisted content would be silently lost. Drop it with nothing to receive it.
+  if (systemField === undefined) {
+    return { messages: out, systemContent: undefined };
+  }
+  return { messages: out, systemContent };
+}
+
+/**
+ * Translate an OpenAI-shaped `tool_choice` to the dialect's own form, per the manifest's
+ * `toolChoiceMap`. An OpenAI `tool_choice` is one of:
+ *   - `"none"`         -> dialect's "don't call tools" sentinel
+ *   - `"auto"`         -> dialect's "let the model decide" sentinel
+ *   - `{type:"function", function:{name:"fn"}}` -> the dialect's specific-call form
+ *
+ * The map keys are the OpenAI forms ("none", "auto", "function"). The values are either plain
+ * literals (e.g. `{type:"const", value:"any"}`) or template strings containing `{{toolChoice...}}`
+ * placeholders that get rendered against the original OpenAI tool_choice — this is how the Anthropic
+ * dialect maps the OpenAI function name into `{type:"tool", name:"<fn>"}`.
+ *
+ * A `null` value means "omit tool_choice entirely for this form". When the manifest omits
+ * `toolChoiceMap`, `toolChoice` passes through untouched (the OpenAI dialect, whose shapes are
+ * already identical).
+ */
+function translateToolChoice(
+  toolChoice: unknown,
+  toolChoiceMap: Record<string, unknown> | undefined,
+): unknown {
+  if (!toolChoiceMap) return toolChoice;
+  if (toolChoice === undefined || toolChoice === null) return undefined;
+  // String forms ("none" / "auto") are the common case — look them up by their literal value.
+  if (typeof toolChoice === "string") {
+    const mapped = toolChoiceMap[toolChoice];
+    if (mapped === undefined) return undefined; // not in the map → drop it (omit)
+    return renderToolChoiceTemplate(mapped, toolChoice);
+  }
+  // Object form ({type:"function", function:{name:"fn"}}) — keyed by `type`.
+  if (typeof toolChoice === "object" && toolChoice !== null) {
+    const o = toolChoice as Record<string, unknown>;
+    const t = typeof o.type === "string" ? o.type : "";
+    const mapped = toolChoiceMap[t];
+    if (mapped === undefined) return undefined;
+    return renderToolChoiceTemplate(mapped, o);
+  }
+  return undefined;
+}
+
+/**
+ * Render a `toolChoiceMap` value: if it's a string template containing `{{toolChoice.*}}`
+ * placeholders, substitute against the source OpenAI tool_choice. Otherwise return the
+ * literal value as-is. Handles nested objects (e.g. `{type:"tool", name:"{{toolChoice.function.name}}"}`).
+ */
+function renderToolChoiceTemplate(mapped: unknown, source: unknown): unknown {
+  if (typeof mapped !== "string") {
+    if (mapped !== null && typeof mapped === "object") {
+      // Recursively resolve placeholders inside nested objects/arrays.
+      const o = mapped as Record<string, unknown>;
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(o)) {
+        out[k] = renderToolChoiceTemplate(v, source);
+      }
+      return out;
+    }
+    return mapped;
+  }
+  // Resolve `{{toolChoice.<path>}}` placeholders against the source tool_choice.
+  const PLACEHOLDER = /^\{\{\s*toolChoice\.([A-Za-z0-9_.]+)\s*\}\}$/;
+  const m = PLACEHOLDER.exec(mapped);
+  if (!m) return mapped; // not a toolChoice template — treat as literal
+  const val = selectOne(source, "$." + m[1]);
+  if (val === undefined || val === null) return undefined;
+  return val;
 }
 
 /**
@@ -399,17 +532,34 @@ export class ManifestInterpreter implements AdapterInstance {
     signal?: AbortSignal,
   ): AsyncGenerator<string, void, void> {
     const ep = this.requireText();
-    const body = renderTemplate(ep.requestTemplate, {
+    // v1.1 amendment (2026-09-30): normalize the OpenAI-shaped request into the dialect's own
+    // message and tool_choice shapes before rendering the template. The manifest declares how its
+    // dialect speaks via `messagesRoleMap` (role remapping + system hoisting) and `toolChoiceMap`
+    // (string/function → dialect form); when either is absent, the corresponding values pass through
+    // untouched. One loop for all dialects, zero branches in the interpreter.
+    const { messages, systemContent } = normalizeDialectMessages(
+      args.messages,
+      ep.messagesRoleMap,
+      ep.systemField,
+    );
+    const templateValues: Record<string, unknown> = {
       model: args.model,
-      messages: args.messages,
+      messages,
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
       temperature: args.temperature,
       tools: args.tools,
-      toolChoice: args.toolChoice,
+      toolChoice: translateToolChoice(args.toolChoice, ep.toolChoiceMap),
       responseFormat: args.responseFormat,
       ...this.ctx.vars,
-    });
+    };
+    // Hoisted system content lands in the dialect's system field (declared by `systemField`).
+    // When the dialect declared a system field, the template will have a `{{system?}}` placeholder;
+    // when it didn't, `systemContent` is undefined and the template field (if any) is omitted.
+    if (systemContent !== undefined) {
+      templateValues.system = systemContent;
+    }
+    const body = renderTemplate(ep.requestTemplate, templateValues);
     // OpenAI-shaped servers send no usage on a stream unless asked, and `stream_options` is
     // rejected outright on a non-stream request — so it can only be added here, at send time,
     // where we know which way this particular call is going. Without it the ledger records
@@ -461,6 +611,11 @@ export class ManifestInterpreter implements AdapterInstance {
           }
         }
       }
+      // Non-stream: surface finish reason via `responseFinish` selector (v1.1 amendment).
+      if (args.onFinish && ep.responseFinish) {
+        const fr = selectOne(json, ep.responseFinish);
+        args.onFinish(typeof fr === "string" && fr && fr !== "null" ? fr : undefined);
+      }
       return;
     }
 
@@ -471,6 +626,9 @@ export class ManifestInterpreter implements AdapterInstance {
     // Last-seen usage block from the stream. Set by the Rust-side parser or by the provider's
     // own usage chunk (e.g. OpenAI puts it on the final choice; Anthropic puts it on message_delta).
     let lastUsage: Partial<UsageTokens> | undefined;
+    // The finish reason (stop/length/tool_calls/etc.), surfaced via `responseFinish` selector.
+    // For Anthropic this maps from `stop_reason` via the manifest's `responseFinish` selector.
+    let finishReason: string | undefined;
 
     // SSE path: `data: {...}` lines through chunkMap / errorMap / finish (§2.6 v1.1).
     // try/finally so the reassembled tool calls are reported on EVERY exit path, including
@@ -551,8 +709,20 @@ export class ManifestInterpreter implements AdapterInstance {
             }
           }
         }
+        // Collect the finish reason from the dialect's `responseFinish` selector — the same
+        // selector is used on both non-stream and stream paths. MUST come before the stopWhen /
+        // early-return checks: a chunk carrying finish_reason may also trigger stopWhen, and
+        // returning before collecting would drop the reason.
+        if (ep.responseFinish) {
+          const fr = selectOne(json, ep.responseFinish);
+          if (typeof fr === "string" && fr && fr !== "null") finishReason = fr;
+        }
         if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
         const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
+        // The `stream.finish` selector doubles as a finish-reason source: it may point at a
+        // different path than `responseFinish` (Anthropic nests `stop_reason` under `delta`
+        // in streaming, vs top-level in the non-stream body), so capture it here too.
+        if (typeof finish === "string" && finish && finish !== "null") finishReason = finish;
         if (typeof finish === "string" && finish !== "null") {
           // When usage is requested, OpenAI-shaped servers put it on a chunk AFTER the one
           // carrying finish_reason — measured against OpenRouter: content, finish_reason,
@@ -579,6 +749,11 @@ export class ManifestInterpreter implements AdapterInstance {
           completion_tokens: lastUsage.completion_tokens ?? 0,
           cached_tokens: lastUsage.cached_tokens,
         });
+      }
+      // Forward finish reason (v1.1 `responseFinish` surfacing). Absent when the provider
+      // never emitted one or the abort flag is set — a cancelled stream has no finish reason.
+      if (args.onFinish && !signal?.aborted) {
+        args.onFinish(finishReason);
       }
     }
   }

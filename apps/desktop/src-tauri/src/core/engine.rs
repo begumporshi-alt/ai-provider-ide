@@ -570,9 +570,12 @@ pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
             if *kind == FailureKind::MidStream {
                 return ErrorClass::ParseError;
             }
-            // The body can contradict the status: a gated 401 is `ClientGate`, not `AuthFailed`.
+            // The body can contradict the status: a gated 401 is `ClientGate`, not `AuthFailed`,
+            // and a 400 that says "model not found" is `NotFound`, not `BadRequestSchema`.
             let hint = crate::core::client_gate::detect_client_gate(*status, body.as_deref())
-                .map(|_| BodyHint::ClientGate);
+                .map(|_| BodyHint::ClientGate)
+                .or_else(|| crate::core::client_gate::detect_not_found(*status, body.as_deref())
+                    .map(|_| BodyHint::NotFound));
             match classify(*status, hint) {
                 ErrorClass::Ok => ErrorClass::ParseError,
                 other => other,
@@ -849,7 +852,12 @@ pub async fn execute_image(
                                     reply.status,
                                     reply.error_body.as_deref(),
                                 )
-                                .map(|_| BodyHint::ClientGate);
+                                .map(|_| BodyHint::ClientGate)
+                                .or_else(|| crate::core::client_gate::detect_not_found(
+                                    reply.status,
+                                    reply.error_body.as_deref(),
+                                )
+                                .map(|_| BodyHint::NotFound));
                                 classify(reply.status, hint)
                             },
                             status: reply.status,

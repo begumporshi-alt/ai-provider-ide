@@ -30,11 +30,18 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
           tool_choice: "{{toolChoice?}}",
           response_format: "{{responseFormat?}}",
         },
+        messagesRoleMap: {
+          user: "user",
+          assistant: "assistant",
+          system: "system",
+          tool: "tool",
+        },
         responseMap: {
           text: "$.choices[0].message.content",
           usage: "$.usage",
           toolCalls: "$.choices[0].message.tool_calls",
         },
+        responseFinish: "$.choices[0].finish_reason",
         stream: {
           protocol: "sse",
           chunkMap: {
@@ -89,13 +96,41 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
         headers: { "anthropic-version": "2023-06-01" },
         requestTemplate: {
           model: "{{model}}",
+          // v1.1 amendment (2026-09-30): system messages are hoisted OUT of `messages` and
+          // assembled into the top-level `system` field — Anthropic has no `system` role in
+          // its messages array. The `messagesRoleMap` declares this (system->null), and the
+          // interpreter's `normalizeDialectMessages` does the hoisting at render time.
           messages: "{{messages}}",
+          system: "{{system?}}",
           stream: "{{stream}}",
           max_tokens: "{{maxTokens}}", // anthropic REQUIRES max_tokens — not optional here
-          // Anthropic's tool_choice is an object, not a string; pass-through, so the caller
-          // supplies the dialect's own shape.
+          // v1.1 amendment: translate the internal OpenAI tool_choice (string "auto"/"none" or
+          // {type:"function",function:{name}}) into Anthropic's object form via `toolChoiceMap`.
+          //   "none"  -> {type:"const", value:"none"}      (never call tools)
+          //   "auto"  -> {type:"const", value:"any"}       (let the model decide; Anthropic's "auto")
+          //   "function" -> {type:"tool", name:"<fn>"}     (require exactly this tool)
           tools: "{{tools?}}",
           tool_choice: "{{toolChoice?}}",
+        },
+        messagesRoleMap: {
+          // OpenAI roles -> Anthropic roles. `null` for "system" means HOIST to the system field.
+          user: "user",
+          assistant: "assistant",
+          system: null,
+          // Anthropic models tool results as `user` turns. The tool_call_id is dropped because
+          // Anthropic's turn-by-turn shape carries no such concept.
+          tool: "user",
+        },
+        systemField: "system",
+        toolChoiceMap: {
+          // "none" = never call tools → Anthropic's const "none"
+          none: { type: "const", value: "none" },
+          // "auto" = let the model decide → Anthropic's const "any" (its name for "auto")
+          auto: { type: "const", value: "any" },
+          // "function" (require specific tool) → Anthropic's {type:"tool", name:"<fn>"}
+          // The `{{toolChoice.function.name}}` placeholder is rendered by `renderToolChoiceTemplate`
+          // against the original OpenAI tool_choice object.
+          function: { type: "tool", name: "{{toolChoice.function.name}}" },
         },
         responseMap: {
           // **The path is the block ARRAY, not block 0.** `content` is a mixed array and which
@@ -110,12 +145,20 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           // block type — see emitToolCalls.
           toolCalls: "$.content",
         },
+        // v1.1: where Anthropic puts its finish reason. Non-stream: `stop_reason` is top-level.
+        // Stream: Anthropic delivers it on the `message_delta` event as `stop_reason`.
+        responseFinish: "$.stop_reason",
         stream: {
           protocol: "sse",
           // content_block_delta events carry {delta:{text}}
           chunkMap: { delta: "$.delta.text" },
           errorMap: { "$.error": "PASS_THROUGH" },
           stopWhen: { path: "$.type", equals: "message_stop" },
+          // Anthropic nests `stop_reason` under `delta` on `message_delta` events (unlike the
+          // non-stream body where it is top-level). The `responseFinish` selector targets the
+          // non-stream shape; `stream.finish` targets the streaming chunk so the reason is
+          // captured before the terminating `message_stop` halts the loop.
+          finish: "$.delta.stop_reason",
           // Tool use is split across events: content_block_start carries id+name, then one
           // content_block_delta per input_json_delta fragment of the arguments JSON.
           toolCallStream: {
@@ -165,14 +208,30 @@ function geminiCompat(baseUrl: string): AdapterManifest {
         path: "/v1beta/{{model}}:generateContent",
         streamPath: "/v1beta/{{model}}:streamGenerateContent?alt=sse",
         requestTemplate: {
+          // v1.1 amendment: Gemini's generateContent has no `system` parameter (unlike
+          // Anthropic). System messages are hoisted by `normalizeDialectMessages` (system->null
+          // in the role map) but, with no `systemField` declared, `systemContent` comes back
+          // undefined and the template simply omits it. The role map still translates
+          // assistant->model and tool->user.
+          contents: "{{messages}}",
           // GenerationConfig carries the knobs the dialect names differently; `maxOutputTokens`
           // is required to be nested, not top-level.
-          contents: "{{messages}}",
           generationConfig: {
             maxOutputTokens: "{{maxTokens?}}",
             temperature: "{{temperature?}}",
           },
         },
+        messagesRoleMap: {
+          // Gemini uses `model` for what OpenAI calls `assistant`.
+          user: "user",
+          assistant: "model",
+          // System has no channel on Gemini's generateContent — hoist but discard.
+          system: null,
+          // Gemini wraps tool results as `user` turns.
+          tool: "user",
+        },
+        // Declared (even though empty) so the interpreter knows system hoisting is a no-op
+        // rather than "this dialect has no role map at all".
         responseMap: {
           // `parts` is an array; selectText joins the text parts the same way it does for
           // Anthropic's content blocks.
@@ -184,6 +243,7 @@ function geminiCompat(baseUrl: string): AdapterManifest {
             cached: "cachedContentTokenCount",
           },
         },
+        responseFinish: "$.candidates[0].finishReason",
         stream: {
           protocol: "sse",
           chunkMap: { delta: "$.candidates[0].content.parts" },

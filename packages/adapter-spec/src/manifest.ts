@@ -84,6 +84,36 @@ const TOOL_CALL_STREAM = z.object({
   }),
 });
 
+/**
+ * Maps the internal OpenAI role vocabulary to the dialect's own roles.
+ *
+ * # Why this is a grammar field, not a code branch
+ *
+ * The assistant and agent loop both speak OpenAI roles internally:
+ * `user | assistant | system | tool`. Three of the four are portable, but the dialects
+ * disagree on the rest:
+ *  - Anthropic has no `system` in `messages`; it is a top-level request param.
+ *  - Anthropic's `tool` role is `user` (tool results are injected as user turns).
+ *  - Gemini uses `user | model | user`<sup>†</sup> for tool results.
+ *
+ * A hardcoded `if dialect === "anthropic"` inside the interpreter is the drift this
+ * repository keeps rediscovering (§1.3). `messagesRoleMap` makes the role translation
+ * declarative: the grammar carries the mapping, the interpreter applies it. A new dialect
+ * only adds a row to the map — no interpreter edit, no branch, nothing to forget.
+ *
+ * `system` is special-cased out by omitting it from the map's output: when the value
+ * for `"system"` is `null`, the interpreter hoists those messages into the dialect's
+ * system field (top-level `system` for Anthropic, a separate param for Gemini). The
+ * OpenAI dialect maps `"system" -> "system"` (a pass-through).
+ *
+ * <sup>†</sup> Gemini's `function.response` is wrapped as a `user` role; this is the
+ * correct mapping, not a lossy one — the `tool_call_id` is dropped because Gemini's
+ * turn-by-turn shape carries no such concept.
+ */
+const MESSAGES_ROLE_MAP = z.record(z.string().min(1), z.string().min(1).nullable());
+// `null` value means "hoist to the dialect's system field"; a string means "translate role to this".
+// OpenAI's own map is all pass-throughs including system->system.
+
 export const GENERATE_TEXT_ENDPOINT = z.object({
   method: z.literal("POST"),
   // May carry a `{{model}}` placeholder (Gemini dials `/v1beta/models/{model}:generateContent`);
@@ -95,12 +125,33 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
   // generationConfig): renderTemplate resolves placeholders at any depth. Top-level keys stay
   // whitelist-bound (REQUEST_FIELD_WHITELIST); nesting adds shape, not trust.
   requestTemplate: z.record(z.unknown()),
+  // v1.1 amendment (2026-09-30): declarative dialect shaping of the request body.
+  //
+  // `messagesRoleMap` maps the internal OpenAI role vocabulary to the dialect's own.
+  // A `null` value means "hoist to the dialect's system field" — Anthropic has no `system`
+  // in its `messages` array; it is a top-level request param, so `system` messages are
+  // extracted out and assembled into that param. The OpenAI dialect maps every role to itself.
+  //
+  // See `normalizeDialectMessages` in the interpreter for the one implementation.
+  messagesRoleMap: MESSAGES_ROLE_MAP.optional(),
+  // The request body field that receives hoisted system messages (e.g. `"system"` for Anthropic).
+  // When absent, hoisted system content is dropped — a dialect without a system channel
+  // simply cannot accept one.
+  systemField: z.string().optional(),
+  // v1.1 amendment (2026-09-30): declarative `tool_choice` translation.
+  // Maps the internal OpenAI tool_choice forms ("none", "auto", "function") to the dialect's own.
+  // A `null` value means "omit tool_choice entirely for this form". A string is a literal value
+  // the interpreter substitutes. When absent, toolChoice passes through untouched (OpenAI dialect).
+  toolChoiceMap: z.record(z.string(), z.unknown()).optional(),
   // **A dialect may stream at a different endpoint than it dials unarily.** Gemini's unary
   // generateText is `:generateContent`; its SSE stream is
   // `:streamGenerateContent?alt=sse` — same endpoint family, different path, and no body field
   // can express that difference. When the caller asks to stream and this is set, the
   // interpreter dials this path instead of `path`.
   streamPath: z.string().optional(),
+  // v1.1 amendment (2026-09-30): where the dialect puts its finish_reason on the response.
+  // Optional — a dialect that omits it simply never surfaces a finish reason.
+  responseFinish: Selector.optional(),
   // `toolCalls` (v1.1 amendment 2026-09-17): where a real tool call sits in the response.
   // Optional and dialect-specific — a manifest that omits it simply never reports tool
   // calls, which is the pre-amendment behaviour.

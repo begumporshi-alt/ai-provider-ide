@@ -40,6 +40,7 @@ export interface ExecuteTextArgs {
   onToolCall?: (call: ToolCall) => void;
   /** Called once with whatever usage the upstream reported; also fills `TextExecution.usage()`. */
   onUsage?: (usage: UsageTokens) => void;
+  onFinish?: (reason: string | undefined) => void;
   signal?: AbortSignal;
   maxAttempts?: number;
 }
@@ -133,7 +134,7 @@ export class ExecutionEngine {
             // way the caller — the gateway bridge, which forwards it host-side — ever learns the
             // token counts. Dropping the caller's callback here left every gateway response
             // reporting `usage: null` even on requests that had usage.
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); } },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); }, onFinish: args.onFinish },
             args.signal,
           )) {
             if (!emitted) {

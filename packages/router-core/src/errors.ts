@@ -2,7 +2,7 @@
  * error-taxonomy (§2.10): the ONLY classification the execution engine uses to decide
  * rotate / failover / drift. Maps an HTTP status (+ optional body signal) to a class.
  */
-import { detectClientGate } from "./client-gate.js";
+import { detectClientGate, detectNotFound } from "./client-gate.js";
 
 export type ErrorClass =
   | "AUTH_FAILED"
@@ -43,12 +43,19 @@ export function isRetryableWithNextKey(c: ErrorClass): boolean {
  *   healthy keys. Detected by the one authority, `detectClientGate` (`client-gate.ts`), which fails
  *   toward "blame the key": an unrecognised body stays `AUTH_FAILED`.
  * - **A billing refusal** (`BILLING`): a 402 is a budget-pool condition, not a transport one.
- *   Classifying it `NETWORK` counted a full pool against the provider's network health and sent
- *   the loop hunting for a "better connected" provider.
+ *   Classifying it `NETWORK` counted a billing condition against the provider's network health and
+ *   sent the loop hunting for a "better connected" provider.
+ * - **A model-not-found** (`NOT_FOUND`): a 400 whose body says the model does not exist is drift
+ *   in the manifest or alias, not a malformed request. Classifying it `BAD_REQUEST_SCHEMA` (the
+ *   status-only default) misleads the operator into checking their request shape when the real
+ *   problem is that the provider does not serve that model. Detected by `detectNotFound`
+ *   (`client-gate.ts`), which fails toward "schema": an unrecognised 400 body stays
+ *   `BAD_REQUEST_SCHEMA`.
  */
 export function classifyHttp(status: number, body: string | undefined | null): ErrorClass {
   const gate = detectClientGate(status, body);
   if (gate) return classify(status, "client_gate");
+  if (detectNotFound(status, body)) return classify(status, "not_found");
   return classify(status);
 }
 

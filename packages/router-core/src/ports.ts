@@ -93,6 +93,12 @@ export interface TextRequest {
    * provider never emitted a usage block.
    */
   onUsage?: (usage: UsageTokens) => void;
+  /**
+   * Finish reason callback: fires once at stream end (or on non-stream response) with the
+   * dialect's finish reason (e.g. "stop", "length", "tool_calls"), surfaced via the manifest's
+   * `responseFinish` selector. Absent if the provider never emitted one.
+   */
+  onFinish?: (reason: string | undefined) => void;
 }
 
 /**
