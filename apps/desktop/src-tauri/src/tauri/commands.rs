@@ -194,6 +194,23 @@ pub fn history_timeline(
     context::timeline(&store, &session_id).map_err(CommandError)
 }
 
+#[tauri::command]
+pub fn history_rename_session(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+    title: String,
+) -> Result<(), CommandError> {
+    context::set_session_title(&store, &session_id, if title.trim().is_empty() { None } else { Some(&title) }).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn history_delete_session(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+) -> Result<(), CommandError> {
+    context::delete_session(&store, &session_id).map_err(CommandError)
+}
+
 // ---------- skills (P5) ----------
 // Skills are procedures, not capabilities: nothing here can widen the agent's tool surface.
 
@@ -642,6 +659,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         context_clear,
         history_sessions,
         history_timeline,
+        history_rename_session,
+        history_delete_session,
         skills_list,
         skills_catalog,
         skills_install,

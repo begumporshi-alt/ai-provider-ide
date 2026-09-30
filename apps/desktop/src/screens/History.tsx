@@ -19,6 +19,9 @@ import { useUi } from "../ui-state";
 import {
   loadHistorySessions,
   loadHistoryTimeline,
+  setSessionTitle,
+  deleteSession,
+  resumeSession,
   type HistorySession,
   type HistoryTimeline,
   type TimelineEntry,
@@ -87,6 +90,8 @@ export function HistoryScreen() {
   const [selected, setSelected] = useState<string | null>(null);
   const [timeline, setTimeline] = useState<HistoryTimeline | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [draftTitle, setDraftTitle] = useState<string>("");
 
   useEffect(() => {
     loadHistorySessions(300).then(setSessions).catch((e: unknown) => setError(String(e)));
@@ -97,6 +102,68 @@ export function HistoryScreen() {
   useEffect(() => {
     if (selected === null && sessions.length > 0) setSelected(sessions[0].session_id);
   }, [sessions, selected]);
+
+  const displayTitle = (s: HistorySession) => s.title || s.preview || "(no text)";
+
+  function startRename(s: HistorySession) {
+    setEditingId(s.session_id);
+    setDraftTitle(s.title ?? "");
+  }
+
+  async function commitRename(sid: string) {
+    const trimmed = draftTitle.trim();
+    try {
+      await setSessionTitle(sid, trimmed);
+      setSessions((prev) =>
+        prev.map((s) =>
+          s.session_id === sid ? { ...s, title: trimmed ? trimmed : null } : s
+        )
+      );
+    } catch (e: unknown) {
+      setError(String(e));
+    } finally {
+      setEditingId(null);
+    }
+  }
+
+  function cancelRename() {
+    setEditingId(null);
+    setDraftTitle("");
+  }
+
+  async function continueInAssistant(sid: string) {
+    try {
+      const msgs = await resumeSession(sid);
+      useUi.getState().setResumeTranscript(msgs);
+      useUi.getState().go("assistant");
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }
+
+  async function removeSession(sid: string) {
+    if (!confirm("Delete this session and all its nodes from the context graph? This cannot be undone.")) {
+      return;
+    }
+    try {
+      await deleteSession(sid);
+      setSessions((prev) => prev.filter((s) => s.session_id !== sid));
+      if (selected === sid) {
+        setSelected(sessions.find((s) => s.session_id !== sid)?.session_id ?? null);
+      }
+    } catch (e: unknown) {
+      setError(String(e));
+    }
+  }
+
+  // Keep Escape from leaving edit mode stranded.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && editingId) cancelRename();
+    };
+    if (editingId) window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [editingId]);
 
   useEffect(() => {
     if (selected === null) {
@@ -167,14 +234,76 @@ export function HistoryScreen() {
                       <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
                         {clock(s.started_ts)}
                       </span>
-                      <span className="truncate text-[12px]" style={{ color: "var(--text)" }}>
-                        {s.preview || "(no text)"}
-                      </span>
+                      {editingId === s.session_id ? (
+                        <input
+                          className="flex-1 truncate border-b bg-transparent text-[12px] outline-none"
+                          style={{
+                            borderColor: "var(--accent)",
+                            color: "var(--text)",
+                          }}
+                          value={draftTitle}
+                          onChange={(e) => setDraftTitle(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") commitRename(s.session_id);
+                          }}
+                          onClick={(e) => e.stopPropagation()}
+                          autoFocus
+                        />
+                      ) : (
+                        <span
+                          className="truncate text-[12px] cursor-pointer"
+                          style={{ color: s.title ? "var(--text)" : "var(--text-dim)" }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRename(s);
+                          }}
+                          title={s.title ? "Click to edit title" : "No custom title — click to add one"}
+                        >
+                          {displayTitle(s)}
+                        </span>
+                      )}
                     </div>
+                    {editingId !== s.session_id && s.title && (
+                      <span
+                        className="ml-auto cursor-pointer text-[10px] opacity-50 hover:opacity-100"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          startRename(s);
+                        }}
+                        title="Rename"
+                      >
+                        ✎
+                      </span>
+                    )}
                     <div className="mt-1 flex flex-wrap items-center gap-1.5">
                       <Chip>{s.turns} turns</Chip>
                       {s.tool_calls > 0 && <Chip>{s.tool_calls} tools</Chip>}
                       <Chip>{durationMs(s.started_ts, s.ended_ts)}</Chip>
+                      {editingId !== s.session_id && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            removeSession(s.session_id);
+                          }}
+                          className="ml-1 text-[10px] opacity-40 hover:opacity-100"
+                          title="Delete session"
+                          style={{ color: "var(--danger)" }}
+                        >
+                          🗑
+                        </button>
+                      )}
+                      {editingId === s.session_id && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            commitRename(s.session_id);
+                          }}
+                          className="ml-1 text-[10px] opacity-60 hover:opacity-100"
+                          style={{ color: "var(--accent)" }}
+                        >
+                          ✓
+                        </button>
+                      )}
                     </div>
                   </button>
                 );
@@ -187,14 +316,60 @@ export function HistoryScreen() {
       <div className="min-w-0 flex-1">
         {current && (
           <div className="mb-3 flex flex-wrap items-baseline gap-x-3 gap-y-1">
-            <h2 className="text-[15px] font-semibold">
-              {current.preview || "Session"}
-            </h2>
+            {editingId === current.session_id ? (
+              <input
+                className="border-b bg-transparent text-[15px] font-semibold outline-none"
+                style={{
+                  borderColor: "var(--accent)",
+                  color: "var(--text)",
+                }}
+                value={draftTitle}
+                onChange={(e) => setDraftTitle(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitRename(current.session_id);
+                }}
+                autoFocus
+              />
+            ) : (
+              <h2 className="text-[15px] font-semibold">
+                {displayTitle(current)}
+              </h2>
+            )}
+            {editingId !== current.session_id && (
+              <button
+                onClick={() => startRename(current)}
+                className="text-[10px] opacity-40 hover:opacity-100"
+                title="Rename session"
+                style={{ color: "var(--text-faint)" }}
+              >
+                ✎
+              </button>
+            )}
             <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
               {new Date(current.started_ts).toLocaleString()} · {current.turns} turns
               {current.tool_calls > 0 ? ` · ${current.tool_calls} tool calls` : ""}
               {current.model ? ` · ${current.model}` : ""}
             </span>
+            {editingId !== current.session_id && (
+              <button
+                onClick={() => continueInAssistant(current.session_id)}
+                className="text-[10px] opacity-40 hover:opacity-100"
+                title="Continue this session in Assistant"
+                style={{ color: "var(--accent)" }}
+              >
+                ↻
+              </button>
+            )}
+            {editingId !== current.session_id && (
+              <button
+                onClick={() => removeSession(current.session_id)}
+                className="text-[10px] opacity-40 hover:opacity-100"
+                title="Delete session"
+                style={{ color: "var(--danger)" }}
+              >
+                🗑
+              </button>
+            )}
           </div>
         )}
 

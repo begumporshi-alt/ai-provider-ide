@@ -14,6 +14,7 @@ use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
 use crate::core::store::Store;
+use crate::core::injection_log::now_ms;
 
 /// Edge weight ceiling. A relation that recurs reads as *stronger*, not as more edges, so
 /// repeated recording bumps weight. Without a ceiling one hot relation would eventually
@@ -216,8 +217,8 @@ pub fn clear(store: &Store) -> Result<(), String> {
 // the sequence number baked into the node id (`message:<session>:7`), which is why `seq_of`
 // exists and why it is tried before `ts`.
 
-/// One row in the history index. `preview` is the first thing the user said, which is the only
-/// useful label a session has — there is no title anywhere in the schema.
+/// One row in the history index. `preview` is the first thing the user said; `title` is a
+/// custom label set by the operator (if any), which takes precedence when present.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct HistorySession {
     pub session_id: String,
@@ -227,6 +228,7 @@ pub struct HistorySession {
     pub turns: i64,
     pub tool_calls: i64,
     pub preview: String,
+    pub title: Option<String>,
     pub model: Option<String>,
 }
 
@@ -238,10 +240,18 @@ pub struct TimelineEntry {
     pub ts: i64,
     pub text: String,
     /// For a tool entry, the result the sandbox returned — joined if the call produced several.
+    /// For an assistant entry, the `tool_calls` array that the message carried (serialized JSON),
+    /// so a resumed session can replay tool invocations with their ids and arguments intact.
     pub detail: Option<String>,
     pub model: Option<String>,
     /// Memories recalled for this turn, collapsed to a count rather than `n` timeline lines.
     pub memories: i64,
+    /// `tool_call_id` linking a tool-result entry back to its originating call (assistant entry).
+    /// Present only on `tool` entries; `None` otherwise.
+    pub tool_call_id: Option<String>,
+    /// Serialized `tool_calls` array on assistant message entries, for session resumption.
+    /// Present only on `assistant` entries with tool calls; `None` otherwise.
+    pub tool_calls: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -266,6 +276,14 @@ fn meta_text(meta: &Option<String>, key: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(raw).ok()?.get(key)?.as_str().map(|s| s.to_string())
 }
 
+/// Extract an arbitrary JSON value from node metadata, re-serialized as a compact string.
+fn meta_json(meta: &Option<String>, key: &str) -> Option<String> {
+    let raw = meta.as_deref()?;
+    let parsed = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+    let val = parsed.get(key)?;
+    serde_json::to_string(val).ok()
+}
+
 /// A session's worth of preview text: the first user message, truncated. Falls back to the
 /// first message of any role, then to nothing — a session of only tool calls still deserves
 /// a row in the index.
@@ -284,14 +302,16 @@ pub fn sessions(store: &Store, limit: usize) -> Result<Vec<HistorySession>, Stri
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT session_id,
-                    MIN(ts), MAX(ts),
-                    SUM(CASE WHEN kind='message' THEN 1 ELSE 0 END),
-                    SUM(CASE WHEN kind='skill'   THEN 1 ELSE 0 END)
-             FROM context_nodes
-             WHERE session_id IS NOT NULL
-             GROUP BY session_id
-             ORDER BY MAX(ts) DESC
+            "SELECT c.session_id,
+                    MIN(c.ts), MAX(c.ts),
+                    SUM(CASE WHEN c.kind='message' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN c.kind='skill'   THEN 1 ELSE 0 END),
+                    t.title
+             FROM context_nodes c
+             LEFT JOIN session_titles t ON t.session_id = c.session_id
+             WHERE c.session_id IS NOT NULL
+             GROUP BY c.session_id
+             ORDER BY MAX(c.ts) DESC
              LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -304,6 +324,7 @@ pub fn sessions(store: &Store, limit: usize) -> Result<Vec<HistorySession>, Stri
                 turns: r.get(3)?,
                 tool_calls: r.get(4)?,
                 preview: String::new(),
+                title: r.get(5)?,
                 model: None,
             })
         })
@@ -453,6 +474,8 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
             detail: None,
             model: meta_text(&n.meta, "model"),
             memories: *recalled.get(n.id.as_str()).unwrap_or(&0),
+            tool_call_id: None,
+            tool_calls: meta_json(&n.meta, "tool_calls"),
         });
 
         let mut calls = tools_of.remove(n.id.as_str()).unwrap_or_default();
@@ -473,11 +496,53 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
                 detail: if detail.is_empty() { None } else { Some(detail) },
                 model: None,
                 memories: 0,
+                tool_call_id: meta_text(target.map(|r| &r.meta).unwrap_or(&None), "tool_call_id"),
+                tool_calls: None,
             });
         }
     }
 
     Ok(HistoryTimeline { session_id: session_id.to_string(), entries })
+}
+
+/// Set or clear a custom title for a session. Passing `None` removes a custom title, so the
+/// History index falls back to the first user message as preview.
+pub fn set_session_title(store: &Store, session_id: &str, title: Option<&str>) -> Result<(), String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    if let Some(t) = title {
+        if t.trim().is_empty() {
+            conn.execute("DELETE FROM session_titles WHERE session_id = ?1", params![session_id])
+                .map_err(|e| e.to_string())?;
+        } else {
+            conn.execute(
+                "INSERT INTO session_titles (session_id, title, updated_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT(session_id) DO UPDATE SET
+                   title = excluded.title, updated_at = excluded.updated_at",
+                params![session_id, t, now_ms()],
+            )
+            .map_err(|e| e.to_string())?;
+        }
+    } else {
+        conn.execute("DELETE FROM session_titles WHERE session_id = ?1", params![session_id])
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Wipe every trace of a session from the context graph and its title metadata.
+pub fn delete_session(store: &Store, session_id: &str) -> Result<(), String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM context_nodes WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM session_titles WHERE session_id = ?1",
+        params![session_id],
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
 }
 
 #[cfg(test)]

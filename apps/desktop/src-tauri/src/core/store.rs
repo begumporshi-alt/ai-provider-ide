@@ -339,6 +339,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0017_gateway_key_cap", backfill_gateway_key_cap),
     ("0018_manual_models", add_manual_models_origin),
     ("0019_onboarding_failed_state", rebuild_onboarding_failed_state),
+    ("0020_session_titles", add_session_titles_table),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -1074,6 +1075,23 @@ CREATE INDEX idx_onboarding_recent ON onboarding_sessions(updated_at DESC);
     }
 }
 
+/// Session title metadata (P8): a small sidecar table so the context_nodes schema stays untouched
+/// while still supporting rename + delete on the History screen. Using `IF NOT EXISTS` because a
+/// re-run against an already-migrated database would otherwise fail.
+fn add_session_titles_table(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS session_titles (
+  session_id TEXT PRIMARY KEY,
+  title      TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_session_titles_session ON session_titles(session_id);
+"#,
+    )?;
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -1241,10 +1259,10 @@ mod tests {
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
         // 0001 schema_v1_1 .. 0006 memories, then the 0007..0019 data migrations.
-        assert_eq!(info.schema_version, 19);
+        assert_eq!(info.schema_version, 20);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(19, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(20, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1273,6 +1291,7 @@ mod tests {
             "router_sessions",
             "session_turns",
             "session_state",
+            "session_titles",
             "memory_pending",
             "memory_principal_policy",
             "router_model_context",

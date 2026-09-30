@@ -1142,6 +1142,8 @@ export interface HistorySession {
   turns: number;
   tool_calls: number;
   preview: string;
+  /** Custom title set by the user, if any. Empty string falls back to preview. */
+  title: string | null;
   model: string | null;
 }
 
@@ -1155,6 +1157,10 @@ export interface TimelineEntry {
   model: string | null;
   /** Memories recalled for this turn, collapsed to a count. */
   memories: number;
+  /** For a tool entry, the `tool_call_id` linking back to the originating assistant call. */
+  tool_call_id?: string | null;
+  /** For an assistant entry with tool calls, serialized JSON array of ToolCall objects. */
+  tool_calls?: string | null;
 }
 
 export interface HistoryTimeline {
@@ -1168,6 +1174,42 @@ export async function loadHistorySessions(limit = 100): Promise<HistorySession[]
 
 export async function loadHistoryTimeline(sessionId: string): Promise<HistoryTimeline> {
   return invoke<HistoryTimeline>("history_timeline", { sessionId });
+}
+
+export async function setSessionTitle(sessionId: string, title: string): Promise<void> {
+  return invoke("history_rename_session", { sessionId, title });
+}
+
+export async function deleteSession(sessionId: string): Promise<void> {
+  return invoke("history_delete_session", { sessionId });
+}
+
+/** Reconstruct a transcript from a session's timeline, preserving tool calls. */
+export async function resumeSession(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
+  const timeline = await loadHistoryTimeline(sessionId);
+  const out: import("./ui-state").ResumeMsg[] = [];
+  for (const e of timeline.entries) {
+    if (e.kind === "user") {
+      out.push({ role: "user", content: e.text });
+    } else if (e.kind === "assistant") {
+      const msg: import("./ui-state").ResumeMsg = { role: "assistant", content: e.text };
+      if (e.tool_calls) {
+        try {
+          msg.tool_calls = JSON.parse(e.tool_calls);
+        } catch {
+          // not JSON → skip
+        }
+      }
+      out.push(msg);
+    } else if (e.kind === "tool") {
+      out.push({
+        role: "tool",
+        content: e.detail ?? e.text,
+        tool_call_id: e.tool_call_id ?? undefined,
+      });
+    }
+  }
+  return out;
 }
 
 // ---------- P5: skills ----------

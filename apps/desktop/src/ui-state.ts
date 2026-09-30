@@ -17,10 +17,20 @@ interface UiState {
   tick: number;
   /** One-shot Connect-form prefill for the auto-setup wizard (e.g. "re-run setup against a new URL"). */
   onboardingPrefill?: OnboardingPrefill;
+  /** One-shot session transcript to seed the Assistant with on navigation (from History → Assistant). */
+  resumeTranscript?: ResumeMsg[];
   go: (s: ScreenId) => void;
   bump: () => void;
   setOnboardingPrefill: (p?: OnboardingPrefill) => void;
+  setResumeTranscript: (m?: ResumeMsg[]) => void;
 }
+
+export type ResumeMsg = {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  tool_calls?: unknown;
+  tool_call_id?: string;
+};
 
 export const useUi = create<UiState>((set) => ({
   screen: "providers",
@@ -28,4 +38,5 @@ export const useUi = create<UiState>((set) => ({
   go: (screen) => set({ screen }),
   bump: () => set((s) => ({ tick: s.tick + 1 })),
   setOnboardingPrefill: (onboardingPrefill) => set({ onboardingPrefill }),
+  setResumeTranscript: (resumeTranscript) => set({ resumeTranscript }),
 }));
