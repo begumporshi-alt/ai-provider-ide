@@ -108,6 +108,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         onToolCall: (call) => {
           collected.push(call);
         },
+        onFinish: opts.onFinish,
       },
       { signal },
     );

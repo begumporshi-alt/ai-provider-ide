@@ -12,23 +12,41 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
 import { useUi } from "../ui-state";
 import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
+import { Markdown } from "../components/Markdown";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
+import { editPoint, retryPoint } from "../lib/chat/actions";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import { toolCallName } from "../lib/tools/wire";
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
-import { activeSession, type Recorder } from "../lib/context/recorder";
+import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 import {
   distilTurn, memoryBlock, recallContext, recordRecall, rememberTurn,
 } from "../lib/memory/engine";
 
 interface Msg {
+  /** Stable identity. The transcript is truncated, re-run and forked by position, so rendering
+   *  must key on something that survives an edit — an array index does not. */
+  id: string;
   role: "user" | "assistant" | "tool";
   content: string;
   /** Set on an assistant turn that requested tool calls, so the next turn can replay them. */
   tool_calls?: unknown;
   /** Set on a tool result turn, linking it to its originating call. */
   tool_call_id?: string;
+}
+
+/** Monotonic within a session; combined with a timestamp so a resumed transcript cannot collide
+ *  with ids minted in this run. */
+let msgSeq = 0;
+function newMsgId(): string {
+  msgSeq += 1;
+  return `m-${Date.now().toString(36)}-${msgSeq}`;
+}
+
+/** Assign ids to messages that arrived without them (a resumed transcript from History). */
+function withIds(msgs: ReadonlyArray<Omit<Msg, "id">>): Msg[] {
+  return msgs.map((m) => ({ ...m, id: newMsgId() }));
 }
 
 /**
@@ -180,13 +198,17 @@ function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[
       rec.edge(skill ?? prev, artifact, "produced");
       continue;
     }
-    const node = rec.node("message", clip(content, 120), { role: m.role, model });
-    rec.edge(prev, node, "follows");
     // `tool_calls` is `unknown` in the core's message type: the wire shape varies by dialect
     // and the core does not commit to one. A stored transcript may hold either the flat internal
     // shape or OpenAI's nested one (the agent loop writes the latter), so the name is read
     // tolerantly rather than assuming whichever shape the current writer produces.
     const calls = (m.tool_calls as ToolCall[] | undefined) ?? [];
+    const node = rec.node("message", clip(content, 120), {
+      role: m.role,
+      model,
+      tool_calls: calls.length ? calls : undefined,
+    });
+    rec.edge(prev, node, "follows");
     for (const c of calls) {
       const skill = rec.node("skill", toolCallName(c));
       rec.edge(node, skill, "used");
@@ -226,6 +248,7 @@ interface Trace {
   model?: string;
   fallbacks: { provider: string; key: string; cls: string }[];
   error?: string;
+  finishReason?: string;
 }
 
 /**
@@ -502,7 +525,13 @@ export function AssistantScreen() {
           wiped the conversation mid-session — a settings save took the transcript with it.
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
           and the model list comes from the store. */}
-      {tab === "text" ? (
+      {/* Both panels stay mounted; the inactive one is hidden with CSS. Switching tabs used to
+          UNMOUNT `Chat`, which took the transcript with it (Chat → Image → Chat lost the whole
+          visible conversation and started blank) and orphaned an in-flight turn: its
+          AbortController lived in the component that had just been destroyed, so the run could not
+          be cancelled and its Stop button was gone. Keeping both mounted preserves the transcript,
+          the run and its Stop button. */}
+      <div className={tab === "text" ? "flex min-h-0 flex-1 flex-col" : "hidden"}>
         <Chat
           noTools={noTools}
           agentMode={agentMode}
@@ -513,9 +542,10 @@ export function AssistantScreen() {
           defaultRoot={defaultRoot}
           onRootChange={setRoot}
         />
-      ) : (
+      </div>
+      <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
         <ImageBox />
-      )}
+      </div>
     </div>
   );
 }
@@ -657,9 +687,7 @@ function AssistantContent({ raw }: { raw: string }) {
     <>
       {segs.map((s, i) =>
         s.kind === "text" ? (
-          <div key={i} className="whitespace-pre-wrap text-[13px]" style={{ color: "var(--text)" }}>
-            {s.text}
-          </div>
+          <Markdown key={i} source={s.text} />
         ) : (
           <ToolCallChip key={i} seg={s} />
         ),
@@ -694,8 +722,22 @@ function Chat({
 }) {
   const tick = useUi((s) => s.tick);
   const [model, setModel] = useState("");
-  const [msgs, setMsgs] = useState<Msg[]>([]);
+  const [msgs, setMsgs] = useState<Msg[]>(() => {
+    const resume = useUi.getState().resumeTranscript;
+    if (resume) {
+      useUi.getState().setResumeTranscript(undefined);
+      return withIds(resume as Omit<Msg, "id">[]);
+    }
+    return [];
+  });
+  // Per-message interaction state. `copiedId` is keyed by message id (not text) so two identical
+  // messages do not both flash "copied"; `editingId` is the user turn currently open in the inline
+  // editor.
+  const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editDraft, setEditDraft] = useState("");
   const [trace, setTrace] = useState<Trace | null>(null);
+  const [finishReason, setFinishReason] = useState<string | undefined>(undefined);
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
   const [input, setInput] = useState("");
@@ -738,11 +780,38 @@ function Chat({
     void fetchToolsPolicy().then(setPolicy).catch(() => setPolicy(null));
   }, [agentMode, policy]);
 
-  // Follow the turn as it arrives. The plain-chat path scrolls itself while streaming, but agent
-  // mode grows the transcript from tool events too and used to leave the newest line offscreen.
+  // Sticky follow. Auto-scrolling on every token made reading scrollback mid-stream impossible —
+  // the view snapped back down before you could read a line. Now we follow only while the user is
+  // already at the bottom; scrolling up detaches, and a "jump to latest" pill re-attaches. The
+  // `atBottomRef` mirror lets the async streaming loop read the latest value without a stale
+  // closure (the loop was started by a render that predates the scroll).
+  const [atBottom, setAtBottom] = useState(true);
+  const atBottomRef = useRef(true);
+  const STICK_THRESHOLD_PX = 48;
+  const onListScroll = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const near = el.scrollHeight - el.scrollTop - el.clientHeight <= STICK_THRESHOLD_PX;
+    atBottomRef.current = near;
+    setAtBottom(near);
+  }, []);
+  const stickToBottom = useCallback(() => {
+    const el = listRef.current;
+    if (!el || !atBottomRef.current) return;
+    el.scrollTo({ top: el.scrollHeight });
+  }, []);
+  const jumpToLatest = useCallback(() => {
+    const el = listRef.current;
+    if (!el) return;
+    el.scrollTo({ top: el.scrollHeight, behavior: "smooth" });
+    atBottomRef.current = true;
+    setAtBottom(true);
+  }, []);
+
+  // Follow new content (streamed text, tool events, appended turns) while anchored at the bottom.
   useEffect(() => {
-    listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
-  }, [streamedText, agentItems]);
+    stickToBottom();
+  }, [msgs, streamedText, agentItems, stickToBottom]);
 
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
@@ -787,12 +856,26 @@ function Chat({
     }
   }, []);
 
-  async function send() {
-    const text = input.trim();
-    if (!text || busy || !chosen) return;
-    setInput("");
+  /**
+   * The one turn runner. A fresh send, a retry and an edit-&-resend all funnel through here, so
+   * they cannot drift in how they build history, record the context graph or surface the trace.
+   * `baseMsgs` is the transcript BEFORE this turn — the whole thing for a send, the truncated
+   * prefix for a retry or an edit. The user turn and the assistant placeholder are appended here;
+   * callers must not append them themselves.
+   */
+  async function runTurn(text: string, baseMsgs: Msg[]) {
+    const trimmed = text.trim();
+    if (!trimmed || busy || !chosen) return;
+    const userMsg: Msg = { id: newMsgId(), role: "user", content: trimmed };
+    const assistantMsg: Msg = { id: newMsgId(), role: "assistant", content: "" };
+    setMsgs([...baseMsgs, userMsg, assistantMsg]);
+    // A send, retry or edit is a deliberate action: re-anchor to the bottom even if the user had
+    // scrolled up, so the reply they just asked for is what they see arrive.
+    atBottomRef.current = true;
+    setAtBottom(true);
     setBusy(true);
     setTrace(null);
+    setFinishReason(undefined);
     const ac = new AbortController();
     abortRef.current = ac;
     const t0 = Date.now();
@@ -800,15 +883,13 @@ function Chat({
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
       if (!root.trim()) {
+        // Undo the optimistic append: the turn never ran, so it must not sit in the transcript.
+        setMsgs(baseMsgs);
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
         abortRef.current = null;
         return;
       }
-      // Mirror the new turn into `msgs` so the UI shows it; `history` is what we actually send,
-      // so it must include this turn too — building it from the stale `msgs` closure (as the
-      // non-agent branch does NOT do) was a real bug: the model never saw the user's prompt.
-      setMsgs((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
       setStreamedText("");
       setAgentItems([]);
       // P6: open the run record before the first call, and register this controller so the
@@ -816,22 +897,22 @@ function Chat({
       const runId = newRunId();
       runIdRef.current = runId;
       iterationsRef.current = 0;
-      startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: text });
+      startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: trimmed });
       registerAbort(runId, ac);
       const host = createTauriToolHost(root.trim());
       // The user's node is created here rather than inside recordAgentTurn, because the recall
       // edges need an anchor before the run starts. Same shape as the plain-chat branch below:
       // one node per turn, reused by everything that needs to point at it.
       const rec = ctxRef.current!;
-      const userNode = rec.node("message", clip(text, 120), { role: "user", model: chosen });
+      const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen });
       if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
       // P7: recall before the run so the agent starts from what is already known. Awaited,
       // because the recalled block has to be in the system prompt before the first call.
-      const recalled = useMemory ? await recallContext(text) : [];
+      const recalled = useMemory ? await recallContext(trimmed) : [];
       if (recalled.length > 0) recordRecall(userNode, recalled);
       // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
       // tool-result turns that answer them — so the model keeps its chaining context.
-      const history: ChatMessage[] = [...replayHistory(msgs), { role: "user", content: text }];
+      const history: ChatMessage[] = [...replayHistory(baseMsgs), { role: "user", content: trimmed }];
       try {
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
@@ -848,6 +929,7 @@ function Chat({
           maxIterations: clampIterations(maxIterations),
           confirm: confirmGate,
           onEvent: handleAgentEvent,
+          onFinish: setFinishReason,
           signal: ac.signal,
         });
         // The loop terminates the moment it sees an answer with no tool calls, but it does NOT
@@ -856,6 +938,7 @@ function Chat({
         const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: finalText }];
         setMsgs(
           fullMessages.map((m) => ({
+            id: newMsgId(),
             role: m.role as Msg["role"],
             content: m.content,
             ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
@@ -870,12 +953,12 @@ function Chat({
         // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
         // it is an extra model call, and a slow or failing one must not hold up the answer the
         // user is already reading.
-        if (useMemory) {
-          void rememberTurn(ctxRef.current!.sessionId, text, finalText).then(() =>
-            distilTurn(ctxRef.current!.sessionId, chosen),
-          );
-        }
-        endRun(runId, "ok", iterationsRef.current);
+      if (useMemory) {
+        void rememberTurn(ctxRef.current!.sessionId, trimmed, finalText).then(() =>
+          distilTurn(ctxRef.current!.sessionId, chosen),
+        ).catch(() => { /* memory distillation is best-effort */ });
+      }
+      endRun(runId, "ok", iterationsRef.current);
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
       } catch (e) {
         if (ac.signal.aborted) {
@@ -902,19 +985,18 @@ function Chat({
     }
 
     // ---- Plain chat (no tools): stream and render as before. ----
-    setMsgs((m) => [...m, { role: "user", content: text }, { role: "assistant", content: "" }]);
     const rec = ctxRef.current!;
-    const userNode = rec.node("message", clip(text, 120), { role: "user", model: chosen });
+    const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen });
     if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
     // P7: recall before answering. Awaited, because the block has to be in the request.
-    const recalled = useMemory ? await recallContext(text) : [];
+    const recalled = useMemory ? await recallContext(trimmed) : [];
     if (recalled.length > 0) recordRecall(userNode, recalled);
     let streamed = "";
     try {
       // The same replay the agent path uses. Sharing it is the fix: this path used to map only
       // {role, content}, so a session that had used agent mode sent its tool results with no
       // tool_call_id and the provider answered 400.
-      const history = replayHistory(msgs);
+      const history = replayHistory(baseMsgs);
       // Recalled memory goes in its own system message, never spliced into the user's text:
       // the model must be able to tell the difference between what was just said and what was
       // remembered from an earlier conversation.
@@ -926,15 +1008,17 @@ function Chat({
             ...(noTools ? [{ role: "system" as const, content: NO_TOOLS_SYSTEM }] : []),
             ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
             ...history,
-            { role: "user" as const, content: text },
+            { role: "user" as const, content: trimmed },
           ],
+          onFinish: setFinishReason,
         },
         { signal: ac.signal },
       );
       for await (const chunk of exec.chunks) {
         streamed += chunk;
-        setMsgs((m) => m.map((x, i) => (i === m.length - 1 ? { ...x, content: streamed } : x)));
-        listRef.current?.scrollTo({ top: listRef.current.scrollHeight });
+        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed } : x)));
+        // Scroll is handled by the sticky-follow effect on `msgs` — following per token here would
+        // also fight the user when they have scrolled up to read.
       }
       const served = exec.served();
       const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
@@ -959,7 +1043,7 @@ function Chat({
         setTrace({ ms: Date.now() - t0, fallbacks: [], error: "stopped by you" });
       } else {
         setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
-        setMsgs((m) => m.map((x, i) => (i === m.length - 1 ? { ...x, content: streamed || `⚠ ${(e as Error).message}` } : x)));
+        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed || `⚠ ${(e as Error).message}` } : x)));
       }
     } finally {
       // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
@@ -968,13 +1052,78 @@ function Chat({
       // P7: remember whatever was actually said, including a failed or stopped turn — an
       // exchange the user abandoned is still part of the record. Distillation is not awaited.
       if (useMemory) {
-        void rememberTurn(ctxRef.current!.sessionId, text, streamed).then(() =>
+        void rememberTurn(ctxRef.current!.sessionId, trimmed, streamed).then(() =>
           distilTurn(ctxRef.current!.sessionId, chosen),
-        );
+        ).catch(() => { /* memory distillation is best-effort */ });
       }
       setBusy(false);
       abortRef.current = null;
     }
+  }
+
+  /** Fresh send from the composer. Clears the input, then runs against the whole transcript. */
+  function send() {
+    const text = input.trim();
+    if (!text || busy || !chosen) return;
+    setInput("");
+    void runTurn(text, msgs);
+  }
+
+  function copyMessage(m: Msg) {
+    void navigator.clipboard.writeText(m.content);
+    setCopiedId(m.id);
+    window.setTimeout(() => setCopiedId((c) => (c === m.id ? null : c)), 2000);
+  }
+
+  function startEdit(m: Msg) {
+    setEditingId(m.id);
+    setEditDraft(m.content);
+  }
+
+  function cancelEdit() {
+    setEditingId(null);
+    setEditDraft("");
+  }
+
+  /**
+   * Truncate at turn `i` and re-run its prompt. The discarded tail is the point: a retry replaces
+   * a bad reply rather than appending a second one. The index walk lives in `lib/chat/actions` so
+   * it is unit-tested rather than embedded here.
+   */
+  function retryTurn(i: number) {
+    const point = retryPoint(msgs, i);
+    if (!point) return;
+    void runTurn(point.text, point.prefix);
+  }
+
+  /** Commit the inline editor: drop this user turn and everything after it, then resend edited. */
+  function submitEdit(i: number) {
+    const text = editDraft.trim();
+    if (!text) return;
+    const prefix = editPoint(msgs, i);
+    cancelEdit();
+    void runTurn(text, prefix);
+  }
+
+  /**
+   * Drop this turn and everything after it. Only the visible transcript is truncated — the context
+   * graph is an append-only record of what happened, so the abandoned turns stay in History.
+   */
+  function deleteFrom(i: number) {
+    setMsgs((m) => m.slice(0, i));
+  }
+
+  /**
+   * Continue this conversation from `i` in a NEW session. The prefix is kept so the follow-up has
+   * its context, and the graph restarts so the two threads do not interleave nodes under one id.
+   */
+  function forkFrom(i: number) {
+    const prefix = msgs.slice(0, i + 1).map((m) => ({ ...m }));
+    ctxRef.current = startSession();
+    lastNodeRef.current = null;
+    setMsgs(prefix);
+    setTrace(null);
+    setFinishReason(undefined);
   }
 
   const ok = trace && !trace.error && trace.fallbacks.length === 0;
@@ -1022,20 +1171,47 @@ function Chat({
         </div>
       )}
 
-      <div
-        ref={listRef}
-        className="min-h-0 flex-1 overflow-y-auto rounded-md border p-3"
-        style={{ background: "var(--surface)", borderColor: "var(--border)" }}
-      >
+      <div className="relative min-h-0 flex-1">
+        <div
+          ref={listRef}
+          onScroll={onListScroll}
+          className="h-full overflow-y-auto rounded-md border p-3"
+          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+        >
         {msgs.length === 0 && !busy && (
           <EmptyState title="Try any routed model. Text streams through the router — rotation and failover are silent; the line below the answer shows what actually happened." />
         )}
         {msgs.map((m, i) => (
-          <div key={i} className="mb-3">
+          <div key={m.id} className="group mb-3">
             <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.role === "user" ? "var(--info)" : m.role === "tool" ? "var(--warn)" : "var(--success)" }}>
               {m.role}
             </div>
-            {m.role === "tool" ? (
+            {editingId === m.id ? (
+              <div>
+                <textarea
+                  autoFocus
+                  value={editDraft}
+                  rows={Math.min(14, Math.max(2, editDraft.split("\n").length))}
+                  onChange={(e) => setEditDraft(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && !e.shiftKey) {
+                      e.preventDefault();
+                      submitEdit(i);
+                    }
+                    if (e.key === "Escape") cancelEdit();
+                  }}
+                  className={`${inputCls} resize-none`}
+                  style={inputStyle}
+                />
+                <div className="mt-1 flex flex-wrap items-center gap-2">
+                  <Button variant="primary" onClick={() => submitEdit(i)}>Save &amp; resend</Button>
+                  <Button variant="ghost" onClick={cancelEdit}>Cancel</Button>
+                  <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+                    everything after this message is discarded
+                  </span>
+                </div>
+              </div>
+            ) : m.role === "tool" ? (
               <ToolResultBubble content={m.content} />
             ) : m.role === "assistant" ? (
               agentMode && i === msgs.length - 1 && busy ? (
@@ -1044,10 +1220,33 @@ function Chat({
                 <AssistantContent raw={m.content} />
               )
             ) : (
-              <div className="whitespace-pre-wrap text-[13px]" style={{ color: "var(--text)" }}>{m.content}</div>
+              <Markdown source={m.content} />
+            )}
+            {editingId !== m.id && (
+              <MessageActions
+                disabled={busy}
+                copied={copiedId === m.id}
+                onCopy={() => copyMessage(m)}
+                onRetry={m.role === "assistant" && i > 0 ? () => retryTurn(i) : undefined}
+                onEdit={m.role === "user" ? () => startEdit(m) : undefined}
+                onFork={i > 0 ? () => forkFrom(i) : undefined}
+                onDelete={i > 0 ? () => deleteFrom(i) : undefined}
+              />
             )}
           </div>
         ))}
+        </div>
+        {!atBottom && (
+          <button
+            type="button"
+            onClick={jumpToLatest}
+            className="absolute bottom-2 left-1/2 -translate-x-1/2 rounded-full border px-3 py-1 text-[11px] shadow-lg transition-opacity hover:opacity-90"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
+            title="Scroll to the newest message"
+          >
+            ↓ jump to latest
+          </button>
+        )}
       </div>
       {trace && (
         <div className="mt-2 text-[12px]">
@@ -1061,6 +1260,9 @@ function Chat({
               <span style={{ color: "var(--warn)" }}>· {trace.fallbacks.length} fallback{trace.fallbacks.length === 1 ? "" : "s"}</span>
             )}
             {trace.error && <span style={{ color: "var(--danger)" }}>{trace.error}</span>}
+            {finishReason === "length" && (
+              <span className="mono" style={{ color: "var(--warn)" }}>· truncated</span>
+            )}
             {(trace.fallbacks.length > 0 || showTrace) && (
               <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>{showTrace ? "▾" : "▸"}</span>
             )}
@@ -1110,6 +1312,61 @@ function Chat({
   );
 }
 
+/**
+ * Per-message actions, revealed on hover (and on focus, so they are keyboard-reachable).
+ *
+ * Every action that re-runs or truncates a turn is disabled while a turn is in flight: re-entering
+ * the loop mid-stream would interleave two runs and both would write to the same transcript. The
+ * caller decides which actions apply to which role by passing or omitting each handler.
+ */
+function MessageActions({
+  disabled,
+  copied,
+  onCopy,
+  onRetry,
+  onEdit,
+  onFork,
+  onDelete,
+}: {
+  disabled: boolean;
+  copied: boolean;
+  onCopy: () => void;
+  onRetry?: () => void;
+  onEdit?: () => void;
+  onFork?: () => void;
+  onDelete?: () => void;
+}) {
+  const btn =
+    "rounded px-1.5 py-0.5 text-[10px] transition-opacity opacity-60 hover:opacity-100 disabled:opacity-30 disabled:hover:opacity-30";
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100 focus-within:opacity-100">
+      <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onCopy} title="Copy this message">
+        {copied ? "✓ copied" : "copy"}
+      </button>
+      {onRetry && (
+        <button type="button" className={btn} style={{ color: "var(--accent)" }} disabled={disabled} onClick={onRetry} title="Discard this reply and regenerate it">
+          ↻ retry
+        </button>
+      )}
+      {onEdit && (
+        <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onEdit} title="Edit this message and resend">
+          ✎ edit
+        </button>
+      )}
+      {onFork && (
+        <button type="button" className={btn} style={{ color: "var(--text-dim)" }} disabled={disabled} onClick={onFork} title="Continue from here in a new session, keeping this point as context">
+          ⑂ fork
+        </button>
+      )}
+      {onDelete && (
+        <button type="button" className={btn} style={{ color: "var(--danger)" }} disabled={disabled} onClick={onDelete} title="Delete this message and everything after it">
+          🗑 delete from here
+        </button>
+      )}
+    </div>
+  );
+}
+
 /** Compact, collapsible view of a tool-result turn persisted in the transcript. */
 function ToolResultBubble({ content }: { content: string }) {
   const [open, setOpen] = useState(false);
@@ -1125,9 +1382,9 @@ function ToolResultBubble({ content }: { content: string }) {
         {open ? "" : ` · ${empty ? "(no output)" : `${preview}${content.length > 70 ? "…" : ""}`}`}
       </button>
       {open && (
-        <pre className="mono mt-1 max-h-60 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text)" }}>
-          {empty ? "(no output — the tool returned nothing, and said nothing about why)" : content}
-        </pre>
+        <div className="mono mt-1 max-h-60 overflow-auto text-[11px]" style={{ color: "var(--text)" }}>
+          {empty ? "(no output — the tool returned nothing, and said nothing about why)" : <Markdown source={content} />}
+        </div>
       )}
     </div>
   );
@@ -1139,9 +1396,7 @@ function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
     s === "calling" ? "var(--info)" : s === "denied" ? "var(--warn)" : s === "ok" ? "var(--success)" : "var(--danger)";
   return (
     <>
-      <div className="whitespace-pre-wrap text-[13px]" style={{ color: "var(--text)" }}>
-        {raw || <span style={{ color: "var(--text-faint)" }}>…</span>}
-      </div>
+      <Markdown source={raw || "…"} />
       {items.map((it, i) => (
         <div key={i} className="mt-2 rounded border px-2.5 py-2" style={{ borderColor: colorOf(it.status), background: "var(--surface-2)" }}>
           <div className="mono text-[11px]" style={{ color: "var(--text)" }}>
@@ -1185,11 +1440,15 @@ function ImageBox() {
   const [fetchNote, setFetchNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [progress, setProgress] = useState("");
+  // A generation can take tens of seconds; without this there was no way out but to wait for it.
+  const abortRef = useRef<AbortController | null>(null);
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.image ?? "";
   const chosen = model || def;
 
   async function go() {
     if (!prompt.trim() || !chosen || busy) return;
+    const ac = new AbortController();
+    abortRef.current = ac;
     setBusy(true);
     setError(null);
     setResult(null);
@@ -1199,7 +1458,7 @@ function ImageBox() {
     setProgress("Queued at the router…");
     const timer = window.setTimeout(() => setProgress("Waiting for the provider…"), 1500);
     try {
-      const res = await router.generateImage({ model: chosen, prompt: prompt.trim() });
+      const res = await router.generateImage({ model: chosen, prompt: prompt.trim() }, { signal: ac.signal });
       setProgress("");
       setResult({ ...res, ms: Date.now() - t0, provider: chosen.split("/")[0] });
 
@@ -1217,9 +1476,12 @@ function ImageBox() {
         }
       }
     } catch (e) {
-      setError((e as Error).message);
+      // A user-initiated stop is not a failure to report in red — it is the thing they asked for.
+      setProgress("");
+      setError(ac.signal.aborted ? "stopped by you" : (e as Error).message);
     } finally {
       clearTimeout(timer);
+      abortRef.current = null;
       setBusy(false);
     }
   }
@@ -1243,7 +1505,11 @@ function ImageBox() {
         placeholder="A tiny lighthouse on a stormy cliff, painterly…"
       />
       <div className="flex items-center gap-3">
-        {busy ? <Button variant="danger" disabled>Generating…</Button> : <Button variant="primary" disabled={!chosen || !prompt.trim()} onClick={() => void go()}>Generate</Button>}
+        {busy ? (
+          <Button variant="danger" onClick={() => abortRef.current?.abort()}>■ Stop</Button>
+        ) : (
+          <Button variant="primary" disabled={!chosen || !prompt.trim()} onClick={() => void go()}>Generate</Button>
+        )}
         {progress && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{progress}</span>}
         {fetchNote && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{fetchNote}</span>}
       </div>

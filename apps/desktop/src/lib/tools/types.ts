@@ -58,5 +58,7 @@ export interface AgentLoopOptions {
   confirm?: (call: import("@aiprovider/router-core").ToolCall, args: Record<string, unknown>) => Promise<boolean>;
   /** Streaming + lifecycle events for the UI. */
   onEvent?: (ev: AgentEvent) => void;
+  /** Finish reason callback, forwarded to `generateText` on each agent round-trip. */
+  onFinish?: (reason: string | undefined) => void;
   signal?: AbortSignal;
 }
