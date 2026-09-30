@@ -26,10 +26,13 @@ type CaptureResponder = {
   body: unknown;
 };
 
+/** A wire message as the assertions read it: the role, and optionally the content. */
+type WireMessage = { role: string; content?: unknown };
+
 /** An interpreter that captures the request body it sends. */
 function capture(dialect: "openai-compat" | "anthropic-compat" | "gemini-compat", response: unknown): { interp: ManifestInterpreter; http: FakeHttp; lastBody: () => Record<string, unknown> | undefined } {
   let last: CaptureResponder = { lastBody: undefined, status: 200, body: response };
-  const http = new FakeHttp((url, init) => {
+  const http = new FakeHttp((_url, init) => {
     if (init.body) last.lastBody = JSON.parse(init.body);
     last.status = 200;
     return { status: 200, body: response };
@@ -58,7 +61,7 @@ describe("openai-compat: pass-through role map", () => {
     const { interp, lastBody } = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
     await drain(interp, { model: "gpt-4o", messages: MESSAGES, stream: false });
     const body = lastBody()!;
-    const msgs = body.messages as Array<{ role: string }>;
+    const msgs = body.messages as WireMessage[];
     expect(msgs.map((m) => m.role)).toEqual(["system", "user", "assistant", "tool"]);
     expect(msgs[0]!.content).toBe("You are a helpful assistant.");
     // No top-level system param (OpenAI takes it in the array).
@@ -77,7 +80,7 @@ describe("anthropic-compat: system hoist + role remap", () => {
     const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(interp, { model: "claude-x", messages: MESSAGES, stream: false });
     const body = lastBody()!;
-    const msgs = body.messages as Array<{ role: string }>;
+    const msgs = body.messages as WireMessage[];
     // system is gone from the array; the three remaining roles are user / assistant / "user" (tool→user).
     expect(msgs.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
     // System content was hoisted into the top-level `system` field.

@@ -8,7 +8,7 @@
  * asserting one specific failed row would have passed against the very code that shipped it.
  */
 import { describe, expect, it } from "vitest";
-import { finalLine, servedLine, statusTitle, wasServed } from "./format";
+import { finalLine, formatCost, servedLine, statusTitle, wasServed } from "./format";
 
 const ok = { status: "ok", provider: "Agnes", key: "key-01", errorClass: null, httpStatus: null };
 const failedUnserved = { status: "error", provider: "—", key: "—", errorClass: "BAD_REQUEST_SCHEMA", httpStatus: 400 };
@@ -73,5 +73,24 @@ describe("status tooltip", () => {
     expect(statusTitle(ok)).toBeUndefined();
     expect(statusTitle(failedUnserved)).toBe("BAD_REQUEST_SCHEMA · HTTP 400 · no provider served");
     expect(statusTitle(failedServed)).toBe("NETWORK · no HTTP response · served by Agnes before failing");
+  });
+});
+
+describe("cost formatting", () => {
+  it("distinguishes unknown from free", () => {
+    // The whole reason the parameter is nullable. `$0.00` for a model whose provider published no
+    // price is a claim the ledger cannot support, and it is the wrong direction: it reads as free.
+    expect(formatCost(null)).toBe("—");
+    expect(formatCost(0)).toBe("$0.00");
+  });
+
+  it("keeps sub-cent amounts visible instead of rounding them to zero", () => {
+    // The common case for a short prompt on a cheap model. Two decimals would print `$0.00` —
+    // indistinguishable from the free case above, which is what makes six decimals load-bearing.
+    expect(formatCost(11)).toBe("$0.000011");
+    expect(formatCost(5_000)).toBe("$0.005000");
+    // At a cent and above, four decimals is plenty and the extra digits stop being information.
+    expect(formatCost(12_345)).toBe("$0.0123");
+    expect(formatCost(2_500_000)).toBe("$2.5000");
   });
 });

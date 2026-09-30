@@ -103,10 +103,16 @@ function systemAi(): SeedInput {
     models: [
       {
         providerId, nativeId: "oracle-mini", modality: "text", contextWindow: 8192, fetchedAt: now,
-        pricingJson: null, capabilitiesJson: null,
+        // Priced, where the other two are not: the Assistant's session readout (Phase 7) only has
+        // a number to show when the catalog carries one, and `pricing_json: null` means UNKNOWN.
+        // $1/M in and $2/M out, in the canonical unit (micro-USD per 1M tokens) the column stores.
+        pricingJson: JSON.stringify({ prompt: 1_000_000, completion: 2_000_000 }),
+        capabilitiesJson: null,
       },
       {
         providerId, nativeId: "oracle-flash", modality: "text", contextWindow: 8192, fetchedAt: now,
+        // Deliberately left unpriced — the readout must not invent a cost for a model whose
+        // provider published none.
         pricingJson: null, capabilitiesJson: null,
       },
       // Image model: "sd-" matches the openai-compat modality rule, so the Assistant's

@@ -66,3 +66,24 @@ export function statusTitle(r: RowOutcome): string | undefined {
     r.provider === "—" ? "no provider served" : `served by ${r.provider} before failing`,
   ].join(" · ");
 }
+
+/**
+ * Micro-USD → dollars (audit R2). `null` means the provider published no price for that model,
+ * which renders as "unknown" — never as "$0.00", because unknown and free are different facts and
+ * conflating them overstates what the app knows.
+ *
+ * Lives here rather than in a screen because two screens print this number now (Activity's rows and
+ * the Assistant's running total), and two copies had already drifted: one rounded sub-cent amounts
+ * to six decimals and the other wrote its own five, so the same request could read `$0.000011` in
+ * one place and `$0.00001` in the other. This is the module that exists so formatting a ledger row
+ * is testable; it is also the module that keeps the two screens agreeing.
+ *
+ * Sub-cent requests are the norm for small prompts — two decimals would show them all as `$0.00`,
+ * which reads as "free" for a request that cost something.
+ */
+export function formatCost(micros: number | null): string {
+  if (micros === null) return "—";
+  if (micros === 0) return "$0.00";
+  const usd = micros / 1_000_000;
+  return usd < 0.01 ? `$${usd.toFixed(6)}` : `$${usd.toFixed(4)}`;
+}

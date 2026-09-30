@@ -232,6 +232,20 @@ async function oracle(req, res, path) {
         res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: w + " " } }] })}\n\n`);
       }
     }
+    // Streamed usage, on request. This is OpenAI's documented shape and the shape the interpreter
+    // waits for: a chunk with an EMPTY `choices` array carrying `usage`, sent after the content
+    // (and, on a real server, after the finish chunk) and before `[DONE]`. The router asks for it
+    // (`stream_options.include_usage`, from the manifest's `stream.requestUsage`), so a mock that
+    // never sent it left every streamed request recording zero tokens — and that is precisely the
+    // "cost stayed 0 forever" defect the interpreter's usage tail exists to prevent. Without this
+    // the harness cannot exercise the streamed-usage path at all, which is the only path the
+    // Assistant uses.
+    if (body.stream_options?.include_usage === true) {
+      res.write(`data: ${JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      })}\n\n`);
+    }
     res.write("data: [DONE]\n\n");
     return res.end();
   }

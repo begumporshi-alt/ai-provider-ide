@@ -34,7 +34,10 @@ import {
   isSearchResult,
   type ToolCallRef,
 } from "../lib/tools/render";
-import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
+import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core";
+import { estimateTokens, DEFAULT_CONTEXT_WINDOW } from "@aiprovider/router-core";
+import { listLedger } from "../store";
+import { formatCost } from "../lib/ledger/format";
 import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 import {
@@ -164,11 +167,12 @@ const AGENT_SYSTEM =
  * spend a tool call on `pwd`, and if that call is denied or fails it reports that it cannot tell.
  * The root is the user's own setting, so naming it costs nothing and answers the question outright.
  */
-function agentSystem(root: string): string {
+function agentSystem(root: string, custom?: string): string {
+  const base = custom && custom.trim() ? custom.trim() : AGENT_SYSTEM;
   const r = root.trim();
-  if (!r) return AGENT_SYSTEM;
+  if (!r) return base;
   return (
-    AGENT_SYSTEM +
+    base +
     `\n\nYour workspace root is: ${r}. Every relative path resolves inside it — answer questions ` +
     `about the path from this rather than spending a tool call on \`pwd\`.`
   );
@@ -184,6 +188,18 @@ interface AgentItem {
 /** Graph labels are identifiers, not content — a 400-character node is unreadable on canvas. */
 function clip(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+/**
+ * Compact token counts for a strip that has to share a line with the composer.
+ *
+ * Local rather than shared because there is no other copy to agree with: `Activity` prints raw
+ * `tokensIn/tokensOut` in a table cell that has the width for them, and this one does not.
+ */
+function formatTokens(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 10_000) return `${Math.round(n / 1000)}k`;
+  return n.toLocaleString();
 }
 
 /**
@@ -363,6 +379,107 @@ function StepBudget({
 }
 
 /**
+ * The system-prompt editor.
+ *
+ * Three prompts, because the screen has three: the no-tools guard, the agent instructions, and a
+ * plain-chat prompt that only applies when the guard is off. They are separate fields rather than
+ * one because the choice between them is the switches' job — a single field would have to be
+ * rewritten every time the user toggled agent mode, losing whatever the other mode said.
+ *
+ * Every field starts empty and empty means **the built-in default**. Pre-filling the textareas with
+ * the constants would look identical and behave differently: the first keystroke would fork the
+ * built-in prompt into a stored copy, so a later improvement to the constant would never reach a
+ * user who had opened the editor and typed one character. A placeholder shows what will be used
+ * without claiming it.
+ */
+function SystemPromptEditor({
+  customSystem,
+  customNoTools,
+  customAgent,
+  onChangeSystem,
+  onChangeNoTools,
+  onChangeAgent,
+  onClose,
+}: {
+  customSystem: string;
+  customNoTools: string;
+  customAgent: string;
+  onChangeSystem: (v: string) => void;
+  onChangeNoTools: (v: string) => void;
+  onChangeAgent: (v: string) => void;
+  onClose: () => void;
+}) {
+  const ta = "mono w-full rounded border p-2 text-[11px]";
+  const taStyle = { background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" } as const;
+  const field = (
+    label: string,
+    hint: string,
+    value: string,
+    onChange: (v: string) => void,
+    fallback: string,
+  ) => (
+    <div className="mb-3">
+      <div className="mb-1 flex items-baseline gap-2">
+        <span className="text-[12px] font-medium" style={{ color: "var(--text)" }}>{label}</span>
+        <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>{hint}</span>
+        {value && (
+          <button
+            type="button"
+            className="ml-auto text-[10px] underline decoration-dotted"
+            style={{ color: "var(--text-dim)" }}
+            onClick={() => onChange("")}
+            title="Drop your copy and go back to the built-in prompt"
+          >
+            reset to default
+          </button>
+        )}
+      </div>
+      <textarea
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder={fallback}
+        rows={5}
+        className={`${ta} resize-y`}
+        style={taStyle}
+        aria-label={`${label} — blank uses the built-in prompt`}
+      />
+    </div>
+  );
+  return (
+    <Modal title="System prompts" onClose={onClose} width={620}>
+      <p className="mb-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
+        Blank fields use the built-in prompt, shown greyed as the placeholder. These are stored with
+        the Assistant's settings and apply to every new turn.
+      </p>
+      {field(
+        "no-tools guard",
+        "prepended while “tell the model it has no tools” is on",
+        customNoTools,
+        onChangeNoTools,
+        NO_TOOLS_SYSTEM,
+      )}
+      {field(
+        "agent instructions",
+        "used in agent mode; the workspace root is appended after it",
+        customAgent,
+        onChangeAgent,
+        AGENT_SYSTEM,
+      )}
+      {field(
+        "plain chat",
+        "used when the no-tools guard is off and agent mode is off",
+        customSystem,
+        onChangeSystem,
+        "(no system prompt is sent unless you write one)",
+      )}
+      <div className="flex justify-end">
+        <Button variant="primary" onClick={onClose}>Done</Button>
+      </div>
+    </Modal>
+  );
+}
+
+/**
  * The Assistant's settings, persisted under the `assistant` key.
  *
  * They are settings rather than per-session state because they describe how the user wants the
@@ -378,6 +495,17 @@ interface AssistantSettings {
   /** Ceiling on tool-calling rounds in one turn. Stored raw; clamped on read, because a value
    *  written by a future build may sit outside today's bounds and must not crash the screen. */
   maxIterations?: number;
+  /** Per-request model parameters. `null` means "unset — send the provider's default", and is
+   *  deliberately distinct from absent: the write below serialises with `JSON.stringify`, which
+   *  DROPS an `undefined` key, so a cleared field saved as `undefined` would leave the previous
+   *  value in the row and silently restore it on the next load. */
+  temperature?: number | null;
+  maxTokens?: number | null;
+  /** Editable system prompts. Empty or absent = the built-in constant; also written as "" for the
+   *  same reason as above (a cleared prompt has to overwrite the stored one). */
+  systemPrompt?: string;
+  noToolsSystem?: string;
+  agentSystem?: string;
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
@@ -419,6 +547,13 @@ export function AssistantScreen() {
   // that trades cost against thoroughness per run: a one-shot question wants 1, a real refactor
   // across a repo doesn't finish in 8.
   const [maxIterations, setMaxIterations] = useState(DEFAULT_MAX_ITERATIONS);
+  const [temperature, setTemperature] = useState<number | "">("");
+  const [maxTokens, setMaxTokens] = useState<number | "">("");
+  // System-prompt editor state — a string means "editing", null means "closed".
+  const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
+  const [customSystemPrompt, setCustomSystemPrompt] = useState("");
+  const [customNoToolsSystem, setCustomNoToolsSystem] = useState("");
+  const [customAgentSystem, setCustomAgentSystem] = useState("");
   const [root, setRoot] = useState("");
   // The workspace the host offers as a default, remembered so the UI can say "this is the
   // default" instead of silently filling a field the user did not fill.
@@ -442,6 +577,18 @@ export function AssistantScreen() {
       if (typeof stored.useMemory === "boolean") setUseMemory(stored.useMemory);
       // Clamped, not trusted: the stored JSON is ours but not written by this build.
       if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
+      // A stored `null` is a real value here — it is how "unset" survives the round trip — so the
+      // tests are explicitly for `null` first and then for a usable number. A blank field and a
+      // field holding 0 are different requests: 0 is a real temperature.
+      if (stored.temperature === null) setTemperature("");
+      else if (typeof stored.temperature === "number" && stored.temperature >= 0 && stored.temperature <= 2) {
+        setTemperature(stored.temperature);
+      }
+      if (stored.maxTokens === null) setMaxTokens("");
+      else if (typeof stored.maxTokens === "number" && stored.maxTokens > 0) setMaxTokens(Math.round(stored.maxTokens));
+      if (typeof stored.systemPrompt === "string") setCustomSystemPrompt(stored.systemPrompt);
+      if (typeof stored.noToolsSystem === "string") setCustomNoToolsSystem(stored.noToolsSystem);
+      if (typeof stored.agentSystem === "string") setCustomAgentSystem(stored.agentSystem);
       setDefaultRoot(fallback);
       setRoot(stored.root ?? fallback ?? "");
       setHydrated(true);
@@ -455,8 +602,20 @@ export function AssistantScreen() {
   // field meant editing both, and forgetting one saved a settings object with the new key
   // missing, which reads back as "the user never changed it".
   const saveAll = useCallback(
-    () => saveAssistantSettings({ root, agentMode, useMemory, noTools, maxIterations }),
-    [root, agentMode, useMemory, noTools, maxIterations],
+    () => saveAssistantSettings({
+      root, agentMode, useMemory, noTools, maxIterations,
+      // `null`, never `undefined`, for an unset field. `JSON.stringify` omits an undefined key, so
+      // an omitted one leaves the previously stored value in the row — clearing "max tokens" would
+      // look like it worked and then quietly come back on the next load.
+      temperature: typeof temperature === "number" ? temperature : null,
+      maxTokens: typeof maxTokens === "number" ? maxTokens : null,
+      // Always written, empty string included: same reason, for the three prompts.
+      systemPrompt: customSystemPrompt,
+      noToolsSystem: customNoToolsSystem,
+      agentSystem: customAgentSystem,
+    }),
+    [root, agentMode, useMemory, noTools, maxIterations, temperature, maxTokens,
+      customSystemPrompt, customNoToolsSystem, customAgentSystem],
   );
 
   // The debounced write below must serialise the state as it is WHEN IT FIRES, not as it was
@@ -473,7 +632,8 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations]);
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations, temperature, maxTokens,
+      customSystemPrompt, customNoToolsSystem, customAgentSystem]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
   useEffect(() => {
@@ -554,15 +714,34 @@ export function AssistantScreen() {
           agentMode={agentMode}
           useMemory={useMemory}
           maxIterations={maxIterations}
+          temperature={temperature}
+          maxTokens={maxTokens}
+          onTemperatureChange={setTemperature}
+          onMaxTokensChange={setMaxTokens}
+          systemPrompt={customSystemPrompt || undefined}
+          noToolsSystem={customNoToolsSystem || undefined}
+          agentSystemPrompt={customAgentSystem || undefined}
           root={root}
           rootError={rootError}
           defaultRoot={defaultRoot}
           onRootChange={setRoot}
+          onEditPrompts={() => setEditingPrompt("system")}
         />
       </div>
       <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
         <ImageBox />
       </div>
+      {editingPrompt !== null && (
+        <SystemPromptEditor
+          customSystem={customSystemPrompt}
+          customNoTools={customNoToolsSystem}
+          customAgent={customAgentSystem}
+          onChangeSystem={setCustomSystemPrompt}
+          onChangeNoTools={setCustomNoToolsSystem}
+          onChangeAgent={setCustomAgentSystem}
+          onClose={() => setEditingPrompt(null)}
+        />
+      )}
     </div>
   );
 }
@@ -723,19 +902,38 @@ function Chat({
   agentMode,
   useMemory,
   maxIterations,
+  temperature,
+  maxTokens,
+  onTemperatureChange,
+  onMaxTokensChange,
+  systemPrompt,
+  noToolsSystem,
+  agentSystemPrompt,
   root,
   rootError,
   defaultRoot,
   onRootChange,
+  onEditPrompts,
 }: {
   noTools: boolean;
   agentMode: boolean;
   useMemory: boolean;
   maxIterations: number;
+  /** Owned by `AssistantScreen`, like `root` — see the note on the composer strip below. */
+  temperature: number | "";
+  maxTokens: number | "";
+  onTemperatureChange: (v: number | "") => void;
+  onMaxTokensChange: (v: number | "") => void;
+  systemPrompt?: string;
+  noToolsSystem?: string;
+  /** Named `agentSystemPrompt` rather than `agentSystem`: the latter is the module-level builder
+   *  this component still has to call, and a same-named prop silently shadows it. */
+  agentSystemPrompt?: string;
   root: string;
   rootError: string | null;
   defaultRoot: string | null;
   onRootChange: (v: string) => void;
+  onEditPrompts: () => void;
 }) {
   const tick = useUi((s) => s.tick);
   const [model, setModel] = useState("");
@@ -763,6 +961,18 @@ function Chat({
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
   const [showPolicy, setShowPolicy] = useState(false);
+  // P7: usage capture for the context meter and token/cost readout.
+  const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
+  // `unpricedRows`/`rows` are the honesty inputs for the cost figure: a total that silently skips
+  // the requests whose model published no price is a number the user cannot tell apart from a
+  // complete one, and this app treats "unknown" and "free" as different facts everywhere else.
+  const [sessionCost, setSessionCost] = useState<{ micros: number; rows: number; unpriced: number }>({
+    micros: 0,
+    rows: 0,
+    unpriced: 0,
+  });
+  const [sessionTokensIn, setSessionTokensIn] = useState(0);
+  const [sessionTokensOut, setSessionTokensOut] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
   // P4: the context graph is recorded as the conversation happens. `activeSession` rather than
@@ -798,6 +1008,53 @@ function Chat({
       })
       .catch(() => undefined);
   }, [tick]);
+
+  // P7: aggregate session cost/tokens from the in-memory ledger.
+  //
+  // Called at the end of every turn rather than only from an effect on `tick`: a ledger append
+  // does not bump the store tick (the sink is a detached `fetchAdmin`), so a tick-only readout
+  // showed the totals from *before* the turn the user just watched finish. The effect below keeps
+  // it live for traffic this screen did not initiate.
+  const refreshUsageTotals = useCallback(() => {
+    let micros = 0;
+    let rows = 0;
+    let unpriced = 0;
+    let inTokens = 0;
+    let outTokens = 0;
+    for (const e of listLedger()) {
+      if (e.source === "ui" && e.status === "ok") {
+        rows += 1;
+        // Same rule Activity's rows use: a ledger row's cost is only meaningful when the catalog
+        // knows a price for that model. Without this check an unpriced model contributes 0 and the
+        // total reads as though the request were free.
+        if (catalog.pricingFor(e.providerId ?? "", e.model)) micros += e.costEstimateMicros ?? 0;
+        else unpriced += 1;
+        inTokens += e.tokensIn ?? 0;
+        outTokens += e.tokensOut ?? 0;
+      }
+    }
+    setSessionCost({ micros, rows, unpriced });
+    setSessionTokensIn(inTokens);
+    setSessionTokensOut(outTokens);
+  }, []);
+
+  /**
+   * The cost cell: an exact total, a lower bound, or "unknown".
+   *
+   * Three states rather than one number, because collapsing them is how a cost readout lies. A
+   * partial sum is marked `≥ …` so the user knows a request is missing from it, and traffic with no
+   * price at all renders as `—` (unknown) rather than `$0.00` (free).
+   */
+  const costLabel =
+    sessionCost.rows === 0
+      ? formatCost(0)
+      : sessionCost.unpriced === sessionCost.rows
+        ? formatCost(null)
+        : `${sessionCost.unpriced > 0 ? "≥ " : ""}${formatCost(sessionCost.micros)}`;
+
+  useEffect(() => {
+    refreshUsageTotals();
+  }, [tick, refreshUsageTotals]);
 
   // Surface the live sandbox allowlist once when agent mode is first enabled.
   useEffect(() => {
@@ -840,6 +1097,39 @@ function Chat({
 
   const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosen = model || def;
+  // P7: context window for the chosen model — looked up from the catalog. A qualified id
+  // `slug/native` needs to resolve the provider to find the catalog row; a bare id scans all carriers.
+  const modelWindow = useMemo(() => {
+    if (!chosen) return DEFAULT_CONTEXT_WINDOW;
+    const rows = catalog.all();
+    const nativeId = chosen.includes("/") ? chosen.split("/")[1]! : chosen;
+    const matching = rows.find((m) => m.nativeId === nativeId && m.modality === "text");
+    return typeof matching?.contextWindow === "number" && matching.contextWindow > 0
+      ? matching.contextWindow
+      : DEFAULT_CONTEXT_WINDOW;
+  }, [chosen, tick]);
+  // P7: estimated prompt tokens for the NEXT send — the system turn the mode implies, the replayed
+  // history, and the draft in the composer. The system turn is included because it is not small:
+  // the agent prompt plus the installed skills' bodies run to hundreds of tokens, and leaving them
+  // out would understate the one number the meter exists to report. Two things are still outside
+  // the estimate, both by nature: the recalled memory block (computed at send time) and, in agent
+  // mode, the tool definitions.
+  const currentPromptTokens = useMemo(() => {
+    if (!input.trim() && msgs.length === 0) return 0;
+    const systemText = agentMode
+      ? agentSystem(root, agentSystemPrompt) + skillsBlock
+      : noTools
+        ? (noToolsSystem || NO_TOOLS_SYSTEM)
+        : (systemPrompt ?? "");
+    const all: ChatMessage[] = [
+      ...(systemText ? [{ role: "system" as const, content: systemText }] : []),
+      ...replayHistory(msgs),
+      ...(input.trim() ? [{ role: "user" as const, content: input }] : []),
+    ];
+    return estimateTokens(all);
+  }, [msgs, input, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
+  // P7: context meter — fraction of the window consumed.
+  const contextUsedRatio = Math.min(1, currentPromptTokens / modelWindow);
   // Join each tool result to the call that declared it, so the transcript can render an
   // `edit_file`/`write_file` as the change itself. The arguments live on the assistant turn, not
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
@@ -946,12 +1236,24 @@ function Chat({
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: agentSystem(root) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
+          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
           registry: AGENT_TOOLS,
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
+          // P7: pass through per-request temperature/maxTokens and capture usage for the meter.
           generate: (req, opts) =>
-            router.generateText(req, { ...opts, summarize: createSummarizer(chosen) }),
+            router.generateText(
+              {
+                ...req,
+                ...(typeof temperature === "number" ? { temperature } : {}),
+                ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+                onUsage: (u) => {
+                  req.onUsage?.(u);
+                  setLastUsage(u);
+                },
+              },
+              { ...opts, summarize: createSummarizer(chosen) },
+            ),
           host,
           // Clamped again at the call site: this is the number that actually bounds the spend,
           // and it is reached from a setting that a future build may have written differently.
@@ -1009,6 +1311,8 @@ function Chat({
         setAgentItems([]);
         setStreamedText("");
         abortRef.current = null;
+        // Every iteration wrote a ledger row; the totals are stale until they are re-read.
+        refreshUsageTotals();
       }
       return;
     }
@@ -1030,16 +1334,24 @@ function Chat({
       // the model must be able to tell the difference between what was just said and what was
       // remembered from an earlier conversation.
       const recallMsg = memoryBlock(recalled);
+      const systemPromptText = noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt;
       const exec = await router.generateText(
         {
           model: chosen,
           messages: [
-            ...(noTools ? [{ role: "system" as const, content: NO_TOOLS_SYSTEM }] : []),
+            ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
             ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
             ...history,
             { role: "user" as const, content: trimmed },
           ],
           onFinish: setFinishReason,
+          // P7: per-request params, and the provider's own token report for the meter's tooltip
+          // (estimate vs what the request actually cost). The running totals are NOT accumulated
+          // here — they are read back from the ledger, which is the same record the Usage screen
+          // shows; incrementing both would double-count every turn.
+          ...(typeof temperature === "number" ? { temperature } : {}),
+          ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+          onUsage: setLastUsage,
         },
         { signal: ac.signal },
       );
@@ -1087,6 +1399,10 @@ function Chat({
       }
       setBusy(false);
       abortRef.current = null;
+      // The ledger row for this turn is already written (the sink append is awaited inside the
+      // router's wrapped stream, before the `for await` above returns), so re-reading now shows
+      // this turn's tokens and cost rather than the previous turn's.
+      refreshUsageTotals();
     }
   }
 
@@ -1476,6 +1792,107 @@ function Chat({
           )}
         </div>
       )}
+      {/* P7: what this turn will actually be sent with. The model picker above says where it goes,
+          this says how. Blank means "the provider's own default", which is why the fields are empty
+          rather than zeroed: 0 is a real temperature and 1 is a real maxTokens, and neither means
+          "unset".
+          The values live in `AssistantScreen` rather than in local state here, for the same reason
+          `root` does: hydration finishes after this component has already mounted, so a local copy
+          seeded from the prop at mount would ignore everything the stored settings said and show a
+          blank field where the user's saved value belongs. */}
+      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" style={{ color: "var(--text-dim)" }}>
+        <label className="flex items-center gap-1">
+          temp
+          <input
+            type="number"
+            min={0}
+            max={2}
+            step={0.1}
+            value={temperature}
+            onChange={(e) => {
+              const v = e.target.value;
+              onTemperatureChange(v === "" ? "" : Math.max(0, Math.min(2, Number(v))));
+            }}
+            placeholder="default"
+            disabled={busy}
+            aria-label="Temperature for this request (blank uses the provider default)"
+            className="mono w-16 rounded border px-1 py-0.5 text-[11px]"
+            style={inputStyle}
+          />
+        </label>
+        <label className="flex items-center gap-1">
+          max tokens
+          <input
+            type="number"
+            min={1}
+            step={64}
+            value={maxTokens}
+            onChange={(e) => {
+              const v = e.target.value;
+              onMaxTokensChange(v === "" ? "" : Math.max(1, Math.round(Number(v))));
+            }}
+            placeholder="default"
+            disabled={busy}
+            aria-label="Maximum response tokens for this request (blank uses the provider default)"
+            className="mono w-20 rounded border px-1 py-0.5 text-[11px]"
+            style={inputStyle}
+          />
+        </label>
+        <button
+          type="button"
+          onClick={onEditPrompts}
+          className="underline decoration-dotted"
+          title="Edit the system prompts this screen sends"
+        >
+          ✎ system prompt
+        </button>
+        {/* Context meter. Position and colour together, because the colour alone is a claim the
+            user cannot check: the numbers say how full the window is and the bar makes it skimmable. */}
+        <span
+          className="ml-auto flex items-center gap-1.5"
+          title={
+            `${currentPromptTokens.toLocaleString()} estimated prompt tokens of ${modelWindow.toLocaleString()} ` +
+            `window for ${chosen || "the default model"}` +
+            // `?? 0` is not defensive noise: `UsageTokens` declares both counts as required, but the
+            // interpreter passes whatever the provider's usage block actually had (`usageOf` returns
+            // `undefined` for a missing field), so a provider that omits one reaches here as
+            // `prompt_tokens: undefined` and an unguarded `.toLocaleString()` would throw while
+            // rendering — turning a missing usage line into a broken screen.
+            (lastUsage ? ` · the last request actually reported ${(lastUsage.prompt_tokens ?? 0).toLocaleString()} in` : "")
+          }
+        >
+          <span>context</span>
+          <span className="h-1.5 w-24 overflow-hidden rounded-full" style={{ background: "var(--surface-2)" }}>
+            <span
+              className="block h-full"
+              style={{
+                // A sliver for any non-zero share, so "nearly empty" is visible at all; a true zero
+                // stays zero rather than claiming a percent that is not there.
+                width: currentPromptTokens === 0 ? "0%" : `${Math.max(1, Math.round(contextUsedRatio * 100))}%`,
+                background:
+                  contextUsedRatio > 0.9 ? "var(--danger)" : contextUsedRatio > 0.7 ? "var(--warn)" : "var(--success)",
+              }}
+            />
+          </span>
+          <span className="mono">
+            {formatTokens(currentPromptTokens)} / {formatTokens(modelWindow)}
+          </span>
+        </span>
+        {/* Session totals from the ledger. "Σ" and the tooltip say *this app's whole ledger*, not
+            just this conversation — the in-memory ledger has no session column to scope by. */}
+        <span
+          className="mono"
+          title={
+            "Totals for every request this app has routed (the ledger's in-memory window), not only this conversation" +
+            (sessionCost.unpriced > 0
+              ? ` · ${sessionCost.unpriced} of ${sessionCost.rows} used a model with no published price, so the cost is a lower bound`
+              : "")
+          }
+        >
+          Σ {formatTokens(sessionTokensIn)} in · {formatTokens(sessionTokensOut)} out · {costLabel}
+        </span>
+      </div>
+
       <div className="mt-2 flex items-end gap-2">
         <textarea
           value={input}

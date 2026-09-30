@@ -7,26 +7,15 @@
 import { useEffect, useMemo, useState } from "react";
 import { listLedger, loadRecentLedger, registry, catalog, type HostLedgerRow } from "../store";
 
-/**
- * Cost formatting (audit R2). The ledger stores micro-USD; `null` means the provider published
- * no price, which must render as "unknown" — never as "$0.00", because unknown and free are
- * different facts and conflating them overstates what the app knows.
- */
-function formatCost(micros: number | null): string {
-  if (micros === null) return "—";
-  if (micros === 0) return "$0.00";
-  const usd = micros / 1_000_000;
-  // Sub-cent requests are the norm for small prompts; 2 decimals would show them all as $0.00.
-  return usd < 0.01 ? `$${usd.toFixed(6)}` : `$${usd.toFixed(4)}`;
-}
-
 /** Cost for a row, or null when the provider published no pricing for that model. */
 function costFor(providerId: string | null, model: string, micros: number): number | null {
   if (!providerId) return null;
   return catalog.pricingFor(providerId, model) ? micros : null;
 }
 
-import { finalLine, servedLine, statusTitle } from "../lib/ledger/format";
+// `formatCost` moved to `lib/ledger/format` when the Assistant's running total started printing the
+// same figure: two copies had drifted to different precision for the same request.
+import { finalLine, servedLine, statusTitle, formatCost } from "../lib/ledger/format";
 import { useUi } from "../ui-state";
 import { EmptyState } from "../components/atoms";
 

@@ -33,14 +33,38 @@ ChatGPT/Claude web chat surfaces.
   Chat/Image panels now stay mounted and hide with CSS (fixes transcript loss on tab switch AND
   the orphaned in-flight run / missing Stop); image tab got a working Stop via AbortController +
   signal.
+- **Phase 7 (parameters & usage) — DONE (2026-09-30).** A composer strip carrying `temp` and
+  `max tokens` (blank = the provider's own default, and blank is *omitted* from the body rather than
+  sent as 0 — 0 is a real temperature), a ✎ **system prompt** editor with three fields (no-tools
+  guard / agent instructions / plain chat, each blank meaning "the built-in constant", shown greyed
+  as the placeholder so nobody forks a default by typing one character), a **context meter**
+  (estimated prompt tokens for the next send against the chosen model's catalog `contextWindow`,
+  coloured by pressure, with the provider's own last-reported count in its tooltip), and a running
+  **Σ readout** of tokens in/out and cost, re-read from the ledger at the end of every turn.
+  New e2e `assistant-params.spec.ts` (8 tests). Verified: workspace typecheck clean, 677 unit tests
+  (23 + 350 + 304), vite build, 127/127 web-test.
+  **Found and fixed while verifying:**
+  (a) `packages/router-core/test/dialect-messages.test.ts` did not typecheck — an unused parameter
+  and a `{role}`-only cast that read `.content` — so `pnpm typecheck` was red on `main` and had been
+  since that test landed;
+  (b) the browser harness's mock never answered `stream_options.include_usage`, so **no streamed
+  request in the harness ever recorded a token**; it now emits the usage chunk a real OpenAI-shaped
+  server sends, which is what makes the ledger's token path exercisable end-to-end;
+  (c) `formatCost` existed only inside `Activity.tsx`, and the second copy written here had already
+  drifted to different precision — it now lives in `lib/ledger/format.ts` with unit tests. The
+  Assistant's total renders `—` (unknown) rather than `$0.00` (free) when nothing could be priced,
+  and `≥ …` when only some of the traffic could be.
+  **Not done in this pass:** reasoning-effort control — `TextRequest` carries no such field and no
+  manifest declares one, so it is a router-core change rather than a UI knob.
 - **Web-test picker debt — FIXED (2026-09-30).** The `web-test` specs drove the model picker via
   `getByRole("combobox")`, which stopped matching in commit `721c115` (searchable picker). All
   four specs now use a shared `web-test/model-picker.ts` helper. Full suite went 86→101 passing;
   `ui.spec.ts` is fully green.
-- **Remaining (pre-existing, NOT this work):** 17 web-test failures cluster in the **Memory**
-  subsystem (12: memory.spec 9, memory-recall 3, smoke 1 — one root cause: seeded memory does not
-  render on the Memory screen / reach the graph) and **trail-health + drift-history** (4). Neither
-  screen is touched by the Assistant work; both need their own investigation.
+- **Superseded note:** an earlier version of this section listed 17 pre-existing web-test failures
+  (Memory, trail-health, drift-history). They are gone — the suite is 127/127 green as of Phase 7,
+  so whatever fixed them landed with the intervening commits (Phase 4/6 and the picker work).
+- **Remaining:** Phase 3 (composer/attachments), Phase 5 (agent approval modes / plan mode / change
+  review — needs more attention than a cheap phase), Phase 8 (shortcuts, command palette).
 
 ## What already exists (baseline — do not rebuild)
 
@@ -235,6 +259,9 @@ you stop it from the Agent dashboard; image generation can be cancelled; a Gemin
 ---
 
 ## Phase 7 — Parameters & usage (temperature · maxTokens · system prompt · context meter · cost)
+
+**Status: DONE (2026-09-30)** — see the Status section above for what shipped, what was found while
+verifying, and the one deliverable that was dropped (reasoning effort) and why.
 
 **Deliverables**
 - Per-request parameter panel: `temperature`, `maxTokens` (both already in `TextRequest`), reasoning
