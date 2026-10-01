@@ -51,6 +51,31 @@ export type UiIntent = "new-chat" | "focus-composer" | "focus-history-search";
 /** The two keyboard overlays the shell can open. */
 export type OverlayKind = "palette" | "sheet";
 
+/**
+ * Whether the sidebar is folded to an icon rail.
+ *
+ * Persisted to localStorage rather than to the host's settings store: it is window chrome, not
+ * app data, and a cold start should restore the width the user last chose without a gateway
+ * round-trip — the same reason the OS remembers a window's size.
+ */
+const SIDEBAR_KEY = "aip.sidebarCollapsed";
+
+function loadSidebarCollapsed(): boolean {
+  try {
+    return window.localStorage.getItem(SIDEBAR_KEY) === "1";
+  } catch {
+    return false; // no storage (or a blocked one) is the expanded default, not an error
+  }
+}
+
+function saveSidebarCollapsed(collapsed: boolean): void {
+  try {
+    window.localStorage.setItem(SIDEBAR_KEY, collapsed ? "1" : "0");
+  } catch {
+    // fire-and-forget: a failed write just means the fold resets next launch
+  }
+}
+
 interface UiState {
   screen: ScreenId;
   tick: number;
@@ -77,6 +102,8 @@ interface UiState {
    * is silently a no-op. Nothing else reads it.
    */
   assistantBusy: boolean;
+  /** Whether the sidebar is folded to an icon rail; see `SIDEBAR_KEY`. */
+  sidebarCollapsed: boolean;
   /**
    * Requests the intent be dropped, so a stale one cannot fire on an unrelated mount later.
    * Called by the target once it has acted — or once it has decided the request is not for it.
@@ -89,6 +116,7 @@ interface UiState {
   fire: (k: UiIntent) => void;
   setOverlay: (o: OverlayKind | null) => void;
   setAssistantBusy: (b: boolean) => void;
+  toggleSidebar: () => void;
 }
 
 export const useUi = create<UiState>((set) => ({
@@ -96,6 +124,7 @@ export const useUi = create<UiState>((set) => ({
   tick: 0,
   overlay: null,
   assistantBusy: false,
+  sidebarCollapsed: loadSidebarCollapsed(),
   go: (screen) => set({ screen }),
   bump: () => set((s) => ({ tick: s.tick + 1 })),
   setOnboardingPrefill: (onboardingPrefill) => set({ onboardingPrefill }),
@@ -107,4 +136,9 @@ export const useUi = create<UiState>((set) => ({
   fire: (k) => set((s) => ({ pendingIntent: { kind: k, nonce: (s.pendingIntent?.nonce ?? 0) + 1 } })),
   setOverlay: (overlay) => set({ overlay }),
   setAssistantBusy: (assistantBusy) => set({ assistantBusy }),
+  toggleSidebar: () =>
+    set((s) => {
+      saveSidebarCollapsed(!s.sidebarCollapsed);
+      return { sidebarCollapsed: !s.sidebarCollapsed };
+    }),
 }));

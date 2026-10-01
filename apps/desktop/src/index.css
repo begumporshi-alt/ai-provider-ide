@@ -1,29 +1,39 @@
 @import "tailwindcss";
 
-/* Dark-only v1 with semantic tokens (UI_UX_PLAN.md "Theme"). Never --dark-gray-1. */
+/* Dark-only v1 with semantic tokens (UI_UX_PLAN.md "Theme"). Never --dark-gray-1.
+   The palette is the navy elevation ladder: bg → sidebar → surface → surface-2 get bluer and
+   lighter as content stacks up, and the accent is one blue used sparingly on the things that
+   are actionable. Every screen reads these vars, so a change here propagates app-wide. */
 :root {
-  --bg: #0b0d10;
-  --sidebar: #0e1116;
-  --surface: #14181f;
-  --surface-2: #1a1f28;
-  --border: #262c36;
-  --text: #e6e9ee;
-  --text-dim: #9aa3af;
-  --text-faint: #6b7280;
-  --success: #34d399;
-  --warn: #fbbf24;
+  --bg: #0a0f1e;
+  --sidebar: #0b1122;
+  --surface: #101830;
+  --surface-2: #16203c;
+  --border: #1e2a4a;
+  --border-strong: #2a3a63;
+  --text: #e7ecf8;
+  --text-dim: #9aa6c2;
+  --text-faint: #626f92;
+  --success: #3fd692;
+  --warn: #f5c451;
   --danger: #f87171;
-  --info: #60a5fa;
+  --info: #5aa2f7;
   --ai: #a78bfa; /* purple: AI / System-AI only, sparingly */
-  --accent: #60a5fa;
+  --accent: #3b82f6;
+  /* The active nav pill, the focus ring and the suggestion-card hover all tint with this
+     instead of stacking translucent blues by hand — one value keeps them the same blue. */
+  --accent-soft: rgba(59, 130, 246, 0.14);
+  --accent-softer: rgba(59, 130, 246, 0.08);
 }
 
 html, body, #root {
   height: 100%;
   background: var(--bg);
   color: var(--text);
-  font-family: Inter, ui-sans-serif, system-ui, sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", Inter, ui-sans-serif, system-ui, sans-serif;
   font-size: 13px;
+  letter-spacing: 0.006em;
+  -webkit-font-smoothing: antialiased;
 }
 
 .mono {
@@ -56,4 +66,105 @@ html, body, #root {
   border-radius: 50%;
   animation: aip-spin 0.8s linear infinite;
   flex-shrink: 0;
+}
+
+/* A real checkbox rendered as a pill switch. It stays an <input type="checkbox"> so the
+   platform semantics (keyboard space-toggle, screen-reader "checkbox", Playwright `.check()`)
+   all keep working — only the paint is custom. The knob is ::after; `:checked` slides it. */
+.switch {
+  appearance: none;
+  -webkit-appearance: none;
+  position: relative;
+  width: 34px;
+  height: 19px;
+  border-radius: 999px;
+  background: var(--surface-2);
+  border: 1px solid var(--border-strong);
+  cursor: pointer;
+  transition: background 0.18s ease, border-color 0.18s ease;
+  flex-shrink: 0;
+}
+.switch::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 0.18s ease, background 0.18s ease;
+}
+.switch:checked {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+.switch:checked::after {
+  transform: translateX(15px);
+  background: #fff;
+}
+.switch:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.switch:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* Sidebar fold. The width animates on the <aside>; labels fade on their own clock so the text
+   disappears *into* the narrowing rail rather than being clipped by it. */
+.side-rail {
+  transition: width 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+}
+.side-label {
+  transition: opacity 0.15s ease;
+  white-space: nowrap;
+}
+.side-label.is-hidden {
+  opacity: 0;
+  pointer-events: none;
+}
+
+/* Sidebar + top-bar hover targets. Classes rather than Tailwind arbitrary values so every hover
+   reads the same token — a hand-rolled rgba here would drift from the accent the pill uses. */
+.nav-item:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
+.nav-icon-btn:hover {
+  background: var(--surface-2);
+}
+
+/* One entrance for the assistant's empty state: the icon, headline and cards rise together
+   with a small stagger. Runs once on mount, so a streaming turn never replays it. */
+@keyframes aip-rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.aip-rise {
+  animation: aip-rise 0.4s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.aip-rise-1 { animation-delay: 0.05s; }
+.aip-rise-2 { animation-delay: 0.12s; }
+.aip-rise-3 { animation-delay: 0.19s; }
+
+/* Number fields: hide the native spin buttons. At 11px they rendered as a blurred dot that read
+   as a spinner or an error, and they ate the width the placeholder needed. Keyboard arrows and
+   typed input still work — only the paint is gone. */
+input[type="number"].no-spin::-webkit-outer-spin-button,
+input[type="number"].no-spin::-webkit-inner-spin-button {
+  -webkit-appearance: none;
+  margin: 0;
+}
+input[type="number"].no-spin {
+  -moz-appearance: textfield;
+  appearance: textfield;
+}
+
+/* The hero mark: a soft blue glow behind the icon tile, matching the mock's halo. */
+.hero-glow {
+  background:
+    radial-gradient(closest-side, rgba(59, 130, 246, 0.22), rgba(59, 130, 246, 0) 70%),
+    var(--surface);
 }
