@@ -302,7 +302,7 @@ fn provenance() -> Value {
 /// is served by its profile in the reference, and would be served by its stale stored row here —
 /// see the note at the top of this module.
 pub fn provider_profile(slug: &str, base_url: &str) -> Option<Value> {
-    match slug {
+    let by_slug = match slug {
         "openrouter" => Some(openai_compat(
             base_url,
             OpenAiExtras {
@@ -330,7 +330,31 @@ pub fn provider_profile(slug: &str, base_url: &str) -> Option<Value> {
         "opencode" => Some(openai_compat(base_url, OpenAiExtras::default())),
         "b.ai" => Some(anthropic_compat(base_url)),
         _ => None,
-    }
+    };
+    by_slug.or_else(|| {
+        // **By measured host, not only by slug** (2026-10-01). The reference keys profiles on an
+        // exact slug, and the live database named this provider `agent-router` while the profile is
+        // `agentrouter` — one hyphen, and the measured profile (D80: the Anthropic route, because
+        // the OpenAI route answers `content: ""` with the output in `reasoning_content`) was
+        // unreachable; the provider was served by its stored row, which lacks every shaping
+        // declaration and 400s on every request that carries a system turn. Host matching is the
+        // same whole-hostname rule `profileForBaseUrl` applies on the TypeScript side — never a
+        // suffix, so a lookalike host gets nothing.
+        (host_of(base_url) == "agentrouter.org").then(|| anthropic_compat(base_url))
+    })
+}
+
+/// The hostname of a base URL, lowercase. Deliberately not the `url` crate: nothing else in this
+/// module parses URLs, and a three-line split cannot drift from a second parser in the tree.
+fn host_of(base_url: &str) -> String {
+    base_url
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(base_url)
+        .split('/')
+        .next()
+        .unwrap_or_default()
+        .to_lowercase()
 }
 
 /// The slugs [`provider_profile`] answers for.
@@ -516,6 +540,24 @@ mod tests {
     fn only_the_anthropic_template_caps_output_tokens() {
         assert!(anthropic_compat(BAI_URL).get("limits").is_some());
         assert!(openai_compat(OPENCODE_URL, OpenAiExtras::default()).get("limits").is_none());
+    }
+
+    /// The slug-mismatch case that routed the live database's `agent-router` provider to its
+    /// unshaped stored row: the profile must also answer by **measured whole hostname**, so a
+    /// provider the operator named differently is still served by the pinned facts. A lookalike
+    /// host (`agentrouter.org.evil.test`, or a suffix match) must get nothing — the same rule
+    /// `profileForBaseUrl` states on the TypeScript side.
+    #[test]
+    fn the_profile_answers_by_measured_host_when_the_slug_spelled_differently() {
+        let m = provider_profile("agent-router", "https://agentrouter.org/v1").expect("host match");
+        assert_eq!(
+            m["dialect"], "anthropic-messages-v1",
+            "the route D80 measured as the working one"
+        );
+        // And an exact-slug miss on an unrelated host stays None.
+        assert_eq!(provider_profile("agent-router", "https://other.test/v1"), None);
+        // A suffix is not a match.
+        assert_eq!(provider_profile("agent-router", "https://agentrouter.org.evil.test/v1"), None);
     }
 
     /// Every generated manifest still parses as the read model — the guard `manifest_view` names.

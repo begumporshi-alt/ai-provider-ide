@@ -87,16 +87,19 @@ describe("anthropic-compat: system hoist + role remap", () => {
     expect(body.system).toBe("You are a helpful assistant.");
   });
 
-  it("translates 'auto' tool_choice to Anthropic's {type:'const', value:'any'}", async () => {
+  it("translates 'auto' tool_choice to Anthropic's {type:'auto'}", async () => {
+    // The previous declaration emitted {type:"const", value:"any"} — a `const` type in no Anthropic
+    // API surface — and mapped auto to ANY, which would have FORCED a tool call on every agent
+    // request rather than letting the model decide. These pin the real schema.
     const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, toolChoice: "auto" });
-    expect(lastBody()!.tool_choice).toEqual({ type: "const", value: "any" });
+    expect(lastBody()!.tool_choice).toEqual({ type: "auto" });
   });
 
-  it("translates 'none' tool_choice to Anthropic's {type:'const', value:'none'}", async () => {
+  it("translates 'none' tool_choice to Anthropic's {type:'none'}", async () => {
     const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, toolChoice: "none" });
-    expect(lastBody()!.tool_choice).toEqual({ type: "const", value: "none" });
+    expect(lastBody()!.tool_choice).toEqual({ type: "none" });
   });
 
   it("translates {type:'function',function:{name:'fn'}} to {type:'tool',name:'fn'}", async () => {
@@ -111,12 +114,25 @@ describe("anthropic-compat: system hoist + role remap", () => {
     expect(lastBody()).not.toHaveProperty("tool_choice");
   });
 
-  it("drops tool_call_id — Anthropic's turn shape carries no such concept", async () => {
+  it("replays a tool turn as tool_use and tool_result blocks, not OpenAI sibling fields", async () => {
+    // The 2026-10-01 shaping: the call is a `tool_use` CONTENT BLOCK on the assistant turn, the
+    // result a `tool_result` block on a user turn, addressed by the call's id. Before this the
+    // OpenAI sibling fields (`tool_calls`, `role:"tool"` + tool_call_id) were forwarded and the
+    // result reached the model as an anonymous plain-text user turn.
     const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(interp, { model: "claude-x", messages: MESSAGES, stream: false });
-    const toolMsg = (lastBody()!.messages as Array<Record<string, unknown>>).find((m) => m.role === "user" && m.content === "result of tool call");
-    expect(toolMsg).toBeDefined();
-    expect(toolMsg).not.toHaveProperty("tool_call_id");
+    const wire = JSON.stringify(lastBody());
+    expect(wire).not.toContain('"tool_calls"');
+    expect(wire).not.toContain('tool_call_id');
+    const msgs = lastBody()!.messages as Array<{ role: string; content: unknown }>;
+    // This fixture's assistant turn declares no tool_calls, so its content is untouched — and
+    // Anthropic declares no `contentField`, so plain-string content stays a plain string.
+    const assistant = msgs.find((m) => m.role === "assistant")!;
+    expect(assistant.content).toBe("Hi there");
+    const result = msgs.find((m) => m.role === "user" && Array.isArray(m.content))!;
+    expect(result.content).toEqual([
+      { type: "tool_result", tool_use_id: "call_123", content: "result of tool call" },
+    ]);
   });
 
   it("surfaces finish_reason from stop_reason via onFinish", async () => {
@@ -284,15 +300,23 @@ describe("tool turns on replay: only a dialect that asks is reshaped", () => {
     expect(msgs[2]).toMatchObject({ role: "tool", tool_call_id: "c1", content: "file text" });
   });
 
-  it("anthropic-compat is unchanged too: the id survives the role remap as before", async () => {
-    // Anthropic's own replay (tool_use / tool_result blocks) is a separate, unmodelled gap — but it
-    // is untouched by this work, and this pins that it was not changed by accident.
+  it("anthropic-compat reshapes the replay too, as tool_use / tool_result blocks", async () => {
+    // Updated 2026-10-01: this test used to pin that Anthropic's replay was left on the OpenAI
+    // sibling fields ("a separate, unmodelled gap"). The gap is now modelled — the call is a
+    // tool_use block on the assistant turn, the result a tool_result block on a user turn — so
+    // the pin flipped from "unchanged" to "the dialect's own shape".
     const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(interp, { model: "claude-x", messages: [...TOOL_TURN], stream: false });
 
-    const msgs = lastBody()!.messages as Array<Record<string, unknown> | undefined>;
-    expect(msgs[1]!.tool_calls).toEqual(TOOL_TURN[1]!.tool_calls);
-    expect(msgs[2]!.role).toBe("user");
-    expect(msgs[2]).not.toHaveProperty("tool_call_id");
+    const wire = JSON.stringify(lastBody());
+    expect(wire).not.toContain('"tool_calls"');
+    const msgs = lastBody()!.messages as Array<{ role: string; content: unknown }>;
+    expect(msgs[1]!.content).toEqual([
+      { type: "text", text: "Reading." },
+      { type: "tool_use", id: "c1", name: "read_file", input: { path: "a" } },
+    ]);
+    expect(msgs[2]!.content).toEqual([
+      { type: "tool_result", tool_use_id: "c1", content: "file text" },
+    ]);
   });
 });

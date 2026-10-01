@@ -183,7 +183,17 @@ pub fn serving_manifest(
     base_url: &str,
     row: Option<(&str, i64)>,
 ) -> Result<Option<Serving>, UnreadableRow> {
-    if let Some(body) = builtin_templates::provider_profile(slug, base_url) {
+    if let Some(mut body) = builtin_templates::provider_profile(slug, base_url) {
+        // The profile wins on shaping, but the stored row's **endpoint headers survive**: they are
+        // operator intent. The live database's `agent-router` row carries the `user-agent` the
+        // operator chose at the client-gate panel — the profile deliberately names none, because
+        // which client to claim is the operator's decision (D80) — and a profile that silently
+        // dropped it would trade one failure for another. Merge order: stored over profile, so the
+        // operator's explicit choice overrides the template's default.
+        if let Some((row_json, version)) = row {
+            merge_stored_headers(&mut body, row_json)
+                .map_err(|detail| UnreadableRow { version, detail })?;
+        }
         return Ok(Some(Serving { body, version: None }));
     }
     let Some((body_json, version)) = row else {
@@ -203,6 +213,37 @@ pub fn serving_manifest(
 pub struct Serving {
     pub body: Value,
     pub version: Option<i64>,
+}
+
+/// Overlay the stored row's `generateText` headers onto a profile body.
+///
+/// Best-effort by construction: a row without a `generateText` endpoint (an image-only row) or
+/// without a headers object contributes nothing, and the only failure is a row that is not JSON at
+/// all — reported to the caller with the row's version, like every other unreadable row.
+fn merge_stored_headers(profile: &mut Value, row_json: &str) -> Result<(), String> {
+    let row: Value = serde_json::from_str(row_json).map_err(|e| e.to_string())?;
+    let Some(stored) = row
+        .get("endpoints")
+        .and_then(|e| e.get("generateText"))
+        .and_then(|t| t.get("headers"))
+        .and_then(Value::as_object)
+    else {
+        return Ok(());
+    };
+    if stored.is_empty() {
+        return Ok(());
+    }
+    let profile_headers = profile
+        .get_mut("endpoints")
+        .and_then(|e| e.get_mut("generateText"))
+        .and_then(|t| t.get_mut("headers"));
+    let Some(map) = profile_headers.and_then(Value::as_object_mut) else {
+        return Ok(());
+    };
+    for (k, v) in stored {
+        map.insert(k.clone(), v.clone());
+    }
+    Ok(())
 }
 
 /// A stored manifest row whose `body_json` is not JSON.
@@ -710,6 +751,53 @@ mod tests {
     /// profile is used, it registers. A test that read a field off the built adapter would be able
     /// to pass on a copy the request path never sees — this cannot, because there is no adapter
     /// unless the profile won.
+    /// The agent-router fix, end to end at the selection seam: a provider whose slug is spelled
+    /// differently from the profile (`agent-router` vs `agentrouter`) is served by the profile
+    /// **and keeps the operator's endpoint headers** from its stored row. Losing the header would
+    /// trade the shaping failure for a client refusal — the header is the operator's client-gate
+    /// decision, and the profile deliberately names no `User-Agent` of its own.
+    #[test]
+    fn a_host_matched_profile_survives_the_stored_rows_operator_headers() {
+        // `serving_manifest` is the production selection function — the same one `activate` and
+        // therefore every gateway launch consults — so the test drives it directly rather than
+        // reaching through an adapter that does not expose its manifest.
+        let row = json!({
+            "manifestVersion": 1,
+            "kind": "declarative",
+            "dialect": "anthropic-messages-v1",
+            "provider": { "baseUrl": "https://agentrouter.org/v1", "auth": { "headers": [{ "name": "x-api-key" }] } },
+            "endpoints": {
+                "generateText": {
+                    "method": "POST",
+                    "path": "/messages",
+                    "headers": { "anthropic-version": "2023-06-01", "user-agent": "claude-cli/2.0.18 (external, cli)" },
+                    "requestTemplate": { "model": "{{model}}", "messages": "{{messages}}" },
+                    "responseMap": { "text": "$.content" }
+                }
+            },
+            "capabilities": { "text": true, "image": false },
+            "provenance": { "origin": "user-edited", "generatorModel": null, "createdAt": "1970-01-01T00:00:00Z" }
+        });
+        let serving = serving_manifest(
+            "agent-router",
+            "https://agentrouter.org/v1",
+            Some((row.to_string().as_str(), 1)),
+        )
+        .expect("the row is readable")
+        .expect("the host match found the profile");
+
+        assert_eq!(serving.body["dialect"], "anthropic-messages-v1", "the measured profile won");
+        assert_eq!(
+            serving.body["endpoints"]["generateText"]["headers"]["user-agent"],
+            "claude-cli/2.0.18 (external, cli)",
+            "the operator's client-gate header survives the profile"
+        );
+        assert_eq!(
+            serving.body["endpoints"]["generateText"]["headers"]["anthropic-version"], "2023-06-01",
+            "the profile's own default is still there under the merge"
+        );
+    }
+
     #[test]
     fn a_builtin_provider_is_served_by_its_profile_not_its_stored_row() {
         let (store, dir) = tmp_store();

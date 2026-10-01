@@ -47,7 +47,6 @@ import {
   ProviderRegistry,
   RepairOrchestrator,
   UsageLedger,
-  PROVIDER_PROFILES,
   type AdapterManifest,
   type ApiKeyRecord,
   type CatalogModel,
@@ -59,6 +58,7 @@ import {
 } from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 import { noteTrailFailure, type TrailId } from "./lib/trail-health";
+import { resolveProviderManifest } from "./lib/providers/profile-select";
 import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
 import {
   isConclusive,
@@ -516,22 +516,16 @@ async function runBootstrap(): Promise<void> {
   // 8k default.
   void publishModelContext();
 
-  // Adapter registration: builtin profiles win by slug (pinned facts, current template);
-  // custom providers use their active manifest row.
+  // Adapter registration. The selection rule lives in `lib/providers/profile-select` (tested
+  // there): the builtin profile wins by slug **or by measured host** — the live database carried a
+  // provider named `agent-router` whose profile is keyed `agentrouter`, and one hyphen routed it
+  // to its stored user-edited manifest, which lacked every shaping declaration and 400'd on every
+  // request. The stored row's endpoint headers survive the profile, because they are operator
+  // intent. Custom providers still use their active manifest row.
   for (const p of providers) {
-    const profile = PROVIDER_PROFILES[p.slug];
-    if (profile) {
-      adapters.register(p.id, withBaseUrl(profile(), p.baseUrl));
-      continue;
-    }
     const row = manifests.find((x) => x.providerId === p.id);
-    if (row) {
-      try {
-        adapters.register(p.id, JSON.parse(row.bodyJson) as AdapterManifest);
-      } catch {
-        // corrupt manifest: leave unregistered; Phase 5 drift/repair surfaces it
-      }
-    }
+    const manifest = resolveProviderManifest(p, row);
+    if (manifest) adapters.register(p.id, manifest);
   }
 
   // The alias table is a derived cache with a **second writer**, and the database cannot tell them
@@ -619,9 +613,6 @@ async function persistAliases(): Promise<void> {
   })));
 }
 
-function withBaseUrl(m: AdapterManifest, baseUrl: string): AdapterManifest {
-  return { ...m, provider: { ...m.provider, baseUrl } };
-}
 
 function hostToProvider(p: HostProviderRow): ProviderRecord {
   return {

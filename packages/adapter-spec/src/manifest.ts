@@ -427,17 +427,17 @@ export const REQUEST_FIELD_WHITELIST: Record<string, ReadonlySet<string>> = {
     // lint with "request field is not whitelisted", i.e. the whitelist would have blocked the only
     // shape this dialect can use.
     "toolConfig",
+    // `contents` and `generationConfig` join (2026-10-01) for the same reason, closing the gap
+    // recorded when `toolConfig` landed: they are Gemini's field names for the caller's `messages`
+    // and `max_tokens`/`temperature`, so without them a *generated* gemini-compat manifest could
+    // never pass lint at all — the linter could not reach the dialect it exists to cover.
+    "contents", "generationConfig",
+    // `system` (2026-10-01) is the anthropic-compat hoist target: the caller's system messages
+    // assembled into one top-level parameter. Caller-supplied on the same footing as `messages` —
+    // and without it even the builtin anthropic template failed lint, so a generated one never
+    // had a chance.
+    "system",
   ]),
   generateImage: new Set(["model", "prompt", "size"]),
   listModels: new Set<string>(),
 };
-
-/**
- * Known gap in `generateText`'s whitelist (found 2026-10-01 while adding `toolConfig`): it is
- * OpenAI-shaped. A gemini-compat manifest fails lint on three counts because of it — `contents` and
- * `generationConfig` are not listed, and `/v1beta/{{model}}:generateContent` fails the URL-path
- * regex on its colon. Builtins are not linted, so nothing is broken at runtime; what is broken is
- * that a *generated* Gemini manifest can never pass, which is the path the linter exists for.
- * Left as found: widening it means deciding whether a colon belongs in the path grammar, which is a
- * grammar decision rather than part of the tool-shaping work that surfaced it.
- */

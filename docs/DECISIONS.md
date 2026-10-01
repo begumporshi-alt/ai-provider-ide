@@ -1628,3 +1628,47 @@ that is not drift (then the rethrown path needs its own health record).
   likely candidate is a dialect that streams fragments of an *object*, which `streamedAs` has no arm
   for); or the two readers are consolidated, which should be done with a test per behaviour the
   legacy path has today.
+
+## 2026-10-01 — A provider is served by its measured profile, reached by host, with the operator's headers kept
+
+- **Decision:** manifest selection (both engines) resolves a provider's serving manifest as: the
+  builtin profile matching its slug **or its measured whole hostname**, then the stored row's
+  `generateText` headers merged **over** the profile's; a provider with neither is served by its
+  stored row as before. In the same commit, `lintManifest` refuses an `anthropic-messages-v1` or
+  `gemini-generate-v1` manifest that lacks its dialect's shaping declarations
+  (`messagesRoleMap`/`systemField`/`contentField`/`contentPartTemplates`), naming each missing field
+  and why — and the request-field whitelist gained `contents`, `generationConfig` and `system`, and
+  the path grammar a `:`, because a *generated* anthropic or gemini manifest could not pass lint at
+  all before (fourth instance of the same gap after `toolConfig`).
+- **Options considered:**
+  1. **Hand-edit the live manifest row** for the failing provider. Rejected: it fixes one row, is
+     outside the app's own write path, and every future provider onboards the same hazard.
+  2. **Fix only the slug** (`agent-router` → `agentrouter` in the database). Rejected twice over:
+     it is still per-row data surgery, and it would have dropped the operator's client-gate
+     `User-Agent`, which the profile deliberately does not name (D80) — trading the shaping failure
+     for a client refusal.
+  3. **Host matching with header merge, plus a lint gate** (chosen). The host rule is the one D80
+     already established (`profileForBaseUrl`, whole hostname, never a suffix); the header merge is
+     what makes the rule safe; the lint gate is what makes the *class* unrepeatable for generated
+     manifests, at the moment the manifest is written rather than at first request.
+- **Rationale:** measured on the live database — a provider named `agent-router` whose profile is
+  keyed `agentrouter` was served by its stored user-edited manifest, which lacked every shaping
+  declaration and sent `role:"system"` inside `messages` to an Anthropic-API endpoint: a 400 on
+  every request the product makes, terminal, and the provider never served one successful row. One
+  hyphen defeated the entire profile mechanism; the selection rule now cannot be defeated by what
+  the operator named the provider. While verifying, the builtin `anthropic-compat` template itself
+  was found emitting `{type:"const", value:"any"}` for `tool_choice` — a shape in no Anthropic API
+  surface, mapping the caller's `auto` to Anthropic's `any` (force a call) — plus OpenAI-wrapped
+  tool declarations and no tool-replay shaping. All fixed by declaration, and the rendered body is
+  pinned Anthropic-shaped end to end in `dialect-messages.test.ts`.
+- **Consequence:** the Rust `serving_manifest` gains the same host match (`agentrouter.org` →
+  `anthropic_compat`) and the same header merge, so both engines select identically — but the Rust
+  interpreter still applies no shaping, so gateway traffic to anthropic/gemini dialects keeps its
+  pre-existing behaviour until that port lands. Four lint-whitelist entries were widened to caller
+  channels only (`contents`, `generationConfig`, `system`, `toolConfig`): the manifest still cannot
+  invent a value, only name where a caller's value goes. The `agent-router/…` 400s with
+  `content-blocked` bodies will continue — that is the provider's own guard, and was never ours.
+- **Revisit if:** a provider measures a second dialect on the same host (the profile pins one route;
+  per-route profiles would need the operator's choice, the "ask the human" shape D80 records as the
+  general fix); or a stored row carries headers on an endpoint other than `generateText`, which the
+  merge deliberately does not touch.

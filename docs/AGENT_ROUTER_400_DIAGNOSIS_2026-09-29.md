@@ -243,3 +243,33 @@ So the answer to the question is: **nothing about the competing client's path is
 host, same model, same endpoint, same client identity, and the guard fires identically for its key.
 It simply sent eleven texts, repeatedly.
 
+
+---
+
+## Correction (2026-10-01)
+
+The verdict above — *"the error is not a schema mismatch, and it is not produced by any validator in
+this repository"* — is correct about the **label** and, measured today, incomplete about the **cause**.
+Two things were true at once, and this document recorded only one of them:
+
+1. **The upstream content guard** (recorded above, unchanged): `agentrouter.org` refuses a
+   deterministic fraction of ordinary prompts with `400 {"error":{"code":"content-blocked", …}}`.
+2. **Our request was also malformed for this dialect.** The provider's active manifest is
+   `anthropic-messages-v1`, hand-edited with none of the dialect-shaping declarations. Rendered
+   through the engine (measured 2026-10-01, before the fix), the request carried `role:"system"`
+   inside `messages` — which the Anthropic Messages API rejects, and which this app sends on
+   **every** request — plus OpenAI-wrapped `tools` and a bare-string `tool_choice`. The provider's
+   ledger agrees it never served one successful request: three 400s and one 500, all terminal.
+
+So the 400s this document investigated had (at least) two independent causes, and only the first was
+identified. The phrase "the request or the manifest is wrong" in the class's own definition was
+righter than the analysis beneath it.
+
+**Fixed 2026-10-01:** profile selection matches by measured hostname (not slug spelling) and keeps
+the stored row's operator headers; the builtin `anthropic-compat` template gained tool
+declaration/replay shaping, and its `toolChoiceMap` — which emitted `{type:"const", value:"any"}`, a
+shape in no Anthropic API surface, mapping `auto` to `any` (force a call) — now emits Anthropic's
+real schema. The rendered body is verified Anthropic-shaped end to end in `dialect-messages.test.ts`,
+and `lintManifest` now fails any unshaped anthropic/gemini manifest at setup time, naming what to
+declare. `PARSE_ERROR`/400 evidence capture (drift D81) records what a refusing provider actually
+says from this build forward.

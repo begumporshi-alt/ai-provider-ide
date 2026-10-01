@@ -137,13 +137,30 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
             type: "image",
             source: { type: "base64", media_type: "{{mediaType}}", data: "{{dataBase64}}" },
           },
+          // v1.1 amendment (2026-10-01): a replayed tool turn. Anthropic carries the call as a
+          // `tool_use` block on the assistant turn and the result as a `tool_result` block on a
+          // user turn — which is what the shaper produces, and why the OpenAI sibling fields
+          // (`tool_calls`, `role:"tool"`) must not reach the wire.
+          toolCall: { type: "tool_use", id: "{{id}}", name: "{{name}}", input: "{{argumentsObject}}" },
+          toolResult: { type: "tool_result", tool_use_id: "{{id}}", content: "{{text}}" },
+        },
+        // One declaration, no `type`/`function` wrapping: Anthropic takes
+        // `{name, description, input_schema}` flat. (Found 2026-10-01 by rendering the wire body:
+        // agent-router — an anthropic dialect — was receiving OpenAI's `{type:"function",
+        // function:{…}}` wrapping, which the API rejects.)
+        toolDeclarationTemplates: {
+          function: { name: "{{name}}", description: "{{description}}", input_schema: "{{parameters}}" },
         },
         toolChoiceMap: {
-          // "none" = never call tools → Anthropic's const "none"
-          none: { type: "const", value: "none" },
-          // "auto" = let the model decide → Anthropic's const "any" (its name for "auto")
-          auto: { type: "const", value: "any" },
-          // "function" (require specific tool) → Anthropic's {type:"tool", name:"<fn>"}
+          // Anthropic's own shapes. The previous declarations emitted `{type:"const", value:"any"}`
+          // — a `const` type that exists in no Anthropic API surface; the comments called it
+          // "Anthropic's const", which is how an invented shape acquires a rationale. And `auto`
+          // was mapped to `any`, which does not mean what the comment said: `auto` lets the model
+          // decide, `any` forces a tool call — mapping our "auto" to Anthropic's "any" would have
+          // forced a tool call on every agent request.
+          none: { type: "none" },
+          auto: { type: "auto" },
+          // "function" (require a specific tool) → Anthropic's {type:"tool", name:"<fn>"}.
           // The `{{toolChoice.function.name}}` placeholder is rendered by `renderToolChoiceTemplate`
           // against the original OpenAI tool_choice object.
           function: { type: "tool", name: "{{toolChoice.function.name}}" },

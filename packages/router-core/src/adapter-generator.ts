@@ -140,6 +140,33 @@ function selectorsIn(obj: unknown): string[] {
   return out;
 }
 
+/**
+ * The shaping each dialect's manifest MUST declare, checked at lint time.
+ *
+ * This is the gate that makes the agent-router failure unrepeatable. Measured on the live database
+ * (2026-10-01): a provider served by a stored `anthropic-messages-v1` manifest with no
+ * `messagesRoleMap` sent `role:"system"` inside `messages` to an Anthropic-API endpoint — a 400 on
+ * every request the product makes, because every request carries a system turn, and Anthropic takes
+ * the system prompt as a top-level `system` parameter. Nothing in setup flagged it; the provider
+ * never served one successful request.
+ *
+ * Keyed by `dialect`, naming the fields the interpreter reads for that dialect. A dialect absent
+ * from this table (`openai-chat-v1`) needs no shaping — its shape is the internal one.
+ */
+const REQUIRED_SHAPING: Record<string, Record<string, string>> = {
+  "anthropic-messages-v1": {
+    // system -> null (hoist) is the entry that does the work; without `systemField` the hoisted
+    // content has nowhere to land and is dropped.
+    messagesRoleMap: "declares the role map (system -> null, tool -> user) — Anthropic takes the system prompt as a top-level `system` parameter and has no system role in `messages`",
+    systemField: 'names the system field ("system") that receives hoisted system messages',
+  },
+  "gemini-generate-v1": {
+    messagesRoleMap: "declares the role map (assistant -> model, system -> null, tool -> user) — Gemini's generateContent accepts only user/model roles",
+    contentField: 'renames content to "parts" — Gemini does not read a `content` field, so without this it receives no conversation at all',
+    contentPartTemplates: "declares the part shapes (text/image) — the string -> parts wrap renders through the dialect's own text template",
+  },
+};
+
 export function lintManifest(m: AdapterManifest, pinnedBaseUrl: string): string[] {
   const errors: string[] = [];
   if (norm(m.provider.baseUrl) !== norm(pinnedBaseUrl)) {
@@ -150,7 +177,24 @@ export function lintManifest(m: AdapterManifest, pinnedBaseUrl: string): string[
     for (const f of Object.keys(text.requestTemplate)) {
       if (!REQUEST_FIELD_WHITELIST.generateText!.has(f)) errors.push(`generateText: request field "${f}" is not whitelisted`);
     }
-    if (!/^\/[A-Za-z0-9._/~{}-]*$/.test(text.path)) errors.push(`generateText: path must be a URL path, got "${text.path}"`);
+    // `:` joined the class (2026-10-01): Gemini dials `/v1beta/{{model}}:generateContent`, and the
+    // colon is path syntax in its documented URL, not a scheme separator arriving early.
+    if (!/^\/[A-Za-z0-9._:/~{}-]*$/.test(text.path)) errors.push(`generateText: path must be a URL path, got "${text.path}"`);
+    // The shaping gate. A manifest that reaches a provider unshaped does not fail loudly — it
+    // sends a body the provider rejects, or worse, one it silently misreads. Saying so here, at
+    // setup, names the fix while the author is still looking at the manifest.
+    const required = REQUIRED_SHAPING[m.dialect];
+    if (required) {
+      for (const [field, why] of Object.entries(required)) {
+        // The shaping fields are grammar-level names the type declares one by one; the check is
+        // deliberately dynamic, so a future amendment adds to `REQUIRED_SHAPING` without touching
+        // this loop.
+        const declared = text as unknown as Record<string, unknown>;
+        if (declared[field] === undefined) {
+          errors.push(`generateText: ${m.dialect} manifest is missing "${field}" — ${why}`);
+        }
+      }
+    }
   }
   const image = m.endpoints.generateImage;
   if (image) {

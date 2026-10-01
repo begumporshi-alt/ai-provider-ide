@@ -96,6 +96,39 @@ describe("lint (invariant 4 + field whitelist)", () => {
     const errs = lintManifest(m, "https://good.test/v1beta");
     expect(errs.some((e) => e.includes("toolConfig"))).toBe(false);
   });
+
+  it("a generated gemini-compat manifest now passes lint outright", async () => {
+    // The gap the previous test recorded is closed the same day: `contents`, `generationConfig`
+    // and the colon in the path regex. This is the assertion that was impossible before — the
+    // linter can now reach the dialect it exists to cover.
+    const { lintManifest } = await import("../src/adapter-generator.js");
+    const m = BUILTIN_TEMPLATES["gemini-compat"]!("https://generativelanguage.googleapis.com");
+    expect(lintManifest(m, "https://generativelanguage.googleapis.com")).toEqual([]);
+  });
+
+  it("an unshaped anthropic manifest fails lint naming exactly what to declare", () => {
+    // The agent-router failure, as a lint result. A stored `anthropic-messages-v1` manifest with
+    // no role map sent `role:"system"` inside `messages` — a 400 on every request — and nothing in
+    // setup said why. This is the gate that makes the class unrepeatable for generated manifests.
+    const shaped = BUILTIN_TEMPLATES["anthropic-compat"]!("https://good.test/v1");
+    expect(lintManifest(shaped, "https://good.test/v1")).toEqual([]);
+
+    const unshaped = JSON.parse(JSON.stringify(shaped)) as typeof shaped;
+    const t = unshaped.endpoints.generateText!;
+    delete (t as unknown as Record<string, unknown>).messagesRoleMap;
+    delete (t as unknown as Record<string, unknown>).systemField;
+    const errs = lintManifest(unshaped, "https://good.test/v1");
+    expect(errs.some((e) => e.includes('missing "messagesRoleMap"'))).toBe(true);
+    expect(errs.some((e) => e.includes('missing "systemField"'))).toBe(true);
+    // The message says WHY, not just what — the author of a generated manifest has not read the
+    // interpreter.
+    expect(errs.join(" ")).toContain("top-level `system`");
+  });
+
+  it("a dialect with no shaping requirement is not gated", () => {
+    const m = BUILTIN_TEMPLATES["openai-compat"]!("https://good.test/v1");
+    expect(lintManifest(m, "https://good.test/v1")).toEqual([]);
+  });
 });
 
 describe("extractJson + redactionHash", () => {
