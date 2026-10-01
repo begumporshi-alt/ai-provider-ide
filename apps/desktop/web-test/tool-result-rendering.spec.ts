@@ -32,9 +32,10 @@ test("tool result: an edit_file call renders as a diff, not a JSON argument blob
   await page.getByRole("button", { name: "Allow once", exact: true }).click();
 
   // The change is rendered, keyed by its path, with the added and removed lines visible.
-  // `.first()`: the transcript renders above the run's change-set panel, which shows the same
-  // file a second time as the aggregate with its revert button. This asserts the transcript's own
-  // diff — the thing the defect was about — rather than whichever one the locator reached first.
+  // `.first()` keeps this scoped to the transcript's own diff (the thing the defect was about)
+  // rather than the run's change-set panel below it. Since 2026-10-01 the panel opens collapsed —
+  // showing both copies expanded put one run's change on screen twice — so the transcript's is
+  // normally the only one, and the locator is a guard rather than a necessity.
   const diff = page.getByRole("group", { name: "Diff of README.md" }).first();
   await expect(diff).toBeVisible({ timeout: 30_000 });
   await expect(diff.locator('[data-kind="add"]').filter({ hasText: "there" })).toBeVisible();

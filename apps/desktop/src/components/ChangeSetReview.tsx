@@ -73,7 +73,12 @@ export function ChangeSetReview({
                 {f.path} — its contents before this run could not be read, so it cannot be restored
               </div>
             ) : change ? (
-              <DiffView change={change} defaultOpen={n <= 3} />
+              // Collapsed, deliberately. Every file here was written by a tool call the transcript
+              // above already renders — with the same diff, from the same arguments — so opening
+              // them all here showed one run's change twice on one screen (reported 2026-10-01).
+              // The panel's job is the decision, and the collapsed row still carries what a decision
+              // needs: the path, the verb, and the +/− counts. One click gets the lines.
+              <DiffView change={change} defaultOpen={false} />
             ) : (
               <div className="mono mb-2 rounded border px-2.5 py-1.5 text-[11px]" style={{ borderColor: "var(--warn)", color: "var(--text-dim)" }}>
                 {f.path} — written, but the new contents could not be read back to show a diff

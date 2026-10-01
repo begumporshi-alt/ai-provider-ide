@@ -95,7 +95,14 @@ test("a run's edits are shown as a diff set and can be reverted", async ({ page 
   await expect(page.getByText("did not exist before this run")).toHaveCount(0);
   // Scoped to the change-set panel: the transcript above it renders the same file's diff for the
   // call that made it, and this assertion is about the panel's own view of the run.
+  //
+  // The panel opens COLLAPSED (2026-10-01): expanded, it put one run's change on screen twice — the
+  // transcript's copy and the panel's — so it now starts as a summary (path, verb, +/− counts) with
+  // the lines one click away. Both states are pinned, because "collapsed on purpose" and "broken"
+  // are the same thing to a missing locator.
   const diff = page.getByTestId("change-set").getByRole("group", { name: "Diff of README.md" });
+  await expect(diff).toHaveCount(0);
+  await page.getByTestId("change-set").getByTitle("Show the diff").click();
   await expect(diff.locator('[data-kind="del"]').filter({ hasText: "world" })).toBeVisible();
   await expect(diff.locator('[data-kind="add"]').filter({ hasText: "there" })).toBeVisible();
   expect((await vfs(page))["README.md"]).toBe(README_AFTER);
