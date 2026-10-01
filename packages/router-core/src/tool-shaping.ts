@@ -265,6 +265,11 @@ function parseArguments(text: string): unknown {
  *    that kept `tool_calls` and gained `parts` would fail the whole request — a replay that
  *    "worked" for OpenAI would 400 for Gemini.
  *
+ * One structural change beyond renaming: a run of consecutive `tool` messages collapses into a
+ * single message holding one part per result. Both non-OpenAI dialects require it (Anthropic: all
+ * `tool_result`s of a turn in the one user message that follows; Gemini: all `functionResponse`
+ * parts in one user turn), and it is measured, not theoretical — see the note in the body.
+ *
  * A dialect that declares neither template gets its messages back untouched.
  */
 export function attachToolParts(
@@ -290,7 +295,46 @@ export function attachToolParts(
     }
   }
 
-  return messages.map((m) => {
+  // Not `map`: a run of consecutive tool messages has to COLLAPSE into one message. OpenAI's
+  // grammar carries each result as its own `role:"tool"` message, and a turn that made N calls
+  // produces N of them back to back. Anthropic requires every `tool_result` of one assistant
+  // turn to sit in the *single* user message that follows it — measured on agentrouter
+  // (2026-10-01): a second user message whose `tool_use_id` names a call from two messages back
+  // is rejected as `unexpected … found in tool_result blocks`. Gemini wants the same grouping,
+  // one user turn with N `functionResponse` parts.
+  const pass1: unknown[] = [];
+  let merged: { role: string; content: unknown[] } | null = null;
+  for (const m of messages) {
+    if (m && typeof m === "object" && (m as Record<string, unknown>).role === "tool" && templates.toolResult) {
+      const msg = m as Record<string, unknown>;
+      const id = typeof msg.tool_call_id === "string" ? msg.tool_call_id : "";
+      const text = typeof msg.content === "string" ? msg.content : "";
+      const block = render(templates.toolResult, {
+        id,
+        name: nameById.get(id) ?? "",
+        text,
+        // Gemini's `functionResponse.response` must be a Struct. A bare string is rejected, so
+        // the text is wrapped rather than passed through — `result` is our field name inside that
+        // Struct, and nothing reads it back out, so it exists only to satisfy the shape.
+        response: { result: text },
+      });
+      if (merged) {
+        merged.content.push(block);
+        continue;
+      }
+      // Replaced, not appended: the result *is* the message. Its text is carried inside the
+      // rendered block (`content`), so keeping the original text part beside it would send the
+      // same output to the model twice — and for a dialect whose parts have no place for a bare
+      // text on a user role, once as something it cannot read.
+      merged = { role: "tool", content: [block] };
+      pass1.push(merged);
+      continue;
+    }
+    merged = null;
+    pass1.push(m);
+  }
+
+  return pass1.map((m) => {
     if (!m || typeof m !== "object") return m;
     const msg = m as Record<string, unknown>;
     const tcs = msg.tool_calls;
@@ -316,27 +360,6 @@ export function attachToolParts(
       // `{content: unknown[]}`, and the `delete` below then has no such property to remove.
       const out: Record<string, unknown> = { ...msg, content: parts };
       delete out.tool_calls;
-      return out;
-    }
-
-    if (msg.role === "tool" && templates.toolResult) {
-      const id = typeof msg.tool_call_id === "string" ? msg.tool_call_id : "";
-      const text = typeof msg.content === "string" ? msg.content : "";
-      // Replaced, not appended: the result *is* the message. Its text is carried inside the
-      // rendered block (`response.result`), so keeping the original text part beside it would send
-      // the same output to the model twice — and for a dialect whose parts have no place for a bare
-      // text on a user role, once as something it cannot read.
-      const out: Record<string, unknown> = { ...msg, content: [
-        render(templates.toolResult, {
-          id,
-          name: nameById.get(id) ?? "",
-          text,
-          // Gemini's `functionResponse.response` must be a Struct. A bare string is rejected, so
-          // the text is wrapped rather than passed through — `result` is our field name inside that
-          // Struct, and nothing reads it back out, so it exists only to satisfy the shape.
-          response: { result: text },
-        }),
-      ] };
       return out;
     }
 

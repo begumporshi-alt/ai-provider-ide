@@ -273,3 +273,10 @@ real schema. The rendered body is verified Anthropic-shaped end to end in `diale
 and `lintManifest` now fails any unshaped anthropic/gemini manifest at setup time, naming what to
 declare. `PARSE_ERROR`/400 evidence capture (drift D81) records what a refusing provider actually
 says from this build forward.
+
+**A third cause, found the same day by the first live agent-mode run on the fixed build** (drift
+D82): a turn that made two tool calls replayed as two consecutive user messages, and only the single
+message following an assistant turn may carry `tool_result` blocks — `400 unexpected
+messages.3.content.0: tool_use_id found in tool_result blocks`. The shaper now collapses each run of
+consecutive tool messages into one message; Gemini's `functionResponse` grouping is the same rule.
+The upstream content guard above is still the one cause that is not ours.

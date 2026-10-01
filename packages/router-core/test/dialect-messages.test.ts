@@ -319,4 +319,34 @@ describe("tool turns on replay: only a dialect that asks is reshaped", () => {
       { type: "tool_result", tool_use_id: "c1", content: "file text" },
     ]);
   });
+
+  it("anthropic-compat collapses a turn's several results into the ONE user message Anthropic requires", async () => {
+    // Measured live (agentrouter, 2026-10-01): a turn that made two calls replayed as two
+    // consecutive tool messages went out as two consecutive user messages, and the provider
+    // rejected the second — `unexpected messages.3.content.0: tool_use_id found in tool_result
+    // blocks` — because only the single message following the assistant turn may answer it.
+    // Every result of a turn belongs in that one message.
+    const parallel = [
+      { role: "user", content: "read both" },
+      {
+        role: "assistant",
+        content: "Reading.",
+        tool_calls: [
+          { id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } },
+          { id: "c2", type: "function", function: { name: "read_file", arguments: '{"path":"b"}' } },
+        ],
+      },
+      { role: "tool", content: "file a", tool_call_id: "c1" },
+      { role: "tool", content: "file b", tool_call_id: "c2" },
+    ];
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: parallel, stream: false });
+
+    const msgs = lastBody()!.messages as Array<{ role: string; content: unknown }>;
+    expect(msgs.map((m) => m.role)).toEqual(["user", "assistant", "user"]);
+    expect(msgs[2]!.content).toEqual([
+      { type: "tool_result", tool_use_id: "c1", content: "file a" },
+      { type: "tool_result", tool_use_id: "c2", content: "file b" },
+    ]);
+  });
 });
