@@ -67,6 +67,73 @@ export interface FileChange {
   note?: string;
 }
 
+/** One step of a turn: a call, plus the result that answered it when one did. */
+export interface ToolStep {
+  name: string;
+  args: Record<string, unknown>;
+  call: ToolCallRef;
+  result?: string;
+}
+
+/** A transcript turn, as much of it as grouping needs. Content is read tolerantly: the Assistant
+ *  transcript stores text, and anything else (a parts array) is not a tool output we can show. */
+interface TurnLike {
+  role: string;
+  content?: unknown;
+  tool_calls?: unknown;
+  tool_call_id?: string;
+}
+
+function textOf(content: unknown): string {
+  return typeof content === "string" ? content : "";
+}
+
+/**
+ * Group a transcript's tool traffic by the turn that requested it.
+ *
+ * The transcript is a flat message list — an assistant turn declaring `tool_calls`, then one
+ * `role:"tool"` turn per call — and rendering it message by message produced the flat run of
+ * anonymous "tool result" bubbles this replaces: the call's *name* was never shown on a result, and
+ * a turn that made three calls read as three separate blocks. Grouping restores the turn's shape.
+ *
+ * Returns the steps per assistant-message index, and the indices of the tool turns **consumed** into
+ * a group, so a renderer can draw one card per turn and skip the turns it has already drawn.
+ *
+ * A tool turn whose call is not found on the immediately preceding assistant turn (a truncated,
+ * edited or replayed transcript) still yields a step, under the name `tool`: dropping it would lose
+ * a tool's output, which is worse than an unlabelled row.
+ */
+export function groupToolRuns(messages: readonly TurnLike[]): { byAssistant: Map<number, ToolStep[]>; consumed: Set<number> } {
+  const byAssistant = new Map<number, ToolStep[]>();
+  const consumed = new Set<number>();
+  messages.forEach((m, i) => {
+    const tcs = m.tool_calls;
+    if (m.role !== "assistant" || !Array.isArray(tcs) || tcs.length === 0) return;
+    const steps: ToolStep[] = tcs.map((c) => {
+      const name = toolCallName(c);
+      const args = toolCallArgs(c);
+      return { name, args, call: { name, args } };
+    });
+    const byId = new Map<string, ToolStep>();
+    tcs.forEach((c, k) => {
+      const id = toolCallId(c);
+      if (id) byId.set(id, steps[k]!);
+    });
+    // Runs to a fixed point on the first non-tool turn: consecutive results are one turn's answers,
+    // and a later turn's results belong to the assistant turn that precedes them.
+    for (let j = i + 1; j < messages.length && messages[j]!.role === "tool"; j++) {
+      consumed.add(j);
+      const id = messages[j]!.tool_call_id;
+      const step = id ? byId.get(id) : undefined;
+      const text = textOf(messages[j]!.content);
+      if (step) step.result = text;
+      else steps.push({ name: "tool", args: {}, call: { name: "tool", args: {} }, result: text });
+    }
+    byAssistant.set(i, steps);
+  });
+  return { byAssistant, consumed };
+}
+
 /**
  * The file change a call represents, or null when it is not a file mutation.
  *

@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   fileChangeFor,
   groupSearchMatches,
+  groupToolRuns,
   indexToolCalls,
   parseStoredToolCalls,
   toolCallArgs,
@@ -114,5 +115,64 @@ describe("groupSearchMatches", () => {  it("groups path:line hits by file, prese
 
   it("returns nothing for output with no path:line lines", () => {
     expect(groupSearchMatches("plain text\nmore text")).toEqual([]);
+  });
+});
+
+describe("groupToolRuns", () => {
+  const call = (id: string, name: string, args: object) => ({
+    id,
+    type: "function",
+    function: { name, arguments: JSON.stringify(args) },
+  });
+
+  it("pairs a turn's calls with the results that answered them, in call order", () => {
+    const msgs = [
+      { role: "user", content: "do both" },
+      { role: "assistant", content: "", tool_calls: [call("c1", "read_file", { path: "a.ts" }), call("c2", "read_file", { path: "b.ts" })] },
+      { role: "tool", content: "contents of a", tool_call_id: "c1" },
+      { role: "tool", content: "contents of b", tool_call_id: "c2" },
+      { role: "assistant", content: "done" },
+    ];
+    const { byAssistant, consumed } = groupToolRuns(msgs);
+    // One group on the turn that asked, not one per message.
+    expect([...byAssistant.keys()]).toEqual([1]);
+    expect(byAssistant.get(1)!.map((s) => [s.name, s.result])).toEqual([
+      ["read_file", "contents of a"],
+      ["read_file", "contents of b"],
+    ]);
+    // Both tool turns are drawn by the group, so the transcript must skip them.
+    expect([...consumed].sort()).toEqual([2, 3]);
+  });
+
+  it("groups results by POSITION, so a result with a mismatched id is not misfiled", () => {
+    const msgs = [
+      { role: "assistant", content: "", tool_calls: [call("c1", "list_dir", { path: "." })] },
+      { role: "tool", content: "the answer", tool_call_id: "some-other-id" },
+    ];
+    const { byAssistant } = groupToolRuns(msgs);
+    const steps = byAssistant.get(0)!;
+    // The call keeps its own row (no result), and the orphan is kept visible rather than dropped:
+    // losing a tool's output is worse than an unlabelled row.
+    expect(steps.map((s) => [s.name, s.result])).toEqual([
+      ["list_dir", undefined],
+      ["tool", "the answer"],
+    ]);
+  });
+
+  it("leaves a tool turn that follows no calls alone", () => {
+    const { byAssistant, consumed } = groupToolRuns([
+      { role: "user", content: "hi" },
+      { role: "tool", content: "orphan", tool_call_id: "c9" },
+    ]);
+    expect(byAssistant.size).toBe(0);
+    // Not consumed: with no group to carry it, the transcript's own bubble must still render it.
+    expect(consumed.size).toBe(0);
+  });
+
+  it("reads a turn's arguments in both stored shapes", () => {
+    const { byAssistant } = groupToolRuns([
+      { role: "assistant", content: "", tool_calls: [{ id: "c1", name: "flat", arguments: '{"path":"f.ts"}' }] },
+    ]);
+    expect(byAssistant.get(0)![0]!.args).toEqual({ path: "f.ts" });
   });
 });

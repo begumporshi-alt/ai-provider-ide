@@ -39,9 +39,11 @@ import { DiffView } from "../components/DiffView";
 import {
   fileChangeFor,
   groupSearchMatches,
+  groupToolRuns,
   indexToolCalls,
   isSearchResult,
   type ToolCallRef,
+  type ToolStep,
 } from "../lib/tools/render";
 import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core";
 import {
@@ -731,7 +733,7 @@ export function AssistantScreen() {
   }, [agentMode, root]);
 
   return (
-    <div className="mx-auto flex h-full max-w-3xl flex-col">
+    <div className="mx-auto flex h-full max-w-6xl flex-col" data-testid="assistant-column">
       <div className="mb-2 flex items-center gap-3">
         <h1 className="text-[20px] font-semibold">Assistant</h1>
         <div className="ml-auto flex gap-1 rounded border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
@@ -1350,6 +1352,11 @@ function Chat({
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
   const callById = useMemo(() => indexToolCalls(msgs), [msgs]);
 
+  // Group a turn's tool traffic. An assistant turn that requested calls and the tool turns that
+  // answered them are one step of the run: they render as one card, and the answered tool turns are
+  // consumed so they cannot *also* appear as anonymous "tool result" bubbles of their own.
+  const toolRuns = useMemo(() => groupToolRuns(msgs), [msgs]);
+
   // Per-call approval gate: consult the policy, and suspend the loop for a modal only when the
   // policy says the user has to decide.
   //
@@ -1570,12 +1577,19 @@ function Chat({
       endRun(runId, "ok", iterationsRef.current);
         setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
       } catch (e) {
+        // The turn's own bubble, not only the trace line. A failed agent run left an empty
+        // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
+        // had not answered yet — with the only clue a thin red line above the composer.
+        const fill = (note: string) =>
+          setMsgs((m) => m.map((x) => (x.id === assistantMsg.id && !x.content.trim() ? { ...x, content: note } : x)));
         if (ac.signal.aborted) {
           endRun(runId, "stopped", iterationsRef.current);
           setTrace({ ms: Date.now() - t0, fallbacks: [], error: "stopped by you" });
+          fill("⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.");
         } else {
           endRun(runId, "error", iterationsRef.current, (e as Error).message);
           setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
+          fill(`⚠ ${(e as Error).message}`);
         }
       } finally {
         // Flush here, not on the success path only. The user's node — and any recall edges
@@ -2098,7 +2112,10 @@ function Chat({
         </div>
       )}
       {agentMode && policy && (
-        <div className="mb-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        // `--text-dim`, not `--text-faint`: this line states the actual limits a run is held to, and
+        // a reviewer reading a screenshot of the screen called it "nearly illegible" (2026-10-01) —
+        // a policy nobody can read is not a policy that was disclosed.
+        <div className="mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
           <button className="underline decoration-dotted" onClick={() => setShowPolicy((v) => !v)}>
             sandbox · {policy.programs.length} programs · git without push/pull/fetch/clone · capped at {policy.max_command_ms}ms · {policy.max_output_bytes / 1024}KB out
           </button>
@@ -2118,7 +2135,10 @@ function Chat({
         {msgs.length === 0 && !busy && (
           <EmptyState title="Try any routed model. Text streams through the router — rotation and failover are silent; the line below the answer shows what actually happened." />
         )}
-        {msgs.map((m, i) => (
+        {msgs.map((m, i) =>
+          // A tool turn already shown inside its turn's group card: rendering it again here is what
+          // produced the flat run of anonymous "tool result" bubbles.
+          toolRuns.consumed.has(i) ? null : (
           <div key={m.id} className="group mb-3">
             <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.role === "user" ? "var(--info)" : m.role === "tool" ? "var(--warn)" : "var(--success)" }}>
               {m.role}
@@ -2154,7 +2174,10 @@ function Chat({
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive raw={streamedText} items={agentItems} />
               ) : (
-                <AssistantContent raw={m.content} />
+                // A turn that only requested tools has no prose of its own. Rendering the
+                // empty-content placeholder there is what left a bare "…" under a tool call —
+                // indistinguishable from a model that answered with nothing.
+                m.content.trim() ? <AssistantContent raw={m.content} /> : null
               )
             ) : (
               <>
@@ -2184,6 +2207,7 @@ function Chat({
                 )}
               </>
             )}
+            {toolRuns.byAssistant.has(i) && <ToolRunGroup steps={toolRuns.byAssistant.get(i)!} />}
             {editingId !== m.id && (
               <MessageActions
                 disabled={busy}
@@ -2466,6 +2490,111 @@ function MessageActions({
   );
 }
 
+/** A step of a live run: the shared shape, plus the outcome only a run in flight knows. */
+type UIStep = ToolStep & { status?: AgentItem["status"] };
+
+/** A call's arguments as one line — `path: src/a.ts · pattern: todo` — with long values clipped. */
+function argSummary(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [k, v] of Object.entries(args)) {
+    const s = typeof v === "string" ? v : v === undefined ? "" : JSON.stringify(v);
+    if (!s) continue;
+    parts.push(`${k}: ${s.replace(/\s+/g, " ").slice(0, 64)}`);
+    if (parts.length === 2) break;
+  }
+  return parts.join(" · ");
+}
+
+const STEP_GLYPH: Record<AgentItem["status"], string> = { calling: "▶", ok: "✓", denied: "✕", error: "⚠" };
+const STEP_COLOR: Record<AgentItem["status"], string> = {
+  calling: "var(--info)", ok: "var(--success)", denied: "var(--warn)", error: "var(--danger)",
+};
+
+/**
+ * A turn's tool calls, grouped into one card (one card per turn, not per call).
+ *
+ * The transcript used to render every call and every result as its own flat bubble: the tool's
+ * *name* never appeared on a persisted result (only "tool result · …"), a 442-line file read put
+ * raw HTML in the column, and a turn that made three calls read as three anonymous blocks. One
+ * card per turn names every call, keeps the output behind a disclosure, and still shows a file
+ * edit's diff outright — that being the part worth seeing without asking.
+ */
+function ToolRunGroup({ steps, live = false }: { steps: UIStep[]; live?: boolean }) {
+  const [open, setOpen] = useState(live);
+  const failed = steps.filter((s) => s.status === "error" || s.status === "denied").length;
+  const running = steps.some((s) => s.status === "calling");
+  const known = steps.some((s) => s.status !== undefined);
+  // Neutral until something measures otherwise: a green "✓ 4 ran" on a replayed transcript would
+  // be a claim no one checked.
+  const color = !known ? "var(--border)" : failed ? "var(--danger)" : running ? "var(--info)" : "var(--success)";
+  const label = steps.length === 1 ? "1 tool call" : `${steps.length} tool calls`;
+  const outcome = !known ? "" : running ? " · running" : failed ? ` · ✕ ${failed} failed` : " · ✓ ran";
+  return (
+    <div className="mt-1.5 rounded border" style={{ borderColor: color, background: "var(--surface-2)" }}>
+      <button
+        type="button"
+        className="mono flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[11px]"
+        onClick={() => setOpen((v) => !v)}
+      >
+        <span style={{ color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
+        <span style={{ color: known && !failed && !running ? "var(--success)" : "var(--text-dim)" }}>{label}{outcome}</span>
+      </button>
+      <div className="px-2.5 pb-1.5">
+        {steps.map((s, i) => {
+          const change = fileChangeFor(s.name, s.args);
+          const glyph = s.status ? STEP_GLYPH[s.status] : "↳";
+          const stepColor = s.status ? STEP_COLOR[s.status] : "var(--text-faint)";
+          const summary = argSummary(s.args);
+          return (
+            <div key={i} className={i > 0 ? "mt-1.5 border-t pt-1.5" : ""} style={{ borderColor: "var(--border)" }}>
+              <div className="mono flex items-baseline gap-1.5 text-[11px]">
+                <span style={{ color: stepColor }}>{glyph}</span>
+                <span style={{ color: "var(--text)" }}>{s.name}</span>
+                {summary && <span className="truncate" style={{ color: "var(--text-faint)" }}>{summary}</span>}
+              </div>
+              {change ? (
+                <div className="mt-1">
+                  <DiffView change={change} />
+                  {/* The diff is what the call *would* write, which is exactly why the result line
+                      has to stay beside it: a refused `write_file` (plan mode, a denied approval)
+                      never touched the file, and a bare diff would present it as done. The old
+                      per-turn bubble showed this line; dropping it here was a regression the browser
+                      suite caught (agent-approval.spec.ts, "in PLAN MODE"). */}
+                  {s.result !== undefined && (
+                    <div className="mono mt-0.5 truncate text-[10px]" style={{ color: "var(--text-faint)" }}>
+                      {s.result.trim() ? s.result.replace(/\s+/g, " ").slice(0, 120) : "(no output)"}
+                    </div>
+                  )}
+                </div>
+              ) : open ? (
+                <>
+                  {Object.entries(s.args).map(([k, v]) => (
+                    <div key={k} className="mono mt-1 break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
+                      <span style={{ color: "var(--text-faint)" }}>{k}: </span>
+                      {typeof v === "string" ? (v.length > 600 ? `${v.slice(0, 600)}…` : v) : JSON.stringify(v)}
+                    </div>
+                  ))}
+                  {s.result !== undefined && (
+                    <pre className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{s.result}</pre>
+                  )}
+                </>
+              ) : (
+                // Collapsed still says what came back — one line, so a failure or an empty result
+                // cannot hide behind a disclosure the user has no reason to open.
+                s.result !== undefined && (
+                  <div className="mono mt-0.5 truncate text-[10px]" style={{ color: "var(--text-faint)" }}>
+                    {s.result.trim() ? s.result.replace(/\s+/g, " ").slice(0, 120) : "(no output)"}
+                  </div>
+                )
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 /** Compact, collapsible view of a tool-result turn persisted in the transcript. */
 function ToolResultBubble({ content, call }: { content: string; call?: ToolCallRef }) {
   const [open, setOpen] = useState(false);
@@ -2525,41 +2654,21 @@ function ToolResultBubble({ content, call }: { content: string; call?: ToolCallR
   );
 }
 
-/** Live view of an in-flight agent turn: streamed text plus the tool calls as they run. */
+/** Live view of an in-flight agent turn: streamed text plus this turn's calls, grouped as they run. */
 function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
-  const colorOf = (s: AgentItem["status"]) =>
-    s === "calling" ? "var(--info)" : s === "denied" ? "var(--warn)" : s === "ok" ? "var(--success)" : "var(--danger)";
+  // The same card the finished turn will render, so a run does not change shape the moment it
+  // ends — the live view simply knows each call's status and the transcript does not.
+  const steps: UIStep[] = items.map((it) => ({
+    name: it.name,
+    args: it.args,
+    call: { name: it.name, args: it.args },
+    ...(it.result !== undefined ? { result: it.result } : {}),
+    status: it.status,
+  }));
   return (
     <>
       <Markdown source={raw || "…"} />
-      {items.map((it, i) => {
-        const change = fileChangeFor(it.name, it.args);
-        return (
-          <div key={i} className="mt-2 rounded border px-2.5 py-2" style={{ borderColor: colorOf(it.status), background: "var(--surface-2)" }}>
-            <div className="mono text-[11px]" style={{ color: "var(--text)" }}>
-              {it.status === "calling" ? "▶ running" : it.status === "denied" ? "✕ denied" : it.status === "ok" ? "✓ ran" : "⚠ error"} · {it.name}
-            </div>
-            {change ? (
-              <div className="mt-1">
-                <DiffView change={change} />
-              </div>
-            ) : (
-              Object.entries(it.args).map(([k, v]) => (
-                <div key={k} className="mono mt-1 break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
-                  <span style={{ color: "var(--text-faint)" }}>{k}: </span>
-                  {typeof v === "string" ? (v.length > 300 ? `${v.slice(0, 300)}…` : v) : JSON.stringify(v)}
-                </div>
-              ))
-            )}
-            {it.result !== undefined &&
-              (change ? (
-                <div className="mono mt-1 text-[10px]" style={{ color: "var(--text-faint)" }}>{it.result}</div>
-              ) : (
-                <pre className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{it.result}</pre>
-              ))}
-          </div>
-        );
-      })}
+      {steps.length > 0 && <ToolRunGroup steps={steps} live />}
     </>
   );
 }

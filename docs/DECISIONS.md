@@ -1672,3 +1672,38 @@ that is not drift (then the rethrown path needs its own health record).
   per-route profiles would need the operator's choice, the "ask the human" shape D80 records as the
   general fix); or a stored row carries headers on an endpoint other than `generateText`, which the
   merge deliberately does not touch.
+
+## 2026-10-01 — A turn's tool calls are one card, and the chat column uses the window
+
+- **Decision:** (a) The Assistant's chat column is `max-w-6xl` instead of `max-w-3xl` — the window is
+  the limit, not a fixed 768px. (b) An assistant turn that requested tool calls, together with the
+  `role:"tool"` turns that answered them, renders as **one grouped card** — a header (`N tool calls`
+  and, when a live run measured it, `· ✓ ran` / `· ✕ N failed` / `· running`), one row per call
+  (glyph, tool name, one-line argument summary), the result behind the card's disclosure, and a file
+  edit's diff shown outright rather than hidden. (c) The grouping is a pure helper,
+  `groupToolRuns`, in `lib/tools/render.ts`, returning the steps per assistant index and the tool
+  turns it consumed. (d) An agent run that threw or was stopped writes a note into its own assistant
+  bubble instead of leaving it empty.
+- **Options considered:**
+  1. **Keep one bubble per message and only restyle it.** Rejected: the flat run *is* the problem —
+     a persisted result showed the text with no indication of which tool produced it, and a turn
+     that made three calls read as three anonymous blocks.
+  2. **Give each call its own card** (the live view's shape, extended to the transcript). Rejected:
+     a five-call turn becomes five stacked cards, which is what the transcript already looked like
+     and what the user reported as unprofessional.
+  3. **One card per turn, collapsed, with per-call rows** (chosen). The turn's shape is preserved,
+     every call is named, and the bulk of tool output — a 442-line file read — is one disclosure
+     away rather than 442 lines of transcript.
+- **Rationale:** the row is the thing a reader scans ("what did it do?"); the output is the thing
+  they sometimes need. Collapsing also fixes a real reading problem measured in the report: a tool
+  result that dumped an entire HTML document made the column unreadable.
+- **Consequence:** the header is **neutral** (`--border`) until a status exists, because a replayed
+  transcript carries no per-call outcome — deriving "failed" from result text would be a guess
+  printed as a status, and a green "✓ 4 ran" nobody measured would be a claim. Only the live view
+  colours it. The collapsed state still prints a one-line result preview, so a failure or an empty
+  result cannot hide behind a disclosure. `ToolResultBubble` remains for a tool turn whose call is
+  not on the preceding assistant turn (a truncated or edited transcript); `groupToolRuns` keeps such
+  an orphan visible as an unlabelled step rather than dropping it.
+- **Revisit if:** a transcript needs per-call timing or the approval decision shown on the row; or a
+  turn's calls exceed what a collapsed card can summarise legibly, at which point the header should
+  carry counts per tool name.
