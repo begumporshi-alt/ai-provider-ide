@@ -48,8 +48,8 @@ ChatGPT/Claude web chat surfaces.
   (d) Two of my own: the interpreter was handed the message *array* where a message's *content* was
   expected (parts silently unrendered), and `textOfContent` had lost the circular-JSON guard the old
   helper had. Both were caught by the new tests, not by review.
-  **Not done in this pass:** Gemini's *tool* shapes (`functionCall`/`functionResponse`) remain
-  unmodelled — a separate pre-existing gap, unchanged here.
+  **Not done in this pass:** Gemini's *tool* shapes (`functionCall`/`functionResponse`) — done
+  2026-10-01, see the entry below.
 - **Phase 4 (in-screen session management) — DONE (2026-09-30).** A session bar at the top of the
   Assistant: the current session's title (click to rename, persisted through `session_titles`), a
   **＋ New** button that swaps the recorder and clears the transcript, and a **Sessions ▾** switcher
@@ -151,10 +151,40 @@ ChatGPT/Claude web chat surfaces.
 - **Superseded note:** an earlier version of this section listed 17 pre-existing web-test failures
   (Memory, trail-health, drift-history). They are gone — the suite went 127/127 green as of Phase 7
   and 156/156 as of Phase 5, so whatever fixed them landed with the intervening commits.
+- **Gemini tool calling — DONE (2026-10-01).** The gap Phase 3 left open. `gemini-compat` declared
+  **no tool field at all**, so a Gemini request went out with no tool declarations and a
+  `functionCall` part in the response was never reported: the model's request to run a tool was lost
+  silently, and agent mode against Gemini could not work. Tools are now declared per dialect rather
+  than hardcoded to OpenAI's shape — `toolDeclarationTemplates` + `toolDeclarationWrapper`,
+  `contentPartTemplates.toolCall`/`.toolResult`, and `responseMap.toolCallShape` (used by both the
+  unary and streamed reads). OpenAI and Anthropic declare none of them and keep the original reader.
+  New files: `packages/router-core/src/tool-shaping.ts`, `test/tool-shaping.test.ts` (31 tests),
+  `test/gemini-tools.test.ts` (14 tests of the wire body, unary and streaming). Verified: workspace
+  typecheck clean, 829 unit tests (23 + 421 + 385), vite build, 156/156 web-test.
+  **Found and fixed while verifying:**
+  (a) **A plain-text message to Gemini carried a `type` field its Part proto does not define.** The
+  string→parts wrap in `shapeMessageContent` ran *after* `renderContentParts`, so it built the part in
+  our internal shape and bypassed the dialect's `text` template — `parts:[{type:"text",text:"hi"}]` on
+  every ordinary Gemini turn. Undetected because the only assertions on a Gemini body checked its
+  length and its roles, and every multimodal test used array content, which does take the rendering
+  path. Pinned by the new round-trip test.
+  (b) `renderToolChoiceTemplate` turned a declared **array** into `{0: …}` (its `typeof === "object"`
+  branch does not except arrays), which is why neither existing `toolChoiceMap` contained a list. It
+  does now, so Gemini's `functionCallingConfig.allowedFunctionNames` is expressible.
+  (c) `renderTemplate` cannot express an array container, so Gemini's `tools: [{functionDeclarations:
+  […]}]` had no declarative form; the container is declared instead (`toolDeclarationWrapper`), which
+  also makes a tool-less request omit `tools` rather than send `tools: {}`.
+  **Recorded and not fixed:** a gemini-compat manifest cannot pass `lintManifest` at all
+  (`contents`, `generationConfig` and the `:generateContent` colon are outside the OpenAI-shaped
+  whitelist and URL-path regex), so a *generated* Gemini manifest is unreachable today — builtins are
+  not linted, so nothing is broken at runtime; and the **Rust interpreter**
+  (`apps/desktop/src-tauri/src/core/interpreter.rs` + `manifest_view.rs`) implements none of the
+  dialect-shaping fields — not `messagesRoleMap`, not `contentField`, not these — so the gateway and
+  headless service still route every dialect through unshaped messages.
 - **Remaining:** nothing from this plan. Known and deliberately out of scope: clickable
   `path:line` file links (Phase 2, needs a root-confined host opener), reasoning-effort control
-  (Phase 7, needs a `TextRequest` field), resizable panels (Phase 8, optional), and Gemini's
-  `functionCall`/`functionResponse` tool shapes (Phase 3, a pre-existing router-core gap).
+  (Phase 7, needs a `TextRequest` field), resizable panels (Phase 8, optional), the Rust
+  interpreter's missing dialect shaping and the gemini lint gap (both above).
 
 ## What already exists (baseline — do not rebuild)
 
@@ -242,8 +272,9 @@ a `search_files` result groups by file.
 
 ## Phase 3 — Composer (attachments · vision input · slash commands · auto-resize)
 
-**Status: DONE (2026-10-01)** — see the Status section above for what shipped, the four defects found
-while verifying, and the one gap left (Gemini tool shapes).
+**Status: DONE (2026-10-01)** — see the Status section above for what shipped and the four defects
+found while verifying. The one gap it left (Gemini tool shapes) was closed 2026-10-01; see the
+Gemini tool-calling entry.
 
 **Why third.** A 2-row textarea with Enter-to-send blocks real multimodal use: you cannot send an image
 *into* the text chat for vision models, and cannot attach a file to context.
@@ -361,7 +392,8 @@ already recorded in the 2026-09-30 audit memory.
 - **Per-tool cancel**: cancel one in-flight tool without killing the run.
 - **Gemini agent mode**: add a tools/tool_choice mapping to the `geminiCompat` template so agent mode
   works (`builtin-templates.ts` + `manifest-interpreter.ts`). **This is the only router-core change in
-  this phase.**
+  this phase.** — **DONE 2026-10-01**, as a declarative grammar amendment rather than a mapping in the
+  template alone; see the Gemini tool-calling entry in the Status section.
 - **Inline error retry**: a failed turn offers Retry directly (depends on Phase 1).
 
 **Effort:** S–M per item. **Risk:** low, except Gemini mapping (medium — template grammar).

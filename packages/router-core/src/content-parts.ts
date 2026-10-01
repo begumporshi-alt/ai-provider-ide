@@ -75,6 +75,21 @@ export function textOfContent(content: unknown): string {
 export type ContentPartTemplates = Record<string, Record<string, unknown>>;
 
 /**
+ * One text part in the dialect's own shape, for the string→parts wrap below.
+ *
+ * A dialect with no `text` template gets our internal shape, which is the pre-existing behaviour and
+ * no worse than before — it is at least a shape some compatible server accepts.
+ */
+function renderWrappedText(
+  text: string,
+  templates: ContentPartTemplates | undefined,
+  render: (template: Record<string, unknown>, values: Record<string, unknown>) => Record<string, unknown>,
+): unknown {
+  const template = templates?.text;
+  return template ? render(template, { text }) : { type: "text", text };
+}
+
+/**
  * Shape every message's content for one dialect: render part arrays, and rename the content field
  * when the dialect calls it something else (Gemini's `parts`).
  *
@@ -101,7 +116,17 @@ export function shapeMessageContent(
     // A dialect that names its own content field wants *parts*, always an array: a plain string
     // becomes a single text part. Without this the rename would produce `parts: "hi"`, which is a
     // shape no provider accepts — a rename without the accompanying shape change is not a mapping.
-    if (typeof content === "string") content = content === "" ? [] : [{ type: "text", text: content }];
+    //
+    // The wrapped part goes through the dialect's **own** text template. It used to be built in our
+    // internal shape (`{type:"text",text}`), which was rendered by nothing — this wrap runs after
+    // `renderContentParts` — so every plain-text message to Gemini went out as
+    // `parts:[{type:"text",text:"hi"}]`, carrying a `type` field its Part proto does not define.
+    // Undetected because the only assertions on a Gemini body checked its length and its roles, and
+    // the multimodal tests all used array content, which does take the rendering path. Found
+    // 2026-10-01 while adding tool parts to the same body.
+    if (typeof content === "string") {
+      content = content === "" ? [] : [renderWrappedText(content, templates, render)];
+    }
     const out = { ...msg, [contentField!]: content ?? [] };
     delete out.content;
     return out;

@@ -29,6 +29,18 @@ export {
   type ContentPartTemplates,
 } from "./content-parts.js";
 export {
+  attachToolParts,
+  blockField,
+  isToolCallBlock,
+  readToolCall,
+  readToolCalls,
+  shapeToolDeclarations,
+  type ToolCallDiscriminator,
+  type ToolCallShape,
+  type ToolDeclarationTemplates,
+  type ToolPartTemplates,
+} from "./tool-shaping.js";
+export {
   compressMessages,
   compressWithSummary,
   SUMMARY_LABEL,

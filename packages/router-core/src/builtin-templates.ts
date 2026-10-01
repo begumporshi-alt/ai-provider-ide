@@ -230,11 +230,47 @@ function geminiCompat(baseUrl: string): AdapterManifest {
           // undefined and the template simply omits it. The role map still translates
           // assistant->model and tool->user.
           contents: "{{messages}}",
+          // v1.1 amendment (2026-10-01): tool declarations. Gemini reads
+          // `tools: [{functionDeclarations: [… ]}]` and does **not** read OpenAI's
+          // `{type:"function", function:{…}}` wrapping, so before this the tools array was sent and
+          // ignored: the model was never told it had any tools. The array's container is declared
+          // as `toolDeclarationWrapper` below (an array literal is not expressible in a template),
+          // and the per-declaration shape as `toolDeclarationTemplates`.
+          tools: "{{tools?}}",
+          // Gemini's tool_choice is not a string either — it is `toolConfig.functionCallingConfig`.
+          // Without this the OpenAI value would be forwarded as `tool_choice`, which Gemini rejects
+          // as an unknown field.
+          toolConfig: "{{toolChoice?}}",
           // GenerationConfig carries the knobs the dialect names differently; `maxOutputTokens`
           // is required to be nested, not top-level.
           generationConfig: {
             maxOutputTokens: "{{maxTokens?}}",
             temperature: "{{temperature?}}",
+          },
+        },
+        // One declaration, no `type`/`function` wrapping, `parameters` always present (Gemini
+        // rejects a declaration without a parameter schema). Mirrors `declaration_to_openai` in
+        // core/gateway_gemini.rs, which performs this same mapping in the other direction.
+        toolDeclarationTemplates: {
+          function: { name: "{{name}}", description: "{{description}}", parameters: "{{parameters}}" },
+        },
+        // `tools` is `repeated Tool`, and each Tool carries its own `repeated functionDeclarations`.
+        // One container holding every declaration is the form Google documents.
+        toolDeclarationWrapper: { functionDeclarations: "{{declarations}}" },
+        // v1.1 amendment (2026-10-01): tool_choice, likewise. Gemini's is not a string but
+        // `toolConfig.functionCallingConfig.mode`, and a bare "auto" forwarded as `toolConfig` is an
+        // unknown-field 400 — which is what the agent loop sends on every tool-enabled request, so
+        // this mapping is what makes agent mode reach Gemini at all. Mirrors `tool_choice_to_openai`
+        // in core/gateway_gemini.rs (AUTO|ANY|NONE plus an optional forced name).
+        toolChoiceMap: {
+          none: { functionCallingConfig: { mode: "NONE" } },
+          auto: { functionCallingConfig: { mode: "AUTO" } },
+          required: { functionCallingConfig: { mode: "ANY" } },
+          function: {
+            functionCallingConfig: {
+              mode: "ANY",
+              allowedFunctionNames: ["{{toolChoice.function.name}}"],
+            },
           },
         },
         messagesRoleMap: {
@@ -249,15 +285,21 @@ function geminiCompat(baseUrl: string): AdapterManifest {
         // v1.1 amendment (2026-10-01): Gemini's parts carry no `type` at all — the shape itself is
         // the discriminator (`{text}` vs `{inlineData}`), which is why these are per-part templates
         // rather than one fixed structure with a type field to fill in.
+        //
+        // `toolCall`/`toolResult` are the same idea applied to a *replayed* tool turn. Gemini
+        // addresses a tool result to the tool's NAME, which is why the shaper resolves it from the
+        // assistant turn that declared the call; and `args`/`response` must be objects, which is
+        // why the shaper offers `argumentsObject`/`response` beside the raw strings.
         contentPartTemplates: {
           text: { text: "{{text}}" },
           image: { inlineData: { mimeType: "{{mediaType}}", data: "{{dataBase64}}" } },
+          toolCall: { functionCall: { name: "{{name}}", args: "{{argumentsObject}}" } },
+          toolResult: { functionResponse: { name: "{{name}}", response: "{{response}}" } },
         },
         // Gemini names a message's content `parts`, and it must be an array of parts even for plain
         // text. Without this declaration every Gemini request carried `content` — a field its
         // generateContent API does not read — so it received no conversation at all. Found while
-        // wiring image input (2026-10-01); the *tool* shapes (functionCall/functionResponse) are
-        // still unmodelled — a separate gap, unchanged here.
+        // wiring image input (2026-10-01).
         contentField: "parts",
         // Declared (even though empty) so the interpreter knows system hoisting is a no-op
         // rather than "this dialect has no role map at all".
@@ -271,11 +313,29 @@ function geminiCompat(baseUrl: string): AdapterManifest {
             completion: "candidatesTokenCount",
             cached: "cachedContentTokenCount",
           },
+          // v1.1 amendment (2026-10-01): where a tool call sits, and how to read one. A Gemini part
+          // is `{functionCall:{name, args}}` with NO `type` — so the discriminator is presence, and
+          // `args` is already an object rather than JSON text. Without these two declarations a
+          // functionCall part reached the loop as a nameless, argument-less call and the model's
+          // request to run a tool was lost without a word.
+          toolCalls: "$.candidates[0].content.parts",
+          toolCallShape: {
+            discriminator: { path: "functionCall", present: true },
+            name: "functionCall.name",
+            arguments: "functionCall.args",
+            argumentsFormat: "object",
+            // Gemini sends a complete call per part; there is nothing to concatenate.
+            streamedAs: "whole",
+          },
         },
         responseFinish: "$.candidates[0].finishReason",
         stream: {
           protocol: "sse",
-          chunkMap: { delta: "$.candidates[0].content.parts" },
+          // The same `parts` path the unary read uses, and deliberately so: a streamed functionCall
+          // is the same shape as a unary one, which is what `streamedAs: "whole"` tells the
+          // interpreter — read each event's calls through `toolCallShape`, do not accumulate
+          // fragments.
+          chunkMap: { delta: "$.candidates[0].content.parts", toolCalls: "$.candidates[0].content.parts" },
           errorMap: { "$.error": "PASS_THROUGH" },
           // No [DONE] sentinel: the server closes the SSE when the turn is over, and
           // finishReason arrives on the last content chunk.

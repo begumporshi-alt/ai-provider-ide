@@ -12,6 +12,20 @@ import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
 import { shapeMessageContent, textOfContent } from "./content-parts.js";
+import {
+  attachToolParts, readToolCalls, shapeToolDeclarations, type ToolCallShape, type ToolPartTemplates,
+} from "./tool-shaping.js";
+
+/**
+ * The `toolCall`/`toolResult` keys of a dialect's `contentPartTemplates`, or `{}` when it declares
+ * neither. Kept as a helper because the same two keys are read at the message-shaping step and a
+ * second reader is how one of them ends up wired to the wrong key.
+ */
+function toolPartTemplates(
+  templates: Record<string, Record<string, unknown>> | undefined,
+): ToolPartTemplates {
+  return { toolCall: templates?.toolCall, toolResult: templates?.toolResult };
+}
 
 /**
  * Cached-prompt tokens from a usage block, in whichever dialect reports them.
@@ -160,9 +174,29 @@ function collectToolCallDeltas(acc: Map<number, PendingCall>, raw: unknown): voi
 /** Block types that are tool calls. Anthropic `content` mixes these with `text` blocks. */
 const TOOL_BLOCK_TYPES = new Set(["tool_use", "function"]);
 
-/** Normalize a non-stream tool-call array (already complete — no reassembly needed). */
-function emitToolCalls(sink: ((call: ToolCall) => void) | undefined, raw: unknown): void {
+/**
+ * Normalize a non-stream tool-call array (already complete — no reassembly needed).
+ *
+ * `shape` (v1.1 amendment 2026-10-01) is the dialect's declared block shape, and when it is present
+ * it decides everything. When it is absent the two shapes that were hardcoded here are used — the
+ * OpenAI nested form and the Anthropic flat form — so a manifest written before the field existed
+ * behaves byte-for-byte as it did.
+ *
+ * The shape-less path is deliberately kept rather than expressed as a built-in shape: the two
+ * differ in a way a shape cannot state (this one emits a call even when it cannot find a name, the
+ * shaped reader refuses), and rewriting a working path to fit a new abstraction is how a
+ * refactor silently changes behaviour.
+ */
+function emitToolCalls(
+  sink: ((call: ToolCall) => void) | undefined,
+  raw: unknown,
+  shape?: ToolCallShape,
+): void {
   if (!sink) return;
+  if (shape) {
+    for (const call of readToolCalls(raw, shape)) sink(call);
+    return;
+  }
   const list = Array.isArray(raw) ? raw : [raw];
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
@@ -367,6 +401,11 @@ function translateToolChoice(
 function renderToolChoiceTemplate(mapped: unknown, source: unknown): unknown {
   if (typeof mapped !== "string") {
     if (mapped !== null && typeof mapped === "object") {
+      // Arrays FIRST. `typeof [] === "object"`, so without this branch a declared list — Gemini's
+      // `functionCallingConfig.allowedFunctionNames`, the only way to name the function to force —
+      // fell into the object loop below and came out as `{0: "name"}`, which the provider rejects.
+      // Latent until 2026-10-01, because neither declared map had a list in it.
+      if (Array.isArray(mapped)) return mapped.map((v) => renderToolChoiceTemplate(v, source));
       // Recursively resolve placeholders inside nested objects/arrays.
       const o = mapped as Record<string, unknown>;
       const out: Record<string, unknown> = {};
@@ -540,8 +579,17 @@ export class ManifestInterpreter implements AdapterInstance {
     // dialect speaks via `messagesRoleMap` (role remapping + system hoisting) and `toolChoiceMap`
     // (string/function → dialect form); when either is absent, the corresponding values pass through
     // untouched. One loop for all dialects, zero branches in the interpreter.
-    const { messages, systemContent } = normalizeDialectMessages(
+    // v1.1 amendment (2026-10-01): move replayed tool traffic into the dialect's own content parts
+    // FIRST. It has to precede the role map, because that step deletes `tool_call_id` for a dialect
+    // with no `tool` role (Gemini maps `tool -> user`), and the id is what names the call — the one
+    // lookup a manifest cannot express. See `attachToolParts`.
+    const withToolParts = attachToolParts(
       args.messages,
+      toolPartTemplates(ep.contentPartTemplates),
+      renderTemplate,
+    );
+    const { messages, systemContent } = normalizeDialectMessages(
+      withToolParts,
       ep.messagesRoleMap,
       ep.systemField,
     );
@@ -562,7 +610,17 @@ export class ManifestInterpreter implements AdapterInstance {
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
       temperature: args.temperature,
-      tools: args.tools,
+      // v1.1 amendment (2026-10-01): the declarations are shaped per dialect before they reach the
+      // placeholder. `{{tools}}` alone ships OpenAI's `{type:"function", function:{…}}` wrapping,
+      // which Gemini does not read — so its declarations were sent and silently ignored, and the
+      // model was never told it had tools at all. A dialect that declares no templates gets the
+      // caller's array back unchanged.
+      tools: shapeToolDeclarations(
+        args.tools,
+        ep.toolDeclarationTemplates,
+        renderTemplate,
+        ep.toolDeclarationWrapper,
+      ),
       toolChoice: translateToolChoice(args.toolChoice, ep.toolChoiceMap),
       responseFormat: args.responseFormat,
       ...this.ctx.vars,
@@ -607,7 +665,9 @@ export class ManifestInterpreter implements AdapterInstance {
       const json: unknown = jsonBody(await res.text(), url);
       const text = selectText(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
-      if (ep.responseMap.toolCalls) emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls));
+      if (ep.responseMap.toolCalls) {
+        emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls), ep.responseMap.toolCallShape);
+      }
       // Non-stream: pick up usage from the response body directly.
       if (args.onUsage && ep.responseMap.usage) {
         const u = selectOne(json, ep.responseMap.usage) as Record<string, unknown> | undefined;
@@ -636,6 +696,9 @@ export class ManifestInterpreter implements AdapterInstance {
     // Reassembled here, flushed once the stream ends: `arguments` is delivered in fragments.
     const pending = new Map<number, PendingCall>();
     const tcs = args.onToolCall ? ep.stream.toolCallStream : undefined;
+    // v1.1 amendment (2026-10-01): the dialect's declared block shape, which the streamed branch
+    // below needs to tell "fragments to concatenate" from "a whole call per event".
+    const toolShape = ep.responseMap.toolCallShape;
     const wantToolCalls = Boolean(args.onToolCall && (ep.stream.chunkMap.toolCalls || tcs));
     // Last-seen usage block from the stream. Set by the Rust-side parser or by the provider's
     // own usage chunk (e.g. OpenAI puts it on the final choice; Anthropic puts it on message_delta).
@@ -698,7 +761,24 @@ export class ManifestInterpreter implements AdapterInstance {
               pending.set(idx, cur);
             }
           } else if (ep.stream.chunkMap.toolCalls) {
-            collectToolCallDeltas(pending, selectOne(json, ep.stream.chunkMap.toolCalls));
+            const blocks = selectOne(json, ep.stream.chunkMap.toolCalls);
+            if (toolShape?.streamedAs === "whole") {
+              // Whole calls, one per event (v1.1 amendment 2026-10-01 — Gemini). This must NOT go
+              // through the fragment accumulator: that one reads `function.arguments`, finds
+              // nothing on a `functionCall` block, and would drop the call without a word. Keyed by
+              // `pending.size`, which is always the next unused index — a whole call carries no
+              // provider index of its own, and the flush below runs in insertion order, so the
+              // key's only job is to be distinct.
+              for (const call of readToolCalls(blocks, toolShape)) {
+                pending.set(pending.size, {
+                  ...(call.id ? { id: call.id } : {}),
+                  name: call.name ?? "",
+                  args: call.arguments ?? "",
+                });
+              }
+            } else {
+              collectToolCallDeltas(pending, blocks);
+            }
           }
         }
         // A chunk delta may be a block ARRAY, not a string (Gemini's parts): join it the same

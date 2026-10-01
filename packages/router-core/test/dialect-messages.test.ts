@@ -253,3 +253,46 @@ describe("multimodal content parts reach each dialect in its own shape", () => {
   });
 });
 
+
+describe("tool turns on replay: only a dialect that asks is reshaped", () => {
+  /**
+   * An assistant turn that declared a call, plus the result answering it. This is what the agent
+   * loop replays on its second iteration, and each dialect needs it in its own place: OpenAI as a
+   * sibling `tool_calls` array answered by `role:"tool"`, Gemini as `functionCall`/`functionResponse`
+   * parts (see gemini-tools.test.ts).
+   */
+  const TOOL_TURN = [
+    { role: "user", content: "read it" },
+    {
+      role: "assistant",
+      content: "Reading.",
+      tool_calls: [{ id: "c1", type: "function", function: { name: "read_file", arguments: '{"path":"a"}' } }],
+    },
+    { role: "tool", content: "file text", tool_call_id: "c1" },
+  ];
+
+  it("openai-compat keeps the sibling tool_calls array and the role:'tool' result", async () => {
+    // OpenAI is the one dialect whose shape the shaper must NOT touch: it reads `tool_calls` on the
+    // assistant turn and a `tool` role for the answer. Declaring a `toolCall` part template here
+    // would move the call into the content array and break every OpenAI tool call.
+    const { interp, lastBody } = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(interp, { model: "gpt-4o", messages: [...TOOL_TURN], stream: false });
+
+    const msgs = lastBody()!.messages as Array<Record<string, unknown>>;
+    expect(msgs[1]!.tool_calls).toEqual(TOOL_TURN[1]!.tool_calls);
+    expect(msgs[1]!.content).toBe("Reading.");
+    expect(msgs[2]).toMatchObject({ role: "tool", tool_call_id: "c1", content: "file text" });
+  });
+
+  it("anthropic-compat is unchanged too: the id survives the role remap as before", async () => {
+    // Anthropic's own replay (tool_use / tool_result blocks) is a separate, unmodelled gap — but it
+    // is untouched by this work, and this pins that it was not changed by accident.
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: [...TOOL_TURN], stream: false });
+
+    const msgs = lastBody()!.messages as Array<Record<string, unknown> | undefined>;
+    expect(msgs[1]!.tool_calls).toEqual(TOOL_TURN[1]!.tool_calls);
+    expect(msgs[2]!.role).toBe("user");
+    expect(msgs[2]).not.toHaveProperty("tool_call_id");
+  });
+});

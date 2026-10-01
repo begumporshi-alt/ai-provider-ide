@@ -84,6 +84,18 @@ describe("lint (invariant 4 + field whitelist)", () => {
     expect(errs.some((e) => e.includes("evil_field"))).toBe(true);
     expect(errs.some((e) => e.includes("$..content"))).toBe(true);
   });
+
+  it("accepts toolConfig, Gemini's own field for the caller's tool_choice", () => {
+    // Deliberately does NOT assert an empty error list. A gemini-compat manifest fails lint on
+    // three pre-existing counts that have nothing to do with this change: `contents` and
+    // `generationConfig` are not whitelisted either, and the `:generateContent` path fails the
+    // URL-path regex on its colon. So a GENERATED Gemini manifest cannot pass lint at all today —
+    // the whitelist was written for OpenAI-shaped bodies and never widened for this dialect.
+    // Recorded as a finding; what is pinned here is that the new entry works.
+    const m = BUILTIN_TEMPLATES["gemini-compat"]!("https://good.test/v1beta");
+    const errs = lintManifest(m, "https://good.test/v1beta");
+    expect(errs.some((e) => e.includes("toolConfig"))).toBe(false);
+  });
 });
 
 describe("extractJson + redactionHash", () => {

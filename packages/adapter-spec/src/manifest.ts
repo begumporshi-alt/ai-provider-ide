@@ -85,6 +85,49 @@ const TOOL_CALL_STREAM = z.object({
 });
 
 /**
+ * How to read ONE tool-call block (v1.1 amendment 2026-10-01).
+ *
+ * The companion of `responseMap.toolCalls`, which selects the array; this describes a member of it.
+ * Paths here are dotted field paths inside a block, not `$` selectors — see `tool-shaping.ts` for
+ * why that is a different language on purpose.
+ *
+ * **OpenAI and Anthropic deliberately do not declare it.** Their shapes are what the interpreter's
+ * original reader already implements, and that reader is kept for a manifest that declares nothing;
+ * re-expressing a working path in a new abstraction is where a refactor silently changes behaviour.
+ * This field exists for a dialect the hardcoded reader cannot express — Gemini, whose blocks carry
+ * no `type` and whose arguments are already an object. The two dialects' shapes, for reference:
+ *
+ *   OpenAI    discriminator {path:"type", equals:"function"}, id "id",
+ *             name "function.name", arguments "function.arguments", argumentsFormat json-string
+ *   Anthropic discriminator {path:"type", equals:"tool_use"}, id "id",
+ *             name "name", arguments "input", argumentsFormat object
+ *   Gemini    discriminator {path:"functionCall", present:true},
+ *             name "functionCall.name", arguments "functionCall.args", argumentsFormat object,
+ *             streamedAs whole
+ */
+const TOOL_CALL_SHAPE = z.object({
+  discriminator: z
+    .object({
+      path: z.string().min(1),
+      equals: z.union([z.string(), z.number(), z.boolean(), z.null()]).optional(),
+      // "This field exists at all" — the only test Gemini can support, since its parts carry no
+      // `type` to compare against. See the comment on `ToolCallDiscriminator.present`.
+      present: z.boolean().optional(),
+    })
+    .optional(),
+  id: z.string().optional(),
+  name: z.string().min(1),
+  arguments: z.string().min(1),
+  // `json-string` = the value is JSON *text* (OpenAI's `function.arguments`); `object` = the value
+  // is already the arguments object (Gemini's `args`, Anthropic's `input`). The internal shape
+  // carries JSON text, so an object is serialised on the way in.
+  argumentsFormat: z.enum(["json-string", "object"]).optional(),
+  // How a streamed call arrives: `fragments` = pieces of one JSON string to concatenate (OpenAI);
+  // `whole` = each event carries a complete call (Gemini).
+  streamedAs: z.enum(["fragments", "whole"]).optional(),
+});
+
+/**
  * Maps the internal OpenAI role vocabulary to the dialect's own roles.
  *
  * # Why this is a grammar field, not a code branch
@@ -151,7 +194,44 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
   // already answers for roles: **the grammar carries the mapping, the interpreter applies it.** A
   // manifest that declares nothing passes parts through unchanged, and nothing is dropped: an
   // undeclared dialect may reject the request, but it will not silently lose the user's image.
+  //
+  // v1.1 amendment (2026-10-01): two further keys, `"toolCall"` and `"toolResult"`, carry a
+  // *replayed* tool turn. They are keyed by internal names, deliberately NOT by a dialect's own
+  // block type — a rendered Anthropic block already has `type: "tool_use"`, and a key of that name
+  // would make `renderContentParts` render it a second time. Available values: `{{id}}`,
+  // `{{name}}`, and `{{arguments}}` / `{{argumentsObject}}` for a call; `{{id}}`, `{{name}}`,
+  // `{{text}}` / `{{response}}` for a result. Declaring NEITHER leaves the OpenAI `tool_calls`
+  // sibling field and `role:"tool"` results exactly as they were, which is what OpenAI needs.
   contentPartTemplates: z.record(z.string(), z.record(z.unknown())).optional(),
+  // v1.1 amendment (2026-10-01): declarative tool DECLARATIONS.
+  //
+  // The `{{tools}}` placeholder ships the caller's OpenAI-shaped array
+  // (`[{type:"function", function:{name, description, parameters}}]`) verbatim, which is right for
+  // OpenAI and Anthropic and wrong for Gemini: Gemini nests declarations one level down, as
+  // `tools: [{functionDeclarations:[{name, description, parameters}]}]`, with no `type`/`function`
+  // wrapping (see `declaration_to_openai` in `core/gateway_gemini.rs`, the same mapping read the
+  // other way). Keyed by the *internal* tool type (`"function"`), each value is a fragment whose
+  // placeholders are resolved per tool: `{{name}}`, `{{description}}`, `{{parameters}}`.
+  //
+  // The outer wrapping is the request template's job, not this field's — `renderTemplate` already
+  // resolves placeholders inside nested structures, so a dialect states it once there
+  // (`tools: { functionDeclarations: "{{tools?}}" }`) instead of this field having to express both
+  // the per-tool shape and the array's container.
+  //
+  // A manifest that declares nothing passes the caller's array through untouched.
+  toolDeclarationTemplates: z.record(z.string(), z.record(z.unknown())).optional(),
+  // The single container the dialect wraps its whole declarations array in, with the declarations
+  // at `{{declarations}}`. Gemini needs `tools: [{functionDeclarations: […]}]`, and this cannot be
+  // written in the request template: `renderTemplate` recurses into objects but not arrays, and an
+  // array literal there is passed through as an unresolved literal.
+  //
+  // Stating it here rather than in the template also makes the empty case come out right by
+  // construction. `tools: { functionDeclarations: "{{tools?}}" }` in the template would still emit
+  // `tools: {}` when there are no tools — the optional placeholder omits its own field and leaves
+  // the enclosing object behind — so a tool-less request would carry an empty object where the
+  // grammar promised omission. With the wrapper declared here, "no tools" makes the whole value
+  // `undefined` and `{{tools?}}` omits the field outright.
+  toolDeclarationWrapper: z.record(z.string(), z.unknown()).optional(),
   // The field name this dialect uses for a message's content. Absent means the universal `content`;
   // Gemini declares `"parts"`, which is also a *shape* difference — its parts must be an array even
   // when the message is one line of text — so the interpreter wraps a string in a text part when
@@ -179,6 +259,17 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
     text: Selector,
     usage: Selector.optional(),
     toolCalls: Selector.optional(),
+    // v1.1 amendment (2026-10-01): the FIELD SHAPE of a tool-call block.
+    //
+    // `toolCalls` says *where* the blocks are; this says how to read one. Without it the reader was
+    // hardcoded to OpenAI's and Anthropic's shapes — a block is a tool call when it has
+    // `type: "tool_use"` or `type: "function"`, and its arguments are at `function.arguments` or
+    // `input`. Gemini's `{functionCall:{name, args}}` has no `type` and no such field, so pointing
+    // `toolCalls` at its parts produced a nameless, argument-less call rather than an error.
+    //
+    // Paths are dotted field paths **within one block** (`"function.name"`), not `$` selectors —
+    // the selector has already chosen the array. See `tool-shaping.ts`.
+    toolCallShape: TOOL_CALL_SHAPE.optional(),
     // **The usage block's own field names, when the dialect does not speak OpenAI's.** The
     // interpreter reads `prompt_tokens` / `completion_tokens` off whatever object `usage`
     // selects; Gemini's usageMetadata says `promptTokenCount` / `candidatesTokenCount`. A
@@ -328,7 +419,25 @@ export const REQUEST_FIELD_WHITELIST: Record<string, ReadonlySet<string>> = {
   generateText: new Set([
     "model", "messages", "stream", "max_tokens", "temperature",
     "tools", "tool_choice", "response_format",
+    // `toolConfig` (2026-10-01) is Gemini's own channel for the same caller-supplied value
+    // `tool_choice` carries — a generation manifest puts the caller's tool_choice through
+    // `{{toolChoice?}}`, and the dialect's field name for it is `toolConfig`. It is on the same
+    // trust footing as `tools`/`tool_choice`: the manifest can only say *where* the caller's value
+    // goes, never invent one. Leaving it out would have made every generated Gemini manifest fail
+    // lint with "request field is not whitelisted", i.e. the whitelist would have blocked the only
+    // shape this dialect can use.
+    "toolConfig",
   ]),
   generateImage: new Set(["model", "prompt", "size"]),
   listModels: new Set<string>(),
 };
+
+/**
+ * Known gap in `generateText`'s whitelist (found 2026-10-01 while adding `toolConfig`): it is
+ * OpenAI-shaped. A gemini-compat manifest fails lint on three counts because of it — `contents` and
+ * `generationConfig` are not listed, and `/v1beta/{{model}}:generateContent` fails the URL-path
+ * regex on its colon. Builtins are not linted, so nothing is broken at runtime; what is broken is
+ * that a *generated* Gemini manifest can never pass, which is the path the linter exists for.
+ * Left as found: widening it means deciding whether a colon belongs in the path grammar, which is a
+ * grammar decision rather than part of the tool-shaping work that surfaced it.
+ */

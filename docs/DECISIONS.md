@@ -1580,3 +1580,51 @@ that is not drift (then the rethrown path needs its own health record).
   dual-dialect host is measured whose Anthropic route is the *broken* one, which would make "prefer
   Anthropic" a per-host fact rather than a default worth holding.
 
+
+## 2026-10-01 — Tool calling becomes declarative, not OpenAI-shaped
+
+- **Decision:** a dialect declares its own tool shapes and one shaper renders them. Three
+  declarations: `toolDeclarationTemplates` + `toolDeclarationWrapper` (what a tool *declaration*
+  looks like, and the container its array sits in), the `toolCall`/`toolResult` keys of the existing
+  `contentPartTemplates` (how a replayed call and its result become content parts), and
+  `responseMap.toolCallShape` (how to read a tool call back out of a provider's block, unary and
+  streamed). OpenAI and Anthropic declare none of them and keep the interpreter's original reader.
+- **Options considered:**
+  1. **Teach the interpreter about Gemini** with a `dialect === "gemini-generate-v1"` branch in
+     `emitToolCalls`, the stream accumulator and the message normalizer. Rejected: it is the third
+     place a dialect would be named in code, and the two existing ones (roles, content parts) were
+     already made declarative for exactly this reason.
+  2. **Widen `RenderTemplate` to handle arrays** so the `tools` container could live in the request
+     template (`tools: [{functionDeclarations: "{{tools?}}"}]`). Rejected as the whole answer: it
+     would also fix the container, but a tool-less request would then emit `tools: [{}]` — the
+     optional placeholder omits its own field and leaves the enclosing object behind. Declaring the
+     wrapper in the grammar makes "no tools" produce `undefined`, and `{{tools?}}` omits the field
+     outright, which is what the placeholder has always promised.
+  3. **Leave OpenAI/Anthropic on the new shaped reader too**, so one path serves all three.
+     Rejected: the legacy reader emits a call even when it cannot find a name and the shaped reader
+     refuses, so re-expressing a working path in the new abstraction would have changed its
+     behaviour in a case no test covers. Two readers is the smaller cost, and the split is stated in
+     both places.
+- **Rationale:** gemini-compat declared **no tool field at all**, so a Gemini request went out with
+  no tool declarations and a `functionCall` part in the response was never reported — the model's
+  request to run a tool was lost silently, and agent mode against Gemini could not work. Nothing in
+  the call said why, because the tools array *was* being sent; it was just wrapped in a shape
+  (`{type:"function", function:{…}}`) the dialect does not read. That is the failure mode a
+  declaration removes: the manifest states the wire shape, and a dialect that states nothing is
+  left alone rather than quietly mis-shaped.
+- **Consequence:** `{{tools}}` means "the value this dialect puts where tools go" — the caller's
+  array for OpenAI and Anthropic, the wrapped container for Gemini — which is the same contract
+  `toolChoiceMap` already established for `tool_choice`. Two further defects surfaced while pinning
+  this: a plain-text Gemini message was sent as `parts:[{type:"text",text}]` (the string→parts wrap
+  ran *after* part rendering, so it bypassed the dialect's text template and leaked our internal
+  `type` field into a proto that has no such field), and `renderToolChoiceTemplate` turned a declared
+  array into `{0: …}`, which is why no map had ever contained one. Both fixed, both pinned by tests.
+  Recorded and **not** fixed: a gemini-compat manifest cannot pass `lintManifest` (`contents`,
+  `generationConfig` and the `:generateContent` colon), so a *generated* Gemini manifest is
+  unreachable today; and the Rust interpreter in `apps/desktop/src-tauri/src/core/` implements
+  none of the dialect shaping fields (not `messagesRoleMap`, not `contentField`, not these), so the
+  gateway and headless service route every dialect through unshaped messages.
+- **Revisit if:** a fourth dialect needs tool shapes these declarations cannot state (the most
+  likely candidate is a dialect that streams fragments of an *object*, which `streamedAs` has no arm
+  for); or the two readers are consolidated, which should be done with a test per behaviour the
+  legacy path has today.
