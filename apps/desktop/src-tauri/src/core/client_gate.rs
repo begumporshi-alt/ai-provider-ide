@@ -65,12 +65,23 @@ mod tests {
     fn mirrors_the_typescript_markers() {
         // quoted from the 2026-09-29 measurement (client-gate.ts)
         assert_eq!(
-            detect_client_gate(401, Some(r#"{"error":{"type":"unauthorized_client_error","message":"unauthorized client detected"}}"#)),
+            detect_client_gate(
+                401,
+                Some(
+                    r#"{"error":{"type":"unauthorized_client_error","message":"unauthorized client detected"}}"#
+                )
+            ),
             Some("unauthorized_client_error"),
         );
-        assert_eq!(detect_client_gate(401, Some("unauthorized client detected")), Some("unauthorized client"));
+        assert_eq!(
+            detect_client_gate(401, Some("unauthorized client detected")),
+            Some("unauthorized client")
+        );
         // case-insensitive, like the source's toLowerCase
-        assert_eq!(detect_client_gate(401, Some("UNAUTHORIZED CLIENT")), Some("unauthorized client"));
+        assert_eq!(
+            detect_client_gate(401, Some("UNAUTHORIZED CLIENT")),
+            Some("unauthorized client")
+        );
         // status-gated
         assert_eq!(detect_client_gate(200, Some("unauthorized client")), None);
         assert_eq!(detect_client_gate(400, Some("unauthorized_client_error")), None);
@@ -96,24 +107,24 @@ mod tests {
     fn detect_not_found_matches_provider_markers() {
         // OpenAI-style — "does not exist" matches first (shorter marker precedes)
         assert_eq!(
-            detect_not_found(400, Some(r#"{"error":{"message":"The model `gpt-5` does not exist"}}"#)),
+            detect_not_found(
+                400,
+                Some(r#"{"error":{"message":"The model `gpt-5` does not exist"}}"#)
+            ),
             Some("does not exist"),
         );
         // Anthropic-style
         assert_eq!(
-            detect_not_found(400, Some(r#"{"error":{"message":"invalid model: claude-nonexistent"}}"#)),
+            detect_not_found(
+                400,
+                Some(r#"{"error":{"message":"invalid model: claude-nonexistent"}}"#)
+            ),
             Some("invalid model"),
         );
         // bare text
-        assert_eq!(
-            detect_not_found(400, Some("model not found")),
-            Some("model not found"),
-        );
+        assert_eq!(detect_not_found(400, Some("model not found")), Some("model not found"),);
         // case-insensitive
-        assert_eq!(
-            detect_not_found(400, Some("UNKNOWN MODEL")),
-            Some("unknown model"),
-        );
+        assert_eq!(detect_not_found(400, Some("UNKNOWN MODEL")), Some("unknown model"),);
     }
 
     #[test]

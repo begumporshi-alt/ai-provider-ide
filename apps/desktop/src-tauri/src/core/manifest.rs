@@ -244,7 +244,9 @@ pub fn render_path(path: &str, model: &str) -> String {
 fn urlencode_component(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
-        let keep = b.is_ascii_alphanumeric() || b == b'/' || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
+        let keep = b.is_ascii_alphanumeric()
+            || b == b'/'
+            || matches!(b, b'-' | b'_' | b'.' | b'!' | b'~' | b'*' | b'\'' | b'(' | b')');
         if keep {
             out.push(b as char);
         } else {
@@ -1052,9 +1054,9 @@ mod tests {
                 body: Some("slow down".to_string())
             }
         );
-        let big = ManifestHttpError::new(400, &"x".repeat(10_000), FailureKind::Response, None);
+        let big = ManifestHttpError::new(400, "x".repeat(10_000), FailureKind::Response, None);
         let projected = AttemptError::from(&big);
         let AttemptError::Http { body, .. } = projected else { unreachable!() };
-        assert_eq!(body.unwrap().chars().count(), MESSAGE_BODY_LIMIT as usize);
+        assert_eq!(body.unwrap().chars().count(), MESSAGE_BODY_LIMIT);
     }
 }

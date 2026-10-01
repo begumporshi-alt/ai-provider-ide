@@ -1634,7 +1634,12 @@ mod tests {
         // attributed to the client. `200` is a real value on this path: the *request* succeeded and
         // the *stream* broke.
         let adapter = Scripted::text(vec![ScriptedTurn::saying(&["partial"]).then_breaking(
-            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None, body: None },
+            AttemptError::Http {
+                status: 200,
+                kind: FailureKind::MidStream,
+                retry_after_ms: None,
+                body: None,
+            },
         )]);
         let bridge = bridge_with(adapter, Host::gateway_tools());
 

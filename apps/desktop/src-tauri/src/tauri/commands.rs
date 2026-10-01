@@ -200,7 +200,12 @@ pub fn history_rename_session(
     session_id: String,
     title: String,
 ) -> Result<(), CommandError> {
-    context::set_session_title(&store, &session_id, if title.trim().is_empty() { None } else { Some(&title) }).map_err(CommandError)
+    context::set_session_title(
+        &store,
+        &session_id,
+        if title.trim().is_empty() { None } else { Some(&title) },
+    )
+    .map_err(CommandError)
 }
 
 #[tauri::command]

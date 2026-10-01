@@ -93,12 +93,12 @@ use crate::core::manifest::{
     read_cached_tokens, render_headers, render_path, retry_after_from, truncate_utf16,
     ManifestHttpError, PendingCalls,
 };
+use crate::core::manifest_view::UsageKeys;
 use crate::core::manifest_view::{
     Capabilities, Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallStream,
 };
 use crate::core::modality;
 use crate::core::template::{is_js_whitespace, render_template};
-use crate::core::manifest_view::UsageKeys;
 use crate::core::usage::UsageTokens;
 
 /// The dialect whose servers omit usage on a stream unless they are asked for it.
@@ -354,7 +354,10 @@ impl ManifestInterpreter {
             .http
             .request(
                 HttpRequest {
-                    url: join_url(&self.view.provider.base_url, &render_path(&ep.path, &args.model)),
+                    url: join_url(
+                        &self.view.provider.base_url,
+                        &render_path(&ep.path, &args.model),
+                    ),
                     method: HttpMethod::Post,
                     headers: json_headers(&self.view, &ep.headers, &self.ctx.vars),
                     body: Some(serialize(&body)),
@@ -542,7 +545,10 @@ impl ManifestInterpreter {
                 .http
                 .request(
                     HttpRequest {
-                        url: join_url(&self.view.provider.base_url, &render_path(dialed_path, &model_for_path)),
+                        url: join_url(
+                            &self.view.provider.base_url,
+                            &render_path(dialed_path, &model_for_path),
+                        ),
                         method: HttpMethod::Post,
                         headers: json_headers(&self.view, &ep.headers, &self.ctx.vars),
                         body: Some(serialize(&body)),
@@ -2259,7 +2265,13 @@ mod tests {
         ])]);
         let interp = interpreter(&manifest, http.clone());
 
-        let out = drain(interp.generate_text("key:k1", text_args("models/gemini-2.0-flash"), &Cancel::new()).await.unwrap()).await;
+        let out = drain(
+            interp
+                .generate_text("key:k1", text_args("models/gemini-2.0-flash"), &Cancel::new())
+                .await
+                .unwrap(),
+        )
+        .await;
 
         assert_eq!(out, vec![Ok("Hi".to_string()), Ok(" there".to_string())]);
         let url = http.only_request().url;

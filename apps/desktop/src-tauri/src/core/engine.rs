@@ -251,18 +251,16 @@ pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
 pub fn reason_from_body(body: Option<&str>) -> Option<String> {
     let body = body?;
     let mut reason = match serde_json::from_str::<serde_json::Value>(body) {
-        Ok(v) => v
-            .get("error")
-            .and_then(|e| {
-                let code = e.get("code").and_then(|c| c.as_str());
-                let message = e.get("message").and_then(|m| m.as_str());
-                match (code, message) {
-                    (Some(c), Some(m)) => Some(format!("{c}: {m}")),
-                    (Some(c), None) => Some(c.to_string()),
-                    (None, Some(m)) => Some(m.to_string()),
-                    (None, None) => None,
-                }
-            }),
+        Ok(v) => v.get("error").and_then(|e| {
+            let code = e.get("code").and_then(|c| c.as_str());
+            let message = e.get("message").and_then(|m| m.as_str());
+            match (code, message) {
+                (Some(c), Some(m)) => Some(format!("{c}: {m}")),
+                (Some(c), None) => Some(c.to_string()),
+                (None, Some(m)) => Some(m.to_string()),
+                (None, None) => None,
+            }
+        }),
         Err(_) => None,
     };
     if reason.is_none() {
@@ -574,8 +572,10 @@ pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
             // and a 400 that says "model not found" is `NotFound`, not `BadRequestSchema`.
             let hint = crate::core::client_gate::detect_client_gate(*status, body.as_deref())
                 .map(|_| BodyHint::ClientGate)
-                .or_else(|| crate::core::client_gate::detect_not_found(*status, body.as_deref())
-                    .map(|_| BodyHint::NotFound));
+                .or_else(|| {
+                    crate::core::client_gate::detect_not_found(*status, body.as_deref())
+                        .map(|_| BodyHint::NotFound)
+                });
             match classify(*status, hint) {
                 ErrorClass::Ok => ErrorClass::ParseError,
                 other => other,
@@ -678,7 +678,13 @@ pub fn records_key_health(disposition: AttemptDisposition) -> bool {
 /// **It is recorded in the chain and deliberately *not* in key health.** The provider is busy, not
 /// the key bad; cooling the key would punish it for a limit the provider imposed on everyone.
 pub fn saturated_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::RateLimited, status: 429, retry_after_ms: None, reason: None, label: None }
+    AttemptOutcome {
+        cls: ErrorClass::RateLimited,
+        status: 429,
+        retry_after_ms: None,
+        reason: None,
+        label: None,
+    }
 }
 
 /// What the loop does with one candidate before calling the adapter.
@@ -729,7 +735,13 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
 /// **keeps nothing else the error carried** — not the status, not the `Retry-After`. See
 /// [`execute_image`] for why that is faithful and what it costs.
 pub fn transport_outcome() -> AttemptOutcome {
-    AttemptOutcome { cls: ErrorClass::Network, status: 0, retry_after_ms: None, reason: None, label: None }
+    AttemptOutcome {
+        cls: ErrorClass::Network,
+        status: 0,
+        retry_after_ms: None,
+        reason: None,
+        label: None,
+    }
 }
 
 /// What one image request is asked to do. The Rust port of `executeImage`'s argument
@@ -853,11 +865,13 @@ pub async fn execute_image(
                                     reply.error_body.as_deref(),
                                 )
                                 .map(|_| BodyHint::ClientGate)
-                                .or_else(|| crate::core::client_gate::detect_not_found(
-                                    reply.status,
-                                    reply.error_body.as_deref(),
-                                )
-                                .map(|_| BodyHint::NotFound));
+                                .or_else(|| {
+                                    crate::core::client_gate::detect_not_found(
+                                        reply.status,
+                                        reply.error_body.as_deref(),
+                                    )
+                                    .map(|_| BodyHint::NotFound)
+                                });
                                 classify(reply.status, hint)
                             },
                             status: reply.status,
@@ -941,8 +955,12 @@ impl AllAttemptsFailed {
             .chain
             .iter()
             .map(|a| match (&a.label, &a.reason) {
-                (Some(l), Some(r)) => format!("{}/{}:{} ({})", l.provider_slug, l.key_label, a.cls.as_str(), r),
-                (Some(l), None) => format!("{}/{}:{}", l.provider_slug, l.key_label, a.cls.as_str()),
+                (Some(l), Some(r)) => {
+                    format!("{}/{}:{} ({})", l.provider_slug, l.key_label, a.cls.as_str(), r)
+                }
+                (Some(l), None) => {
+                    format!("{}/{}:{}", l.provider_slug, l.key_label, a.cls.as_str())
+                }
                 (None, _) => format!("{}:{}", a.cls.as_str(), a.status),
             })
             .collect::<Vec<_>>()
@@ -3375,13 +3393,23 @@ mod tests {
     /// A **response-phase** refusal, as the script records it: the attempt answered with a failure
     /// before a single byte, so the loop may retry it.
     fn refused(status: u16) -> TextReply {
-        Err(AttemptError::Http { status, kind: FailureKind::Response, retry_after_ms: None, body: None })
+        Err(AttemptError::Http {
+            status,
+            kind: FailureKind::Response,
+            retry_after_ms: None,
+            body: None,
+        })
     }
 
     /// A **mid-stream** break, as the script records it: one item of an otherwise-answered stream.
     /// The type is the *stream's*, not the script's — that is the two-phase split written down.
     fn broke(status: u16) -> Result<String, AttemptError> {
-        Err(AttemptError::Http { status, kind: FailureKind::MidStream, retry_after_ms: None, body: None })
+        Err(AttemptError::Http {
+            status,
+            kind: FailureKind::MidStream,
+            retry_after_ms: None,
+            body: None,
+        })
     }
 
     /// The same error value, for comparing against what the loop carried out. `AttemptError` is

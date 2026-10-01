@@ -1020,14 +1020,18 @@ fn rebuild_onboarding_failed_state(tx: &rusqlite::Transaction<'_>) -> rusqlite::
         {
             let mut detached: Vec<(i64, i64)> = Vec::new();
             {
-                let mut stmt =
-                    tx.prepare("SELECT id, session_id FROM generator_audit WHERE session_id IS NOT NULL")?;
+                let mut stmt = tx.prepare(
+                    "SELECT id, session_id FROM generator_audit WHERE session_id IS NOT NULL",
+                )?;
                 let mut rows = stmt.query([])?;
                 while let Some(row) = rows.next()? {
                     detached.push((row.get(0)?, row.get(1)?));
                 }
             }
-            tx.execute("UPDATE generator_audit SET session_id = NULL WHERE session_id IS NOT NULL", [])?;
+            tx.execute(
+                "UPDATE generator_audit SET session_id = NULL WHERE session_id IS NOT NULL",
+                [],
+            )?;
             // Drop-then-rename, not rename-then-drop: `ALTER TABLE RENAME` rewrites the
             // referencing FK to follow the old table, so renaming first would leave
             // generator_audit pointing at a table that is about to be dropped. Dropping first
@@ -1233,7 +1237,8 @@ mod tests {
             [],
         )
         .unwrap();
-        let session_id: i64 = conn.query_row("SELECT MAX(id) FROM onboarding_sessions", [], |r| r.get(0)).unwrap();
+        let session_id: i64 =
+            conn.query_row("SELECT MAX(id) FROM onboarding_sessions", [], |r| r.get(0)).unwrap();
         conn.execute(
             "INSERT INTO generator_audit (ts, model_used, prompt_tokens, completion_tokens, redaction_hash, session_id)
              VALUES (1, 'm', 1, 1, 'h', ?1)",

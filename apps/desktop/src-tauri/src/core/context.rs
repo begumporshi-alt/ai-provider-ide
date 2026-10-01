@@ -13,8 +13,8 @@
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 
-use crate::core::store::Store;
 use crate::core::injection_log::now_ms;
+use crate::core::store::Store;
 
 /// Edge weight ceiling. A relation that recurs reads as *stronger*, not as more edges, so
 /// repeated recording bumps weight. Without a ceiling one hot relation would eventually
@@ -507,7 +507,11 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
 
 /// Set or clear a custom title for a session. Passing `None` removes a custom title, so the
 /// History index falls back to the first user message as preview.
-pub fn set_session_title(store: &Store, session_id: &str, title: Option<&str>) -> Result<(), String> {
+pub fn set_session_title(
+    store: &Store,
+    session_id: &str,
+    title: Option<&str>,
+) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     if let Some(t) = title {
         if t.trim().is_empty() {
@@ -532,16 +536,10 @@ pub fn set_session_title(store: &Store, session_id: &str, title: Option<&str>) -
 /// Wipe every trace of a session from the context graph and its title metadata.
 pub fn delete_session(store: &Store, session_id: &str) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM context_nodes WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| e.to_string())?;
-    conn.execute(
-        "DELETE FROM session_titles WHERE session_id = ?1",
-        params![session_id],
-    )
-    .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM context_nodes WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    conn.execute("DELETE FROM session_titles WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 

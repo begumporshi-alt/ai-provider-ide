@@ -2303,8 +2303,12 @@ mod tests {
     async fn a_tool_call_then_a_mid_stream_break_rethrows_not_failover() {
         let store = one_provider();
         // Empty chunks (no text), one tool call delivered, then a transport error mid-stream.
-        let brk =
-            AttemptError::Http { status: 200, kind: FailureKind::MidStream, retry_after_ms: None, body: None };
+        let brk = AttemptError::Http {
+            status: 200,
+            kind: FailureKind::MidStream,
+            retry_after_ms: None,
+            body: None,
+        };
         let adapter = Scripted::new(vec![chunks(&[])])
             .with_tools(vec![vec![ToolCall {
                 id: Some("call_1".to_string()),
@@ -3465,7 +3469,8 @@ mod tests {
             status: 0,
             retry_after_ms: None,
             label: None,
-        reason: None, }];
+            reason: None,
+        }];
         let value: Value = serde_json::from_str(&chain_json(&attempts).unwrap()).unwrap();
         assert_eq!(value[0], json!({ "cls": "NETWORK" }));
     }

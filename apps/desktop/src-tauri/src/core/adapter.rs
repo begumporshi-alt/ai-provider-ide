@@ -546,10 +546,18 @@ mod tests {
         // Both carry 429. Only the phase separates them, and the engine's classification turns
         // entirely on that — `RateLimited` cools a key, `ParseError` does not. A seam that collapsed
         // the two kinds into one would make the distinction unrecoverable downstream.
-        let response =
-            AttemptError::Http { status: 429, kind: FailureKind::Response, retry_after_ms: None, body: None };
-        let mid_stream =
-            AttemptError::Http { status: 429, kind: FailureKind::MidStream, retry_after_ms: None, body: None };
+        let response = AttemptError::Http {
+            status: 429,
+            kind: FailureKind::Response,
+            retry_after_ms: None,
+            body: None,
+        };
+        let mid_stream = AttemptError::Http {
+            status: 429,
+            kind: FailureKind::MidStream,
+            retry_after_ms: None,
+            body: None,
+        };
 
         assert_eq!(classify_attempt_error(&response), ErrorClass::RateLimited);
         assert_eq!(classify_attempt_error(&mid_stream), ErrorClass::ParseError);
