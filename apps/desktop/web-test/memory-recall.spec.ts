@@ -57,7 +57,7 @@ test("memory recall: the recalled block lands in the chat-completions request as
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
-  await page.getByPlaceholder(/Send a message through the router/)
+  await page.getByPlaceholder(/Message your assistant/)
     .fill("what is the timezone where you live?");
   await page.getByRole("button", { name: "Send" }).click();
 
@@ -90,7 +90,7 @@ test("memory recall: a recalled memory lands in the context graph as a memory no
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
-  await page.getByPlaceholder(/Send a message through the router/)
+  await page.getByPlaceholder(/Message your assistant/)
     .fill("what is the timezone where you live?");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
@@ -117,7 +117,7 @@ test("memory recall: recalling the same memory twice leaves one node with two ed
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await selectModel(page);
-  const box = page.getByPlaceholder(/Send a message through the router/);
+  const box = page.getByPlaceholder(/Message your assistant/);
   const send = page.getByRole("button", { name: "Send" });
 
   // Both questions must share a token with the stored atom: recall is BM25 over tokens, with no
@@ -170,7 +170,7 @@ test("memory recall: toggling memory off skips the recall path entirely", async 
   // Uncheck the memory toggle — it is on by default. The label wraps the input, so
   // getByLabel is the reliable handle here (the same form as the "agent mode" toggle).
   await page.getByLabel("memory").uncheck();
-  await page.getByPlaceholder(/Send a message through the router/)
+  await page.getByPlaceholder(/Message your assistant/)
     .fill("what is the timezone where you live?");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });

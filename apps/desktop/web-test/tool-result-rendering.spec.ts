@@ -21,7 +21,10 @@ test("tool result: an edit_file call renders as a diff, not a JSON argument blob
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   await page.getByPlaceholder(/Describe a task for the agent/).fill("edit the readme greeting");
   await page.getByRole("button", { name: "Send" }).click();

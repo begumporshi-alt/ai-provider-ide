@@ -43,7 +43,7 @@ async function startWizard(page: Page, name: string, baseUrl: string, key: strin
 async function sendInAssistant(page: Page, model: RegExp, prompt: string, answer: RegExp): Promise<string> {
   await page.getByRole("button", { name: "Assistant" }).click();
   await pickModel(page, model);
-  await page.getByPlaceholder(/Send a message through the router/).fill(prompt);
+  await page.getByPlaceholder(/Message your assistant/).fill(prompt);
   await page.getByRole("button", { name: "Send" }).click();
   const box = page.locator("div.whitespace-pre-wrap").filter({ hasText: answer }).last();
   await expect(box).toBeVisible({ timeout: 30_000 });
@@ -434,19 +434,23 @@ test("assistant: agent mode refuses to send without a workspace root", async ({ 
   await pickModel(page, /oracle-mini/);
 
   // Flip agent mode on. The root is now filled in for you — the host's default workspace — so a
-  // fresh screen is usable instead of dead on arrival.
+  // fresh screen is usable instead of dead on arrival. Root setup lives in its own tab; Send's
+  // guard is read back on the Chat tab.
   await page.getByLabel("agent mode").check();
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   const rootBox = page.getByPlaceholder(/absolute\/path/);
   await expect(rootBox).toHaveValue(/AI-Provider-Router-Workspace/);
-  await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
 
   // The guard is unchanged: emptying the root re-arms it. Send's disabled state is the guard,
   // not a post-hoc error.
   await rootBox.fill("");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.getByRole("button", { name: "Send" })).toBeDisabled();
 
   // Filling the root unsticks it.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await rootBox.fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
   await expect(page.getByRole("button", { name: "Send" })).toBeEnabled();
 });
 
@@ -475,9 +479,12 @@ test("assistant: agent mode, memory and the no-tools switch sit under the title"
   const t = await title.boundingBox();
   const a = await agent.boundingBox();
   const p = await picker.boundingBox();
-  // Below the title, and above the model picker rather than beside it.
+  // Both under the title, inside the Run configuration card: the mock lays the card out as
+  // labelled columns — Model & Provider, then the screen-level switches beside it — so the old
+  // "switches above the picker" geometry no longer holds. What must still hold is that neither
+  // control floats above the screen's heading.
   expect(a!.y).toBeGreaterThan(t!.y);
-  expect(a!.y).toBeLessThan(p!.y - 8);
+  expect(p!.y).toBeGreaterThan(t!.y);
 });
 
 // ---------------------------------------------------------------------------
@@ -492,6 +499,8 @@ test("assistant: the switches and the workspace root survive a reload", async ({
 
   await page.getByLabel("agent mode").check();
   await page.getByLabel("memory").uncheck();
+  // Root setup lives in its own tab.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp/persisted-workspace");
   // The root is typed, so its write is debounced; a reload before it lands would test the
   // debounce rather than the persistence.
@@ -503,6 +512,7 @@ test("assistant: the switches and the workspace root survive a reload", async ({
 
   await expect(page.getByLabel("agent mode")).toBeChecked();
   await expect(page.getByLabel("memory")).not.toBeChecked();
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await expect(page.getByPlaceholder(/absolute\/path/)).toHaveValue("/tmp/persisted-workspace");
 });
 

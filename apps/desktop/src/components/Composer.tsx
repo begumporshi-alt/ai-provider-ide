@@ -25,7 +25,7 @@
  * that is what the user typed and rewriting it under the caret as they type is how a composer starts
  * fighting the person using it.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button, inputCls, inputStyle } from "./atoms";
 import { matchSlashCommands, parseSlash, type SlashCommand } from "../lib/chat/slash";
 import {
@@ -111,6 +111,28 @@ export interface ComposerProps {
   readFile: ((path: string) => Promise<string | null>) | null;
   /** A notice to show the user (a skipped mention, a refused attachment). */
   onNotice: (message: string) => void;
+  /**
+   * A suggestion card's text, injected into the draft. The composer owns the draft (see above), so
+   * the parent cannot set it directly — it hands down `{ text, nonce }` and this effect claims it
+   * by nonce, the same pending-and-consumed shape the shell's one-shot intents use. A re-fire with
+   * the same text must still re-fill the box, which is why the claim is keyed on the nonce and not
+   * on the string.
+   */
+  seed?: { text: string; nonce: number };
+  /**
+   * The run toolbar, rendered into the composer's action row between "Add context" and Send. The
+   * screen owns the controls (mode toggles, the model picker); the composer only gives them a
+   * home in the same row as the send — so what a turn will use sits where it is sent from. A node
+   * rather than props: the controls belong to `AssistantScreen`'s state and this component must
+   * not grow their concerns.
+   */
+  toolbar?: ReactNode;
+  /**
+   * A node pinned to the composer's top-right corner, level with the textarea — the model
+   * picker's home (see `ComposerProps.toolbar` for why it is a node): the picker reads as
+   * "what this box will send with" when it overlooks the send button.
+   */
+  corner?: ReactNode;
 }
 
 export function Composer({
@@ -130,6 +152,9 @@ export function Composer({
   listFiles,
   readFile,
   onNotice,
+  seed,
+  toolbar,
+  corner,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [caret, setCaret] = useState(0);
@@ -140,6 +165,22 @@ export function Composer({
   const [slashPick, setSlashPick] = useState(0);
   const [dragOver, setDragOver] = useState(false);
   const pickerRef = useRef<HTMLInputElement | null>(null);
+
+  // The seed claim (see `ComposerProps.seed`). Focused on the textarea and the caret parked at the
+  // end, so the user can start typing onto the suggestion immediately.
+  const seenSeed = useRef<number | null>(null);
+  useEffect(() => {
+    if (!seed || seed.nonce === seenSeed.current) return;
+    seenSeed.current = seed.nonce;
+    setDraft(seed.text);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      const end = seed.text.length;
+      el.setSelectionRange(end, end);
+    });
+  }, [seed, textareaRef]);
 
   const slashMatches = useMemo(() => matchSlashCommands(draft), [draft]);
   const parsedSlash = useMemo(() => parseSlash(draft), [draft]);
@@ -438,70 +479,103 @@ export function Composer({
       )}
 
       <div
-        className="flex items-end gap-2 rounded border p-1.5"
+        className="rounded-xl border p-2.5"
         style={{
           borderColor: dragOver ? "var(--accent)" : "var(--border)",
-          background: dragOver ? "var(--surface-2)" : "transparent",
+          background: dragOver ? "var(--surface-2)" : "var(--surface)",
         }}
       >
-        {/* Attach stays live even when images are refused — text files still work — and its tooltip
-            says which case applies instead of the button being dead with no explanation. */}
-        <button
-          type="button"
-          onClick={() => pickerRef.current?.click()}
-          disabled={busy}
-          aria-label="Attach files"
-          title={visionNote ?? "Attach an image or a text file"}
-          className="shrink-0 rounded px-1.5 py-1 text-[13px] disabled:opacity-40"
-          style={{ color: vision === true ? "var(--accent)" : "var(--text-dim)" }}
-        >
-          📎
-        </button>
-        <input
-          ref={pickerRef}
-          type="file"
-          multiple
-          accept="image/*,.txt,.md,.json,.ts,.tsx,.js,.py,.rs,.toml,.yaml,.yml,.csv,.log"
-          className="hidden"
-          data-testid="composer-file-input"
-          onChange={(e) => {
-            if (e.target.files?.length) void addFiles(e.target.files);
-            // Reset so picking the same file twice fires `change` again.
-            e.target.value = "";
-          }}
-        />
+        <div className="flex items-start gap-2.5">
+          {/* Attach stays live even when images are refused — text files still work — and its tooltip
+              says which case applies instead of the button being dead with no explanation. */}
+          <button
+            type="button"
+            onClick={() => pickerRef.current?.click()}
+            disabled={busy}
+            aria-label="Attach files"
+            title={visionNote ?? "Attach an image or a text file"}
+            className="mt-1.5 shrink-0 rounded px-0.5 py-0.5 disabled:opacity-40"
+            style={{ color: vision === true ? "var(--accent)" : "var(--text-dim)" }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
+              <path d="m20.5 11.5-8 8a5 5 0 0 1-7-7l8-8a3.5 3.5 0 0 1 5 5l-8 8a2 2 0 0 1-2.8-2.8l7.3-7.3" />
+            </svg>
+          </button>
+          <input
+            ref={pickerRef}
+            type="file"
+            multiple
+            accept="image/*,.txt,.md,.json,.ts,.tsx,.js,.py,.rs,.toml,.yaml,.yml,.csv,.log"
+            className="hidden"
+            data-testid="composer-file-input"
+            onChange={(e) => {
+              if (e.target.files?.length) void addFiles(e.target.files);
+              // Reset so picking the same file twice fires `change` again.
+              e.target.value = "";
+            }}
+          />
 
-        <textarea
-          ref={textareaRef}
-          value={draft}
-          rows={1}
-          onChange={(e) => {
-            setDraft(e.target.value);
-            setCaret(e.target.selectionStart ?? 0);
-            onDraftChange(e.target.value);
-            syncMenus(e.target.value, e.target.selectionStart ?? 0);
-          }}
-          onKeyUp={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
-          onClick={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
-          onKeyDown={onKeyDown}
-          placeholder={
-            parsedSlash
-              ? `Press Enter to run /${parsedSlash.command.name}`
-              : agentMode
-                ? "Describe a task for the agent…  / for commands, @ for files (Enter to send)"
-                : "Send a message through the router…  / for commands, @ for files (Enter to send)"
-          }
-          aria-label="Message"
-          className={`${inputCls} resize-none border-0 focus:brightness-100`}
-          style={{ ...inputStyle, background: "transparent" }}
+          <textarea
+            ref={textareaRef}
+            value={draft}
+            rows={1}
+            onChange={(e) => {
+              setDraft(e.target.value);
+              setCaret(e.target.selectionStart ?? 0);
+              onDraftChange(e.target.value);
+              syncMenus(e.target.value, e.target.selectionStart ?? 0);
+            }}
+            onKeyUp={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
+            onClick={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
+            onKeyDown={onKeyDown}
+            placeholder={
+              parsedSlash
+                ? `Press Enter to run /${parsedSlash.command.name}`
+                : agentMode
+                  ? "Describe a task for the agent…  / for commands, @ for files (Enter to send)"
+                  : "Message your assistant…  Use / for commands, @ to reference files"
+            }
+            aria-label="Message"
+            className={`${inputCls} min-h-[40px] flex-1 resize-none border-0 focus:brightness-100`}
+            style={{ ...inputStyle, background: "transparent" }}
           data-testid="composer-input"
         />
+        {/* The corner node sits level with the textarea's first line, at the card's top-right —
+            directly above the send button it configures. */}
+        {corner && <div className="shrink-0 self-start pt-0.5">{corner}</div>}
+      </div>
 
-        {busy ? (
-          <Button variant="danger" onClick={onStop}>■ Stop</Button>
-        ) : (
-          <Button variant="primary" disabled={sendDisabled} onClick={() => void send()}>Send</Button>
-        )}
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          {/* "Add context" is the attach affordance named for what it is for. It opens the same
+              file picker — images become parts, text files become fenced blocks — so there is one
+              input, not two, and one place that explains refusals. */}
+          <button
+            type="button"
+            onClick={() => pickerRef.current?.click()}
+            disabled={busy}
+            className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors disabled:opacity-40"
+            style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+          >
+            ＋ Add context
+            <span aria-hidden="true" style={{ color: "var(--text-faint)" }}>▾</span>
+          </button>
+          {/* The screen's run controls (mode toggles, model picker) share the send's row. The
+              toolbar's trailing auto-margin pushes the picker against Send, per the layout: what
+              the turn will use brackets the row's two ends with what it does. */}
+          {toolbar}
+          <span className="ml-auto flex items-center gap-2">
+            {busy ? (
+              <Button variant="danger" onClick={onStop}>■ Stop</Button>
+            ) : (
+              <Button variant="primary" disabled={sendDisabled} onClick={() => void send()}>
+                Send
+                {/* aria-hidden: decoration on the button's face. The accessible name stays exactly
+                    "Send", which the specs (and screen readers) match on. */}
+                <span aria-hidden="true" style={{ opacity: 0.75, fontWeight: 400 }}>↵ Enter</span>
+              </Button>
+            )}
+          </span>
+        </div>
       </div>
 
       {visionNote && (

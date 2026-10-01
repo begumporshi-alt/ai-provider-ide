@@ -14,7 +14,7 @@ const ANSWER = "Hello from oracle-mini";
 
 /** Send one plain-chat message and wait for the streamed answer. */
 async function sendHello(page: import("@playwright/test").Page): Promise<void> {
-  await page.getByPlaceholder(/Send a message through the router/).fill("Hello");
+  await page.getByPlaceholder(/Message your assistant/).fill("Hello");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").filter({ hasText: ANSWER }).last()).toBeVisible({
     timeout: 30_000,

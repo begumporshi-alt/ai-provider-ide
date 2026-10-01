@@ -72,7 +72,7 @@ async function openPalette(page: Page): Promise<void> {
  * running" was satisfied by the sentence saying it had been stopped.
  */
 async function sendSlowTurn(page: Page): Promise<void> {
-  await page.getByPlaceholder(/Send a message through the router/).fill("slow: hold the line");
+  await page.getByPlaceholder(/Message your assistant/).fill("slow: hold the line");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("button", { name: /Stop$/ })).toBeVisible({ timeout: 10_000 });
 }
@@ -171,7 +171,7 @@ test("new chat starts a fresh conversation from the keyboard", async ({ page }) 
   await openAssistant(page);
   await pickModel(page, /oracle-mini/);
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("remember this");
+  await page.getByPlaceholder(/Message your assistant/).fill("remember this");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("remember this")).toBeVisible();
@@ -201,12 +201,12 @@ test("Escape does nothing when no turn is running", async ({ page }) => {
   await openAssistant(page);
   await pickModel(page, /oracle-mini/);
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("draft text");
+  await page.getByPlaceholder(/Message your assistant/).fill("draft text");
   await page.keyboard.press("Escape");
 
   // Not swallowed: the composer keeps what was typed, and no transcript appeared. A shortcut that
   // fires with nothing to act on is how a key silently stops meaning what it meant.
-  await expect(page.getByPlaceholder(/Send a message through the router/)).toHaveValue("draft text");
+  await expect(page.getByPlaceholder(/Message your assistant/)).toHaveValue("draft text");
   await expect(page.getByText(/stopped by you/)).toHaveCount(0);
 });
 
@@ -232,7 +232,7 @@ test("conversation search filters the session list and keeps the detail in step"
 
   // Two sessions with distinguishable text, so a filter can be shown to keep one and drop the other.
   for (const text of ["alpha conversation", "beta conversation"]) {
-    await page.getByPlaceholder(/Send a message through the router/).fill(text);
+    await page.getByPlaceholder(/Message your assistant/).fill(text);
     await page.getByRole("button", { name: "Send" }).click();
     await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
     await pressMod(page, "Shift+O");
@@ -265,7 +265,7 @@ test("the palette's Search conversations focuses the History box", async ({ page
   // exists once there is something to search.
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
 
@@ -286,7 +286,7 @@ test("the palette's Focus the composer puts the caret in it", async ({ page }) =
   await page.getByLabel("Command palette search").fill("focus the composer");
   await page.keyboard.press("Enter");
 
-  const composer = page.getByPlaceholder(/Send a message through the router/);
+  const composer = page.getByPlaceholder(/Message your assistant/);
   await expect(composer).toBeFocused();
   await page.keyboard.type("typed without clicking");
   await expect(composer).toHaveValue("typed without clicking");

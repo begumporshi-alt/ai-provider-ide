@@ -73,7 +73,7 @@ test("temperature and max tokens reach the provider", async ({ page }) => {
 
   await page.getByLabel(/Temperature for this request/).fill("0.3");
   await page.getByLabel(/Maximum response tokens for this request/).fill("256");
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
 
   const body = await lastChatBody(page);
@@ -89,7 +89,7 @@ test("blank parameters are omitted rather than sent as zero", async ({ page }) =
 
   // Nothing touched: the fields start blank, which means "the provider's own default". Sending
   // `temperature: 0` instead would silently make every reply deterministic.
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
 
   const body = await lastChatBody(page);
@@ -105,7 +105,7 @@ test("the context meter shows the chosen model's window and a growing estimate",
   await expect(meter).toContainText("8,192");
 
   // Typing raises the estimate — the meter is about the NEXT send, so it counts the draft.
-  await page.getByPlaceholder(/Send a message through the router/)
+  await page.getByPlaceholder(/Message your assistant/)
     .fill("count these words please, thank you very much indeed");
   await expect(meter).not.toContainText("0 / 8,192");
 });
@@ -118,7 +118,7 @@ test("a custom no-tools system prompt is what the model receives", async ({ page
   await page.getByLabel(/no-tools guard/).fill(CUSTOM);
   await page.getByRole("button", { name: "Done" }).click();
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
 
   const body = await lastChatBody(page);
@@ -137,7 +137,7 @@ test("a blank editor field falls back to the built-in prompt", async ({ page }) 
   await expect(page.getByLabel(/no-tools guard/)).toHaveValue("");
   await page.getByRole("button", { name: "Done" }).click();
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
 
   const body = await lastChatBody(page);
@@ -149,7 +149,7 @@ test("a blank editor field falls back to the built-in prompt", async ({ page }) 
 test("the session readout accumulates the ledger's tokens and cost", async ({ page }) => {
   await openAssistant(page);
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
   await lastChatBody(page);
 
@@ -174,7 +174,7 @@ test("an unpriced model reports its cost as unknown, not as free", async ({ page
   // `oracle-flash` is the seed's deliberately unpriced model: same window, no `pricing_json`.
   await pickModel(page, /oracle-flash/);
 
-  await page.getByPlaceholder(/Send a message through the router/).fill("hello there");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
   await lastChatBody(page);
 

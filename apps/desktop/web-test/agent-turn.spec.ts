@@ -28,7 +28,10 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
   // off first to make sure the controls change, then flip on agent mode.
   await page.getByLabel("agent mode").check();
   // Without a root the guard keeps Send disabled; fill it.
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   // --- send the task -----------------------------------------------------------------
   await page.getByPlaceholder(/Describe a task for the agent/).fill("list files");
@@ -101,7 +104,10 @@ test("agent turn: a failed tool call shows the host's reason, not a blank result
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   // "missing" routes the oracle to read_file of a file the virtual FS does not have.
   await page.getByPlaceholder(/Describe a task for the agent/).fill("read the missing file");
@@ -134,7 +140,10 @@ test("agent turn: an unrecorded ending shows the status it was, not a closed ses
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   // Arrange the failure before the loop can reach its finish write.
   await page.evaluate(() =>
@@ -186,7 +195,10 @@ test("agent turn: a run that was never recorded is reported once, not once per w
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 
   await page.evaluate(() =>
     (window as unknown as { __webTest: { failNext: (cmd: string, message: string) => void } })

@@ -27,7 +27,10 @@ async function openAgentChat(page: import("@playwright/test").Page) {
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
   await page.getByLabel("agent mode").check();
+  // Root setup lives in its own tab now; set it there, then go back to the chat.
+  await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
 }
 
 async function vfs(page: import("@playwright/test").Page): Promise<Record<string, string>> {

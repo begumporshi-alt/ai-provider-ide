@@ -4,7 +4,8 @@
  * request the calm summary line (`✓ 421ms · OpenRouter · key-03` / `↻ 1 fallback`) with an
  * expandable per-attempt route trace. Acceptance criterion 4: text + image end-to-end.
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import {
   catalog,
   listSkills,
@@ -20,7 +21,7 @@ import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
 import { useUi } from "../ui-state";
-import { Button, EmptyState, Modal, inputCls, inputStyle } from "../components/atoms";
+import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
 import { Composer, type Attachment, type InlinedText } from "../components/Composer";
 import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
@@ -341,27 +342,38 @@ interface Trace {
  */
 function OptionCheck({
   label,
+  displayLabel,
   checked,
   onChange,
   disabled,
 }: {
+  /** The accessible name — always the full, unambiguous setting name. */
   label: string;
+  /** Shorter visible text for tight rows; when set, `label` moves to aria-label so specs and
+      screen readers keep matching the full name. */
+  displayLabel?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
 }) {
   return (
+    // A real checkbox painted as a pill switch (`.switch` in index.css): the platform semantics —
+    // keyboard space-toggle, the "checkbox" role, the specs' `.check()` — all keep working. The
+    // bordered pill wraps label + switch so the pairing is unambiguous in a row of toggles: the
+    // switch inside a pill belongs to that pill's label, never to its neighbour's.
     <label
-      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
-      style={{ color: "var(--text-dim)" }}
+      className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
+      style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
     >
+      {displayLabel ?? label}
       <input
         type="checkbox"
+        className="switch"
         checked={checked}
         disabled={disabled}
+        aria-label={displayLabel ? label : undefined}
         onChange={(e) => onChange(e.target.checked)}
       />
-      {label}
     </label>
   );
 }
@@ -397,8 +409,11 @@ function StepBudget({
   };
 
   return (
+    // The run toolbar's step budget: an inline chip beside the mode toggles. The accessible name
+    // stays "tool steps" (aria-label wins over the label's visible text), so the spec that fills
+    // this field keeps matching.
     <label
-      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
+      className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
       style={{ color: "var(--text-dim)" }}
       title={
         disabled
@@ -406,7 +421,7 @@ function StepBudget({
           : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}); the loop also stops as soon as the model answers without calling a tool`
       }
     >
-      tool steps
+      <span className="text-[11px]">Steps</span>
       <input
         type="number"
         min={1}
@@ -418,8 +433,9 @@ function StepBudget({
         onKeyDown={(e) => {
           if (e.key === "Enter") commit();
         }}
-        className="w-14 rounded border px-1 py-0.5 text-[11px]"
-        style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+        aria-label="tool steps"
+        className="no-spin w-14 rounded-full border px-2 py-0.5 text-center text-[11px]"
+        style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
       />
     </label>
   );
@@ -590,7 +606,10 @@ function saveAssistantSettings(s: AssistantSettings): void {
 export function AssistantScreen() {
   // `Chat` subscribes to the tick itself (the skills block re-reads on it), so this shell does
   // not — and not subscribing is what keeps a store bump from tearing down the transcript.
-  const [tab, setTab] = useState<"text" | "image">("text");
+  const [tab, setTab] = useState<"text" | "image" | "root">("text");
+  // The DOM node the session features portal into (see the title row). State, not a ref: Chat has
+  // to re-render once the node exists, which a ref callback + setState gives us for free.
+  const [sessionSlot, setSessionSlot] = useState<HTMLDivElement | null>(null);
   // The switches live here, above `Chat`, so switching Chat/Image does not silently reset them.
   // `Chat` unmounts on a tab switch; how the user has configured the screen outliving that is
   // the difference between "the tab changed" and "my settings changed".
@@ -617,9 +636,6 @@ export function AssistantScreen() {
   const [customNoToolsSystem, setCustomNoToolsSystem] = useState("");
   const [customAgentSystem, setCustomAgentSystem] = useState("");
   const [root, setRoot] = useState("");
-  // The workspace the host offers as a default, remembered so the UI can say "this is the
-  // default" instead of silently filling a field the user did not fill.
-  const [defaultRoot, setDefaultRoot] = useState<string | null>(null);
   // A root that will not work is worth saying before the run, not after it. An unusable root
   // used to reach the model as a blank tool result, which reads as "the agent is broken" rather
   // than "the path you typed does not exist" — and the model echoes that back.
@@ -627,6 +643,28 @@ export function AssistantScreen() {
   // Nothing is written until the stored settings have been read. Without this the first render
   // would save the defaults over whatever the user had actually chosen.
   const [hydrated, setHydrated] = useState(false);
+  // The chosen text model, lifted out of `Chat` so the Run configuration card can own the whole
+  // "where does this go" column (mock layout): the picker, the provider chip and the routed badge
+  // are one control. `Chat` becomes a pure consumer of `chosen`. `def` is the same store default
+  // `Chat` used to fall back to before the lift.
+  const [model, setModel] = useState("");
+  const [pickerNonce, setPickerNonce] = useState(0);
+  // The sandbox policy is a screen-level fact — what the host confines agent runs to — shown in
+  // the card's Advanced column. `Chat` used to fetch it lazily in agent mode; fetching once on
+  // mount costs one host call and lets the card disclose the sandbox before the first run.
+  const [sandboxPolicy, setSandboxPolicy] = useState<ToolsPolicy | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    void fetchToolsPolicy()
+      .then((p) => {
+        if (!cancelled) setSandboxPolicy(p);
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // Hydrate: stored settings first, then the host's default workspace, then empty.
   useEffect(() => {
@@ -655,7 +693,6 @@ export function AssistantScreen() {
       // build would otherwise reach `decide()` and match none of its branches, which reads as
       // "ask every time" — a silent downgrade the user could not see.
       if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode)) setApprovalMode(stored.approvalMode!);
-      setDefaultRoot(fallback);
       setRoot(stored.root ?? fallback ?? "");
       setHydrated(true);
     })();
@@ -732,55 +769,82 @@ export function AssistantScreen() {
     };
   }, [agentMode, root]);
 
+  // Where this screen's turns go. Same shape `Chat` used to compute: an explicit pick wins, the
+  // store's default text model is the fallback.
+  const textDef = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
+  const chosenText = model || textDef;
+
+  // The run toolbar (user's layout): the mode toggles share the composer's action row, beside
+  // "Add context". The model picker left the row for the composer's top-right corner (see
+  // `modelCorner`), and the step budget moved to the title row — an agent-only knob does not
+  // deserve a permanent seat next to the send button. Built here because every control is this
+  // component's state; `Chat` only gives them a seat in the row.
+  const runToolbar = (
+    <>
+      <OptionCheck label="Agent mode" checked={agentMode} onChange={setAgentMode} />
+      <OptionCheck label="Memory" checked={useMemory} onChange={setUseMemory} />
+      <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
+      <OptionCheck label="Plan mode" checked={planMode} onChange={setPlanMode} disabled={!agentMode} />
+      <OptionCheck
+        label="tell the model it has no tools"
+        displayLabel="no tools"
+        checked={noTools}
+        onChange={setNoTools}
+        disabled={agentMode}
+      />
+    </>
+  );
+  const modelCorner = (
+    <ModelPicker modality="text" value={chosenText} onChange={setModel} openNonce={pickerNonce} />
+  );
+
   return (
-    <div className="mx-auto flex h-full max-w-6xl flex-col" data-testid="assistant-column">
-      <div className="mb-2 flex items-center gap-3">
-        <h1 className="text-[20px] font-semibold">Assistant</h1>
-        <div className="ml-auto flex gap-1 rounded border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-          {(["text", "image"] as const).map((t) => (
+    // Full width, not `max-w-6xl`: at this app's 13px root font 6xl is ~940px, which is what made
+    // the screen read as a narrow strip — the mock runs the assistant edge to edge inside the
+    // shell's padding.
+    <div className="flex h-full w-full flex-col" data-testid="assistant-column">
+      {/* The title row carries the session features (portal from `Chat`, which owns their state —
+          the slot here is where they render) and the three tabs. Root setup moved into its own tab
+          with a folder browser, which freed this row for the session controls. */}
+      <div className="mb-3 flex items-center gap-3">
+        <h1 className="text-[16px] font-semibold tracking-tight">Assistant</h1>
+        <div ref={setSessionSlot} className="flex min-w-0 flex-1 items-center gap-2" />
+        {agentMode && root.trim() ? (
+          // In agent mode the root is the one fact the transcript can't show, so it stays visible
+          // here as a chip that opens the Root tab — the pane is one click away either way.
+          <button
+            type="button"
+            onClick={() => setTab("root")}
+            className="nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]"
+            style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+            title={`${root}${rootError ? ` — ${rootError}` : " — open the Root tab"}`}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+              <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
+            </svg>
+            <span className="max-w-[180px] truncate">{root.split("/").filter(Boolean).pop() ?? root}</span>
+          </button>
+        ) : null}
+        <StepBudget value={maxIterations} onChange={setMaxIterations} disabled={!agentMode} />
+        <div className="ml-auto flex gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+          {(["text", "image", "root"] as const).map((t) => (
             <button
               key={t}
               onClick={() => setTab(t)}
-              className="rounded px-2.5 py-1 text-[12px]"
+              className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
               style={tab === t ? { background: "var(--surface-2)", color: "var(--text)" } : { color: "var(--text-dim)" }}
             >
-              {t === "text" ? "Chat" : "Image"}
+              {t === "text" ? "Chat" : t === "image" ? "Image" : "Root"}
             </button>
           ))}
         </div>
-      </div>
-      <div className="mb-3 flex flex-wrap items-center gap-x-4 gap-y-1.5">
-        <OptionCheck label="agent mode" checked={agentMode} onChange={setAgentMode} />
-        <OptionCheck label="memory" checked={useMemory} onChange={setUseMemory} />
-        <OptionCheck
-          label="tell the model it has no tools"
-          checked={noTools}
-          onChange={setNoTools}
-          disabled={agentMode}
-        />
-        <StepBudget
-          value={maxIterations}
-          onChange={setMaxIterations}
-          disabled={!agentMode}
-        />
-        <ApprovalPicker
-          mode={approvalMode}
-          onChange={setApprovalMode}
-          disabled={!agentMode}
-        />
-        <OptionCheck
-          label="plan mode"
-          checked={planMode}
-          onChange={setPlanMode}
-          disabled={!agentMode}
-        />
       </div>
       {agentMode && planMode && (
         // The pairing is the whole reason this appears: plan mode subtracts permissions and never
         // grants them, so a plan pass that reads without being clicked through needs the mode
         // above it to say so. Without this line the user gets asked about every read and reads
         // that as plan mode being broken.
-        <p className="-mt-2 mb-2 text-[11px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
+        <p className="-mt-1.5 mb-2 text-[11px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
           Plan mode refuses every write, whatever the approval mode. Pair it with “auto-approve reads”
           for a pass that explores without asking.
         </p>
@@ -813,8 +877,11 @@ export function AssistantScreen() {
           agentSystemPrompt={customAgentSystem || undefined}
           root={root}
           rootError={rootError}
-          defaultRoot={defaultRoot}
-          onRootChange={setRoot}
+          chosen={chosenText}
+          onOpenModelPicker={() => setPickerNonce((n) => n + 1)}
+          toolbar={runToolbar}
+          corner={modelCorner}
+          sessionSlot={sessionSlot}
           onEditPrompts={() => setEditingPrompt("system")}
           onSwitchToImageTab={() => setTab("image")}
           active={tab === "text"}
@@ -822,6 +889,14 @@ export function AssistantScreen() {
       </div>
       <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
         <ImageBox />
+      </div>
+      <div className={tab === "root" ? "min-h-0 flex-1" : "hidden"}>
+        <RootPane
+          root={root}
+          rootError={rootError}
+          sandboxPolicy={sandboxPolicy}
+          onSetRoot={setRoot}
+        />
       </div>
       {editingPrompt !== null && (
         <SystemPromptEditor
@@ -1004,6 +1079,199 @@ function AssistantContent({ raw }: { raw: string }) {
 }
 
 /**
+ * The empty-state suggestion cards. Each carries the prompt it will drop into the draft — the
+ * visible text names the task, the prompt is what actually lands in the composer (via
+ * `ComposerProps.seed`), so the card's copy and the model's instructions can say different things
+ * without either lying.
+ */
+const SUGGESTIONS: readonly { icon: string; title: string; blurb: string; prompt: string }[] = [
+  {
+    icon: "code",
+    title: "Explain this codebase",
+    blurb: "Get a clear explanation of how this project works.",
+    prompt: "Explain this codebase: what it does, how it is structured, and where the key entry points are.",
+  },
+  {
+    icon: "bug",
+    title: "Find and fix a bug",
+    blurb: "Locate issues and propose fixes with code changes.",
+    prompt: "Find a bug in this project, explain the root cause, and propose a fix with code changes.",
+  },
+  {
+    icon: "doc",
+    title: "Summarize recent changes",
+    blurb: "Review commits, PRs, or file updates.",
+    prompt: "Summarize recent changes in this workspace: commits, pull requests, or file updates.",
+  },
+];
+
+/** The card glyphs, kept inline rather than an icon file for three paths. */
+function SuggestionIcon({ name }: { name: string }) {
+  const paths: Record<string, ReactNode> = {
+    code: <path d="m8.5 8-4 4 4 4m7-8 4 4-4 4M13.5 5l-3 14" />,
+    bug: (
+      <>
+        <circle cx="12" cy="13" r="5" />
+        <path d="M12 8V6.5M8.5 9 6.5 7m11 2 2-2M7 13H4.5m15 0H17M8.5 17l-2 2m11-2 2 2" />
+      </>
+    ),
+    doc: <path d="M7 3.5h7l4 4V20.5H7v-17Zm7 0v4h4M10 12h5m-5 3.5h5" />,
+  };
+  return (
+    <svg
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.6"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="h-[18px] w-[18px]"
+      aria-hidden="true"
+    >
+      {paths[name] ?? paths.doc}
+    </svg>
+  );
+}
+
+/**
+ * The Root tab: set the agent's workspace root by browsing instead of typing.
+ *
+ * The browser walks the real filesystem through `tools_list_dirs` — immediate child directories
+ * only, one level per click — which exists precisely because the sandboxed `list_dir` must never
+ * escape the current root. Typing a path stays available above the browser: some roots are faster
+ * typed than clicked to, and the input is the same controlled value the rest of the screen reads.
+ */
+function RootPane({
+  root,
+  rootError,
+  sandboxPolicy,
+  onSetRoot,
+}: {
+  root: string;
+  rootError: string | null;
+  sandboxPolicy: ToolsPolicy | null;
+  onSetRoot: (path: string) => void;
+}) {
+  const parentOf = (p: string) => {
+    const t = p.replace(/\/+$/, "");
+    const i = t.lastIndexOf("/");
+    return i <= 0 ? "/" : t.slice(0, i) || "/";
+  };
+  // Start the browse at the current root's parent, so the first thing you see is the folder you
+  // are already in, among its siblings — the fastest route to "somewhere next to where I was".
+  const [browsePath, setBrowsePath] = useState(() => parentOf(root.trim() || "/"));
+  const [dirs, setDirs] = useState<string[] | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setDirs(null);
+    setLoadError(null);
+    invoke<string[]>("tools_list_dirs", { path: browsePath })
+      .then((d) => {
+        if (!cancelled) setDirs(d);
+      })
+      .catch((e) => {
+        if (!cancelled) setLoadError(String(e));
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [browsePath]);
+
+  const here = browsePath === root.trim();
+
+  return (
+    <div className="mx-auto flex w-full max-w-3xl flex-col gap-4" data-testid="root-pane">
+      <div className="flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-dim)" }}>
+        <span className="shrink-0">Root:</span>
+        <input
+          value={root}
+          onChange={(e) => onSetRoot(e.target.value)}
+          placeholder="/absolute/path"
+          title={rootError ?? "Workspace root the agent's tools are confined to"}
+          className="min-w-0 flex-1 rounded border px-2 py-1 text-[12px]"
+          style={rootError ? { ...inputStyle, borderColor: "var(--danger)" } : inputStyle}
+          aria-invalid={rootError ? true : undefined}
+        />
+      </div>
+      {rootError ? (
+        <p className="-mt-2 text-[11px]" style={{ color: "var(--danger)" }} data-testid="root-pane-error">{rootError}</p>
+      ) : (
+        <p className="-mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+          An absolute path. Agent tools — reading, writing, shell — are confined to this folder; {sandboxPolicy ? `the sandbox allows ${sandboxPolicy.programs.length} programs, capped at ${Math.round(sandboxPolicy.max_command_ms / 100) / 10}s per command.` : "the sandbox allowlist applies inside it."}
+        </p>
+      )}
+      <div className="rounded-xl border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+        <div className="flex items-center gap-2 border-b px-3 py-2" style={{ borderColor: "var(--border)" }}>
+          <button
+            type="button"
+            onClick={() => setBrowsePath(parentOf(browsePath))}
+            disabled={browsePath === "/"}
+            aria-label="Go up one level"
+            title="Parent folder"
+            className="nav-icon-btn flex h-7 w-7 shrink-0 items-center justify-center rounded-md disabled:opacity-40"
+            style={{ color: "var(--text-dim)" }}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5" aria-hidden="true">
+              <path d="M12 19V5m-6 6 6-6 6 6" />
+            </svg>
+          </button>
+          <span className="mono min-w-0 flex-1 truncate text-[12px]" title={browsePath}>
+            {browsePath}
+          </span>
+          <button
+            type="button"
+            onClick={() => onSetRoot(browsePath)}
+            disabled={here}
+            className={`nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[11px] disabled:opacity-60`}
+            style={here ? { borderColor: "var(--border)", color: "var(--success)" } : { borderColor: "var(--border)", color: "var(--accent)" }}
+          >
+            {here ? (
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+                <path d="m4.5 12.5 5 5 10-11" />
+              </svg>
+            ) : null}
+            {here ? "Current root" : "Set as root"}
+          </button>
+        </div>
+        <div className="grid max-h-[340px] grid-cols-2 gap-1 overflow-y-auto p-2 sm:grid-cols-3">
+          {dirs === null && !loadError && (
+            <div className="col-span-full px-2 py-3">
+              <span className="spinner" role="status" aria-label="Listing folders" />
+            </div>
+          )}
+          {loadError && (
+            <p className="col-span-full px-2 py-3 text-[11px]" style={{ color: "var(--danger)" }}>
+              {loadError}
+            </p>
+          )}
+          {dirs?.map((d) => (
+            <button
+              key={d}
+              type="button"
+              onClick={() => setBrowsePath(`${browsePath === "/" ? "" : browsePath}/${d}`)}
+              className="nav-item flex items-center gap-1.5 rounded-lg px-2 py-1.5 text-left text-[12px]"
+              style={{ color: "var(--text-dim)" }}
+            >
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5 shrink-0" style={{ color: "var(--accent)" }} aria-hidden="true">
+                <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
+              </svg>
+              <span className="truncate">{d}</span>
+            </button>
+          ))}
+          {dirs?.length === 0 && (
+            <p className="col-span-full px-2 py-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              No subfolders here — this is a leaf. Set it as the root, or go up a level.
+            </p>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/**
  * `noTools`, `agentMode`, `useMemory` and `root` are owned by `AssistantScreen`, which renders
  * the switches under the title and persists all four as settings. `Chat` only consumes them —
  * one source of truth, and a tab switch cannot silently reset what the user chose.
@@ -1025,8 +1293,11 @@ function Chat({
   agentSystemPrompt,
   root,
   rootError,
-  defaultRoot,
-  onRootChange,
+  chosen,
+  onOpenModelPicker,
+  toolbar,
+  corner,
+  sessionSlot,
   onEditPrompts,
   onSwitchToImageTab,
   active,
@@ -1053,8 +1324,22 @@ function Chat({
   agentSystemPrompt?: string;
   root: string;
   rootError: string | null;
-  defaultRoot: string | null;
-  onRootChange: (v: string) => void;
+  /** The resolved text model (explicit pick or store default), owned by `AssistantScreen` so the
+   *  composer's toolbar and this transcript can never disagree about where a turn goes. */
+  chosen: string;
+  /** Opens the picker from outside (`/model`). The picker itself lives in the toolbar; Chat only
+   *  triggers it. */
+  onOpenModelPicker: () => void;
+  /** The run controls (mode toggles) rendered into the composer's action row — built by
+   *  `AssistantScreen`, which owns their state; see `ComposerProps.toolbar`. */
+  toolbar?: ReactNode;
+  /** The model picker, pinned to the composer's top-right corner; see `ComposerProps.corner`. */
+  corner?: ReactNode;
+  /**
+   * The title row's session slot: when present, this component's session controls portal into it
+   * (see `sessionControls`). `HTMLDivElement | null` — null until the title row has committed.
+   */
+  sessionSlot: HTMLDivElement | null;
   onEditPrompts: () => void;
   /** Switch the AssistantScreen to the Image tab (`/image`). */
   onSwitchToImageTab: () => void;
@@ -1067,7 +1352,12 @@ function Chat({
   // P8: the composer, so a shortcut (and the palette's "Focus the composer") can put the caret in
   // it without reaching into the DOM by id.
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
-  const [model, setModel] = useState("");
+  // The empty-state suggestion cards fill the draft through this. `{ text, nonce }` claimed by the
+  // composer (see `ComposerProps.seed`); bumping the nonce re-fills even when the text is identical,
+  // which is what clicking the same card twice has to do.
+  const [seed, setSeed] = useState<{ text: string; nonce: number } | undefined>(undefined);
+  // (`model` lives in `AssistantScreen` now — see the note on the `chosen` prop — so the Run
+  // configuration card and this transcript cannot disagree about where a turn goes.)
   const [msgs, setMsgs] = useState<Msg[]>(() => {
     const resume = useUi.getState().resumeTranscript;
     if (resume) {
@@ -1092,9 +1382,6 @@ function Chat({
   const [draftText, setDraftText] = useState("");
   /** A one-line notice: a refused attachment, a mention that matched nothing. */
   const [notice, setNotice] = useState<string | null>(null);
-  /** Bumped by `/model` to open the picker, which owns its own open state. */
-  const [pickerNonce, setPickerNonce] = useState(0);
-  const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (choice: ApprovalChoice) => void } | null>(null);
   /**
    * P5: the trust the user has granted from the approval modal — this tool, or everything.
@@ -1111,7 +1398,6 @@ function Chat({
   const [runChanges, setRunChanges] = useState<RunChangeSet | null>(null);
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
-  const [showPolicy, setShowPolicy] = useState(false);
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
   // `unpricedRows`/`rows` are the honesty inputs for the cost figure: a total that silently skips
@@ -1273,12 +1559,6 @@ function Chat({
     return () => window.removeEventListener("keydown", onKey);
   }, [active]);
 
-  // Surface the live sandbox allowlist once when agent mode is first enabled.
-  useEffect(() => {
-    if (!agentMode || policy) return;
-    void fetchToolsPolicy().then(setPolicy).catch(() => setPolicy(null));
-  }, [agentMode, policy]);
-
   // Sticky follow. Auto-scrolling on every token made reading scrollback mid-stream impossible —
   // the view snapped back down before you could read a line. Now we follow only while the user is
   // already at the bottom; scrolling up detaches, and a "jump to latest" pill re-attaches. The
@@ -1312,8 +1592,6 @@ function Chat({
     stickToBottom();
   }, [msgs, streamedText, agentItems, stickToBottom]);
 
-  const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
-  const chosen = model || def;
   // P7: context window for the chosen model — looked up from the catalog. A qualified id
   // `slug/native` needs to resolve the provider to find the catalog row; a bare id scans all carriers.
   const modelWindow = useMemo(() => {
@@ -1996,144 +2274,184 @@ function Chat({
     }
   }, [busy, msgs, modelWindow, chosen]);
 
+  // The session controls, extracted from the old in-Chat session bar so they can portal into the
+  // title row. Their state stays here on purpose: a session is its transcript — New/reset,
+  // resume, and the per-session title are all operations on `msgs` and `sessionId`, which only
+  // this component owns.
+  const sessionControls = (
+    <>
+      {renaming ? (
+        <input
+          autoFocus
+          value={titleDraft}
+          onChange={(e) => setTitleDraft(e.target.value)}
+          onBlur={commitTitle}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commitTitle();
+            if (e.key === "Escape") setRenaming(false);
+          }}
+          placeholder="name this session…"
+          aria-label="Session title"
+          className="min-w-0 flex-1 rounded border px-2 py-0.5 text-[12px]"
+          style={inputStyle}
+        />
+      ) : (
+        <button
+          type="button"
+          className="nav-item min-w-0 flex-1 truncate rounded-md px-1 py-0.5 text-left text-[15px] font-semibold tracking-tight"
+          style={{ color: sessionTitle ? "var(--text)" : "var(--text-faint)" }}
+          onClick={() => {
+            setTitleDraft(sessionTitle);
+            setRenaming(true);
+          }}
+          title="Click to name this session"
+        >
+          {sessionTitle || "untitled session — click to name it"}
+          {/* aria-hidden: the glyph is decoration, and the specs click this button by its exact
+              accessible name — a named "✎" would break `exact: true` matching. */}
+          <span className="ml-1.5 text-[12px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
+            ✎
+          </span>
+        </button>
+      )}
+      <div className="relative shrink-0">
+        <Button
+          variant="ghost"
+          ariaLabel="Switch session"
+          onClick={() => {
+            refreshSessions();
+            setSwitcherOpen((v) => !v);
+          }}
+        >
+          Sessions ▾
+        </Button>
+        {switcherOpen && (
+          <>
+            <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
+            <div
+              className="absolute right-0 top-8 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
+              style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+              role="menu"
+              aria-label="Recent sessions"
+            >
+              {sessions.length === 0 ? (
+                <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+                  No sessions recorded yet — this one appears once a turn is sent.
+                </p>
+              ) : (
+                sessions.map((s) => (
+                  <button
+                    key={s.session_id}
+                    role="menuitem"
+                    className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
+                    style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
+                    onClick={() => void openSession(s.session_id)}
+                    title={s.title || s.preview}
+                  >
+                    <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
+                    <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
+                      {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
+                    </span>
+                  </button>
+                ))
+              )}
+            </div>
+          </>
+        )}
+      </div>
+      <Button variant="ghost" onClick={newChat} disabled={busy} ariaLabel="Start a new chat">
+        ＋ New
+      </Button>
+    </>
+  );
+
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      {/* Session bar (Phase 4): which conversation this is, what it is called, and how to start or
-          switch one without leaving the screen. */}
-      <div className="mb-2 flex items-center gap-2">
-        {renaming ? (
-          <input
-            autoFocus
-            value={titleDraft}
-            onChange={(e) => setTitleDraft(e.target.value)}
-            onBlur={commitTitle}
-            onKeyDown={(e) => {
-              if (e.key === "Enter") commitTitle();
-              if (e.key === "Escape") setRenaming(false);
-            }}
-            placeholder="name this session…"
-            aria-label="Session title"
-            className="min-w-0 flex-1 rounded border px-2 py-0.5 text-[12px]"
-            style={inputStyle}
-          />
-        ) : (
-          <button
-            type="button"
-            className="min-w-0 flex-1 truncate text-left text-[12px]"
-            style={{ color: sessionTitle ? "var(--text)" : "var(--text-faint)" }}
-            onClick={() => {
-              setTitleDraft(sessionTitle);
-              setRenaming(true);
-            }}
-            title="Click to name this session"
-          >
-            {sessionTitle || "untitled session — click to name it"}
-          </button>
-        )}
-        <div className="relative shrink-0">
-          <Button
-            variant="ghost"
-            ariaLabel="Switch session"
-            onClick={() => {
-              refreshSessions();
-              setSwitcherOpen((v) => !v);
-            }}
-          >
-            Sessions ▾
-          </Button>
-          {switcherOpen && (
-            <>
-              <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
-              <div
-                className="absolute right-0 top-8 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
-                style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-                role="menu"
-                aria-label="Recent sessions"
-              >
-                {sessions.length === 0 ? (
-                  <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-                    No sessions recorded yet — this one appears once a turn is sent.
-                  </p>
-                ) : (
-                  sessions.map((s) => (
-                    <button
-                      key={s.session_id}
-                      role="menuitem"
-                      className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
-                      style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
-                      onClick={() => void openSession(s.session_id)}
-                      title={s.title || s.preview}
-                    >
-                      <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
-                      <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
-                        {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
-                      </span>
-                    </button>
-                  ))
-                )}
-              </div>
-            </>
-          )}
-        </div>
-        <Button variant="ghost" onClick={newChat} disabled={busy} ariaLabel="Start a new chat">
-          ＋ New
-        </Button>
-      </div>
+      {/* Session features (Phase 4): which conversation this is, what it is called, and how to
+          start or switch one — portaled into the title row's slot, where the user asked them to
+          live. The portal keeps both truths intact: the DOM sits up in the chrome, the state (the
+          transcript a New or resume acts on) stays here in `Chat`. */}
+      {sessionSlot && createPortal(sessionControls, sessionSlot)}
 
-      <div className="mb-2 flex items-center gap-2">
-        <ModelPicker modality="text" value={chosen} onChange={setModel} openNonce={pickerNonce} />
-        <span className="mono text-[11px]" style={{ color: "var(--text-faint)" }}>{chosen || "—"}</span>
-        {/* The switches are under the title now (AssistantScreen) — this row is per-request
-            only: what this message is sent to. */}
-      </div>
-
-      {agentMode && (
-        <div className="mb-2">
-          <div className="flex items-center gap-2">
-            <span className="shrink-0 text-[11px]" style={{ color: "var(--text-dim)" }}>root</span>
-            <input
-              value={root}
-              onChange={(e) => onRootChange(e.target.value)}
-              placeholder="/absolute/path the tools are confined to"
-              className={`${inputCls} flex-1`}
-              style={rootError ? { ...inputStyle, borderColor: "var(--danger)" } : inputStyle}
-              aria-invalid={rootError ? true : undefined}
-            />
-          </div>
-          {rootError ? (
-            <p className="mt-1 text-[11px]" style={{ color: "var(--danger)" }}>{rootError}</p>
-          ) : root.trim() && root.trim() === defaultRoot ? (
-            // Say it is the default. A filled field the user did not fill is otherwise
-            // indistinguishable from one they did, and the agent will write there.
-            <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
-              default workspace — tools are confined to this folder
-            </p>
-          ) : null}
-        </div>
-      )}
-      {agentMode && policy && (
-        // `--text-dim`, not `--text-faint`: this line states the actual limits a run is held to, and
-        // a reviewer reading a screenshot of the screen called it "nearly illegible" (2026-10-01) —
-        // a policy nobody can read is not a policy that was disclosed.
-        <div className="mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-          <button className="underline decoration-dotted" onClick={() => setShowPolicy((v) => !v)}>
-            sandbox · {policy.programs.length} programs · git without push/pull/fetch/clone · capped at {policy.max_command_ms}ms · {policy.max_output_bytes / 1024}KB out
-          </button>
-          {showPolicy && (
-            <div className="mono mt-1 break-all">{policy.programs.join(", ")}</div>
-          )}
-        </div>
-      )}
-
+      {/* The model row and the workspace-root field moved up into the Run configuration card
+          (AssistantScreen): the picker, the provider chip and the sandbox facts are one column
+          there, and this transcript starts directly under the session bar. */}
       <div className="relative min-h-0 flex-1">
         <div
           ref={listRef}
           onScroll={onListScroll}
-          className="h-full overflow-y-auto rounded-md border p-3"
-          style={{ background: "var(--surface)", borderColor: "var(--border)" }}
+          // Borderless, like the mock: the conversation floats on the background instead of sitting
+          // in a boxed panel, so the chat area owns its full height and the hero centers in it.
+          className="h-full overflow-y-auto px-1"
         >
         {msgs.length === 0 && !busy && (
-          <EmptyState title="Try any routed model. Text streams through the router — rotation and failover are silent; the line below the answer shows what actually happened." />
+          // The empty state (mock: "What would you like to build?"). One staggered entrance via
+          // `.aip-rise`, then static — a transcript that replays its own animation on every store
+          // bump would read as broken. The wrapper centers with `m-auto` rather than
+          // `justify-center`: center-justified content taller than the scroll panel clips its TOP
+          // out of scroll reach, which is exactly where the headline lives. `m-auto` keeps the
+          // centering when it fits and degrades to top-aligned scroll when it does not. The hint
+          // line states what actually happens on this screen: the answer streams, and the trace
+          // line under it names the routed provider and any fallbacks — which is why "rotation and
+          // failover are silent" from the old copy survives as "routed provider … appear below each
+          // answer" rather than being dropped.
+          <div className="flex min-h-full flex-col">
+            {/* Compact vertical rhythm: the whole hero has to fit inside the chat area on a
+                ~1000px-tall window, or the cards clip against the composer. The `m-auto` wrapper
+                still centers it when it fits and degrades to scroll when it cannot. */}
+            <div className="m-auto flex w-full max-w-3xl flex-col items-center px-4 py-5 text-center">
+            <div
+              className="aip-rise hero-glow mb-4 flex h-12 w-12 items-center justify-center rounded-2xl border"
+              style={{ borderColor: "var(--border)" }}
+              aria-hidden="true"
+            >
+              <svg
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="var(--accent)"
+                strokeWidth="1.6"
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                className="h-5 w-5"
+              >
+                <path d="M4 5.5h13v9H9l-5 4v-13Z" />
+                <path d="m17.5 14.5 1 2.4 2.4 1-2.4 1-1 2.4-1-2.4-2.4-1 2.4-1 1-2.4Z" fill="var(--accent)" stroke="none" />
+              </svg>
+            </div>
+            <h2 className="aip-rise aip-rise-1 text-[22px] font-semibold tracking-tight">
+              What would you like to build?
+            </h2>
+            <p className="aip-rise aip-rise-1 mt-1 text-[13px]" style={{ color: "var(--text-dim)" }}>
+              Ask a question, run a task, or work with files in your project.
+            </p>
+            <div className="aip-rise aip-rise-2 mt-5 grid w-full max-w-3xl gap-3 sm:grid-cols-3">
+              {SUGGESTIONS.map((s) => (
+                <button
+                  key={s.title}
+                  type="button"
+                  onClick={() => setSeed({ text: s.prompt, nonce: Date.now() })}
+                  className="nav-item rounded-xl border p-3.5 text-left transition-transform enabled:active:scale-[0.99]"
+                  style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+                >
+                  <span className="mb-2.5 flex h-8 w-8 items-center justify-center rounded-lg" style={{ background: "var(--accent-soft)", color: "var(--accent)" }}>
+                    <SuggestionIcon name={s.icon} />
+                  </span>
+                  <span className="block text-[13px] font-semibold">{s.title}</span>
+                  <span className="mt-1 block text-[12px] leading-snug" style={{ color: "var(--text-dim)" }}>
+                    {s.blurb}
+                  </span>
+                </button>
+              ))}
+            </div>
+            <p className="aip-rise aip-rise-3 mt-4 flex items-center gap-1.5 text-[12px]" style={{ color: "var(--text-faint)" }}>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" className="h-3.5 w-3.5" aria-hidden="true">
+                <circle cx="12" cy="12" r="8.5" />
+                <path d="M12 11v5m0-8.5h.01" />
+              </svg>
+              Responses stream live; routed provider and tool activity appear below each answer.
+            </p>
+            </div>
+          </div>
         )}
         {msgs.map((m, i) =>
           // A tool turn already shown inside its turn's group card: rendering it again here is what
@@ -2222,7 +2540,10 @@ function Chat({
           </div>
         ))}
         </div>
-        {!atBottom && (
+        {/* `msgs.length > 0` — an empty transcript's hero is taller than the chat area on short
+            windows, which detached the scroll anchor and floated this pill over the suggestion
+            cards. There is nothing to jump to until the first message exists. */}
+        {!atBottom && msgs.length > 0 && (
           <button
             type="button"
             onClick={jumpToLatest}
@@ -2299,7 +2620,65 @@ function Chat({
           `root` does: hydration finishes after this component has already mounted, so a local copy
           seeded from the prop at mount would ignore everything the stored settings said and show a
           blank field where the user's saved value belongs. */}
-      <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px]" style={{ color: "var(--text-dim)" }}>
+      {/* The per-request readouts (temp, max tokens, context meter, ledger totals) and the
+          model/sandbox chips moved below the composer — the mock's status strip. Above the
+          composer only the transcript's own notices remain. */}
+
+
+      {/* P3: the composer owns the draft, the attachments and the two menus. It is disabled — not
+          hidden — when the turn cannot run, so the reason stays visible next to a live box. */}
+      {(notice || (agentMode && (!root.trim() || !!rootError))) && (
+        <p className="mt-2 text-[11px]" style={{ color: notice ? "var(--warn)" : "var(--danger)" }} data-testid="composer-notice">
+          {notice ?? "Set a workspace root before using agent mode."}
+        </p>
+      )}
+      <div className="mt-2">
+        <Composer
+          textareaRef={inputRef}
+          busy={busy}
+          agentMode={agentMode}
+          vision={chosenVision}
+          modelLabel={chosen || "the current model"}
+          onSend={send}
+          onStop={() => abortRef.current?.abort()}
+          onClear={newChat}
+          onOpenModelPicker={onOpenModelPicker}
+          onSwitchToImageTab={onSwitchToImageTab}
+          onCompact={() => void compactNow()}
+          listFiles={mentionHost ? listWorkspaceFiles : null}
+          readFile={mentionHost ? readWorkspaceFile : null}
+          onNotice={setNotice}
+          onDraftChange={setDraftText}
+          seed={seed}
+          toolbar={toolbar}
+          corner={corner}
+          sendDisabled={!chosen || (agentMode && (!root.trim() || !!rootError))}
+        />
+      </div>
+
+      {/* The status strip (mock): what this run will use and what it has cost, under the composer.
+          The chips at left are state; the meters at right are the same context/ledger readouts the
+          params row above the composer used to carry — moved, not lost, and every control in it
+          keeps the aria-label it had. */}
+      <div
+        className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1 rounded-lg border px-3 py-1.5 text-[11px]"
+        style={{ borderColor: "var(--border)", background: "var(--surface)", color: "var(--text-dim)" }}
+      >
+        {/* The routed badge moved here from the old card's Model & Provider column: a bare model
+            id is the only form failover can act on, and the strip is where per-request facts live. */}
+        {!chosen.includes("/") && chosen ? (
+          <span
+            className="flex items-center gap-1 rounded-md border px-1.5 py-0.5"
+            style={{ borderColor: "var(--border)", color: "var(--success)" }}
+            title="A bare model id lets the router plan every enabled carrier and fail over between them"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+              <path d="m4.5 12.5 5 5 10-11" />
+            </svg>
+            Routed (failover enabled)
+          </span>
+        ) : null}
+        <span className="h-4 w-px" style={{ background: "var(--border)" }} aria-hidden="true" />
         <label className="flex items-center gap-1">
           temp
           <input
@@ -2315,7 +2694,7 @@ function Chat({
             placeholder="default"
             disabled={busy}
             aria-label="Temperature for this request (blank uses the provider default)"
-            className="mono w-16 rounded border px-1 py-0.5 text-[11px]"
+            className="mono no-spin w-16 rounded border px-1 py-0.5 text-[11px]"
             style={inputStyle}
           />
         </label>
@@ -2333,7 +2712,7 @@ function Chat({
             placeholder="default"
             disabled={busy}
             aria-label="Maximum response tokens for this request (blank uses the provider default)"
-            className="mono w-20 rounded border px-1 py-0.5 text-[11px]"
+            className="mono no-spin w-20 rounded border px-1 py-0.5 text-[11px]"
             style={inputStyle}
           />
         </label>
@@ -2390,35 +2769,6 @@ function Chat({
         >
           Σ {formatTokens(sessionTokensIn)} in · {formatTokens(sessionTokensOut)} out · {costLabel}
         </span>
-      </div>
-
-
-      {/* P3: the composer owns the draft, the attachments and the two menus. It is disabled — not
-          hidden — when the turn cannot run, so the reason stays visible next to a live box. */}
-      {(notice || (agentMode && (!root.trim() || !!rootError))) && (
-        <p className="mt-2 text-[11px]" style={{ color: notice ? "var(--warn)" : "var(--danger)" }} data-testid="composer-notice">
-          {notice ?? "Set a workspace root before using agent mode."}
-        </p>
-      )}
-      <div className="mt-2">
-        <Composer
-          textareaRef={inputRef}
-          busy={busy}
-          agentMode={agentMode}
-          vision={chosenVision}
-          modelLabel={chosen || "the current model"}
-          onSend={send}
-          onStop={() => abortRef.current?.abort()}
-          onClear={newChat}
-          onOpenModelPicker={() => setPickerNonce((n) => n + 1)}
-          onSwitchToImageTab={onSwitchToImageTab}
-          onCompact={() => void compactNow()}
-          listFiles={mentionHost ? listWorkspaceFiles : null}
-          readFile={mentionHost ? readWorkspaceFile : null}
-          onNotice={setNotice}
-          onDraftChange={setDraftText}
-          sendDisabled={!chosen || (agentMode && (!root.trim() || !!rootError))}
-        />
       </div>
 
       {pendingConfirm && (
@@ -2695,15 +3045,22 @@ function ApprovalPicker({
 }) {
   const current = APPROVAL_MODES.find((m) => m.id === mode) ?? APPROVAL_MODES[0]!;
   return (
-    <label className="flex flex-wrap items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
-      <span>approval</span>
+    // The run toolbar's approval control: the named choice inline with the toggles, its
+    // consequence carried by the tooltip rather than a visible hint line — the row has no room
+    // for a sentence, and hiding it here would be worse than shortening it.
+    <label
+      className={`flex items-center gap-1.5 text-[11px] ${disabled ? "opacity-50" : ""}`}
+      style={{ color: "var(--text-dim)" }}
+      title={current.hint}
+    >
+      <span>Approval mode</span>
       <select
         value={mode}
         disabled={disabled}
         onChange={(e) => onChange(e.target.value as ApprovalMode)}
         aria-label="How agent tool calls are approved"
         data-testid="approval-mode"
-        className="mono rounded border px-1 py-0.5 text-[11px] disabled:opacity-40"
+        className="mono max-w-[150px] rounded-md border px-1.5 py-0.5 text-[11px] disabled:opacity-40"
         style={inputStyle}
       >
         {APPROVAL_MODES.map((m) => (
@@ -2712,9 +3069,6 @@ function ApprovalPicker({
           </option>
         ))}
       </select>
-      <span style={{ color: "var(--text-faint)" }} title={current.hint}>
-        {current.hint}
-      </span>
     </label>
   );
 }
