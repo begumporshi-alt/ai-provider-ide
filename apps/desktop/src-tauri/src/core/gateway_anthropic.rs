@@ -309,10 +309,13 @@ fn tool_choice_to_openai(tc: &Value) -> Option<Value> {
     }
 }
 
+/// Map a finish reason from the **OpenAI vocabulary** (what the interpreter produces, via a
+/// dialect's `responseFinishMap`) onto Anthropic's `stop_reason` for this client.
 fn anthropic_stop_reason(cls: Option<&str>) -> &'static str {
     match cls {
         Some("length") => "max_tokens",
-        Some("tool_use") => "tool_use",
+        Some("tool_use") | Some("tool_calls") => "tool_use",
+        Some("content_filter") => "refusal",
         _ => "end_turn",
     }
 }
@@ -397,6 +400,9 @@ pub(crate) async fn messages_h(
                 .data(json!({ "type": "content_block_start", "index": 0, "content_block": { "type": "text", "text": "" } }).to_string()));
             let mut usage: Option<(u64, u64)> = None;
             let mut has_tool_calls = false;
+            // The provider's reason, in the OpenAI vocabulary the interpreter produced; turned back
+            // into Anthropic's word for this client at the terminal event.
+            let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -406,6 +412,7 @@ pub(crate) async fn messages_h(
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
+                    BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
                         if let Some(p) = &prep {
                             let _ = finish_capture(p, &streamed);
@@ -489,7 +496,13 @@ pub(crate) async fn messages_h(
             // run the tools it declared, and `message_stop` is how it knows the turn ended at
             // all. Both used to be skipped on exactly the turn where they mattered, so a
             // streaming agent loop stopped after one step with no error anywhere.
-            let stop_reason = if has_tool_calls { "tool_use" } else { "end_turn" };
+            let stop_reason = if has_tool_calls {
+                "tool_use"
+            } else {
+                // The provider's own reason when it declared one — a `max_tokens` truncation must
+                // reach an Anthropic client as `max_tokens`, not `end_turn` (drift D86).
+                anthropic_stop_reason(finish_reason.as_deref())
+            };
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
                 .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
                     "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
@@ -508,6 +521,7 @@ pub(crate) async fn messages_h(
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
     let mut tool_content_blocks: Vec<Value> = Vec::new();
     let mut has_tool_calls = false;
+    let mut finish_reason: Option<String> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => {
@@ -519,6 +533,7 @@ pub(crate) async fn messages_h(
                 full.push_str(&t);
             }
             BridgeMsg::Result(_) => {}
+            BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {
                 tracing::info!(request_id = id, full_len = full.len(), "anthropic non-stream done");
                 if let Some(p) = &prep {
@@ -593,7 +608,7 @@ pub(crate) async fn messages_h(
                 json!({
                     "id": msg_id, "type": "message", "role": "assistant",
                     "content": content,
-                    "model": model, "stop_reason": anthropic_stop_reason(if has_tool_calls { Some("tool_use") } else { None }), "stop_sequence": null,
+                    "model": model, "stop_reason": if has_tool_calls { "tool_use" } else { anthropic_stop_reason(finish_reason.as_deref()) }, "stop_sequence": null,
                     "usage": { "input_tokens": prompt_tokens, "output_tokens": completion_tokens }
                 })
                 .to_string(),

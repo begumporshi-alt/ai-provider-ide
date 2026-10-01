@@ -86,17 +86,18 @@ use crate::core::adapter::{
     AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, StreamObservation,
     TextArgs, ToolCall,
 };
+use crate::core::dialect_shaping;
 use crate::core::engine::{AttemptError, FailureKind};
 use crate::core::http_port::{HttpError, HttpMethod, HttpPort, HttpRequest, HttpResponse};
 use crate::core::jsonpath::{select_all, select_one, JsonPathError};
 use crate::core::manifest::{
     auth_headers, collect_tool_call_deltas, emit_tool_calls, join_url, js_string_coerce,
     read_cached_tokens, render_headers, render_path, retry_after_from, truncate_utf16,
-    ManifestHttpError, PendingCalls,
+    ManifestHttpError, PendingCall, PendingCalls,
 };
 use crate::core::manifest_view::UsageKeys;
 use crate::core::manifest_view::{
-    Capabilities, Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallStream,
+    Capabilities, Condition, ManifestView, StreamSpec, TextEndpoint, ToolCallShape, ToolCallStream,
 };
 use crate::core::modality;
 use crate::core::template::{is_js_whitespace, render_template};
@@ -415,6 +416,7 @@ impl ManifestInterpreter {
                 response_format,
                 on_tool_call,
                 on_usage,
+                on_finish,
                 prompt_cache_enabled,
                 observation,
             } = args;
@@ -436,13 +438,48 @@ impl ManifestInterpreter {
             let streaming = stream && spec.is_some();
             let wants_usage = wants_usage(&self.view, ep);
 
+            // v1.1 dialect shaping (ported 2026-10-01), in the reference's own order
+            // (`manifest-interpreter.ts:599-640`): replay tool traffic into the dialect's content
+            // parts FIRST (while `tool_call_id` still names the call), then hoist/remap roles, then
+            // render the parts, then shape the tool declarations. A dialect that declares none of
+            // these gets its body unchanged — the OpenAI dialect's shapes are the internal shapes.
+            let parts = ep.content_part_templates.as_ref();
+            let shaped_messages = dialect_shaping::attach_tool_parts(
+                messages,
+                parts.and_then(|p| p.get("toolCall")).and_then(Value::as_object),
+                parts.and_then(|p| p.get("toolResult")).and_then(Value::as_object),
+            )
+            .map_err(|_| AttemptError::Transport)?;
+            let (normalized, system_content) = dialect_shaping::normalize_dialect_messages(
+                &shaped_messages,
+                ep.messages_role_map.as_ref(),
+                ep.system_field.as_deref(),
+            );
+            let dialect_messages = dialect_shaping::shape_message_content(
+                &normalized,
+                parts,
+                ep.content_field.as_deref(),
+            )
+            .map_err(|_| AttemptError::Transport)?;
+            let shaped_tools = dialect_shaping::shape_tool_declarations(
+                tools,
+                ep.tool_declaration_templates.as_ref(),
+                ep.tool_declaration_wrapper.as_ref(),
+            )
+            .map_err(|_| AttemptError::Transport)?;
+
             let mut values = Map::new();
             // A dialect may put the model in the PATH (`{{model}}`), so the segment survives the
             // move into the template values.
             let model_for_path = model.clone();
             values.insert("model".to_string(), Value::String(model));
-            values.insert("messages".to_string(), Value::Array(messages.to_vec()));
+            values.insert("messages".to_string(), Value::Array(dialect_messages));
             values.insert("stream".to_string(), Value::Bool(stream));
+            // Hoisted system content lands in the dialect's declared system field; `{{system?}}` in
+            // the template omits the field when the dialect has no system channel.
+            if let Some(system) = system_content {
+                values.insert("system".to_string(), Value::String(system));
+            }
             // `args.maxTokens ?? this.m.limits?.maxOutputTokens` — nullish, so a caller-supplied
             // zero survives and only an absent value falls through to the manifest's ceiling.
             if let Some(limit) =
@@ -453,11 +490,17 @@ impl ManifestInterpreter {
             if let Some(t) = temperature {
                 values.insert("temperature".to_string(), Value::from(t));
             }
-            if let Some(v) = tools {
-                values.insert("tools".to_string(), v.clone());
+            if let Some(v) = shaped_tools {
+                values.insert("tools".to_string(), v);
             }
             if let Some(v) = tool_choice {
-                values.insert("toolChoice".to_string(), v.clone());
+                // The dialect's own shape, per `toolChoiceMap` — NOT verbatim. An Anthropic-dialect
+                // provider (agentrouter.org) accepts `tool_choice` only as an object, so the OpenAI
+                // string `"auto"` is a 400 upstream; the map declares `{type:"auto"}` and friends.
+                // `None` omits the field entirely — the same signal as a form the map does not name.
+                if let Some(mapped) = translate_tool_choice(v, ep.tool_choice_map.as_ref()) {
+                    values.insert("toolChoice".to_string(), mapped);
+                }
             }
             if let Some(v) = response_format {
                 values.insert("responseFormat".to_string(), v.clone());
@@ -573,7 +616,7 @@ impl ManifestInterpreter {
             }
 
             if !streaming {
-                return unary_text(ep, &res.body, on_tool_call, on_usage);
+                return unary_text(ep, &res.body, on_tool_call, on_usage, on_finish);
             }
             let Some(spec) = spec else {
                 // Unreachable: `streaming` implies a spec. Written as a match rather than an
@@ -591,9 +634,11 @@ impl ManifestInterpreter {
                 cancel,
                 on_tool_call,
                 on_usage,
+                on_finish,
                 observation,
                 pending: PendingCalls::new(),
                 last_usage: None,
+                finish_reason: None,
                 end_after_emit: false,
                 finished: false,
                 flushed: false,
@@ -654,6 +699,100 @@ impl AdapterInstance for ManifestInterpreter {
 }
 
 /* --------------------------------------------------------------- text: values */
+
+/// Translate an OpenAI-shaped `tool_choice` to the dialect's own form, per the endpoint's
+/// `toolChoiceMap`. The port of `translateToolChoice` (`manifest-interpreter.ts:386-407`).
+///
+/// The internal form is the OpenAI one: the string `"none"` / `"auto"`, or an object
+/// `{type:"function", function:{name}}`. The map is keyed by those forms; a value may be a literal
+/// (Anthropic's `{type:"auto"}`) or carry `{{toolChoice.<path>}}` placeholders rendered against the
+/// source — which is how Anthropic's forced-tool form names the function.
+///
+/// **Three outcomes, and the third is the one a naive port drops:**
+///   - no map at all   → the value passes through untouched (the OpenAI dialect).
+///   - form in the map → the mapped value, rendered.
+///   - form NOT in map → `None`, i.e. omit `tool_choice` entirely.
+///
+/// The shape that forced this: agentrouter.org is the Anthropic dialect, whose `tool_choice` must be
+/// an object; the OpenAI string `"auto"` went out verbatim and the upstream refused it
+/// (`tool_choice must be an object`) on every tool-using request. Measured live 2026-10-01.
+fn translate_tool_choice(tool_choice: &Value, map: Option<&Map<String, Value>>) -> Option<Value> {
+    // No map declares this dialect's shapes → pass the OpenAI form through, which is what OpenAI
+    // itself expects. The caller's `None` (no tool_choice at all) never reaches here.
+    let Some(map) = map else {
+        return Some(tool_choice.clone());
+    };
+    let mapped = match tool_choice {
+        Value::String(s) => map.get(s.as_str()),
+        Value::Object(o) => map.get(o.get("type").and_then(Value::as_str).unwrap_or("")),
+        // A number/bool/array is not an OpenAI tool_choice form; nothing to look up.
+        _ => None,
+    }?;
+    render_tool_choice_value(mapped, tool_choice)
+}
+
+/// Render a `toolChoiceMap` value: substitute `{{toolChoice.<path>}}` placeholders against the
+/// source `tool_choice`, recursing through objects and arrays; any other string is a literal.
+///
+/// `None` means "resolved to nothing" — a placeholder whose path is absent. The reference turns that
+/// into `undefined`, which `JSON.stringify` drops from the enclosing object (and turns into `null`
+/// inside an array); this mirrors it: a dropped key in an object, `null` in an array, and — at the
+/// top level — `None`, which the caller reads as "omit `tool_choice`".
+fn render_tool_choice_value(mapped: &Value, source: &Value) -> Option<Value> {
+    match mapped {
+        Value::String(s) => match tool_choice_placeholder(s) {
+            Some(path) => {
+                let v = get_dotted(source, &path)?;
+                if v.is_null() {
+                    return None;
+                }
+                Some(v.clone())
+            }
+            None => Some(Value::String(s.clone())),
+        },
+        Value::Array(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for it in items {
+                out.push(render_tool_choice_value(it, source).unwrap_or(Value::Null));
+            }
+            Some(Value::Array(out))
+        }
+        Value::Object(o) => {
+            let mut out = Map::new();
+            for (k, v) in o {
+                // A key whose placeholder resolved to nothing is dropped, matching `JSON.stringify`.
+                if let Some(rendered) = render_tool_choice_value(v, source) {
+                    out.insert(k.clone(), rendered);
+                }
+            }
+            Some(Value::Object(out))
+        }
+        other => Some(other.clone()),
+    }
+}
+
+/// Extract `<path>` from a `{{toolChoice.<path>}}` placeholder, or `None` for any other string
+/// (including a bare literal like `"tool"`). The reference anchors the pattern
+/// (`^\{\{\s*toolChoice\.([A-Za-z0-9_.]+)\s*\}\}$`), so a string that merely *contains* a
+/// placeholder is a literal — hand-parsed here rather than pulling in the regex crate.
+fn tool_choice_placeholder(text: &str) -> Option<String> {
+    let inner = text.trim().strip_prefix("{{")?.strip_suffix("}}")?.trim();
+    let path = inner.strip_prefix("toolChoice.")?;
+    if path.is_empty() || !path.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '.') {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Resolve a dotted object path (`function.name`) against a JSON value — the subset the
+/// `{{toolChoice.<path>}}` placeholder uses. Not a general jsonpath: no `[*]`, no `$`.
+fn get_dotted<'a>(value: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = value;
+    for seg in path.split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
 
 /// `provider.auth.headers`, `content-type`, then the endpoint's own static headers — in that order,
 /// so an endpoint may override `content-type` and the source's spread does too.
@@ -760,9 +899,17 @@ struct UnaryTextStream<'a> {
     /// when it resolved to nothing. `emit_tool_calls` treats `Null` as an empty list, which is what
     /// the source's `[undefined]` amounts to.
     tool_calls: Option<Value>,
+    /// The dialect's declared block shape, when it declares one (v1.1). `emit_tool_calls` reads the
+    /// calls by it instead of the two hardcoded shapes — the difference between reading a Gemini
+    /// `functionCall` part and losing it.
+    tool_call_shape: Option<ToolCallShape>,
     usage: Option<UsageTokens>,
+    /// The finish reason, already mapped to the OpenAI vocabulary, read at construction — the source
+    /// reads it in the same place (`manifest-interpreter.ts:701-705`), after usage.
+    finish_reason: Option<String>,
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     done: bool,
 }
 
@@ -784,11 +931,15 @@ impl Stream for UnaryTextStream<'_> {
         if let Some(raw) = this.tool_calls.as_ref() {
             if let Some(cb) = this.on_tool_call.as_deref_mut() {
                 let sink: &mut dyn FnMut(ToolCall) = cb;
-                emit_tool_calls(sink, raw);
+                emit_tool_calls(sink, raw, this.tool_call_shape.as_ref());
             }
         }
         if let (Some(usage), Some(cb)) = (this.usage, this.on_usage.as_deref_mut()) {
             cb(usage);
+        }
+        // Finish reason last — the source's order is text, tool calls, usage, finish.
+        if let Some(cb) = this.on_finish.as_deref_mut() {
+            cb(this.finish_reason.clone());
         }
         Poll::Ready(None)
     }
@@ -858,6 +1009,7 @@ fn unary_text<'a>(
     body: &str,
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
 ) -> Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError> {
     let json: Value = serde_json::from_str(body).map_err(|_| AttemptError::Transport)?;
 
@@ -887,7 +1039,33 @@ fn unary_text<'a>(
         _ => None,
     };
 
-    Ok(Box::pin(UnaryTextStream { chunk, tool_calls, usage, on_tool_call, on_usage, done: false }))
+    // The finish reason, gated by the callback and the selector the same way, and mapped into the
+    // OpenAI vocabulary at the single point it is read.
+    let finish_reason = match (&ep.response_finish, on_finish.is_some()) {
+        (Some(path), true) => select_one(&json, path)
+            .map_err(|_| AttemptError::Transport)?
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty() && *s != "null")
+            .map(|s| {
+                crate::core::dialect_shaping::translate_finish_reason(
+                    s,
+                    ep.response_finish_map.as_ref(),
+                )
+            }),
+        _ => None,
+    };
+
+    Ok(Box::pin(UnaryTextStream {
+        chunk,
+        tool_calls,
+        tool_call_shape: ep.response_map.tool_call_shape.clone(),
+        usage,
+        finish_reason,
+        on_tool_call,
+        on_usage,
+        on_finish,
+        done: false,
+    }))
 }
 
 /// A usage block, or `None` when it carried nothing readable.
@@ -934,6 +1112,14 @@ struct StreamPlan {
     usage_path: Option<String>,
     /// The usage block's own field names, when the dialect does not speak OpenAI's.
     usage_keys: Option<UsageKeys>,
+    /// The dialect's declared block shape. Its `streamedAs` decides whether a `chunkMap.toolCalls`
+    /// selection holds **fragments to concatenate** (OpenAI, the default) or **whole calls** (Gemini)
+    /// — the fragment accumulator reads `function.arguments`, finds nothing on a `functionCall`
+    /// block, and would drop the call without a word.
+    tool_call_shape: Option<ToolCallShape>,
+    /// Where the dialect puts its finish reason, and how to translate its words into OpenAI's.
+    response_finish: Option<String>,
+    response_finish_map: Option<Map<String, Value>>,
     want_tool_calls: bool,
     wants_usage: bool,
 }
@@ -949,6 +1135,9 @@ impl StreamPlan {
             finish: spec.finish.clone(),
             usage_path: ep.response_map.usage.clone(),
             usage_keys: ep.response_map.usage_keys.clone(),
+            tool_call_shape: ep.response_map.tool_call_shape.clone(),
+            response_finish: ep.response_finish.clone(),
+            response_finish_map: ep.response_finish_map.clone(),
             // `Boolean(args.onToolCall && (chunkMap.toolCalls || tcs))` — no sink, no work.
             want_tool_calls: has_tool_sink
                 && (spec.chunk_map.tool_calls.is_some() || spec.tool_call_stream.is_some()),
@@ -991,12 +1180,18 @@ struct TextStream<'a> {
     cancel: &'a Cancel,
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     /// Noted per `data:` event whether or not the manifest can read it — the engine reads this
     /// only when the stream delivered nothing, which is the one case where the count and a sample
     /// of the first event are the difference between two findings with different owners.
     observation: Option<&'a mut StreamObservation>,
     pending: PendingCalls,
     last_usage: Option<PartialUsage>,
+    /// The **raw** dialect reason, collected on any chunk that carries one; mapped once at the
+    /// flush. Collected raw because `responseFinish` and `stream.finish` may name different paths
+    /// (Anthropic's `stop_reason` is top-level unary and nested under `delta` when streaming), and
+    /// both feed the same declaration.
+    finish_reason: Option<String>,
     end_after_emit: bool,
     finished: bool,
     flushed: bool,
@@ -1048,6 +1243,16 @@ impl TextStream<'_> {
                 ));
             }
         }
+        // The finish reason last — the source's `finally` order is tool calls, usage, finish.
+        if let Some(cb) = self.on_finish.as_deref_mut() {
+            let mapped = self.finish_reason.as_deref().map(|raw| {
+                crate::core::dialect_shaping::translate_finish_reason(
+                    raw,
+                    self.plan.response_finish_map.as_ref(),
+                )
+            });
+            cb(mapped);
+        }
     }
 
     /// Process one line. Mirrors the source's loop body (`:345-419`) in its exact order.
@@ -1095,7 +1300,31 @@ impl TextStream<'_> {
             } else if let Some(path) = self.plan.chunk_tool_calls.as_ref() {
                 match select_one(&json, path) {
                     Ok(raw) => {
-                        collect_tool_call_deltas(&mut self.pending, raw.unwrap_or(&Value::Null))
+                        let raw = raw.unwrap_or(&Value::Null);
+                        // `streamedAs` decides the framing: `whole` (Gemini) is one complete call per
+                        // event, which must NOT go through the fragment accumulator — that one reads
+                        // `function.arguments`, finds nothing on a `functionCall` block, and would
+                        // drop the call without a word. Keyed by `pending.len()`, always the next
+                        // unused index: a whole call carries no provider index of its own, and the
+                        // flush runs in insertion order, so the key's only job is to be distinct.
+                        match self.plan.tool_call_shape.as_ref() {
+                            Some(shape) if shape.streamed_as.as_deref() == Some("whole") => {
+                                for call in
+                                    crate::core::dialect_shaping::read_tool_calls(raw, shape)
+                                {
+                                    let index = self.pending.len() as i64;
+                                    self.pending.insert(
+                                        index,
+                                        PendingCall {
+                                            id: call.id,
+                                            name: call.name,
+                                            args: call.arguments.unwrap_or_default(),
+                                        },
+                                    );
+                                }
+                            }
+                            _ => collect_tool_call_deltas(&mut self.pending, raw),
+                        }
                     }
                     Err(_) => return LineStep::Fail,
                 }
@@ -1158,6 +1387,23 @@ impl TextStream<'_> {
         // `typeof finish === "string" && finish !== "null"` — a provider that literally sends the
         // text `null` has not finished.
         let finished = finish.as_deref().is_some_and(|f| f != "null");
+        // **The finish reason, from the dialect's own selector.** Raw here, mapped once at the
+        // flush. Collected before the early returns below so a chunk that both carries the reason
+        // and ends the stream still reports it.
+        if let Some(path) = self.plan.response_finish.as_ref() {
+            match select_one(&json, path) {
+                Ok(Some(Value::String(raw))) if !raw.is_empty() && raw.as_str() != "null" => {
+                    self.finish_reason = Some(raw.clone());
+                }
+                Ok(_) => {}
+                Err(_) => return LineStep::Fail,
+            }
+        }
+        // `stream.finish` doubles as a source: it may point somewhere else than `responseFinish`
+        // (Anthropic nests `stop_reason` under `delta` when streaming, top-level when not).
+        if let Some(raw) = finish.as_deref().filter(|f| !f.is_empty() && *f != "null") {
+            self.finish_reason = Some(raw.to_string());
+        }
         // **`wantsUsage` keeps the loop alive past `finish_reason`.** OpenAI-shaped servers put
         // usage on a chunk *after* the one carrying `finish_reason`; returning there is how every
         // streamed request came to report zero tokens and the spend cap stayed at 0 forever.
@@ -1543,6 +1789,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
             // provider — reports no cache fields either way (measured 2026-09-28).
             prompt_cache_enabled: false,
@@ -1563,6 +1810,460 @@ mod tests {
     /// A `data:` line carrying one OpenAI-shaped delta.
     fn delta_line(text: &str) -> String {
         format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}")
+    }
+
+    /* ------------------------------------------- tool_choice: the dialect's own shape */
+
+    /// `anthropic_manifest` with the v1.1 `toolChoiceMap` declared — the shape the real
+    /// `anthropic_compat` builtin now carries, and the one agentrouter.org needs.
+    fn anthropic_tool_choice_manifest() -> Value {
+        let mut m = anthropic_manifest();
+        let ep = &mut m["endpoints"]["generateText"];
+        ep["requestTemplate"]["tool_choice"] = json!("{{toolChoice?}}");
+        ep["toolChoiceMap"] = json!({
+            "none": { "type": "none" },
+            "auto": { "type": "auto" },
+            "function": { "type": "tool", "name": "{{toolChoice.function.name}}" }
+        });
+        m
+    }
+
+    /// Render one unary `generateText` and return the JSON body that reached the port.
+    async fn rendered_body(manifest: &Value, tool_choice: Option<Value>) -> Value {
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(manifest, http.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.tool_choice = tool_choice.as_ref();
+        let stream =
+            interp.generate_text("key:k1", args, &cancel).await.expect("the response phase");
+        let _ = drain(stream).await;
+        let req = http.only_request();
+        serde_json::from_str(req.body.as_deref().expect("the call carries a body"))
+            .expect("the body is JSON")
+    }
+
+    /// The reported 400: the OpenAI string `"auto"` went out verbatim and the Anthropic upstream
+    /// refused it (`tool_choice must be an object`). The map turns it into Anthropic's object form.
+    #[tokio::test]
+    async fn anthropic_auto_tool_choice_becomes_an_object() {
+        let body = rendered_body(&anthropic_tool_choice_manifest(), Some(json!("auto"))).await;
+        assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_none_tool_choice_becomes_an_object() {
+        let body = rendered_body(&anthropic_tool_choice_manifest(), Some(json!("none"))).await;
+        assert_eq!(body["tool_choice"], json!({ "type": "none" }));
+    }
+
+    /// The forced-tool form: the function name is rendered from the source object into Anthropic's
+    /// `{type:"tool", name}` — the one place the map's `{{toolChoice.<path>}}` placeholder matters.
+    #[tokio::test]
+    async fn anthropic_function_tool_choice_names_the_tool() {
+        let body = rendered_body(
+            &anthropic_tool_choice_manifest(),
+            Some(json!({ "type": "function", "function": { "name": "read_file" } })),
+        )
+        .await;
+        assert_eq!(body["tool_choice"], json!({ "type": "tool", "name": "read_file" }));
+    }
+
+    #[tokio::test]
+    async fn anthropic_omits_tool_choice_when_the_caller_supplies_none() {
+        let body = rendered_body(&anthropic_tool_choice_manifest(), None).await;
+        assert!(body.get("tool_choice").is_none(), "absent must not be sent: {body}");
+    }
+
+    /// A form the map does not name is omitted, not passed through — the reference's third outcome,
+    /// and the one a `map.get(..).unwrap_or(original)` port would get wrong.
+    #[tokio::test]
+    async fn a_form_the_map_does_not_name_is_omitted() {
+        let body = rendered_body(&anthropic_tool_choice_manifest(), Some(json!("required"))).await;
+        assert!(body.get("tool_choice").is_none(), "an unmapped form omits the field: {body}");
+    }
+
+    /// The OpenAI dialect declares no map, and must not: its shapes ARE the internal shapes, so a
+    /// bare `"auto"` stays a bare `"auto"`. A port that translated unconditionally would send an
+    /// object to OpenAI and break every tool call.
+    #[tokio::test]
+    async fn a_dialect_without_a_map_passes_tool_choice_through() {
+        let mut m = openai_manifest();
+        m["endpoints"]["generateText"]["requestTemplate"]["tool_choice"] = json!("{{toolChoice?}}");
+        let body = rendered_body(&m, Some(json!("auto"))).await;
+        assert_eq!(body["tool_choice"], json!("auto"));
+    }
+
+    /// **End to end through the real builtin the gateway resolves for agentrouter.org.** A
+    /// hand-built fixture cannot prove the declared map survives `ManifestView`'s parse — the exact
+    /// place the shaping could be silently dropped (serde ignores unknown fields, so a missing
+    /// field would read as "no map" and pass through — the original bug, again).
+    #[tokio::test]
+    async fn the_anthropic_builtin_shapes_auto_into_an_object() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let body = rendered_body(&builtin, Some(json!("auto"))).await;
+        assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    /* ------------------------- v1.1 dialect shaping, through the real builtins ------------------- */
+
+    /// Render one unary `generateText` with a full conversation and tools, and return the wire body.
+    /// `dialect-messages.test.ts` asserts these same bodies for the TypeScript engine; these are the
+    /// Rust port's, rendered through the **real** builtin templates — which is what proves the
+    /// declared shaping survives `ManifestView`'s parse rather than being silently ignored.
+    async fn rendered_body_full(
+        manifest: &Value,
+        messages: Vec<Value>,
+        tools: Option<Value>,
+        tool_choice: Option<Value>,
+    ) -> Value {
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(manifest, http.clone());
+        let cancel = Cancel::new();
+        let args = TextArgs {
+            model: "claude-x".to_string(),
+            messages: &messages,
+            stream: false,
+            max_tokens: None,
+            temperature: None,
+            tools: tools.as_ref(),
+            tool_choice: tool_choice.as_ref(),
+            response_format: None,
+            on_tool_call: None,
+            on_usage: None,
+            on_finish: None,
+            prompt_cache_enabled: false,
+            observation: None,
+        };
+        let stream =
+            interp.generate_text("key:k1", args, &cancel).await.expect("the response phase");
+        let _ = drain(stream).await;
+        let req = http.only_request();
+        serde_json::from_str(req.body.as_deref().expect("the call carries a body"))
+            .expect("the body is JSON")
+    }
+
+    fn system_user_assistant_tool() -> Vec<Value> {
+        vec![
+            json!({ "role": "system", "content": "You are a helpful assistant." }),
+            json!({ "role": "user", "content": "Hello" }),
+            json!({ "role": "assistant", "content": "Hi there" }),
+            json!({ "role": "tool", "content": "result of tool call", "tool_call_id": "call_123" }),
+        ]
+    }
+
+    fn one_function_tool() -> Value {
+        json!([
+            { "type": "function", "function": {
+                "name": "read_file", "description": "read a file",
+                "parameters": { "type": "object", "properties": {} }
+            } }
+        ])
+    }
+
+    /// The Anthropic request the gateway actually sends: the system prompt is hoisted OUT of
+    /// `messages` into the top-level `system` field, and the tool turn becomes a `tool_result` block
+    /// on a `user` message. Before the port this went out with `role:"system"` inside `messages` —
+    /// an Anthropic 400 on every request that carried a system prompt.
+    #[tokio::test]
+    async fn the_anthropic_builtin_hoists_system_and_replays_the_tool_turn() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let body = rendered_body_full(&builtin, system_user_assistant_tool(), None, None).await;
+        let msgs = body["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert_eq!(body["system"], json!("You are a helpful assistant."));
+        assert_eq!(
+            msgs[2]["content"],
+            json!([{ "type": "tool_result", "tool_use_id": "call_123", "content": "result of tool call" }])
+        );
+        // The OpenAI sibling fields must not reach an Anthropic endpoint.
+        let wire = body.to_string();
+        assert!(!wire.contains("tool_call_id"), "{wire}");
+        assert!(!wire.contains("tool_calls"), "{wire}");
+    }
+
+    /// Anthropic tool declarations are flat: `{name, description, input_schema}`, not OpenAI's
+    /// `{type:"function", function:{…}}` wrapping, which the API rejects.
+    #[tokio::test]
+    async fn the_anthropic_builtin_sends_flat_tool_declarations() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let body = rendered_body_full(
+            &builtin,
+            vec![json!({ "role": "user", "content": "hi" })],
+            Some(one_function_tool()),
+            Some(json!("auto")),
+        )
+        .await;
+        assert_eq!(
+            body["tools"],
+            json!([{ "name": "read_file", "description": "read a file", "input_schema": { "type": "object", "properties": {} } }])
+        );
+        assert_eq!(body["tool_choice"], json!({ "type": "auto" }));
+    }
+
+    /// Drift D82, end to end: a turn that made two calls replays as ONE user message carrying both
+    /// `tool_result` blocks — Anthropic rejects a second such message.
+    #[tokio::test]
+    async fn the_anthropic_builtin_collapses_a_two_call_turn_into_one_user_message() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let parallel = vec![
+            json!({ "role": "user", "content": "read both" }),
+            json!({
+                "role": "assistant", "content": "Reading.",
+                "tool_calls": [
+                    { "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" } },
+                    { "id": "c2", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"b\"}" } }
+                ]
+            }),
+            json!({ "role": "tool", "content": "file a", "tool_call_id": "c1" }),
+            json!({ "role": "tool", "content": "file b", "tool_call_id": "c2" }),
+        ];
+        let body = rendered_body_full(&builtin, parallel, None, None).await;
+        let msgs = body["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(roles, vec!["user", "assistant", "user"]);
+        assert_eq!(
+            msgs[1]["content"],
+            json!([
+                { "type": "text", "text": "Reading." },
+                { "type": "tool_use", "id": "c1", "name": "read_file", "input": { "path": "a" } },
+                { "type": "tool_use", "id": "c2", "name": "read_file", "input": { "path": "b" } }
+            ])
+        );
+        assert_eq!(
+            msgs[2]["content"],
+            json!([
+                { "type": "tool_result", "tool_use_id": "c1", "content": "file a" },
+                { "type": "tool_result", "tool_use_id": "c2", "content": "file b" }
+            ])
+        );
+    }
+
+    /// Gemini: declarations are wrapped in `functionDeclarations`, tool_choice becomes
+    /// `toolConfig.functionCallingConfig`, `assistant`→`model`, and the content field is renamed to
+    /// `parts` with a plain string wrapped as one text part (with NO `type`, which its Part proto
+    /// does not define). Before the port a Gemini request carried no tool declarations at all and a
+    /// `content` field its API does not read.
+    #[tokio::test]
+    async fn the_gemini_builtin_wraps_declarations_and_renames_content_to_parts() {
+        let builtin = crate::core::builtin_templates::gemini_compat(
+            "https://generativelanguage.googleapis.com",
+        );
+        let body = rendered_body_full(
+            &builtin,
+            vec![
+                json!({ "role": "system", "content": "be terse" }),
+                json!({ "role": "user", "content": "hi" }),
+                json!({ "role": "assistant", "content": "yo" }),
+            ],
+            Some(one_function_tool()),
+            Some(json!("auto")),
+        )
+        .await;
+        assert_eq!(
+            body["tools"],
+            json!([{ "functionDeclarations": [
+                { "name": "read_file", "description": "read a file", "parameters": { "type": "object", "properties": {} } }
+            ] }])
+        );
+        assert_eq!(body["toolConfig"], json!({ "functionCallingConfig": { "mode": "AUTO" } }));
+        let contents = body["contents"].as_array().expect("contents");
+        // The system turn is hoisted-and-discarded: Gemini has no system channel.
+        assert_eq!(contents.len(), 2);
+        assert_eq!(contents[0]["role"], json!("user"));
+        assert_eq!(contents[0]["parts"], json!([{ "text": "hi" }]));
+        assert_eq!(contents[1]["role"], json!("model"));
+        assert!(contents[0].get("content").is_none(), "content must be renamed, not duplicated");
+    }
+
+    /// The OpenAI dialect declares the identity role map, so its messages pass through — including a
+    /// `role:"system"` left in the array, which is exactly where OpenAI wants it. A port that
+    /// hoisted unconditionally would break every OpenAI request.
+    #[tokio::test]
+    async fn the_openai_builtin_keeps_system_in_messages() {
+        let builtin = crate::core::builtin_templates::openai_compat(
+            "https://api.test/v1",
+            crate::core::builtin_templates::OpenAiExtras::default(),
+        );
+        let body = rendered_body_full(&builtin, system_user_assistant_tool(), None, None).await;
+        let msgs = body["messages"].as_array().expect("messages");
+        let roles: Vec<&str> = msgs.iter().filter_map(|m| m["role"].as_str()).collect();
+        assert_eq!(roles, vec!["system", "user", "assistant", "tool"]);
+        assert!(
+            body.get("system").is_none(),
+            "OpenAI takes system in the array, not as a param: {body}"
+        );
+        // The OpenAI tool turn keeps its sibling fields — the shaper must NOT touch this dialect.
+        assert_eq!(msgs[3]["role"], json!("tool"));
+        assert_eq!(msgs[3]["tool_call_id"], json!("call_123"));
+    }
+
+    /* ----------------------- reading a tool call back, through the real builtins ------------------ */
+
+    /// The Gemini builtin **reads** a tool call from a unary response: a `functionCall` part (no
+    /// `type` field) reaches `on_tool_call` with its name and its arguments serialised to JSON text.
+    /// Before the port the response map had no `toolCalls` selector at all, so the model's request to
+    /// run a tool was simply lost.
+    #[tokio::test]
+    async fn the_gemini_builtin_reads_a_function_call_from_a_unary_response() {
+        let builtin = crate::core::builtin_templates::gemini_compat(
+            "https://generativelanguage.googleapis.com",
+        );
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"candidates":[{"content":{"parts":[
+                {"text":"let me look"},
+                {"functionCall":{"name":"read_file","args":{"path":"a"}}}
+            ]}}]}"#,
+        )]);
+        let interp = interpreter(&builtin, http.clone());
+        let calls: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let mut on_tool = move |c: ToolCall| sink.lock().unwrap().push(c);
+        let mut args = text_args("models/gemini-2.0-flash");
+        args.stream = false;
+        args.on_tool_call = Some(&mut on_tool);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        let got = calls.lock().unwrap();
+        assert_eq!(got.len(), 1, "the text part must not be read as a call: {got:?}");
+        assert_eq!(got[0].name.as_deref(), Some("read_file"));
+        assert_eq!(got[0].arguments.as_deref(), Some("{\"path\":\"a\"}"));
+    }
+
+    /// The same read on the **stream** path, where `streamedAs: "whole"` decides the framing: a
+    /// `functionCall` part is one complete call, so it must NOT go through the OpenAI fragment
+    /// accumulator (which reads `function.arguments`, finds nothing, and drops the call).
+    #[tokio::test]
+    async fn the_gemini_builtin_reads_a_whole_function_call_from_a_stream() {
+        let builtin = crate::core::builtin_templates::gemini_compat(
+            "https://generativelanguage.googleapis.com",
+        );
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            r#"data: {"candidates":[{"content":{"parts":[{"functionCall":{"name":"read_file","args":{"path":"a"}}}]}}]}"#,
+            r#"data: {"candidates":[{"content":{"parts":[]},"finishReason":"STOP"}]}"#,
+        ])]);
+        let interp = interpreter(&builtin, http.clone());
+        let calls: Arc<Mutex<Vec<ToolCall>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = calls.clone();
+        let mut on_tool = move |c: ToolCall| sink.lock().unwrap().push(c);
+        let mut args = text_args("models/gemini-2.0-flash");
+        args.stream = true;
+        args.on_tool_call = Some(&mut on_tool);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        let got = calls.lock().unwrap();
+        assert_eq!(got.len(), 1, "a whole call must be reported once: {got:?}");
+        assert_eq!(got[0].name.as_deref(), Some("read_file"));
+        assert_eq!(got[0].arguments.as_deref(), Some("{\"path\":\"a\"}"));
+    }
+
+    /* --------------------------------- finish reason, through the real builtins ------------------ */
+
+    /// Anthropic reports a truncation as `max_tokens`; every consumer of this router speaks OpenAI,
+    /// where the word is `length`. Unmapped, a response cut off at the token ceiling looked complete
+    /// (drift D86).
+    #[tokio::test]
+    async fn the_anthropic_builtin_reports_a_truncation_as_length() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"text","text":"partial"}],"stop_reason":"max_tokens"}"#,
+        )]);
+        let interp = interpreter(&builtin, http.clone());
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut on_finish = move |r: Option<String>| sink.lock().unwrap().push(r);
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.on_finish = Some(&mut on_finish);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some("length".to_string())]);
+    }
+
+    /// The same, on the stream path — where Anthropic nests `stop_reason` under `delta` on
+    /// `message_delta`, which is `stream.finish`'s job to reach.
+    #[tokio::test]
+    async fn the_anthropic_builtin_reports_a_streamed_truncation_as_length() {
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"partial"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ])]);
+        let interp = interpreter(&builtin, http.clone());
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut on_finish = move |r: Option<String>| sink.lock().unwrap().push(r);
+        let mut args = text_args("claude-x");
+        args.stream = true;
+        args.on_finish = Some(&mut on_finish);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some("length".to_string())]);
+    }
+
+    /// Gemini says `MAX_TOKENS`; OpenAI says `length`. And OpenAI itself needs no map — its words
+    /// already are the target, so `length` must survive untouched.
+    #[tokio::test]
+    async fn gemini_and_openai_finish_reasons_reach_the_same_vocabulary() {
+        let gemini = crate::core::builtin_templates::gemini_compat(
+            "https://generativelanguage.googleapis.com",
+        );
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"candidates":[{"content":{"parts":[{"text":"partial"}]},"finishReason":"MAX_TOKENS"}]}"#,
+        )]);
+        let interp = interpreter(&gemini, http.clone());
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut on_finish = move |r: Option<String>| sink.lock().unwrap().push(r);
+        let mut args = text_args("models/gemini-2.0-flash");
+        args.stream = false;
+        args.on_finish = Some(&mut on_finish);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some("length".to_string())]);
+
+        let openai = crate::core::builtin_templates::openai_compat(
+            "https://api.test/v1",
+            crate::core::builtin_templates::OpenAiExtras::default(),
+        );
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"choices":[{"message":{"content":"partial"},"finish_reason":"length"}]}"#,
+        )]);
+        let interp = interpreter(&openai, http.clone());
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let mut on_finish = move |r: Option<String>| sink.lock().unwrap().push(r);
+        let mut args = text_args("gpt-4o");
+        args.stream = false;
+        args.on_finish = Some(&mut on_finish);
+        let cancel = Cancel::new();
+        let stream = interp.generate_text("key:k1", args, &cancel).await.unwrap();
+        let _ = drain(stream).await;
+        assert_eq!(seen.lock().unwrap().as_slice(), [Some("length".to_string())]);
     }
 
     /* --------------------------------------------------------------- requests */

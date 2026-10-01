@@ -159,6 +159,14 @@ pub struct TextArgs<'a> {
     pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     /// Called once with whatever usage the upstream reported, if it reported anything at all.
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    /// Called once with the finish reason, translated into the **OpenAI vocabulary** by the
+    /// manifest's `responseFinishMap` (Anthropic's `max_tokens` → `length`). `None` when the dialect
+    /// declares no `responseFinish` selector or the provider emitted no reason.
+    ///
+    /// **Why OpenAI's vocabulary and not the dialect's own word:** both consumers speak it — the
+    /// app's truncation warning tests `reason == "length"`, and the gateway writes the value onto an
+    /// OpenAI-shaped `finish_reason`. See `dialect_shaping::translate_finish_reason`.
+    pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     /// Mark the last system message block with `cache_control: {"type":"ephemeral"}` on egress.
     /// Off by default; a provider without prefix caching will ignore or reject the field, so
     /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
@@ -559,6 +567,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             prompt_cache_enabled: false,
             observation: None,
         }

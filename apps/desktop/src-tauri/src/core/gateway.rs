@@ -416,6 +416,13 @@ pub enum BridgeMsg {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// The provider's finish reason, **already mapped to the OpenAI vocabulary** by the serving
+    /// dialect's `responseFinishMap` (Anthropic `max_tokens` → `length`). Not terminal: it arrives
+    /// just before `Done`.
+    ///
+    /// Without it the egress hardcoded `"stop"`, so a response cut off at `max_tokens` reached the
+    /// client looking complete — indistinguishable from a finished answer (drift D86).
+    Finish(String),
     Done,
     Error {
         status: u16,

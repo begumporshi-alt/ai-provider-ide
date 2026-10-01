@@ -146,6 +146,57 @@ pub struct TextEndpoint {
     #[serde(default)]
     pub headers: BTreeMap<String, String>,
     pub request_template: Map<String, Value>,
+    /// Declarative `tool_choice` translation (v1.1, ported 2026-10-01). Maps the internal OpenAI
+    /// forms — the strings `"none"`/`"auto"` and `{type:"function",…}` — to this dialect's own
+    /// shape; keys are the OpenAI forms. **Absent means pass-through**, which is the OpenAI dialect,
+    /// whose shapes already agree. Anthropic needs it: it accepts `tool_choice` only as an object,
+    /// so a bare `"auto"` is an upstream 400 (measured live 2026-10-01 — the gateway path, which is
+    /// this port, was the one that failed). See `interpreter.rs::translate_tool_choice`.
+    #[serde(default)]
+    pub tool_choice_map: Option<Map<String, Value>>,
+    /// Internal OpenAI roles → this dialect's roles (v1.1, ported 2026-10-01). A **`null` value
+    /// hoists** that role's content into the dialect's top-level system field (Anthropic has no
+    /// `system` role in `messages`); a string remaps the role inline (Gemini's `assistant`→`model`).
+    /// A role the map omits passes through. Absent means pass-through — the OpenAI dialect.
+    ///
+    /// Typed as `Value` rather than `Option<String>` because `serde_json::Map` only implements
+    /// `Deserialize` for `Map<String, Value>`; the null-vs-string distinction is read at use time in
+    /// [`crate::core::dialect_shaping::normalize_dialect_messages`].
+    #[serde(default)]
+    pub messages_role_map: Option<Map<String, Value>>,
+    /// The top-level request field the hoisted system prompt goes in (`system` for Anthropic).
+    /// Absent means the dialect has no system channel and hoisted content is dropped.
+    #[serde(default)]
+    pub system_field: Option<String>,
+    /// This dialect's content-part shapes, keyed by our internal part type (`text`, `image`, and the
+    /// replayed `toolCall`/`toolResult`). An absent entry leaves that part untouched.
+    #[serde(default)]
+    pub content_part_templates: Option<Map<String, Value>>,
+    /// The field this dialect names a message's content by, when it is not `content` (Gemini:
+    /// `parts`). When set, the content is always an array of parts.
+    #[serde(default)]
+    pub content_field: Option<String>,
+    /// This dialect's tool-declaration shape, keyed by the internal tool type (`function`).
+    /// Anthropic takes `{name, description, input_schema}` flat where OpenAI wraps it in
+    /// `{type:"function", function:{…}}`.
+    #[serde(default)]
+    pub tool_declaration_templates: Option<Map<String, Value>>,
+    /// The container a dialect nests its declarations under (Gemini's
+    /// `{functionDeclarations:[…]}`), because `tools` is `{{tools}}` — a whole-value substitution,
+    /// and an array literal is not expressible in the template grammar.
+    #[serde(default)]
+    pub tool_declaration_wrapper: Option<Map<String, Value>>,
+    /// Where the dialect puts its finish reason on a response. Absent = it never surfaces one.
+    #[serde(default)]
+    pub response_finish: Option<String>,
+    /// The dialect's own finish-reason words mapped to the **OpenAI vocabulary** (`stop` /
+    /// `length` / `tool_calls` / `content_filter`) — the words every consumer of this router
+    /// speaks. Anthropic says `max_tokens` where OpenAI says `length`; Gemini says `MAX_TOKENS`.
+    /// Without the map those consumers compare a dialect word against an OpenAI one and silently
+    /// never match, so a response truncated at `max_tokens` looked complete. A reason the map does
+    /// not name passes through raw; absent means the raw value is surfaced untouched.
+    #[serde(default)]
+    pub response_finish_map: Option<Map<String, Value>>,
     pub response_map: ResponseMap,
     #[serde(default)]
     pub stream: Option<StreamSpec>,
@@ -165,6 +216,14 @@ pub struct ResponseMap {
     /// reports them, which is the pre-amendment behaviour.
     #[serde(default)]
     pub tool_calls: Option<String>,
+    /// **How to recognize and read one tool call** among the blocks `tool_calls` selected (v1.1,
+    /// ported 2026-10-01). Absent means the two shapes that were hardcoded — OpenAI's nested
+    /// `{type:"function", function:{…}}` and Anthropic's flat `{type:"tool_use", name, input}`.
+    /// Gemini needs it: its parts carry **no `type`**, so the shape itself is the discriminator
+    /// (`{functionCall:{…}}`) and `args` is already an object. Without it a Gemini `functionCall`
+    /// part is read as a nameless, argument-less call and the model's tool request is lost.
+    #[serde(default)]
+    pub tool_call_shape: Option<ToolCallShape>,
     /// The usage block's own field names, when the dialect does not speak OpenAI's
     /// (`prompt_tokens` / `completion_tokens`). Gemini's usageMetadata says
     /// `promptTokenCount` / `candidatesTokenCount`; without this override such a dialect
@@ -180,6 +239,51 @@ pub struct UsageKeys {
     pub completion: String,
     #[serde(default)]
     pub cached: Option<String>,
+}
+
+/// How to recognize and read one tool call in a dialect's own response blocks (v1.1, ported
+/// 2026-10-01). The port of `ToolCallShape` (`tool-shaping.ts:79-108`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallShape {
+    /// Absent = every selected block is a candidate.
+    #[serde(default)]
+    pub discriminator: Option<ToolCallDiscriminator>,
+    /// Dotted path within the block (e.g. `id`). Absent when the dialect declares no call id.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Dotted path to the tool name. Required — a call without a name is not a call.
+    pub name: String,
+    /// Dotted path to the arguments.
+    pub arguments: String,
+    /// `json-string` (default) — the value is JSON *text* and is carried through as-is (OpenAI's
+    /// `function.arguments`). `object` — the value is already the arguments object (Gemini's
+    /// `args`, Anthropic's `input`), and must be serialised on the way in, because the internal
+    /// `ToolCall.arguments` is JSON text.
+    #[serde(default)]
+    pub arguments_format: Option<String>,
+    /// How the dialect delivers a call **in a stream**: `fragments` (default, OpenAI — pieces to
+    /// concatenate) or `whole` (Gemini — one complete call per event). The explicit field decides,
+    /// rather than inferring it from `arguments_format`.
+    #[serde(default)]
+    pub streamed_as: Option<String>,
+}
+
+/// How to tell a tool call apart from the other blocks in a mixed array. See [`ToolCallShape`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ToolCallDiscriminator {
+    /// Dotted path within the block.
+    pub path: String,
+    /// Matches when the field strictly equals this value (OpenAI `type:"function"`, Anthropic
+    /// `type:"tool_use"`).
+    #[serde(default)]
+    pub equals: Option<Value>,
+    /// Matches when the field is present at all — the check Gemini needs, and the reason this is a
+    /// separate arm rather than an `equals` against something: a Gemini part carries no `type`, so
+    /// there is no value to compare and no key that holds one.
+    #[serde(default)]
+    pub present: Option<bool>,
 }
 
 /// The SSE shape (v1.1).

@@ -310,6 +310,10 @@ impl Job {
             let mut collected: Vec<ToolCall> = Vec::new();
             let mut mercury: Vec<ToolCall> = Vec::new();
             let mut turn_text = String::new();
+            // The serving dialect's finish reason, mapped to the OpenAI vocabulary by the engine.
+            // Per turn: only the turn that ends the request is reported, so a mid-loop tool turn's
+            // reason is deliberately discarded.
+            let mut finish_reason: Option<String> = None;
 
             let result = {
                 let mut on_chunk = |chunk: &str| {
@@ -350,6 +354,12 @@ impl Job {
                     );
                 };
 
+                let mut on_finish = |reason: Option<String>| {
+                    if let Some(reason) = reason {
+                        finish_reason = Some(reason);
+                    }
+                };
+
                 let text_req = crate::core::router::TextRequest {
                     model: model.clone(),
                     // Cloned per turn: `TextRequest` owns its messages and `generate_text` consumes
@@ -364,6 +374,7 @@ impl Job {
                     response_format: response_format.clone(),
                     on_tool_call: Some(&mut on_tool_call),
                     on_usage: Some(&mut on_usage),
+                    on_finish: Some(&mut on_finish),
                     max_attempts: None,
                     prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };
@@ -392,6 +403,11 @@ impl Job {
                 TurnOutcome::Finish => {
                     if let Some(text) = gate.release() {
                         let _ = replies.reply(id, BridgeMsg::Delta(text));
+                    }
+                    // Before `Done`, so the client sees the real reason on the terminal chunk: a
+                    // provider that stopped for `max_tokens` reports `length`, not `stop`.
+                    if let Some(reason) = finish_reason.take() {
+                        let _ = replies.reply(id, BridgeMsg::Finish(reason));
                     }
                     let _ = replies.reply(id, BridgeMsg::Done);
                     return Ok(());

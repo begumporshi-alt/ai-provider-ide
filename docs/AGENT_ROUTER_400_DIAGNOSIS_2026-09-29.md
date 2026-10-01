@@ -280,3 +280,42 @@ message following an assistant turn may carry `tool_result` blocks — `400 unex
 messages.3.content.0: tool_use_id found in tool_result blocks`. The shaper now collapses each run of
 consecutive tool messages into one message; Gemini's `functionResponse` grouping is the same rule.
 The upstream content guard above is still the one cause that is not ours.
+
+**A fourth cause — and the one that survives on the gateway path** (drift D85, 2026-10-01). Everything
+under *"Fixed 2026-10-01"* above is the **TypeScript** engine, which serves the in-app Assistant. The
+app's **gateway** — the local HTTP surface an external client (WorkBuddy) calls — is a separate
+**Rust** implementation (`apps/desktop/src-tauri/src/core`) and received **none** of that shaping: its
+`anthropic_compat` is the v1.0 transcription (no `messagesRoleMap`/`systemField`/`contentPartTemplates`/
+`toolDeclarationTemplates`/`toolChoiceMap`) and its interpreter forwarded the caller's `tool_choice`
+**verbatim**. Measured live 2026-10-01 15:44:52 on a `source='gateway'` row (the `ui` rows above were
+the TS engine; this one was not):
+
+```
+400 {"error":{"message":"tool_choice must be an object [trace_id=…]"}}   ← both key-01 and key-02
+```
+
+The gateway's ingress normalizes Anthropic→OpenAI, so the internal value is the OpenAI string `"auto"`;
+an Anthropic-dialect endpoint accepts `tool_choice` only as an object, so every tool-using request was
+refused.
+
+**The whole request-side shaping family is now ported** (drift D85). `tool_choice` shaping lives in
+`TextEndpoint.tool_choice_map` + `interpreter::translate_tool_choice` + the Rust `toolChoiceMap`; the
+other four declarations live in a new `core/dialect_shaping.rs` (the port of `tool-shaping.ts` +
+`content-parts.ts` + `normalizeDialectMessages`) and are declared on the Rust `anthropic_compat`,
+`gemini_compat` and `openai_compat` templates: system hoisting + role remap, tool-replay content parts
+(`tool_use`/`tool_result`, with the run-collapse D82 requires), flat/nested tool declarations, and
+Gemini's `toolConfig`/`parts`. The **response side** is ported too — `responseMap.toolCallShape` and
+its reader (`read_tool_calls`), so a Gemini `functionCall` part is read from both a unary body and a
+stream, where the template previously had no `toolCalls` selector at all and the call was lost. 17
+`dialect_shaping` specs and 8 end-to-end interpreter specs render the real builtin bodies (the
+`dialect-messages.test.ts` assertions, in Rust), falsified by deleting the Anthropic `messagesRoleMap`
+and the Gemini `toolCallShape`.
+
+One adjacent gap was found at the same time and **is now closed too — D86**: finish-reason fidelity.
+The gateway hardcoded `finish_reason: "stop"` / `"tool_calls"` in its OpenAI-shaped egress, so an answer
+truncated at `max_tokens` reported complete — and the app's own truncation warning (which tests
+`reason === "length"`) never fired on a non-OpenAI provider either, because Anthropic says `max_tokens`
+and Gemini says `MAX_TOKENS`. Both engines now translate the dialect's word into the OpenAI vocabulary
+at the point it is read, via a declared `responseFinishMap`, and the mapped reason reaches every egress
+path (OpenAI `finish_reason`, Anthropic `stop_reason`, Gemini `finishReason`, Responses
+`status: incomplete`). A reason the map does not name passes through raw.

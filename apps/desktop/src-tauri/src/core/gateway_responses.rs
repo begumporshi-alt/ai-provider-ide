@@ -219,6 +219,19 @@ fn strip_tool_fields(body: &mut Value, enabled: bool) {
     }
 }
 
+/// The Responses API's terminal status, from a finish reason in the **OpenAI vocabulary** (what the
+/// interpreter produces, via a dialect's `responseFinishMap`).
+///
+/// A truncation is `incomplete` with `incomplete_details.reason = "max_output_tokens"` — the shape a
+/// client reads to know the answer was cut off. Everything else is `completed`. Reporting
+/// `completed` for a truncated answer is what made it look finished (drift D86).
+fn responses_status(cls: Option<&str>) -> (&'static str, Option<Value>) {
+    match cls {
+        Some("length") => ("incomplete", Some(json!({ "reason": "max_output_tokens" }))),
+        _ => ("completed", None),
+    }
+}
+
 pub(crate) async fn responses_h(
     State(core): State<Arc<GatewayCore>>,
     headers: HeaderMap,
@@ -293,6 +306,9 @@ pub(crate) async fn responses_h(
             let mut tool_calls: Vec<(String, String, Value)> = Vec::new(); // call_id, name, arguments
             let mut usage: Option<(u64, u64)> = None;
             let mut tool_pending = false;
+            // The provider's reason in the OpenAI vocabulary; the Responses API expresses a
+            // truncation as `status: "incomplete"` with an `incomplete_details.reason`.
+            let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -301,6 +317,7 @@ pub(crate) async fn responses_h(
                             "output_index": 0, "content_index": 0, "delta": t }));
                     }
                     BridgeMsg::Result(_) => {}
+                    BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
                         // `text` is the accumulated assistant output; this is the stream's Done.
                         if let Some(p) = &prep {
@@ -364,13 +381,17 @@ pub(crate) async fn responses_h(
                     .map(|_| json!("auto"))
                     .or(tool_choice.clone())
                     .unwrap_or(json!("auto"));
-                yield ev("response.completed", json!({ "type": "response.completed",
-                    "response": { "id": rid, "object": "response", "status": "completed",
-                        "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
-                        "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
-                        "tools": stream_tools.unwrap_or(json!([])),
-                        "tool_choice": resolved_tool_choice
-                    } }));
+                let (status, incomplete) = responses_status(finish_reason.as_deref());
+                let mut response = json!({ "id": rid, "object": "response", "status": status,
+                    "output": [{ "type": "message", "role": "assistant", "content": content_parts }],
+                    "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
+                    "tools": stream_tools.unwrap_or(json!([])),
+                    "tool_choice": resolved_tool_choice
+                });
+                if let Some(details) = incomplete {
+                    response["incomplete_details"] = details;
+                }
+                yield ev("response.completed", json!({ "type": "response.completed", "response": response }));
             } else {
                 return;
             }
@@ -388,10 +409,12 @@ pub(crate) async fn responses_h(
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
     let mut tool_calls: Vec<(String, String, Value)> = Vec::new();
     let mut usage: Option<(u64, u64)> = None;
+    let mut provider_finish: Option<String> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
+            BridgeMsg::Finish(reason) => provider_finish = Some(reason),
             BridgeMsg::Done => {
                 if let Some(p) = &prep {
                     let _ = finish_capture(p, &full);
@@ -449,13 +472,17 @@ pub(crate) async fn responses_h(
                 content.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
             }
             let (pt, ct) = usage.unwrap_or((0, 0));
-            let resp_body = json!({
-                "id": resp_id, "object": "response", "status": "completed",
+            let (status, incomplete) = responses_status(provider_finish.as_deref());
+            let mut resp_body = json!({
+                "id": resp_id, "object": "response", "status": status,
                 "output": [{ "type": "message", "role": "assistant", "content": content }],
                 "usage": { "input_tokens": pt, "output_tokens": ct },
                 "tools": tools.unwrap_or(json!([])),
                 "tool_choice": tool_choice.unwrap_or(json!("auto"))
             });
+            if let Some(details) = incomplete {
+                resp_body["incomplete_details"] = details;
+            }
             (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], resp_body.to_string())
                 .into_response()
         }

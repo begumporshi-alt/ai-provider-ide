@@ -407,6 +407,30 @@ function translateToolChoice(
 }
 
 /**
+ * Translate a dialect's own finish reason into the **OpenAI vocabulary**, per the manifest's
+ * `responseFinishMap`. The raw value is whatever the `responseFinish` selector read — Anthropic's
+ * `max_tokens`, Gemini's `MAX_TOKENS`.
+ *
+ * # Why a map, and why OpenAI's words are the target
+ *
+ * Both consumers of this value speak OpenAI: the app warns when `reason === "length"`, and the
+ * gateway puts the reason on an OpenAI-shaped response where clients switch on `stop` / `length` /
+ * `tool_calls`. Comparing a dialect word against an OpenAI one never matches, so before this a
+ * response truncated at `max_tokens` looked complete on every non-OpenAI provider — silently, on
+ * both paths.
+ *
+ * A reason the map does not name passes through **raw** rather than being dropped: a dialect that
+ * knows three of its six reasons should still surface the other three, and an unrecognised word is
+ * more useful to a caller than `undefined`. When the manifest declares no map the value is untouched
+ * — the OpenAI dialect, whose words already are the target.
+ */
+function translateFinishReason(reason: string, map: Record<string, unknown> | undefined): string {
+  if (!map) return reason;
+  const mapped = map[reason];
+  return typeof mapped === "string" && mapped ? mapped : reason;
+}
+
+/**
  * Render a `toolChoiceMap` value: if it's a string template containing `{{toolChoice.*}}`
  * placeholders, substitute against the source OpenAI tool_choice. Otherwise return the
  * literal value as-is. Handles nested objects (e.g. `{type:"tool", name:"{{toolChoice.function.name}}"}`).
@@ -698,10 +722,11 @@ export class ManifestInterpreter implements AdapterInstance {
           }
         }
       }
-      // Non-stream: surface finish reason via `responseFinish` selector (v1.1 amendment).
+      // Non-stream: surface finish reason via `responseFinish` selector (v1.1 amendment), translated
+      // into the OpenAI vocabulary the consumers of this router speak.
       if (args.onFinish && ep.responseFinish) {
         const fr = selectOne(json, ep.responseFinish);
-        args.onFinish(typeof fr === "string" && fr && fr !== "null" ? fr : undefined);
+        args.onFinish(typeof fr === "string" && fr && fr !== "null" ? translateFinishReason(fr, ep.responseFinishMap) : undefined);
       }
       return;
     }
@@ -858,10 +883,15 @@ export class ManifestInterpreter implements AdapterInstance {
           cached_tokens: lastUsage.cached_tokens,
         });
       }
-      // Forward finish reason (v1.1 `responseFinish` surfacing). Absent when the provider
-      // never emitted one or the abort flag is set — a cancelled stream has no finish reason.
+      // Forward finish reason (v1.1 `responseFinish` surfacing), translated into the OpenAI
+      // vocabulary at the single report site — both collectors above store the RAW reason. Absent
+      // when the provider never emitted one or the abort flag is set: a cancelled stream has none.
       if (args.onFinish && !signal?.aborted) {
-        args.onFinish(finishReason);
+        args.onFinish(
+          finishReason === undefined
+            ? undefined
+            : translateFinishReason(finishReason, ep.responseFinishMap),
+        );
       }
     }
   }

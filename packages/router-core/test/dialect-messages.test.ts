@@ -135,12 +135,36 @@ describe("anthropic-compat: system hoist + role remap", () => {
     ]);
   });
 
-  it("surfaces finish_reason from stop_reason via onFinish", async () => {
+  it("surfaces finish_reason from stop_reason via onFinish, in the OpenAI vocabulary", async () => {
     let finish: string | undefined;
     const http = new FakeHttp(() => ({ status: 200, body: { content: [{ type: "text", text: "ok" }], stop_reason: "end_turn" } }));
     const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, onFinish: (r) => { finish = r; } });
-    expect(finish).toBe("end_turn");
+    // `end_turn` maps to `stop` (v1.1 2026-10-01). Both consumers of this router speak OpenAI —
+    // the app warns when `reason === "length"`, the gateway writes it onto an OpenAI-shaped
+    // `finish_reason` — so the raw dialect word has to be translated at the source.
+    expect(finish).toBe("stop");
+  });
+
+  it("translates a max_tokens truncation to OpenAI's 'length'", async () => {
+    // The defect this pins: Anthropic reports `max_tokens` and OpenAI says `length`, so the app's
+    // truncation warning (`finishReason === "length"`) never fired on an Anthropic provider and a
+    // cut-off answer looked complete.
+    let finish: string | undefined;
+    const http = new FakeHttp(() => ({ status: 200, body: { content: [{ type: "text", text: "ok" }], stop_reason: "max_tokens" } }));
+    const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, onFinish: (r) => { finish = r; } });
+    expect(finish).toBe("length");
+  });
+
+  it("passes an unnamed reason through raw rather than dropping it", async () => {
+    // A dialect that knows some of its reasons should still surface the rest — Anthropic has added
+    // stop reasons before and will again, and an unrecognised word beats `undefined`.
+    let finish: string | undefined;
+    const http = new FakeHttp(() => ({ status: 200, body: { content: [{ type: "text", text: "ok" }], stop_reason: "model_context_window_exceeded" } }));
+    const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, onFinish: (r) => { finish = r; } });
+    expect(finish).toBe("model_context_window_exceeded");
   });
 });
 
@@ -155,7 +179,7 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     expect(contents.map((c) => c.role)).toEqual(["user", "model", "user"]);
   });
 
-  it("surfaces finish_reason from candidates[0].finishReason via onFinish", async () => {
+  it("surfaces finish_reason from candidates[0].finishReason via onFinish, in the OpenAI vocabulary", async () => {
     let finish: string | undefined;
     const http = new FakeHttp(() => ({
       status: 200,
@@ -163,7 +187,8 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     }));
     const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["gemini-compat"]("https://generativelanguage.googleapis.com"), { http, vars: {} });
     await drain(interp, { model: "models/gemini-2.0-flash", messages: [], stream: false, onFinish: (r) => { finish = r; } });
-    expect(finish).toBe("STOP");
+    // Gemini's `STOP` maps to OpenAI's `stop` (v1.1 2026-10-01) — see the anthropic case above.
+    expect(finish).toBe("stop");
   });
 
   it("captures finish_reason from the stream's final chunk", async () => {
@@ -177,7 +202,7 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     }));
     const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["gemini-compat"]("https://generativelanguage.googleapis.com"), { http, vars: {} });
     await drain(interp, { model: "models/gemini-2.0-flash", messages: [], stream: true, onFinish: (r) => { finish = r; } });
-    expect(finish).toBe("STOP");
+    expect(finish).toBe("stop");
   });
 
   it("captures finish_reason from the stream's final chunk — Anthropic stop_reason", async () => {
@@ -193,7 +218,8 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     }));
     const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: (r) => { finish = r; } });
-    expect(finish).toBe("tool_use");
+    // `tool_use` maps to OpenAI's `tool_calls`.
+    expect(finish).toBe("tool_calls");
   });
 });
 

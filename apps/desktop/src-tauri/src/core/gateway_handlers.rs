@@ -101,6 +101,9 @@ pub(crate) async fn chat_h(
             let mut usage: Option<(u64, u64)> = None;
             let mut started = false;
             let mut streamed = String::new();
+            // The provider's own finish reason, already in the OpenAI vocabulary. Absent for a
+            // dialect that declares no `responseFinish`, where `stop` stays the honest default.
+            let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
                     // An empty delta carries no content, so it is not a wire event at all.
@@ -123,6 +126,7 @@ pub(crate) async fn chat_h(
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
+                    BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
                         if let Some(p) = &prep {
                             let _ = finish_capture(p, &streamed);
@@ -136,7 +140,9 @@ pub(crate) async fn chat_h(
                                 "choices": [{
                                     "index": 0,
                                     "delta": {},
-                                    "finish_reason": "stop",
+                                    // The provider's reason when it declared one — a truncation at
+                                    // `max_tokens` must not read as `stop` (drift D86).
+                                    "finish_reason": finish_reason.take().unwrap_or_else(|| "stop".to_string()),
                                     "usage": {
                                         "prompt_tokens": pt,
                                         "completion_tokens": ct,
@@ -198,10 +204,12 @@ pub(crate) async fn chat_h(
     let mut tool_calls_json: Option<String> = None;
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
+    let mut finish_reason: Option<String> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
+            BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {
                 if let Some(p) = &prep {
                     let _ = finish_capture(p, &full);
@@ -248,7 +256,10 @@ pub(crate) async fn chat_h(
             r
         }
         None => {
-            let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": clean_assistant_text(&full) }, "finish_reason": "stop" });
+            // The provider's own reason when it declared one, `stop` otherwise. A truncation at
+            // `max_tokens` must not read as a finished answer (drift D86).
+            let reason = finish_reason.take().unwrap_or_else(|| "stop".to_string());
+            let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": clean_assistant_text(&full) }, "finish_reason": reason });
             if let Some(tc) = tool_calls_json {
                 let parsed: Value = serde_json::from_str(&tc).unwrap_or_default();
                 if !parsed.is_null() {
@@ -313,6 +324,8 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
+            // Model listing and image generation carry no chat finish reason.
+            BridgeMsg::Finish(_) => {}
         }
     }
     err(
@@ -415,6 +428,8 @@ pub(crate) async fn image_h(
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
             BridgeMsg::Usage { .. } => {}
+            // Model listing and image generation carry no chat finish reason.
+            BridgeMsg::Finish(_) => {}
         }
     }
     err(

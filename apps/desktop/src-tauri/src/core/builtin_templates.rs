@@ -124,6 +124,24 @@ fn openai_text(extra: &OpenAiExtras) -> Value {
             "response_format": "{{responseFormat?}}"
         }),
     );
+    // v1.1 dialect shaping (ported 2026-10-01). OpenAI is the internal vocabulary, so its role map
+    // is the identity — declared rather than omitted, because "I speak these roles natively" and
+    // "I declare no map at all" are the same body but different facts, and only the second is a
+    // dialect nobody has taught yet. Its content parts are the same story: our internal
+    // `{type:"image",mediaType,dataBase64}` is NOT OpenAI's `{type:"image_url",image_url:{url}}`.
+    ep.insert(
+        "messagesRoleMap".to_string(),
+        json!({ "user": "user", "assistant": "assistant", "system": "system", "tool": "tool" }),
+    );
+    ep.insert(
+        "contentPartTemplates".to_string(),
+        json!({
+            "text": { "type": "text", "text": "{{text}}" },
+            // OpenAI carries an image as an `image_url` whose url IS the data URI, so this dialect
+            // uses `{{dataUri}}` where Anthropic uses the bare bytes.
+            "image": { "type": "image_url", "image_url": { "url": "{{dataUri}}" } }
+        }),
+    );
     ep.insert(
         "responseMap".to_string(),
         json!({
@@ -132,6 +150,9 @@ fn openai_text(extra: &OpenAiExtras) -> Value {
             "toolCalls": "$.choices[0].message.tool_calls"
         }),
     );
+    // Where this dialect puts its finish reason. **No `responseFinishMap`**: OpenAI's words already
+    // ARE the vocabulary every consumer of this router speaks, so there is nothing to translate.
+    ep.insert("responseFinish".to_string(), json!("$.choices[0].finish_reason"));
     // `requestUsage: true` is what makes cost — and therefore the spend cap — non-zero for a
     // streamed request: this dialect omits usage on a stream unless it is explicitly asked for.
     ep.insert(
@@ -186,10 +207,73 @@ pub fn anthropic_compat(base_url: &str) -> Value {
                 "requestTemplate": {
                     "model": "{{model}}",
                     "messages": "{{messages}}",
+                    // Anthropic has no `system` role in its messages array: the system prompt is a
+                    // top-level param. `messagesRoleMap` (system→null) hoists it, `systemField`
+                    // names where it lands, and `{{system?}}` omits the field when nothing hoisted.
+                    "system": "{{system?}}",
                     "stream": "{{stream}}",
                     "max_tokens": "{{maxTokens}}",
                     "tools": "{{tools?}}",
                     "tool_choice": "{{toolChoice?}}"
+                },
+                // v1.1 dialect shaping (ported 2026-10-01): the four declarations the TypeScript
+                // engine has had since 2026-10-01 and the Rust gateway never received. Without them
+                // the gateway sent `role:"system"` inside `messages` (an Anthropic 400 on every
+                // request that carries a system prompt) and OpenAI's `{type:"function",…}` tool
+                // wrapping. Mirrors `builtin-templates.ts:123-155` exactly.
+                "messagesRoleMap": {
+                    "user": "user",
+                    "assistant": "assistant",
+                    // `null` = HOIST to the system field. Anthropic has no `system` role.
+                    "system": null,
+                    // Anthropic models tool results as `user` turns; `tool_call_id` is dropped.
+                    "tool": "user"
+                },
+                "systemField": "system",
+                // Anthropic carries an image as a base64 `source` block and a text part as a plain
+                // `{type:"text",text}`. No data-URI here — media type and bytes are separate fields.
+                "contentPartTemplates": {
+                    "text": { "type": "text", "text": "{{text}}" },
+                    "image": {
+                        "type": "image",
+                        "source": { "type": "base64", "media_type": "{{mediaType}}", "data": "{{dataBase64}}" }
+                    },
+                    // A replayed tool turn: the call is a `tool_use` block on the assistant turn,
+                    // the result a `tool_result` block on a user turn — which is why the OpenAI
+                    // sibling fields (`tool_calls`, `role:"tool"`) must not reach the wire.
+                    "toolCall": { "type": "tool_use", "id": "{{id}}", "name": "{{name}}", "input": "{{argumentsObject}}" },
+                    "toolResult": { "type": "tool_result", "tool_use_id": "{{id}}", "content": "{{text}}" }
+                },
+                // One declaration, no `type`/`function` wrapping: Anthropic takes
+                // `{name, description, input_schema}` flat.
+                "toolDeclarationTemplates": {
+                    "function": { "name": "{{name}}", "description": "{{description}}", "input_schema": "{{parameters}}" }
+                },
+                // v1.1 amendment (ported 2026-10-01): Anthropic takes `tool_choice` only as an
+                // OBJECT, so the internal OpenAI string ("auto"/"none") and the
+                // `{type:"function",function:{name}}` form must be translated. Without this map the
+                // OpenAI value went out verbatim and every tool-using request 400'd
+                // (`tool_choice must be an object`) — measured live 2026-10-01 on the gateway path.
+                // The `function` value's placeholder names the forced tool. Mirrors
+                // `builtin-templates.ts:156-169` exactly.
+                "toolChoiceMap": {
+                    "none": { "type": "none" },
+                    "auto": { "type": "auto" },
+                    "function": { "type": "tool", "name": "{{toolChoice.function.name}}" }
+                },
+                // v1.1 amendment (2026-10-01): where Anthropic puts its finish reason, and how its
+                // words map onto the OpenAI vocabulary both consumers of this router speak (the
+                // app's `reason == "length"` warning, the gateway's OpenAI-shaped `finish_reason`).
+                // Without the map a response truncated at `max_tokens` matched nothing and looked
+                // complete. A reason not named here passes through raw.
+                "responseFinish": "$.stop_reason",
+                "responseFinishMap": {
+                    "end_turn": "stop",
+                    "max_tokens": "length",
+                    "tool_use": "tool_calls",
+                    "stop_sequence": "stop",
+                    "pause_turn": "stop",
+                    "refusal": "content_filter"
                 },
                 "responseMap": {
                     "text": "$.content[0].text",
@@ -204,6 +288,12 @@ pub fn anthropic_compat(base_url: &str) -> Value {
                     "chunkMap": { "delta": "$.delta.text" },
                     "errorMap": { "$.error": "PASS_THROUGH" },
                     "stopWhen": { "path": "$.type", "equals": "message_stop" },
+                    // Anthropic nests `stop_reason` under `delta` on `message_delta` events, unlike
+                    // the non-stream body where it is top-level. `responseFinish` targets the
+                    // non-stream shape; this targets the streaming chunk, so the reason is captured
+                    // before the terminating `message_stop` halts the loop. Mirrors
+                    // `builtin-templates.ts:207`.
+                    "finish": "$.delta.stop_reason",
                     // Tool use is split across events: content_block_start carries id+name, then one
                     // content_block_delta per input_json_delta fragment of the arguments JSON.
                     "toolCallStream": {
@@ -256,10 +346,79 @@ pub fn gemini_compat(base_url: &str) -> Value {
                 "streamPath": "/v1beta/{{model}}:streamGenerateContent?alt=sse",
                 "requestTemplate": {
                     "contents": "{{messages}}",
+                    // Gemini reads `tools:[{functionDeclarations:[…]}]` and does NOT read OpenAI's
+                    // `{type:"function",function:{…}}` wrapping, so before this the tools array was
+                    // sent and ignored — the model was never told it had any tools.
+                    "tools": "{{tools?}}",
+                    // Gemini's tool_choice is not a string either: it is
+                    // `toolConfig.functionCallingConfig`. A bare "auto" forwarded as `toolConfig`
+                    // is an unknown-field 400 — and the agent loop sends one on every tool-enabled
+                    // request, so this mapping is what makes agent mode reach Gemini at all.
+                    "toolConfig": "{{toolChoice?}}",
                     "generationConfig": {
                         "maxOutputTokens": "{{maxTokens?}}",
                         "temperature": "{{temperature?}}"
                     }
+                },
+                // v1.1 dialect shaping (ported 2026-10-01). Mirrors `builtin-templates.ts:281-333`.
+                "toolDeclarationTemplates": {
+                    "function": { "name": "{{name}}", "description": "{{description}}", "parameters": "{{parameters}}" }
+                },
+                // `tools` is `repeated Tool`, and each Tool carries its own `repeated
+                // functionDeclarations`. An array literal is not expressible in the template
+                // grammar, which is why the container is declared separately.
+                "toolDeclarationWrapper": { "functionDeclarations": "{{declarations}}" },
+                // Mirrors `tool_choice_to_openai` in `gateway_gemini.rs` (AUTO|ANY|NONE plus an
+                // optional forced name).
+                "toolChoiceMap": {
+                    "none": { "functionCallingConfig": { "mode": "NONE" } },
+                    "auto": { "functionCallingConfig": { "mode": "AUTO" } },
+                    "required": { "functionCallingConfig": { "mode": "ANY" } },
+                    "function": {
+                        "functionCallingConfig": {
+                            "mode": "ANY",
+                            "allowedFunctionNames": ["{{toolChoice.function.name}}"]
+                        }
+                    }
+                },
+                "messagesRoleMap": {
+                    // Gemini uses `model` for what OpenAI calls `assistant`.
+                    "user": "user",
+                    "assistant": "model",
+                    // Hoist but discard: generateContent has no system param and no `systemField`
+                    // is declared, so hoisted content is dropped rather than sent nowhere.
+                    "system": null,
+                    "tool": "user"
+                },
+                // A Gemini part carries NO `type` — the shape itself is the discriminator
+                // (`{text}` vs `{inlineData}`), which is why these are per-part templates rather
+                // than one structure with a type field to fill in. `args`/`response` must be
+                // objects, which is why the shaper offers `argumentsObject`/`response`.
+                "contentPartTemplates": {
+                    "text": { "text": "{{text}}" },
+                    "image": { "inlineData": { "mimeType": "{{mediaType}}", "data": "{{dataBase64}}" } },
+                    "toolCall": { "functionCall": { "name": "{{name}}", "args": "{{argumentsObject}}" } },
+                    "toolResult": { "functionResponse": { "name": "{{name}}", "response": "{{response}}" } }
+                },
+                // Gemini names a message's content `parts`, and it must be an array of parts even
+                // for plain text. Without this every request carried `content` — a field
+                // generateContent does not read — so it received no conversation at all.
+                "contentField": "parts",
+                // v1.1 amendment (2026-10-01): Gemini's `finishReason` is upper-cased and unrelated
+                // to OpenAI's words (`MAX_TOKENS` where OpenAI says `length`). The same selector
+                // serves the unary body and the streamed chunk. The safety reasons all collapse to
+                // OpenAI's `content_filter`; `OTHER` and `MALFORMED_FUNCTION_CALL` are left out on
+                // purpose, so they surface raw rather than being guessed into a word that means
+                // something else.
+                "responseFinish": "$.candidates[0].finishReason",
+                "responseFinishMap": {
+                    "STOP": "stop",
+                    "MAX_TOKENS": "length",
+                    "SAFETY": "content_filter",
+                    "RECITATION": "content_filter",
+                    "BLOCKLIST": "content_filter",
+                    "PROHIBITED_CONTENT": "content_filter",
+                    "SPII": "content_filter"
                 },
                 "responseMap": {
                     "text": "$.candidates[0].content.parts",
@@ -268,12 +427,35 @@ pub fn gemini_compat(base_url: &str) -> Value {
                         "prompt": "promptTokenCount",
                         "completion": "candidatesTokenCount",
                         "cached": "cachedContentTokenCount"
+                    },
+                    // Where a tool call sits, and how to read one (v1.1, ported 2026-10-01). A Gemini
+                    // part is `{functionCall:{name, args}}` with NO `type` — so the discriminator is
+                    // presence, and `args` is already an object. Without these two declarations a
+                    // functionCall part reached the loop as a nameless, argument-less call and the
+                    // model's request to run a tool was lost without a word.
+                    "toolCalls": "$.candidates[0].content.parts",
+                    "toolCallShape": {
+                        "discriminator": { "path": "functionCall", "present": true },
+                        "name": "functionCall.name",
+                        "arguments": "functionCall.args",
+                        "argumentsFormat": "object",
+                        // Gemini sends a complete call per part; there is nothing to concatenate.
+                        "streamedAs": "whole"
                     }
                 },
                 "stream": {
                     "protocol": "sse",
-                    "chunkMap": { "delta": "$.candidates[0].content.parts" },
+                    // The same `parts` path the unary read uses, and deliberately so: a streamed
+                    // functionCall is the same shape as a unary one, which is what
+                    // `streamedAs: "whole"` tells the interpreter — read each event's calls through
+                    // `toolCallShape`, do not accumulate fragments.
+                    "chunkMap": {
+                        "delta": "$.candidates[0].content.parts",
+                        "toolCalls": "$.candidates[0].content.parts"
+                    },
                     "errorMap": { "$.error": "PASS_THROUGH" },
+                    // No `[DONE]` sentinel: the server closes the SSE when the turn is over, and
+                    // finishReason arrives on the last content chunk.
                     "stopWhen": { "path": "$.candidates[0].finishReason", "equals": "STOP" }
                 }
             }

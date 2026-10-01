@@ -88,8 +88,10 @@ use serde::Deserialize;
 use serde_json::{Map, Value};
 
 use crate::core::adapter::ToolCall;
+use crate::core::dialect_shaping::read_tool_calls;
 use crate::core::egress::SENTINEL;
 use crate::core::engine::{AttemptError, FailureKind};
+use crate::core::manifest_view::ToolCallShape;
 use crate::core::template::is_js_whitespace;
 
 /// How much of a provider's error body reaches the message — `body.slice(0, 400)` in the source.
@@ -480,7 +482,21 @@ const TOOL_BLOCK_TYPES: [&str; 2] = ["tool_use", "function"];
 /// *drops* it (`&& o.id`). The two are separate functions in the source for the same reason, and
 /// `an_empty_id_survives_here_but_not_in_the_deltas` pins the difference so it cannot be "tidied"
 /// away by someone reading only one of them.
-pub fn emit_tool_calls(sink: &mut dyn FnMut(ToolCall), raw: &Value) {
+///
+/// **`shape` (v1.1 amendment, ported 2026-10-01) decides everything when present.** When it is
+/// absent the two hardcoded shapes below are used — OpenAI's nested form and Anthropic's flat one —
+/// so a manifest written before the field existed behaves byte-for-byte as it did. The shape-less
+/// path is deliberately kept rather than expressed as one built-in shape: the two differ in a way a
+/// shape cannot state (this one emits a call even when it cannot find a name; the shaped reader
+/// refuses), and rewriting a working path to fit a new abstraction is how a refactor silently
+/// changes behaviour.
+pub fn emit_tool_calls(sink: &mut dyn FnMut(ToolCall), raw: &Value, shape: Option<&ToolCallShape>) {
+    if let Some(shape) = shape {
+        for call in read_tool_calls(raw, shape) {
+            sink(call);
+        }
+        return;
+    }
     let mut emit = |item: &Value| {
         if !is_js_object(item) {
             return;
@@ -880,7 +896,7 @@ mod tests {
 
     fn collected(raw: &Value) -> Vec<ToolCall> {
         let mut out = Vec::new();
-        emit_tool_calls(&mut |call| out.push(call), raw);
+        emit_tool_calls(&mut |call| out.push(call), raw, None);
         out
     }
 

@@ -599,6 +599,7 @@ mod tests {
                     response_format: None,
                     on_tool_call: None,
                     on_usage: None,
+                    on_finish: None,
                     prompt_cache_enabled: false,
                     observation: None,
                 },
@@ -715,6 +716,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             prompt_cache_enabled: false,
             observation: None,
         };
@@ -792,6 +794,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             prompt_cache_enabled: false,
             observation: None,
         }

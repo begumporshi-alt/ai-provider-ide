@@ -358,6 +358,9 @@ pub struct TextRequest<'a> {
     pub response_format: Option<Value>,
     pub on_tool_call: Option<&'a mut (dyn FnMut(crate::core::adapter::ToolCall) + Send)>,
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    /// The finish reason, mapped to the OpenAI vocabulary by the serving dialect's
+    /// `responseFinishMap` — the word an OpenAI-shaped client switches on.
+    pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
     /// Whether to mark the system prompt with `cache_control` on egress so a provider with
@@ -918,6 +921,7 @@ impl<'a> ModelRouter<'a> {
             response_format,
             on_tool_call,
             on_usage,
+            on_finish,
             max_attempts,
             prompt_cache_enabled,
         } = req;
@@ -975,6 +979,15 @@ impl<'a> ModelRouter<'a> {
                     cb(u);
                 }
             };
+            // The same local-closure shape as `forward_usage` above, and for the same documented
+            // reason (`engine.rs:1230-1249`): a reference taken off the field directly carries the
+            // field's declared lifetime and fails to borrow-check.
+            let mut caller_on_finish = on_finish;
+            let mut forward_finish = |r: Option<String>| {
+                if let Some(cb) = caller_on_finish.as_deref_mut() {
+                    cb(r);
+                }
+            };
             let args = ExecuteTextArgs {
                 plan,
                 messages,
@@ -987,6 +1000,7 @@ impl<'a> ModelRouter<'a> {
                 response_format,
                 on_tool_call: Some(&mut forward_tool),
                 on_usage: Some(&mut forward_usage),
+                on_finish: Some(&mut forward_finish),
                 max_attempts,
                 prompt_cache_enabled,
             };
@@ -1386,6 +1400,7 @@ impl<'a> ModelRouter<'a> {
                 response_format: None,
                 on_tool_call: None,
                 on_usage: None,
+                on_finish: None,
                 max_attempts: None,
                 // Read from the router settings rather than hardcoded off, so the operator's
                 // toggle governs this path too. `CompleteRequest` carries no flag of its own:
@@ -2090,6 +2105,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }

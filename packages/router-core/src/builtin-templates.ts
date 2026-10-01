@@ -194,6 +194,19 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
         // v1.1: where Anthropic puts its finish reason. Non-stream: `stop_reason` is top-level.
         // Stream: Anthropic delivers it on the `message_delta` event as `stop_reason`.
         responseFinish: "$.stop_reason",
+        // v1.1 amendment (2026-10-01): Anthropic's `stop_reason` words are not OpenAI's. Both
+        // consumers of this router test against the OpenAI vocabulary — the app warns on
+        // `reason === "length"`, the gateway puts it on an OpenAI-shaped `finish_reason` — so
+        // without this a response truncated at `max_tokens` reported `max_tokens`, matched nothing,
+        // and looked complete. A reason not named here passes through raw.
+        responseFinishMap: {
+          end_turn: "stop",
+          max_tokens: "length",
+          tool_use: "tool_calls",
+          stop_sequence: "stop",
+          pause_turn: "stop",
+          refusal: "content_filter",
+        },
         stream: {
           protocol: "sse",
           // content_block_delta events carry {delta:{text}}
@@ -359,6 +372,20 @@ function geminiCompat(baseUrl: string): AdapterManifest {
           },
         },
         responseFinish: "$.candidates[0].finishReason",
+        // v1.1 amendment (2026-10-01): Gemini's `finishReason` is upper-cased and unrelated to
+        // OpenAI's words — `MAX_TOKENS` where OpenAI says `length`. Same reason as Anthropic's map.
+        // The safety/blocked reasons all collapse to OpenAI's `content_filter`; `OTHER` and
+        // `MALFORMED_FUNCTION_CALL` are left out on purpose, so they surface raw rather than
+        // being guessed into a word that means something else.
+        responseFinishMap: {
+          STOP: "stop",
+          MAX_TOKENS: "length",
+          SAFETY: "content_filter",
+          RECITATION: "content_filter",
+          BLOCKLIST: "content_filter",
+          PROHIBITED_CONTENT: "content_filter",
+          SPII: "content_filter",
+        },
         stream: {
           protocol: "sse",
           // The same `parts` path the unary read uses, and deliberately so: a streamed functionCall

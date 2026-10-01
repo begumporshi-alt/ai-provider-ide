@@ -1003,6 +1003,8 @@ pub struct ExecuteTextArgs<'a> {
     pub response_format: Option<Value>,
     pub on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    /// Forwarded untouched, like `on_tool_call` — the finish reason mapped to the OpenAI vocabulary.
+    pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     pub max_attempts: Option<usize>,
     /// Mark the last system message block with `cache_control` on egress. See
     /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
@@ -1245,6 +1247,14 @@ pub async fn execute_text(
                         cb(tc);
                     }
                 };
+                // The same local-closure shape as `forward_tool`, for the same documented reason: the
+                // reference taken off the field directly would carry the field's declared lifetime.
+                let mut caller_on_finish = args.on_finish.as_deref_mut();
+                let mut forward_finish = |reason: Option<String>| {
+                    if let Some(cb) = caller_on_finish.as_deref_mut() {
+                        cb(reason);
+                    }
+                };
                 let text_args = TextArgs {
                     model: candidate.model.native_id.clone(),
                     messages: &args.messages,
@@ -1256,6 +1266,7 @@ pub async fn execute_text(
                     response_format: args.response_format.as_ref(),
                     on_tool_call: Some(&mut forward_tool),
                     on_usage: Some(&mut record_usage),
+                    on_finish: Some(&mut forward_finish),
                     prompt_cache_enabled: args.prompt_cache_enabled,
                     observation: Some(&mut observation),
                 };
@@ -3377,6 +3388,7 @@ mod tests {
             response_format: None,
             on_tool_call: None,
             on_usage: None,
+            on_finish: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }

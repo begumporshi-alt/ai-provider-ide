@@ -252,6 +252,20 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
   // v1.1 amendment (2026-09-30): where the dialect puts its finish_reason on the response.
   // Optional — a dialect that omits it simply never surfaces a finish reason.
   responseFinish: Selector.optional(),
+  // v1.1 amendment (2026-10-01): translate the dialect's own finish reason into the **OpenAI
+  // vocabulary** (`stop` / `length` / `tool_calls` / `content_filter`).
+  //
+  // Maps the RAW reason the `responseFinish` selector read (Anthropic `max_tokens`, Gemini
+  // `MAX_TOKENS`) to the word every consumer of this router speaks — the app's "answer was
+  // truncated" warning, which tests `reason === "length"`, and the gateway's OpenAI-shaped
+  // `finish_reason`, which clients read to tell a complete answer from a cut-off one.
+  //
+  // Without it those consumers compare a dialect word against an OpenAI one and silently never
+  // match, so a response truncated at `max_tokens` looked complete on every non-OpenAI provider.
+  // A reason the map does not name passes through raw, so a dialect can map only what it knows.
+  // When absent, `responseFinish`'s value is surfaced untouched (the OpenAI dialect, whose words
+  // already are the target vocabulary).
+  responseFinishMap: z.record(z.string(), z.unknown()).optional(),
   // `toolCalls` (v1.1 amendment 2026-09-17): where a real tool call sits in the response.
   // Optional and dialect-specific — a manifest that omits it simply never reports tool
   // calls, which is the pre-amendment behaviour.

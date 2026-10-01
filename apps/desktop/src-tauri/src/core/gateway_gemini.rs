@@ -93,6 +93,22 @@ fn gemini_error(message: &str, status: StatusCode) -> Response {
     (status, axum::Json(gemini_error_body(message, status))).into_response()
 }
 
+/// Map a finish reason from the **OpenAI vocabulary** (what the interpreter produces, via a
+/// dialect's `responseFinishMap`) onto Gemini's `FinishReason` for this client.
+///
+/// Only the truncation case matters on the wire: `MAX_TOKENS` is the one Gemini member that tells a
+/// client its answer was cut off, and reporting `STOP` instead is what made a truncated answer look
+/// complete (drift D86). The safety reasons map to `SAFETY`, which is the nearest member Gemini
+/// has; anything else — including OpenAI's `tool_calls`, for which Gemini has no member at all —
+/// is `STOP`.
+fn gemini_finish_reason(cls: Option<&str>) -> &'static str {
+    match cls {
+        Some("length") => "MAX_TOKENS",
+        Some("content_filter") => "SAFETY",
+        _ => "STOP",
+    }
+}
+
 /// Gemini generateContent ingress (v1.1, 2026-09-16): `x-goog-api-key` or `?key=`, model
 /// in the path, contents/parts request and candidates response shapes. SSE via ?alt=sse.
 pub(crate) async fn gemini_h(
@@ -242,6 +258,8 @@ pub(crate) async fn gemini_h(
             let prep = prep;
             let mut usage: Option<(u64, u64)> = None;
             let mut streamed = String::new();
+            // The provider's reason in the OpenAI vocabulary; turned back into Gemini's word.
+            let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
                     BridgeMsg::Delta(t) => {
@@ -250,12 +268,15 @@ pub(crate) async fn gemini_h(
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                     }
                     BridgeMsg::Result(_) => {}
+                    BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
                         if let Some(p) = &prep {
                             let _ = finish_capture(p, &streamed);
                         }
                         let (pt, ct) = usage.unwrap_or((0, 0));
-                        let fin = json!({ "candidates": [{ "finishReason": "STOP" }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
+                        // The provider's own reason when it declared one — a truncation must reach a
+                        // Gemini client as MAX_TOKENS, not STOP (drift D86).
+                        let fin = json!({ "candidates": [{ "finishReason": gemini_finish_reason(finish_reason.as_deref()) }], "usageMetadata": { "promptTokenCount": pt, "candidatesTokenCount": ct } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(fin.to_string()));
                         break;
                     }
@@ -310,10 +331,12 @@ pub(crate) async fn gemini_h(
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
     let mut has_tool_calls = false;
     let mut tool_parts: Vec<Value> = Vec::new();
+    let mut provider_finish: Option<String> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
             BridgeMsg::Result(_) => {}
+            BridgeMsg::Finish(reason) => provider_finish = Some(reason),
             BridgeMsg::Done => {
                 if let Some(p) = &prep {
                     let _ = finish_capture(p, &full);
@@ -370,7 +393,16 @@ pub(crate) async fn gemini_h(
             // `if has_tool_calls { "STOP" } else { "STOP" }` until 2026-09-22: a dead branch that
             // implied a distinction the protocol does not make.
             // Pinned by `gemini_tool_turn_still_reports_stop`.
-            let finish_reason = "STOP";
+            //
+            // **A truncation is the one case this collapses wrongly**, so it is the one case the
+            // provider's own reason is used for: a turn cut off at `max_tokens` must reach a Gemini
+            // client as `MAX_TOKENS`, not `STOP` — otherwise it reads as a finished answer
+            // (drift D86). A tool turn keeps the `STOP` above, because Gemini has no other member.
+            let finish_reason = if has_tool_calls {
+                "STOP"
+            } else {
+                gemini_finish_reason(provider_finish.as_deref())
+            };
             let parts = if has_tool_calls && !tool_parts.is_empty() {
                 tool_parts
             } else {
