@@ -11,11 +11,17 @@
  */
 import type { ChatMessage, TextRequest, TextStream } from "@aiprovider/router-core";
 
+/** What a tool does to the workspace. Declared per tool so the approval policy can be a function
+ *  of the declaration instead of a second hardcoded list that drifts away from this one. */
+export type ToolEffect = "read" | "mutate";
+
 /** A tool the agent may call. Every entry maps 1:1 to a handler in the Rust sandbox — a name
  *  the host does not implement is a call that can only ever fail. */
 export interface ToolSpec {
   name: string;
   description: string;
+  /** `read` never changes the workspace; `mutate` can. Drives approval modes and plan mode. */
+  effect: ToolEffect;
   /** JSON-schema fragment: { properties, required }. `additionalProperties:false` is forced. */
   parameters: { properties: Record<string, unknown>; required?: string[] };
 }
@@ -54,8 +60,16 @@ export interface AgentLoopOptions {
   /**
    * Per-call confirmation gate. Return true to execute, false to deny (the UI shows the
    * user an allow/deny prompt). When omitted, every call executes (non-interactive use).
+   *
+   * A refusal may carry a `reason`, which is what the model is told. That matters whenever the
+   * refusal is not the user's doing — plan mode refuses mutations on its own, and the model has
+   * to know it should propose a plan rather than rephrase the same call and try again. The
+   * default reason blames the user, which is a lie in that case.
    */
-  confirm?: (call: import("@aiprovider/router-core").ToolCall, args: Record<string, unknown>) => Promise<boolean>;
+  confirm?: (
+    call: import("@aiprovider/router-core").ToolCall,
+    args: Record<string, unknown>,
+  ) => Promise<boolean | { allow: boolean; reason?: string }>;
   /** Streaming + lifecycle events for the UI. */
   onEvent?: (ev: AgentEvent) => void;
   /** Finish reason callback, forwarded to `generateText` on each agent round-trip. */

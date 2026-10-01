@@ -43,7 +43,7 @@ async function sendAndApprove(page: Page, task: string): Promise<void> {
   await page.getByPlaceholder(/Describe a task for the agent/).fill(task);
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow" }).click();
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeHidden({ timeout: 30_000 });
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
 }

@@ -12,7 +12,7 @@
  * silently un-gate a writing tool, so the names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOLS, registryToOpenAI } from "./registry";
+import { AGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
 
 /** Mirrors `MUTATING_TOOLS` in src-tauri/src/gateway.rs. Keep the two in step. */
 const MUTATING = ["write_file", "edit_file", "mkdir", "run_command"];
@@ -59,6 +59,22 @@ describe("AGENT_TOOLS", () => {
     // The reason edit_file exists: write_file is a whole-file overwrite, so every small change
     // was expensive and destructive. If edit_file is ever dropped, this is the regression.
     expect(AGENT_TOOLS.some((t) => t.name === "edit_file")).toBe(true);
+  });
+
+  it("the declared effect agrees with the gateway's mutating list", () => {
+    // Two descriptions of the same fact used to live in a comment and in this list. Phase 5's
+    // approval modes read `effect`, so a tool that writes but declares "read" would run with no
+    // prompt under "auto-approve reads" — silently, and in the direction that loses work.
+    for (const t of AGENT_TOOLS) {
+      const expected = MUTATING.includes(t.name) ? "mutate" : "read";
+      expect(t.effect, t.name).toBe(expected);
+    }
+  });
+
+  it("knows the effect of a name, and fails closed for one it does not", () => {
+    expect(toolEffect("read_file")).toBe("read");
+    expect(toolEffect("run_command")).toBe("mutate");
+    expect(toolEffect("not_a_tool")).toBe("mutate");
   });
 });
 

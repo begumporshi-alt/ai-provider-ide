@@ -575,6 +575,14 @@ let eventSeq = 0;
    */
   invoke: (cmd: string, args: Record<string, unknown> = {}) => handle(cmd, args),
   /**
+   * Read the harness's virtual workspace.
+   *
+   * The shim owns the tool sandbox the browser does not have, so a spec that has to prove a *file*
+   * changed — or was put back — has to read it here. A diff on screen is what the UI believes; this
+   * is what the sandbox holds, and only the second one can falsify a revert that reported success.
+   */
+  vfs: (): Record<string, string> => Object.fromEntries(virtualFs),
+  /**
    * Set what `capture_queue_status` reports — same reason as `gatewayStatus`: the drain and its
    * budget live in the host, so the capped branch can only be arranged here.
    */

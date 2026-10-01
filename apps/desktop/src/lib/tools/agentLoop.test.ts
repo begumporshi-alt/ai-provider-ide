@@ -99,6 +99,54 @@ describe("runAgentLoop", () => {
     expect(result && result.type === "tool_result" && result.result).toContain("denied");
   });
 
+  it("uses the gate's own reason when the refusal was not the user's doing", async () => {
+    // Plan mode refuses a write itself. Telling the model "the user denied this" when the user was
+    // never shown the call is what makes it rephrase the same edit instead of proposing a plan.
+    const events: AgentEvent[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "should-not-happen" }; } };
+    const model = fakeModel([
+      { text: "x", calls: [{ id: "c1", name: "write_file", arguments: '{"path":"a","content":"b"}' }] },
+      { text: "here is my plan" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm: async () => ({ allow: false, reason: "PLAN MODE: propose the change instead." }),
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(out.text).toBe("here is my plan");
+    const result = events.find((e) => e.type === "tool_result");
+    expect(result && result.type === "tool_result" && result.result).toBe("PLAN MODE: propose the change instead.");
+  });
+
+  it("still blames the user when a plain `false` denies the call", async () => {
+    // The widened contract must not lose the old wording: an ordinary deny is still the user's.
+    const events: AgentEvent[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "nope" }; } };
+    const model = fakeModel([
+      { text: "x", calls: [{ id: "c1", name: "write_file", arguments: '{"path":"a","content":"b"}' }] },
+      { text: "ok" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm: async () => false,
+      onEvent: (e) => events.push(e),
+    });
+
+    const result = events.find((e) => e.type === "tool_result");
+    expect(result && result.type === "tool_result" && result.result).toContain("denied by the user");
+  });
+
   it("stops at the iteration ceiling instead of looping forever", async () => {
     const events: AgentEvent[] = [];
     const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };

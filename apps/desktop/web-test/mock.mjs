@@ -173,6 +173,21 @@ async function oracle(req, res, path) {
       // so this is what proves the bridge forwards the reason instead of a blank result.
       toolCall = { name: "read_file", arguments: JSON.stringify({ path: "nope.txt" }) };
       content = "";
+    } else if (tools && /again/i.test(last)) {
+      // Agent mode, SECOND-TURN variant: the same tool again, on a later turn and with a history
+      // that already contains a tool result. Ungated on `sawToolResult` for that reason — the
+      // "always allow this tool" spec needs a call that would be gated if the grant were not
+      // recorded, and a branch that required a clean history could never produce one.
+      toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "there", new: "world" }) };
+      content = "";
+    } else if (tools && /approved/i.test(last)) {
+      // Agent mode, PLAN-APPROVED variant: the user turn that follows clicking "Approve plan &
+      // execute". Deliberately NOT gated on `!sawToolResult`: the plan pass before it always ends
+      // with a tool result (the refusal), so a branch that required a clean history could never
+      // fire and the executing pass would look like it did nothing — which is precisely the
+      // behaviour this variant exists to disprove.
+      toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "world", new: "there" }) };
+      content = "";
     } else if (tools && !sawToolResult && /edit/i.test(last)) {
       // Agent mode, MUTATION variant: an edit_file call against the shim's virtual FS
       // (`README.md` holds "hello\nworld\n"). The transcript must render this as a diff — the

@@ -10,12 +10,18 @@
  * `write_file`, `edit_file`, `mkdir` and `run_command` are MUTATING — the four the gateway
  * refuses unless mutation is explicitly enabled, and the four the Assistant confirms one call at
  * a time. The other four only read, and are always available.
+ *
+ * That split is now *declared* on each entry (`effect`) rather than only described here, because
+ * Phase 5's approval modes and plan mode both have to ask "does this tool write?" on every call,
+ * and a second hand-maintained list of mutating names is a list that eventually disagrees with
+ * this one. `effect` and the gateway's `MUTATING_TOOLS` are pinned together by a test.
  */
-import type { ToolSpec } from "./types";
+import type { ToolEffect, ToolSpec } from "./types";
 
 export const AGENT_TOOLS: ToolSpec[] = [
   {
     name: "read_file",
+    effect: "read",
     description:
       "Read a UTF-8 text file from the workspace and return its contents. Directories are rejected. Use offset/limit to read part of a large file instead of swallowing the whole thing.",
     parameters: {
@@ -38,6 +44,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "write_file",
+    effect: "mutate",
     description:
       "Write UTF-8 text to a workspace file, creating parent directories as needed. Overwrites any existing file — prefer edit_file for changing one part of a file you have read.",
     parameters: {
@@ -50,6 +57,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "list_dir",
+    effect: "read",
     description: "List the entries of a workspace directory. Defaults to the workspace root.",
     parameters: {
       properties: {
@@ -67,6 +75,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "search_files",
+    effect: "read",
     description:
       "Search the workspace for a literal string and return matching lines as path:line: text. Case-insensitive by default. Use this to find where something is defined instead of reading files one at a time.",
     parameters: {
@@ -86,6 +95,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "file_info",
+    effect: "read",
     description:
       "Report whether a workspace path exists, and its kind, size and last-modified time. A missing path is a normal result, not an error.",
     parameters: {
@@ -97,6 +107,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "edit_file",
+    effect: "mutate",
     description:
       "Replace an exact snippet in a file. The snippet must match exactly — including indentation — and must occur exactly once unless replace_all is true. Safer than rewriting a whole file.",
     parameters: {
@@ -114,6 +125,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "mkdir",
+    effect: "mutate",
     description: "Create a directory inside the workspace, including any missing parents.",
     parameters: {
       properties: {
@@ -124,6 +136,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
   },
   {
     name: "run_command",
+    effect: "mutate",
     description:
       "Run a single allowlisted command inside the workspace. There is no shell, so ; | && ` ` and $( ) are inert literals, not syntax. Network-facing git subcommands (push/pull/fetch/clone) are refused.",
     parameters: {
@@ -165,4 +178,20 @@ export function registryToOpenAI(registry: ToolSpec[]): unknown {
       },
     },
   }));
+}
+
+/** Effects by tool name, for callers that hold a name rather than a spec. */
+const EFFECT_BY_NAME = new Map(AGENT_TOOLS.map((t) => [t.name, t.effect]));
+
+/**
+ * The effect of a call by name.
+ *
+ * **Unknown names are `"mutate"`.** A name this registry does not list is one the host would
+ * refuse anyway, but the answer must not be "read" — that would let a tool that appears in a
+ * future registry (or one a manifest-shaped host implements) run unprompted under
+ * "auto-approve reads" on the strength of being unrecognised. Fail closed.
+ */
+export function toolEffect(name: string | undefined | null): ToolEffect {
+  if (!name) return "mutate";
+  return EFFECT_BY_NAME.get(name) ?? "mutate";
 }

@@ -144,9 +144,21 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       let ok = true;
 
       let allow = true;
-      if (confirm) allow = await confirm(call, args);
+      // A refusal the gate made on its own behalf (plan mode) carries its own wording. The default
+      // blames the user, and telling the model "the user denied this" when the user never saw the
+      // call teaches it to retry the same edit with different phrasing instead of proposing a plan.
+      let denyReason = `Tool call "${name}" was denied by the user.`;
+      if (confirm) {
+        const verdict = await confirm(call, args);
+        if (typeof verdict === "boolean") {
+          allow = verdict;
+        } else {
+          allow = verdict.allow;
+          if (verdict.reason) denyReason = verdict.reason;
+        }
+      }
       if (!allow) {
-        resultText = `Tool call "${name}" was denied by the user.`;
+        resultText = denyReason;
         ok = false;
       } else {
         try {

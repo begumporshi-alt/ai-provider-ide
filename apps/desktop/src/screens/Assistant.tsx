@@ -27,6 +27,13 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import {
+  APPROVAL_MODES, INITIAL_APPROVAL, decide, withAllowAll, withTrustedTool,
+  RunCheckpoint, createCheckpointingHost, revertPlan,
+  type ApprovalMode, type ApprovalState, type RunChangeSet,
+} from "../lib/tools";
+import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
+import { ChangeSetReview } from "../components/ChangeSetReview";
 import { toolCallName } from "../lib/tools/wire";
 import { DiffView } from "../components/DiffView";
 import {
@@ -202,6 +209,26 @@ interface AgentItem {
   status: "calling" | "ok" | "error" | "denied";
   result?: string;
 }
+
+/**
+ * Plan mode's system prompt (Phase 5).
+ *
+ * The prompt is not the enforcement — the approval gate refuses every mutation itself, and would
+ * refuse them even if this text were deleted. Saying it anyway is what makes the pass *useful*:
+ * a model that is asked to research and is silently blocked at its first edit spends its tool
+ * budget rediscovering that it cannot write, and then answers with an apology. Told up front, it
+ * proposes instead.
+ */
+const PLAN_MODE_SYSTEM =
+  "\n\nPLAN MODE — this pass may not modify the workspace. Every writing tool (write_file, " +
+  "edit_file, mkdir, run_command) will be refused. Use the read-only tools (read_file, list_dir, " +
+  "search_files, file_info) to understand the task, then answer with the plan you intend to carry " +
+  "out: numbered steps, the exact files each step changes, and anything you would need to confirm. " +
+  "Do not attempt a write, and do not ask the user to apply it for you.";
+
+/** The user turn that starts the executing pass after a plan is approved. Phrased as the user's
+ *  own words rather than a hidden instruction, because it is replayed in every later turn. */
+const PLAN_APPROVED_TURN = "The plan is approved — carry it out now.";
 
 /** Graph labels are identifiers, not content — a 400-character node is unreadable on canvas. */
 function clip(s: string, n: number): string {
@@ -524,6 +551,15 @@ interface AssistantSettings {
   systemPrompt?: string;
   noToolsSystem?: string;
   agentSystem?: string;
+  /**
+   * Phase 5 approval mode.
+   *
+   * Persisted, like `agentMode`: it is how the user wants the screen to behave, and re-choosing it
+   * every launch would be a setting that is not one. Plan mode is deliberately NOT persisted — it
+   * is an intent for one pass, and a launch that quietly refused every write because of a flag
+   * left on in a previous session would be a very confusing way to lose an afternoon.
+   */
+  approvalMode?: ApprovalMode;
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
@@ -558,6 +594,12 @@ export function AssistantScreen() {
   // the difference between "the tab changed" and "my settings changed".
   const [noTools, setNoTools] = useState(true);
   const [agentMode, setAgentMode] = useState(false);
+  // P5: how the agent's tool calls are gated. `ask` is today's behaviour and the default, so a
+  // user who never opens the control gets exactly what they had.
+  const [approvalMode, setApprovalMode] = useState<ApprovalMode>("ask");
+  // P5: plan mode — a pass that may not modify the workspace, whose answer is a plan to approve.
+  // Session-scoped and never persisted; see the note in `AssistantSettings`.
+  const [planMode, setPlanMode] = useState(false);
   // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
   // what the model sees and costs a second call, so it has to be possible to turn it off.
   const [useMemory, setUseMemory] = useState(true);
@@ -607,6 +649,10 @@ export function AssistantScreen() {
       if (typeof stored.systemPrompt === "string") setCustomSystemPrompt(stored.systemPrompt);
       if (typeof stored.noToolsSystem === "string") setCustomNoToolsSystem(stored.noToolsSystem);
       if (typeof stored.agentSystem === "string") setCustomAgentSystem(stored.agentSystem);
+      // Validated against the known ids rather than trusted: an unknown string from a future
+      // build would otherwise reach `decide()` and match none of its branches, which reads as
+      // "ask every time" — a silent downgrade the user could not see.
+      if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode)) setApprovalMode(stored.approvalMode!);
       setDefaultRoot(fallback);
       setRoot(stored.root ?? fallback ?? "");
       setHydrated(true);
@@ -621,7 +667,7 @@ export function AssistantScreen() {
   // missing, which reads back as "the user never changed it".
   const saveAll = useCallback(
     () => saveAssistantSettings({
-      root, agentMode, useMemory, noTools, maxIterations,
+      root, agentMode, useMemory, noTools, maxIterations, approvalMode,
       // `null`, never `undefined`, for an unset field. `JSON.stringify` omits an undefined key, so
       // an omitted one leaves the previously stored value in the row — clearing "max tokens" would
       // look like it worked and then quietly come back on the next load.
@@ -632,7 +678,7 @@ export function AssistantScreen() {
       noToolsSystem: customNoToolsSystem,
       agentSystem: customAgentSystem,
     }),
-    [root, agentMode, useMemory, noTools, maxIterations, temperature, maxTokens,
+    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, temperature, maxTokens,
       customSystemPrompt, customNoToolsSystem, customAgentSystem],
   );
 
@@ -650,7 +696,7 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, temperature, maxTokens,
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, temperature, maxTokens,
       customSystemPrompt, customNoToolsSystem, customAgentSystem]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
@@ -715,7 +761,28 @@ export function AssistantScreen() {
           onChange={setMaxIterations}
           disabled={!agentMode}
         />
+        <ApprovalPicker
+          mode={approvalMode}
+          onChange={setApprovalMode}
+          disabled={!agentMode}
+        />
+        <OptionCheck
+          label="plan mode"
+          checked={planMode}
+          onChange={setPlanMode}
+          disabled={!agentMode}
+        />
       </div>
+      {agentMode && planMode && (
+        // The pairing is the whole reason this appears: plan mode subtracts permissions and never
+        // grants them, so a plan pass that reads without being clicked through needs the mode
+        // above it to say so. Without this line the user gets asked about every read and reads
+        // that as plan mode being broken.
+        <p className="-mt-2 mb-2 text-[11px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
+          Plan mode refuses every write, whatever the approval mode. Pair it with “auto-approve reads”
+          for a pass that explores without asking.
+        </p>
+      )}
       {/* No `key={tick}` here. Keying on the tick remounted Chat on every store bump, which
           wiped the conversation mid-session — a settings save took the transcript with it.
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
@@ -732,6 +799,9 @@ export function AssistantScreen() {
           agentMode={agentMode}
           useMemory={useMemory}
           maxIterations={maxIterations}
+          approvalMode={approvalMode}
+          planMode={planMode}
+          onPlanModeChange={setPlanMode}
           temperature={temperature}
           maxTokens={maxTokens}
           onTemperatureChange={setTemperature}
@@ -941,6 +1011,9 @@ function Chat({
   agentMode,
   useMemory,
   maxIterations,
+  approvalMode,
+  planMode,
+  onPlanModeChange,
   temperature,
   maxTokens,
   onTemperatureChange,
@@ -960,6 +1033,12 @@ function Chat({
   agentMode: boolean;
   useMemory: boolean;
   maxIterations: number;
+  /** P5: how tool calls are gated. The mode itself lives in `AssistantScreen` (it is persisted);
+   *  the trust the user grants from the modal is per-session state held here. */
+  approvalMode: ApprovalMode;
+  planMode: boolean;
+  /** Called to leave plan mode — the executing pass runs with it off. */
+  onPlanModeChange: (v: boolean) => void;
   /** Owned by `AssistantScreen`, like `root` — see the note on the composer strip below. */
   temperature: number | "";
   maxTokens: number | "";
@@ -1014,7 +1093,20 @@ function Chat({
   /** Bumped by `/model` to open the picker, which owns its own open state. */
   const [pickerNonce, setPickerNonce] = useState(0);
   const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
-  const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (ok: boolean) => void } | null>(null);
+  const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (choice: ApprovalChoice) => void } | null>(null);
+  /**
+   * P5: the trust the user has granted from the approval modal — this tool, or everything.
+   *
+   * Session-scoped and held here rather than in `AssistantScreen`: it is a decision about *this*
+   * conversation (and, for "this session", expires with the app anyway), not a persisted setting.
+   * The mode is the persisted half; see `AssistantSettings`.
+   */
+  const [granted, setGranted] = useState<{ trustedTools: ReadonlySet<string>; allowAll: boolean }>({
+    trustedTools: new Set(),
+    allowAll: false,
+  });
+  /** P5: what the finished run changed, for `ChangeSetReview`. Null until a run touches something. */
+  const [runChanges, setRunChanges] = useState<RunChangeSet | null>(null);
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
   const [showPolicy, setShowPolicy] = useState(false);
@@ -1258,10 +1350,40 @@ function Chat({
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
   const callById = useMemo(() => indexToolCalls(msgs), [msgs]);
 
-  // Per-call confirmation gate: suspend the loop until the user allows or denies.
+  // Per-call approval gate: consult the policy, and suspend the loop for a modal only when the
+  // policy says the user has to decide.
+  //
+  // The state read here is a ref reassigned every render, for the same reason `keyActions` is: the
+  // gate is handed to `runAgentLoop` once, at the start of a run, so a gate that closed over
+  // `approvalMode` would keep asking about reads after the user switched to auto-approve
+  // mid-run. Reading the latest value is also what makes a modal's "always allow this tool" take
+  // effect on the *next* call of the same run, which is the only reason that button exists.
+  const approvalRef = useRef<ApprovalState>({ ...INITIAL_APPROVAL, mode: approvalMode });
+  approvalRef.current = { mode: approvalMode, planMode, trustedTools: granted.trustedTools, allowAll: granted.allowAll };
+
   const confirmGate = useCallback(
-    (call: ToolCall, args: Record<string, unknown>) =>
-      new Promise<boolean>((resolve) => setPendingConfirm({ call, args, resolve })),
+    async (call: ToolCall, args: Record<string, unknown>) => {
+      const name = call.name ?? "?";
+      const verdict = decide(approvalRef.current, name);
+      // Plan mode refuses writes itself, and does so without a modal: a prompt here would let the
+      // user approve exactly the write plan mode exists to prevent, one click away from a mode
+      // they chose for a reason.
+      if (verdict.action === "allow") return { allow: true };
+      if (verdict.action === "deny") return { allow: false, reason: verdict.reason };
+      const choice = await new Promise<ApprovalChoice>((resolve) => setPendingConfirm({ call, args, resolve }));
+      if (choice.allow && choice.scope !== "once") {
+        // Applied to the ref **and** to state. State is what the render reads; the ref is what the
+        // very next call of this same run reads, and `setGranted` is not applied until React
+        // re-renders — which the loop does not wait for. Without the ref, "always allow this tool"
+        // would ask about the same tool again on the immediately following call.
+        const next = choice.scope === "session"
+          ? withAllowAll(approvalRef.current)
+          : withTrustedTool(approvalRef.current, name);
+        approvalRef.current = next;
+        setGranted({ trustedTools: next.trustedTools, allowAll: next.allowAll });
+      }
+      return { allow: choice.allow };
+    },
     [],
   );
 
@@ -1273,7 +1395,12 @@ function Chat({
       if (ev.type === "tool_call") {
         recordStep(run, "tool_call", ev.call.name ?? "?", ev.call.arguments ?? undefined);
       } else if (ev.type === "tool_result") {
-        const denied = ev.result.includes("denied");
+        // `refused` as well as `denied`: plan mode refuses a write on its own behalf, and the two
+        // are the same thing to the reader ("the agent did not run this") while being different
+        // things to them ("you said no" / "the mode said no"). Both render as "denied" here and the
+        // full sentence is in the recorded step. Without `refused` in this test every plan-mode
+        // refusal painted the caller's block as an unexpected failure.
+        const denied = /denied|refused/i.test(ev.result);
         recordStep(run, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
       } else if (ev.type === "done") {
         iterationsRef.current = ev.iterations;
@@ -1289,7 +1416,7 @@ function Chat({
         const copy = [...l];
         for (let i = copy.length - 1; i >= 0; i--) {
           if (copy[i].status === "calling") {
-            copy[i] = { ...copy[i], status: ev.result.includes("denied") ? "denied" : ev.ok ? "ok" : "error", result: ev.result };
+            copy[i] = { ...copy[i], status: /denied|refused/i.test(ev.result) ? "denied" : ev.ok ? "ok" : "error", result: ev.result };
             break;
           }
         }
@@ -1346,6 +1473,9 @@ function Chat({
       }
       setStreamedText("");
       setAgentItems([]);
+      // The previous run's review is about to be superseded — and leaving it up while a new run
+      // writes the same files would offer a revert that restores a state two runs old.
+      setRunChanges(null);
       // P6: open the run record before the first call, and register this controller so the
       // orchestrator dashboard can stop the run even though it did not start it.
       const runId = newRunId();
@@ -1353,7 +1483,11 @@ function Chat({
       iterationsRef.current = 0;
       startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: trimmed });
       registerAbort(runId, ac);
-      const host = createTauriToolHost(root.trim());
+      // P5: the run's checkpoint. Every write this run makes goes through the wrapping host, which
+      // reads the file's previous contents *before* the write — that is what makes both the review
+      // diff and "revert this run" show what actually changed rather than what the model claimed.
+      const checkpoint = new RunCheckpoint();
+      const host = createCheckpointingHost(createTauriToolHost(root.trim()), checkpoint);
       // The user's node is created here rather than inside recordAgentTurn, because the recall
       // edges need an anchor before the run starts. Same shape as the plain-chat branch below:
       // one node per turn, reused by everything that needs to point at it.
@@ -1377,7 +1511,7 @@ function Chat({
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : ""),
+          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : "") + (planMode ? PLAN_MODE_SYSTEM : ""),
           registry: AGENT_TOOLS,
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
@@ -1455,6 +1589,11 @@ function Chat({
         setAgentItems([]);
         setStreamedText("");
         abortRef.current = null;
+        // P5: publish the change set in `finally`, not on the success path. A run the user stopped
+        // or that threw has still written every file it got to before that, and those are exactly
+        // the writes someone wants to take back — hiding them because the turn did not finish would
+        // make "revert this run" unavailable in the only case it matters most.
+        setRunChanges(checkpoint.empty ? null : checkpoint.snapshot());
         // Every iteration wrote a ledger row; the totals are stale until they are re-read.
         refreshUsageTotals();
       }
@@ -1569,6 +1708,55 @@ function Chat({
   function send(text: string, attachments: Attachment[], inlined: InlinedText[]) {
     if (busy || !chosen) return;
     void runTurn(text, msgs, attachments, inlined);
+  }
+
+  /**
+   * P5: approve the plan and run it for real.
+   *
+   * The approval ref is updated **before** `send`, and that order is the whole trick: `send` starts
+   * the run synchronously, and the gate for that run reads the ref. Turning plan mode off with
+   * `setPlanMode(false)` alone would not have taken effect until the next render — after the run
+   * had already begun — so the executing pass would refuse its own first write and the user would
+   * watch the agent fail to do the thing they just approved.
+   */
+  function approvePlan() {
+    approvalRef.current = { ...approvalRef.current, planMode: false };
+    onPlanModeChange(false);
+    void runTurn(PLAN_APPROVED_TURN, msgs);
+  }
+
+  /**
+   * P5: put back the files this run touched.
+   *
+   * Writes go through the **plain** host, not the checkpointing one: reverting is not part of the
+   * run being reverted, and re-checkpointing it would let a second revert "revert the revert" back
+   * to the state the user just rejected.
+   *
+   * Every outcome is reported. A revert that silently skipped a file — because the sandbox refused
+   * the path, or because the old contents were never readable — would leave the user believing the
+   * workspace was restored when it was not.
+   */
+  async function revertRun() {
+    if (!runChanges) return;
+    const plan = revertPlan(runChanges);
+    const host = createTauriToolHost(root.trim());
+    const failed: string[] = [];
+    for (const op of plan.ops) {
+      try {
+        const r = await host.run("write_file", { path: op.path, content: op.content });
+        if (!r.ok) failed.push(op.path);
+      } catch {
+        failed.push(op.path);
+      }
+    }
+    const restored = plan.ops.length - failed.length;
+    // Honest in both directions: what was restored, what could not be, and what was never tracked.
+    const parts = [`reverted ${restored} of ${plan.ops.length} file${plan.ops.length === 1 ? "" : "s"}`];
+    if (failed.length) parts.push(`could not restore ${failed.join(", ")}`);
+    for (const s of plan.skipped) parts.push(`${s.path}: ${s.reason}`);
+    if (runChanges.untracked.length) parts.push("commands it ran are not undone");
+    setRunChanges(null);
+    setNotice(`revert this run — ${parts.join("; ")}`);
   }
 
   function copyMessage(m: Msg) {
@@ -2022,6 +2210,35 @@ function Chat({
           </button>
         )}
       </div>
+      {/* P5: plan mode's approve step. Shown only once a plan pass has finished — during the run
+          there is nothing to approve yet, and the button would start a second run on top of the
+          first (which is what `busy` guards against everywhere else on this screen). */}
+      {agentMode && planMode && !busy && msgs.length > 0 && (
+        <div
+          className="mt-3 flex flex-wrap items-center gap-3 rounded-md border px-3 py-2"
+          style={{ borderColor: "var(--info)", background: "var(--surface)" }}
+          data-testid="plan-approve"
+        >
+          <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
+            Plan mode — the agent could read but not write. Approving runs the plan for real.
+          </span>
+          <Button variant="primary" onClick={approvePlan}>
+            Approve plan &amp; execute
+          </Button>
+        </div>
+      )}
+
+      {/* P5: what this run changed. Shown after it ends, including after a stop or a failure —
+          those runs have still written whatever they got to. */}
+      {!busy && runChanges && (runChanges.files.length > 0 || runChanges.untracked.length > 0) && (
+        <ChangeSetReview
+          set={runChanges}
+          busy={busy}
+          onKeep={() => setRunChanges(null)}
+          onRevert={() => void revertRun()}
+        />
+      )}
+
       {trace && (
         <div className="mt-2 text-[12px]">
           <button className="flex items-center gap-2" onClick={() => setShowTrace((v) => !v)}>
@@ -2181,11 +2398,11 @@ function Chat({
       </div>
 
       {pendingConfirm && (
-        <ConfirmModal
+        <ApproveModal
           name={pendingConfirm.call.name ?? "?"}
           args={pendingConfirm.args}
-          onResolve={(allow) => {
-            pendingConfirm.resolve(allow);
+          onResolve={(choice) => {
+            pendingConfirm.resolve(choice);
             setPendingConfirm(null);
           }}
         />
@@ -2347,17 +2564,49 @@ function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
   );
 }
 
-/** Per-call confirmation gate. The agent loop awaits the user's choice before executing. */
-function ConfirmModal({ name, args, onResolve }: { name: string; args: Record<string, unknown>; onResolve: (ok: boolean) => void }) {
+/* The per-call gate used to live here as `ConfirmModal` — allow/deny and nothing else. It is now
+   `components/ApproveModal`, because the answer set grew a scope (this call / this tool / this
+   session) and the component has one job worth testing on its own. */
+
+/**
+ * The approval-mode picker (Phase 5).
+ *
+ * A `<select>` rather than three radio buttons: the row already carries a checkbox group and a
+ * number field, and the mode is the one control here that changes what the others *mean* — it
+ * reads better as a named choice with its consequence spelled out underneath.
+ */
+function ApprovalPicker({
+  mode,
+  onChange,
+  disabled,
+}: {
+  mode: ApprovalMode;
+  onChange: (m: ApprovalMode) => void;
+  disabled?: boolean;
+}) {
+  const current = APPROVAL_MODES.find((m) => m.id === mode) ?? APPROVAL_MODES[0]!;
   return (
-    <Modal title="Allow this tool call?" onClose={() => onResolve(false)}>
-      <div className="mono mb-2 text-[12px]" style={{ color: "var(--warn)" }}>{name}</div>
-      <pre className="mono mb-3 max-h-56 overflow-auto rounded border p-2 text-[11px]" style={{ borderColor: "var(--border)", color: "var(--text-dim)", background: "var(--surface-2)" }}>{JSON.stringify(args, null, 2)}</pre>
-      <div className="flex justify-end gap-2">
-        <Button variant="ghost" onClick={() => onResolve(false)}>Deny</Button>
-        <Button variant="primary" onClick={() => onResolve(true)}>Allow</Button>
-      </div>
-    </Modal>
+    <label className="flex flex-wrap items-center gap-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
+      <span>approval</span>
+      <select
+        value={mode}
+        disabled={disabled}
+        onChange={(e) => onChange(e.target.value as ApprovalMode)}
+        aria-label="How agent tool calls are approved"
+        data-testid="approval-mode"
+        className="mono rounded border px-1 py-0.5 text-[11px] disabled:opacity-40"
+        style={inputStyle}
+      >
+        {APPROVAL_MODES.map((m) => (
+          <option key={m.id} value={m.id}>
+            {m.label}
+          </option>
+        ))}
+      </select>
+      <span style={{ color: "var(--text-faint)" }} title={current.hint}>
+        {current.hint}
+      </span>
+    </label>
   );
 }
 

@@ -108,17 +108,53 @@ ChatGPT/Claude web chat surfaces.
   the state was over before a key could arrive. It now supports an opt-in `slow:` prompt that streams
   over ~5 s.
   **Not done in this pass:** resizable panels (listed as optional in the phase).
+- **Phase 5 (agent control) — DONE (2026-10-01).** Approval modes (`ask every time` /
+  `auto-approve reads` / `yolo`) driven by a declared per-tool `effect` rather than a second list of
+  mutating names; a four-answer gate (`Deny` / `Always allow <tool>` / `Allow all this session` /
+  `Allow once`) replacing the old allow-deny modal; plan mode (a system-prompt pass whose writes the
+  gate refuses itself, then an "Approve plan & execute" that runs it for real); and a run **change
+  set** with a real before/after diff and a revert that restores the pre-run bytes.
+  New files: `lib/tools/approval.ts` (18 unit tests), `lib/tools/changeset.ts` (17),
+  `components/ApproveModal.tsx`, `components/ChangeSetReview.tsx`, `web-test/agent-approval.spec.ts`
+  (7 e2e). Verified: workspace typecheck clean, 781 unit tests (23 + 373 + 385), vite build,
+  156/156 web-test.
+  **Design decisions worth keeping:**
+  (a) `effect` is declared on each `ToolSpec` and **pinned by a test** against the gateway's
+  `MUTATING_TOOLS`; an unknown tool name answers `mutate`, so "auto-approve reads" can never
+  auto-approve something it has never heard of.
+  (b) Plan mode **only subtracts**. It refuses writes (outranking `yolo` and a session-wide allow)
+  and never auto-approves reads the mode underneath withheld — a switch that could grant
+  permissions its neighbour took away is one whose effect nobody can predict. The hint under it says
+  to pair it with "auto-approve reads" for a quiet pass.
+  (c) The checkpoint reads a file's previous contents **before the first write of the run**, which
+  is what makes the review a true diff (a `write_file` used to render as all-additions with "any
+  previous contents are not shown") and makes a file written twice revert to its pre-run state.
+  (d) `run_command` and `mkdir` are named as **outside the checkpoint** rather than counted as
+  reverted, and a file whose old bytes could not be read is *skipped with a reason* rather than
+  emptied — an unreadable file is not an empty one, and emptying it would be a destructive act
+  presented as an undo.
+  (e) A refusal may now carry its own wording to the model. "The user denied this" was the only
+  sentence the loop could say, and in plan mode it is false — the user never saw the call, so the
+  model rephrases the same edit instead of proposing a plan.
+  **Found and fixed while verifying:** the first `RunCheckpoint.snapshot()` copied the array but not
+  the entries, so a snapshot kept mutating after it was taken (`setAfter` writes through the map);
+  caught by the unit test written for it, not by review. The harness also grew a `__webTest.vfs()`
+  reader, because only the sandbox can falsify a revert that reported success — a diff on screen is
+  what the UI believes.
+  **Not done in this pass:** per-file revert (the panel acts on the whole run); deleting a file the
+  run created (agent mode has no delete tool, and adding one would hand the model a new destructive
+  primitive to solve a UI problem).
 - **Web-test picker debt — FIXED (2026-09-30).** The `web-test` specs drove the model picker via
   `getByRole("combobox")`, which stopped matching in commit `721c115` (searchable picker). All
   four specs now use a shared `web-test/model-picker.ts` helper. Full suite went 86→101 passing;
   `ui.spec.ts` is fully green.
 - **Superseded note:** an earlier version of this section listed 17 pre-existing web-test failures
-  (Memory, trail-health, drift-history). They are gone — the suite is 127/127 green as of Phase 7,
-  so whatever fixed them landed with the intervening commits (Phase 4/6 and the picker work).
-- **Remaining:** Phase 3 (composer/attachments — the multimodal `ContentPart` decision is already
-  taken in its section, so it is implementation work now) and Phase 5 (agent approval modes / plan
-  mode / change review — the largest and riskiest, deliberately left for a session with attention
-  to spare).
+  (Memory, trail-health, drift-history). They are gone — the suite went 127/127 green as of Phase 7
+  and 156/156 as of Phase 5, so whatever fixed them landed with the intervening commits.
+- **Remaining:** nothing from this plan. Known and deliberately out of scope: clickable
+  `path:line` file links (Phase 2, needs a root-confined host opener), reasoning-effort control
+  (Phase 7, needs a `TextRequest` field), resizable panels (Phase 8, optional), and Gemini's
+  `functionCall`/`functionResponse` tool shapes (Phase 3, a pre-existing router-core gap).
 
 ## What already exists (baseline — do not rebuild)
 
@@ -265,6 +301,9 @@ persists; switching sessions swaps the transcript.
 
 ## Phase 5 — Agent control (approval modes · plan mode · change review · undo)
 
+**Status: DONE (2026-10-01)** — see the Status section above for what shipped, the design decisions,
+and the defect the new tests caught.
+
 **Why fifth.** Today the only gate is a blocking per-call modal; there is no auto-approve, no
 propose-then-execute, and no reviewable change set for agent edits.
 
@@ -288,6 +327,23 @@ user file).
 
 **Acceptance:** in "auto-approve reads" a `read_file` runs with no modal but `write_file` still prompts;
 a run's edits are shown as a diff set that can be applied or reverted.
+
+### What shipped, against the deliverables
+
+| Deliverable | Where |
+|---|---|
+| Approval modes | `lib/tools/approval.ts` (`decide`), `ToolSpec.effect` in `registry.ts`, picker in `AssistantScreen` (persisted) |
+| Always allow / this session | `components/ApproveModal.tsx`; grants held in `Chat` for the session |
+| Plan mode | `PLAN_MODE_SYSTEM` + the gate's `deny` verdict; "Approve plan & execute" on the Assistant |
+| Change review | `components/ChangeSetReview.tsx`, one `DiffView` per file, Keep / Revert |
+| Checkpoint & undo | `lib/tools/changeset.ts` (`RunCheckpoint`, `createCheckpointingHost`, `revertPlan`) |
+
+**No Tauri change was needed**, contrary to the file list above: the checkpoint reads and restores
+through the existing root-confined `tool_run` (`read_file` / `write_file`), so there is no second path
+to the filesystem to keep confined. The only sandbox gap it exposes is that a file the run *created*
+cannot be deleted — agent mode has no delete tool, and adding one to serve a UI affordance would hand
+the model a new destructive primitive. That case is reported, not hidden: the file is emptied and the
+panel says why.
 
 ---
 

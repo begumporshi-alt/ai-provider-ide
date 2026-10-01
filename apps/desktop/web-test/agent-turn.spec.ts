@@ -40,7 +40,7 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
   // heading (and on the tool name next to it) instead.
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
   await expect(page.getByText("list_dir", { exact: true }).last()).toBeVisible();
-  await page.getByRole("button", { name: "Allow" }).click();
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeHidden({ timeout: 30_000 });
 
   // --- the loop completes with the final answer --------------------------------------
@@ -108,7 +108,7 @@ test("agent turn: a failed tool call shows the host's reason, not a blank result
   await page.getByRole("button", { name: "Send" }).click();
 
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow" }).click();
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
 
   // The reason itself, surfaced through the real host bridge.
   await expect(page.getByText(/no such file/)).toBeVisible({ timeout: 30_000 });
@@ -145,7 +145,7 @@ test("agent turn: an unrecorded ending shows the status it was, not a closed ses
   await page.getByPlaceholder(/Describe a task for the agent/).fill("list files");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow" }).click();
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
   await expect(page.getByText("Done. Here is what I found in the workspace.")).toBeVisible({ timeout: 30_000 });
 
   await page.getByRole("button", { name: "Agents", exact: true }).click();
@@ -196,7 +196,7 @@ test("agent turn: a run that was never recorded is reported once, not once per w
   await page.getByPlaceholder(/Describe a task for the agent/).fill("list files");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow" }).click();
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
   // The run itself still completed: a lost record must not become a lost run.
   await expect(page.getByText("Done. Here is what I found in the workspace.")).toBeVisible({ timeout: 30_000 });
 

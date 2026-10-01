@@ -26,12 +26,16 @@ test("tool result: an edit_file call renders as a diff, not a JSON argument blob
   await page.getByPlaceholder(/Describe a task for the agent/).fill("edit the readme greeting");
   await page.getByRole("button", { name: "Send" }).click();
 
-  // Approve the one mutating call.
-  await expect(page.getByRole("heading", { name: "Allow this tool call?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow" }).click();
+  // Approve the one mutating call. The title says "change" rather than "tool call" because this
+  // call declares `effect: "mutate"` — the modal names what it is actually about to do.
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
 
   // The change is rendered, keyed by its path, with the added and removed lines visible.
-  const diff = page.getByRole("group", { name: "Diff of README.md" });
+  // `.first()`: the transcript renders above the run's change-set panel, which shows the same
+  // file a second time as the aggregate with its revert button. This asserts the transcript's own
+  // diff — the thing the defect was about — rather than whichever one the locator reached first.
+  const diff = page.getByRole("group", { name: "Diff of README.md" }).first();
   await expect(diff).toBeVisible({ timeout: 30_000 });
   await expect(diff.locator('[data-kind="add"]').filter({ hasText: "there" })).toBeVisible();
   await expect(diff.locator('[data-kind="del"]').filter({ hasText: "world" })).toBeVisible();
