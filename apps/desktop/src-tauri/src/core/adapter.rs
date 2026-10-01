@@ -164,6 +164,62 @@ pub struct TextArgs<'a> {
     /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
     /// note.
     pub prompt_cache_enabled: bool,
+    /// Filled by the adapter with what the stream actually carried, whether or not the manifest
+    /// could read any of it. The engine reads it only when the stream delivered nothing — the arm
+    /// that files `PARSE_ERROR` with no status and an empty chain, and the reason 154 rows in the
+    /// live ledger said nothing about whether the provider sent nothing at all or sent a shape the
+    /// manifest's delta selector does not match.
+    pub observation: Option<&'a mut StreamObservation>,
+}
+
+/// What one upstream stream carried, counted at the source.
+///
+/// Deliberately two facts, not a buffer: how many `data:` events arrived, and a truncated sample of
+/// the first. That is the minimum that separates "the provider streamed nothing" from "it streamed a
+/// shape this manifest cannot read" — two findings with different owners — and it is also the most
+/// a ledger row can afford, since the payload is provider output and a full body would put user
+/// content in the database at whatever length the provider chose.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct StreamObservation {
+    pub events: u32,
+    pub first: Option<String>,
+}
+
+impl StreamObservation {
+    /// The first event's sample cap, in **bytes** — what a `TEXT` column and a `String` both
+    /// measure. 240 bytes: enough to show a delta shape or an error envelope, small next to a
+    /// row's other text columns.
+    const SAMPLE_CHARS: usize = 240;
+
+    pub fn note(&mut self, payload: &str) {
+        self.events += 1;
+        if self.first.is_none() {
+            let sample = if payload.len() > Self::SAMPLE_CHARS {
+                // Char-boundary safe: a byte-indexed slice landing mid-UTF-8 would panic.
+                let mut cut = Self::SAMPLE_CHARS;
+                while !payload.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                format!("{}…", &payload[..cut])
+            } else {
+                payload.to_string()
+            };
+            self.first = Some(sample);
+        }
+    }
+
+    /// The ledger wording. `None` when nothing was observed — the engine only asks on a drained
+    /// stream, but a drained stream with zero events is "the provider sent nothing", which is
+    /// itself worth stating once rather than implying.
+    pub fn describe(&self) -> Option<String> {
+        match (self.events, self.first.as_deref()) {
+            (0, _) => Some("stream carried no SSE events at all".to_string()),
+            (n, Some(first)) => Some(format!(
+                "stream carried {n} SSE event(s), none matched the manifest's delta selector; first: {first}"
+            )),
+            (n, None) => Some(format!("stream carried {n} SSE event(s) with no readable payload")),
+        }
+    }
 }
 
 /// One model as the catalogue reported it — the port of `ModelEntry`
@@ -281,6 +337,53 @@ mod tests {
     #[test]
     fn a_fresh_cancel_is_not_cancelled() {
         assert!(!Cancel::new().is_cancelled());
+    }
+
+    // ---------- StreamObservation ----------
+
+    #[test]
+    fn the_observation_counts_every_event_and_keeps_only_the_first() {
+        let mut o = StreamObservation::default();
+        o.note("{\"a\":1}");
+        o.note("{\"b\":2}");
+        o.note("{\"c\":3}");
+        assert_eq!(o.events, 3);
+        assert_eq!(
+            o.first.as_deref(),
+            Some("{\"a\":1}"),
+            "the sample is the first event, not the last"
+        );
+    }
+
+    #[test]
+    fn the_sample_is_capped_at_240_bytes_without_cutting_mid_utf_8() {
+        // 120 two-byte characters = 240 bytes exactly, then one more character overflows the cap —
+        // and a byte-indexed slice at 240 would land mid-character and panic.
+        let payload = "é".repeat(121);
+        let mut o = StreamObservation::default();
+        o.note(&payload);
+        let first = o.first.expect("a sample was kept");
+        assert!(first.len() <= 243, "capped (240 bytes + the 3-byte ellipsis): {}", first.len());
+        assert!(first.ends_with('…'), "the truncation is named, not silent");
+        // 120 whole characters survived the byte cap, never a torn one.
+        assert_eq!(first.trim_end_matches('…').chars().count(), 120);
+    }
+
+    #[test]
+    fn describe_names_each_state_the_ledger_needs_to_tell_apart() {
+        // Nothing at all: the provider streamed no events — a provider-side finding.
+        assert_eq!(
+            StreamObservation::default().describe().as_deref(),
+            Some("stream carried no SSE events at all")
+        );
+        // Events that matched nothing: a manifest-side finding, with the evidence to check it.
+        let mut o = StreamObservation::default();
+        o.note("{\"choices\":[]}");
+        o.note("{\"choices\":[]}");
+        let d = o.describe().expect("described");
+        assert!(d.contains("2 SSE event"), "{d}");
+        assert!(d.contains("none matched the manifest's delta selector"), "{d}");
+        assert!(d.contains("{\"choices\":[]}"), "the sample is in the wording: {d}");
     }
 
     #[test]
@@ -457,6 +560,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             prompt_cache_enabled: false,
+            observation: None,
         }
     }
 

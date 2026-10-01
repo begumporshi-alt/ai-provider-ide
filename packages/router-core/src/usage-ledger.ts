@@ -48,6 +48,12 @@ export interface LedgerEntry {
    */
   cachedTokens?: number;
   fallbackChain?: AttemptOutcome[];
+  /**
+   * Bounded evidence for a failure the class label cannot explain — today, the drained-empty
+   * stream arm (`PARSE_ERROR` with no status and an empty chain): what the provider's stream
+   * actually carried. Truncated at the capture point (~240 chars of payload); never a full body.
+   */
+  failureDetail?: string;
 }
 
 /** The host's structured persistence surface for ledger writes (invariant 12). */

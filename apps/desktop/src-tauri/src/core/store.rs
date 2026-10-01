@@ -340,6 +340,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0018_manual_models", add_manual_models_origin),
     ("0019_onboarding_failed_state", rebuild_onboarding_failed_state),
     ("0020_session_titles", add_session_titles_table),
+    ("0021_ledger_failure_detail", add_ledger_failure_detail),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -1096,6 +1097,22 @@ CREATE INDEX IF NOT EXISTS idx_session_titles_session ON session_titles(session_
     Ok(())
 }
 
+/// 0021 — the evidence column for a failure the class label cannot explain.
+///
+/// `PARSE_ERROR` on a drained stream had no status and an empty chain, so a row could not say
+/// whether the provider streamed nothing at all or streamed a shape the manifest's delta selector
+/// does not match. The live ledger held 154 such rows for one provider. The engine now observes the
+/// stream as it reads it and `router::write_text_ledger` writes the wording here; `NULL` for every
+/// other row, and for every row written before this migration. A data migration rather than a
+/// `MIGRATIONS` entry for the reason `backfill_live_context` records: appending to `MIGRATIONS`
+/// would shift every computed data-migration version under an existing database.
+fn add_ledger_failure_detail(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "ledger", "failure_detail")? {
+        tx.execute_batch("ALTER TABLE ledger ADD COLUMN failure_detail TEXT;")?;
+    }
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -1263,11 +1280,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0019 data migrations.
-        assert_eq!(info.schema_version, 20);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0021 data migrations.
+        assert_eq!(info.schema_version, 21);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(20, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(21, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

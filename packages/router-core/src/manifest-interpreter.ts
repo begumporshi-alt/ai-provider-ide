@@ -140,6 +140,19 @@ export interface TextArgs {
    * provider never emitted a usage block.
    */
   onUsage?: (usage: UsageTokens) => void;
+  /**
+   * Called for every SSE `data:` event the stream carries, before anything decides whether the
+   * manifest can read it — so a stream that ends having delivered nothing leaves behind what the
+   * provider actually sent. This is the only record of the 154 `PARSE_ERROR` rows the live ledger
+   * held for the busiest configured provider: each was a stream that drained with no chunk and no
+   * tool call, and the row said nothing about whether the provider had sent nothing at all or sent
+   * a shape the manifest's `chunkMap.delta` does not select — two findings with different owners
+   * (the provider vs. the manifest), indistinguishable without this.
+   *
+   * The payload is passed raw; the CALLER bounds and truncates it (the engine keeps a sample, not
+   * the stream), because only the caller knows how much evidence a ledger row can afford.
+   */
+  onStreamEvent?: (payload: string) => void;
   /** Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
    *  `responseFinish` selector. Absent if the provider never emitted one. */
   onFinish?: (reason: string | undefined) => void;
@@ -729,6 +742,7 @@ export class ManifestInterpreter implements AdapterInstance {
         if (!trimmed.startsWith("data:")) continue;
         const payload = trimmed.slice(5).trim();
         if (payload === "[DONE]") return;
+        args.onStreamEvent?.(payload);
         let json: unknown;
         try {
           json = JSON.parse(payload);

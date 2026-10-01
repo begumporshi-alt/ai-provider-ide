@@ -114,6 +114,9 @@ export const isHostLedgerRow = shape<HostLedgerRow>({
   costEstimateMicros: isNum,
   fallbackChainJson: nullable(isStr),
   cachedTokens: nullable(isNum),
+  // `maybe`, not `nullable`: a host older than migration 0021 omits the column outright, and a
+  // guard that rejected its rows would silently empty the Activity history rather than fail loud.
+  failureDetail: maybe(isStr),
 });
 
 // ---------- the live-context graph ----------

@@ -643,6 +643,12 @@ pub struct LedgerRow {
     pub cached_tokens: Option<i64>,
     #[serde(default)]
     pub fallback_chain_json: Option<String>,
+    /// Bounded evidence for a failure the class label cannot explain — today the drained-empty
+    /// stream arm (`PARSE_ERROR`, no status, empty chain): what the provider's stream actually
+    /// carried. Truncated at the capture point; never a full body. `None` for every other row, and
+    /// for every row written before migration 0018.
+    #[serde(default)]
+    pub failure_detail: Option<String>,
 }
 
 /// The one place a ledger row is written.
@@ -657,9 +663,9 @@ pub struct LedgerRow {
 /// ledger rows without a command to go through.
 pub fn ledger_insert(conn: &rusqlite::Connection, e: &LedgerRow) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json)
-         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17)",
-        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.app_key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.cached_tokens, e.fallback_chain_json],
+        "INSERT INTO ledger (ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json, failure_detail)
+         VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18)",
+        params![e.ts, e.modality, e.source, e.provider_id, e.key_id, e.app_key_id, e.requested_model, e.model, e.status, e.http_status, e.error_class, e.latency_ms, e.tokens_in, e.tokens_out, e.cost_estimate_micros, e.cached_tokens, e.fallback_chain_json, e.failure_detail],
     )?;
     Ok(())
 }
@@ -682,7 +688,7 @@ pub fn ledger_append(store: State<'_, Arc<Store>>, e: LedgerRow) -> Result<(), C
 
 /// The ledger's read statement. It lives next to the mapper below and is used by the command *and*
 /// by the round-trip test, so the test drives the real statement rather than a copy that can drift.
-const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json
+const LEDGER_SELECT: &str = "SELECT ts, modality, source, provider_id, key_id, app_key_id, requested_model, model, status, http_status, error_class, latency_ms, tokens_in, tokens_out, cost_estimate_micros, cached_tokens, fallback_chain_json, failure_detail
          FROM ledger ORDER BY ts DESC LIMIT ?1";
 
 /// Map one `ledger` row to its wire shape.
@@ -709,6 +715,7 @@ fn ledger_row_from(r: &rusqlite::Row<'_>) -> rusqlite::Result<LedgerRow> {
         cost_estimate_micros: r.get(14)?,
         cached_tokens: r.get(15)?,
         fallback_chain_json: r.get(16)?,
+        failure_detail: r.get(17)?,
     })
 }
 
@@ -1776,6 +1783,7 @@ mod persist_tests {
             cost_estimate_micros: 10,
             cached_tokens: None,
             fallback_chain_json: None,
+            failure_detail: None,
         };
         {
             let conn = store.conn.lock().unwrap();
@@ -1797,6 +1805,51 @@ mod persist_tests {
         assert_eq!(key_id.as_deref(), Some("ak-1"));
         drop(stmt);
         drop(conn);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 0021 round trip: the evidence column survives INSERT -> the read the UI makes. `ledger_row_from`
+    /// reads it by POSITION (17), so the test drives the real SELECT — a column added to the struct
+    /// without the statement would compile and read `None` forever.
+    #[test]
+    fn ledger_failure_detail_round_trips_through_the_real_select() {
+        let (store, dir) = tmp_store("failuredetail");
+        let detail =
+            "stream carried 3 SSE event(s), none matched the manifest's delta selector; first: {}";
+        // `ledger_recent_rows` orders on `ts DESC`, so the two rows need distinct timestamps or
+        // the assertion tests the tie-break, not the column.
+        let row = |ts: i64, d: Option<&str>| LedgerRow {
+            ts,
+            modality: "text".into(),
+            source: "gateway".into(),
+            provider_id: Some("p".into()),
+            key_id: None,
+            app_key_id: None,
+            requested_model: Some("m".into()),
+            model: "m".into(),
+            status: "error".into(),
+            http_status: None,
+            error_class: Some("PARSE_ERROR".into()),
+            latency_ms: Some(9),
+            tokens_in: 0,
+            tokens_out: 0,
+            cost_estimate_micros: 0,
+            cached_tokens: None,
+            fallback_chain_json: Some("[]".into()),
+            failure_detail: d.map(str::to_string),
+        };
+        {
+            let conn = store.conn.lock().unwrap();
+            ledger_insert(&conn, &row(2, Some(detail))).unwrap();
+            ledger_insert(&conn, &row(1, None)).unwrap();
+        }
+        let rows = ledger_recent_rows(&store, None).expect("read back");
+        assert_eq!(
+            rows[0].failure_detail.as_deref(),
+            Some(detail),
+            "newest first: the detailed row"
+        );
+        assert_eq!(rows[1].failure_detail, None, "a row without evidence stays null, not empty");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1854,6 +1907,7 @@ mod persist_tests {
                     cost_estimate_micros: 19,
                     cached_tokens: Some(23),
                     fallback_chain_json: Some("chain-1".into()),
+                    failure_detail: None,
                 },
             )
             .unwrap();

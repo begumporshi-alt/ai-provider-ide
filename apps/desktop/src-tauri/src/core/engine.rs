@@ -47,7 +47,9 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde_json::Value;
 
-use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs, TextArgs, ToolCall};
+use crate::core::adapter::{
+    AdapterFactory, Cancel, ImageArgs, StreamObservation, TextArgs, ToolCall,
+};
 use crate::core::limiter::ProviderLimiter;
 use crate::core::persist::{ApiKeyRow, ProviderRow};
 use crate::core::planner::Candidate;
@@ -1017,6 +1019,13 @@ pub struct TextSuccess {
     pub attempts: Vec<AttemptOutcome>,
     /// Whatever the upstream reported, if it reported anything at all.
     pub usage: Option<UsageTokens>,
+    /// What the stream carried, when it delivered nothing — the drained arm's only evidence, and
+    /// the difference between "the provider streamed nothing" and "it streamed a shape the
+    /// manifest cannot read". `None` whenever output was delivered.
+    ///
+    /// Boxed: `TextSuccess` is compared against `ImageSuccess` by size in the test below, and a
+    /// 48-byte inline field tipped it over — the guard doing precisely what it exists for.
+    pub observation: Option<Box<StreamObservation>>,
 }
 
 /// A text request that produced no successful stream — and the state the caller can still read.
@@ -1129,8 +1138,10 @@ pub async fn execute_text(
     // instead, and every reader lives after it — which is also where the TypeScript's readers are,
     // on the object it returned *before* the throw.
     enum Ended {
-        /// A candidate streamed to the sink (`:107`).
-        Served(Candidate),
+        /// A candidate streamed to the sink (`:107`). The observation rides along only when the
+        /// stream delivered nothing — the drained arm is where the ledger needs it, and on any
+        /// other success the output itself is the answer to "what did the provider send".
+        Served { candidate: Candidate, observation: Option<Box<StreamObservation>> },
         /// The break arrived after the sink already held text (`:112-116`).
         MidStream { error: AttemptError, served: Candidate },
         /// Cancellation stopped the loop (`:80`, `:133`).
@@ -1200,6 +1211,9 @@ pub async fn execute_text(
             let mut emitted = false;
             let mut tool_calls = 0usize;
             let mut broke: Option<AttemptError> = None;
+            // What this attempt's stream carried. Reset per attempt so the evidence always names
+            // the candidate the row will blame; read only on the drained arm in `write_text_ledger`.
+            let mut observation = StreamObservation::default();
             let refused = {
                 // `:97` — the engine's own `onUsage` does double duty: it fills the box the ledger
                 // reads, and it forwards to the caller's callback. Dropping the caller's here is how
@@ -1243,6 +1257,7 @@ pub async fn execute_text(
                     on_tool_call: Some(&mut forward_tool),
                     on_usage: Some(&mut record_usage),
                     prompt_cache_enabled: args.prompt_cache_enabled,
+                    observation: Some(&mut observation),
                 };
 
                 // **The `let` is load-bearing, not stylistic.** `Result<BoxStream<…>, _>` is a
@@ -1311,15 +1326,17 @@ pub async fn execute_text(
 
             // `:106-107` — the stream ended and the attempt served, so the loop stops rather than
             // advancing. This is why the source's `if (!served)` guard has nothing to guard.
-            break 'plan Ended::Served(candidate);
+            let observation =
+                if emitted || tool_calls > 0 { None } else { Some(Box::new(observation)) };
+            break 'plan Ended::Served { candidate, observation };
         }
         Ended::Spent
     };
 
     match ended {
-        Ended::Served(candidate) => {
+        Ended::Served { candidate, observation } => {
             health.record_result(&candidate.key.id, ErrorClass::Ok, None, now_ms());
-            Ok(TextSuccess { candidate, attempts, usage })
+            Ok(TextSuccess { candidate, attempts, usage, observation })
         }
         Ended::MidStream { error, served } => {
             Err(TextFailure::MidStream { error, served, attempts, usage })

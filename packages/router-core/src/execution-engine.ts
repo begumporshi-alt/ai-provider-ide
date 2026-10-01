@@ -56,6 +56,16 @@ export interface TextExecution {
   fallbackChain: () => AttemptOutcome[];
   chunks: AsyncIterable<string>;
   usage: () => Partial<UsageTokens> | undefined;
+  /**
+   * What the last attempt's stream actually contained, when it delivered nothing: the count of SSE
+   * events seen and a bounded sample of the first. `undefined` for any request that produced output,
+   * where the question "what did the provider send?" is answered by the output itself.
+   *
+   * This is the difference between "the provider streamed nothing" and "the provider streamed a
+   * shape the manifest cannot read" — two findings with different owners that one `PARSE_ERROR`
+   * label had been conflating, with no evidence to tell them apart.
+   */
+  observation: () => string | undefined;
 }
 
 export const MAX_ATTEMPTS_DEFAULT = 6;
@@ -86,6 +96,12 @@ export class ExecutionEngine {
     const attempts = Math.min(args.plan.length, maxAttempts);
 
     const self = this;
+    // What the FINAL attempt's stream carried — see `TextExecution.observation`. Reset per attempt
+    // so the evidence always names the candidate the row will blame, and kept as a formatted string
+    // (bounded here, at the capture point) rather than a growing buffer: only the sample is ever
+    // worth the bytes.
+    let observation: string | undefined;
+    const SAMPLE_CHARS = 240;
     async function* stream(): AsyncGenerator<string, void, void> {
       for (let i = 0; i < attempts; i++) {
         const c = args.plan[i]!;
@@ -99,6 +115,9 @@ export class ExecutionEngine {
         }
         let emitted = false;
         let toolCalls = 0;
+        let events = 0;
+        let firstEvent: string | undefined;
+        observation = undefined;
         // **A tool call is delivered output, so it marks the candidate as `served`.** `served` is
         // what `wrapLedger` tests (`model-router.ts:429`) and what names the provider on the row,
         // and it was being set from `chunks` alone — so a turn whose entire output is a tool call
@@ -134,7 +153,14 @@ export class ExecutionEngine {
             // way the caller — the gateway bridge, which forwards it host-side — ever learns the
             // token counts. Dropping the caller's callback here left every gateway response
             // reporting `usage: null` even on requests that had usage.
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); }, onFinish: args.onFinish },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); },
+              // See `TextArgs.onStreamEvent`. The sample is truncated here, at the capture point,
+              // because only the engine knows how much evidence a row can afford.
+              onStreamEvent: payload => {
+                events++;
+                firstEvent ??= payload.length > SAMPLE_CHARS ? payload.slice(0, SAMPLE_CHARS) + "…" : payload;
+              },
+              onFinish: args.onFinish },
             args.signal,
           )) {
             if (!emitted) {
@@ -144,6 +170,16 @@ export class ExecutionEngine {
             yield chunk;
           }
           self.health.recordResult(c.key, "OK");
+          // Delivered nothing: this is the arm the ledger's PARSE_ERROR-with-no-evidence rows come
+          // from, so keep what the stream actually carried before the success return discards it.
+          // Zero events is a finding of its own ("the provider sent nothing at all"), so it is
+          // worded rather than left undefined — the same three states the Rust describe() names.
+          if (!emitted && toolCalls === 0) {
+            observation =
+              events === 0
+                ? "stream carried no SSE events at all"
+                : `stream carried ${events} SSE event(s), none matched the manifest's delta selector; first: ${firstEvent}`;
+          }
           return; // success
         } catch (e) {
           // Mid-stream errors are drift-class (§2.10), never "OK from status 200"
@@ -196,6 +232,7 @@ export class ExecutionEngine {
       fallbackChain: () => [...fallbackChain],
       chunks: stream(),
       usage: () => usageBox.value,
+      observation: () => observation,
     };
   }
 

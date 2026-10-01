@@ -83,7 +83,8 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::core::adapter::{
-    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs, ToolCall,
+    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, StreamObservation,
+    TextArgs, ToolCall,
 };
 use crate::core::engine::{AttemptError, FailureKind};
 use crate::core::http_port::{HttpError, HttpMethod, HttpPort, HttpRequest, HttpResponse};
@@ -415,6 +416,7 @@ impl ManifestInterpreter {
                 on_tool_call,
                 on_usage,
                 prompt_cache_enabled,
+                observation,
             } = args;
 
             let Some(ep) = self.view.endpoints.generate_text.as_ref() else {
@@ -589,6 +591,7 @@ impl ManifestInterpreter {
                 cancel,
                 on_tool_call,
                 on_usage,
+                observation,
                 pending: PendingCalls::new(),
                 last_usage: None,
                 end_after_emit: false,
@@ -988,6 +991,10 @@ struct TextStream<'a> {
     cancel: &'a Cancel,
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
+    /// Noted per `data:` event whether or not the manifest can read it — the engine reads this
+    /// only when the stream delivered nothing, which is the one case where the count and a sample
+    /// of the first event are the difference between two findings with different owners.
+    observation: Option<&'a mut StreamObservation>,
     pending: PendingCalls,
     last_usage: Option<PartialUsage>,
     end_after_emit: bool,
@@ -1058,6 +1065,11 @@ impl TextStream<'_> {
         let payload = after_prefix.trim_matches(is_js_whitespace);
         if payload == "[DONE]" {
             return LineStep::End;
+        }
+        // Noted before the parse, on purpose: a data line that is not JSON is exactly the kind of
+        // evidence this exists to keep, and it is the caller that bounds the sample.
+        if let Some(o) = self.observation.as_deref_mut() {
+            o.note(payload);
         }
         let Ok(json) = serde_json::from_str::<Value>(payload) else {
             return LineStep::Continue;
@@ -1534,6 +1546,7 @@ mod tests {
             // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
             // provider — reports no cache fields either way (measured 2026-09-28).
             prompt_cache_enabled: false,
+            observation: None,
         }
     }
 
@@ -2116,6 +2129,36 @@ mod tests {
                 .await;
 
         assert_eq!(out, vec![Ok("Hello".to_string()), Ok(" world".to_string())]);
+    }
+
+    /// The observation records every `data:` event — including one that is not JSON, which the
+    /// parse guard skips but the evidence must not — and stops at `[DONE]`. This is the
+    /// interpreter's half of the drained-stream finding: the engine can only report what the
+    /// adapter noted, so a line dropped here is a row that cannot say what the provider sent.
+    #[tokio::test]
+    async fn the_observation_notes_every_data_event_including_an_unreadable_one() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            ": comment",
+            "data: not json at all",
+            &delta_line("Hello"),
+            "data: [DONE]",
+        ])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+
+        let mut observed = StreamObservation::default();
+        let args = TextArgs { observation: Some(&mut observed), ..text_args("m") };
+        let out = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        assert_eq!(out, vec![Ok("Hello".to_string())]);
+        assert_eq!(
+            observed.events, 2,
+            "the comment line is not a data event; [DONE] is not counted"
+        );
+        assert_eq!(
+            observed.first.as_deref(),
+            Some("not json at all"),
+            "the unreadable one is kept"
+        );
     }
 
     /// Lines that are not `data:`, a `data:` line that is not JSON, and a delta that is an empty

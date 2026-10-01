@@ -1040,83 +1040,108 @@ impl<'a> ModelRouter<'a> {
         let now = now_ms();
         let source = opts.source().to_string();
 
-        let (mut row, usage, attempts, served, error_class, http_status) = match result {
-            // **`delivered.any()` and not `delivered.chunks > 0` — that distinction is the defect.**
-            // A turn whose entire output is a tool call delivers nothing through the sink, so a
-            // chunk-only count left `chunks == 0` on a request that answered correctly, and it
-            // landed in the `PARSE_ERROR` arm below while the engine recorded the same request's
-            // key as `OK` (`engine.rs:1165`).
-            Ok(success) if delivered.any() => {
-                // **The deploy marker, and the only evidence this path ever fires.** The row a
-                // recovered tool-call turn writes is indistinguishable from any other success, and
-                // the fix is otherwise made of types and control flow — so it leaves no string in
-                // the binary and `strings | grep` cannot tell the new build from the old (§9 of the
-                // triage skill). This line earns its place twice: it calibrates the deploy, and it
-                // is what proves a given `ok` row came from here.
-                if delivered.chunks == 0 {
-                    tracing::info!(
-                        tool_calls = delivered.tool_calls,
-                        "served by tool calls alone — recorded as ok, not PARSE_ERROR",
-                    );
+        let (mut row, usage, attempts, served, error_class, http_status, failure_detail) =
+            match result {
+                // **`delivered.any()` and not `delivered.chunks > 0` — that distinction is the defect.**
+                // A turn whose entire output is a tool call delivers nothing through the sink, so a
+                // chunk-only count left `chunks == 0` on a request that answered correctly, and it
+                // landed in the `PARSE_ERROR` arm below while the engine recorded the same request's
+                // key as `OK` (`engine.rs:1165`).
+                Ok(success) if delivered.any() => {
+                    // **The deploy marker, and the only evidence this path ever fires.** The row a
+                    // recovered tool-call turn writes is indistinguishable from any other success, and
+                    // the fix is otherwise made of types and control flow — so it leaves no string in
+                    // the binary and `strings | grep` cannot tell the new build from the old (§9 of the
+                    // triage skill). This line earns its place twice: it calibrates the deploy, and it
+                    // is what proves a given `ok` row came from here.
+                    if delivered.chunks == 0 {
+                        tracing::info!(
+                            tool_calls = delivered.tool_calls,
+                            "served by tool calls alone — recorded as ok, not PARSE_ERROR",
+                        );
+                    }
+                    let mut row = ledger_row(now, TEXT, &source);
+                    row.provider_id = Some(success.candidate.provider.id.clone());
+                    row.key_id = Some(success.candidate.key.id.clone());
+                    row.app_key_id = opts.app_key_id.clone();
+                    row.requested_model = Some(requested_model.to_string());
+                    row.model = success.candidate.model.native_id.clone();
+                    row.latency_ms = Some(now - t0);
+                    let (tokens_in, tokens_out) =
+                        success.usage.map(|u| u.counts()).unwrap_or((0, 0));
+                    row.tokens_in = tokens_in as i64;
+                    row.tokens_out = tokens_out as i64;
+                    row.cached_tokens = success.usage.and_then(|u| u.cached_for_ledger());
+                    // R2: real cost instead of a constant 0. Unknown pricing is 0 in the column, and
+                    // the UI renders "—" for it by consulting the catalog (unknown != free).
+                    row.cost_estimate_micros = estimate_cost_micros(
+                        self.pricing_for(&success.candidate.model),
+                        tokens_in,
+                        tokens_out,
+                    )
+                    .unwrap_or(0);
+                    row.fallback_chain_json = chain_json(&success.attempts);
+                    let provider = success.candidate.provider.id.clone();
+                    self.shared
+                        .ledger()
+                        .append(row)
+                        .map_err(|e| RouterError::Ledger(e.to_string()))?;
+                    self.advance_cursor(&provider);
+                    return Ok(());
                 }
-                let mut row = ledger_row(now, TEXT, &source);
-                row.provider_id = Some(success.candidate.provider.id.clone());
-                row.key_id = Some(success.candidate.key.id.clone());
-                row.app_key_id = opts.app_key_id.clone();
-                row.requested_model = Some(requested_model.to_string());
-                row.model = success.candidate.model.native_id.clone();
-                row.latency_ms = Some(now - t0);
-                let (tokens_in, tokens_out) = success.usage.map(|u| u.counts()).unwrap_or((0, 0));
-                row.tokens_in = tokens_in as i64;
-                row.tokens_out = tokens_out as i64;
-                row.cached_tokens = success.usage.and_then(|u| u.cached_for_ledger());
-                // R2: real cost instead of a constant 0. Unknown pricing is 0 in the column, and
-                // the UI renders "—" for it by consulting the catalog (unknown != free).
-                row.cost_estimate_micros = estimate_cost_micros(
-                    self.pricing_for(&success.candidate.model),
-                    tokens_in,
-                    tokens_out,
-                )
-                .unwrap_or(0);
-                row.fallback_chain_json = chain_json(&success.attempts);
-                let provider = success.candidate.provider.id.clone();
-                self.shared.ledger().append(row).map_err(|e| RouterError::Ledger(e.to_string()))?;
-                self.advance_cursor(&provider);
-                return Ok(());
-            }
-            // The drained-with-nothing case, and the abort case: both reach the source's `!served`
-            // branch. `CANCELLED` is decided by the signal there, and by the variant here — the
-            // engine can only produce `TextFailure::Cancelled` when the flag is set.
-            //
-            // "Nothing" means neither a chunk nor a tool call: the guard above has already taken
-            // every request that produced output, so what lands here is a provider that answered
-            // `200` with an empty body, or a client that cancelled before the first byte.
-            Ok(success) => (
-                ledger_row(now, TEXT, &source),
-                success.usage,
-                &success.attempts,
-                None,
-                if cancelled { "CANCELLED" } else { "PARSE_ERROR" },
-                None,
-            ),
-            Err(TextFailure::Cancelled { attempts, usage }) => {
-                (ledger_row(now, TEXT, &source), *usage, attempts, None, "CANCELLED", None)
-            }
-            Err(TextFailure::MidStream { served, attempts, usage, .. }) => {
-                (ledger_row(now, TEXT, &source), *usage, attempts, Some(served), "NETWORK", None)
-            }
-            Err(TextFailure::AllAttemptsFailed { error, usage }) => {
-                let last = error.chain.last();
-                (
+                // The drained-with-nothing case, and the abort case: both reach the source's `!served`
+                // branch. `CANCELLED` is decided by the signal there, and by the variant here — the
+                // engine can only produce `TextFailure::Cancelled` when the flag is set.
+                //
+                // "Nothing" means neither a chunk nor a tool call: the guard above has already taken
+                // every request that produced output, so what lands here is a provider that answered
+                // `200` with an empty body, or a client that cancelled before the first byte.
+                //
+                // This is the arm the 154 `PARSE_ERROR` rows in the live ledger came from — no status,
+                // an empty chain, and no way to tell "the provider sent nothing" from "it sent a shape
+                // the manifest cannot read". The observation is the evidence that tells them apart.
+                Ok(success) => (
+                    ledger_row(now, TEXT, &source),
+                    success.usage,
+                    &success.attempts,
+                    None,
+                    if cancelled { "CANCELLED" } else { "PARSE_ERROR" },
+                    None,
+                    success.observation.as_deref().and_then(|o| o.describe()),
+                ),
+                Err(TextFailure::Cancelled { attempts, usage }) => (
                     ledger_row(now, TEXT, &source),
                     *usage,
-                    &error.chain,
+                    attempts,
                     None,
-                    last.map(|a| a.cls.as_str()).unwrap_or(NO_ROUTE),
-                    last.map(|a| a.status as i64),
-                )
-            }
-        };
+                    "CANCELLED",
+                    None,
+                    None,
+                ),
+                Err(TextFailure::MidStream { served, attempts, usage, .. }) => (
+                    ledger_row(now, TEXT, &source),
+                    *usage,
+                    attempts,
+                    Some(served),
+                    "NETWORK",
+                    None,
+                    None,
+                ),
+                Err(TextFailure::AllAttemptsFailed { error, usage }) => {
+                    let last = error.chain.last();
+                    (
+                        ledger_row(now, TEXT, &source),
+                        *usage,
+                        &error.chain,
+                        None,
+                        last.map(|a| a.cls.as_str()).unwrap_or(NO_ROUTE),
+                        last.map(|a| a.status as i64),
+                        // The chain entries already carry their reasons; this column is for the one
+                        // failure shape the chain cannot describe.
+                        None,
+                    )
+                }
+            };
 
         let (tokens_in, tokens_out) = usage.map(|u| u.counts()).unwrap_or((0, 0));
         row.status = "error".to_string();
@@ -1128,6 +1153,7 @@ impl<'a> ModelRouter<'a> {
         row.tokens_in = tokens_in as i64;
         row.tokens_out = tokens_out as i64;
         row.cached_tokens = usage.and_then(|u| u.cached_for_ledger());
+        row.failure_detail = failure_detail;
         // **`served` only — deliberately not the last attempt.** The source says why (`:499-503`):
         // "Provider"/"Key" mean *who served*, so a null provider on an error row is itself the
         // signal that nothing served at all. The attempt that failed is in the chain below.
@@ -1508,6 +1534,7 @@ fn ledger_row(ts: i64, modality: &str, source: &str) -> LedgerRow {
         cost_estimate_micros: 0,
         cached_tokens: None,
         fallback_chain_json: None,
+        failure_detail: None,
     }
 }
 
@@ -1850,6 +1877,8 @@ mod tests {
         /// shape of a mid-stream break; `None` leaves the stream clean.
         breaks: Mutex<VecDeque<Option<AttemptError>>>,
         usage: Mutex<VecDeque<Option<UsageTokens>>>,
+        /// Per text call: `[(payload, repeat)]` noted into `args.observation`, in order.
+        observations: Mutex<VecDeque<Vec<(String, u32)>>>,
         image: Mutex<VecDeque<Result<ImageReply, AttemptError>>>,
         calls: Mutex<Vec<String>>,
     }
@@ -1892,6 +1921,23 @@ mod tests {
             Arc::clone(self)
         }
 
+        /// Queue one stream observation per text call, in order — the `(events, first payload)`
+        /// the adapter seam records. A real interpreter fills it from the SSE lines; the fake
+        /// fills it here, which is enough to pin the *engine's* half: that a drained stream's
+        /// observation reaches the ledger row.
+        fn with_observations(self: &Arc<Self>, obs: Vec<Vec<(&str, u32)>>) -> Arc<Self> {
+            *self.observations.lock().unwrap() = obs
+                .into_iter()
+                .map(|batch| {
+                    batch
+                        .into_iter()
+                        .map(|(payload, repeat)| (payload.to_string(), repeat))
+                        .collect::<Vec<_>>()
+                })
+                .collect();
+            Arc::clone(self)
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -1921,6 +1967,7 @@ mod tests {
             let tools = self.tools.lock().unwrap().pop_front().unwrap_or_default();
             let brk = self.breaks.lock().unwrap().pop_front().flatten();
             let usage = self.usage.lock().unwrap().pop_front().flatten();
+            let observation = self.observations.lock().unwrap().pop_front().unwrap_or_default();
             Box::pin(async move {
                 match next {
                     None => Err(AttemptError::Transport),
@@ -1933,6 +1980,13 @@ mod tests {
                         }
                         if let (Some(u), Some(cb)) = (usage, args.on_usage.as_deref_mut()) {
                             cb(u);
+                        }
+                        if let Some(slot) = args.observation.as_deref_mut() {
+                            for (payload, repeat) in observation {
+                                for _ in 0..repeat {
+                                    slot.note(&payload);
+                                }
+                            }
                         }
                         // A mid-stream break appends `Err(e)` after the chunks, which is the shape
                         // of a real stream that dies mid-flight. Without `brk` the stream is clean.
@@ -2243,6 +2297,61 @@ mod tests {
         assert_eq!(row.key_id, None);
         assert_eq!(row.model, "m1", "the requested id, because no native id served");
         assert_eq!(router.next_key_cursor("p1"), 0, "nothing served, so nothing advances");
+        // The fake notes nothing, and a stream that carried no events has a wording of its own —
+        // "the provider sent nothing at all" is a finding, not an absence of one.
+        assert_eq!(
+            row.failure_detail.as_deref(),
+            Some("stream carried no SSE events at all"),
+            "a drained stream always says what it carried, even when that is nothing"
+        );
+    }
+
+    /// The evidence the drained arm never had: what the provider's stream actually carried.
+    /// 154 live rows said `PARSE_ERROR` with no status and an empty chain — indistinguishable
+    /// between "the provider streamed nothing" and "it streamed a shape the manifest cannot
+    /// read". The observation is what tells them apart, and this pins the engine's half of it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_drained_stream_s_row_carries_what_the_stream_actually_held() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&[])]).with_observations(vec![vec![(
+            "{\"choices\":[{\"delta\":{\"reasoning_content\":\"...\"}}]}",
+            3,
+        )]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        router
+            .generate_text(text_req("m1"), &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("nothing threw — the stream drained clean");
+
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.error_class.as_deref(), Some("PARSE_ERROR"));
+        let detail = row.failure_detail.as_deref().expect("the observation reached the row");
+        assert!(detail.contains("3 SSE event"), "the count: {detail}");
+        assert!(detail.contains("reasoning_content"), "a sample of the first event: {detail}");
+    }
+
+    /// A stream that DID deliver is not described: the output itself answers what the provider
+    /// sent, and a detail line beside it would be noise on every healthy row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_delivered_stream_writes_no_failure_detail() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&["hello"])]).with_observations(vec![vec![(
+            "{\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}",
+            1,
+        )]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        router
+            .generate_text(text_req("m1"), &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("served");
+
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "ok");
+        assert_eq!(row.failure_detail, None, "output delivered: no detail owed");
     }
 
     /// A tool-call turn delivers its whole answer through `on_tool_call`, and none of it through

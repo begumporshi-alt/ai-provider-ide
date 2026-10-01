@@ -383,6 +383,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             prompt_cache_enabled: false,
+            observation: None,
         }
     }
 

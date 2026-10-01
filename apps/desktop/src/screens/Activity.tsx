@@ -50,6 +50,7 @@ export function ActivityScreen() {
       tokensOut: e.tokensOut,
       cost: costFor(e.providerId ?? null, e.model, e.costEstimateMicros),
       fallbacks: (e.fallbackChain ?? []).map((a) => `${registry.getProvider(a.candidate.provider.id)?.name ?? a.candidate.provider.slug} · ${a.candidate.key.label} → ${a.cls}`),
+      failureDetail: e.failureDetail ?? null,
     }));
     const fromDisk = persisted
       .filter((p) => !live.some((l) => Math.abs(l.ts - p.ts) < 1000 && l.model === p.model))
@@ -76,6 +77,7 @@ export function ActivityScreen() {
             return [];
           }
         })(),
+        failureDetail: p.failureDetail,
       }));
     return [...fromLive, ...fromDisk].sort((a, b) => b.ts - a.ts).slice(0, 300);
   }, [live, persisted]);
@@ -139,6 +141,12 @@ export function ActivityScreen() {
                         <div>{servedLine(r, r.requested, r.model, r.modality)}</div>
                         <div>tokens in/out: {r.tokensIn}/{r.tokensOut}{r.source === "generator" ? " · System AI request (§2.8 exclusion path)" : ""}</div>
                         {r.cost === null && <div>cost: unknown — this provider publishes no pricing for {r.model}</div>}
+                        {/* Migration 0021: what a failed stream actually carried — the evidence a
+                            class label cannot give. A PARSE_ERROR with no status and an empty chain
+                            used to be a dead end; this line is why it no longer is. */}
+                        {r.failureDetail && (
+                          <div className="mt-1" style={{ color: "var(--warn)" }}>what the stream carried: {r.failureDetail}</div>
+                        )}
                         {(r.fallbacks.length > 0 || r.status !== "ok") && (
                           <div className="mt-1">
                             <div className="mb-0.5" style={{ color: "var(--warn)" }}>routing chain:</div>

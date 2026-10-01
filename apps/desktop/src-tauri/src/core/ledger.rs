@@ -238,6 +238,7 @@ mod tests {
             cost_estimate_micros: 0,
             cached_tokens: None,
             fallback_chain_json: None,
+            failure_detail: None,
         }
     }
 

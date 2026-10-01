@@ -201,6 +201,38 @@ describe("a stream that completes without serving is not a success", () => {
     expect(row.status).toBe("error");
     expect(row.errorClass).toBe("PARSE_ERROR");
     expect(row.providerId).toBeUndefined();
+    // And the row now says what the stream carried — which for zero events is itself a finding
+    // (the provider sent nothing at all), not an absence of evidence.
+    expect(row.failureDetail).toBe("stream carried no SSE events at all");
+  });
+
+  it("a stream whose events match nothing names them, so the manifest can be checked", async () => {
+    // The other half of the drained arm: the provider DID answer, with events the manifest's
+    // chunkMap does not select. Before the observation existed this row was byte-identical to the
+    // empty-body one above — 154 of them in the live ledger for one provider, undiagnosable.
+    const s = setup((url) =>
+      url.endsWith("/models")
+        ? MODELS
+        : {
+            status: 200,
+            lines: [
+              `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "thinking..." } }] })}`,
+              `data: ${JSON.stringify({ choices: [{ delta: { reasoning_content: "more" } }] })}`,
+              "data: [DONE]",
+            ],
+          },
+    );
+    await arm(s);
+
+    const exec = await ask(s);
+    expect(await collect(exec.chunks)).toBe("");
+
+    const row = s.ledger.query()[0]!;
+    expect(row.errorClass).toBe("PARSE_ERROR");
+    const detail = row.failureDetail!;
+    expect(detail).toContain("2 SSE event");
+    expect(detail).toContain("reasoning_content");
+    expect(detail).toContain("none matched the manifest's delta selector");
   });
 
   it("an aborted request is logged as CANCELLED, not as ok", async () => {

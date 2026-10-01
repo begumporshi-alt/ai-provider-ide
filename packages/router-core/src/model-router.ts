@@ -457,6 +457,11 @@ export class ModelRouter implements RouterFacade, AiTextPort {
             model: requestedModel,
             status: "error",
             errorClass: signal?.aborted ? "CANCELLED" : "PARSE_ERROR",
+            // The one evidence this arm never had: what the provider actually streamed. A sample of
+            // the first event separates "the provider sent nothing" from "it sent a shape this
+            // manifest cannot read" — two findings with different owners that the class label alone
+            // conflated.
+            failureDetail: exec.observation(),
             latencyMs: Date.now() - t0,
             tokensIn,
             tokensOut,

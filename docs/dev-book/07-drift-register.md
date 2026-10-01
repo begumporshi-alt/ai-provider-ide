@@ -376,6 +376,8 @@ generated ids and refuses duplicate ids, which the repo-wide check cannot see.
 
 ## Adding an entry
 
+| **D81** | The ledger's `PARSE_ERROR` rows carry no evidence: on a drained stream the row has no `http_status`, an empty `fallback_chain_json`, and nothing saying whether the provider streamed nothing at all or streamed a shape the manifest's `chunkMap.delta` does not select. Related stale claim in this chapter: the Status page's Schema cell said **17** versions while the code had reached 20 | Live DB measured 2026-10-01: 168 `PARSE_ERROR` rows of 2531, **154** of them on the busiest provider (`agnes`), every drained one with `fallback_chain_json = '[]'` and `http_status NULL`; still occurring 2026-09-30. `PARSE_ERROR` is deliberately not retried and not failed over (both engines' `is_retryable_with_next_key` exclude it), so each was a terminal, undiagnosable failure | **Half** — the class taxonomy is correct (the two causes it merges are genuinely one class on the wire), the evidence was the missing half | **Fixed** 2026-10-01 — migration `0021_ledger_failure_detail`; the engine now observes each stream's `data:` events as they are read (count + a 240-byte sample of the first, bounded at capture) and the drained arm writes `failure_detail` on the row; surfaced in the Activity screen's expanded row and in both engines' unit tests. The class label itself is unchanged, deliberately: reclassifying is a wire-contract change, and the evidence removes the need |
+
 ```
 | **D<n>** | the claim, quoted | file:line | what you measured, and with what | False / Half / Stale / Correct | Open / Fixed |
 ```

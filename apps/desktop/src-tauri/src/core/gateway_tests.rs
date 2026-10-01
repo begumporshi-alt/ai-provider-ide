@@ -4317,6 +4317,7 @@ async fn admin_ledger_read_honours_limit() {
                     cost_estimate_micros: 1,
                     cached_tokens: None,
                     fallback_chain_json: None,
+                    failure_detail: None,
                 },
             )
             .unwrap();

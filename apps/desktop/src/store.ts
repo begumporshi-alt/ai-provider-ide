@@ -126,6 +126,12 @@ export interface HostLedgerRow {
   costEstimateMicros: number; fallbackChainJson: string | null;
   /** Null when the provider reported no cache block — not the same as a reported zero (0015). */
   cachedTokens: number | null;
+  /**
+   * Bounded evidence for a failure the class label cannot explain (migration 0021). Optional, not
+   * nullable: a host older than the migration omits the column outright, and the guard is `maybe`
+   * for exactly that reason.
+   */
+  failureDetail?: string | null;
 }
 
 // ---------- singletons ----------
