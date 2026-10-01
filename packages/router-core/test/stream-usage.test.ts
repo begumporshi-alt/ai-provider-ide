@@ -8,7 +8,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { ManifestInterpreter } from "../src/manifest-interpreter.js";
-import { PROVIDER_PROFILES } from "../src/builtin-templates.js";
+import { BUILTIN_TEMPLATES, PROVIDER_PROFILES } from "../src/builtin-templates.js";
 import { ProviderRegistry } from "../src/provider-registry.js";
 import { ModelCatalog } from "../src/model-catalog.js";
 import { AdapterRuntime } from "../src/adapter-runtime.js";
@@ -168,5 +168,64 @@ describe("stream usage", () => {
     }
     const body = JSON.parse(http.calls[0]!.body!);
     expect(body.stream_options).toBeUndefined();
+  });
+});
+
+/**
+ * Anthropic-shaped streams: the names differ, and the template did not say so.
+ *
+ * An Anthropic usage block reports `input_tokens` / `output_tokens`; the interpreter's fallback is
+ * OpenAI's `prompt_tokens` / `completion_tokens`, and the builtin template declared a `usage`
+ * selector but no `usageKeys` — so both counts were read as "missing" on every streamed request.
+ * Measured on the live ledger (2026-10-01): every `agent-router/deepseek-v4-flash` ui row recorded
+ * `tokens_in = 0, tokens_out = 0`, while `cached_tokens` was populated on the successful ones —
+ * and that field can only be non-zero if the same block was reached and its own key matched. The
+ * UI's session total read "Σ 0 in · 0 out".
+ */
+describe("anthropic-compatible stream usage", () => {
+  const ANTHROPIC = BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1");
+
+  function anthropicStream(lines: string[]) {
+    const http = new FakeHttp(() => ({ status: 200, lines }));
+    const interp = new ManifestInterpreter(ANTHROPIC, { http, vault: new FakeVault(), vars: {} } as never);
+    return { http, interp };
+  }
+
+  it("reads Anthropic's names from a streamed usage block", async () => {
+    const { interp } = anthropicStream([
+      `data: ${JSON.stringify({ type: "content_block_delta", delta: { type: "text_delta", text: "hi" } })}`,
+      // The shape measured from agentrouter: the terminal event carries the whole block, cache
+      // fields included. `cache_read_input_tokens` at THIS path is what populated `cached_tokens`
+      // on the live rows, which is the proof the block arrives here rather than only under
+      // `message.usage`.
+      `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 1200, output_tokens: 42, cache_read_input_tokens: 960 } })}`,
+    ]);
+    let seen: { prompt_tokens?: number; completion_tokens?: number; cached_tokens?: number } | undefined;
+    for await (const _c of interp.generateText("key:x", {
+      model: "claude-x", messages: [], stream: true, onUsage: (u: never) => { seen = u; },
+    } as never)) {
+      void _c;
+    }
+    expect(seen).toEqual({ prompt_tokens: 1200, completion_tokens: 42, cached_tokens: 960 });
+  });
+
+  it("GAP, not a contract: an input count reported only on `message_start` is still missed", async () => {
+    // Anthropic's own `message_start` nests usage as `message.usage`, and the jsonpath subset
+    // deliberately has no descendant selector (`$..usage` is unsupported — see jsonpath.ts), so one
+    // `usage` path cannot reach both places. Pinned here rather than fixed: the provider this was
+    // measured against reports the full block on a top-level `usage`, and closing the other case
+    // means either a second selector in the grammar or a fallback list — a grammar decision, not a
+    // side effect of this fix. If this test ever fails, the gap was closed and this note is stale.
+    const { interp } = anthropicStream([
+      `data: ${JSON.stringify({ type: "message_start", message: { usage: { input_tokens: 1200, cache_read_input_tokens: 960 } } })}`,
+      `data: ${JSON.stringify({ type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 42 } })}`,
+    ]);
+    let seen: { prompt_tokens?: number; completion_tokens?: number } | undefined;
+    for await (const _c of interp.generateText("key:x", {
+      model: "claude-x", messages: [], stream: true, onUsage: (u: never) => { seen = u; },
+    } as never)) {
+      void _c;
+    }
+    expect(seen).toEqual({ prompt_tokens: 0, completion_tokens: 42, cached_tokens: undefined });
   });
 });

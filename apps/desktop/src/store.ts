@@ -179,6 +179,12 @@ export const ledger = new UsageLedger({
             ...(a.reason ? { reason: a.reason } : {}),
           })))
         : null,
+      // Bounded evidence for a failure the class label cannot explain (migration 0021). This field
+      // was missing here for the whole life of the column: the engine set it, the Rust row accepts
+      // it, Activity renders it — and this object literal dropped it, so all 2562 rows held NULL and
+      // a drained stream stayed a dead end. `deny_unknown_fields` cannot catch an *absent* field;
+      // only this line can. Measured 2026-10-01 (`SELECT count(*) … failure_detail <> ''` = 0).
+      failureDetail: e.failureDetail ?? null,
     });
   },
 });

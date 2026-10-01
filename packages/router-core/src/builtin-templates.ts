@@ -111,10 +111,12 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           stream: "{{stream}}",
           max_tokens: "{{maxTokens}}", // anthropic REQUIRES max_tokens — not optional here
           // v1.1 amendment: translate the internal OpenAI tool_choice (string "auto"/"none" or
-          // {type:"function",function:{name}}) into Anthropic's object form via `toolChoiceMap`.
-          //   "none"  -> {type:"const", value:"none"}      (never call tools)
-          //   "auto"  -> {type:"const", value:"any"}       (let the model decide; Anthropic's "auto")
+          // {type:"function",function:{name}}) into Anthropic's object form via `toolChoiceMap`:
+          //   "none"     -> {type:"none"}                  (never call tools)
+          //   "auto"     -> {type:"auto"}                  (let the model decide)
           //   "function" -> {type:"tool", name:"<fn>"}     (require exactly this tool)
+          // The map previously emitted `{type:"const", …}` — a shape in no Anthropic API surface,
+          // and `auto` mapped to Anthropic's `any`, which FORCES a call. Fixed 2026-10-01.
           tools: "{{tools?}}",
           tool_choice: "{{toolChoice?}}",
         },
@@ -173,6 +175,17 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           // selects the text blocks — see `selectText`.
           text: "$.content",
           usage: "$.usage",
+          // Anthropic names its token counts differently from OpenAI, and without these the
+          // interpreter falls back to `prompt_tokens`/`completion_tokens` — which an Anthropic
+          // usage block does not have. Measured 2026-10-01 on the live ledger: every
+          // agent-router row recorded 0 in / 0 out while `cached_tokens` (read by its own
+          // default key, `cache_read_input_tokens`) was populated — proof the usage block was
+          // reached and only the two names missed. The UI's session total read "Σ 0 in · 0 out".
+          usageKeys: {
+            prompt: "input_tokens",
+            completion: "output_tokens",
+            cached: "cache_read_input_tokens",
+          },
           // Non-stream: `content` is a MIXED array (text blocks + tool_use blocks). The
           // jsonpath subset has no filter expressions, so the interpreter filters by
           // block type — see emitToolCalls.
