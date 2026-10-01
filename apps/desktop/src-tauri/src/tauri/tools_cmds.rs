@@ -37,6 +37,12 @@ pub fn tools_default_root() -> Result<String, String> {
     crate::core::tools::tools_default_root()
 }
 
+/// Immediate subdirectories of an absolute path, for the Assistant's root picker.
+#[tauri::command]
+pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
+    crate::core::tools::tools_list_dirs(path)
+}
+
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
 #[tauri::command]
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {

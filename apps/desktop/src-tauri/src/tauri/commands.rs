@@ -727,6 +727,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::tauri::tools_cmds::tools_policy,
         crate::tauri::tools_cmds::tools_check_root,
         crate::tauri::tools_cmds::tools_default_root,
+        crate::tauri::tools_cmds::tools_list_dirs,
         crate::tauri::tools_cmds::tool_run,
         memory_capture,
         memory_capture_batch,

@@ -1282,6 +1282,22 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       }
       return null;
     }
+    case "tools_list_dirs": {
+      // Mirrors tools.rs::tools_list_dirs: immediate child directories of an absolute path, no
+      // dot-entries, sorted. The shim has no filesystem, so it answers from a small fixed tree
+      // wide enough to walk down toward the default workspace's parent — a Root-tab browse in a
+      // spec sees real-looking folder names at each step rather than a dead end.
+      const p = String(args.path ?? "").trim();
+      if (!p.startsWith("/")) throw new Error("path must be absolute");
+      const tree: Record<string, string[]> = {
+        "/": ["Users", "home", "opt", "tmp"],
+        "/Users": ["Shared", "tester"],
+        "/home": ["tester"],
+        "/home/tester": ["Documents", "myapps", "Projects"],
+        "/Users/tester": ["Desktop", "Documents", "Downloads", "myapps", "Projects"],
+      };
+      return tree[p] ?? ["AI-Provider-Router-Workspace", "archive", "notes"];
+    }
     case "tool_run": {
       // The Rust host collapses (name, args, root) into a single `req` object — match that shape
       // so the host-side allowlist, path confinement and timeout run the same code paths in test.

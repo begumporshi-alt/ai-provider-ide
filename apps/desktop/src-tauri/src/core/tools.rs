@@ -158,6 +158,33 @@ pub fn tools_default_root() -> Result<String, String> {
         .ok_or_else(|| "no home directory — set a workspace root".to_string())
 }
 
+/// Immediate subdirectories of an absolute path, for the Assistant's root picker.
+///
+/// A browse-to-set-root UI has to walk the filesystem OUTSIDE any workspace root — which the
+/// sandboxed `list_dir` must never do, since its whole job is refusing to escape the root. This
+/// command is that walk, kept deliberately dumb: names of immediate child directories only —
+/// no files, no recursion, no contents — so it is a wayfinding aid, not a listing primitive the
+/// sandbox would have to answer for. Hidden entries are skipped: a workspace picker does not
+/// need dot-directories, and hiding them keeps the pane short.
+pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
+    if path.trim().is_empty() {
+        return Err("empty path".into());
+    }
+    let mut out: Vec<String> = Vec::new();
+    let entries = fs::read_dir(&path).map_err(|e| e.to_string())?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') {
+            continue;
+        }
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            out.push(name);
+        }
+    }
+    out.sort_by_key(|a| a.to_lowercase());
+    Ok(out)
+}
+
 /// Resolve `rel` inside `root`, refusing anything that escapes it.
 ///
 /// Absolute paths and `..` components are rejected outright; the surviving path is then
