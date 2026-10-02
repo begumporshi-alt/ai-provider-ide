@@ -203,6 +203,19 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "web_ask",
+    effect: "read",
+    description:
+      "Ask a question about a web page: fetches it and answers with the model in a side call, so the page text stays out of the conversation. Only the answer is returned.",
+    parameters: {
+      properties: {
+        url: { type: "string", description: "The page's public http(s) URL." },
+        question: { type: "string", description: "What you want to know from that page." },
+      },
+      required: ["url", "question"],
+    },
+  },
+  {
     name: "http_request",
     effect: "mutate",
     description:

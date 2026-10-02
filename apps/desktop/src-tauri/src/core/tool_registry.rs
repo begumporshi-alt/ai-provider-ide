@@ -6,6 +6,11 @@
 //! `tools` array; `additionalProperties: false` keeps the model from smuggling extra fields the
 //! sandbox would ignore anyway.
 //!
+//! **One deliberate divergence from the frontend registry:** `web_ask` exists only there. It is
+//! answered by the agent loop, which holds the model — a capability this side keeps one-way. It
+//! is not listed here, so the gateway never advertises it; the sandbox still carries a refusal
+//! arm in case a call arrives by name anyway.
+//!
 //! `write_file`, `edit_file`, `mkdir` and `run_command` are **mutating** — the four the gateway
 //! refuses unless mutation is explicitly enabled ([`crate::core::gateway::MUTATING_TOOLS`]), and the
 //! four the Assistant confirms one call at a time. `todo_write` mutates only the Assistant's

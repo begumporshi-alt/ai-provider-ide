@@ -162,15 +162,59 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         ok = false;
       } else {
         try {
-          const r = await host.run(name, args);
-          resultText = r.output;
-          ok = r.ok;
-          // Belt and braces: `ToolHost` is an interface, and a host that reports a failure with
-          // an empty string sends the model a blank tool result — it cannot tell "nothing to
-          // report" from "something went wrong", and answers as if the tool had no output.
-          // A failure must always carry a reason.
-          if (!ok && !resultText.trim()) {
-            resultText = `Tool "${name}" failed and reported no reason.`;
+          // `web_ask` never reaches the sandbox: it is answered HERE, by the same model, in a
+          // side conversation — fetch the page (cache included) through the host, then ask the
+          // question against the text. The 32 KB of page content stays out of the main
+          // transcript, which is the whole point of the tool. The backend has no handler on
+          // purpose: the gateway path has no aux-model mechanism, so the tool is
+          // Assistant-only, and the sandbox would refuse the name if it ever saw it.
+          if (name === "web_ask") {
+            const pageUrl = typeof args.url === "string" ? args.url : "";
+            const question = typeof args.question === "string" ? args.question : "";
+            if (!pageUrl || !question) {
+              resultText = 'web_ask needs a "url" and a "question".';
+              ok = false;
+            } else {
+              const page = await host.run("web_fetch", { url: pageUrl });
+              if (!page.ok) {
+                resultText = `could not fetch the page: ${page.output}`;
+                ok = false;
+              } else {
+                const aux = await generate(
+                  {
+                    model,
+                    messages: [
+                      {
+                        role: "user" as const,
+                        content:
+                          `Answer the question using only the page content below. ` +
+                          `If the page does not answer it, say exactly that.\n\n` +
+                          `URL: ${pageUrl}\nQUESTION: ${question}\n\nPAGE CONTENT:\n${page.output}`,
+                      },
+                    ],
+                  },
+                  { signal },
+                );
+                let answer = "";
+                for await (const chunk of aux.chunks) {
+                  if (signal?.aborted) break;
+                  answer += chunk;
+                }
+                resultText = answer.trim() || "(the model returned no answer)";
+                ok = true;
+              }
+            }
+          } else {
+            const r = await host.run(name, args);
+            resultText = r.output;
+            ok = r.ok;
+            // Belt and braces: `ToolHost` is an interface, and a host that reports a failure with
+            // an empty string sends the model a blank tool result — it cannot tell "nothing to
+            // report" from "something went wrong", and answers as if the tool had no output.
+            // A failure must always carry a reason.
+            if (!ok && !resultText.trim()) {
+              resultText = `Tool "${name}" failed and reported no reason.`;
+            }
           }
         } catch (e) {
           resultText = `Tool execution error: ${e instanceof Error ? e.message : String(e)}`;

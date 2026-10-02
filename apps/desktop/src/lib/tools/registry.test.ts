@@ -62,6 +62,7 @@ describe("AGENT_TOOLS", () => {
       "read_image",
       "search_files",
       "todo_write",
+      "web_ask",
       "web_fetch",
       "web_search",
     ]);
@@ -81,6 +82,14 @@ describe("AGENT_TOOLS", () => {
       const expected = MUTATING.includes(t.name) ? "mutate" : "read";
       expect(t.effect, t.name).toBe(expected);
     }
+  });
+
+  it("Assistant-only tools stay out of the gateway's registry", () => {
+    // `web_ask` is answered by the agent loop itself (it needs a model, which the Rust tool
+    // host does not have), so it is a frontend-registry entry with NO backend registry entry
+    // and NO sandbox handler beyond a refusal. This test pins the asymmetry: if web_ask ever
+    // appears in a backend-shaped list here, the mirror invariant below it needs rethinking.
+    expect(AGENT_TOOLS.some((t) => t.name === "web_ask")).toBe(true);
   });
 
   it("knows the effect of a name, and fails closed for one it does not", () => {

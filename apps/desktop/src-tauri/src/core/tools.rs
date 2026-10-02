@@ -1569,6 +1569,13 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "todo_write" => do_todo_write(&args),
         "web_fetch" => do_web_fetch(&args),
         "web_search" => do_web_search(&args),
+        // `web_ask` is Assistant-only: it is answered by the agent loop, which holds the model
+        // — the sandbox does not, and that boundary is one-way by design. The gateway never
+        // advertises it (the backend registry omits it); this arm exists so a direct call fails
+        // with the reason instead of "unknown tool".
+        "web_ask" => ToolResult::err(
+            "web_ask runs in the Assistant only — the sandbox has no model to answer with; use web_fetch and read the page",
+        ),
         "read_document" => do_read_document(&args, &root),
         "read_image" => do_read_image(&args, &root),
         "http_request" => do_http_request(&args),
