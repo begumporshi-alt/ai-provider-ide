@@ -129,10 +129,18 @@ describe("anthropic-compat: system hoist + role remap", () => {
     // Anthropic declares no `contentField`, so plain-string content stays a plain string.
     const assistant = msgs.find((m) => m.role === "assistant")!;
     expect(assistant.content).toBe("Hi there");
-    const result = msgs.find((m) => m.role === "user" && Array.isArray(m.content))!;
-    expect(result.content).toEqual([
-      { type: "tool_result", tool_use_id: "call_123", content: "result of tool call" },
-    ]);
+    // **Flipped 2026-10-02.** This used to pin a `tool_result` block for `MESSAGES`' result, whose
+    // `call_123` no turn in the payload declares. Reproduced against agentrouter.org's Anthropic
+    // route: a `tool_result` addressing a call the request does not contain is refused outright —
+    // `unexpected \`messages.2.content.0: tool_use_id\` found in \`tool_result\` blocks: <id>` — so
+    // that shape 400'd the whole turn, which is the live failure this came from. A block can only
+    // be legal when the call it answers is present, so the result rides as an ordinary user turn
+    // instead and the model still reads the output.
+    expect(wire).not.toContain("tool_result");
+    const result = msgs.find(
+      (m) => m.role === "user" && JSON.stringify(m.content).includes("result of tool call"),
+    )!;
+    expect(result).toBeDefined();
   });
 
   it("surfaces finish_reason from stop_reason via onFinish, in the OpenAI vocabulary", async () => {
@@ -374,5 +382,30 @@ describe("tool turns on replay: only a dialect that asks is reshaped", () => {
       { type: "tool_result", tool_use_id: "c1", content: "file a" },
       { type: "tool_result", tool_use_id: "c2", content: "file b" },
     ]);
+  });
+
+  it("anthropic-compat never sends a tool_result whose call the request does not declare", async () => {
+    // The exact 400 the live app hit on 2026-10-02, reproduced against agentrouter.org with a
+    // hand-built body. A result naming a call that is not in the request is refused as
+    //   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: .
+    // — note the EMPTY id list, which is the signature of a missing `tool_call_id`: the shaper used
+    // to fall back to `""` and render the block anyway, so `tool_use_id: ""` went out and the whole
+    // turn was refused. An id that names nothing can never be paired, by any dialect.
+    const orphaned = [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: "Reading." }, // declares no call at all
+      { role: "tool", content: "file a", tool_call_id: "c1" }, // answers a call that is gone
+      { role: "tool", content: "no id was recorded" }, // `tool_call_id` missing entirely
+    ];
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: orphaned, stream: false });
+
+    const wire = JSON.stringify(lastBody());
+    expect(wire).not.toContain("tool_result");
+    expect(wire).not.toContain('"tool_use_id"');
+    // The output is not discarded along with the block: the role map turns each into an ordinary
+    // user turn, so the model still sees what the tool produced.
+    expect(wire).toContain("file a");
+    expect(wire).toContain("no id was recorded");
   });
 });

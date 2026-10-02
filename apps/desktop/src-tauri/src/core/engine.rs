@@ -244,6 +244,21 @@ pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
     ErrorClass::Network
 }
 
+/// Longest provider reason kept, in code points. Mirror of `errors.ts:MAX_REASON_CHARS` — these two
+/// are a pair a reader compares, so a divergence would mean the app and the daemon report the same
+/// refusal at different lengths.
+///
+/// 120 was too tight for the message the field exists to carry. Measured from `agentrouter.org`'s
+/// Anthropic route (2026-10-02), a rejected `tool_result` answers with 186 characters *before* the
+/// aggregator appends its own request/trace ids:
+///
+///   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_x.
+///   Each `tool_result` block must have a corresponding `tool_use` block in the previous message.
+///
+/// The old cut landed at "Each `…", dropping both the offending id and the rule that explains it,
+/// so a live 400 could not be diagnosed from the ledger. The cap only bounds a text column.
+pub const MAX_REASON_CHARS: usize = 400;
+
 /// The provider's own words for why it refused, short enough for a chain entry.
 ///
 /// Rust mirror of `errors.ts:reasonFromBody` — one of the pair a reader compares. Before this
@@ -271,8 +286,8 @@ pub fn reason_from_body(body: Option<&str>) -> Option<String> {
     let reason = reason.unwrap();
     // char-counted, not byte-counted: a CJK error message (the measurement saw 无效的令牌) would
     // panic on a byte slice that splits a code point.
-    Some(if reason.chars().count() > 120 {
-        format!("{}…", reason.chars().take(117).collect::<String>())
+    Some(if reason.chars().count() > MAX_REASON_CHARS {
+        format!("{}…", reason.chars().take(MAX_REASON_CHARS).collect::<String>())
     } else {
         reason
     })
@@ -1744,11 +1759,28 @@ mod tests {
         // not JSON: the raw text is still the provider's own words
         assert_eq!(reason_from_body(Some("plain refusal")).as_deref(), Some("plain refusal"));
         // char-counted truncation: a CJK message must not panic on a split code point
-        let long = "无".repeat(200);
+        let long = "无".repeat(MAX_REASON_CHARS + 100);
         let got = reason_from_body(Some(&long)).unwrap();
-        assert!(got.chars().count() <= 120);
+        assert!(got.chars().count() <= MAX_REASON_CHARS + 1);
         assert!(got.ends_with('…'));
         assert_eq!(reason_from_body(None), None);
+    }
+
+    #[test]
+    fn a_validation_error_keeps_the_rule_that_explains_it() {
+        // Measured from agentrouter.org's Anthropic route (2026-10-02), verbatim apart from the id.
+        // It is 186 characters before the aggregator appends its own request/trace suffixes, so the
+        // old 120-character cut landed at "Each `…" and dropped both the offending id and the rule —
+        // thereby making a live 400 undiagnosable from the ledger, which is this field's whole job.
+        let message = "unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: \
+                       toolu_bogus_123. Each `tool_result` block must have a corresponding `tool_use` \
+                       block in the previous message.";
+        let body = serde_json::json!({ "error": { "message": message } }).to_string();
+        let got = reason_from_body(Some(&body)).unwrap();
+
+        assert!(got.contains("toolu_bogus_123"), "{got}");
+        assert!(got.contains("must have a corresponding"), "{got}");
+        assert!(!got.ends_with('…'), "the rule must survive: {got}");
     }
 
     #[test]

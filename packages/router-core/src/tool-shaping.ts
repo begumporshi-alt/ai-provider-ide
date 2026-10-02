@@ -309,6 +309,20 @@ export function attachToolParts(
       const msg = m as Record<string, unknown>;
       const id = typeof msg.tool_call_id === "string" ? msg.tool_call_id : "";
       const text = typeof msg.content === "string" ? msg.content : "";
+      // A `tool_result` is only a legal block when the call it answers is declared in THIS request,
+      // because the dialect validates that relation and rejects the whole turn when it fails —
+      // `unexpected \`messages.N.content.0: tool_use_id\` found in \`tool_result\` blocks`. The block
+      // used to be rendered regardless, so a result naming a call that is not here (including the
+      // `""` a missing `tool_call_id` became) produced a 400 whose message names the block and whose
+      // id list is *empty*, which is exactly the evidence that is missing when you need it.
+      //
+      // Left as an ordinary message instead, the role map turns it into a user turn and the output
+      // still reaches the model. Dropping it would be the other 400: a declared call with no result.
+      if (!id || !nameById.has(id)) {
+        merged = null;
+        pass1.push(m);
+        continue;
+      }
       const block = render(templates.toolResult, {
         id,
         name: nameById.get(id) ?? "",

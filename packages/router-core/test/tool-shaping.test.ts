@@ -237,10 +237,20 @@ describe("attachToolParts", () => {
     expect(out[1]!.content).toEqual([{ functionResponse: { name: "list_dir", response: { result: "ok" } } }]);
   });
 
-  it("leaves a result whose id it cannot resolve nameless rather than guessing", () => {
+  it("renders no result part for a call the request never declares", () => {
+    // **Flipped 2026-10-02.** The old pin kept the block and left the name empty rather than
+    // "guessing" one — but the block itself is the problem, not only its name: a result part
+    // addressing a call that is absent from the payload cannot be paired by any dialect, and the
+    // dialect that validates the relation refuses the whole request. Reproduced against
+    // agentrouter.org's Anthropic route: with a bogus id the refusal quotes it, and with an EMPTY
+    // id it quotes nothing — `blocks: .` — which is the signature of the live 400 this came from.
+    // Left as an ordinary message, the role map makes it a user turn and the text still reaches
+    // the model, so nothing is lost but an unpaired block.
     const orphan = [{ role: "tool", content: "text", tool_call_id: "ghost" }];
     const out = attachToolParts(orphan, tpl, render) as Array<Record<string, unknown>>;
-    expect(out[0]!.content).toEqual([{ functionResponse: { name: "", response: { result: "text" } } }]);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.role).toBe("tool");
+    expect(out[0]!.content).toBe("text");
   });
 
   it("declares each half independently", () => {
