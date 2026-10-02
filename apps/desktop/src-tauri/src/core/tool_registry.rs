@@ -219,6 +219,21 @@ fn build() -> Vec<ToolSpec> {
             required: &["program"],
         },
         ToolSpec {
+            name: "glob",
+            description: "List workspace paths matching a glob pattern: ** spans directories, * and ? stay in one segment. Capped at 500 entries.",
+            properties: json!({
+                "pattern": {
+                    "type": "string",
+                    "description": "Glob relative to the workspace root, e.g. \"src/**/*.rs\". May not contain \"..\".",
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional workspace-relative base directory to match within. Defaults to \".\".",
+                },
+            }),
+            required: &["pattern"],
+        },
+        ToolSpec {
             name: "todo_write",
             description: "Write the task list for the current run: replace it wholesale with every task and its status. Keep at most one task in_progress.",
             properties: json!({
@@ -269,8 +284,8 @@ mod tests {
     use crate::core::gateway::MUTATING_TOOLS;
 
     #[test]
-    fn the_registry_holds_eleven_tools() {
-        assert_eq!(agent_tools().len(), 11);
+    fn the_registry_holds_twelve_tools() {
+        assert_eq!(agent_tools().len(), 12);
     }
 
     #[test]
@@ -373,6 +388,7 @@ mod tests {
             read_only,
             vec![
                 "file_info",
+                "glob",
                 "list_dir",
                 "read_file",
                 "search_files",
@@ -393,12 +409,12 @@ mod tests {
     // ── gateway_tool_set ──────────────────────────────────────────────────
 
     /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
-    /// will refuse. Falsified by dropping the filter — the set goes back to eleven.
+    /// will refuse. Falsified by dropping the filter — the set goes back to twelve.
     #[test]
     fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
         let set = gateway_tool_set(false);
         let names: Vec<&str> = set.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 7, "expected the seven read-only tools, got {names:?}");
+        assert_eq!(names.len(), 8, "expected the eight read-only tools, got {names:?}");
         for m in MUTATING_TOOLS {
             assert!(!names.contains(&m), "{m} is advertised but would be refused");
         }
@@ -407,16 +423,16 @@ mod tests {
     /// Enabling mutation is opt-in and must restore the whole registry, not a subset.
     #[test]
     fn gateway_tool_set_includes_every_tool_when_mutation_is_on() {
-        assert_eq!(gateway_tool_set(true).len(), 11);
+        assert_eq!(gateway_tool_set(true).len(), 12);
     }
 
-    /// The read-only seven are advertised either way — narrowing must never remove a tool the
+    /// The read-only eight are advertised either way — narrowing must never remove a tool the
     /// gateway is willing to run.
     #[test]
     fn the_read_only_tools_are_advertised_either_way() {
         for on in [true, false] {
             let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
-            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write", "web_fetch", "web_search"] {
+            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write", "web_fetch", "web_search", "glob"] {
                 assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
             }
         }

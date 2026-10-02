@@ -463,6 +463,10 @@ function SystemPromptEditor({
   customSystem,
   customNoTools,
   customAgent,
+  searchProvider,
+  hasSearchKey,
+  onChangeSearchProvider,
+  onSaveSearchKey,
   onChangeSystem,
   onChangeNoTools,
   onChangeAgent,
@@ -471,6 +475,10 @@ function SystemPromptEditor({
   customSystem: string;
   customNoTools: string;
   customAgent: string;
+  searchProvider: "none" | "brave" | "tavily";
+  hasSearchKey: boolean;
+  onChangeSearchProvider: (v: "none" | "brave" | "tavily") => void;
+  onSaveSearchKey: (key: string) => void;
   onChangeSystem: (v: string) => void;
   onChangeNoTools: (v: string) => void;
   onChangeAgent: (v: string) => void;
@@ -478,6 +486,7 @@ function SystemPromptEditor({
 }) {
   const ta = "mono w-full rounded border p-2 text-[11px]";
   const taStyle = { background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" } as const;
+  const [keyDraft, setKeyDraft] = useState("");
   const field = (
     label: string,
     hint: string,
@@ -539,6 +548,57 @@ function SystemPromptEditor({
         onChangeSystem,
         "(no system prompt is sent unless you write one)",
       )}
+      <div className="mb-3 rounded-md border p-3" style={{ borderColor: "var(--border)" }}>
+        <div className="mb-1 flex items-baseline gap-2">
+          <span className="text-[12px] font-medium" style={{ color: "var(--text)" }}>
+            Web search API key (optional)
+          </span>
+          {hasSearchKey && (
+            <span className="text-[10px]" style={{ color: "var(--success)" }}>
+              a key is saved
+            </span>
+          )}
+        </div>
+        <p className="mb-2 text-[10px]" style={{ color: "var(--text-faint)" }}>
+          Search works without one (keyless, with fallback backends). Adding a Brave or Tavily key
+          puts that provider first in the chain — far more reliable under load. The key goes to the
+          OS vault; it is never readable back here and never reaches the model or the transcript.
+        </p>
+        <div className="flex items-center gap-2">
+          <select
+            value={searchProvider}
+            onChange={(e) => onChangeSearchProvider(e.target.value as "none" | "brave" | "tavily")}
+            className="rounded border bg-transparent px-2 py-1 text-[11px]"
+            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+            aria-label="Search key provider"
+          >
+            <option value="none">None (keyless)</option>
+            <option value="brave">Brave Search</option>
+            <option value="tavily">Tavily</option>
+          </select>
+          <input
+            value={keyDraft}
+            onChange={(e) => setKeyDraft(e.target.value)}
+            placeholder={hasSearchKey ? "replace the saved key…" : "paste an API key"}
+            disabled={searchProvider === "none"}
+            className="min-w-0 flex-1 rounded border bg-transparent px-2 py-1 text-[11px] disabled:opacity-40"
+            style={{ borderColor: "var(--border)", color: "var(--text)" }}
+            aria-label="Search API key"
+          />
+          <button
+            type="button"
+            onClick={() => {
+              onSaveSearchKey(keyDraft.trim());
+              setKeyDraft("");
+            }}
+            disabled={searchProvider === "none" || !keyDraft.trim()}
+            className="shrink-0 rounded-md border px-2 py-1 text-[11px] transition-opacity enabled:hover:opacity-90 disabled:opacity-40"
+            style={{ borderColor: "var(--border)", background: "var(--surface-2)", color: "var(--text)" }}
+          >
+            Save
+          </button>
+        </div>
+      </div>
       <div className="flex justify-end">
         <Button variant="primary" onClick={onClose}>Done</Button>
       </div>
@@ -582,6 +642,12 @@ interface AssistantSettings {
    * left on in a previous session would be a very confusing way to lose an afternoon.
    */
   approvalMode?: ApprovalMode;
+  /**
+   * Optional web-search key tier. Only the PROVIDER lives here; the key itself goes to the
+   * vault (`websearch` account, `<provider>|<key>`), because a credential is not settings data.
+   * Absent = keyless search, the default.
+   */
+  searchProvider?: "brave" | "tavily" | null;
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
@@ -639,6 +705,11 @@ export function AssistantScreen() {
   const [customSystemPrompt, setCustomSystemPrompt] = useState("");
   const [customNoToolsSystem, setCustomNoToolsSystem] = useState("");
   const [customAgentSystem, setCustomAgentSystem] = useState("");
+  // The web-search key tier: which provider (if any) the search chain should lead with, and
+  // whether a key is already in the vault (the key itself is never readable back from the
+  // webview — `vault_has` only, by design).
+  const [searchProvider, setSearchProvider] = useState<"none" | "brave" | "tavily">("none");
+  const [hasSearchKey, setHasSearchKey] = useState(false);
   const [root, setRoot] = useState("");
   // A root that will not work is worth saying before the run, not after it. An unusable root
   // used to reach the model as a blank tool result, which reads as "the agent is broken" rather
@@ -697,6 +768,10 @@ export function AssistantScreen() {
       // build would otherwise reach `decide()` and match none of its branches, which reads as
       // "ask every time" — a silent downgrade the user could not see.
       if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode)) setApprovalMode(stored.approvalMode!);
+      if (stored.searchProvider === "brave" || stored.searchProvider === "tavily") setSearchProvider(stored.searchProvider);
+      void invoke("vault_has", { account: "websearch" })
+        .then((has) => setHasSearchKey(Boolean(has)))
+        .catch(() => undefined);
       setRoot(stored.root ?? fallback ?? "");
       setHydrated(true);
     })();
@@ -720,9 +795,11 @@ export function AssistantScreen() {
       systemPrompt: customSystemPrompt,
       noToolsSystem: customNoToolsSystem,
       agentSystem: customAgentSystem,
+      // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
+      searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
     [root, agentMode, useMemory, noTools, maxIterations, approvalMode, temperature, maxTokens,
-      customSystemPrompt, customNoToolsSystem, customAgentSystem],
+      customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider],
   );
 
   // The debounced write below must serialise the state as it is WHEN IT FIRES, not as it was
@@ -907,6 +984,21 @@ export function AssistantScreen() {
           customSystem={customSystemPrompt}
           customNoTools={customNoToolsSystem}
           customAgent={customAgentSystem}
+          searchProvider={searchProvider}
+          hasSearchKey={hasSearchKey}
+          onChangeSearchProvider={(v) => {
+            setSearchProvider(v);
+            if (v === "none") {
+              void invoke("vault_delete", { account: "websearch" })
+                .then(() => setHasSearchKey(false))
+                .catch(() => undefined);
+            }
+          }}
+          onSaveSearchKey={(key) => {
+            void invoke("vault_put", { account: "websearch", secret: `${searchProvider}|${key}` })
+              .then(() => setHasSearchKey(true))
+              .catch(() => undefined);
+          }}
           onChangeSystem={setCustomSystemPrompt}
           onChangeNoTools={setCustomNoToolsSystem}
           onChangeAgent={setCustomAgentSystem}

@@ -55,6 +55,7 @@ describe("AGENT_TOOLS", () => {
     const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
     expect(readOnly.sort()).toEqual([
       "file_info",
+      "glob",
       "list_dir",
       "read_file",
       "search_files",

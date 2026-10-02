@@ -71,6 +71,47 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
+// ── the fetch cache ──────────────────────────────────────────────────────────────────────
+
+/// The agent re-reads pages constantly within a run; re-fetching is tokens, latency, and
+/// politeness spent for nothing. Successful `web_fetch` results are cached per URL for a short
+/// window (the ZCode WebFetch behaviour), bounded in entries so a long session cannot grow it
+/// without limit.
+const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
+const CACHE_MAX_ENTRIES: usize = 32;
+
+fn fetch_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
+    static CELL: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> =
+        OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Insert with an explicit timestamp, so the TTL is testable without sleeping.
+fn cache_insert(url: String, text: String, at: std::time::Instant) {
+    let mut cache = fetch_cache().lock().unwrap();
+    if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&url) {
+        // Evict the oldest entry rather than refusing: a full cache must not disable caching.
+        if let Some(oldest) = cache
+            .iter()
+            .min_by_key(|(_, (t, _))| *t)
+            .map(|(k, _)| k.clone())
+        {
+            cache.remove(&oldest);
+        }
+    }
+    cache.insert(url, (at, text));
+}
+
+fn cache_lookup(url: &str) -> Option<String> {
+    let mut cache = fetch_cache().lock().unwrap();
+    let (at, text) = cache.get(url).cloned()?;
+    if at.elapsed() > CACHE_TTL {
+        cache.remove(url);
+        return None;
+    }
+    Some(text)
+}
+
 // ── the URL guard ────────────────────────────────────────────────────────────────────────
 
 /// Is this IP inside the machine's own or otherwise non-routable space? The guard's core.
@@ -220,8 +261,16 @@ pub fn http_get(url: &reqwest::Url) -> Result<Vec<u8>, String> {
 /// Fetch a URL and return readable text. HTML responses are stripped to text (scripts, styles,
 /// tags and most entities removed); anything else that sniffs as text is passed through as-is.
 /// A `Page:`/`URL:` header is prefixed so the model can cite what it read.
+///
+/// Results are cached per URL for [`CACHE_TTL`] — a run that reads the same page twice pays
+/// once. The cache sits behind the guard: a URL the guard refuses is never fetched and never
+/// cached.
 pub fn web_fetch_text(raw_url: &str) -> Result<String, String> {
     let url = check_public_http_url(raw_url)?;
+    let key = url.as_str().to_string();
+    if let Some(cached) = cache_lookup(&key) {
+        return Ok(format!("{cached}\n\n(from cache — {key})"));
+    }
     let body = http_get(&url)?;
     let raw = String::from_utf8_lossy(&body).into_owned();
     let title = if looks_like_html(&body) {
@@ -255,6 +304,7 @@ pub fn web_fetch_text(raw_url: &str) -> Result<String, String> {
     }
     out.push_str(&format!("URL: {url}\n\n"));
     out.push_str(&text);
+    cache_insert(key, out.clone(), std::time::Instant::now());
     Ok(out)
 }
 
@@ -529,6 +579,177 @@ pub fn parse_searxng(html: &str) -> Vec<WebSearchHit> {
 /// GET one backend page and hand its body to the parser. Shared shape so the chain can hold a
 /// list of them.
 type SearchBackend = fn(&str) -> Result<Vec<WebSearchHit>, String>;
+
+/// The vault account holding the optional search key, as `"<provider>|<key>"` with provider
+/// `brave` or `tavily`. Written by the Assistant's settings UI through the `vault_put`
+/// command; the chain reads it at call time, so saving a key takes effect on the next search
+/// without a restart. Absent = keyless mode, the zero-config default.
+const SEARCH_KEY_ACCOUNT: &str = "websearch";
+
+/// The key-tier backends. These are official APIs — the stable path the keyless chain defers
+/// to whenever the user has configured a key. Each parses the provider's JSON and needs a
+/// `POST`-or-header variant of the fetch, so they carry their own thin request code instead of
+/// `http_get`.
+fn search_brave(query: &str) -> Result<Vec<WebSearchHit>, String> {
+    let secret = vault_secret()?;
+    let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
+    if key.is_empty() {
+        return Err("no key configured".into());
+    }
+    let mut url = reqwest::Url::parse("https://api.search.brave.com/res/v1/web/search").expect("constant");
+    url.query_pairs_mut().append_pair("q", query);
+    url.query_pairs_mut().append_pair("count", "10");
+    let body = http_get_with_headers(
+        &url,
+        &[("X-Subscription-Token", key), ("Accept", "application/json")],
+    )?;
+    parse_brave_json(&body)
+}
+
+fn search_tavily(query: &str) -> Result<Vec<WebSearchHit>, String> {
+    let secret = vault_secret()?;
+    let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
+    if key.is_empty() {
+        return Err("no key configured".into());
+    }
+    let body = http_post_json(
+        "https://api.tavily.com/search",
+        &key,
+        &serde_json::json!({ "api_key": key, "query": query, "max_results": 10 }).to_string(),
+    )?;
+    parse_tavily_json(&body)
+}
+
+/// The stored `<provider>|<key>` secret, if one is configured and well-formed.
+fn vault_secret() -> Result<String, String> {
+    match crate::core::vault::get(SEARCH_KEY_ACCOUNT) {
+        Ok(Some(secret)) if secret.contains('|') && !secret.ends_with('|') => Ok(secret),
+        Ok(_) => Err("no key configured".into()),
+        Err(e) => Err(format!("cannot read the search key: {e}")),
+    }
+}
+
+/// Parse Brave's web-search JSON: `web.results[]` of `{title, url, description}`.
+fn parse_brave_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Brave returned non-JSON: {e}"))?;
+    let results = v["web"]["results"]
+        .as_array()
+        .ok_or_else(|| format!("Brave response has no web.results: {}", snip(body)))?;
+    Ok(results
+        .iter()
+        .filter_map(|r| {
+            Some(WebSearchHit {
+                title: r["title"].as_str()?.to_string(),
+                url: r["url"].as_str()?.to_string(),
+                snippet: r["description"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .take(10)
+        .collect())
+}
+
+/// Parse Tavily's JSON: `results[]` of `{title, url, content}`.
+fn parse_tavily_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
+    let v: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("Tavily returned non-JSON: {e}"))?;
+    let results = v["results"]
+        .as_array()
+        .ok_or_else(|| format!("Tavily response has no results: {}", snip(body)))?;
+    Ok(results
+        .iter()
+        .filter_map(|r| {
+            Some(WebSearchHit {
+                title: r["title"].as_str()?.to_string(),
+                url: r["url"].as_str()?.to_string(),
+                snippet: r["content"].as_str().unwrap_or_default().to_string(),
+            })
+        })
+        .take(10)
+        .collect())
+}
+
+fn snip(s: &str) -> String {
+    s.chars().take(120).collect()
+}
+
+/// GET with extra headers — the shape `http_get` cannot express (Brave authenticates by
+/// header). Same timeout and no-redirect discipline.
+fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(FETCH_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+    runtime().block_on(async {
+        let mut req = client.get(url.clone());
+        for (name, value) in headers {
+            req = req.header(*name, *value);
+        }
+        let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("reading failed: {e}"))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+}
+
+/// POST JSON with a bearer-free `Content-Type` body — Tavily authenticates in the body. Same
+/// timeout and no-redirect discipline as `http_get`.
+fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(FETCH_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+    runtime().block_on(async {
+        let resp = client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .body(json.to_string())
+            .send()
+            .await
+            .map_err(|e| format!("request failed: {e}"))?;
+        let status = resp.status();
+        if !status.is_success() {
+            return Err(format!("HTTP {status}"));
+        }
+        let bytes = resp.bytes().await.map_err(|e| format!("reading failed: {e}"))?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    })
+}
+
+/// The keyless backends, tried in order after any key tier. A self-hosted SearXNG slots in at
+/// the TAIL (see [`parse_searxng`]).
+fn keyless_backends() -> Vec<(&'static str, SearchBackend)> {
+    vec![("DuckDuckGo", search_ddg_lite), ("DuckDuckGo (html)", search_ddg_html)]
+}
+
+/// The chain as a pure function of the configured secret, which is what makes the tiering
+/// testable without touching the vault. The key backend goes at the HEAD: when the user
+/// configured one, it is the answer they asked for; the keyless backends become the fallback.
+fn chain_for(secret: Option<&str>) -> Vec<(&'static str, SearchBackend)> {
+    let mut out: Vec<(&'static str, SearchBackend)> = Vec::new();
+    match secret.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(s) if s.starts_with("brave|") => out.push(("Brave", search_brave)),
+        Some(s) if s.starts_with("tavily|") => out.push(("Tavily", search_tavily)),
+        _ => {}
+    }
+    out.extend(keyless_backends());
+    out
+}
+
+/// The chain as the app will run it: whatever key the user configured, then the keyless pair.
+fn search_backends() -> Vec<(&'static str, SearchBackend)> {
+    let secret = crate::core::vault::get(SEARCH_KEY_ACCOUNT).ok().flatten();
+    chain_for(secret.as_deref())
+}
 
 /// Run the backend chain: first success wins; every failure is kept so the final error says
 /// what actually went wrong per backend. Generic over the backend callable (a `&dyn Fn`) so
@@ -818,6 +1039,87 @@ mod tests {
     #[test]
     fn an_empty_query_is_refused_before_any_network() {
         assert!(web_search("   ").is_err());
+    }
+
+    // ── the fetch cache ──────────────────────────────────────────────────
+
+    #[test]
+    fn web_fetch_text_serves_a_second_read_from_the_cache() {
+        // The guard runs before the cache, so a live loopback round-trip is not reachable
+        // offline by design. Seeding a cache entry for a public-URL key proves the same claim:
+        // `web_fetch_text` answers from the cache without any fetch at all.
+        let key = "https://example.com/aip-cache-round-trip";
+        cache_insert(
+            key.to_string(),
+            "Page: T\nURL: https://example.com/aip-cache-round-trip\n\ncache me".into(),
+            std::time::Instant::now(),
+        );
+        let second = web_fetch_text(key).expect("served from cache");
+        assert!(second.contains("cache me"), "{second}");
+        assert!(second.contains("(from cache"), "the cache hit is disclosed: {second}");
+    }
+
+    #[test]
+    fn an_expired_cache_entry_is_refetched() {
+        let url_key = "https://cache-test.invalid/expired".to_string();
+        let stale = std::time::Instant::now() - CACHE_TTL - std::time::Duration::from_secs(1);
+        cache_insert(url_key.clone(), "stale body".into(), stale);
+        assert!(cache_lookup(&url_key).is_none(), "a past-TTL entry must not serve");
+    }
+
+    #[test]
+    fn a_full_cache_evicts_the_oldest_entry_rather_than_refusing() {
+        // Strictly increasing timestamps, so "oldest" is unambiguous — equal ones would leave
+        // the eviction choice to HashMap iteration order.
+        let now = std::time::Instant::now();
+        for i in 0..CACHE_MAX_ENTRIES + 1 {
+            let at = now + std::time::Duration::from_millis(i as u64);
+            cache_insert(format!("https://cache-test.invalid/{i}"), format!("body {i}"), at);
+        }
+        // The oldest insert (index 0) was evicted to make room; the newest survives.
+        assert!(cache_lookup("https://cache-test.invalid/0").is_none());
+        assert!(
+            cache_lookup(&format!("https://cache-test.invalid/{CACHE_MAX_ENTRIES}")).is_some()
+        );
+    }
+
+    // ── the key tier ─────────────────────────────────────────────────────
+
+    #[test]
+    fn the_chain_gains_a_head_slot_only_when_a_key_is_configured() {
+        assert_eq!(chain_for(None).len(), 2, "keyless: just the two DDG templates");
+        assert_eq!(chain_for(Some("brave|TAV-KEY")).len(), 3, "brave at the head");
+        assert_eq!(chain_for(Some("tavily|tvly-123")).len(), 3, "tavily at the head");
+        assert_eq!(chain_for(Some("  ")).len(), 2, "a blank secret is no key");
+        assert_eq!(chain_for(Some("gibberish")).len(), 2, "an unknown provider is ignored, not fatal");
+        let names: Vec<&str> = chain_for(Some("brave|k")).iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["Brave", "DuckDuckGo", "DuckDuckGo (html)"]);
+    }
+
+    #[test]
+    fn the_brave_parser_reads_web_results() {
+        let body = r#"{"web":{"results":[
+            {"title":"Rust","url":"https://rust-lang.org/","description":"A language"},
+            {"title":"Docs","url":"https://doc.rust-lang.org/","description":"The book"}
+        ]}}"#;
+        let hits = parse_brave_json(body).expect("parses");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        assert_eq!(hits[1].snippet, "The book");
+        assert!(parse_brave_json("{\"type\":\"error\"}").is_err());
+    }
+
+    #[test]
+    fn the_tavily_parser_reads_results() {
+        let body = r#"{"results":[
+            {"title":"Rust","url":"https://rust-lang.org/","content":"A language"},
+            {"title":"Docs","url":"https://doc.rust-lang.org/","content":"The book"}
+        ]}"#;
+        let hits = parse_tavily_json(body).expect("parses");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].url, "https://rust-lang.org/");
+        assert_eq!(hits[1].snippet, "The book");
+        assert!(parse_tavily_json("{\"detail\":\"bad key\"}").is_err());
     }
 
     // ── http_get against a local listener (no public internet needed) ────

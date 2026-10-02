@@ -34,9 +34,12 @@ impl From<vault::VaultError> for CommandError {
 }
 
 /// All webview-facing vault accounts must be provider keys (`key:<keyId>`); the gateway
-/// `masterkey` account is host-only (invariant 10).
+/// `masterkey` account is host-only (invariant 10). `websearch` is the one deliberate
+/// exception: the user's optional search API key, entered in the Assistant's settings UI and
+/// read back only by the search chain in `core::web` — never exposed to a command again
+/// (there is still no `vault_get`).
 fn check_account(account: &str) -> Result<(), CommandError> {
-    if account.starts_with("key:") {
+    if account.starts_with("key:") || account == "websearch" {
         Ok(())
     } else {
         Err(CommandError("vault account namespace not permitted".into()))

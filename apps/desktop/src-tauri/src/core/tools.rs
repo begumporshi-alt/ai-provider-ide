@@ -34,6 +34,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
+use regex::Regex;
 
 /// Executables that may start. Everything else is refused, including anything destructive
 /// (`rm`, `mv` to `rm`-like effect is bounded by confinement) or network-facing.
@@ -1112,6 +1113,108 @@ fn do_web_fetch(args: &serde_json::Value) -> ToolResult {
     }
 }
 
+/// Convert a glob pattern to an anchored regex over relative workspace paths. `**` spans
+/// directories (and `a/**/b` also matches `a/b`), `*` and `?` stay within one segment.
+fn glob_to_regex(pattern: &str) -> Result<Regex, String> {
+    if pattern.split('/').any(|c| c == "..") {
+        return Err("a glob pattern may not contain \"..\"".into());
+    }
+    let mut re = String::from("^");
+    let mut chars = pattern.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '*' => {
+                if chars.peek() == Some(&'*') {
+                    chars.next();
+                    // `**/` at the start, or `/**/` anywhere, also matches zero directories.
+                    if re == "^" && chars.peek() == Some(&'/') {
+                        chars.next();
+                        re.push_str("(?:.*/)?");
+                    } else if re.ends_with("(?:.*/)?/") || re.ends_with('/') {
+                        // `/**/` — consume the following `/` too.
+                        if chars.peek() == Some(&'/') {
+                            chars.next();
+                            re.push_str("(?:.*/)?");
+                        } else {
+                            re.push_str(".*");
+                        }
+                    } else {
+                        re.push_str(".*");
+                    }
+                } else {
+                    re.push_str("[^/]*");
+                }
+            }
+            '?' => re.push_str("[^/]"),
+            other => {
+                if !other.is_alphanumeric() && !"_-.~ /".contains(other) {
+                    re.push('\\');
+                }
+                re.push(other);
+            }
+        }
+    }
+    re.push('$');
+    Regex::new(&re).map_err(|e| format!("pattern is not a valid glob: {e}"))
+}
+
+/// List workspace paths matching a glob pattern — `**/*.rs` for "every Rust file". The file
+/// tools' confinement rules apply to the base directory; the pattern itself may not contain
+/// `..`, so the match set cannot be steered outside the root.
+fn do_glob(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let pattern = arg_str(args, "pattern")?;
+        let re = glob_to_regex(&pattern)?;
+        let base = match args.get("path").and_then(|p| p.as_str()) {
+            Some(p) if !p.is_empty() => resolve_within(root, p, false)?,
+            _ => root.to_path_buf(),
+        };
+        let mut matches: Vec<String> = Vec::new();
+        let mut truncated = false;
+        fn walk(dir: &Path, base: &Path, re: &Regex, out: &mut Vec<String>, truncated: &mut bool) {
+            if *truncated || out.len() >= MAX_LIST_ENTRIES {
+                *truncated = out.len() >= MAX_LIST_ENTRIES;
+                return;
+            }
+            let entries = match fs::read_dir(dir) {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            for entry in entries.flatten() {
+                if out.len() >= MAX_LIST_ENTRIES {
+                    *truncated = true;
+                    return;
+                }
+                let path = entry.path();
+                let rel = match path.strip_prefix(base) {
+                    Ok(r) => r.to_string_lossy().replace('\\', "/"),
+                    Err(_) => continue,
+                };
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    walk(&path, base, re, out, truncated);
+                } else if re.is_match(&rel) {
+                    out.push(rel);
+                }
+            }
+        }
+        walk(&base, &base, &re, &mut matches, &mut truncated);
+        if matches.is_empty() {
+            return Ok(format!("no paths match \"{pattern}\""));
+        }
+        matches.sort();
+        let mut out = matches.join("\n");
+        if truncated {
+            out.push_str(&format!(
+                "\n\n(capped at {MAX_LIST_ENTRIES} entries — narrow the pattern or add a base path)"
+            ));
+        }
+        Ok(out)
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
 /// Search the public web via the keyless backend chain (DuckDuckGo, then SearXNG — see
 /// `core::web`; no API keys involved).
 fn do_web_search(args: &serde_json::Value) -> ToolResult {
@@ -1148,6 +1251,7 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "todo_write" => do_todo_write(&args),
         "web_fetch" => do_web_fetch(&args),
         "web_search" => do_web_search(&args),
+        "glob" => do_glob(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }
@@ -1424,6 +1528,44 @@ mod tests {
     }
 
     // --- the git capsule: git_summary and git_commit_push against real temp repos ---
+
+    #[test]
+    fn glob_matches_across_and_within_directories() {
+        let dir = root();
+        fs::create_dir_all(dir.join("src/deep")).unwrap();
+        fs::write(dir.join("main.rs"), "").unwrap();
+        fs::write(dir.join("src/lib.rs"), "").unwrap();
+        fs::write(dir.join("src/deep/mod.rs"), "").unwrap();
+        fs::write(dir.join("src/notes.md"), "").unwrap();
+
+        let hits = |pattern: &str| {
+            let res = do_glob(&obj(&[("pattern", serde_json::json!(pattern))]), &dir);
+            assert!(res.ok, "{pattern}: {:?}", res.error);
+            res.output.lines().map(str::to_string).collect::<Vec<_>>()
+        };
+
+        let all = hits("**/*.rs");
+        assert_eq!(all.len(), 3, "{all:?}");
+        assert!(all.contains(&"src/deep/mod.rs".to_string()));
+
+        assert_eq!(hits("*.rs"), vec!["main.rs".to_string()], "* stays in one segment");
+        let deep = hits("src/**/*.rs");
+        assert_eq!(deep.len(), 2, "{deep:?}");
+        assert!(hits("?ain.rs").contains(&"main.rs".to_string()));
+        assert!(hits("**/*.md").contains(&"src/notes.md".to_string()));
+    }
+
+    #[test]
+    fn glob_refuses_traversal_and_reports_no_matches() {
+        let dir = root();
+        let res = do_glob(&obj(&[("pattern", serde_json::json!("../**/*.rs"))]), &dir);
+        assert!(!res.ok, "a traversal pattern must be refused");
+        assert!(res.error.unwrap().contains(".."));
+
+        let none = do_glob(&obj(&[("pattern", serde_json::json!("**/*.zig"))]), &dir);
+        assert!(none.ok);
+        assert!(none.output.contains("no paths match"));
+    }
 
     /// A scratch repo with an identity configured, so commits work without ambient config.
     fn scratch_repo(tag: &str) -> PathBuf {

@@ -160,6 +160,25 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "glob",
+    effect: "read",
+    description:
+      "List workspace paths matching a glob pattern: ** spans directories, * and ? stay in one segment. Capped at 500 entries.",
+    parameters: {
+      properties: {
+        pattern: {
+          type: "string",
+          description: 'Glob relative to the workspace root, e.g. "src/**/*.rs". May not contain "..".',
+        },
+        path: {
+          type: "string",
+          description: 'Optional workspace-relative base directory to match within. Defaults to ".".',
+        },
+      },
+      required: ["pattern"],
+    },
+  },
+  {
     name: "todo_write",
     effect: "read",
     description:
