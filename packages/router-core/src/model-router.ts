@@ -168,6 +168,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       // engine keeps its own copy for the ledger regardless.
       onUsage: req.onUsage,
       onFinish: req.onFinish,
+      onReasoning: req.onReasoning,
       signal: opts?.signal,
     });
     return this.wrapLedger(
@@ -448,6 +449,19 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           // chunks alone sent it here: 11 of the 42 rows written since the 2026-09-27 deploy were
           // `PARSE_ERROR`, and probing two of them (rows 1714/1715) showed both were healthy
           // `finish_reason: "tool_calls"` answers that the client received correctly.
+          // **A provider that reasoned but never answered is not a parse error.** The class was a
+          // constant on this arm, so a stream carrying 8197 `thinking_delta` events and an explicit
+          // `stop_reason: max_tokens` was filed identically to a provider returning four bytes of
+          // HTML — and the operator was sent to look at a manifest that was already correct. The
+          // evidence is in hand: `reasoning()` is non-empty exactly when the model composed
+          // something it never turned into an answer. Measured 2026-10-02: four such turns in
+          // 75 minutes on one model, each ~40 s and an empty bubble.
+          const reasoned = exec.reasoning();
+          const errorClass = signal?.aborted
+            ? "CANCELLED"
+            : reasoned
+              ? "NO_OUTPUT"
+              : "PARSE_ERROR";
           await ledger.append({
             ts: Date.now(),
             modality,
@@ -456,7 +470,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
             requestedModel,
             model: requestedModel,
             status: "error",
-            errorClass: signal?.aborted ? "CANCELLED" : "PARSE_ERROR",
+            errorClass,
             // The one evidence this arm never had: what the provider actually streamed. A sample of
             // the first event separates "the provider sent nothing" from "it sent a shape this
             // manifest cannot read" — two findings with different owners that the class label alone

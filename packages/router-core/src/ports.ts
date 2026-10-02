@@ -123,6 +123,16 @@ export interface TextRequest {
    * `responseFinish` selector. Absent if the provider never emitted one.
    */
   onFinish?: (reason: string | undefined) => void;
+  /**
+   * The model's **reasoning**, as it streams — its own channel, never mixed into `chunks`.
+   *
+   * A caller that renders it gets to show the model's thinking; a caller that ignores it still
+   * gains, because the engine keeps its own copy and uses it to classify a turn that produced no
+   * answer. Without this the reasoning was discarded at the interpreter and a model whose thinking
+   * outran its output budget (measured: 8192 tokens of `thinking_delta`, zero `text_delta`) looked
+   * exactly like a provider that sent nothing. See `TextArgs.onReasoningDelta`.
+   */
+  onReasoning?: (text: string) => void;
 }
 
 /**

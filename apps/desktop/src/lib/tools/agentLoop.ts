@@ -109,6 +109,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           collected.push(call);
         },
         onFinish: opts.onFinish,
+        // Forwarded as its own event rather than appended to `text`: an agent turn's reasoning
+        // must not land in the transcript, where it would be replayed to the provider on the next
+        // round-trip as if the model had already said it.
+        onReasoning: (t) => onEvent?.({ type: "reasoning", text: t }),
       },
       { signal },
     );

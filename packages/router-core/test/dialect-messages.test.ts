@@ -165,6 +165,26 @@ describe("anthropic-compat: system hoist + role remap", () => {
     expect(finish).toBe("length");
   });
 
+  it("a caller's output budget overrides the manifest's, which is the lever for a reasoning model", async () => {
+    // `max_tokens` on this dialect covers the model's **reasoning and its answer together**, and
+    // the manifest's own `limits.maxOutputTokens` (8192) is a request-side default, not a property
+    // of the model. Measured 2026-10-02 against `agentrouter.org` (`deepseek-v4-flash`): at 8192 a
+    // hard prompt spent every token thinking and opened no text block at all (`stop_reason:
+    // max_tokens`, `output_tokens: 8192`, zero text); the same prompt at 64000 answered, having
+    // used 13211. So the caller's value MUST win — the composer's "max tokens" field is what makes
+    // such a model usable, and letting the manifest's default override it would silently put the
+    // working lever out of reach.
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, maxTokens: 32000 });
+    expect(lastBody()!.max_tokens).toBe(32000);
+
+    // And with no caller value the manifest's limit is what goes on the wire — the budget the
+    // truncation above happened at.
+    const bare = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(bare.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(bare.lastBody()!.max_tokens).toBe(8192);
+  });
+
   it("passes an unnamed reason through raw rather than dropping it", async () => {
     // A dialect that knows some of its reasons should still surface the rest — Anthropic has added
     // stop reasons before and will again, and an unrecognised word beats `undefined`.

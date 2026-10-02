@@ -10,6 +10,18 @@ export type ErrorClass =
   | "NOT_FOUND"
   | "BAD_REQUEST_SCHEMA"
   | "PARSE_ERROR"
+  /**
+   * The provider answered and composed nothing a caller could use — a 200 with no text and no tool
+   * call. Distinct from `PARSE_ERROR`, which is about a shape this router cannot read: here there
+   * is nothing to read, because the model never wrote an answer.
+   *
+   * The measured cause (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended thinking is
+   * on by default, `max_tokens` covers reasoning **and** answer, and the reasoning consumed the
+   * whole 8192-token budget, so the stream ended at `stop_reason: max_tokens` having opened no text
+   * block. Four such turns in 75 minutes, each ~40 s of waiting and an empty bubble, filed as a
+   * parse error against a manifest that was correct.
+   */
+  | "NO_OUTPUT"
   | "SERVER_ERROR"
   | "TIMEOUT"
   | "NETWORK"
@@ -17,7 +29,13 @@ export type ErrorClass =
   | "BILLING"
   | "OK";
 
-/** Errors that count toward provider drift (§2.10). */
+/**
+ * Errors that count toward provider drift (§2.10).
+ *
+ * `NO_OUTPUT` is deliberately absent. Drift is the provider failing to honour the shape it declared;
+ * a reasoning model that ran out of output budget is the provider honouring its contract exactly,
+ * and counting it would push a healthy provider toward repair for a request-side cause.
+ */
 export const DRIFT_CLASSES: ReadonlySet<ErrorClass> = new Set([
   "NOT_FOUND",
   "BAD_REQUEST_SCHEMA",
