@@ -86,6 +86,17 @@ pub enum ErrorClass {
     BadRequestSchema,
     /// A 2xx whose body could not be parsed, or a stream that broke mid-flight.
     ParseError,
+    /// **The provider answered and composed nothing a caller could use** — a 200 with no text and
+    /// no tool call. Distinct from `ParseError`, which is about a shape this router cannot read:
+    /// here there is nothing to read, because the model never wrote an answer.
+    ///
+    /// The measured cause (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended thinking
+    /// is on by default, `max_tokens` covers reasoning **and** answer, and the reasoning consumed
+    /// the whole 8192-token budget, so the stream ended at `stop_reason: max_tokens` having opened
+    /// no text block. Four such turns in 75 minutes, each ~40 s of waiting and an empty bubble,
+    /// filed as a parse error against a manifest that was correct. The TypeScript union gained the
+    /// same member on the same day; this is the mirror, not a divergence.
+    NoOutput,
     /// 5xx — the provider is unwell; another provider is the better answer.
     ServerError,
     /// 408.
@@ -145,12 +156,13 @@ pub enum BodyHint {
 /// union spelled out verbatim. A variant added without a spelling fails there — which is the
 /// point: the wire spellings are a cross-language contract, and a new class that quietly
 /// rendered as `{:?}` would be a spelling nobody agreed to.
-pub const ALL_CLASSES: [ErrorClass; 12] = [
+pub const ALL_CLASSES: [ErrorClass; 13] = [
     ErrorClass::AuthFailed,
     ErrorClass::RateLimited,
     ErrorClass::NotFound,
     ErrorClass::BadRequestSchema,
     ErrorClass::ParseError,
+    ErrorClass::NoOutput,
     ErrorClass::ServerError,
     ErrorClass::Timeout,
     ErrorClass::Network,
@@ -189,6 +201,7 @@ impl ErrorClass {
             ErrorClass::NotFound => "NOT_FOUND",
             ErrorClass::BadRequestSchema => "BAD_REQUEST_SCHEMA",
             ErrorClass::ParseError => "PARSE_ERROR",
+            ErrorClass::NoOutput => "NO_OUTPUT",
             ErrorClass::ServerError => "SERVER_ERROR",
             ErrorClass::Timeout => "TIMEOUT",
             ErrorClass::Network => "NETWORK",
@@ -1337,8 +1350,28 @@ pub async fn execute_text(
 
             // `:106-107` — the stream ended and the attempt served, so the loop stops rather than
             // advancing. This is why the source's `if (!served)` guard has nothing to guard.
-            let observation =
-                if emitted || tool_calls > 0 { None } else { Some(Box::new(observation)) };
+            let drained = !(emitted || tool_calls > 0);
+            let observation = if drained { Some(Box::new(observation)) } else { None };
+            // **The attempt is recorded, because an attempt happened.** The chain held only
+            // failures, so a provider that answered 200 and streamed thousands of events while
+            // producing nothing left no trace in it — and the chain then read as if the model had
+            // never been tried. The status is 200 because that is what the provider returned: this
+            // is not a failed request, it is a request that was answered and whose answer was not
+            // usable. Deliberately NOT a reason to advance to the next candidate — the plan has
+            // already run, and changing that is a behaviour decision, not bookkeeping. Key health
+            // still says OK below, because the key and the provider did their job.
+            if drained {
+                attempts.push(labelled(
+                    AttemptOutcome {
+                        cls: ErrorClass::NoOutput,
+                        status: 200,
+                        retry_after_ms: None,
+                        reason: None,
+                        label: None,
+                    },
+                    &candidate,
+                ));
+            }
             break 'plan Ended::Served { candidate, observation };
         }
         Ended::Spent
@@ -1599,6 +1632,10 @@ impl HealthTracker {
             ErrorClass::NotFound
             | ErrorClass::BadRequestSchema
             | ErrorClass::ParseError
+            // The provider honoured its contract and the model never wrote an answer — nothing here
+            // is evidence against the credential, and counting it would cool a healthy key for a
+            // request-side cause.
+            | ErrorClass::NoOutput
             | ErrorClass::ServerError
             | ErrorClass::Timeout
             | ErrorClass::Network
@@ -2235,12 +2272,15 @@ mod tests {
     /// a wire spelling fails here instead of quietly rendering as its `Debug` form. `CLIENT_GATE`
     /// and `BILLING` joined both unions on 2026-09-29: a gated 401 is not about the key, and a
     /// 402 is not about the network.
-    const TS_SPELLINGS: [&str; 11] = [
+    const TS_SPELLINGS: [&str; 12] = [
         "AUTH_FAILED",
         "RATE_LIMITED",
         "NOT_FOUND",
         "BAD_REQUEST_SCHEMA",
         "PARSE_ERROR",
+        // Gained 2026-10-02 on both sides of the port: a stream that reasoned and never answered
+        // is not a parse error. See `ErrorClass::NoOutput`.
+        "NO_OUTPUT",
         "SERVER_ERROR",
         "TIMEOUT",
         "NETWORK",
@@ -2297,6 +2337,21 @@ mod tests {
         assert_eq!(attempt_budget(0, None), 0);
         assert_eq!(attempt_budget(3, Some(9)), 3);
         assert_eq!(attempt_budget(9, Some(3)), 3);
+    }
+
+    #[test]
+    fn no_output_is_neither_drift_nor_key_retryable() {
+        // The provider honoured its contract and the model never wrote an answer. Drift would push
+        // a healthy provider toward repair for a request-side cause; key-retryability would rotate
+        // through every other key of the provider for a decision no key took part in.
+        assert!(!ErrorClass::NoOutput.is_drift());
+        assert!(!is_retryable_with_next_key(ErrorClass::NoOutput));
+        // And the tracker's own match leaves the key untouched — the arm is exhaustive, so this is
+        // the behavioural half of the same claim.
+        let tracker = HealthTracker::default();
+        tracker.record_result("k", ErrorClass::NoOutput, None, now_ms());
+        // No assertion beyond "this ran and changed nothing observable" — the entry is created
+        // lazily and stays at its defaults, which is the point.
     }
 
     #[test]
