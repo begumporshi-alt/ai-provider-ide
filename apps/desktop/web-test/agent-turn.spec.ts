@@ -13,6 +13,7 @@
  */
 import { expect, test } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -26,7 +27,9 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
 
   // The "tell the model it has no tools" toggle is disabled in agent mode by design — exercise it
   // off first to make sure the controls change, then flip on agent mode.
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Without a root the guard keeps Send disabled; fill it.
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
@@ -103,7 +106,9 @@ test("agent turn: a failed tool call shows the host's reason, not a blank result
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
@@ -139,7 +144,9 @@ test("agent turn: an unrecorded ending shows the status it was, not a closed ses
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
@@ -194,7 +201,9 @@ test("agent turn: a run that was never recorded is reported once, not once per w
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");

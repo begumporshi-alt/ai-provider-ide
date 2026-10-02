@@ -1194,6 +1194,11 @@ export async function deleteSession(sessionId: string): Promise<void> {
   return invoke("history_delete_session", { sessionId });
 }
 
+/** Highest node sequence already recorded for a session, so a resume can continue the sequence. */
+export async function historyMaxSeq(sessionId: string): Promise<number> {
+  return invoke<number>("history_max_seq", { sessionId });
+}
+
 /** Reconstruct a transcript from a session's timeline, preserving tool calls. */
 export async function resumeSession(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
   const timeline = await loadHistoryTimeline(sessionId);

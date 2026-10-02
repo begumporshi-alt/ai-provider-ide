@@ -452,7 +452,11 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
             "used" => tools_of.entry(from.as_str()).or_default().push(to.as_str()),
             "produced" => {
                 if let Some(n) = by_id.get(to.as_str()) {
-                    results_of.entry(from.as_str()).or_default().push(n.label.clone());
+                    // Prefer the full text stored in meta over the clipped label: artifact labels
+                    // are 80-character previews, but a resumed run replays the whole result.
+                    let text =
+                        meta_text(&n.meta, "text").unwrap_or_else(|| n.label.clone());
+                    results_of.entry(from.as_str()).or_default().push(text);
                 }
             }
             "recalled" => *recalled.entry(from.as_str()).or_insert(0) += 1,
@@ -467,10 +471,14 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
         }
         let role = meta_text(&n.meta, "role").unwrap_or_else(|| "assistant".to_string());
         let kind = if role == "user" { "user" } else { "assistant" };
+        // The label is a 120-character preview for the graph canvas; the full text the turn was
+        // recorded with lives in meta (`text`). Nodes written before that field existed fall back
+        // to the label — a preview is still better than nothing on old sessions.
+        let text = meta_text(&n.meta, "text").unwrap_or_else(|| n.label.clone());
         entries.push(TimelineEntry {
             kind: kind.to_string(),
             ts: n.ts,
-            text: n.label.clone(),
+            text,
             detail: None,
             model: meta_text(&n.meta, "model"),
             memories: *recalled.get(n.id.as_str()).unwrap_or(&0),
@@ -543,6 +551,29 @@ pub fn delete_session(store: &Store, session_id: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// The highest sequence number already used by this session's generated node ids.
+///
+/// Resuming a session continues it in place, so the recorder must start its sequence past what is
+/// already stored — restarting from 1 would generate ids that upsert over the session's existing
+/// nodes and silently rewrite its history. Explicit ids (`m-…` memories) carry no numeric tail and
+/// are correctly ignored.
+pub fn max_node_seq(store: &Store, session_id: &str) -> Result<i64, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare("SELECT id FROM context_nodes WHERE session_id = ?1")
+        .map_err(|e| e.to_string())?;
+    let ids: Vec<String> = stmt
+        .query_map(params![session_id], |row| row.get(0))
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(ids
+        .iter()
+        .filter_map(|id| id.rsplit(':').next().and_then(|tail| tail.parse::<i64>().ok()))
+        .max()
+        .unwrap_or(0))
+}
+
 #[cfg(test)]
 mod context_graph_tests {
     use super::*;
@@ -590,6 +621,33 @@ mod context_graph_tests {
         assert_eq!(g.nodes.len(), 2);
         assert_eq!(g.edges.len(), 1);
         assert_eq!(g.edges[0].kind, "produced");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn max_node_seq_skips_explicit_ids_and_reads_generated_tails() {
+        let (s, d) = temp_store("maxseq");
+        assert_eq!(max_node_seq(&s, "s-1").unwrap(), 0, "empty session: 0");
+
+        // Generated ids carry the numeric tail; memory nodes are explicit and tail-less.
+        let mut m1 = node("message:s-1:1", "message");
+        m1.session_id = Some("s-1".into());
+        let mut m7 = node("message:s-1:7", "message");
+        m7.session_id = Some("s-1".into());
+        let mut mem = node("m-L3-1a0b", "memory");
+        mem.session_id = Some("s-1".into());
+        // A node from ANOTHER session must not count toward this one.
+        let mut other = node("message:s-2:99", "message");
+        other.session_id = Some("s-2".into());
+        record(&s, &[m1, m7, mem, other], &[]).unwrap();
+
+        assert_eq!(max_node_seq(&s, "s-1").unwrap(), 7, "max numeric tail of this session's ids");
+        assert_eq!(max_node_seq(&s, "s-2").unwrap(), 99);
+        assert_eq!(
+            max_node_seq(&s, "s-3").unwrap(),
+            0,
+            "a session with only tail-less ids reads as empty"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

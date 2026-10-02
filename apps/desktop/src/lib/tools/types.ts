@@ -26,9 +26,18 @@ export interface ToolSpec {
   parameters: { properties: Record<string, unknown>; required?: string[] };
 }
 
-/** Execution boundary. `run` returns a result, never throws on model input. */
+/** Execution boundary. `run` returns a result, never throws on model input.
+ *
+ *  `opts.callId` is the model's tool-call id, carried so a running call can be stopped: the host
+ *  forwards it to the sandbox (which registers long `run_command` children for `tool_cancel`) and
+ *  fires the cancel itself when `opts.signal` aborts. Both are optional, so a plain call — a test,
+ *  a tool run outside a cancellable turn — keeps working unchanged. */
 export interface ToolHost {
-  run(name: string, args: Record<string, unknown>): Promise<{ ok: boolean; output: string }>;
+  run(
+    name: string,
+    args: Record<string, unknown>,
+    opts?: { callId?: string; signal?: AbortSignal },
+  ): Promise<{ ok: boolean; output: string }>;
 }
 
 /** The router facade's `generateText`, typed stand-alone so it can be faked in tests. */

@@ -132,6 +132,14 @@ pdf-extract = "0.12.1"
 # were not. Removed 2026-09-27: `grep -rIn 'objc2|NSProcessInfo|beginActivity|App Nap'` over this
 # crate returned zero hits outside Cargo.lock, where the crates are present transitively via Tauri
 # and therefore say nothing about a *direct* dependency.
+#
+# The one exception is unix-scoped, and it earns its place: `tool_cancel` stops a running
+# `run_command` child by signalling its PROCESS GROUP — std can place a child in its own group
+# (`CommandExt::process_group`) but has no `killpg`, and killing only the pid is what lets
+# `npm test` outlive Stop. Unix-only by nature: the Windows path keeps the timeout handler's
+# `Child::kill` and reports "nothing to cancel" from `tool_cancel`.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]

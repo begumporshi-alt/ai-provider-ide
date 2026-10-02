@@ -195,6 +195,12 @@ async function oracle(req, res, path) {
       // rendering spec asserts.
       toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "world", new: "there" }) };
       content = "";
+    } else if (tools && !sawToolResult && /long|slow/i.test(last)) {
+      // Agent mode, LONG-COMMAND variant: a run_command the spec holds open (see the shim's
+      // `holdTool`), so "Stop cancels the tool that is actually running" can be driven for real.
+      // `node` is allowlisted, so the call is one the real sandbox would accept too.
+      toolCall = { name: "run_command", arguments: JSON.stringify({ program: "node", args: ["-e", "setTimeout(() => {}, 60000)"] }) };
+      content = "";
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.

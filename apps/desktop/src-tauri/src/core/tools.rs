@@ -24,14 +24,15 @@
 //! directory the user pointed it at) is the risk the user accepted by enabling agent mode,
 //! and every call is confirmed in the UI before it reaches this file.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +111,10 @@ const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 const MAX_READ_BYTES: usize = 256 * 1024;
 const MAX_WRITE_BYTES: usize = 1024 * 1024;
 const MAX_LIST_ENTRIES: usize = 500;
+/// How long a cancelled command gets to exit on SIGINT before SIGKILL follows. Two seconds is the
+/// conventional grace: long enough for a test runner to flush and exit cleanly, short enough that
+/// a user who pressed Stop does not experience it as a hang.
+const CANCEL_GRACE_MS: u64 = 2_000;
 /// Bounds for the read-only discovery tools. Each exists because the alternative is a model
 /// asking for the whole workspace and getting a wall of text it cannot use — or worse, one that
 /// blows past the 64KB output cap and comes back truncated mid-line.
@@ -659,7 +664,112 @@ fn do_mkdir(args: &serde_json::Value, root: &Path) -> ToolResult {
     }
 }
 
+/// One running `run_command` child, as the cancel path needs to see it: the pid to signal and a
+/// flag the runner reads after the wait to learn that the exit was a cancellation, not a result.
+struct RunningChild {
+    pid: u32,
+    canceled: Arc<AtomicBool>,
+}
+
+/// Children currently running, keyed by the model's tool-call id.
+///
+/// A process-global because the id is what both ends have: the agent loop knows the call it
+/// issued, `tool_cancel` arrives from the UI with only that id in hand, and the runner thread that
+/// owns the `Child` is not reachable from either. Only `run_command` registers — it is the only
+/// tool that can run for minutes, and the only one where "the step in flight" is a real process
+/// tree. The other tools are bounded by their own timeouts.
+fn running_children() -> &'static Mutex<HashMap<String, RunningChild>> {
+    static CELL: OnceLock<Mutex<HashMap<String, RunningChild>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Signal a whole process group. The child is spawned as its own group leader
+/// (`process_group(0)`), so `-pid` reaches every descendant — `npm` AND the `node` running the
+/// tests under it. Signalling only the pid is the classic half-fix: the wrapper dies, the work
+/// keeps running, and Stop looks broken while the machine stays busy.
+#[cfg(unix)]
+fn signal_group(pid: u32, sig: libc::c_int) {
+    // SAFETY: `kill` with a negative pid is `killpg` on the caller's own child group; the worst
+    // case is ESRCH (already dead), which is exactly the state this call is trying to reach.
+    unsafe {
+        libc::kill(-(pid as libc::pid_t), sig);
+    }
+}
+
+/// Removes a child's registration when the runner leaves scope, however it leaves — success,
+/// timeout, error or panic-free early return. A stale entry would make every later cancel of the
+/// same id "succeed" against a process that no longer exists, and would keep the escalation
+/// watchdog signalling a pid that the OS may have recycled.
+struct CancelRegistration(Option<String>);
+
+impl Drop for CancelRegistration {
+    fn drop(&mut self) {
+        if let Some(id) = self.0.take() {
+            if let Ok(mut map) = running_children().lock() {
+                map.remove(&id);
+            }
+        }
+    }
+}
+
+/// Stop a running tool call. Returns whether a child was actually running under that id, so the
+/// caller can tell "stopped it" from "it had already finished" — the same distinction
+/// `stopRun` makes for runs, and the same reason: a stop that did nothing must not read as one
+/// that did.
+///
+/// Signal escalation, the POSIX convention every terminal uses: SIGINT first (a well-behaved
+/// program flushes and exits), then SIGKILL after [`CANCEL_GRACE_MS`] if the registration is
+/// still present. The runner treats a canceled exit as `stopped by you` rather than as the
+/// command's output — a half-finished `git commit` must never be fed back to the model as a
+/// result it can build on.
+pub fn tool_cancel(call_id: &str) -> Result<bool, String> {
+    let pid = {
+        let mut map = running_children().lock().map_err(|e| e.to_string())?;
+        match map.get_mut(call_id) {
+            Some(child) => {
+                // The flag is set before any signal is sent, so there is no window where the
+                // process has exited from the signal but the runner reads the flag as unset.
+                child.canceled.store(true, Ordering::SeqCst);
+                child.pid
+            }
+            None => return Ok(false),
+        }
+    };
+    #[cfg(unix)]
+    {
+        signal_group(pid, libc::SIGINT);
+        let id = call_id.to_string();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(CANCEL_GRACE_MS));
+            // Presence in the map means the runner has not returned yet — that is the liveness
+            // test. (Checking the pid directly would race reaping and possible pid reuse.)
+            let still_running = running_children()
+                .lock()
+                .map(|map| map.contains_key(&id))
+                .unwrap_or(false);
+            if still_running {
+                signal_group(pid, libc::SIGKILL);
+            }
+        });
+    }
+    Ok(true)
+}
+
+/// The uncancellable form, kept for the tests (and for callers that have no tool-call id): every
+/// production path goes through `tool_run_with_call`, which supplies one when the Assistant has it.
+#[cfg(test)]
 fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
+    do_run_command_with(args, root, None)
+}
+
+/// `call_id` is the model's tool-call id when the caller has one (the Assistant does; the
+/// gateway and direct calls do not). With an id, the child is registered for cancellation; without
+/// one it simply runs to completion or timeout, exactly as before.
+fn do_run_command_with(
+    args: &serde_json::Value,
+    root: &Path,
+    call_id: Option<&str>,
+) -> ToolResult {
     match (|| -> Result<String, String> {
         let program = arg_str(args, "program")?;
         if !allowed_programs().contains(program.as_str()) {
@@ -726,7 +836,29 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
             .env("LANG", "C.UTF-8");
 
+        // Own process group, so a cancel (or a timeout) can signal the whole tree rather than the
+        // first pid. Without this the group is inherited from the app, and `killpg` would signal
+        // the app itself.
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt as _;
+            cmd.process_group(0);
+        }
+
         let mut child = cmd.spawn().map_err(|e| format!("cannot start \"{program}\": {e}"))?;
+        let child_pid = child.id();
+        // Registered before the pipes are read, so a cancel that arrives while the command is
+        // still starting up finds it. The guard removes the entry on every exit from here on.
+        let canceled = Arc::new(AtomicBool::new(false));
+        let _registration = CancelRegistration(call_id.map(|id| {
+            if let Ok(mut map) = running_children().lock() {
+                map.insert(
+                    id.to_string(),
+                    RunningChild { pid: child_pid, canceled: canceled.clone() },
+                );
+            }
+            id.to_string()
+        }));
         // `std` has no wait-with-timeout that also captures output, so the child is parked in
         // a worker thread that reads both pipes to EOF and then waits; on timeout the caller
         // kills it through the shared lock. `kill`/`wait` both take `&mut self`, so the child
@@ -760,13 +892,27 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             Ok(Ok(triple)) => triple,
             Ok(Err(e)) => return Err(format!("command failed: {e}")),
             Err(_) => {
-                // Timed out: kill, then drain the worker's result so the thread exits.
+                // Timed out: kill the GROUP, not just the pid — the same orphan problem the cancel
+                // path solves. A `pnpm` wrapper that dies leaves `node` running otherwise, and the
+                // worker thread's read-to-EOF never returns, so the drain below would hang out the
+                // whole grace window and then give up on a process that is still alive.
+                #[cfg(unix)]
+                signal_group(child_pid, libc::SIGKILL);
+                // Windows has no group signal here; the direct kill is what it has always had.
                 let _ = child.lock().unwrap().kill();
                 let _ =
                     rx.recv_timeout(Duration::from_millis(MAX_COMMAND_MS.saturating_add(5_000)));
                 return Err(format!("\"{program}\" timed out after {timeout_ms}ms and was killed"));
             }
         };
+
+        // A cancelled run's exit code is meaningless — the process was killed, and whatever it
+        // had printed is a fragment. Report the user's action, never the fragment: the loop turns
+        // this into the tool result the model reads back, and "stopped by you" is the truth that
+        // stops it from treating a half-finished command as a completed one.
+        if canceled.load(Ordering::SeqCst) {
+            return Err("stopped by you".to_string());
+        }
 
         let mut text = String::new();
         text.push_str(&truncate(&captured_out, MAX_OUTPUT_BYTES));
@@ -1548,6 +1694,17 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchFile>, String> {
 
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
+    tool_run_with_call(req, None)
+}
+
+/// The same, with the model's tool-call id when the caller has one.
+///
+/// A separate argument rather than a field on `ToolRunRequest`: the id is a property of *this
+/// invocation* (who is asking, so it can be stopped), not of the request the model composed, and
+/// every existing constructor — the gateway bridge, the agent tests, the direct-call tests — stays
+/// exactly as it was. With an id, a `run_command` child registers for cancellation; without one
+/// it runs to completion or timeout, as before.
+pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolResult {
     let root = match validate_root(Path::new(&req.root)) {
         Ok(c) => c,
         Err(e) => return ToolResult::err(e),
@@ -1565,7 +1722,7 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "list_dir" => do_list_dir(&args, &root),
         "search_files" => do_search_files(&args, &root),
         "file_info" => do_file_info(&args, &root),
-        "run_command" => do_run_command(&args, &root),
+        "run_command" => do_run_command_with(&args, &root, call_id),
         "todo_write" => do_todo_write(&args),
         "web_fetch" => do_web_fetch(&args),
         "web_search" => do_web_search(&args),
@@ -2180,6 +2337,58 @@ diff --git a/a.txt b/a.txt
             do_run_command(&serde_json::json!({ "program": "cat", "args": ["hello.txt"] }), &dir);
         assert!(res.ok, "a relative path inside the root must still work: {:?}", res.error);
         assert!(res.output.contains("inside-the-root"), "got: {}", res.output);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_running_command_can_be_cancelled_and_reports_stopped_by_you() {
+        // The gap this closes: Stop flipped the abort flag, but a `run_command` in flight kept
+        // running to its 20 s default timeout, so the button looked broken while the machine
+        // stayed busy. `tail -f` is the honest worst case the fix is for — an allowlisted program
+        // that runs until told to stop, with no output to wait on.
+        let dir = root();
+        fs::write(dir.join("empty.log"), "").unwrap();
+        let id = format!("call-{}", std::process::id());
+        let started = std::time::Instant::now();
+        let handle = {
+            let dir = dir.clone();
+            let id = id.clone();
+            std::thread::spawn(move || {
+                do_run_command_with(
+                    &serde_json::json!({
+                        "program": "tail",
+                        "args": ["-f", "empty.log"],
+                        "timeout_ms": 60_000,
+                    }),
+                    &dir,
+                    Some(&id),
+                )
+            })
+        };
+        // The runner registers the child from its own thread; wait for that before cancelling,
+        // exactly as a user's Stop is a moment after the call appears on screen.
+        let mut registered = false;
+        for _ in 0..300 {
+            if running_children().lock().unwrap().contains_key(&id) {
+                registered = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(registered, "the running child must be registered under its tool-call id");
+
+        assert!(tool_cancel(&id).unwrap(), "cancel must find and signal the registered child");
+        let res = handle.join().unwrap();
+        let elapsed = started.elapsed();
+
+        assert!(!res.ok, "a cancelled command is not a success");
+        assert_eq!(res.error.as_deref(), Some("stopped by you"), "the reason is the user's action");
+        // Well under the 60 s timeout the child was given: this measures cancellation, not the
+        // timeout path dressed up as one.
+        assert!(elapsed < Duration::from_secs(10), "cancel must be prompt, took {elapsed:?}");
+        // And the registration is gone, so a second Stop is honestly "nothing running".
+        assert!(!running_children().lock().unwrap().contains_key(&id));
+        assert!(!tool_cancel(&id).unwrap(), "nothing is running under that id any more");
     }
 
     #[test]

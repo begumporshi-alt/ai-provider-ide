@@ -17,12 +17,16 @@ interface UiState {
   tick: number;
   /** One-shot Connect-form prefill for the auto-setup wizard (e.g. "re-run setup against a new URL"). */
   onboardingPrefill?: OnboardingPrefill;
-  /** One-shot session transcript to seed the Assistant with on navigation (from History → Assistant). */
-  resumeTranscript?: ResumeMsg[];
+  /**
+   * One-shot "continue this session in the Assistant" request (from History → Assistant). The id,
+   * not the transcript: the Assistant fetches the turns itself and adopts the session in place —
+   * its recorder and session bar have to agree on the identity, and only it owns that machinery.
+   */
+  resumeSessionId?: string;
   go: (s: ScreenId) => void;
   bump: () => void;
   setOnboardingPrefill: (p?: OnboardingPrefill) => void;
-  setResumeTranscript: (m?: ResumeMsg[]) => void;
+  setResumeSessionId: (sid?: string) => void;
 }
 
 export type ResumeMsg = {
@@ -81,8 +85,8 @@ interface UiState {
   tick: number;
   /** One-shot Connect-form prefill for the auto-setup wizard (e.g. "re-run setup against a new URL"). */
   onboardingPrefill?: OnboardingPrefill;
-  /** One-shot session transcript to seed the Assistant with on navigation (from History → Assistant). */
-  resumeTranscript?: ResumeMsg[];
+  /** One-shot "continue this session in the Assistant" request; see `resumeSessionId`. */
+  resumeSessionId?: string;
   /** The unclaimed one-shot request, if any; see `UiIntent`. */
   pendingIntent?: { kind: UiIntent; nonce: number };
   /**
@@ -112,7 +116,7 @@ interface UiState {
   go: (s: ScreenId) => void;
   bump: () => void;
   setOnboardingPrefill: (p?: OnboardingPrefill) => void;
-  setResumeTranscript: (m?: ResumeMsg[]) => void;
+  setResumeSessionId: (sid?: string) => void;
   fire: (k: UiIntent) => void;
   setOverlay: (o: OverlayKind | null) => void;
   setAssistantBusy: (b: boolean) => void;
@@ -128,7 +132,7 @@ export const useUi = create<UiState>((set) => ({
   go: (screen) => set({ screen }),
   bump: () => set((s) => ({ tick: s.tick + 1 })),
   setOnboardingPrefill: (onboardingPrefill) => set({ onboardingPrefill }),
-  setResumeTranscript: (resumeTranscript) => set({ resumeTranscript }),
+  setResumeSessionId: (resumeSessionId) => set({ resumeSessionId }),
   consumeIntent: () => set({ pendingIntent: undefined }),
   // The nonce is not read by anything today: the kind is what the consumer matches on. It is there
   // so that two `fire`s in a row are distinguishable in a trace, which is the only way to tell

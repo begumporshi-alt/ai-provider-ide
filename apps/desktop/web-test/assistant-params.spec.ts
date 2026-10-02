@@ -21,6 +21,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -64,7 +65,9 @@ async function openAssistant(page: Page): Promise<void> {
   // distillation issues a SECOND model call after the turn — so with memory on, "the last
   // chat-completions body" and the ledger totals both depend on a background request that races
   // the assertions. Every test here is about one deliberate request, so the second one is noise.
+  await openRunConfig(page);
   await page.getByLabel("memory").uncheck();
+  await closeRunConfig(page);
   await selectModel(page);
 }
 
@@ -170,7 +173,9 @@ test("the session readout accumulates the ledger's tokens and cost", async ({ pa
 test("an unpriced model reports its cost as unknown, not as free", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await openRunConfig(page);
   await page.getByLabel("memory").uncheck();
+  await closeRunConfig(page);
   // `oracle-flash` is the seed's deliberately unpriced model: same window, no `pricing_json`.
   await pickModel(page, /oracle-flash/);
 

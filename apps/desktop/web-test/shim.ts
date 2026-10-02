@@ -226,6 +226,19 @@ const failNext = new Map<string, string>();
  * A deferred failure is what puts the older rejection *last*, where only the guard can suppress it.
  */
 const failDelay = new Map<string, number>();
+/**
+ * A tool call the harness will hold OPEN, so a spec can exercise Stop while a tool is really
+ * running. `tool_run` for that name answers only when the hold elapses or a `tool_cancel` for the
+ * call arrives — whichever first.
+ *
+ * This is the one arrangement under which mid-tool cancellation is observable in a browser spec
+ * at all: the shim's tools otherwise return in microseconds, so Stop can never land while one is
+ * in flight, and a test of "stopping cancels the running tool" would silently be a test of
+ * nothing.
+ */
+const heldTools = new Map<string, { ms: number; output: string }>();
+/** Release handles for held calls, keyed by the model's tool-call id. */
+const pendingTools = new Map<string, () => void>();
 /** Mirrors the Rust defaults (GatewayCore::new): tools on, gateway-side mutation off (audit H1b). */
 const toolsState = { enabled: true, mutationEnabled: false };
 /**
@@ -626,6 +639,14 @@ let eventSeq = 0;
   /** What a gateway tool run answers — see `toolRunResult` above. */
   toolRunResult: (next: Partial<typeof toolRunResult>): void => {
     Object.assign(toolRunResult, next);
+  },
+  /**
+   * Hold the next `tool_run` for `name` open for `ms`, so a spec can click Stop while a tool is
+   * genuinely in flight. Released by `tool_cancel` (→ "stopped by you") or by the timer (→ the
+   * given output). One-shot, like `failNext`.
+   */
+  holdTool: (name: string, ms: number, output = "(held command finished)"): void => {
+    heldTools.set(name, { ms, output });
   },
   /** Whether the client's config file is there (the Models screen greys itself out if not). */
   workbuddy: (next: Partial<typeof workbuddy>): void => {
@@ -1114,6 +1135,20 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       else sessionTitles.delete(sid);
       return null;
     }
+    case "history_max_seq": {
+      // The host reads the max numeric tail of this session's generated node ids; the emulation
+      // parses the same tail so a resumed session's recorder starts past what is stored instead
+      // of upserting over it.
+      const sid = String(args.session_id ?? "");
+      let max = 0;
+      for (const n of contextNodes) {
+        if (String(n.session_id ?? "") !== sid) continue;
+        const tail = String(n.id ?? "").split(":").pop() ?? "";
+        const num = Number(tail);
+        if (Number.isFinite(num) && num > max) max = num;
+      }
+      return max;
+    }
     case "history_delete_session": {
       const sid = String(args.session_id ?? "");
       if (!sid) throw new Error("history_delete_session: missing session_id");
@@ -1154,8 +1189,14 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         } else if (e.kind === "produced") {
           const target = byId.get(to);
           if (target) {
+            let targetMeta: Record<string, unknown> = {};
+            try {
+              targetMeta = JSON.parse(String(target.meta_json ?? "{}")) as Record<string, unknown>;
+            } catch {
+              targetMeta = {};
+            }
             const arr = resultsOf.get(from) ?? [];
-            arr.push(String(target.label ?? ""));
+            arr.push(typeof targetMeta.text === "string" ? targetMeta.text : String(target.label ?? ""));
             resultsOf.set(from, arr);
           }
         } else if (e.kind === "recalled") {
@@ -1175,7 +1216,9 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         entries.push({
           kind: meta.role === "user" ? "user" : "assistant",
           ts: Number(n.ts ?? 0),
-          text: String(n.label ?? ""),
+          // Full text from meta when present — the label is the 120-character graph preview. Old
+          // nodes without the field fall back to the label, matching the host.
+          text: typeof meta.text === "string" ? meta.text : String(n.label ?? ""),
           detail: null,
           model: typeof meta.model === "string" ? meta.model : null,
           memories: recalled.get(id) ?? 0,
@@ -1269,6 +1312,24 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return TOOLS_POLICY;
     case "tools_default_root":
       return DEFAULT_WORKSPACE_ROOT;
+    case "tool_cancel": {
+      // The real host signals the child's process group; here, releasing the held call IS the
+      // process dying. `false` for an unknown id mirrors the Rust return: nothing was running.
+      const callId = String(args.call_id ?? "");
+      const release = pendingTools.get(callId);
+      if (!release) return false;
+      release();
+      return true;
+    }
+    case "vault_has":
+      // The webview only ever asks about the websearch key tier; the shim has no vault, so no.
+      return false;
+    case "git_summary":
+      // The capsule's read-only workspace report. The virtual FS is not a git repository, so the
+      // honest answer is the not-a-repo shape the component already renders as "no repo".
+      return { isRepo: false, branch: "", ahead: 0, behind: 0, insertions: 0, deletions: 0, files: [] };
+    case "git_commit_push":
+      throw new Error("git_commit_push: the web-test sandbox has no repository to commit to");
     case "tools_check_root": {
       // Mirrors tools.rs::validate_root closely enough for the UI: absolute, not the filesystem
       // root, not a system directory. The shim has no real filesystem, so it judges the string —
@@ -1306,6 +1367,28 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const { name, arguments: toolArgs } = req;
       const ok = (output: string): { ok: boolean; output: string } => ({ ok: true, output });
       const fail = (error: string): { ok: boolean; output: string; error: string } => ({ ok: false, output: "", error });
+
+      // A held call (see `heldTools`): stay in flight until the timer or a `tool_cancel`. This is
+      // what makes "Stop mid-tool" observable — the shim's normal tools return instantly, so the
+      // click could never land while one was running.
+      const hold = heldTools.get(name);
+      if (hold) {
+        heldTools.delete(name);
+        const callId = String(args.call_id ?? "");
+        return await new Promise((resolve) => {
+          const settle = (canceled: boolean) => {
+            pendingTools.delete(callId);
+            resolve(canceled ? fail("stopped by you") : ok(hold.output));
+          };
+          const timer = setTimeout(() => settle(false), hold.ms);
+          if (callId) {
+            pendingTools.set(callId, () => {
+              clearTimeout(timer);
+              settle(true);
+            });
+          }
+        });
+      }
 
       if (name === "list_dir") {
         const p = String(toolArgs["path"] ?? ".");

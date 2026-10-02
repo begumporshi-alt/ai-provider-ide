@@ -28,9 +28,11 @@ export interface Recorder {
 class BufferedRecorder implements Recorder {
   private nodes: HostContextNode[] = [];
   private edges: HostContextEdge[] = [];
-  private seq = 0;
+  private seq: number;
 
-  constructor(readonly sessionId: string) {}
+  constructor(readonly sessionId: string, startSeq = 0) {
+    this.seq = startSeq;
+  }
 
   private nextId(kind: ContextNodeKind): string {
     this.seq += 1;
@@ -85,9 +87,13 @@ class BufferedRecorder implements Recorder {
 
 let current: Recorder | null = null;
 
-/** One recorder per session; a new session resets the sequence so ids stay stable per turn. */
-export function startSession(sessionId = `s-${Date.now()}`): Recorder {
-  current = new BufferedRecorder(sessionId);
+/**
+ * One recorder per session. `startSeq` continues an existing session's id sequence — a resumed
+ * session adopts its own id in place, and its new nodes must sort (and upsert) past every node
+ * already stored, never over them. The host's `history_max_seq` supplies the number.
+ */
+export function startSession(sessionId = `s-${Date.now()}`, startSeq = 0): Recorder {
+  current = new BufferedRecorder(sessionId, startSeq);
   return current;
 }
 

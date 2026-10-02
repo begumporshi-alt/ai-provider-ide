@@ -29,7 +29,6 @@ import {
   loadHistoryTimeline,
   setSessionTitle,
   deleteSession,
-  resumeSession,
   type HistorySession,
   type HistoryTimeline,
   type TimelineEntry,
@@ -147,13 +146,10 @@ export function HistoryScreen() {
   }
 
   async function continueInAssistant(sid: string) {
-    try {
-      const msgs = await resumeSession(sid);
-      useUi.getState().setResumeTranscript(msgs);
-      useUi.getState().go("assistant");
-    } catch (e: unknown) {
-      setError(String(e));
-    }
+    // The id, not a pre-fetched transcript: the Assistant owns session adoption (it must point its
+    // recorder and session bar at the same session), so it fetches the turns itself.
+    useUi.getState().setResumeSessionId(sid);
+    useUi.getState().go("assistant");
   }
 
   async function removeSession(sid: string) {

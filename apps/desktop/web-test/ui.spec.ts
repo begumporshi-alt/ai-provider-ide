@@ -10,6 +10,7 @@
 import { expect, test, type Page } from "@playwright/test";
 import { EXOTIC_BASE, EXOTIC_KEY, MOCK_ORIGIN, ORACLE_BASE, ORACLE_KEY } from "./seeds";
 import { pickModel, pickerButton } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -436,7 +437,9 @@ test("assistant: agent mode refuses to send without a workspace root", async ({ 
   // Flip agent mode on. The root is now filled in for you — the host's default workspace — so a
   // fresh screen is usable instead of dead on arrival. Root setup lives in its own tab; Send's
   // guard is read back on the Chat tab.
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   await page.getByRole("button", { name: "Root", exact: true }).click();
   const rootBox = page.getByPlaceholder(/absolute\/path/);
   await expect(rootBox).toHaveValue(/AI-Provider-Router-Workspace/);
@@ -455,35 +458,39 @@ test("assistant: agent mode refuses to send without a workspace root", async ({ 
 });
 
 // ---------------------------------------------------------------------------
-// Story 12 — The screen's behaviour switches live under the title.
+// Story 12 — The screen's behaviour switches live in the run-configuration panel.
 // They are not per-request choices: the model picker decides where one message goes, these
-// decide how the screen behaves for everything after. Sitting them in the picker's row buried a
-// screen-level setting among request-level controls, and put them inside `Chat` — which
-// unmounts on a tab switch — so the tab switch silently reset them.
+// decide how the screen behaves for everything after. Five inline controls crowded the composer
+// row, so they now sit in one panel behind a sliders icon beside "Add context" — still outside
+// `Chat`, which unmounts on a tab switch, so the tab switch still cannot reset them.
 // ---------------------------------------------------------------------------
 
-test("assistant: agent mode, memory and the no-tools switch sit under the title", async ({ page }) => {
+test("assistant: the behaviour switches live in the run-configuration panel", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
   const title = page.getByRole("heading", { name: "Assistant" });
+  const picker = pickerButton(page);
+
+  // Closed until asked: the composer row shows one icon, not five controls.
+  await expect(page.getByRole("dialog", { name: "Run configuration" })).toHaveCount(0);
+
+  await openRunConfig(page);
+  const panel = page.getByRole("dialog", { name: "Run configuration" });
   const agent = page.getByLabel("agent mode");
   const memory = page.getByLabel("memory");
   const noTools = page.getByLabel("tell the model it has no tools");
-  const picker = pickerButton(page);
 
   await expect(agent).toBeVisible();
   await expect(memory).toBeVisible();
   await expect(noTools).toBeVisible();
 
   const t = await title.boundingBox();
-  const a = await agent.boundingBox();
+  const d = await panel.boundingBox();
   const p = await picker.boundingBox();
-  // Both under the title, inside the Run configuration card: the mock lays the card out as
-  // labelled columns — Model & Provider, then the screen-level switches beside it — so the old
-  // "switches above the picker" geometry no longer holds. What must still hold is that neither
-  // control floats above the screen's heading.
-  expect(a!.y).toBeGreaterThan(t!.y);
+  // The panel opens upward from the composer row, so it stays below the screen's heading; the
+  // model picker (the composer's top-right corner) does too.
+  expect(d!.y).toBeGreaterThan(t!.y);
   expect(p!.y).toBeGreaterThan(t!.y);
 });
 
@@ -497,8 +504,10 @@ test("assistant: the switches and the workspace root survive a reload", async ({
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
   await page.getByLabel("memory").uncheck();
+  await closeRunConfig(page);
   // Root setup lives in its own tab.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp/persisted-workspace");
@@ -510,8 +519,10 @@ test("assistant: the switches and the workspace root survive a reload", async ({
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
+  await openRunConfig(page);
   await expect(page.getByLabel("agent mode")).toBeChecked();
   await expect(page.getByLabel("memory")).not.toBeChecked();
+  await closeRunConfig(page);
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await expect(page.getByPlaceholder(/absolute\/path/)).toHaveValue("/tmp/persisted-workspace");
 });
@@ -521,6 +532,9 @@ test("assistant: the tool-step budget is a setting, and a value past the cap is 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
   const budget = page.getByLabel("tool steps");
+
+  // The budget lives in the run-configuration panel now, next to the switches it belongs to.
+  await openRunConfig(page);
 
   // Without agent mode there is no loop to step through, so the field is not offered — a budget
   // you can set but that does nothing is worse than one that is greyed out.
@@ -550,5 +564,6 @@ test("assistant: the tool-step budget is a setting, and a value past the cap is 
   await page.waitForTimeout(700);
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await openRunConfig(page);
   await expect(page.getByLabel("tool steps")).toHaveValue("12");
 });

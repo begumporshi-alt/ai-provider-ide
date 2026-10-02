@@ -46,9 +46,22 @@ pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
 }
 
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
+///
+/// `call_id` is the model's tool-call id, sent by the Assistant so the call can be stopped
+/// mid-flight; absent for a gateway call, which has no Stop button to serve.
 #[tauri::command]
-pub fn tool_run(req: ToolRunRequest) -> ToolResult {
-    crate::core::tools::tool_run(req)
+pub fn tool_run(req: ToolRunRequest, call_id: Option<String>) -> ToolResult {
+    crate::core::tools::tool_run_with_call(req, call_id.as_deref())
+}
+
+/// Stop a tool call that is still running — the Stop button's mid-flight path.
+///
+/// Returns whether a child was actually running under that id: `false` means it had already
+/// finished, which the UI can report honestly rather than as a stop that happened. Only
+/// `run_command` registers for cancellation; every other tool is bounded by its own timeout.
+#[tauri::command]
+pub fn tool_cancel(call_id: String) -> Result<bool, String> {
+    crate::core::tools::tool_cancel(&call_id)
 }
 
 /// The workspace's git state for the Assistant's git capsule.

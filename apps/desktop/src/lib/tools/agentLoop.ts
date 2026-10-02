@@ -175,7 +175,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               resultText = 'web_ask needs a "url" and a "question".';
               ok = false;
             } else {
-              const page = await host.run("web_fetch", { url: pageUrl });
+              const page = await host.run("web_fetch", { url: pageUrl }, { signal });
               if (!page.ok) {
                 resultText = `could not fetch the page: ${page.output}`;
                 ok = false;
@@ -205,7 +205,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               }
             }
           } else {
-            const r = await host.run(name, args);
+            // `call.id` and the run's signal travel together: the id lets the sandbox register a
+            // long `run_command` for cancellation, and the signal is what fires the cancel when
+            // the user hits Stop mid-tool. Without both, Stop could only take effect at the next
+            // tool boundary — which for a 60-second command is exactly the "stop doesn't work"
+            // complaint this path exists to answer.
+            const r = await host.run(name, args, { callId: call.id, signal });
             resultText = r.output;
             ok = r.ok;
             // Belt and braces: `ToolHost` is an interface, and a host that reports a failure with

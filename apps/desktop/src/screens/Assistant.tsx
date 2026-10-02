@@ -13,6 +13,7 @@ import {
   router,
   loadHistorySessions,
   resumeSession,
+  historyMaxSeq,
   setSessionTitle as saveSessionTitle,
   type HistorySession,
 } from "../store";
@@ -280,7 +281,10 @@ function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[
   for (const m of produced) {
     const content = typeof m.content === "string" ? m.content : "";
     if (m.role === "tool") {
-      const artifact = rec.node("artifact", clip(content, 80), { tool_call_id: m.tool_call_id });
+      // `text` carries the full result beside the clipped label: the timeline (and therefore
+      // resume) rebuilds content from it, and an 80-character label would truncate every tool
+      // result a resumed session replays.
+      const artifact = rec.node("artifact", clip(content, 80), { tool_call_id: m.tool_call_id, text: content });
       const skill = m.tool_call_id ? skillByCall.get(m.tool_call_id) : undefined;
       rec.edge(skill ?? prev, artifact, "produced");
       continue;
@@ -293,6 +297,9 @@ function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[
     const node = rec.node("message", clip(content, 120), {
       role: m.role,
       model,
+      // Full text beside the clipped label — the label is for the graph canvas, `text` is what
+      // a resume rebuilds the conversation from.
+      text: content,
       tool_calls: calls.length ? calls : undefined,
     });
     rec.edge(prev, node, "follows");
@@ -339,45 +346,46 @@ interface Trace {
 }
 
 /**
- * One of the screen's behavioural switches — agent mode, memory, the no-tools guard.
- *
- * These sit under the title rather than beside the model picker because they are not
- * per-request choices: the picker changes what this one message is sent to, these change how the
- * screen behaves for everything after. Grouping them with the picker buried a screen-level
- * setting among request-level controls.
+ * One switch row inside the run-configuration panel: setting name on the left, pill switch on
+ * the right. The accessible name is always the full setting name — the same names the inline
+ * controls used to carry — so the specs and screen readers keep matching them; `displayLabel`
+ * only shortens the visible text.
  */
-function OptionCheck({
+function RunSwitchRow({
   label,
   displayLabel,
   checked,
   onChange,
   disabled,
+  note,
 }: {
-  /** The accessible name — always the full, unambiguous setting name. */
   label: string;
-  /** Shorter visible text for tight rows; when set, `label` moves to aria-label so specs and
-      screen readers keep matching the full name. */
   displayLabel?: string;
   checked: boolean;
   onChange: (v: boolean) => void;
   disabled?: boolean;
+  /** One line under the name — usually why the row is disabled. */
+  note?: string;
 }) {
   return (
-    // A real checkbox painted as a pill switch (`.switch` in index.css): the platform semantics —
-    // keyboard space-toggle, the "checkbox" role, the specs' `.check()` — all keep working. The
-    // bordered pill wraps label + switch so the pairing is unambiguous in a row of toggles: the
-    // switch inside a pill belongs to that pill's label, never to its neighbour's.
     <label
-      className={`flex items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
-      style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+      className={`flex items-center justify-between gap-3 rounded px-2 py-1.5 text-[12px] ${disabled ? "opacity-50" : "cursor-pointer"}`}
+      style={{ color: "var(--text)" }}
     >
-      {displayLabel ?? label}
+      <span className="min-w-0">
+        <span className="block truncate">{displayLabel ?? label}</span>
+        {note && (
+          <span className="block text-[10px]" style={{ color: "var(--text-faint)" }}>
+            {note}
+          </span>
+        )}
+      </span>
       <input
         type="checkbox"
-        className="switch"
+        className="switch shrink-0"
         checked={checked}
         disabled={disabled}
-        aria-label={displayLabel ? label : undefined}
+        aria-label={label}
         onChange={(e) => onChange(e.target.checked)}
       />
     </label>
@@ -415,9 +423,9 @@ function StepBudget({
   };
 
   return (
-    // The run toolbar's step budget: an inline chip beside the mode toggles. The accessible name
-    // stays "tool steps" (aria-label wins over the label's visible text), so the spec that fills
-    // this field keeps matching.
+    // The run-configuration panel's step budget, under the agent switches it belongs to. The
+    // accessible name stays "tool steps" (aria-label wins over the label's visible text), so the
+    // spec that fills this field keeps matching.
     <label
       className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
       style={{ color: "var(--text-dim)" }}
@@ -650,6 +658,8 @@ interface AssistantSettings {
    * Absent = keyless search, the default.
    */
   searchProvider?: "brave" | "tavily" | null;
+  /** The chosen text model as a qualified id (`slug/native`). Empty/absent = the store default. */
+  model?: string;
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
@@ -696,6 +706,9 @@ export function AssistantScreen() {
   // P7: memory is on by default but switchable. Recalling and distilling on every turn changes
   // what the model sees and costs a second call, so it has to be possible to turn it off.
   const [useMemory, setUseMemory] = useState(true);
+  // Whether the run-configuration panel (the sliders icon beside "Add context") is open. The five
+  // behaviour switches it holds keep their state above `Chat` — only the door lives here.
+  const [runConfigOpen, setRunConfigOpen] = useState(false);
   // The tool-step ceiling. It is a setting rather than a constant because it is the one knob
   // that trades cost against thoroughness per run: a one-shot question wants 1, a real refactor
   // across a repo doesn't finish in 8.
@@ -771,6 +784,9 @@ export function AssistantScreen() {
       // "ask every time" — a silent downgrade the user could not see.
       if (APPROVAL_MODES.some((m) => m.id === stored.approvalMode)) setApprovalMode(stored.approvalMode!);
       if (stored.searchProvider === "brave" || stored.searchProvider === "tavily") setSearchProvider(stored.searchProvider);
+      // A model choice survives a remount like every other setting — without this, coming back to
+      // the screen reset the picker and Send sat disabled until the user re-picked.
+      if (typeof stored.model === "string") setModel(stored.model);
       void invoke("vault_has", { account: "websearch" })
         .then((has) => setHasSearchKey(Boolean(has)))
         .catch(() => undefined);
@@ -788,6 +804,9 @@ export function AssistantScreen() {
   const saveAll = useCallback(
     () => saveAssistantSettings({
       root, agentMode, useMemory, noTools, maxIterations, approvalMode,
+      // Always written, empty string included: a model the picker cleared has to overwrite the
+      // stored one, not vanish from the row.
+      model,
       // `null`, never `undefined`, for an unset field. `JSON.stringify` omits an undefined key, so
       // an omitted one leaves the previously stored value in the row — clearing "max tokens" would
       // look like it worked and then quietly come back on the next load.
@@ -800,7 +819,7 @@ export function AssistantScreen() {
       // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
       searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
-    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, temperature, maxTokens,
+    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
       customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider],
   );
 
@@ -812,13 +831,14 @@ export function AssistantScreen() {
   const latestSave = useRef(saveAll);
   latestSave.current = saveAll;
 
-  // Persist. The switches are single clicks, so they are written immediately.
+  // Persist. The switches are single clicks, so they are written immediately — and so is the
+  // model pick, which is what makes it survive a remount.
   useEffect(() => {
     if (!hydrated) return;
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, temperature, maxTokens,
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
       customSystemPrompt, customNoToolsSystem, customAgentSystem]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
@@ -857,25 +877,97 @@ export function AssistantScreen() {
   const textDef = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.text ?? "";
   const chosenText = model || textDef;
 
-  // The run toolbar (user's layout): the mode toggles share the composer's action row, beside
-  // "Add context". The model picker left the row for the composer's top-right corner (see
-  // `modelCorner`), and the step budget moved to the title row — an agent-only knob does not
-  // deserve a permanent seat next to the send button. Built here because every control is this
-  // component's state; `Chat` only gives them a seat in the row.
+  // The run toolbar (user's layout): one sliders icon beside "Add context" opens the
+  // run-configuration panel — agent mode, memory, approval, plan mode, the no-tools guard and the
+  // step budget in one place — instead of five inline controls crowding the composer row. Every
+  // control is this component's state; `Chat` only gives the panel its seat in the row. The icon
+  // carries the state at a glance: accent while agent mode is on, a dot whenever anything differs
+  // from its default — hiding the switches must not hide their effect.
+  const runConfigDirty =
+    agentMode || planMode || !useMemory || !noTools || approvalMode !== "ask" || maxIterations !== DEFAULT_MAX_ITERATIONS;
   const runToolbar = (
-    <>
-      <OptionCheck label="Agent mode" checked={agentMode} onChange={setAgentMode} />
-      <OptionCheck label="Memory" checked={useMemory} onChange={setUseMemory} />
-      <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
-      <OptionCheck label="Plan mode" checked={planMode} onChange={setPlanMode} disabled={!agentMode} />
-      <OptionCheck
-        label="tell the model it has no tools"
-        displayLabel="no tools"
-        checked={noTools}
-        onChange={setNoTools}
-        disabled={agentMode}
-      />
-    </>
+    <div className="relative shrink-0">
+      <button
+        type="button"
+        aria-label="Run configuration"
+        aria-expanded={runConfigOpen}
+        onClick={() => setRunConfigOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-lg border px-2 py-1 transition-colors"
+        style={{
+          borderColor: agentMode || runConfigOpen ? "var(--accent)" : "var(--border)",
+          color: agentMode ? "var(--accent)" : "var(--text-dim)",
+        }}
+        title="Agent mode, memory, approval, plan mode, tools and steps for this run"
+      >
+        <svg
+          viewBox="0 0 24 24"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="1.7"
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          className="h-3.5 w-3.5"
+          aria-hidden="true"
+        >
+          <path d="M4 7h9M17.5 7H20M4 12h1.5M10 12h10M4 17h9M17.5 17H20" />
+          <circle cx="15" cy="7" r="2.2" />
+          <circle cx="7.5" cy="12" r="2.2" />
+          <circle cx="15" cy="17" r="2.2" />
+        </svg>
+        {/* aria-hidden: the dot is decoration — the state it signals is read from the panel. */}
+        {runConfigDirty && <span aria-hidden="true" className="h-1 w-1 rounded-full" style={{ background: "var(--accent)" }} />}
+      </button>
+      {runConfigOpen && (
+        <>
+          {/* The outside-click catcher. The composer sits at the screen's bottom, so the panel
+              opens UPWARD from the row — a downward dropdown would be clipped. */}
+          <div data-testid="run-config-overlay" className="fixed inset-0 z-40" onClick={() => setRunConfigOpen(false)} />
+          <div
+            role="dialog"
+            aria-label="Run configuration"
+            className="absolute bottom-full left-0 z-50 mb-1.5 w-80 rounded-lg border p-1.5 shadow-lg"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            onKeyDown={(e) => {
+              if (e.key === "Escape") setRunConfigOpen(false);
+            }}
+          >
+            <RunSwitchRow label="Agent mode" checked={agentMode} onChange={setAgentMode} />
+            <RunSwitchRow label="Memory" checked={useMemory} onChange={setUseMemory} />
+            <div className="px-2 py-1.5">
+              <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
+              {agentMode && planMode && (
+                // The pairing is the whole reason this appears: plan mode subtracts permissions
+                // and never grants them, so a plan pass that reads without being clicked through
+                // needs the mode above it to say so. Living next to the approval select it names,
+                // not as a stray line above the transcript.
+                <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
+                  Plan mode refuses every write, whatever the approval mode. Pair it with “auto-approve reads”
+                  for a pass that explores without asking.
+                </p>
+              )}
+            </div>
+            <RunSwitchRow
+              label="Plan mode"
+              checked={planMode}
+              onChange={setPlanMode}
+              disabled={!agentMode}
+              note={agentMode ? undefined : "agent mode only"}
+            />
+            <RunSwitchRow
+              label="tell the model it has no tools"
+              displayLabel="no tools"
+              checked={noTools}
+              onChange={setNoTools}
+              disabled={agentMode}
+              note={agentMode ? "agent mode provides the tools" : undefined}
+            />
+            <div className="mt-1 border-t px-2 pt-2" style={{ borderColor: "var(--border)" }}>
+              <StepBudget value={maxIterations} onChange={setMaxIterations} disabled={!agentMode} />
+            </div>
+          </div>
+        </>
+      )}
+    </div>
   );
   const modelCorner = (
     <ModelPicker modality="text" value={chosenText} onChange={setModel} openNonce={pickerNonce} />
@@ -908,7 +1000,6 @@ export function AssistantScreen() {
             <span className="max-w-[180px] truncate">{root.split("/").filter(Boolean).pop() ?? root}</span>
           </button>
         ) : null}
-        <StepBudget value={maxIterations} onChange={setMaxIterations} disabled={!agentMode} />
         <div className="ml-auto flex gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
           {(["text", "image", "root"] as const).map((t) => (
             <button
@@ -922,16 +1013,6 @@ export function AssistantScreen() {
           ))}
         </div>
       </div>
-      {agentMode && planMode && (
-        // The pairing is the whole reason this appears: plan mode subtracts permissions and never
-        // grants them, so a plan pass that reads without being clicked through needs the mode
-        // above it to say so. Without this line the user gets asked about every read and reads
-        // that as plan mode being broken.
-        <p className="-mt-1.5 mb-2 text-[11px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
-          Plan mode refuses every write, whatever the approval mode. Pair it with “auto-approve reads”
-          for a pass that explores without asking.
-        </p>
-      )}
       {/* No `key={tick}` here. Keying on the tick remounted Chat on every store bump, which
           wiped the conversation mid-session — a settings save took the transcript with it.
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
@@ -1457,11 +1538,10 @@ function Chat({
   // (`model` lives in `AssistantScreen` now — see the note on the `chosen` prop — so the Run
   // configuration card and this transcript cannot disagree about where a turn goes.)
   const [msgs, setMsgs] = useState<Msg[]>(() => {
-    const resume = useUi.getState().resumeTranscript;
-    if (resume) {
-      useUi.getState().setResumeTranscript(undefined);
-      return withIds(resume as Omit<Msg, "id">[]);
-    }
+    // Cross-screen resume used to be seeded here as a raw transcript, while the recorder quietly
+    // kept pointing at whichever session was open before — the on-screen turns and the recorded
+    // session disagreed. The resume is now a session id (see `resumeSessionId`); the mount effect
+    // below adopts it through the same path as the session chip.
     return [];
   });
   // Per-message interaction state. `copiedId` is keyed by message id (not text) so two identical
@@ -1502,6 +1582,9 @@ function Chat({
   const [streamedText, setStreamedText] = useState("");
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
+  // Tokens this agent run has spent so far — every model call in the loop reports, and the live
+  // status line sums them. `lastUsage` stays the single-request readout the meter's tooltip uses.
+  const [runUsage, setRunUsage] = useState<{ tokensIn: number; tokensOut: number }>({ tokensIn: 0, tokensOut: 0 });
   // `unpricedRows`/`rows` are the honesty inputs for the cost figure: a total that silently skips
   // the requests whose model published no price is a number the user cannot tell apart from a
   // complete one, and this app treats "unknown" and "free" as different facts everywhere else.
@@ -1513,6 +1596,16 @@ function Chat({
   const [sessionTokensIn, setSessionTokensIn] = useState(0);
   const [sessionTokensOut, setSessionTokensOut] = useState(0);
   const abortRef = useRef<AbortController | null>(null);
+  // True from the moment Stop is clicked until the run actually unwinds. With the sandbox's
+  // `tool_cancel` in place the gap is short — a running command is signalled SIGINT (then
+  // SIGKILL) and the stream aborts immediately — but it is not zero, and naming it is what keeps
+  // the click from ever feeling ignored.
+  const [stopping, setStopping] = useState(false);
+  const stopRun = useCallback(() => {
+    if (!abortRef.current) return;
+    setStopping(true);
+    abortRef.current.abort();
+  }, []);
   const listRef = useRef<HTMLDivElement>(null);
   // P4: the context graph is recorded as the conversation happens. `activeSession` rather than
   // `startSession` so any remount — switching tabs, for one — reuses the open session instead of
@@ -1636,7 +1729,7 @@ function Chat({
   const keyActions = useRef<{ newChat: () => void; stop: () => void; busy: boolean }>({
     newChat, stop: () => undefined, busy,
   });
-  keyActions.current = { newChat, stop: () => abortRef.current?.abort(), busy };
+  keyActions.current = { newChat, stop: stopRun, busy };
   useEffect(() => {
     if (!active) return;
     const onKey = (e: KeyboardEvent) => {
@@ -1757,7 +1850,37 @@ function Chat({
       // they chose for a reason.
       if (verdict.action === "allow") return { allow: true };
       if (verdict.action === "deny") return { allow: false, reason: verdict.reason };
-      const choice = await new Promise<ApprovalChoice>((resolve) => setPendingConfirm({ call, args, resolve }));
+      const choice = await new Promise<ApprovalChoice & { reason?: string }>((resolve) => {
+        // Stop must work while the gate is up. The loop parks on this promise, and an abort fired
+        // while it parks used to go nowhere: the controller's flag flipped, but nothing resolved
+        // the promise, so the run stayed "busy" until the modal was answered and Stop read as
+        // broken. Racing the current run's signal resolves it as a deny — the call is not run,
+        // the modal closes, and the next loop boundary throws the AbortError the catch already
+        // turns into "stopped by you".
+        const sig = abortRef.current?.signal;
+        let onAbort: (() => void) | null = null;
+        const denyForStop = () => {
+          if (onAbort && sig) sig.removeEventListener("abort", onAbort);
+          setPendingConfirm(null);
+          resolve({ allow: false, scope: "once", reason: "stopped by you — this call was not run" });
+        };
+        if (sig) {
+          if (sig.aborted) {
+            denyForStop();
+            return;
+          }
+          onAbort = denyForStop;
+          sig.addEventListener("abort", onAbort, { once: true });
+        }
+        setPendingConfirm({
+          call,
+          args,
+          resolve: (c) => {
+            if (onAbort && sig) sig.removeEventListener("abort", onAbort);
+            resolve(c);
+          },
+        });
+      });
       if (choice.allow && choice.scope !== "once") {
         // Applied to the ref **and** to state. State is what the render reads; the ref is what the
         // very next call of this same run reads, and `setGranted` is not applied until React
@@ -1769,7 +1892,9 @@ function Chat({
         approvalRef.current = next;
         setGranted({ trustedTools: next.trustedTools, allowAll: next.allowAll });
       }
-      return { allow: choice.allow };
+      // A deny that Stop caused carries its own wording: the model must not read "the user denied
+      // this" out of a run the user cancelled, and the transcript step should say which happened.
+      return choice.reason ? { allow: choice.allow, reason: choice.reason } : { allow: choice.allow };
     },
     [],
   );
@@ -1870,11 +1995,13 @@ function Chat({
         setMsgs(baseMsgs);
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
+        setStopping(false);
         abortRef.current = null;
         return;
       }
       setStreamedText("");
       setAgentItems([]);
+      setRunUsage({ tokensIn: 0, tokensOut: 0 });
       // The previous run's review is about to be superseded — and leaving it up while a new run
       // writes the same files would offer a revert that restores a state two runs old.
       setRunChanges(null);
@@ -1894,7 +2021,7 @@ function Chat({
       // edges need an anchor before the run starts. Same shape as the plain-chat branch below:
       // one node per turn, reused by everything that needs to point at it.
       const rec = ctxRef.current!;
-      const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen });
+      const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen, text: trimmed });
       if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
       // P7: recall before the run so the agent starts from what is already known. Awaited,
       // because the recalled block has to be in the system prompt before the first call.
@@ -1927,6 +2054,12 @@ function Chat({
                 onUsage: (u) => {
                   req.onUsage?.(u);
                   setLastUsage(u);
+                  // Summed, not replaced: an agent turn is several model calls, and the live
+                  // status line shows what the whole run has spent so far.
+                  setRunUsage((r) => ({
+                    tokensIn: r.tokensIn + (u.prompt_tokens ?? 0),
+                    tokensOut: r.tokensOut + (u.completion_tokens ?? 0),
+                  }));
                 },
               },
               { ...opts, summarize: createSummarizer(chosen) },
@@ -1969,8 +2102,18 @@ function Chat({
           distilTurn(ctxRef.current!.sessionId, chosen),
         ).catch(() => { /* memory distillation is best-effort */ });
       }
-      endRun(runId, "ok", iterationsRef.current);
-        setTrace({ ms: Date.now() - t0, fallbacks: [], provider: "agent" });
+      // An abort mid-stream with no tool calls yet returns from the loop normally (the chunk loop
+      // just breaks), so the success path — not only the catch — must distinguish a stopped run.
+      // The trace said `✓` for a turn the user had cancelled, same lie the plain-chat path
+      // already stopped telling (it marks "stopped by you" in its own trace).
+      const stopped = ac.signal.aborted;
+      endRun(runId, stopped ? "stopped" : "ok", iterationsRef.current);
+        setTrace({
+          ms: Date.now() - t0,
+          fallbacks: [],
+          provider: "agent",
+          ...(stopped ? { error: "stopped by you" } : {}),
+        });
       } catch (e) {
         // The turn's own bubble, not only the trace line. A failed agent run left an empty
         // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
@@ -1994,6 +2137,7 @@ function Chat({
         void ctxRef.current!.flush();
         runIdRef.current = null;
         setBusy(false);
+        setStopping(false);
         setPendingConfirm(null);
         setAgentItems([]);
         setStreamedText("");
@@ -2011,7 +2155,7 @@ function Chat({
 
     // ---- Plain chat (no tools): stream and render as before. ----
     const rec = ctxRef.current!;
-    const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen });
+    const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen, text: trimmed });
     if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
     // P7: recall before answering. Awaited, because the block has to be in the request.
     const recalled = useMemory ? await recallContext(trimmed) : [];
@@ -2063,6 +2207,7 @@ function Chat({
         role: "assistant",
         model: served?.model.nativeId ?? chosen,
         provider: served?.provider.id,
+        text: streamed,
       });
       rec.edge(userNode, assistantNode, "follows");
       lastNodeRef.current = assistantNode;
@@ -2101,6 +2246,7 @@ function Chat({
         ).catch(() => { /* memory distillation is best-effort */ });
       }
       setBusy(false);
+      setStopping(false);
       abortRef.current = null;
       // The ledger row for this turn is already written (the sink append is awaited inside the
       // router's wrapped stream, before the `for await` above returns), so re-reading now shows
@@ -2251,6 +2397,43 @@ function Chat({
     setSessionTitle(mine?.title ?? "");
   }, [sessions, sessionId, renaming]);
 
+  // A remount used to keep recording into the open session while showing an empty transcript —
+  // the chip said "that conversation", the pane said nothing. Switching screens unmounts this
+  // component (App.tsx renders one screen at a time), so on the way back in, the open session's
+  // stored turns are re-read exactly the way a resume rebuilds them. Once per mount, and only
+  // when the stored session actually has turns — a brand-new session restores nothing.
+  const restoredOnMount = useRef(false);
+  useEffect(() => {
+    if (restoredOnMount.current) return;
+    restoredOnMount.current = true;
+    // A "Continue in Assistant" handed over from History wins: adopt that session (recorder,
+    // session id, stored turns) instead of restoring the singleton's own.
+    const intent = useUi.getState().resumeSessionId;
+    useUi.getState().setResumeSessionId(undefined);
+    if (intent) {
+      void (async () => {
+        try {
+          const [resumed, seq] = await Promise.all([resumeSession(intent), historyMaxSeq(intent)]);
+          const rec = startSession(intent, seq);
+          ctxRef.current = rec;
+          lastNodeRef.current = null;
+          setSessionId(rec.sessionId);
+          setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+        } catch {
+          return; // same policy as openSession: an unreadable session is not an error wall
+        }
+      })();
+      return;
+    }
+    const sid = ctxRef.current!.sessionId;
+    void resumeSession(sid)
+      .then((resumed) => {
+        if (resumed.length > 0) setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+      })
+      .catch(() => undefined);
+    // Mount only: afterwards the transcript is owned by the turn runner and the session actions.
+  }, []);
+
   /**
    * Start a fresh conversation. The recorder is replaced, not merely cleared, so the new turns are
    * recorded under a new session id — otherwise the abandoned thread would keep growing.
@@ -2271,41 +2454,52 @@ function Chat({
     setEditDraft("");
     setSessionTitle("");
     setSwitcherOpen(false);
-    useUi.getState().setResumeTranscript(undefined);
+    useUi.getState().setResumeSessionId(undefined);
   }
 
   /**
-   * Resume a past session. Its transcript is seeded for context, but the recorder starts *fresh*:
-   * reusing the old id would restart the node sequence from 1 and upsert over that session's
-   * existing nodes. Same semantics as History's "Continue in Assistant".
+   * Resume a past session — by continuing it in place, not forking.
+   *
+   * The recorder previously started under a NEW session id, because reusing the old id would
+   * restart the node sequence from 1 and upsert over that session's existing nodes. The collision
+   * was real, but forking was the wrong cure: every visit to an old session manufactured a
+   * same-named duplicate, and History filled up with empty shells. The recorder now seeds its
+   * sequence past what the session already has stored (`history_max_seq`), so the session id —
+   * and the user's mental model of "I am back in that conversation" — survives intact. An explicit
+   * fork ("⑂ fork" on a message) remains available where a split is actually wanted.
    */
   async function openSession(sid: string) {
     if (busy) return;
     setSwitcherOpen(false);
+    if (sid === sessionId) return;
     let resumed: Awaited<ReturnType<typeof resumeSession>>;
+    let seq = 0;
     try {
       resumed = await resumeSession(sid);
+      seq = await historyMaxSeq(sid);
     } catch {
       return; // an unreadable session is not worth an error wall; leave the transcript as it was
     }
-    const rec = startSession();
+    const rec = startSession(sid, seq);
     ctxRef.current = rec;
     lastNodeRef.current = null;
-    setSessionId(rec.sessionId);
+    setSessionId(sid);
     setMsgs(withIds(resumed as Omit<Msg, "id">[]));
     setTrace(null);
     setFinishReason(undefined);
     setEditingId(null);
-    // Carry the resumed thread's name into the bar, so it is clear WHICH conversation was opened.
-    // The recorder is still a new session, so this label is deliberately transient: editing it
-    // writes a title for the continuation.
-    titleLoadedFor.current = rec.sessionId;
+    // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
+    // stamped so the async list refresh cannot adopt a stale value over it.
+    titleLoadedFor.current = sid;
     setSessionTitle(sessions.find((s) => s.session_id === sid)?.title ?? "");
   }
 
   function commitTitle() {
     const t = titleDraft.trim();
     setRenaming(false);
+    // The panel only existed to reach the rename field; the name is settled, so close it and let
+    // the chip carry the new title alone.
+    setSwitcherOpen(false);
     // Mark this session as adopted BEFORE the list refreshes, so the loading effect cannot adopt
     // the still-stale (pre-rename) value and undo what the user just typed.
     titleLoadedFor.current = sessionId;
@@ -2396,91 +2590,113 @@ function Chat({
   // title row. Their state stays here on purpose: a session is its transcript — New/reset,
   // resume, and the per-session title are all operations on `msgs` and `sessionId`, which only
   // this component owns.
+  //
+  // One control, one concept: the chip names the conversation you are in, and opening it is the
+  // single place where renaming, starting fresh, and resuming an old one happen — three actions
+  // about the same thing (which conversation is this?) should not be three separate affordances
+  // in the chrome.
   const sessionControls = (
-    <>
-      {renaming ? (
-        <input
-          autoFocus
-          value={titleDraft}
-          onChange={(e) => setTitleDraft(e.target.value)}
-          onBlur={commitTitle}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") commitTitle();
-            if (e.key === "Escape") setRenaming(false);
-          }}
-          placeholder="name this session…"
-          aria-label="Session title"
-          className="min-w-0 flex-1 rounded border px-2 py-0.5 text-[12px]"
-          style={inputStyle}
-        />
-      ) : (
-        <button
-          type="button"
-          className="nav-item min-w-0 flex-1 truncate rounded-md px-1 py-0.5 text-left text-[15px] font-semibold tracking-tight"
-          style={{ color: sessionTitle ? "var(--text)" : "var(--text-faint)" }}
-          onClick={() => {
-            setTitleDraft(sessionTitle);
-            setRenaming(true);
-          }}
-          title="Click to name this session"
-        >
-          {sessionTitle || "untitled session — click to name it"}
-          {/* aria-hidden: the glyph is decoration, and the specs click this button by its exact
-              accessible name — a named "✎" would break `exact: true` matching. */}
-          <span className="ml-1.5 text-[12px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
-            ✎
-          </span>
-        </button>
-      )}
-      <div className="relative shrink-0">
-        <Button
-          variant="ghost"
-          ariaLabel="Switch session"
-          onClick={() => {
-            refreshSessions();
-            setSwitcherOpen((v) => !v);
-          }}
-        >
-          Sessions ▾
-        </Button>
-        {switcherOpen && (
-          <>
-            <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
-            <div
-              className="absolute right-0 top-8 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
-              style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
-              role="menu"
-              aria-label="Recent sessions"
+    <div className="relative min-w-0 flex-1">
+      <button
+        type="button"
+        className="nav-item flex w-full min-w-0 items-center gap-1 truncate rounded-md px-1 py-0.5 text-left text-[15px] font-semibold tracking-tight"
+        style={{ color: sessionTitle ? "var(--text)" : "var(--text-faint)" }}
+        aria-haspopup="menu"
+        aria-expanded={switcherOpen}
+        onClick={() => {
+          refreshSessions();
+          setSwitcherOpen((v) => !v);
+        }}
+        title="Open this session’s name, a new session, or a previous one"
+      >
+        <span className="min-w-0 flex-1 truncate">{sessionTitle || "untitled session"}</span>
+        {/* aria-hidden: the chevron is decoration — the chip is identified by the session name
+            itself, which is what the specs and screen readers key on. */}
+        <span className="shrink-0 text-[11px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
+          ▾
+        </span>
+      </button>
+      {switcherOpen && (
+        <>
+          <div className="fixed inset-0 z-40" onClick={() => setSwitcherOpen(false)} />
+          <div
+            className="absolute left-0 top-9 z-50 max-h-80 w-72 overflow-y-auto rounded border p-1 shadow-lg"
+            style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
+            role="menu"
+            aria-label="Session actions"
+          >
+            {renaming ? (
+              <input
+                autoFocus
+                value={titleDraft}
+                onChange={(e) => setTitleDraft(e.target.value)}
+                onBlur={commitTitle}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") commitTitle();
+                  if (e.key === "Escape") setRenaming(false);
+                }}
+                placeholder="name this session…"
+                aria-label="Session title"
+                className="mb-1 w-full rounded border px-2 py-1 text-[12px]"
+                style={inputStyle}
+              />
+            ) : (
+              <button
+                type="button"
+                aria-label="Rename session"
+                className="mb-1 block w-full truncate rounded px-2 py-1.5 text-left text-[13px] font-medium transition-opacity hover:opacity-80"
+                style={{ color: "var(--text-dim)" }}
+                onClick={() => {
+                  setTitleDraft(sessionTitle);
+                  setRenaming(true);
+                }}
+                title="Name this session"
+              >
+                {sessionTitle || "name this session…"}
+                {/* aria-hidden: the glyph is decoration — this row is reached as "Rename session",
+                    and a named "✎" would make its accessible name ambiguous. */}
+                <span className="ml-1 text-[11px] font-normal" style={{ color: "var(--text-faint)" }} aria-hidden="true">
+                  ✎
+                </span>
+              </button>
+            )}
+            <button
+              type="button"
+              role="menuitem"
+              disabled={busy}
+              className="block w-full rounded px-2 py-1.5 text-left text-[12px] font-medium transition-opacity hover:opacity-80 disabled:opacity-50"
+              style={{ color: "var(--accent)" }}
+              onClick={newChat}
+              title="Start a new chat"
             >
-              {sessions.length === 0 ? (
-                <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-                  No sessions recorded yet — this one appears once a turn is sent.
-                </p>
-              ) : (
-                sessions.map((s) => (
-                  <button
-                    key={s.session_id}
-                    role="menuitem"
-                    className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
-                    style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
-                    onClick={() => void openSession(s.session_id)}
-                    title={s.title || s.preview}
-                  >
-                    <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
-                    <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
-                      {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
-                    </span>
-                  </button>
-                ))
-              )}
-            </div>
-          </>
-        )}
-      </div>
-      <Button variant="ghost" onClick={newChat} disabled={busy} ariaLabel="Start a new chat">
-        ＋ New
-      </Button>
-    </>
+              ＋ New session
+            </button>
+            <div className="my-1 border-t" style={{ borderColor: "var(--border)" }} />
+            {sessions.length === 0 ? (
+              <p className="px-2 py-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+                No sessions recorded yet — this one appears once a turn is sent.
+              </p>
+            ) : (
+              sessions.map((s) => (
+                <button
+                  key={s.session_id}
+                  role="menuitem"
+                  className="block w-full rounded px-2 py-1.5 text-left text-[12px] transition-opacity hover:opacity-80"
+                  style={{ color: s.session_id === sessionId ? "var(--accent)" : "var(--text-dim)" }}
+                  onClick={() => void openSession(s.session_id)}
+                  title={s.title || s.preview}
+                >
+                  <span className="block truncate">{s.title || s.preview || "(no text)"}</span>
+                  <span className="text-[10px]" style={{ color: "var(--text-faint)" }}>
+                    {new Date(s.started_ts).toLocaleString()} · {s.turns} turns
+                  </span>
+                </button>
+              ))
+            )}
+          </div>
+        </>
+      )}
+    </div>
   );
 
   return (
@@ -2609,7 +2825,13 @@ function Chat({
               <ToolResultBubble content={m.content} call={m.tool_call_id ? callById.get(m.tool_call_id) : undefined} />
             ) : m.role === "assistant" ? (
               agentMode && i === msgs.length - 1 && busy ? (
-                <AgentLive raw={streamedText} items={agentItems} />
+                <AgentLive
+                  raw={streamedText}
+                  items={agentItems}
+                  waiting={pendingConfirm?.call.name ?? null}
+                  stopping={stopping}
+                  usage={runUsage}
+                />
               ) : (
                 // A turn that only requested tools has no prose of its own. Rendering the
                 // empty-content placeholder there is what left a bare "…" under a tool call —
@@ -2759,7 +2981,7 @@ function Chat({
           vision={chosenVision}
           modelLabel={chosen || "the current model"}
           onSend={send}
-          onStop={() => abortRef.current?.abort()}
+          onStop={stopRun}
           onClear={newChat}
           onOpenModelPicker={onOpenModelPicker}
           onSwitchToImageTab={onSwitchToImageTab}
@@ -3123,8 +3345,88 @@ function ToolResultBubble({ content, call }: { content: string; call?: ToolCallR
   );
 }
 
-/** Live view of an in-flight agent turn: streamed text plus this turn's calls, grouped as they run. */
-function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
+/**
+ * The live status line (2026-10-02).
+ *
+ * Replaces the bare "…" an in-flight turn showed while nothing had streamed yet — the three dots
+ * the user could not read anything from. One line, two ends: the left says what the run is doing
+ * right now (waiting on you / stopping / running a named tool / thinking), the right carries the
+ * live-only metrics — elapsed time, tokens the run has spent so far, and the stop hint. They
+ * vanish when the turn ends because this component unmounts with it, which is the point: the
+ * metrics describe the run, not the transcript.
+ *
+ * No progress bar and no percentage: the loop has no known denominator, and every other coding
+ * agent that tried one (Cursor, Copilot, Cline, Claude Code) settled on exactly this verb +
+ * metrics line instead.
+ */
+function AgentStatus({
+  items,
+  waiting,
+  stopping,
+  usage,
+}: {
+  items: AgentItem[];
+  waiting: string | null;
+  stopping: boolean;
+  usage: { tokensIn: number; tokensOut: number };
+}) {
+  const [elapsed, setElapsed] = useState(0);
+  useEffect(() => {
+    const t = window.setInterval(() => setElapsed((s) => s + 1), 1000);
+    return () => window.clearInterval(t);
+  }, []);
+  // The call in flight, if any — it is the one a "is it hung?" glance is really about, so it is
+  // the one the status line names. Elapsed for it comes for free: the last "calling" item started
+  // when the tool_call event arrived, and the timer above started when the run did.
+  const running = items.length > 0 && items[items.length - 1]!.status === "calling" ? items[items.length - 1]! : null;
+  const summary = running ? argSummary(running.args) : "";
+  return (
+    <div className="mono flex flex-wrap items-baseline gap-x-2 text-[11px]" data-testid="agent-status">
+      {/* role="status" so the activity change is announced — but it sits on this span only, never
+          on the metrics, which re-render every second and would flood a live region. */}
+      <span role="status" style={{ color: waiting ? "var(--warn)" : "var(--info)" }}>
+        {waiting
+          ? `Waiting for you — ${waiting} needs approval`
+          : stopping
+            ? "Stopping — cancelling the step in flight"
+            : running
+              ? `Running ${running.name}`
+              : "Thinking…"}
+      </span>
+      {running && summary && (
+        <span className="truncate" style={{ color: "var(--text-faint)" }}>{summary}</span>
+      )}
+      <span className="ml-auto whitespace-nowrap" style={{ color: "var(--text-faint)" }}>
+        {formatElapsed(elapsed)}
+        {usage.tokensOut > 0 ? ` · ↑ ${formatTokens(usage.tokensOut)} tokens` : ""}
+        {/* While the approval modal is up, Escape belongs to the modal (deny), not to stop. */}
+        {!waiting && " · Esc to stop"}
+      </span>
+    </div>
+  );
+}
+
+/** Compact elapsed clock for the status line: "47s", then "1m 42s" past the minute. */
+function formatElapsed(s: number): string {
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return m > 0 ? `${m}m ${String(r).padStart(2, "0")}s` : `${r}s`;
+}
+
+/** Live view of an in-flight agent turn: the status line, streamed text plus this turn's calls, grouped as they run. */
+function AgentLive({
+  raw,
+  items,
+  waiting,
+  stopping,
+  usage,
+}: {
+  raw: string;
+  items: AgentItem[];
+  waiting: string | null;
+  stopping: boolean;
+  usage: { tokensIn: number; tokensOut: number };
+}) {
   // The same card the finished turn will render, so a run does not change shape the moment it
   // ends — the live view simply knows each call's status and the transcript does not.
   const steps: UIStep[] = items.map((it) => ({
@@ -3136,7 +3438,8 @@ function AgentLive({ raw, items }: { raw: string; items: AgentItem[] }) {
   }));
   return (
     <>
-      <Markdown source={raw || "…"} />
+      <AgentStatus items={items} waiting={waiting} stopping={stopping} usage={usage} />
+      {raw.trim() ? <Markdown source={raw} /> : null}
       {steps.length > 0 && <ToolRunGroup steps={steps} live />}
     </>
   );

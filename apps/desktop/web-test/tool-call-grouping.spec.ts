@@ -18,6 +18,7 @@
  */
 import { expect, test } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -29,7 +30,9 @@ test("tool calls: one grouped card per turn, the tool's name on it, and a wider 
 
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");

@@ -26,10 +26,36 @@ export interface ToolsPolicy {
 /** Build a `ToolHost` bound to one workspace root. Every call is confined to that root. */
 export function createTauriToolHost(root: string): ToolHost {
   return {
-    async run(name, args) {
-      const res = await invoke<WireToolResult>("tool_run", {
+    async run(name, args, opts) {
+      const callId = opts?.callId;
+      const signal = opts?.signal;
+      // Aborted before the call even went out: report it, do not start work the user just
+      // cancelled. (The loop checks its own signal at the same boundary; this is the host's own
+      // guarantee for a caller that does not.)
+      if (signal?.aborted) return { ok: false, output: "stopped by you — this call was not run" };
+
+      const inflight = invoke<WireToolResult>("tool_run", {
         req: { name, arguments: args, root },
+        ...(callId ? { callId } : {}),
       });
+      // The stop path. Flipping the abort signal cannot by itself end a sandbox command that is
+      // already running, so the host asks the sandbox to cancel it — SIGINT, then SIGKILL, to the
+      // child's whole process group — and resolves immediately. The invoke above still settles
+      // when the Rust side returns `stopped by you`; whichever lands first, the caller gets the
+      // honest reason. Nothing is left dangling: `race` handles both promises.
+      const stopped = new Promise<WireToolResult>((resolve) => {
+        if (!signal) return; // never settles — the race is then just `inflight`
+        signal.addEventListener(
+          "abort",
+          () => {
+            if (callId) void invoke<boolean>("tool_cancel", { callId }).catch(() => undefined);
+            resolve({ ok: false, output: "", error: "stopped by you" });
+          },
+          { once: true },
+        );
+      });
+
+      const res = await Promise.race([inflight, stopped]);
       // A refusal carries its reason in `error`, not `output` — on the failure path `output` is
       // deliberately empty (`ToolResult::err`). Returning it as-is handed the model a blank tool
       // result for every denied or refused call, which is how a run ends with "the tool results

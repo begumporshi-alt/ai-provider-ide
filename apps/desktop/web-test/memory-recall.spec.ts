@@ -9,6 +9,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -169,7 +170,9 @@ test("memory recall: toggling memory off skips the recall path entirely", async 
   await selectModel(page);
   // Uncheck the memory toggle — it is on by default. The label wraps the input, so
   // getByLabel is the reliable handle here (the same form as the "agent mode" toggle).
+  await openRunConfig(page);
   await page.getByLabel("memory").uncheck();
+  await closeRunConfig(page);
   await page.getByPlaceholder(/Message your assistant/)
     .fill("what is the timezone where you live?");
   await page.getByRole("button", { name: "Send" }).click();

@@ -14,6 +14,7 @@
  */
 import { expect, test, type Page } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -34,7 +35,9 @@ async function nodes(page: Page): Promise<NodeRow[]> {
 async function openAgent(page: Page): Promise<void> {
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");

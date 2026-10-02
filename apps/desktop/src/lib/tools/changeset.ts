@@ -108,11 +108,11 @@ export class RunCheckpoint {
  */
 export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoint): ToolHost {
   return {
-    async run(name, args) {
+    async run(name, args, opts) {
       const effect = toolEffect(name);
       const path = typeof args.path === "string" ? args.path : "";
 
-      if (effect !== "mutate") return inner.run(name, args);
+      if (effect !== "mutate") return inner.run(name, args, opts);
 
       if (!FILE_WRITERS.has(name) || !path) {
         // `mkdir` makes a directory; `run_command` can do anything. Neither has a file body to
@@ -125,13 +125,16 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
         } else if (name === "mkdir" && path) {
           checkpoint.noteUntracked(`created directory ${path}`);
         }
-        return inner.run(name, args);
+        return inner.run(name, args, opts);
       }
 
       if (!checkpoint.has(path)) {
         checkpoint.captureBefore(path, await readOrNull(inner, path));
       }
-      const res = await inner.run(name, args);
+      const res = await inner.run(name, args, opts);
+      // A cancelled write never happened: a stopped `edit_file` must not be recorded as the
+      // file's new state, or "revert this run" would offer to undo a change that was never made.
+      if (!res.ok && /stopped by you/.test(res.output)) return res;
       // Read back rather than deriving the new contents from `args`: `edit_file` has a
       // `replace_all` mode and the file on disk is the only account of what actually happened.
       checkpoint.setAfter(path, res.ok ? await readOrNull(inner, path) : null);

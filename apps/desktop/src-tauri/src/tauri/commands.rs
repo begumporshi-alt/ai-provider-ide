@@ -211,6 +211,16 @@ pub fn history_rename_session(
     .map_err(CommandError)
 }
 
+/// Highest node sequence already recorded for a session, so a resumed session continues its id
+/// sequence instead of restarting it and upserting over stored history.
+#[tauri::command]
+pub fn history_max_seq(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+) -> Result<i64, CommandError> {
+    context::max_node_seq(&store, &session_id).map_err(CommandError)
+}
+
 #[tauri::command]
 pub fn history_delete_session(
     store: State<'_, Arc<Store>>,
@@ -668,6 +678,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         history_sessions,
         history_timeline,
         history_rename_session,
+        history_max_seq,
         history_delete_session,
         skills_list,
         skills_catalog,
@@ -732,6 +743,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::tauri::tools_cmds::tools_default_root,
         crate::tauri::tools_cmds::tools_list_dirs,
         crate::tauri::tools_cmds::tool_run,
+        crate::tauri::tools_cmds::tool_cancel,
         crate::tauri::tools_cmds::git_summary,
         crate::tauri::tools_cmds::git_commit_push,
         memory_capture,

@@ -58,6 +58,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "futures-util",
+ "libc",
  "pdf-extract",
  "rand 0.8.8",
  "regex",

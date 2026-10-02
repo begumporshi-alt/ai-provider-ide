@@ -12,6 +12,7 @@
  */
 import { expect, test } from "@playwright/test";
 import { pickModel } from "./model-picker";
+import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
@@ -26,7 +27,9 @@ async function openAgentChat(page: import("@playwright/test").Page) {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await pickModel(page, /oracle-mini/);
+  await openRunConfig(page);
   await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
   // Root setup lives in its own tab now; set it there, then go back to the chat.
   await page.getByRole("button", { name: "Root", exact: true }).click();
   await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
@@ -44,7 +47,9 @@ async function send(page: import("@playwright/test").Page, text: string) {
 
 test("auto-approve reads: a read runs with no modal, and the run finishes", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByTestId("approval-mode").selectOption("auto-reads");
+  await closeRunConfig(page);
 
   // The oracle's default agent variant is one `list_dir` call — a read.
   await send(page, "list files");
@@ -56,7 +61,9 @@ test("auto-approve reads: a read runs with no modal, and the run finishes", asyn
 
 test("auto-approve reads: a write still prompts", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByTestId("approval-mode").selectOption("auto-reads");
+  await closeRunConfig(page);
 
   await send(page, "edit the readme greeting");
 
@@ -73,7 +80,9 @@ test("auto-approve reads: a write still prompts", async ({ page }) => {
 
 test("yolo: a write runs with no modal at all", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByTestId("approval-mode").selectOption("yolo");
+  await closeRunConfig(page);
 
   await send(page, "edit the readme greeting");
 
@@ -84,7 +93,9 @@ test("yolo: a write runs with no modal at all", async ({ page }) => {
 
 test("a run's edits are shown as a diff set and can be reverted", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByTestId("approval-mode").selectOption("auto-reads");
+  await closeRunConfig(page);
 
   await send(page, "edit the readme greeting");
   await page.getByRole("button", { name: "Allow once", exact: true }).click();
@@ -123,7 +134,9 @@ test("a run's edits are shown as a diff set and can be reverted", async ({ page 
 
 test("'keep changes' leaves the files alone", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByTestId("approval-mode").selectOption("yolo");
+  await closeRunConfig(page);
 
   await send(page, "edit the readme greeting");
   await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
@@ -154,8 +167,10 @@ test("'always allow this tool' covers the next call of the same tool", async ({ 
 
 test("plan mode refuses a write without asking, then executes the approved plan", async ({ page }) => {
   await openAgentChat(page);
+  await openRunConfig(page);
   await page.getByLabel("plan mode").check();
   await expect(page.getByTestId("plan-mode-hint")).toBeVisible();
+  await closeRunConfig(page);
 
   await send(page, "edit the readme greeting");
 
@@ -181,4 +196,39 @@ test("plan mode refuses a write without asking, then executes the approved plan"
   expect((await vfs(page))["README.md"]).toBe(README_AFTER);
   // The approve panel is gone: the run it was offering is the one that just happened.
   await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+});
+
+// The gate and Stop used to fight: while the modal was up the loop was parked on the approval
+// promise, and an abort flipped the controller's flag without resolving it. The gate now races
+// the run's abort signal and answers "stopped by you" on its behalf.
+//
+// The modal's backdrop swallows every click outside it, so the pointer cannot leave the
+// Assistant while the gate is up — but keyboard focus can. Leaving the screen unmounts the modal
+// (and the whole transcript state with it) while the loop is STILL parked on the gate, and the
+// only remaining handle on that run is the Agents dashboard's stop. Stopping there used to flip
+// the abort flag and nothing else: the promise never resolved, and the run row claimed
+// "running" forever. The dashboard is this test's oracle for exactly that.
+test("stopping a run parked on the approval gate unblocks it", async ({ page }) => {
+  await openAgentChat(page);
+
+  // Default mode ("ask"): every call waits for the modal, so the run is parked on the gate.
+  await send(page, "edit the readme greeting");
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+
+  // The live status line names the parked state instead of showing anonymous dots.
+  await expect(page.getByTestId("agent-status")).toContainText("Waiting for you — edit_file needs approval");
+
+  // The backdrop sits between the pointer and everything else — even a synthetic click at the
+  // rail's coordinates lands on the backdrop (and would answer the modal). Focus does not care:
+  // a keyboard user can still Tab to the rail and press Enter, which is exactly the path this
+  // click takes. Leaving the screen unmounts the modal — and the whole transcript state with it —
+  // while the loop is STILL parked on the gate, and the only remaining handle on that run is the
+  // Agents dashboard's stop.
+  await page.getByRole("button", { name: "Agents", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "stop", exact: true }).click();
+
+  // The run must actually end — not keep claiming "running" from a loop parked on a dead gate.
+  await expect(page.getByText("● running")).toHaveCount(0, { timeout: 10_000 });
+  await expect(page.getByText("stopped", { exact: true })).toBeVisible();
 });
