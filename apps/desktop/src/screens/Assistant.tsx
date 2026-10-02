@@ -28,6 +28,7 @@ import { Composer, type Attachment, type InlinedText } from "../components/Compo
 import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
+import { instructionSystemText } from "../lib/chat/context-blocks";
 import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, decide, withAllowAll, withTrustedTool,
@@ -1558,6 +1559,15 @@ function Chat({
   // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
   // context meter's estimate of what the next send will contain, and nothing else.
   const [draftText, setDraftText] = useState("");
+  /**
+   * The per-turn instruction from the composer's "Add context" menu.
+   *
+   * Held here rather than inside `Composer` for the same reason `draftText` is: it is a system
+   * message the next send will carry, and the context meter has to count it. It belongs to one turn
+   * — cleared by the composer after a send — and never to the session, which is what separates it
+   * from the durable prompt under ⚙.
+   */
+  const [turnInstruction, setTurnInstruction] = useState("");
   /** A one-line notice: a refused attachment, a mention that matched nothing. */
   const [notice, setNotice] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (choice: ApprovalChoice) => void } | null>(null);
@@ -1799,27 +1809,58 @@ function Chat({
       : DEFAULT_CONTEXT_WINDOW;
   }, [chosen, tick]);
   // P7: estimated prompt tokens for the NEXT send — the system turn the mode implies, the replayed
-  // history, and the draft in the composer. The system turn is included because it is not small:
-  // the agent prompt plus the installed skills' bodies run to hundreds of tokens, and leaving them
-  // out would understate the one number the meter exists to report. Two things are still outside
-  // the estimate, both by nature: the recalled memory block (computed at send time) and, in agent
-  // mode, the tool definitions.
+  // history, the per-turn instruction, and the draft in the composer. The system turn is included
+  // because it is not small: the agent prompt plus the installed skills' bodies run to hundreds of
+  // tokens, and leaving them out would understate the one number the meter exists to report. What is
+  // still outside the estimate, and why: the recalled memory block (computed at send time), the tool
+  // definitions in agent mode, and the contents of `@`-referenced files (read at send time, so only
+  // the reference itself is in the draft this counts).
   const currentPromptTokens = useMemo(() => {
     if (!draftText.trim() && msgs.length === 0) return 0;
-    const systemText = agentMode
+    const base = agentMode
       ? agentSystem(root, agentSystemPrompt) + skillsBlock
       : noTools
         ? (noToolsSystem || NO_TOOLS_SYSTEM)
         : (systemPrompt ?? "");
+    // Counted because it is a system message of its own on both send paths; a meter that ignored a
+    // constraint the user just set would be wrong at exactly the moment they are watching it.
+    const perTurn = instructionSystemText(turnInstruction);
+    const systemText = perTurn ? `${base}\n\n${perTurn}` : base;
     const all: ChatMessage[] = [
       ...(systemText ? [{ role: "system" as const, content: systemText }] : []),
       ...replayHistory(msgs),
       ...(draftText.trim() ? [{ role: "user" as const, content: draftText }] : []),
     ];
     return estimateTokens(all);
-  }, [msgs, draftText, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
+  }, [msgs, draftText, turnInstruction, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
   // P7: context meter — fraction of the window consumed.
   const contextUsedRatio = Math.min(1, currentPromptTokens / modelWindow);
+
+  /**
+   * The composer's "Previous results" row: earlier answers in this conversation, newest first.
+   *
+   * Assistant turns only, and only ones that carry text — a turn that failed or is still streaming
+   * offers nothing to reuse, and listing it would make the row a list of placeholders. Numbered by
+   * order of appearance, because two answers to similar questions read alike and the number is what
+   * lets the user tell them apart in a menu of truncations.
+   */
+  const previousOutputs = useMemo(() => {
+    const out: { id: string; label: string; text: string }[] = [];
+    let n = 0;
+    for (const m of msgs) {
+      if (m.role !== "assistant") continue;
+      const text = m.content.trim();
+      if (!text) continue;
+      n += 1;
+      const flat = text.replace(/\s+/g, " ");
+      out.push({
+        id: m.id,
+        label: `Answer ${n} · ${flat.length > 70 ? `${flat.slice(0, 70)}…` : flat}`,
+        text: m.content,
+      });
+    }
+    return out.reverse();
+  }, [msgs]);
   // Join each tool result to the call that declared it, so the transcript can render an
   // `edit_file`/`write_file` as the change itself. The arguments live on the assistant turn, not
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
@@ -1964,8 +2005,12 @@ function Chat({
     baseMsgs: Msg[],
     attachments: Attachment[] = [],
     inlined: InlinedText[] = [],
+    instruction = "",
   ) {
     const trimmed = text.trim();
+    // Shaped once, used by both paths. An empty instruction yields an empty string, so a turn with
+    // no constraint carries no extra system message on either branch.
+    const perTurn = instructionSystemText(instruction);
     // An image-only turn is a real turn: the composer allows sending one, so the guard must too.
     if ((!trimmed && attachments.length === 0) || busy || !chosen) return;
     const userMsg: Msg = {
@@ -2040,7 +2085,10 @@ function Chat({
         const { text: finalText, messages } = await runAgentLoop({
           model: chosen,
           messages: history,
-          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : "") + (planMode ? PLAN_MODE_SYSTEM : ""),
+          // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
+          // a system message rather than a line in the user's text so the model can tell a constraint
+          // the user set from a sentence the user wrote.
+          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : "") + (planMode ? PLAN_MODE_SYSTEM : "") + (perTurn ? `\n\n${perTurn}` : ""),
           registry: AGENT_TOOLS,
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
@@ -2177,6 +2225,9 @@ function Chat({
           messages: [
             ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
             ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
+            // Last, and directly above the user's turn: a per-turn constraint is the most specific
+            // instruction in the request, and its own message keeps it from reading as the user's words.
+            ...(perTurn ? [{ role: "system" as const, content: perTurn }] : []),
             ...history,
             // The user's own turn, as parts when it carries images — `userContent` returns a plain
             // string otherwise, so an ordinary message is still an ordinary message.
@@ -2260,9 +2311,9 @@ function Chat({
    * attachments read. Nothing to clear here — the composer owns the text it just handed over, and
    * clearing it here too is how the two would drift.
    */
-  function send(text: string, attachments: Attachment[], inlined: InlinedText[]) {
+  function send(text: string, attachments: Attachment[], inlined: InlinedText[], instruction = "") {
     if (busy || !chosen) return;
-    void runTurn(text, msgs, attachments, inlined);
+    void runTurn(text, msgs, attachments, inlined, instruction);
   }
 
   /**
@@ -2990,6 +3041,8 @@ function Chat({
           readFile={mentionHost ? readWorkspaceFile : null}
           onNotice={setNotice}
           onDraftChange={setDraftText}
+          onInstructionChange={setTurnInstruction}
+          previousOutputs={previousOutputs}
           seed={seed}
           toolbar={toolbar}
           corner={corner}
