@@ -10,7 +10,10 @@
 //!      single choice removes the entire injection class.
 //!   2. ALLOWLIST. Only a fixed set of executables can start. `rm`, `sudo`, `sh`, `curl`,
 //!      `wget`, `ssh`, `nc` and friends are simply absent, so they cannot run at any
-//!      argument. `git` is further restricted to non-network subcommands.
+//!      argument. `git` may reach the network in both directions (the user points the
+//!      assistant at repos and asks it to publish branches); `gh` is the GitHub surface,
+//!      gated to the subcommands that are neither interactive nor machine-credential-touching
+//!      nor destructive to a remote.
 //!   3. ROOT CONFINEMENT. Every file path is resolved and must land inside the workspace
 //!      root after canonicalization, so `..` and symlinks pointing outward both fail.
 //!   4. BOUNDED. Wall-clock timeout, output caps, and a scrubbed environment (no ambient
@@ -41,16 +44,19 @@ fn allowed_programs() -> &'static HashSet<&'static str> {
         [
             "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "printf",
             "date", "which", "basename", "dirname", "stat", "du", "diff", "sort", "uniq", "tr",
-            "cut", "sed", "awk", "tar", "unzip", "mkdir", "touch", "cp", "git", "node", "npm",
-            "npx", "pnpm", "python3", "pip3", "make",
+            "cut", "sed", "awk", "tar", "unzip", "mkdir", "touch", "cp", "git", "gh", "node",
+            "npm", "npx", "pnpm", "python3", "pip3", "make",
         ]
         .into_iter()
         .collect()
     })
 }
 
-/// `git` is allowed, but only for subcommands that cannot reach the network. `push`/`pull`/
-/// `fetch`/`clone` are excluded so a model cannot exfiltrate a repo or fetch a payload.
+/// `git` is allowed for the subcommands working on a repository needs, including the network
+/// ones: the user points the assistant at repos and asks it to publish branches, so inbound
+/// (`clone`, `fetch`, `pull`) and outbound (`push`) are all reachable. The allowlist itself is
+/// the boundary — anything not listed here (e.g. `remote`, `rebase`, `filter-branch`) is
+/// refused, and the argument pass refuses path-like arguments that leave the workspace.
 const GIT_SUBCOMMANDS: &[&str] = &[
     "status",
     "diff",
@@ -65,7 +71,35 @@ const GIT_SUBCOMMANDS: &[&str] = &[
     "config",
     "describe",
     "stash",
+    "clone",
+    "fetch",
+    "pull",
+    "push",
 ];
+
+/// `gh` top-level commands that are refused outright. `auth` is interactive (it would hang to
+/// the timeout) and mutates machine-level credentials; everything else on the GitHub surface —
+/// repos, PRs, issues, gists, releases, workflow runs, `gh api` — is reachable.
+const GH_DENIED: &[&str] = &["auth"];
+
+/// The second layer of the `gh` gate: (command, subcommand) pairs that destroy or mutate a
+/// remote resource wholesale. Refused even though the rest of their command is allowed.
+const GH_DENIED_PAIRS: &[(&str, &str)] = &[("repo", "delete"), ("codespace", "delete")];
+
+/// Why this `gh` invocation is refused, if it is. Split from `do_run_command` so the gate is
+/// unit-testable without spawning `gh` at all.
+fn gh_denial(argv: &[String]) -> Option<String> {
+    let sub = argv.first()?;
+    if GH_DENIED.contains(&sub.as_str()) {
+        return Some(format!("gh subcommand \"{sub}\" is not allowed"));
+    }
+    if let Some(action) = argv.get(1) {
+        if GH_DENIED_PAIRS.contains(&(sub.as_str(), action.as_str())) {
+            return Some(format!("gh {sub} {action} is not allowed"));
+        }
+    }
+    None
+}
 
 const MAX_COMMAND_MS: u64 = 60_000;
 const DEFAULT_COMMAND_MS: u64 = 20_000;
@@ -639,7 +673,7 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             None => Vec::new(),
             Some(_) => return Err("\"args\" must be an array of strings".into()),
         };
-        // Sub-gate `git`: network-facing subcommands are not reachable.
+        // Sub-gate `git`: only the subcommands working on a repository needs are reachable.
         if program == "git" {
             match argv.first() {
                 None => return Err("git needs a subcommand".into()),
@@ -647,6 +681,16 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
                     return Err(format!("git subcommand \"{sub}\" is not allowed"));
                 }
                 Some(_) => {}
+            }
+        }
+        // Sub-gate `gh`: the GitHub surface, minus the interactive, credential-touching and
+        // remotely destructive subcommands.
+        if program == "gh" {
+            if argv.is_empty() {
+                return Err("gh needs a subcommand".into());
+            }
+            if let Some(reason) = gh_denial(&argv) {
+                return Err(reason);
             }
         }
         // Audit H1: the program is allowlisted, but the ARGUMENTS were never inspected. Refuse
@@ -674,7 +718,7 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
             // Scrubbed environment: nothing ambient (tokens, keys, shell vars) can leak into
             // output the model reads back.
             .env_clear()
-            .env("PATH", "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("PATH", CHILD_PATH)
             .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
             .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
             .env("LANG", "C.UTF-8");
@@ -825,6 +869,236 @@ fn arguments_object(args: &serde_json::Value) -> Result<serde_json::Value, Strin
     }
 }
 
+/// Record the assistant's task list for the current run. The list itself lives in the UI — the
+/// Assistant screen renders it in the progress capsule — so this handler is only the validation
+/// gate: a well-formed list is acknowledged, a malformed one is refused before it can confuse
+/// the panel. Nothing is written to the workspace, which is why the tool is not mutating.
+fn do_todo_write(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let todos = args
+            .get("todos")
+            .ok_or("missing argument \"todos\"")?
+            .as_array()
+            .ok_or("\"todos\" must be an array")?;
+        if todos.len() > 50 {
+            return Err(format!("\"todos\" is capped at 50 entries, got {}", todos.len()));
+        }
+        for (i, todo) in todos.iter().enumerate() {
+            let content = todo
+                .get("content")
+                .and_then(|c| c.as_str())
+                .ok_or_else(|| format!("todos[{i}] needs a \"content\" string"))?;
+            if content.trim().is_empty() {
+                return Err(format!("todos[{i}] content is empty"));
+            }
+            let status = todo
+                .get("status")
+                .and_then(|s| s.as_str())
+                .ok_or_else(|| format!("todos[{i}] needs a \"status\" string"))?;
+            if !matches!(status, "pending" | "in_progress" | "completed") {
+                return Err(format!(
+                    "todos[{i}] status must be \"pending\", \"in_progress\" or \"completed\", got {status:?}"
+                ));
+            }
+        }
+        Ok(format!("recorded {} todo(s)", todos.len()))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// The fixed PATH every spawned child gets — homebrew first, then the system dirs. A scrubbed
+/// environment still has to find the allowlisted executables.
+const CHILD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// One changed file as the git capsule shows it: the workspace-relative path and the short
+/// status letter (`M`odified, `A`dded, `D`eleted, `R`enamed, `?`ntracked…).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitFileEntry {
+    pub path: String,
+    pub status: String,
+}
+
+/// The workspace's git state for the Assistant's git capsule: branch, ahead/behind, the
+/// +/- line counts of the uncommitted changes, and the changed files.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GitSummary {
+    pub is_repo: bool,
+    pub branch: String,
+    pub ahead: u32,
+    pub behind: u32,
+    pub insertions: u64,
+    pub deletions: u64,
+    pub files: Vec<GitFileEntry>,
+}
+
+/// Run one `git` invocation against `root` under the same scrubbed environment the model-facing
+/// tool uses. A non-zero exit is NOT an error here — several callers probe (`is there an
+/// upstream?`) — so the caller reads `(success, stdout, stderr)` itself.
+fn git_at(root: &Path, args: &[&str]) -> (bool, String, String) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .stdin(Stdio::null())
+        .env_clear()
+        .env("PATH", CHILD_PATH)
+        .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
+        .env("LANG", "C.UTF-8")
+        .output();
+    match out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).into_owned(),
+            String::from_utf8_lossy(&o.stderr).into_owned(),
+        ),
+        Err(e) => (false, String::new(), format!("cannot start git: {e}")),
+    }
+}
+
+/// Read the workspace's git state. A workspace that is not a repository is a normal result
+/// (`is_repo: false`), not an error — the capsule renders "not a repo" rather than failing.
+pub fn git_summary(root: &Path) -> Result<GitSummary, String> {
+    let root = validate_root(root)?;
+    let mut summary = GitSummary {
+        is_repo: false,
+        branch: String::new(),
+        ahead: 0,
+        behind: 0,
+        insertions: 0,
+        deletions: 0,
+        files: Vec::new(),
+    };
+    let (ok, out, err) = git_at(&root, &["status", "--porcelain", "-b"]);
+    if !ok {
+        if err.contains("not a git repository") {
+            return Ok(summary);
+        }
+        return Err(if err.trim().is_empty() { "git status failed".into() } else { err.trim().to_string() });
+    }
+    summary.is_repo = true;
+    for line in out.lines() {
+        if let Some(rest) = line.strip_prefix("## ") {
+            let rest = rest.trim();
+            if let Some(branch) = rest.strip_prefix("No commits yet on ") {
+                summary.branch = branch.trim().to_string();
+                continue;
+            }
+            let head = rest.split(" [").next().unwrap_or(rest);
+            summary.branch = head.split("...").next().unwrap_or(head).to_string();
+            if let Some(bracket) = rest.split('[').nth(1) {
+                for part in bracket.trim_end_matches(']').split(',') {
+                    let part = part.trim();
+                    if let Some(n) = part.strip_prefix("ahead ") {
+                        summary.ahead = n.trim().parse().unwrap_or(0);
+                    }
+                    if let Some(n) = part.strip_prefix("behind ") {
+                        summary.behind = n.trim().parse().unwrap_or(0);
+                    }
+                }
+            }
+        } else if line.len() >= 4 {
+            // `XY path` — X is the index column, Y the worktree one; `??` is untracked. A
+            // rename reports `old -> new`, and the capsule tracks the new side.
+            let (xy, path) = line.split_at(2);
+            let mut path = path.trim_start();
+            if path.starts_with('"') {
+                path = path.trim_matches('"');
+            }
+            let path = path.rsplit(" -> ").next().unwrap_or(path);
+            let status = if xy == "??" {
+                "?"
+            } else if !xy.starts_with(' ') {
+                &xy[..1]
+            } else {
+                &xy[1..]
+            };
+            summary.files.push(GitFileEntry {
+                path: path.to_string(),
+                status: status.to_string(),
+            });
+        }
+    }
+    // Line counts: `--numstat HEAD` covers staged+unstaged against the last commit. A repo with
+    // no commits has no HEAD, so fall back to the unstaged-only form (still zero for a fresh
+    // repo — acceptable for a capsule whose +/- is an approximation, not a diff view).
+    let (numstat_ok, numstat, _) = git_at(&root, &["diff", "--numstat", "HEAD"]);
+    let numstat = if numstat_ok { numstat } else { git_at(&root, &["diff", "--numstat"]).1 };
+    for line in numstat.lines() {
+        let mut cols = line.split('\t');
+        if let (Some(added), Some(deleted)) = (cols.next(), cols.next()) {
+            summary.insertions += added.parse::<u64>().unwrap_or(0);
+            summary.deletions += deleted.parse::<u64>().unwrap_or(0);
+        }
+    }
+    Ok(summary)
+}
+
+/// Stage everything, commit with `message`, and push — the git capsule's "Commit or push" row.
+///
+/// Push is best-effort and explicit about partial success: an upstream is pushed directly; a
+/// repo with an `origin` remote but no upstream gets `push -u origin <branch>`; a repo with no
+/// remote at all reports the commit as done and the push as skipped. Any git-level failure
+/// (no `user.name`, rejected push) travels out with git's own stderr.
+pub fn git_commit_push(root: &Path, message: &str) -> Result<String, String> {
+    let root = validate_root(root)?;
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("a commit message is required".into());
+    }
+    let message: String = message.chars().take(500).collect();
+
+    let (ok, _, err) = git_at(&root, &["add", "-A"]);
+    if !ok {
+        return Err(format!("git add failed: {}", err.trim()));
+    }
+
+    let (ok, out, err) = git_at(&root, &["commit", "-m", &message]);
+    let mut summary = if ok {
+        let (sha_ok, sha, _) = git_at(&root, &["rev-parse", "--short", "HEAD"]);
+        if sha_ok {
+            format!("committed {}", sha.trim())
+        } else {
+            "committed".into()
+        }
+    } else if out.contains("nothing to commit") || err.contains("nothing to commit") {
+        "nothing to commit".into()
+    } else {
+        let why = if err.trim().is_empty() { out.trim() } else { err.trim() };
+        return Err(format!("git commit failed: {why}"));
+    };
+
+    let (upstream_ok, _, _) =
+        git_at(&root, &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]);
+    if upstream_ok {
+        // Push writes its progress ("To origin …") to stderr even on success, so the exit
+        // flag — not an empty stderr — decides the outcome.
+        let (ok, _, push_err) = git_at(&root, &["push"]);
+        if ok {
+            summary.push_str(", pushed to upstream");
+        } else {
+            return Err(format!("{summary}, but push failed: {}", push_err.trim()));
+        }
+    } else {
+        let (_, remotes, _) = git_at(&root, &["remote"]);
+        let origin = remotes.lines().map(str::trim).find(|r| *r == "origin");
+        if let Some(origin) = origin {
+            let (_, branch, _) = git_at(&root, &["rev-parse", "--abbrev-ref", "HEAD"]);
+            let branch = branch.trim().to_string();
+            let (ok, _, push_err) = git_at(&root, &["push", "-u", origin, &branch]);
+            if !ok {
+                return Err(format!("{summary}, but push failed: {}", push_err.trim()));
+            }
+            summary.push_str(&format!(", pushed and set upstream to {origin}/{branch}"));
+        } else {
+            summary.push_str(", not pushed (no remote configured)");
+        }
+    }
+    Ok(summary)
+}
+
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
     let root = match validate_root(Path::new(&req.root)) {
@@ -845,6 +1119,7 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "search_files" => do_search_files(&args, &root),
         "file_info" => do_file_info(&args, &root),
         "run_command" => do_run_command(&args, &root),
+        "todo_write" => do_todo_write(&args),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }
@@ -1012,15 +1287,202 @@ mod tests {
     }
 
     #[test]
-    fn git_network_subcommands_are_refused() {
+    fn git_unlisted_subcommands_are_refused() {
         let r = root();
-        for sub in ["push", "pull", "fetch", "clone"] {
+        for sub in ["remote", "rebase", "filter-branch"] {
             let res = do_run_command(
                 &obj(&[("program", serde_json::json!("git")), ("args", serde_json::json!([sub]))]),
                 &r,
             );
             assert!(!res.ok, "git {sub} should be refused");
+            assert!(res.error.unwrap().contains("is not allowed"));
         }
+    }
+
+    #[test]
+    fn git_network_subcommands_pass_the_gate() {
+        // `git fetch`/`push` in an empty workspace cannot succeed, but their failure is git's
+        // own ("fatal: not a git repository…", reported as ok with "[exit 128]") — not the
+        // gate's, and none of them touches the network before git rejects the cwd. The claim
+        // under test is only that the gate let the command start.
+        let r = root();
+        for sub in ["clone", "fetch", "pull", "push"] {
+            let res = do_run_command(
+                &obj(&[("program", serde_json::json!("git")), ("args", serde_json::json!([sub]))]),
+                &r,
+            );
+            assert!(res.ok, "git {sub} should pass the gate: {:?}", res.error);
+            assert!(
+                !res.output.contains("is not allowed"),
+                "git {sub} must not be refused by the gate: {}",
+                res.output
+            );
+        }
+    }
+
+    #[test]
+    fn gh_interactive_and_destructive_invocations_are_refused() {
+        for argv in [
+            vec!["auth", "login"],
+            vec!["auth", "token"],
+            vec!["repo", "delete", "owner/name"],
+            vec!["codespace", "delete", "-s", "codespace-id"],
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+            let denial = gh_denial(&argv);
+            assert!(
+                denial.is_some(),
+                "gh {argv:?} should be refused by the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn gh_github_surface_passes_the_gate() {
+        for argv in [
+            vec!["repo", "view", "zai-org/ZCode"],
+            vec!["repo", "clone", "zai-org/ZCode"],
+            vec!["pr", "list"],
+            vec!["pr", "view", "12"],
+            vec!["issue", "list"],
+            vec!["gist", "create", "notes.md"],
+            vec!["release", "list"],
+            vec!["run", "watch", "123"],
+            vec!["api", "repos/zai-org/ZCode"],
+            vec!["codespace", "list"],
+        ] {
+            let argv: Vec<String> = argv.into_iter().map(String::from).collect();
+            let denial = gh_denial(&argv);
+            assert!(
+                denial.is_none(),
+                "gh {argv:?} should pass the gate: {denial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn todo_write_accepts_a_well_formed_list() {
+        let res = do_todo_write(&obj(&[(
+            "todos",
+            serde_json::json!([
+                { "content": "clone the repo", "status": "completed" },
+                { "content": "read the entry point", "status": "in_progress" },
+                { "content": "summarise the architecture", "status": "pending" },
+            ]),
+        )]));
+        assert!(res.ok, "{:?}", res.error);
+        assert!(res.output.contains("3 todo(s)"));
+    }
+
+    #[test]
+    fn todo_write_refuses_a_malformed_list() {
+        let too_many = serde_json::json!({
+            "todos": (0..51)
+                .map(|i| serde_json::json!({ "content": format!("task {i}"), "status": "pending" }))
+                .collect::<Vec<_>>()
+        });
+        let bad = [
+            serde_json::json!({}),
+            serde_json::json!({ "todos": "three things" }),
+            serde_json::json!({ "todos": [{ "status": "pending" }] }),
+            serde_json::json!({ "todos": [{ "content": "x", "status": "done" }] }),
+            serde_json::json!({ "todos": [{ "content": "  ", "status": "pending" }] }),
+            too_many,
+        ];
+        for args in bad {
+            let res = do_todo_write(&args);
+            assert!(!res.ok, "todo_write should refuse {args}");
+        }
+    }
+
+    // --- the git capsule: git_summary and git_commit_push against real temp repos ---
+
+    /// A scratch repo with an identity configured, so commits work without ambient config.
+    fn scratch_repo(tag: &str) -> PathBuf {
+        let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!(
+            "aiprovider-tools-test-{tag}-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        git_at(&dir, &["init", "-b", "main"]);
+        git_at(&dir, &["config", "user.name", "Test"]);
+        git_at(&dir, &["config", "user.email", "test@example.com"]);
+        dir
+    }
+
+    #[test]
+    fn git_summary_reports_a_plain_directory_as_not_a_repo() {
+        let dir = root();
+        let s = git_summary(&dir).expect("a plain directory is a normal result");
+        assert!(!s.is_repo);
+        assert!(s.files.is_empty());
+    }
+
+    #[test]
+    fn git_summary_reads_branch_changes_and_counts() {
+        let dir = scratch_repo("summary");
+        fs::write(dir.join("a.txt"), "one\ntwo\n").unwrap();
+        let (ok, _, _) = git_at(&dir, &["add", "-A"]);
+        assert!(ok);
+        let s = git_summary(&dir).expect("summary of a fresh repo");
+        assert!(s.is_repo);
+        assert_eq!(s.branch, "main");
+        assert_eq!(s.files.len(), 1);
+        assert_eq!(s.files[0].status, "A");
+
+        let (ok, _, _) = git_at(&dir, &["commit", "-m", "first"]);
+        assert!(ok);
+        fs::write(dir.join("a.txt"), "one\nTWO\nthree\n").unwrap();
+        fs::write(dir.join("b.txt"), "new\n").unwrap();
+        let s = git_summary(&dir).expect("summary of a dirty repo");
+        assert_eq!(s.branch, "main");
+        assert!(s.insertions >= 2, "expected the rewrite counted: {s:?}");
+        assert!(s.deletions >= 1);
+        let modified = s.files.iter().find(|f| f.path == "a.txt").expect("a.txt listed");
+        assert_eq!(modified.status, "M");
+        assert!(s.files.iter().any(|f| f.path == "b.txt" && f.status == "?"));
+    }
+
+    #[test]
+    fn git_commit_push_round_trips_through_a_local_remote() {
+        let seq = TEST_DIR_SEQ.fetch_add(1, Ordering::SeqCst);
+        let remote = std::env::temp_dir().join(format!(
+            "aiprovider-tools-test-bare-{}-{}",
+            std::process::id(),
+            seq
+        ));
+        let _ = fs::remove_dir_all(&remote);
+        fs::create_dir_all(&remote).unwrap();
+        let (ok, _, err) = git_at(&remote, &["init", "--bare", "-b", "main"]);
+        assert!(ok, "bare init failed: {err}");
+
+        let dir = scratch_repo("push-work");
+        let (ok, _, err) = git_at(&dir, &["remote", "add", "origin", remote.to_str().unwrap()]);
+        assert!(ok, "remote add failed: {err}");
+        fs::write(dir.join("a.txt"), "hello\n").unwrap();
+
+        let res = git_commit_push(&dir, "first commit").expect("first push round-trips");
+        assert!(res.contains("committed"), "{res}");
+        assert!(res.contains("origin/main"), "{res}");
+
+        let (ok, ls, _) = git_at(&dir, &["ls-remote", "--heads", "origin"]);
+        assert!(ok);
+        assert!(ls.contains("refs/heads/main"), "the branch must be on the remote: {ls}");
+
+        // A second run with nothing staged commits nothing but still reports cleanly.
+        let res = git_commit_push(&dir, "empty").expect("an empty run is not an error");
+        assert!(res.contains("nothing to commit"), "{res}");
+    }
+
+    #[test]
+    fn git_commit_push_never_pushes_without_a_message() {
+        let dir = scratch_repo("no-message");
+        fs::write(dir.join("a.txt"), "x\n").unwrap();
+        let err = git_commit_push(&dir, "   ").expect_err("an empty message is refused");
+        assert!(err.contains("message is required"), "{err}");
     }
 
     #[test]

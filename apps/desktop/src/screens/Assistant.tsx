@@ -35,6 +35,7 @@ import {
 } from "../lib/tools";
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
 import { ChangeSetReview } from "../components/ChangeSetReview";
+import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
 import { toolCallName } from "../lib/tools/wire";
 import { DiffView } from "../components/DiffView";
 import {
@@ -184,6 +185,8 @@ const AGENT_SYSTEM =
   "where something is, read_file (with offset/limit for large files) and list_dir to inspect, " +
   "file_info to check a path exists, edit_file to change one exact snippet, write_file to " +
   "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
+  "For any task with several steps, maintain the task list with todo_write (the whole list, each " +
+  "task pending/in_progress/completed, one in_progress at a time) — the user watches it live. " +
   "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +
   "Never ask the user to run a command — call the tool. " +
   "Stop calling tools once the task is done and give a concise final answer.";
@@ -225,7 +228,7 @@ interface AgentItem {
 const PLAN_MODE_SYSTEM =
   "\n\nPLAN MODE — this pass may not modify the workspace. Every writing tool (write_file, " +
   "edit_file, mkdir, run_command) will be refused. Use the read-only tools (read_file, list_dir, " +
-  "search_files, file_info) to understand the task, then answer with the plan you intend to carry " +
+  "search_files, file_info, todo_write) to understand the task, then answer with the plan you intend to carry " +
   "out: numbered steps, the exact files each step changes, and anything you would need to confirm. " +
   "Do not attempt a write, and do not ask the user to apply it for you.";
 
@@ -1397,6 +1400,10 @@ function Chat({
   /** P5: what the finished run changed, for `ChangeSetReview`. Null until a run touches something. */
   const [runChanges, setRunChanges] = useState<RunChangeSet | null>(null);
   const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
+  /** The task list the model maintains through `todo_write`, rendered by the floating capsule.
+   *  Session-scoped: a New chat clears it, a resumed one starts empty until the model writes a
+   *  new list (the transcript of the old session is context, not live state). */
+  const [todos, setTodos] = useState<TodoItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
@@ -1696,6 +1703,21 @@ function Chat({
       setStreamedText((t) => t + ev.text);
     } else if (ev.type === "tool_call") {
       setAgentItems((l) => [...l, { name: ev.call.name ?? "?", args: tryParseArgs(ev.call.arguments), status: "calling" }]);
+      // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
+      // so the panel can update the moment the call arrives rather than after the result lands.
+      if ((ev.call.name ?? "") === "todo_write") {
+        const parsed = tryParseArgs(ev.call.arguments);
+        const list = parsed?.todos;
+        if (Array.isArray(list)) {
+          setTodos(
+            list
+              .filter((t): t is { content: string; status: TodoItem["status"] } =>
+                typeof t?.content === "string" &&
+                (t?.status === "pending" || t?.status === "in_progress" || t?.status === "completed"))
+              .map((t) => ({ content: t.content, status: t.status })),
+          );
+        }
+      }
     } else if (ev.type === "tool_result") {
       setAgentItems((l) => {
         const copy = [...l];
@@ -2148,6 +2170,7 @@ function Chat({
     setTrace(null);
     setFinishReason(undefined);
     setAgentItems([]);
+    setTodos([]);
     setStreamedText("");
     setEditingId(null);
     setEditDraft("");
@@ -2377,6 +2400,7 @@ function Chat({
           (AssistantScreen): the picker, the provider chip and the sandbox facts are one column
           there, and this transcript starts directly under the session bar. */}
       <div className="relative min-h-0 flex-1">
+        <AssistantCapsule root={root} todos={todos} busy={busy} />
         <div
           ref={listRef}
           onScroll={onListScroll}

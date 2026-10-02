@@ -152,10 +152,16 @@ fn destructive_and_network_programs_are_absent() {
         assert!(!r.ok, "{prog} must be refused");
         assert!(r.error.unwrap().contains("not on the allowlist"));
     }
-    // git is allowed, but only for offline subcommands.
-    for sub in ["push", "pull", "fetch", "clone"] {
+    // git is allowed, but only the listed subcommands; an unlisted one is refused even though
+    // the network-facing ones (clone/fetch/pull/push) are all in the list now.
+    for sub in ["remote", "rebase"] {
         let r = run(&root, "git", &[sub]);
         assert!(!r.ok, "git {sub} must be refused");
+    }
+    // gh is allowed, but the interactive and destructive subcommands are gated.
+    for argv in [vec!["auth", "login"], vec!["repo", "delete", "a/b"]] {
+        let r = run(&root, "gh", &argv);
+        assert!(!r.ok, "gh {argv:?} must be refused");
     }
 }
 

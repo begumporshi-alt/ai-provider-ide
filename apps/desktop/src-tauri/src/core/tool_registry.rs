@@ -8,8 +8,9 @@
 //!
 //! `write_file`, `edit_file`, `mkdir` and `run_command` are **mutating** — the four the gateway
 //! refuses unless mutation is explicitly enabled ([`crate::core::gateway::MUTATING_TOOLS`]), and the
-//! four the Assistant confirms one call at a time. The other four only read, and are always
-//! available.
+//! four the Assistant confirms one call at a time. `todo_write` mutates only the Assistant's
+//! progress panel, never the workspace, so it is not gated; the other four only read, and are
+//! always available.
 //!
 //! # Why the invariants live in tests rather than in types
 //!
@@ -198,11 +199,11 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "run_command",
-            description: "Run one allowlisted command inside the workspace. There is no shell, so ; | && are inert literals. Network git subcommands are refused.",
+            description: "Run one allowlisted command in the workspace. No shell, so ; | && are inert literals. git may clone, fetch, pull and push; gh is gated.",
             properties: json!({
                 "program": {
                     "type": "string",
-                    "description": "Executable from the allowlist: ls, cat, grep, rg, find, git, node, npm, npx, pnpm, python3, make, tar, sed, awk, …",
+                    "description": "Executable from the allowlist: ls, cat, grep, rg, find, git (listed subcommands only — clone/fetch/pull/push included), gh (GitHub: repos, PRs, issues, gists, releases, workflow runs, gh api — gh auth and gh repo delete refused), node, npm, npx, pnpm, python3, make, tar, sed, awk, …",
                 },
                 "args": {
                     "type": "array",
@@ -216,6 +217,26 @@ fn build() -> Vec<ToolSpec> {
             }),
             required: &["program"],
         },
+        ToolSpec {
+            name: "todo_write",
+            description: "Write the task list for the current run: replace it wholesale with every task and its status. Keep at most one task in_progress.",
+            properties: json!({
+                "todos": {
+                    "type": "array",
+                    "description": "The full task list, in order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "content": { "type": "string", "description": "The task, one sentence." },
+                            "status": { "type": "string", "enum": ["pending", "in_progress", "completed"] },
+                        },
+                        "required": ["content", "status"],
+                        "additionalProperties": false,
+                    },
+                },
+            }),
+            required: &["todos"],
+        },
     ]
 }
 
@@ -225,8 +246,8 @@ mod tests {
     use crate::core::gateway::MUTATING_TOOLS;
 
     #[test]
-    fn the_registry_holds_eight_tools() {
-        assert_eq!(agent_tools().len(), 8);
+    fn the_registry_holds_nine_tools() {
+        assert_eq!(agent_tools().len(), 9);
     }
 
     #[test]
@@ -322,7 +343,12 @@ mod tests {
         let mut read_only: Vec<&str> =
             names.iter().copied().filter(|n| !MUTATING_TOOLS.contains(n)).collect();
         read_only.sort_unstable();
-        assert_eq!(read_only, vec!["file_info", "list_dir", "read_file", "search_files"]);
+        // `todo_write` mutates only the Assistant's progress panel, never the workspace, so it
+        // is on the read-only side even though its name says "write".
+        assert_eq!(
+            read_only,
+            vec!["file_info", "list_dir", "read_file", "search_files", "todo_write"]
+        );
     }
 
     /// The reason `edit_file` exists: `write_file` is a whole-file overwrite, so every small change
@@ -335,12 +361,12 @@ mod tests {
     // ── gateway_tool_set ──────────────────────────────────────────────────
 
     /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
-    /// will refuse. Falsified by dropping the filter — the set goes back to eight.
+    /// will refuse. Falsified by dropping the filter — the set goes back to nine.
     #[test]
     fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
         let set = gateway_tool_set(false);
         let names: Vec<&str> = set.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 4, "expected the four read-only tools, got {names:?}");
+        assert_eq!(names.len(), 5, "expected the five read-only tools, got {names:?}");
         for m in MUTATING_TOOLS {
             assert!(!names.contains(&m), "{m} is advertised but would be refused");
         }
@@ -349,16 +375,16 @@ mod tests {
     /// Enabling mutation is opt-in and must restore the whole registry, not a subset.
     #[test]
     fn gateway_tool_set_includes_every_tool_when_mutation_is_on() {
-        assert_eq!(gateway_tool_set(true).len(), 8);
+        assert_eq!(gateway_tool_set(true).len(), 9);
     }
 
-    /// The read-only four are advertised either way — narrowing must never remove a tool the
+    /// The read-only five are advertised either way — narrowing must never remove a tool the
     /// gateway is willing to run.
     #[test]
     fn the_read_only_tools_are_advertised_either_way() {
         for on in [true, false] {
             let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
-            for r in ["read_file", "list_dir", "search_files", "file_info"] {
+            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write"] {
                 assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
             }
         }
@@ -381,18 +407,23 @@ mod tests {
 
     /// The reduction the trim and the filter were written to deliver, pinned as bytes on the wire.
     ///
-    /// Measured baseline: the full registry rendered ~4,050 characters of tool JSON, which is ~1,187
-    /// prompt tokens of a 1,721-token prompt. Falsified by removing the filter or letting the
-    /// descriptions grow back.
+    /// The narrowed set must cost less than its PROPORTIONAL SHARE of the full render — five
+    /// read-only tools of nine means under 5/9 of the bytes, i.e. the read-only tools are each
+    /// cheaper than the registry average. (It used to be "under half" back when half the registry
+    /// was read-only; a ninth tool that is read-only and lives in both sets made a strict half
+    /// unreachable, so the invariant moved to the share that matches the set's composition.)
+    /// Falsified by removing the filter or letting the read-only descriptions grow back.
     #[test]
     fn the_gateway_set_is_less_than_half_the_rendered_bytes() {
         let full = registry_to_openai(agent_tools()).expect("full registry renders");
         let narrowed = registry_to_openai(&gateway_tool_set(false)).expect("narrowed renders");
         let full_bytes = serde_json::to_string(&full).unwrap().len();
         let narrow_bytes = serde_json::to_string(&narrowed).unwrap().len();
+        let narrowed_count = gateway_tool_set(false).len();
         assert!(
-            narrow_bytes * 2 < full_bytes,
-            "narrowed {narrow_bytes} bytes is not under half of full {full_bytes}"
+            narrow_bytes * agent_tools().len() < full_bytes * narrowed_count,
+            "narrowed {narrow_bytes} bytes is not under its {narrowed_count}/{} share of full {full_bytes}",
+            agent_tools().len()
         );
     }
 

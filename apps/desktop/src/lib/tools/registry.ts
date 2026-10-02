@@ -138,13 +138,13 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "run_command",
     effect: "mutate",
     description:
-      "Run a single allowlisted command inside the workspace. There is no shell, so ; | && ` ` and $( ) are inert literals, not syntax. Network-facing git subcommands (push/pull/fetch/clone) are refused.",
+      "Run a single allowlisted command inside the workspace. There is no shell, so ; | && ` ` and $( ) are inert literals, not syntax. git may clone, fetch, pull and push; gh covers GitHub (repos, PRs, issues, gists, releases, runs, api — gh auth and gh repo delete refused).",
     parameters: {
       properties: {
         program: {
           type: "string",
           description:
-            "Executable from the allowlist: ls, cat, grep, rg, find, git, node, npm, npx, pnpm, python3, make, tar, sed, awk, …",
+            "Executable from the allowlist: ls, cat, grep, rg, find, git, gh, node, npm, npx, pnpm, python3, make, tar, sed, awk, …",
         },
         args: {
           type: "array",
@@ -157,6 +157,29 @@ export const AGENT_TOOLS: ToolSpec[] = [
         },
       },
       required: ["program"],
+    },
+  },
+  {
+    name: "todo_write",
+    effect: "read",
+    description:
+      "Write the task list for the current run: replace it wholesale with every task and its status. Keep at most one task in_progress.",
+    parameters: {
+      properties: {
+        todos: {
+          type: "array",
+          description: "The full task list, in order.",
+          items: {
+            type: "object",
+            properties: {
+              content: { type: "string", description: "The task, one sentence." },
+              status: { type: "string", enum: ["pending", "in_progress", "completed"] },
+            },
+            required: ["content", "status"],
+          },
+        },
+      },
+      required: ["todos"],
     },
   },
 ];

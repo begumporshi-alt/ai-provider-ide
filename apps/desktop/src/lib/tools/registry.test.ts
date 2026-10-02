@@ -50,9 +50,10 @@ describe("AGENT_TOOLS", () => {
   it("the mutating set is exactly the four the gateway gates", () => {
     expect(MUTATING.filter((m) => AGENT_TOOLS.some((t) => t.name === m))).toEqual(MUTATING);
     // The complement must be read-only: a tool that is neither listed nor read-only is a
-    // tool that writes without being gated.
+    // tool that writes without being gated. `todo_write` only feeds the progress capsule —
+    // it never touches the workspace — so it belongs on the read-only side.
     const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
-    expect(readOnly.sort()).toEqual(["file_info", "list_dir", "read_file", "search_files"]);
+    expect(readOnly.sort()).toEqual(["file_info", "list_dir", "read_file", "search_files", "todo_write"]);
   });
 
   it("editing is possible without rewriting a whole file", () => {

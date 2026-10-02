@@ -16,6 +16,8 @@
 //! start enforcing two slightly different sandboxes, which is the failure this split exists to
 //! prevent.
 
+use std::path::Path;
+
 use crate::core::tools::{ToolAllowlist, ToolResult, ToolRunRequest};
 
 /// Announce the sandbox to the UI so it can show the user what is actually permitted, rather than
@@ -47,4 +49,16 @@ pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
 #[tauri::command]
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
     crate::core::tools::tool_run(req)
+}
+
+/// The workspace's git state for the Assistant's git capsule.
+#[tauri::command]
+pub fn git_summary(root: String) -> Result<crate::core::tools::GitSummary, String> {
+    crate::core::tools::git_summary(Path::new(&root))
+}
+
+/// Stage, commit and push the workspace from the Assistant's git capsule.
+#[tauri::command]
+pub fn git_commit_push(root: String, message: String) -> Result<String, String> {
+    crate::core::tools::git_commit_push(Path::new(&root), &message)
 }

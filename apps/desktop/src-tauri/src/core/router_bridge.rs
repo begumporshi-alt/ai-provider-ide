@@ -1422,7 +1422,7 @@ mod tests {
         drain(&bridge_with(gateway.clone(), Host::gateway_tools_mutating()), chat("m1")).await;
         let supplied = gateway.tools_seen(0).expect("the gateway supplied tools");
         let names = tool_names(&supplied);
-        assert_eq!(names.len(), 8, "mutation on should restore the full registry: {names:?}");
+        assert_eq!(names.len(), 9, "mutation on should restore the full registry: {names:?}");
         assert!(
             names.iter().any(|n| n == "write_file"),
             "write_file should be advertised when mutation is on: {names:?}"
