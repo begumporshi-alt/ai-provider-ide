@@ -288,12 +288,23 @@ fn meta_json(meta: &Option<String>, key: &str) -> Option<String> {
 /// first message of any role, then to nothing — a session of only tool calls still deserves
 /// a row in the index.
 fn preview_of(label: &str) -> String {
+    const MAX_BYTES: usize = 120;
     let flat = label.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.len() <= 120 {
-        flat
-    } else {
-        format!("{}…", &flat[..120])
+    if flat.len() <= MAX_BYTES {
+        return flat;
     }
+    // `flat.len()` counts bytes, so cutting at MAX_BYTES can land inside a multi-byte character
+    // and `&flat[..MAX_BYTES]` panics — which aborts the process, taking the app down rather than
+    // costing one preview. Two shapes reach here: a label whose own text is multi-byte, and the
+    // far more common one, a label the UI already clipped with `clip(s, 120)` — that appends the
+    // three-byte `…` after 119 UTF-16 units, so any opening message over 120 characters puts the
+    // ellipsis at bytes 119..122 and byte 120 lands inside it whatever the language. Clamp to a
+    // boundary first, exactly as `web.rs` and `js_host.rs` already do before truncating.
+    let mut cut = MAX_BYTES;
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &flat[..cut])
 }
 
 /// The session index, newest first. Sessions with no `session_id` are excluded rather than
@@ -750,6 +761,50 @@ mod context_graph_tests {
         assert_eq!(rows[0].turns, 2, "two messages, not seven nodes");
         assert_eq!(rows[0].tool_calls, 2);
         assert_eq!(rows[0].model.as_deref(), Some("a/b"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The fixture that aborted the process: `clip(s, 120)` in the UI appends a three-byte `…`
+    /// after 119 UTF-16 units, so a label it produced is 122 bytes with the ellipsis at
+    /// 119..122 — and byte 120 is inside it. The cut had to move back to 119, which reconstructs
+    /// exactly what the UI wrote.
+    #[test]
+    fn a_preview_whose_cut_lands_inside_the_ui_ellipsis_is_clamped() {
+        let label = format!("{}…", "a".repeat(119));
+        assert_eq!(label.len(), 122, "119 ASCII bytes plus a three-byte ellipsis");
+        assert!(!label.is_char_boundary(120), "which is why the unguarded cut panicked");
+
+        assert_eq!(preview_of(&label), label);
+    }
+
+    /// A multi-byte character straddling the cut rather than sitting at the end, so the clamp
+    /// visibly truncates instead of reconstructing the input.
+    #[test]
+    fn a_preview_cut_inside_a_multibyte_character_drops_that_character() {
+        let label = format!("{}{}", "a".repeat(118), "€".repeat(10));
+        assert!(!label.is_char_boundary(120), "byte 120 is a continuation byte of a `€`");
+
+        let out = preview_of(&label);
+        assert_eq!(out, format!("{}…", "a".repeat(118)), "clamped back to the last full character");
+        assert!(!out.contains('€'), "the split character is dropped, not mangled");
+    }
+
+    /// The crash as it actually reached users: not a unit test of the truncation but the IPC
+    /// command the Assistant screen calls on mount. This aborted the process, so the assertion
+    /// that matters is that the call returns at all.
+    #[test]
+    fn a_session_whose_preview_straddles_the_cut_is_still_indexed() {
+        let (s, d) = temp_store("preview-clamp");
+        let mut m = node("message:s-1:1", "message");
+        m.label = format!("{}…", "a".repeat(119));
+        m.session_id = Some("s-1".into());
+        m.meta_json = Some(r#"{"role":"user"}"#.into());
+        record(&s, &[m], &[]).unwrap();
+
+        let rows = sessions(&s, 50).unwrap();
+        assert_eq!(rows.len(), 1, "the row is indexed rather than aborting the call");
+        assert_eq!(rows[0].preview.chars().count(), 120, "119 characters plus the ellipsis");
+        assert!(rows[0].preview.ends_with('…'), "preview: {}", rows[0].preview);
         let _ = std::fs::remove_dir_all(&d);
     }
 
