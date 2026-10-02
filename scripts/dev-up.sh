@@ -163,13 +163,25 @@ step "Installing the service"
 # machine where the job is already registered it would tear a working gateway down and then fail
 # to put it back.
 #
-# When launchd already holds the label, neither call is needed: replace the binary in place and
-# `kickstart` the job, which works from any session. `install` is used only for the first-time
-# case, where there is no job to lose.
+# When launchd already holds the label, neither call is needed: swap the binary and `kickstart`
+# the job, which works from any session. `install` is used only for the first-time case, where
+# there is no job to lose.
+#
+# The swap is a **rename, never a write in place**. `install` over the live path truncates and
+# rewrites the very file the running job was started from, and macOS invalidates a running
+# process's code signature the moment its on-disk image changes — the kernel then SIGKILLs it with
+# `OS_REASON_CODESIGNING` (`launchctl print` shows `last exit reason = OS_REASON_CODESIGNING`, and
+# AppKit files a report reading "Code Signature Invalid"). That is why every `dev-up.sh` run left
+# a crash report behind while the gateway had in fact come up cleanly seconds later. A
+# same-directory temp file plus `mv` is rename(2): the running process keeps the old inode, and the
+# path points at a complete, correctly-signed file before launchd is asked to start it.
 if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
-    echo "    job is registered — replacing the binary and restarting it"
-    install -m 755 "$SERVICE_BIN" "$DATA_DIR/bin/aiproviderd" \
-        || die "could not write $DATA_DIR/bin/aiproviderd" 3
+    echo "    job is registered — swapping the binary and restarting it"
+    NEW_BIN="$DATA_DIR/bin/.aiproviderd.new-$$"
+    install -m 755 "$SERVICE_BIN" "$NEW_BIN" \
+        || die "could not write $NEW_BIN" 3
+    mv -f "$NEW_BIN" "$DATA_DIR/bin/aiproviderd" \
+        || die "could not replace $DATA_DIR/bin/aiproviderd" 3
     launchctl kickstart -k "$DOMAIN/$LABEL" \
         || die "the job is registered but would not restart — see $DATA_DIR/aiproviderd.err.log" 3
 else
