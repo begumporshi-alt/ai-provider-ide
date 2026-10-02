@@ -201,7 +201,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "web_search",
     effect: "read",
     description:
-      "Search the public web with DuckDuckGo (no key needed) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
+      "Search the public web (keyless, automatic fallback between backends) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
     parameters: {
       properties: {
         query: { type: "string", description: "What to search for, in the user's terms." },

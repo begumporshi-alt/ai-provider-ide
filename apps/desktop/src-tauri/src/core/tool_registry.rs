@@ -251,7 +251,7 @@ fn build() -> Vec<ToolSpec> {
         },
         ToolSpec {
             name: "web_search",
-            description: "Search the public web with DuckDuckGo (no key needed) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
+            description: "Search the public web (keyless, automatic fallback between backends) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
             properties: json!({
                 "query": {
                     "type": "string",

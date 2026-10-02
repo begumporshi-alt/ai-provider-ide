@@ -1112,12 +1112,13 @@ fn do_web_fetch(args: &serde_json::Value) -> ToolResult {
     }
 }
 
-/// Search the public web via DuckDuckGo's HTML endpoint (keyless, like [`do_web_fetch`]).
+/// Search the public web via the keyless backend chain (DuckDuckGo, then SearXNG — see
+/// `core::web`; no API keys involved).
 fn do_web_search(args: &serde_json::Value) -> ToolResult {
     match (|| -> Result<String, String> {
         let query = arg_str(args, "query")?;
-        let hits = crate::core::web::web_search(&query)?;
-        Ok(crate::core::web::format_search_results(&query, &hits))
+        let (backend, hits) = crate::core::web::web_search(&query)?;
+        Ok(crate::core::web::format_search_results(&query, backend, &hits))
     })() {
         Ok(text) => ToolResult::ok(text),
         Err(e) => ToolResult::err(e),

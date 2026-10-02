@@ -3,11 +3,21 @@
 //! Two capabilities, no API keys, no external service accounts:
 //!
 //! - [`web_fetch_text`] — download a public page and hand back readable text (HTML stripped).
-//! - [`web_search`] — query DuckDuckGo's HTML endpoint (the "lite" page: server-rendered, no
-//!   JavaScript, no auth) and parse the result list out of it. This is the same trick curl-based
-//!   scrapers have used for years; it is free and unauthenticated, and the trade is that the
-//!   markup is unofficial, so the parser is written tolerant and its fixture test pins the shape
-//!   it relies on.
+//! - [`web_search`] — query keyless search endpoints and parse the result lists out of their
+//!   server-rendered HTML. There is no stable, free, keyless, general-web search API anywhere,
+//!   so search here is deliberately a CHAIN: backends are tried in order and the first that
+//!   answers wins (the result says which one). Today that is DuckDuckGo's "lite" page, then
+//!   DuckDuckGo's full "html" template (same provider, different markup, so one template
+//!   changing does not take out both); each parser is tolerant and pinned by a fixture test,
+//!   so a markup change degrades to the next backend instead of breaking the tool. The
+//!   chain-head slot is where an optional key-backed backend (Brave/Tavily/…) goes when a
+//!   settings field for it exists — see [`web_search`]. A self-hosted SearXNG is the permanent
+//!   keyless option and slots in at the tail — see [`parse_searxng`].
+//!
+//! For comparison: ZCode solves search by delegating to the model provider's server-side
+//! `web_search` (`supportsNativeWebSearch` in their handler) — the vendor hosts the search
+//! infrastructure. That is not available to a multi-provider, bring-your-own-key app, hence the
+//! chain.
 //!
 //! # The boundary is the URL guard, not the egress allowlist
 //!
@@ -422,29 +432,189 @@ pub fn parse_ddg_lite(html: &str) -> Vec<WebSearchHit> {
     hits
 }
 
-/// Query DuckDuckGo and return the parsed results. This is the whole `web_search` tool.
-pub fn web_search(query: &str) -> Result<Vec<WebSearchHit>, String> {
+/// Parse a DuckDuckGo "html" endpoint result page — the full template behind
+/// html.duckduckgo.com, whose markup differs from the lite page's table (`result__a` headline
+/// links, `result__snippet` blurbs). The two templates are the first two chain backends: same
+/// provider, but a markup change on one page does not touch the other.
+pub fn parse_ddg_html(html: &str) -> Vec<WebSearchHit> {
+    let link_re = Regex::new(r#"(?is)<a\b[^>]*class=["']result__a["'][^>]*>(.*?)</a>"#).expect("constant");
+    let href_re = Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#).expect("constant");
+    let snippet_re = Regex::new(r#"(?is)<a\b[^>]*class=["']result__snippet["'][^>]*>(.*?)</a>"#).expect("constant");
+
+    let snippets: Vec<String> = snippet_re
+        .captures_iter(html)
+        .map(|c| html_to_text(&c[1]))
+        .collect();
+
+    let mut hits: Vec<WebSearchHit> = Vec::new();
+    for caps in link_re.captures_iter(html) {
+        let anchor = &caps[0];
+        let Some(href) = href_re.captures(anchor) else { continue };
+        let mut url = href[1].trim().to_string();
+        if let Some(pos) = url.find("uddg=") {
+            let encoded = url[pos + 5..].split('&').next().unwrap_or("");
+            url = percent_decode(encoded);
+        } else if url.starts_with("//") {
+            url = format!("https:{url}");
+        }
+        if url.contains("duckduckgo.com") || !url.starts_with("http") {
+            continue;
+        }
+        let title = html_to_text(&caps[1]);
+        if title.is_empty() {
+            continue;
+        }
+        hits.push(WebSearchHit {
+            title,
+            url,
+            snippet: snippets.get(hits.len()).cloned().unwrap_or_default(),
+        });
+        if hits.len() >= 10 {
+            break;
+        }
+    }
+    hits
+}
+
+/// Parse a SearXNG result page (the default HTML theme): `<article class="result …">` blocks,
+/// each with a headline link and a `<p class="content">` blurb. Tolerant in the same way the
+/// DDG parsers are — it extracts what it recognises and skips what it does not.
+///
+/// Kept ready but NOT in the default chain: every public instance probed in 2026-10 serves a
+/// browser-verification challenge or 429s scripted clients. The parser's real purpose is a
+/// SELF-HOSTED instance, which is the permanent keyless path — user-owned infrastructure, no
+/// markup surprises, reachable because the search backends bypass the public-URL guard (the
+/// guard governs what the MODEL may fetch, not what the app's own configured services are).
+pub fn parse_searxng(html: &str) -> Vec<WebSearchHit> {
+    let article_re = Regex::new(r#"(?is)<article\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>(.*?)</article>"#)
+        .expect("constant");
+    let link_re = Regex::new(r#"(?is)<a\b([^>]*)href=["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("constant");
+    let content_re = Regex::new(r#"(?is)<p\b[^>]*class=["'][^"']*\bcontent\b[^"']*["'][^>]*>(.*?)</p>"#)
+        .expect("constant");
+
+    let mut hits: Vec<WebSearchHit> = Vec::new();
+    for caps in article_re.captures_iter(html) {
+        let block = &caps[1];
+        let Some(link) = link_re.captures(block) else { continue };
+        let url = link[2].trim().to_string();
+        // Results are absolute http(s) links; instance-internal ones (settings, about,
+        // pagination — relative or same-host) are not.
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            continue;
+        }
+        let title = html_to_text(&link[3]);
+        if title.is_empty() {
+            continue;
+        }
+        let snippet = content_re
+            .captures(block)
+            .map(|c| html_to_text(&c[1]))
+            .unwrap_or_default();
+        hits.push(WebSearchHit { title, url, snippet });
+        if hits.len() >= 10 {
+            break;
+        }
+    }
+    hits
+}
+
+/// GET one backend page and hand its body to the parser. Shared shape so the chain can hold a
+/// list of them.
+type SearchBackend = fn(&str) -> Result<Vec<WebSearchHit>, String>;
+
+/// Run the backend chain: first success wins; every failure is kept so the final error says
+/// what actually went wrong per backend. Generic over the backend callable (a `&dyn Fn`) so
+/// the failover logic is testable with closures and no network.
+pub fn run_search_chain(
+    query: &str,
+    backends: &[(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)],
+) -> Result<(&'static str, Vec<WebSearchHit>), String> {
+    let mut failures: Vec<String> = Vec::new();
+    for (name, backend) in backends {
+        match backend(query) {
+            Ok(hits) if hits.is_empty() => {
+                failures.push(format!("{name}: returned no results"));
+            }
+            Ok(hits) => return Ok((name, hits)),
+            Err(e) => failures.push(format!("{name}: {e}")),
+        }
+    }
+    Err(format!(
+        "every search backend failed — {}",
+        failures.join("; ")
+    ))
+}
+
+/// Query DuckDuckGo's lite page and parse the results.
+fn search_ddg_lite(query: &str) -> Result<Vec<WebSearchHit>, String> {
+    let mut url = reqwest::Url::parse("https://lite.duckduckgo.com/lite/").expect("constant");
+    url.query_pairs_mut().append_pair("q", query);
+    let body = http_get(&url)?;
+    let html = String::from_utf8_lossy(&body).into_owned();
+    let hits = parse_ddg_lite(&html);
+    if hits.is_empty() {
+        return Err("no parsable results (rate-limited or markup changed?)".into());
+    }
+    Ok(hits)
+}
+
+/// Query DuckDuckGo's "html" endpoint (the full template) and parse the results. Second in the
+/// chain: a different template from the lite page, so the two do not share a markup change.
+fn search_ddg_html(query: &str) -> Result<Vec<WebSearchHit>, String> {
+    let mut url = reqwest::Url::parse("https://html.duckduckgo.com/html/").expect("constant");
+    url.query_pairs_mut().append_pair("q", query);
+    let body = http_get(&url)?;
+    let html = String::from_utf8_lossy(&body).into_owned();
+    let hits = parse_ddg_html(&html);
+    if hits.is_empty() {
+        return Err("no parsable results (rate-limited or markup changed?)".into());
+    }
+    Ok(hits)
+}
+
+/// Query a SearXNG instance and parse the results. Not in the default chain — see
+/// [`parse_searxng`]; this is the self-hosted-instance path, held ready.
+const SEARXNG_BASE: &str = "https://searx.be/search";
+
+fn search_searxng(query: &str) -> Result<Vec<WebSearchHit>, String> {
+    let mut url = reqwest::Url::parse(SEARXNG_BASE).expect("constant");
+    url.query_pairs_mut().append_pair("q", query);
+    let body = http_get(&url)?;
+    let html = String::from_utf8_lossy(&body).into_owned();
+    let hits = parse_searxng(&html);
+    if hits.is_empty() {
+        return Err("no parsable results (blocked, down, or markup changed?)".into());
+    }
+    Ok(hits)
+}
+
+/// Search the public web: try every keyless backend in order, return the first answer with the
+/// name of the backend that served it. This is the whole `web_search` tool.
+///
+/// Where other backends go: a key-backed backend (Brave/Tavily/…) slots in at the HEAD of the
+/// list once a settings field for it exists, returning `Err` with a recognisable "no key
+/// configured" message when unset so the chain skips it without counting a failure; a
+/// self-hosted SearXNG slots in at the TAIL (see [`parse_searxng`]).
+pub fn web_search(query: &str) -> Result<(&'static str, Vec<WebSearchHit>), String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("a search query is required".into());
     }
     let query: String = query.chars().take(300).collect();
-    let mut url = reqwest::Url::parse("https://lite.duckduckgo.com/lite/").expect("constant");
-    url.query_pairs_mut().append_pair("q", &query);
-    let body = http_get(&url)?;
-    let html = String::from_utf8_lossy(&body).into_owned();
-    let hits = parse_ddg_lite(&html);
-    if hits.is_empty() {
-        return Err(
-            "the search engine returned no parsable results (it may be rate-limiting or changed its markup) — try again, or web_fetch a likely URL directly".into(),
-        );
-    }
-    Ok(hits)
+    let names: [&'static str; 2] = ["DuckDuckGo", "DuckDuckGo (html)"];
+    let backends: Vec<SearchBackend> = vec![search_ddg_lite, search_ddg_html];
+    let dyn_backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
+        names
+            .iter()
+            .zip(backends.iter())
+            .map(|(n, f)| (*n, f as &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>))
+            .collect();
+    run_search_chain(&query, &dyn_backends)
 }
 
 /// Format the results the way the transcript wants them.
-pub fn format_search_results(query: &str, hits: &[WebSearchHit]) -> String {
-    let mut out = format!("Results for \"{}\":\n\n", query.trim());
+pub fn format_search_results(query: &str, backend: &str, hits: &[WebSearchHit]) -> String {
+    let mut out = format!("Results for \"{}\" (via {backend}):\n\n", query.trim());
     for (i, hit) in hits.iter().enumerate() {
         out.push_str(&format!("{}. {}\n   {}\n", i + 1, hit.title, hit.url));
         if !hit.snippet.is_empty() {
@@ -543,6 +713,52 @@ mod tests {
         assert_eq!(hits[1].snippet, "The long-form docs.");
     }
 
+    const DDG_HTML_FIXTURE: &str = r#"<div class="results">
+      <div class="result results_links results_links_deep web-result">
+        <h2 class="result__title"><a rel="nofollow" class="result__a" href="https://example.org/guide">Rust <b>Guide</b></a></h2>
+        <a class="result__snippet" href="//duckduckgo.com/l/?uddg=https%3A%2F%2Fexample.org%2Fguide&amp;rut=abc">A gentle intro to <b>Rust</b> &amp; ownership.</a>
+      </div>
+      <div class="result results_links results_links_deep web-result">
+        <h2 class="result__title"><a rel="nofollow" class="result__a" href="https://docs.example.com/overview">Overview</a></h2>
+        <a class="result__snippet" href="https://docs.example.com/overview">The long-form docs.</a>
+      </div>
+    </div>"#;
+
+    #[test]
+    fn the_ddg_html_parser_extracts_hits_and_snippets() {
+        let hits = parse_ddg_html(DDG_HTML_FIXTURE);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].title, "Rust Guide");
+        assert_eq!(hits[0].url, "https://example.org/guide");
+        assert!(hits[0].snippet.contains("ownership"), "{:?}", hits[0].snippet);
+        assert_eq!(hits[1].url, "https://docs.example.com/overview");
+        assert_eq!(hits[1].snippet, "The long-form docs.");
+    }
+
+    const SEARXNG_FIXTURE: &str = r#"<div id="results">
+      <article class="result result-default">
+        <h3><a href="https://example.org/guide" class="url_wrapper">Rust <b>Guide</b></a></h3>
+        <p class="content">A gentle intro to Rust &amp; ownership.</p>
+      </article>
+      <article class="result result-default">
+        <h3><a href="https://docs.example.com/overview" class="url_wrapper">Overview</a></h3>
+        <p class="content">The long-form docs.</p>
+      </article>
+      <article class="result">
+        <h3><a href="/about">About this instance</a></h3>
+      </article>
+    </div>"#;
+
+    #[test]
+    fn the_searxng_parser_extracts_hits_and_drops_instance_links() {
+        let hits = parse_searxng(SEARXNG_FIXTURE);
+        assert_eq!(hits.len(), 2, "{hits:?}");
+        assert_eq!(hits[0].title, "Rust Guide");
+        assert_eq!(hits[0].url, "https://example.org/guide");
+        assert!(hits[0].snippet.contains("ownership"), "{:?}", hits[0].snippet);
+        assert_eq!(hits[1].url, "https://docs.example.com/overview");
+    }
+
     #[test]
     fn search_results_render_numbered_and_citable() {
         let hits = vec![WebSearchHit {
@@ -550,9 +766,55 @@ mod tests {
             url: "https://example.org/".into(),
             snippet: "S".into(),
         }];
-        let out = format_search_results("q", &hits);
+        let out = format_search_results("q", "DuckDuckGo", &hits);
         assert!(out.contains("1. T"), "{out}");
         assert!(out.contains("https://example.org/"), "{out}");
+        assert!(out.contains("via DuckDuckGo"), "{out}");
+    }
+
+    // ── the backend chain ────────────────────────────────────────────────
+
+    #[test]
+    fn the_chain_takes_the_first_backend_that_answers() {
+        let fail = |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
+        let serve = |_q: &str| -> Result<Vec<WebSearchHit>, String> {
+            Ok(vec![WebSearchHit {
+                title: "hit".into(),
+                url: "https://example.org/".into(),
+                snippet: String::new(),
+            }])
+        };
+        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
+            vec![("A", &fail), ("B", &serve)];
+        let (served, hits) = run_search_chain("q", &backends).expect("B serves");
+        assert_eq!(served, "B");
+        assert_eq!(hits.len(), 1);
+    }
+
+    #[test]
+    fn the_chain_aggregates_every_failure_when_all_backends_fail() {
+        let fail = |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
+        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
+            vec![("A", &fail), ("B", &fail)];
+        let err = run_search_chain("q", &backends).expect_err("all fail");
+        assert!(err.contains("A: backend is down"), "{err}");
+        assert!(err.contains("B: backend is down"), "{err}");
+    }
+
+    #[test]
+    fn an_empty_backend_answer_counts_as_a_failure_not_a_success() {
+        let empty = |_q: &str| -> Result<Vec<WebSearchHit>, String> { Ok(Vec::new()) };
+        let serve = |_q: &str| -> Result<Vec<WebSearchHit>, String> {
+            Ok(vec![WebSearchHit {
+                title: "hit".into(),
+                url: "https://example.org/".into(),
+                snippet: String::new(),
+            }])
+        };
+        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
+            vec![("A", &empty), ("B", &serve)];
+        let (served, _) = run_search_chain("q", &backends).expect("B serves");
+        assert_eq!(served, "B");
     }
 
     #[test]
