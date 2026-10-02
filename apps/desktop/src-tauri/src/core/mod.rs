@@ -72,3 +72,4 @@ pub mod tools;
 pub mod ui_session;
 pub mod usage;
 pub mod vault;
+pub mod web;

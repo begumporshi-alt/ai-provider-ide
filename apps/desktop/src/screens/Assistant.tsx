@@ -185,6 +185,7 @@ const AGENT_SYSTEM =
   "where something is, read_file (with offset/limit for large files) and list_dir to inspect, " +
   "file_info to check a path exists, edit_file to change one exact snippet, write_file to " +
   "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
+  "For the public web, web_search (DuckDuckGo, keyless) finds pages and web_fetch reads one. " +
   "For any task with several steps, maintain the task list with todo_write (the whole list, each " +
   "task pending/in_progress/completed, one in_progress at a time) — the user watches it live. " +
   "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +

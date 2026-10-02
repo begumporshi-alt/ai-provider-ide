@@ -9,8 +9,9 @@
 //! `write_file`, `edit_file`, `mkdir` and `run_command` are **mutating** — the four the gateway
 //! refuses unless mutation is explicitly enabled ([`crate::core::gateway::MUTATING_TOOLS`]), and the
 //! four the Assistant confirms one call at a time. `todo_write` mutates only the Assistant's
-//! progress panel, never the workspace, so it is not gated; the other four only read, and are
-//! always available.
+//! progress panel, never the workspace, and `web_fetch`/`web_search` reach the public internet
+//! without writing anywhere; none of them is gated. The other four only read, and are always
+//! available.
 //!
 //! # Why the invariants live in tests rather than in types
 //!
@@ -237,6 +238,28 @@ fn build() -> Vec<ToolSpec> {
             }),
             required: &["todos"],
         },
+        ToolSpec {
+            name: "web_fetch",
+            description: "Read a public web page from the internet: fetched over http(s), HTML stripped, text capped at 32 KB. Private, loopback and non-http(s) URLs are refused.",
+            properties: json!({
+                "url": {
+                    "type": "string",
+                    "description": "The page's public http(s) URL. Redirects are reported, not followed — call again on the Location.",
+                },
+            }),
+            required: &["url"],
+        },
+        ToolSpec {
+            name: "web_search",
+            description: "Search the public web with DuckDuckGo (no key needed) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
+            properties: json!({
+                "query": {
+                    "type": "string",
+                    "description": "What to search for, in the user's terms.",
+                },
+            }),
+            required: &["query"],
+        },
     ]
 }
 
@@ -246,8 +269,8 @@ mod tests {
     use crate::core::gateway::MUTATING_TOOLS;
 
     #[test]
-    fn the_registry_holds_nine_tools() {
-        assert_eq!(agent_tools().len(), 9);
+    fn the_registry_holds_eleven_tools() {
+        assert_eq!(agent_tools().len(), 11);
     }
 
     #[test]
@@ -344,10 +367,19 @@ mod tests {
             names.iter().copied().filter(|n| !MUTATING_TOOLS.contains(n)).collect();
         read_only.sort_unstable();
         // `todo_write` mutates only the Assistant's progress panel, never the workspace, so it
-        // is on the read-only side even though its name says "write".
+        // is on the read-only side even though its name says "write". The web tools reach the
+        // public internet but write nothing anywhere, so they read too.
         assert_eq!(
             read_only,
-            vec!["file_info", "list_dir", "read_file", "search_files", "todo_write"]
+            vec![
+                "file_info",
+                "list_dir",
+                "read_file",
+                "search_files",
+                "todo_write",
+                "web_fetch",
+                "web_search"
+            ]
         );
     }
 
@@ -361,12 +393,12 @@ mod tests {
     // ── gateway_tool_set ──────────────────────────────────────────────────
 
     /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
-    /// will refuse. Falsified by dropping the filter — the set goes back to nine.
+    /// will refuse. Falsified by dropping the filter — the set goes back to eleven.
     #[test]
     fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
         let set = gateway_tool_set(false);
         let names: Vec<&str> = set.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 5, "expected the five read-only tools, got {names:?}");
+        assert_eq!(names.len(), 7, "expected the seven read-only tools, got {names:?}");
         for m in MUTATING_TOOLS {
             assert!(!names.contains(&m), "{m} is advertised but would be refused");
         }
@@ -375,16 +407,16 @@ mod tests {
     /// Enabling mutation is opt-in and must restore the whole registry, not a subset.
     #[test]
     fn gateway_tool_set_includes_every_tool_when_mutation_is_on() {
-        assert_eq!(gateway_tool_set(true).len(), 9);
+        assert_eq!(gateway_tool_set(true).len(), 11);
     }
 
-    /// The read-only five are advertised either way — narrowing must never remove a tool the
+    /// The read-only seven are advertised either way — narrowing must never remove a tool the
     /// gateway is willing to run.
     #[test]
     fn the_read_only_tools_are_advertised_either_way() {
         for on in [true, false] {
             let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
-            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write"] {
+            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write", "web_fetch", "web_search"] {
                 assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
             }
         }
@@ -427,25 +459,20 @@ mod tests {
         );
     }
 
-    /// The trim saved ~318 chars of the ~4,050-char full render (~26%).  This test pins that the
-    /// narrowed set stays under 55% of the full render — a regression signal if descriptions grow
-    /// back past the budget.
-    ///
-    /// (The test above checks < 50%; this one is the tighter budget check.  Both must hold.)
+    /// The token-budget guard for the registry as a whole: no tool may bloat the render past a
+    /// fixed per-tool budget. This replaced the old "narrowed under 55% of full" check, which
+    /// was composed for a registry that was half read-only — after the web tools joined, the
+    /// read-only share is 7/11 and that ratio test became structurally unreachable. The
+    /// proportional-share test above still guards the narrowing; this one guards bloat.
     #[test]
-    fn the_narrowed_set_stays_under_55pct_of_full() {
+    fn the_registry_render_stays_under_the_per_tool_budget() {
         let full = registry_to_openai(agent_tools()).expect("full registry renders");
-        let narrowed = registry_to_openai(&gateway_tool_set(false)).expect("narrowed renders");
         let full_bytes = serde_json::to_string(&full).unwrap().len();
-        let narrow_bytes = serde_json::to_string(&narrowed).unwrap().len();
-        // 55% threshold: the 26% trim saves ~1,050 of ~4,050 chars, so the 4/8-tool
-        // ratio should land around 46–50%.  55% gives a small margin for one description
-        // growing back without flagging.
-        let ratio = narrow_bytes as f64 / full_bytes as f64;
+        let budget = 650 * agent_tools().len();
         assert!(
-            ratio < 0.55,
-            "narrowed {narrow_bytes} bytes is {pct:.0}% of full {full_bytes}; expected < 55%",
-            pct = ratio * 100.0
+            full_bytes <= budget,
+            "full render {full_bytes} bytes is over the {budget}-byte budget ({} tools × 650)",
+            agent_tools().len()
         );
     }
 

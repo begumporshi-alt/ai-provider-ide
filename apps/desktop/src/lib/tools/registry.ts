@@ -182,6 +182,33 @@ export const AGENT_TOOLS: ToolSpec[] = [
       required: ["todos"],
     },
   },
+  {
+    name: "web_fetch",
+    effect: "read",
+    description:
+      "Read a public web page from the internet: fetched over http(s), HTML stripped, text capped at 32 KB. Private, loopback and non-http(s) URLs are refused.",
+    parameters: {
+      properties: {
+        url: {
+          type: "string",
+          description: "The page's public http(s) URL. Redirects are reported, not followed — call again on the Location.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "web_search",
+    effect: "read",
+    description:
+      "Search the public web with DuckDuckGo (no key needed) and get the top results: title, URL and snippet. Follow up with web_fetch to read a result.",
+    parameters: {
+      properties: {
+        query: { type: "string", description: "What to search for, in the user's terms." },
+      },
+      required: ["query"],
+    },
+  },
 ];
 
 /** Render the OpenAI `tools` array from a registry. Empty registry yields undefined so the

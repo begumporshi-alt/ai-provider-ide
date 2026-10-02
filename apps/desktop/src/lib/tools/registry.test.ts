@@ -53,7 +53,15 @@ describe("AGENT_TOOLS", () => {
     // tool that writes without being gated. `todo_write` only feeds the progress capsule —
     // it never touches the workspace — so it belongs on the read-only side.
     const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
-    expect(readOnly.sort()).toEqual(["file_info", "list_dir", "read_file", "search_files", "todo_write"]);
+    expect(readOnly.sort()).toEqual([
+      "file_info",
+      "list_dir",
+      "read_file",
+      "search_files",
+      "todo_write",
+      "web_fetch",
+      "web_search",
+    ]);
   });
 
   it("editing is possible without rewriting a whole file", () => {

@@ -1099,6 +1099,31 @@ pub fn git_commit_push(root: &Path, message: &str) -> Result<String, String> {
     Ok(summary)
 }
 
+/// Read a public web page for the model (built-in, keyless — the machinery is `core::web`). The
+/// workspace root is irrelevant here and the boundary is different too: the URL guard in
+/// `core::web` confines the tool to the public internet, not to a directory.
+fn do_web_fetch(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let url = arg_str(args, "url")?;
+        crate::core::web::web_fetch_text(&url)
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// Search the public web via DuckDuckGo's HTML endpoint (keyless, like [`do_web_fetch`]).
+fn do_web_search(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let query = arg_str(args, "query")?;
+        let hits = crate::core::web::web_search(&query)?;
+        Ok(crate::core::web::format_search_results(&query, &hits))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
     let root = match validate_root(Path::new(&req.root)) {
@@ -1120,6 +1145,8 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "file_info" => do_file_info(&args, &root),
         "run_command" => do_run_command(&args, &root),
         "todo_write" => do_todo_write(&args),
+        "web_fetch" => do_web_fetch(&args),
+        "web_search" => do_web_search(&args),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }
