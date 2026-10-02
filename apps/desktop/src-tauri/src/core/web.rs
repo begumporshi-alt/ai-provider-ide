@@ -183,6 +183,14 @@ pub fn http_get(url: &reqwest::Url) -> Result<Vec<u8>, String> {
         if !status.is_success() {
             return Err(format!("HTTP {status}"));
         }
+        if status.as_u16() != 200 {
+            // 2xx-but-not-200 from a page GET is a bot-check/anomaly response in practice (the
+            // search engines answer 202 with a challenge page). Say so: the model reading this
+            // should retry later or fetch a likely URL directly, not parse a challenge page.
+            return Err(format!(
+                "HTTP {status} — likely a bot check or rate limit; wait a moment and retry"
+            ));
+        }
         let total = resp.content_length();
         if let Some(n) = total {
             if n as usize > MAX_BODY_BYTES {
@@ -572,21 +580,11 @@ fn search_ddg_html(query: &str) -> Result<Vec<WebSearchHit>, String> {
     Ok(hits)
 }
 
-/// Query a SearXNG instance and parse the results. Not in the default chain — see
-/// [`parse_searxng`]; this is the self-hosted-instance path, held ready.
-const SEARXNG_BASE: &str = "https://searx.be/search";
-
-fn search_searxng(query: &str) -> Result<Vec<WebSearchHit>, String> {
-    let mut url = reqwest::Url::parse(SEARXNG_BASE).expect("constant");
-    url.query_pairs_mut().append_pair("q", query);
-    let body = http_get(&url)?;
-    let html = String::from_utf8_lossy(&body).into_owned();
-    let hits = parse_searxng(&html);
-    if hits.is_empty() {
-        return Err("no parsable results (blocked, down, or markup changed?)".into());
-    }
-    Ok(hits)
-}
+/// Query a SearXNG instance and parse the results. Held ready, not wired into the chain —
+/// see [`parse_searxng`]. Wiring it is one entry in `web_search`'s backend list plus this
+/// request; the base URL is a placeholder to be replaced by the configured instance's.
+// fn search_searxng — removed until a settings field exists for the instance URL, so the
+// build carries no unreachable code; the parser above is the tested half and stays.
 
 /// Search the public web: try every keyless backend in order, return the first answer with the
 /// name of the backend that served it. This is the whole `web_search` tool.
