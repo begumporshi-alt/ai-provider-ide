@@ -350,8 +350,8 @@ pub fn html_to_text(html: &str) -> String {
 }
 
 /// Decode the HTML entities the wild actually uses. Scans once and never re-scans output, so
-/// `&amp;lt;` decodes to the literal `&lt;` rather than `<`.
-fn decode_entities(s: &str) -> String {
+/// `&amp;lt;` decodes to the literal `&lt;` rather than `<`. Shared with the DOCX extractor.
+pub fn decode_entities(s: &str) -> String {
     if !s.contains('&') {
         return s.to_string();
     }
@@ -829,6 +829,83 @@ pub fn web_search(query: &str) -> Result<(&'static str, Vec<WebSearchHit>), Stri
             .map(|(n, f)| (*n, f as &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>))
             .collect();
     run_search_chain(&query, &dyn_backends)
+}
+
+/// Send one HTTP request to a public URL and return `HTTP {status}` plus the body. This backs
+/// the `http_request` tool — the general-API caller that `http_get` deliberately is not. The
+/// same guard applies (public http(s) only), redirects are reported rather than followed, and
+/// the body is capped. The tool is registered MUTATING because a request is data leaving the
+/// machine: it rides the approval gate, not the read-only fast path.
+pub fn http_request(
+    method: &str,
+    raw_url: &str,
+    headers: &[(String, String)],
+    body: Option<&str>,
+) -> Result<String, String> {
+    const MAX_RESPONSE_BYTES: usize = 256 * 1024;
+    let url = check_public_http_url(raw_url)?;
+    let method = method.to_ascii_uppercase();
+    match method.as_str() {
+        "GET" | "POST" | "PUT" | "PATCH" | "DELETE" | "HEAD" | "OPTIONS" => {}
+        other => return Err(format!("method \"{other}\" is not supported")),
+    }
+    let client = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(FETCH_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .build()
+        .map_err(|e| format!("cannot build HTTP client: {e}"))?;
+    runtime().block_on(async {
+        let m: reqwest::Method = method
+            .parse()
+            .map_err(|e| format!("bad method: {e}"))?;
+        let mut req = client.request(m, url.clone());
+        for (name, value) in headers {
+            if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
+                return Err(format!("header \"{name}\" contains a line break — refused"));
+            }
+            req = req.header(name.as_str(), value.as_str());
+        }
+        if let Some(b) = body {
+            req = req.body(b.to_string());
+        }
+        let resp = req.send().await.map_err(|e| format!("request failed: {e}"))?;
+        let status = resp.status();
+        if status.is_redirection() {
+            let loc = resp
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("(no location)");
+            return Err(format!("redirected to {loc} — request that URL directly"));
+        }
+        let mut out = format!("HTTP {status}");
+        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+            out.push_str(&format!(" ({ct})"));
+        }
+        let mut bytes: Vec<u8> = Vec::new();
+        let mut resp = resp;
+        while let Some(chunk) = resp
+            .chunk()
+            .await
+            .map_err(|e| format!("reading the response failed: {e}"))?
+        {
+            if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
+                bytes.extend_from_slice(&chunk[..MAX_RESPONSE_BYTES - bytes.len()]);
+                out.push_str("\n\n(response truncated at 256 KB)");
+                return Ok(out);
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        if text.trim().is_empty() {
+            return Ok(format!("{out}\n\n(empty body)"));
+        }
+        out.push_str("\n\n");
+        out.push_str(&text);
+        Ok(out)
+    })
 }
 
 /// Format the results the way the transcript wants them.

@@ -815,8 +815,16 @@ pub const MEMORY_FREEZE_TTL: Duration = Duration::from_secs(600);
 /// accumulates one entry per session for ever.
 const MAX_FROZEN_BLOCKS: usize = 256;
 
-/// Gateway-side tools that can change the workspace. Everything else only reads it.
-pub const MUTATING_TOOLS: [&str; 4] = ["write_file", "edit_file", "mkdir", "run_command"];
+/// Gateway-side tools that can change the workspace — or, for `http_request`, send data out of
+/// it. Everything else only reads.
+pub const MUTATING_TOOLS: [&str; 6] = [
+    "write_file",
+    "edit_file",
+    "mkdir",
+    "run_command",
+    "http_request",
+    "apply_patch",
+];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///

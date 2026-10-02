@@ -17,9 +17,11 @@ function state(patch: Partial<Parameters<typeof decide>[0]> = {}) {
 }
 
 describe("toolEffect", () => {
-  it("classifies the four writing tools as mutations and the rest as reads", () => {
+  it("classifies the mutating tools as mutations and the rest as reads", () => {
     const mutate = AGENT_TOOLS.filter((t) => t.effect === "mutate").map((t) => t.name).sort();
-    expect(mutate).toEqual(["edit_file", "mkdir", "run_command", "write_file"]);
+    // `http_request` sends data out and `apply_patch` rewrites files, so both are gated like
+    // the file writers even though neither name says "write".
+    expect(mutate).toEqual(["apply_patch", "edit_file", "http_request", "mkdir", "run_command", "write_file"]);
   });
 
   it("answers `mutate` for a name the registry does not know", () => {

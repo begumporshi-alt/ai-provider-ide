@@ -15,7 +15,7 @@ import { describe, expect, it } from "vitest";
 import { AGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
 
 /** Mirrors `MUTATING_TOOLS` in src-tauri/src/gateway.rs. Keep the two in step. */
-const MUTATING = ["write_file", "edit_file", "mkdir", "run_command"];
+const MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
 
 describe("AGENT_TOOLS", () => {
   it("names are unique", () => {
@@ -57,7 +57,9 @@ describe("AGENT_TOOLS", () => {
       "file_info",
       "glob",
       "list_dir",
+      "read_document",
       "read_file",
+      "read_image",
       "search_files",
       "todo_write",
       "web_fetch",

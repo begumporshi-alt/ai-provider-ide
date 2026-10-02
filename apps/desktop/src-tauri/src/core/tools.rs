@@ -27,6 +27,7 @@
 use std::collections::HashSet;
 use std::fs;
 use std::io::Read;
+use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -35,6 +36,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use regex::Regex;
+use base64::Engine as _;
 
 /// Executables that may start. Everything else is refused, including anything destructive
 /// (`rm`, `mv` to `rm`-like effect is bounded by confinement) or network-facing.
@@ -1228,6 +1230,322 @@ fn do_web_search(args: &serde_json::Value) -> ToolResult {
     }
 }
 
+/// Extract readable text from a PDF or DOCX in the workspace. Binary documents are the one
+/// thing `read_file` cannot serve (it is UTF-8-only by design), and "read the spec PDF in my
+/// project" is a core assistant task. Text is capped like `read_file`.
+fn do_read_document(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let rel = arg_str(args, "path")?;
+        let path = resolve_within(root, &rel, false)?;
+        let meta = fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if meta.len() > 20 * 1024 * 1024 {
+            return Err(format!("{rel} is over the 20 MB document cap"));
+        }
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let text = match ext.as_str() {
+            "pdf" => pdf_extract::extract_text(&path)
+                .map_err(|e| format!("PDF extraction failed: {e}"))?,
+            "docx" => docx_text(&path, &rel)?,
+            other => {
+                return Err(format!(
+                    "\"{other}\" documents are not supported — read_document covers .pdf and .docx; use read_file for text"
+                ))
+            }
+        };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return Err(format!("{rel} contains no extractable text (scanned images have no text layer)"));
+        }
+        if text.len() > MAX_READ_BYTES {
+            let mut cut = MAX_READ_BYTES;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            return Ok(format!(
+                "{}\n\n(truncated at {} KB of {} KB total)",
+                &text[..cut],
+                MAX_READ_BYTES / 1024,
+                text.len() / 1024
+            ));
+        }
+        Ok(text)
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// DOCX text: the document is a ZIP whose `word/document.xml` holds the body. Paragraphs end
+/// at `</w:p>`, runs of text live in `<w:t>` elements. Deliberately regex-shaped rather than a
+/// full XML parse — the OOXML body is machine-generated and the tolerance is the point.
+fn docx_text(path: &Path, rel: &str) -> Result<String, String> {
+    let file = fs::File::open(path).map_err(|e| format!("cannot open {rel}: {e}"))?;
+    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{rel} is not a readable DOCX: {e}"))?;
+    let mut xml = String::new();
+    archive
+        .by_name("word/document.xml")
+        .map_err(|e| format!("{rel} is missing word/document.xml: {e}"))?
+        .read_to_string(&mut xml)
+        .map_err(|e| format!("cannot decode {rel}: {e}"))?;
+    let paragraphs = xml.replace("</w:p>", "\n");
+    let run = Regex::new(r"(?s)<w:t[^>]*>(.*?)</w:t>").expect("constant");
+    let mut out = String::new();
+    for para in paragraphs.split('\n') {
+        let mut line = String::new();
+        for c in run.captures_iter(para) {
+            line.push_str(&crate::core::web::decode_entities(&c[1]));
+        }
+        out.push_str(line.trim_end());
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+/// Serve a workspace image to a vision-capable model. The base64 payload rides in the tool
+/// result under a marker; the Assistant's loop strips it out and attaches the image as a real
+/// content part (the same wire shape chat attachments use), leaving the model a short text
+/// receipt. A non-vision model will see the receipt and can say so.
+const IMAGE_EXTENSIONS: &[(&str, &str)] = &[("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("webp", "image/webp")];
+
+fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let rel = arg_str(args, "path")?;
+        let path = resolve_within(root, &rel, false)?;
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        let media = IMAGE_EXTENSIONS
+            .iter()
+            .find(|(e, _)| *e == ext)
+            .map(|(_, m)| *m)
+            .ok_or_else(|| {
+                format!(
+                    "\"{ext}\" is not a supported image — supported: {}",
+                    IMAGE_EXTENSIONS.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ")
+                )
+            })?;
+        let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if bytes.len() > 4 * 1024 * 1024 {
+            return Err(format!("{rel} is over the 4 MB image cap"));
+        }
+        let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
+        Ok(format!(
+            "READ_IMAGE:{media};base64,{b64}\npath: {rel}\nbytes: {}",
+            bytes.len()
+        ))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// Send one HTTP request to a public URL — the general-API caller. Registered MUTATING: a
+/// request is data leaving the machine, so it rides the approval gate and the gateway's
+/// mutation switch; the public-URL guard (core::web) still rules out the local network.
+fn do_http_request(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let method = args.get("method").and_then(|m| m.as_str()).unwrap_or("GET");
+        let url = arg_str(args, "url")?;
+        let mut headers: Vec<(String, String)> = Vec::new();
+        match args.get("headers") {
+            Some(serde_json::Value::Object(map)) => {
+                for (k, v) in map {
+                    headers.push((k.clone(), match v {
+                        serde_json::Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    }));
+                }
+            }
+            Some(serde_json::Value::Null) | None => {}
+            Some(_) => return Err("\"headers\" must be an object of string values".into()),
+        }
+        let body = match args.get("body") {
+            Some(serde_json::Value::String(s)) => Some(s.as_str()),
+            Some(serde_json::Value::Null) | None => None,
+            Some(_) => return Err("\"body\" must be a string".into()),
+        };
+        if body.is_some() && matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS") {
+            return Err(format!("{method} does not carry a body — use POST/PUT/PATCH"));
+        }
+        crate::core::web::http_request(method, &url, &headers, body)
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// Apply a unified diff to workspace files. Strict: every context and deletion line must match
+/// the file exactly (searched forward from the previous hunk, so line drift is tolerated but
+/// content drift is not), and anything ambiguous fails the whole patch rather than applying
+/// half of it. Registered MUTATING like edit_file, which it complements for multi-hunk and
+/// multi-file changes.
+fn do_apply_patch(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let patch = arg_str(args, "patch")?;
+        let files = parse_unified_patch(&patch)?;
+        if files.is_empty() {
+            return Err("no file diffs found in the patch".into());
+        }
+        let mut report: Vec<String> = Vec::new();
+        for file in &files {
+            let target = resolve_within(root, &file.path, true)?;
+            let mut lines: Vec<String> = if file.is_new {
+                Vec::new()
+            } else {
+                fs::read_to_string(&target)
+                    .map_err(|e| format!("cannot read {}: {e}", file.path))?
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            };
+            let had_trailing_newline = file.is_new
+                || fs::read_to_string(&target)
+                    .map(|s| s.ends_with('\n'))
+                    .unwrap_or(true);
+            let mut cursor = 0usize;
+            for (i, hunk) in file.hunks.iter().enumerate() {
+                if hunk.before.is_empty() {
+                    // A pure insertion lands at the hunk's declared line (1-based), searched
+                    // forward like any other hunk.
+                    let at = hunk.old_start.saturating_sub(1).min(lines.len());
+                    if at < cursor {
+                        return Err(format!("{}: hunk {} would move backwards", file.path, i + 1));
+                    }
+                    let at = at.clamp(cursor, lines.len());
+                    lines.splice(at..at, hunk.after.iter().cloned());
+                    cursor = at + hunk.after.len();
+                    continue;
+                }
+                let found = (cursor..=lines.len().saturating_sub(hunk.before.len()))
+                    .find(|&i| lines[i..i + hunk.before.len()] == hunk.before[..]);
+                let Some(at) = found else {
+                    return Err(format!(
+                        "{}: hunk {} does not match the file — context lines must be exact",
+                        file.path,
+                        i + 1
+                    ));
+                };
+                lines.splice(at..at + hunk.before.len(), hunk.after.iter().cloned());
+                cursor = at + hunk.after.len();
+            }
+            if let Some(parent) = target.parent() {
+                let _ = fs::create_dir_all(parent);
+            }
+            let mut out = lines.join("\n");
+            if had_trailing_newline && !out.is_empty() {
+                out.push('\n');
+            }
+            fs::write(&target, out).map_err(|e| format!("cannot write {}: {e}", file.path))?;
+            report.push(format!("applied {} hunk(s) to {}", file.hunks.len(), file.path));
+        }
+        Ok(report.join("\n"))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// One file's worth of a unified diff.
+struct PatchFile {
+    path: String,
+    is_new: bool,
+    hunks: Vec<PatchHunk>,
+}
+
+/// One `@@` hunk: the lines it expects to find (`before` = context + deletions) and what
+/// replaces them (`after` = context + additions).
+struct PatchHunk {
+    old_start: usize,
+    before: Vec<String>,
+    after: Vec<String>,
+}
+
+/// Parse a unified diff. Tolerant of the header shapes models emit (`a/`/`b:` prefixes,
+/// `diff --git` noise, missing counts in `@@`), strict about hunk content.
+fn parse_unified_patch(patch: &str) -> Result<Vec<PatchFile>, String> {
+    let hunk_header = Regex::new(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@").expect("constant");
+    let strip_prefix = |p: &str| -> String {
+        let p = p.trim();
+        if p == "/dev/null" {
+            return String::new();
+        }
+        p.strip_prefix("b/")
+            .or_else(|| p.strip_prefix("a/"))
+            .unwrap_or(p)
+            .trim_start_matches([':', ' '])
+            .to_string()
+    };
+    let mut files: Vec<PatchFile> = Vec::new();
+    let mut current: Option<PatchFile> = None;
+    let mut in_hunk = false;
+    let mut pending_old: Option<String> = None;
+    for line in patch.lines() {
+        if let Some(c) = hunk_header.captures(line) {
+            let f = current.as_mut().ok_or("a hunk appeared before any ---/+++ header")?;
+            f.hunks.push(PatchHunk {
+                old_start: c[1].parse().unwrap_or(1),
+                before: Vec::new(),
+                after: Vec::new(),
+            });
+            in_hunk = true;
+            continue;
+        }
+        if line.starts_with("--- ") {
+            pending_old = Some(line[4..].trim().to_string());
+            in_hunk = false;
+            continue; // the +++ line decides the target path
+        }
+        if line.starts_with("+++ ") {
+            let path = strip_prefix(&line[4..]);
+            if path.is_empty() {
+                return Err("file deletion is not supported — remove the file with a command instead".into());
+            }
+            let is_new = pending_old.as_deref() == Some("/dev/null");
+            // A new +++ header closes the previous file: a multi-file patch would otherwise
+            // silently keep only its last file.
+            if let Some(f) = current.take() {
+                files.push(f);
+            }
+            current = Some(PatchFile { path, is_new, hunks: Vec::new() });
+            continue;
+        }
+        if !in_hunk {
+            continue; // `diff --git`, index, mode lines and anything else outside hunks
+        }
+        let Some(f) = current.as_mut() else { continue };
+        let Some(hunk) = f.hunks.last_mut() else { continue };
+        if let Some(rest) = line.strip_prefix(' ') {
+            hunk.before.push(rest.to_string());
+            hunk.after.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix('-') {
+            hunk.before.push(rest.to_string());
+        } else if let Some(rest) = line.strip_prefix('+') {
+            hunk.after.push(rest.to_string());
+        } else if line == "\\" || line.starts_with("\\ No newline") {
+            continue;
+        } else if line.is_empty() {
+            // A blank line inside a hunk is a context line whose content is empty (the
+            // trailing space is commonly stripped by editors and models alike).
+            hunk.before.push(String::new());
+            hunk.after.push(String::new());
+        } else {
+            // Anything else ends the hunk stream (the next ---/+++ will restart it).
+            in_hunk = false;
+        }
+    }
+        if let Some(f) = current.take() {
+            files.push(f);
+        }
+        files.retain(|f| !f.hunks.is_empty());
+        Ok(files)
+}
+
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
 pub fn tool_run(req: ToolRunRequest) -> ToolResult {
     let root = match validate_root(Path::new(&req.root)) {
@@ -1251,6 +1569,10 @@ pub fn tool_run(req: ToolRunRequest) -> ToolResult {
         "todo_write" => do_todo_write(&args),
         "web_fetch" => do_web_fetch(&args),
         "web_search" => do_web_search(&args),
+        "read_document" => do_read_document(&args, &root),
+        "read_image" => do_read_image(&args, &root),
+        "http_request" => do_http_request(&args),
+        "apply_patch" => do_apply_patch(&args, &root),
         "glob" => do_glob(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
@@ -1565,6 +1887,154 @@ mod tests {
         let none = do_glob(&obj(&[("pattern", serde_json::json!("**/*.zig"))]), &dir);
         assert!(none.ok);
         assert!(none.output.contains("no paths match"));
+    }
+
+    // --- read_document: a real DOCX built in the test, plus the refusal paths ---
+
+    #[test]
+    fn read_document_extracts_a_docx_built_in_the_test() {
+        use zip::write::SimpleFileOptions;
+        let dir = root();
+        let docx = dir.join("spec.docx");
+        let file = fs::File::create(&docx).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file("word/document.xml", SimpleFileOptions::default()).unwrap();
+        let xml = concat!(
+            r#"<?xml version="1.0"?><w:document xmlns:w="w"><w:body>"#,
+            r#"<w:p><w:r><w:t>First paragraph &amp; intro</w:t></w:r></w:p>"#,
+            r#"<w:p><w:r><w:t>Second line</w:t></w:r><w:r><w:t> joined</w:t></w:r></w:p>"#,
+            r#"</w:body></w:document>"#
+        );
+        zip.write_all(xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+
+        let res = do_read_document(&obj(&[("path", serde_json::json!("spec.docx"))]), &dir);
+        assert!(res.ok, "{:?}", res.error);
+        assert!(res.output.contains("First paragraph & intro"), "{}", res.output);
+        assert!(res.output.contains("Second line joined"), "{}", res.output);
+    }
+
+    #[test]
+    fn read_document_refuses_unsupported_and_missing_files() {
+        let dir = root();
+        fs::write(dir.join("notes.txt"), "plain").unwrap();
+        let res = do_read_document(&obj(&[("path", serde_json::json!("notes.txt"))]), &dir);
+        assert!(!res.ok, "txt must be routed to read_file, not read_document");
+        let res = do_read_document(&obj(&[("path", serde_json::json!("absent.pdf"))]), &dir);
+        assert!(!res.ok);
+    }
+
+    // --- read_image: marker format, size and extension gates ---
+
+    #[test]
+    fn read_image_serves_base64_under_the_marker() {
+        let dir = root();
+        // 1x1 PNG, a real image so the extension and content path are both exercised.
+        let png: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
+        ];
+        fs::write(dir.join("dot.png"), png).unwrap();
+        let res = do_read_image(&obj(&[("path", serde_json::json!("dot.png"))]), &dir);
+        assert!(res.ok, "{:?}", res.error);
+        let out = res.output;
+        assert!(out.starts_with("READ_IMAGE:image/png;base64,"), "{out}");
+        assert!(out.contains("path: dot.png"));
+    }
+
+    #[test]
+    fn read_image_refuses_non_images() {
+        let dir = root();
+        fs::write(dir.join("x.txt"), "nope").unwrap();
+        let res = do_read_image(&obj(&[("path", serde_json::json!("x.txt"))]), &dir);
+        assert!(!res.ok);
+        assert!(res.error.unwrap().contains("not a supported image"));
+    }
+
+    // --- http_request: the offline validation gates (the live path is web.rs's) ---
+
+    #[test]
+    fn http_request_refuses_a_body_on_get_and_bad_methods() {
+        let res = do_http_request(&obj(&[
+            ("url", serde_json::json!("https://example.com/")),
+            ("method", serde_json::json!("GET")),
+            ("body", serde_json::json!("data")),
+        ]));
+        assert!(!res.ok, "GET must not carry a body");
+        let res = do_http_request(&obj(&[
+            ("url", serde_json::json!("https://example.com/")),
+            ("method", serde_json::json!("TRACE")),
+        ]));
+        assert!(!res.ok, "unsupported methods are refused");
+    }
+
+    // --- apply_patch: strict unified-diff application ---
+
+    #[test]
+    fn apply_patch_rewrites_one_file_with_context() {
+        let dir = root();
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-two
++TWO
+ three";
+        let res = do_apply_patch(&obj(&[("patch", serde_json::json!(patch))]), &dir);
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "one\nTWO\nthree\n");
+    }
+
+    #[test]
+    fn apply_patch_handles_multiple_hunks_files_and_new_files() {
+        let dir = root();
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let patch = "\
+diff --git a/a.txt b/a.txt
+--- a/a.txt
++++ b/a.txt
+@@ -1,2 +1,3 @@
+ one
++inserted
+ two
+@@ -4,2 +5,2 @@
+ four
+-five
++FIVE
+--- /dev/null
++++ b/new/nested.txt
+@@ -0,0 +1,2 @@
++hello
++world";
+        let res = do_apply_patch(&obj(&[("patch", serde_json::json!(patch))]), &dir);
+        assert!(res.ok, "{:?}", res.error);
+        assert_eq!(
+            fs::read_to_string(dir.join("a.txt")).unwrap(),
+            "one\ninserted\ntwo\nthree\nfour\nFIVE\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("new/nested.txt")).unwrap(),
+            "hello\nworld\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_fails_the_whole_patch_when_context_drifts() {
+        let dir = root();
+        fs::write(dir.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        let patch = "\
+--- a/a.txt
++++ b/a.txt
+@@ -1,3 +1,3 @@
+ one
+-totally-different
++TWO
+ three";
+        let res = do_apply_patch(&obj(&[("patch", serde_json::json!(patch))]), &dir);
+        assert!(!res.ok, "a context mismatch must fail, not half-apply");
+        assert!(res.error.unwrap().contains("does not match the file"));
+        assert_eq!(fs::read_to_string(dir.join("a.txt")).unwrap(), "one\ntwo\nthree\n");
     }
 
     /// A scratch repo with an identity configured, so commits work without ambient config.

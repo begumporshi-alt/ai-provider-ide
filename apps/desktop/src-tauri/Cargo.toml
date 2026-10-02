@@ -123,6 +123,8 @@ url = "2.5.8"
 base64 = "0.22"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+pdf-extract = "0.12.1"
 
 # There is deliberately no macOS-only dependency block here. `objc2` / `objc2-foundation` were
 # declared for App Nap suppression on the hidden worker webview, and both went with that webview

@@ -179,6 +179,25 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       }
 
       onEvent?.({ type: "tool_result", call, result: resultText, ok });
+
+      // `read_image` returns its payload under a marker: the tool message itself stays a short
+      // text receipt, and the image rides as a real content part on a following user message —
+      // the same wire shape chat attachments use. Without this, the base64 would flood the
+      // transcript as text no model can see.
+      const imageData = name === "read_image" && ok ? extractReadImage(resultText) : null;
+      if (imageData) {
+        const receipt = `image loaded: ${imageData.path} (${Math.round(imageData.bytes / 1024)} KB) — attached as an image part below`;
+        messages.push({ role: "tool", content: receipt, tool_call_id: ids[i]! });
+        messages.push({
+          role: "user",
+          content: [
+            { type: "text", text: `[image you just loaded with read_image: ${imageData.path}]` },
+            { type: "image", mediaType: imageData.mediaType, dataBase64: imageData.base64 },
+          ],
+        });
+        continue;
+      }
+
       messages.push({ role: "tool", content: resultText, tool_call_id: ids[i]! });
     }
   }
@@ -186,4 +205,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // Hit the iteration ceiling: hand back the last answer rather than spinning forever.
   onEvent?.({ type: "done", text: lastText, iterations: maxIterations });
   return { text: lastText, messages };
+}
+
+/** The marker `read_image` writes: `READ_IMAGE:<media>;base64,<payload>` then `path:`/`bytes:` lines. */
+function extractReadImage(resultText: string): { mediaType: string; base64: string; path: string; bytes: number } | null {
+  const marker = resultText.match(/^READ_IMAGE:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]+)/);
+  if (!marker) return null;
+  const path = resultText.match(/^path: (.+)$/m)?.[1] ?? "(unknown)";
+  const bytes = Number(resultText.match(/^bytes: (\d+)$/m)?.[1] ?? 0);
+  return { mediaType: marker[1], base64: marker[2], path, bytes };
 }

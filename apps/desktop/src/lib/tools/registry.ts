@@ -179,6 +179,63 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "read_document",
+    effect: "read",
+    description:
+      "Read text from a PDF or Word (.docx) document in the workspace — the binary documents read_file cannot serve. Text is capped.",
+    parameters: {
+      properties: {
+        path: { type: "string", description: "Workspace-relative path of the .pdf or .docx." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "read_image",
+    effect: "read",
+    description:
+      "Read a workspace image (png/jpg/gif/webp, 4 MB cap) so a vision-capable model can see it in the next turn.",
+    parameters: {
+      properties: {
+        path: { type: "string", description: "Workspace-relative path of the image." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "http_request",
+    effect: "mutate",
+    description:
+      "Run one HTTP request against a public URL: method, headers, body; returns the response. It sends data out, so it is always confirmed; private hosts are refused.",
+    parameters: {
+      properties: {
+        url: { type: "string", description: "Public http(s) URL. Redirects are reported, not followed." },
+        method: {
+          type: "string",
+          description: "Optional: GET (default), POST, PUT, PATCH, DELETE, HEAD, OPTIONS.",
+        },
+        headers: { type: "object", description: "Optional request headers as name/value strings." },
+        body: { type: "string", description: "Optional request body (POST/PUT/PATCH only)." },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "apply_patch",
+    effect: "mutate",
+    description:
+      "Write a unified diff (multi-hunk, multi-file) into workspace files: context must match exactly; a mismatch fails the whole patch.",
+    parameters: {
+      properties: {
+        patch: {
+          type: "string",
+          description: "The full unified diff, ---/+++ and @@ hunks included. New files start from /dev/null.",
+        },
+      },
+      required: ["patch"],
+    },
+  },
+  {
     name: "todo_write",
     effect: "read",
     description:

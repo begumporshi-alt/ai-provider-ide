@@ -234,6 +234,62 @@ fn build() -> Vec<ToolSpec> {
             required: &["pattern"],
         },
         ToolSpec {
+            name: "read_document",
+            description: "Read text from a PDF or Word (.docx) document in the workspace — the binary documents read_file cannot serve. Text is capped.",
+            properties: json!({
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the .pdf or .docx.",
+                },
+            }),
+            required: &["path"],
+        },
+        ToolSpec {
+            name: "read_image",
+            description: "Read a workspace image (png/jpg/gif/webp, 4 MB cap) so a vision-capable model can see it in the next turn.",
+            properties: json!({
+                "path": {
+                    "type": "string",
+                    "description": "Workspace-relative path of the image.",
+                },
+            }),
+            required: &["path"],
+        },
+        ToolSpec {
+            name: "http_request",
+            description: "Run one HTTP request against a public URL: method, headers, body; returns the response. It sends data out, so it is always confirmed; private hosts are refused.",
+            properties: json!({
+                "url": {
+                    "type": "string",
+                    "description": "Public http(s) URL. Redirects are reported, not followed.",
+                },
+                "method": {
+                    "type": "string",
+                    "description": "Optional: GET (default), POST, PUT, PATCH, DELETE, HEAD, OPTIONS.",
+                },
+                "headers": {
+                    "type": "object",
+                    "description": "Optional request headers as name/value strings.",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "Optional request body (POST/PUT/PATCH only).",
+                },
+            }),
+            required: &["url"],
+        },
+        ToolSpec {
+            name: "apply_patch",
+            description: "Write a unified diff (multi-hunk, multi-file) into workspace files: context must match exactly; a mismatch fails the whole patch.",
+            properties: json!({
+                "patch": {
+                    "type": "string",
+                    "description": "The full unified diff, ---/+++ and @@ hunks included. New files start from /dev/null.",
+                },
+            }),
+            required: &["patch"],
+        },
+        ToolSpec {
             name: "todo_write",
             description: "Write the task list for the current run: replace it wholesale with every task and its status. Keep at most one task in_progress.",
             properties: json!({
@@ -284,8 +340,8 @@ mod tests {
     use crate::core::gateway::MUTATING_TOOLS;
 
     #[test]
-    fn the_registry_holds_twelve_tools() {
-        assert_eq!(agent_tools().len(), 12);
+    fn the_registry_holds_sixteen_tools() {
+        assert_eq!(agent_tools().len(), 16);
     }
 
     #[test]
@@ -370,10 +426,10 @@ mod tests {
         }
     }
 
-    /// The mutating set is exactly the four the gateway gates, in both directions: a tool that is
+    /// The mutating set is exactly what the gateway gates, in both directions: a tool that is
     /// neither listed nor read-only is a tool that writes without being gated.
     #[test]
-    fn the_mutating_set_is_exactly_the_four_the_gateway_gates() {
+    fn the_mutating_set_is_exactly_what_the_gateway_gates() {
         let names: Vec<&str> = agent_tools().iter().map(|t| t.name).collect();
         for m in MUTATING_TOOLS {
             assert!(names.contains(&m), "{m} is gated by the gateway but absent from the registry");
@@ -383,14 +439,18 @@ mod tests {
         read_only.sort_unstable();
         // `todo_write` mutates only the Assistant's progress panel, never the workspace, so it
         // is on the read-only side even though its name says "write". The web tools reach the
-        // public internet but write nothing anywhere, so they read too.
+        // public internet but write nothing anywhere, so they read too. `http_request` and
+        // `apply_patch` are the opposite case: names that sound read-adjacent ("request",
+        // "patch") but which send data out or rewrite files, so they are gated.
         assert_eq!(
             read_only,
             vec![
                 "file_info",
                 "glob",
                 "list_dir",
+                "read_document",
                 "read_file",
+                "read_image",
                 "search_files",
                 "todo_write",
                 "web_fetch",
@@ -409,12 +469,12 @@ mod tests {
     // ── gateway_tool_set ──────────────────────────────────────────────────
 
     /// The whole point: with mutation off (the default) the gateway must not advertise a tool it
-    /// will refuse. Falsified by dropping the filter — the set goes back to twelve.
+    /// will refuse. Falsified by dropping the filter — the set goes back to sixteen.
     #[test]
     fn gateway_tool_set_omits_the_mutating_four_when_mutation_is_off() {
         let set = gateway_tool_set(false);
         let names: Vec<&str> = set.iter().map(|t| t.name).collect();
-        assert_eq!(names.len(), 8, "expected the eight read-only tools, got {names:?}");
+        assert_eq!(names.len(), 10, "expected the ten read-only tools, got {names:?}");
         for m in MUTATING_TOOLS {
             assert!(!names.contains(&m), "{m} is advertised but would be refused");
         }
@@ -423,16 +483,19 @@ mod tests {
     /// Enabling mutation is opt-in and must restore the whole registry, not a subset.
     #[test]
     fn gateway_tool_set_includes_every_tool_when_mutation_is_on() {
-        assert_eq!(gateway_tool_set(true).len(), 12);
+        assert_eq!(gateway_tool_set(true).len(), 16);
     }
 
-    /// The read-only eight are advertised either way — narrowing must never remove a tool the
+    /// The read-only ten are advertised either way — narrowing must never remove a tool the
     /// gateway is willing to run.
     #[test]
     fn the_read_only_tools_are_advertised_either_way() {
         for on in [true, false] {
             let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
-            for r in ["read_file", "list_dir", "search_files", "file_info", "todo_write", "web_fetch", "web_search", "glob"] {
+            for r in [
+                "read_file", "list_dir", "search_files", "file_info", "todo_write",
+                "web_fetch", "web_search", "glob", "read_document", "read_image",
+            ] {
                 assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
             }
         }

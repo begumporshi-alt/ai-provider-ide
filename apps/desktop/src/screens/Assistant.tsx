@@ -186,6 +186,7 @@ const AGENT_SYSTEM =
   "file_info to check a path exists, edit_file to change one exact snippet, write_file to " +
   "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
   "For the public web, web_search (keyless, with fallback backends) finds pages and web_fetch reads one. " +
+  "read_document reads PDFs and Word files; read_image shows you an image if you support vision. " +
   "For any task with several steps, maintain the task list with todo_write (the whole list, each " +
   "task pending/in_progress/completed, one in_progress at a time) — the user watches it live. " +
   "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +
