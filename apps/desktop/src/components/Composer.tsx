@@ -1,5 +1,5 @@
 /**
- * The composer: the draft, its attachments, and the two menus that change what a keystroke means.
+ * The composer: the draft, what context it carries, and the two menus that change what a keystroke means.
  *
  * # Why this owns the draft
  *
@@ -8,15 +8,25 @@
  * sent" a fact split across two components, and the two would disagree exactly when it matters — on
  * the send that carries an image and a `/clear`.
  *
- * The parent gets one callback, `onSend(text, attachments, inlined)`, with everything already
- * resolved: mentions expanded and attachment bytes read. Nothing is left for the turn runner to guess.
+ * The parent gets one callback, `onSend(text, attachments, inlined, instruction)`, with everything
+ * already resolved: mentions expanded, attachment bytes read, the per-turn instruction separated from
+ * the text. Nothing is left for the turn runner to guess.
+ *
+ * # One attach affordance, and it names what it attaches
+ *
+ * There used to be two buttons that did the same thing — a paperclip and `＋ Add context ▾` — and the
+ * chevron was decoration on a button that opened a file dialog. `AddContextMenu` is that button's
+ * menu, and the paperclip is gone; drag-and-drop and paste remain, because those are different
+ * gestures rather than a second control for one job.
  *
  * # Files are read here, not fetched from the host
  *
  * A picked or dropped file is read with `FileReader` inside the webview. Images become base64 parts
- * (`ContentPart`); text files become a fenced block in the draft itself. That is also why this phase
- * adds no Tauri command: the host's job (egress, confinement) is unchanged, and a native file dialog
- * would add a privileged surface for something the platform already provides.
+ * (`ContentPart`); text files become a fenced block in the draft itself; a document is refused,
+ * because this side can only read text and claiming otherwise means inlining compressed bytes as
+ * replacement characters. That is also why this component adds no Tauri command: the host's job
+ * (egress, confinement) is unchanged, and a native file dialog would add a privileged surface for
+ * something the platform already provides.
  *
  * # Two ways in for a text file, deliberately different
  *
@@ -24,9 +34,17 @@
  * delete it. An **`@reference`** is expanded at send time and stays a path in the draft, because
  * that is what the user typed and rewriting it under the caret as they type is how a composer starts
  * fighting the person using it.
+ *
+ * # Nothing attaches invisibly
+ *
+ * Everything this menu adds is either in the draft (references, reused results, text files) or in a
+ * chip (images, the instruction). An instruction the user cannot see is a constraint they will
+ * misremember setting, so it gets a chip with its text and a ✕ like any other attachment.
  */
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Button, inputCls, inputStyle } from "./atoms";
+import { AddContextMenu, type PreviousOutput } from "./AddContextMenu";
+import { ProjectFilePicker } from "./ProjectFilePicker";
 import { matchSlashCommands, parseSlash, type SlashCommand } from "../lib/chat/slash";
 import {
   INLINE_LIMIT_BYTES,
@@ -37,6 +55,16 @@ import {
   mentionedPaths,
   type MentionCandidate,
 } from "../lib/chat/mentions";
+import {
+  binaryRefusal,
+  clampInstruction,
+  contextSummary,
+  documentRefusal,
+  fileKind,
+  looksBinary,
+  previousResultBlock,
+  previousResultMarkerCount,
+} from "../lib/chat/context-blocks";
 
 /** An image the user attached, already read into memory. */
 export interface Attachment {
@@ -54,7 +82,6 @@ export interface InlinedText {
   bytes: number;
 }
 
-const IMAGE_TYPES = /^image\/(png|jpeg|jpg|webp|gif)$/i;
 const MAX_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 
 /** Read a file into base64, without the data-URI prefix (the dialect template adds that). */
@@ -80,6 +107,17 @@ function readAsText(file: File): Promise<string> {
   });
 }
 
+/**
+ * The first few KB of a file, for the binary check.
+ *
+ * Only for files whose kind could not be decided from the name or the type. A chunk is enough: a NUL
+ * byte in the first kilobyte is not something a text file does, and reading the whole thing to find
+ * out would cost exactly what deciding not to attach it is meant to save.
+ */
+async function headBytes(file: File): Promise<Uint8Array> {
+  return new Uint8Array(await file.slice(0, 4096).arrayBuffer());
+}
+
 export interface ComposerProps {
   /** The composer's textarea, owned here and handed up so a shortcut can focus it. */
   textareaRef: React.RefObject<HTMLTextAreaElement | null>;
@@ -90,7 +128,7 @@ export interface ComposerProps {
   vision: boolean | undefined;
   /** The model's own name, for the notice — "GPT-4o does not accept images" beats "not allowed". */
   modelLabel: string;
-  onSend: (text: string, attachments: Attachment[], inlined: InlinedText[]) => void;
+  onSend: (text: string, attachments: Attachment[], inlined: InlinedText[], instruction: string) => void;
   onStop: () => void;
   /**
    * The draft, reported on each keystroke. The parent needs it for exactly one thing — the context
@@ -98,6 +136,14 @@ export interface ComposerProps {
    * lifting the whole draft back out of here.
    */
   onDraftChange: (text: string) => void;
+  /**
+   * The per-turn instruction, reported for the same reason as the draft: it is a system message the
+   * next send will carry, so a meter that did not know about it would understate the prompt by
+   * however much the user asked for.
+   */
+  onInstructionChange?: (text: string) => void;
+  /** Earlier assistant answers in this conversation, newest first, offered by "Previous results". */
+  previousOutputs?: PreviousOutput[];
   /** Why Send is refused when the turn cannot run (no model, no workspace root). */
   sendDisabled?: boolean;
   /** Slash commands the composer cannot run itself. */
@@ -105,7 +151,7 @@ export interface ComposerProps {
   onOpenModelPicker: () => void;
   onSwitchToImageTab: () => void;
   onCompact: () => void;
-  /** Workspace listing for @-mentions, or null when there is no root to search. */
+  /** Workspace listing for @-mentions and the Project files panel, or null when there is no root. */
   listFiles: (() => Promise<MentionCandidate[]>) | null;
   /** Reads a workspace file for inlining; null when there is no root. */
   readFile: ((path: string) => Promise<string | null>) | null;
@@ -144,6 +190,8 @@ export function Composer({
   onSend,
   onStop,
   onDraftChange,
+  onInstructionChange,
+  previousOutputs = [],
   sendDisabled = false,
   onClear,
   onOpenModelPicker,
@@ -159,12 +207,16 @@ export function Composer({
   const [draft, setDraft] = useState("");
   const [caret, setCaret] = useState(0);
   const [attachments, setAttachments] = useState<Attachment[]>([]);
+  const [instruction, setInstruction] = useState("");
   const [files, setFiles] = useState<MentionCandidate[] | null>(null);
   const [mentionStart, setMentionStart] = useState<number | null>(null);
   const [mentionPick, setMentionPick] = useState(0);
   const [slashPick, setSlashPick] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const pickerRef = useRef<HTMLInputElement | null>(null);
+  const menuWrapRef = useRef<HTMLDivElement | null>(null);
 
   // The seed claim (see `ComposerProps.seed`). Focused on the textarea and the caret parked at the
   // end, so the user can start typing onto the suggestion immediately.
@@ -173,6 +225,7 @@ export function Composer({
     if (!seed || seed.nonce === seenSeed.current) return;
     seenSeed.current = seed.nonce;
     setDraft(seed.text);
+    onDraftChange(seed.text);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -180,13 +233,48 @@ export function Composer({
       const end = seed.text.length;
       el.setSelectionRange(end, end);
     });
-  }, [seed, textareaRef]);
+  }, [seed, textareaRef, onDraftChange]);
+
+  // The menu closes on a click outside its wrapper — the button and the panel share that wrapper, so
+  // "outside" means outside both. A click on the button itself must not close-then-reopen it, which
+  // is exactly what a document-level listener without the wrapper would do.
+  useEffect(() => {
+    if (!menuOpen) return;
+    const onDown = (e: MouseEvent) => {
+      if (!menuWrapRef.current?.contains(e.target as Node)) setMenuOpen(false);
+    };
+    document.addEventListener("mousedown", onDown);
+    return () => document.removeEventListener("mousedown", onDown);
+  }, [menuOpen]);
+
+  // Closing the menu hands focus back to the box the user was typing in — otherwise Escape drops the
+  // caret on the floor and the next keystroke goes nowhere. Guarded on the picker: when the menu
+  // closes *because* Project files opened, the modal has already taken focus and stealing it back
+  // would leave its search box unusable.
+  const menuWasOpen = useRef(false);
+  useEffect(() => {
+    if (menuWasOpen.current && !menuOpen && !projectPickerOpen) textareaRef.current?.focus();
+    menuWasOpen.current = menuOpen;
+  }, [menuOpen, projectPickerOpen, textareaRef]);
 
   const slashMatches = useMemo(() => matchSlashCommands(draft), [draft]);
   const parsedSlash = useMemo(() => parseSlash(draft), [draft]);
   const mentionMatches = useMemo(
     () => (mentionStart === null ? [] : matchMentions(files ?? [], draft.slice(mentionStart + 1, caret))),
     [mentionStart, draft, caret, files],
+  );
+
+  // What the button says is attached. Derived from the draft and the attachments rather than from
+  // which rows were clicked, so deleting a block by hand takes the count down with it.
+  const summary = useMemo(
+    () =>
+      contextSummary({
+        attachments: attachments.length,
+        references: mentionedPaths(draft).length,
+        results: previousResultMarkerCount(draft),
+        instruction,
+      }),
+    [attachments.length, draft, instruction],
   );
 
   // Auto-grow: height follows the content up to a cap, past which the box scrolls. A composer that
@@ -218,11 +306,42 @@ export function Composer({
     }
   }
 
+  /**
+   * Append a block to the end of the draft and park the caret after it.
+   *
+   * Every writer of "context the user can see" goes through here — a dropped text file, a project
+   * reference, a reused answer — for two reasons. The draft is what the user edits, so the block is
+   * visible and deletable by construction; and `onDraftChange` is called with the new value, which
+   * is what keeps the context meter counting what was just added. The previous code appended a text
+   * file through a bare `setDraft` and left the parent's copy stale, so the meter was already
+   * under-reporting before this menu existed.
+   */
+  function appendToDraft(block: string) {
+    const next = `${draft.trimEnd()}${draft.trim() ? "\n\n" : ""}${block}`;
+    setDraft(next);
+    onDraftChange(next);
+    requestAnimationFrame(() => {
+      const el = textareaRef.current;
+      if (!el) return;
+      el.focus();
+      el.setSelectionRange(next.length, next.length);
+      setCaret(next.length);
+    });
+  }
+
+  function setInstructionValue(text: string) {
+    const clamped = clampInstruction(text);
+    setInstruction(clamped);
+    onInstructionChange?.(clamped);
+  }
+
   async function addFiles(list: FileList | File[]) {
     const incoming = Array.from(list);
     const images: Attachment[] = [];
     for (const file of incoming) {
-      if (IMAGE_TYPES.test(file.type)) {
+      const kind = fileKind(file.name, file.type);
+
+      if (kind === "image") {
         if (vision !== true) {
           // The gate, said out loud. A dropped file that silently does nothing reads as a broken app
           // rather than as a model that cannot see.
@@ -250,6 +369,29 @@ export function Composer({
         }
         continue;
       }
+
+      // A container this side cannot open. Refused by name, because reading it as text would
+      // *succeed* and put compressed bytes in the draft as replacement characters — a failure with
+      // no error to notice.
+      if (kind === "document") {
+        onNotice(documentRefusal(file.name));
+        continue;
+      }
+
+      // Neither recognised nor obviously text: look at the bytes before trusting the name. Only here,
+      // where the extension and the browser's type have both failed to say anything.
+      if (kind === "unknown") {
+        try {
+          if (looksBinary(await headBytes(file))) {
+            onNotice(binaryRefusal(file.name));
+            continue;
+          }
+        } catch (e) {
+          onNotice(`${file.name} could not be read: ${(e as Error).message}`);
+          continue;
+        }
+      }
+
       // Anything else is treated as text and appended to the draft as a fenced block — visible and
       // editable, which is what a text file is: context, not an attachment.
       if (file.size > INLINE_LIMIT_BYTES) {
@@ -261,7 +403,7 @@ export function Composer({
       }
       try {
         const text = await readAsText(file);
-        setDraft((d) => `${d.trimEnd()}${d.trim() ? "\n\n" : ""}${file.name}:\n\`\`\`\n${text}\n\`\`\``);
+        appendToDraft(`${file.name}:\n\`\`\`\n${text}\n\`\`\``);
       } catch (e) {
         onNotice(`${file.name} could not be read: ${(e as Error).message}`);
       }
@@ -274,6 +416,7 @@ export function Composer({
     if (mentionStart === null) return;
     const { text, caret: nextCaret } = applyMention(draft, mentionStart, caret, path);
     setDraft(text);
+    onDraftChange(text);
     setMentionStart(null);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
@@ -291,6 +434,10 @@ export function Composer({
     onDraftChange("");
     setAttachments([]);
     setMentionStart(null);
+    // A per-turn instruction belongs to the turn, not the composer: `/clear` starts a new chat, and
+    // carrying a constraint across it would apply the last conversation's rules to the next one.
+    setInstruction("");
+    onInstructionChange?.("");
     switch (command.id) {
       case "clear": onClear(); break;
       case "model": onOpenModelPicker(); break;
@@ -307,6 +454,7 @@ export function Composer({
     }
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
+    const turnInstruction = instruction;
 
     let body = text;
     const inlined: InlinedText[] = [];
@@ -339,8 +487,10 @@ export function Composer({
     setAttachments([]);
     setMentionStart(null);
     setCaret(0);
+    setInstruction("");
     onDraftChange("");
-    onSend(body, attachments, inlined);
+    onInstructionChange?.("");
+    onSend(body, attachments, inlined, turnInstruction);
   }
 
   function onKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -450,8 +600,30 @@ export function Composer({
         </div>
       )}
 
-      {attachments.length > 0 && (
+      {(attachments.length > 0 || instruction.trim()) && (
         <div className="mb-1.5 flex flex-wrap gap-1.5">
+          {/* The instruction is chipped like an attachment rather than held invisibly in state: a
+              constraint the user cannot see is one they will believe they removed, or forget they
+              set, and it changes the request as much as an image does. */}
+          {instruction.trim() && (
+            <span
+              className="flex max-w-[360px] items-center gap-1.5 rounded border px-1.5 py-0.5 text-[11px]"
+              style={{ borderColor: "var(--accent)", background: "var(--surface-2)", color: "var(--text-dim)" }}
+              data-testid="instruction-chip"
+            >
+              <span aria-hidden="true" style={{ color: "var(--accent)" }}>⚑</span>
+              <span className="truncate">{instruction.trim()}</span>
+              <button
+                type="button"
+                aria-label="Remove the per-turn instruction"
+                className="px-0.5"
+                style={{ color: "var(--text-faint)" }}
+                onClick={() => setInstructionValue("")}
+              >
+                ✕
+              </button>
+            </span>
+          )}
           {attachments.map((a) => (
             <span
               key={a.id}
@@ -486,21 +658,6 @@ export function Composer({
         }}
       >
         <div className="flex items-start gap-2.5">
-          {/* Attach stays live even when images are refused — text files still work — and its tooltip
-              says which case applies instead of the button being dead with no explanation. */}
-          <button
-            type="button"
-            onClick={() => pickerRef.current?.click()}
-            disabled={busy}
-            aria-label="Attach files"
-            title={visionNote ?? "Attach an image or a text file"}
-            className="mt-1.5 shrink-0 rounded px-0.5 py-0.5 disabled:opacity-40"
-            style={{ color: vision === true ? "var(--accent)" : "var(--text-dim)" }}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden="true">
-              <path d="m20.5 11.5-8 8a5 5 0 0 1-7-7l8-8a3.5 3.5 0 0 1 5 5l-8 8a2 2 0 0 1-2.8-2.8l7.3-7.3" />
-            </svg>
-          </button>
           <input
             ref={pickerRef}
             type="file"
@@ -528,6 +685,17 @@ export function Composer({
             onKeyUp={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
             onClick={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
             onKeyDown={onKeyDown}
+            onPaste={(e) => {
+              // Paste is the fastest path there is for a screenshot, and it did not exist: a
+              // screenshot on the clipboard arrives as a File, and the default handler does nothing
+              // with it. Only intercepted when there are files — a paste of text must stay a paste
+              // of text, or the composer swallows ordinary clipboard use.
+              const files = e.clipboardData?.files;
+              if (files?.length) {
+                e.preventDefault();
+                void addFiles(files);
+              }
+            }}
             placeholder={
               parsedSlash
                 ? `Press Enter to run /${parsedSlash.command.name}`
@@ -546,19 +714,47 @@ export function Composer({
       </div>
 
         <div className="mt-1.5 flex flex-wrap items-center gap-2">
-          {/* "Add context" is the attach affordance named for what it is for. It opens the same
-              file picker — images become parts, text files become fenced blocks — so there is one
-              input, not two, and one place that explains refusals. */}
-          <button
-            type="button"
-            onClick={() => pickerRef.current?.click()}
-            disabled={busy}
-            className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors disabled:opacity-40"
-            style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
-          >
-            ＋ Add context
-            <span aria-hidden="true" style={{ color: "var(--text-faint)" }}>▾</span>
-          </button>
+          {/* The one attach affordance, and it opens a menu. It used to be two buttons doing the same
+              thing with a decorative chevron; the badge is what it actually carries, counted from the
+              draft so it cannot claim context the user has deleted. Drag-and-drop and paste stay —
+              different gestures, not a second control. */}
+          <div ref={menuWrapRef} className="relative">
+            <button
+              type="button"
+              onClick={() => setMenuOpen((o) => !o)}
+              disabled={busy}
+              aria-haspopup="menu"
+              aria-expanded={menuOpen}
+              title={summary.title}
+              data-testid="add-context-button"
+              className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors disabled:opacity-40"
+              style={{
+                borderColor: summary.badge ? "var(--accent)" : "var(--border)",
+                color: summary.badge ? "var(--text)" : "var(--text-dim)",
+              }}
+            >
+              ＋ Add context
+              {summary.badge && (
+                <span className="text-[11px]" style={{ color: "var(--accent)" }}>{summary.badge}</span>
+              )}
+              <span aria-hidden="true" style={{ color: "var(--text-faint)" }}>▾</span>
+            </button>
+            {menuOpen && (
+              <AddContextMenu
+                onUploadFiles={() => pickerRef.current?.click()}
+                onOpenProjectFiles={() => setProjectPickerOpen(true)}
+                projectFilesReason={listFiles ? null : "Set a workspace root to reference files"}
+                previousOutputs={previousOutputs}
+                onInsertResult={(o) => {
+                  const { block } = previousResultBlock(o.label, o.text, INLINE_LIMIT_BYTES);
+                  appendToDraft(block);
+                }}
+                instruction={instruction}
+                onInstructionChange={setInstructionValue}
+                onClose={() => setMenuOpen(false)}
+              />
+            )}
+          </div>
           {/* The screen's run controls (mode toggles, model picker) share the send's row. The
               toolbar's trailing auto-margin pushes the picker against Send, per the layout: what
               the turn will use brackets the row's two ends with what it does. */}
@@ -577,6 +773,15 @@ export function Composer({
           </span>
         </div>
       </div>
+
+      {projectPickerOpen && listFiles && (
+        <ProjectFilePicker
+          loadFiles={listFiles}
+          alreadyReferenced={mentionedPaths(draft)}
+          onAdd={(paths) => appendToDraft(paths.map((p) => `@${p}`).join(" "))}
+          onClose={() => setProjectPickerOpen(false)}
+        />
+      )}
 
       {visionNote && (
         <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="vision-note">
