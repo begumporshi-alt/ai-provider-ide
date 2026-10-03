@@ -452,7 +452,16 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
 
     // message -> skill (used), skill -> artifact (produced), message -> memory (recalled).
     let mut tools_of: std::collections::HashMap<&str, Vec<&str>> = std::collections::HashMap::new();
-    let mut results_of: std::collections::HashMap<&str, Vec<String>> =
+    // `skill -> artifact (produced)`: each result's text **and** the id the request declared for the
+    // call that produced it, keyed by the skill node the edge starts from.
+    //
+    // The id has to be collected here, because a `skill` node is written with no metadata at all
+    // (`Assistant.tsx`: `rec.node("skill", toolCallName(c))`) — the `tool_call_id` lives on the
+    // artifact. Reading it from the skill instead yields `None` for every replayed call, so a
+    // resumed session re-sent the call's `tool_use` with nothing answering it and the provider
+    // refused the entire request: "tool_use ids were found without tool_result blocks immediately
+    // after". Measured on a live transcript: 0 skill nodes carried the id, 272 artifact nodes did.
+    let mut results_of: std::collections::HashMap<&str, (Vec<String>, Option<String>)> =
         std::collections::HashMap::new();
     let mut recalled: std::collections::HashMap<&str, i64> = std::collections::HashMap::new();
     for (from, to, kind) in &edges {
@@ -464,7 +473,13 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
                     // are 80-character previews, but a resumed run replays the whole result.
                     let text =
                         meta_text(&n.meta, "text").unwrap_or_else(|| n.label.clone());
-                    results_of.entry(from.as_str()).or_default().push(text);
+                    let entry = results_of.entry(from.as_str()).or_default();
+                    entry.0.push(text);
+                    // First id wins: a call is answered by one artifact in practice, and an id
+                    // arriving later cannot be the one a request already declared.
+                    if entry.1.is_none() {
+                        entry.1 = meta_text(&n.meta, "tool_call_id");
+                    }
                 }
             }
             "recalled" => *recalled.entry(from.as_str()).or_insert(0) += 1,
@@ -498,7 +513,7 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
         calls.sort_by_key(|id| sort_key(id, by_id.get(id).map(|r| r.ts).unwrap_or(0)));
         for call in calls {
             let target = by_id.get(call);
-            let result = results_of.remove(call).unwrap_or_default();
+            let (result, artifact_id) = results_of.remove(call).unwrap_or_default();
             let detail = result
                 .iter()
                 .map(|s| s.trim().to_string())
@@ -512,7 +527,12 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
                 detail: if detail.is_empty() { None } else { Some(detail) },
                 model: None,
                 memories: 0,
-                tool_call_id: meta_text(target.map(|r| &r.meta).unwrap_or(&None), "tool_call_id"),
+                // The id the request declared, taken from the artifact that answered the call. The
+                // fallback to the node's own metadata covers any older shape that wrote the id
+                // there; the artifact is where the recorder puts it.
+                tool_call_id: artifact_id.or_else(|| {
+                    meta_text(target.map(|r| &r.meta).unwrap_or(&None), "tool_call_id")
+                }),
                 tool_calls: None,
             });
         }
@@ -814,6 +834,23 @@ mod context_graph_tests {
         assert_eq!(t.entries[2].detail.as_deref(), Some("main.rs"));
         assert_eq!(t.entries[3].text, "read_file");
         assert_eq!(t.entries[3].detail.as_deref(), Some("fn main() {}"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A replayed transcript carries the wire id of every tool result.
+    ///
+    /// This id is what a resumed session sends back as `tool_result.tool_use_id`, and the artifact
+    /// node is the only place it is stored — a `skill` node is written with no metadata at all. The
+    /// test above checked a result's text and detail and never its id, which is exactly why a
+    /// replayed call could lose it unnoticed. A lost id is not a degraded answer: the provider
+    /// refuses the whole request, so the user sees every attempt fail with a schema error.
+    #[test]
+    fn a_replayed_tool_result_keeps_the_id_the_request_declared() {
+        let (s, d) = temp_store("ids");
+        agent_session(&s, "s-1", 1000);
+        let t = timeline(&s, "s-1").unwrap();
+        assert_eq!(t.entries[2].tool_call_id.as_deref(), Some("c1"), "list_dir's result id");
+        assert_eq!(t.entries[3].tool_call_id.as_deref(), Some("c2"), "read_file's result id");
         let _ = std::fs::remove_dir_all(&d);
     }
 
