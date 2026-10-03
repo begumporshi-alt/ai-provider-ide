@@ -1991,6 +1991,12 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return Boolean(args?.id);
     case "crash_clear_all":
       return 0;
+    // The Control screen compares this with what the gateway reports on `/admin/build`, to notice a
+    // companion binary left behind by an earlier build (`core/build_id.rs`). A harness holds one
+    // build and the mock 404s that route, so `gatewayBuildIdentity` yields `null` and the comparison
+    // stays quiet — the honest answer when there is nothing to compare it against.
+    case "app_build_identity":
+      return { commit: "webtest", source_fp: "webtest" };
     case "gateway_project_key":
       // The shim has no workspace root; the Memory screen treats `null` as "no project scoping
       // today" and renders atoms un-scoped. Without this case the screen's main `Promise.all`
