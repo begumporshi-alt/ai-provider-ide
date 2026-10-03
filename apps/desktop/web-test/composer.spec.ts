@@ -48,15 +48,24 @@ function userTurn(body: Record<string, unknown>): WireMessage {
 }
 
 async function lastChatBody(page: Page): Promise<Record<string, unknown>> {
-  const reqs = await page.evaluate(
-    () =>
-      (
-        (window as unknown as { __webTest: { store: Record<string, () => unknown> } }).__webTest.store
-          .requests!() as EgressLogEntry[]
-      ),
-  );
-  const last = [...reqs].reverse().find((r) => r.url.endsWith("/chat/completions") && r.body);
-  expect(last, "no chat request was sent").toBeDefined();
+  // Poll rather than read once: between clicking Send and the request appearing in the log sit
+  // the app's own pre-send work (state assembly, memory recall, the agent loop's first hop), and
+  // on the ~2.5× slower hosted runner that gap has occasionally outlived a single read
+  // (2026-10-03 CI: "no chat request was sent" on different specs across two runs, every one
+  // passing locally and on retry). A single read turns that latency into a failure; polling
+  // turns it into what it is — waiting for the turn to start.
+  let last: EgressLogEntry | undefined;
+  await expect(async () => {
+    const reqs = await page.evaluate(
+      () =>
+        (
+          (window as unknown as { __webTest: { store: Record<string, () => unknown> } }).__webTest.store
+            .requests!() as EgressLogEntry[]
+        ),
+    );
+    last = [...reqs].reverse().find((r) => r.url.endsWith("/chat/completions") && r.body);
+    expect(last, "no chat request was sent").toBeDefined();
+  }).toPass({ timeout: process.env.CI ? 60_000 : 15_000 });
   return JSON.parse(last!.body!) as Record<string, unknown>;
 }
 

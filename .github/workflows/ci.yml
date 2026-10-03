@@ -130,6 +130,18 @@ jobs:
         run: pnpm --filter ai-provider-router-desktop exec playwright install chromium
       - name: Live-UI tests (Playwright harness — wizard, Tier-2 review, egress image)
         run: pnpm --filter ai-provider-router-desktop web-test
+      - name: Upload Playwright failure artifacts
+        # Playwright saves traces/videos/screenshots on failure but the runner deletes them with
+        # the workspace; without an upload step a CI-only stall is a log line and nothing else
+        # (2026-10-03: two runs, a different spec failing each, "no chat request was sent", no
+        # artifact to inspect). failure() + if-no-files-found: ignore — green runs upload nothing.
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-failures
+          path: apps/desktop/test-results/
+          if-no-files-found: ignore
+          retention-days: 7
 
   # Headless service binary (`aiproviderd`) — dev-book §10, Phase 1.
   #

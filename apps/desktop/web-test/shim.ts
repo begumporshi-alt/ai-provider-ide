@@ -2676,12 +2676,14 @@ function authorize(req: WireReq): Record<string, string> {
 
 async function egressUnary(req: WireReq): Promise<{ status: number; headers: Record<string, string>; body: string }> {
   const headers = authorize(req);
+  // Logged at request-issue time, matching egressStream: logging only after `res.text()` would
+  // let a slow response read as "no request was ever sent" to a spec polling store.requests().
+  recordEgress({ url: req.url, body: req.body ?? null });
   const res = await fetch(req.url, { method: req.method, headers, body: req.body ?? undefined, redirect: "manual" });
   const resHeaders: Record<string, string> = {};
   res.headers.forEach((v, k) => (resHeaders[k.toLowerCase()] = v));
   const body = await res.text();
   recordReturnedHosts(body);
-  recordEgress({ url: req.url, body: req.body ?? null });
   return { status: res.status, headers: resHeaders, body };
 }
 

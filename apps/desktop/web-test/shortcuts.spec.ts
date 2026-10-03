@@ -31,6 +31,14 @@ import { pickModel } from "./model-picker";
 const APP = "/web-test/";
 
 /**
+ * How long to wait for the reply bubble after a Send. Omitting the timeout would inherit the
+ * config's expect budget (60 s on CI, 30 s locally), but these waits are written per-test because
+ * the two-turn search test spends the budget twice — so the constant is explicit and CI-scaled,
+ * and the search test additionally calls test.slow() to keep the sum inside its own budget.
+ */
+const REPLY_TIMEOUT = process.env.CI ? 60_000 : 30_000;
+
+/**
  * The modifier the app itself would use here, read from the page for the same reason the app reads
  * it: the platform is a runtime fact, not a property of the test runner.
  */
@@ -173,7 +181,7 @@ test("new chat starts a fresh conversation from the keyboard", async ({ page }) 
 
   await page.getByPlaceholder(/Message your assistant/).fill("remember this");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
   await expect(page.getByText("remember this")).toBeVisible();
 
   await pressMod(page, "Shift+O");
@@ -227,6 +235,9 @@ test("the palette refuses New chat while a turn is running, and says why", async
 });
 
 test("conversation search filters the session list and keeps the detail in step", async ({ page }) => {
+  // Two full turns inside one test: the reply waits (REPLY_TIMEOUT each) and the turns themselves
+  // have to fit the per-test budget, and on the slow hosted runner two of everything did not.
+  test.slow();
   await openAssistant(page);
   await pickModel(page, /oracle-mini/);
 
@@ -234,7 +245,7 @@ test("conversation search filters the session list and keeps the detail in step"
   for (const text of ["alpha conversation", "beta conversation"]) {
     await page.getByPlaceholder(/Message your assistant/).fill(text);
     await page.getByRole("button", { name: "Send" }).click();
-    await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
+    await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
     await pressMod(page, "Shift+O");
   }
 
@@ -267,7 +278,7 @@ test("the palette's Search conversations focuses the History box", async ({ page
   await pickModel(page, /oracle-mini/);
   await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
-  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
+  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
 
   await openPalette(page);
   await page.getByLabel("Command palette search").fill("search conv");
