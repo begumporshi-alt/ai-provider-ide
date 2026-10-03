@@ -10,6 +10,18 @@ export type ErrorClass =
   | "NOT_FOUND"
   | "BAD_REQUEST_SCHEMA"
   | "PARSE_ERROR"
+  /**
+   * The provider answered and composed nothing a caller could use — a 200 with no text and no tool
+   * call. Distinct from `PARSE_ERROR`, which is about a shape this router cannot read: here there
+   * is nothing to read, because the model never wrote an answer.
+   *
+   * The measured cause (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended thinking is
+   * on by default, `max_tokens` covers reasoning **and** answer, and the reasoning consumed the
+   * whole 8192-token budget, so the stream ended at `stop_reason: max_tokens` having opened no text
+   * block. Four such turns in 75 minutes, each ~40 s of waiting and an empty bubble, filed as a
+   * parse error against a manifest that was correct.
+   */
+  | "NO_OUTPUT"
   | "SERVER_ERROR"
   | "TIMEOUT"
   | "NETWORK"
@@ -17,7 +29,13 @@ export type ErrorClass =
   | "BILLING"
   | "OK";
 
-/** Errors that count toward provider drift (§2.10). */
+/**
+ * Errors that count toward provider drift (§2.10).
+ *
+ * `NO_OUTPUT` is deliberately absent. Drift is the provider failing to honour the shape it declared;
+ * a reasoning model that ran out of output budget is the provider honouring its contract exactly,
+ * and counting it would push a healthy provider toward repair for a request-side cause.
+ */
 export const DRIFT_CLASSES: ReadonlySet<ErrorClass> = new Set([
   "NOT_FOUND",
   "BAD_REQUEST_SCHEMA",
@@ -83,8 +101,26 @@ export function classify(status: number, bodyHint?: "schema" | "not_found" | "cl
  * `400 {"error":{"code":"content-blocked",…}}` reached the operator as "schema" — a word about
  * *our* request shape, for a refusal that was about the provider's content policy. The raw signal
  * is appended, not reformatted: `error.code` when the body names one, else `error.message`, else
- * the body itself, all truncated to 120 characters.
+ * the body itself, truncated to `MAX_REASON_CHARS`.
  */
+
+/**
+ * Longest provider reason kept, counted in **code points**.
+ *
+ * 120 was too tight for the message this exists to carry. Measured against `agentrouter.org`'s
+ * Anthropic route on 2026-10-02, a rejected `tool_result` answers with 186 characters before the
+ * aggregator appends its own request/trace ids:
+ *
+ *   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_x.
+ *   Each `tool_result` block must have a corresponding `tool_use` block in the previous message.
+ *
+ * The old cut landed at "Each `…", dropping BOTH the offending id and the rule that explains it —
+ * so a live 400 could not be diagnosed from the ledger at all, which is the same
+ * evidence-truncated-where-it-matters defect as the stream sample. The cap exists only to bound a
+ * text column; a validation error that cannot state its rule is not evidence.
+ */
+export const MAX_REASON_CHARS = 400;
+
 export function reasonFromBody(body: string | undefined | null): string | undefined {
   if (!body) return undefined;
   let reason: string | undefined;
@@ -103,5 +139,8 @@ export function reasonFromBody(body: string | undefined | null): string | undefi
     // not JSON — the raw text is still the provider's own words
   }
   reason ??= body;
-  return reason.length > 120 ? reason.slice(0, 117) + "…" : reason;
+  // Code points, not `slice`: a UTF-16 cut can land between a surrogate pair and leave a lone half
+  // in the ledger — the same rule the Rust mirror's `chars()` and the stream sample follow.
+  const points = Array.from(reason);
+  return points.length <= MAX_REASON_CHARS ? reason : `${points.slice(0, MAX_REASON_CHARS).join("")}…`;
 }

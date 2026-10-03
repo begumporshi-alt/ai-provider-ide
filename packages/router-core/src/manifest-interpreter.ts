@@ -12,6 +12,7 @@ import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
 import { shapeMessageContent, textOfContent } from "./content-parts.js";
+import { reasoningDeltaOf } from "./stream-shape.js";
 import {
   attachToolParts, readToolCalls, shapeToolDeclarations, type ToolCallShape, type ToolPartTemplates,
 } from "./tool-shaping.js";
@@ -199,6 +200,22 @@ export interface TextArgs {
    * the stream), because only the caller knows how much evidence a ledger row can afford.
    */
   onStreamEvent?: (payload: string) => void;
+  /**
+   * The model's **reasoning**, as it streams. Separated from `chunks` on purpose: reasoning is not
+   * the answer, and a caller that put it in the transcript would be quoting the model's notes as if
+   * they were its reply.
+   *
+   * It exists because reasoning is otherwise *lost*, and losing it turns a slow answer into no
+   * answer at all. Measured 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`, extended thinking
+   * on by default): a request whose reasoning outruns `max_tokens` streams 8192 `thinking_delta`
+   * events, zero `text_delta`, and ends at `stop_reason: max_tokens`. `chunkMap.delta` is
+   * `$.delta.text`, so every one of those events was dropped, the caller received nothing, and the
+   * turn was filed as a parse error — for a provider that had answered perfectly and a model that
+   * had simply not reached its answer yet.
+   *
+   * Fires once per carrier event, in order. Never fires for a non-reasoning model.
+   */
+  onReasoningDelta?: (text: string) => void;
   /** Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
    *  `responseFinish` selector. Absent if the provider never emitted one. */
   onFinish?: (reason: string | undefined) => void;
@@ -311,6 +328,27 @@ const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
  */
 function selectText(json: unknown, path: string): string | undefined {
   return joinTextParts(selectOne(json, path));
+}
+
+/**
+ * The **thinking** blocks of a mixed block array, joined. The unary counterpart of
+ * `reasoningDeltaOf`: `selectText` is careful to read *past* a thinking block so the answer behind
+ * it still arrives, which is why a reasoning-only reply came back empty with nothing to show for
+ * it. This is what that path shows instead — the reasoning itself.
+ *
+ * Block type first, then the field: a `thinking` block carries its text in `thinking`, and a
+ * `redacted_thinking` block carries none at all (the provider withheld it), so it contributes
+ * nothing and is not an error.
+ */
+function joinThinkingParts(v: unknown): string | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const parts: string[] = [];
+  for (const item of v) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (o.type === "thinking" && typeof o.thinking === "string") parts.push(o.thinking);
+  }
+  return parts.length ? parts.join("") : undefined;
 }
 
 /** Join a selected value into text — a string as-is, a mixed block array by its text parts. */
@@ -753,6 +791,13 @@ export class ManifestInterpreter implements AdapterInstance {
       const json: unknown = jsonBody(await res.text(), url);
       const text = selectText(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
+      // The reasoning, when the reply was mostly reasoning. Read from the same mixed array
+      // `selectText` reads past, so a thinking-only body is no longer indistinguishable from a
+      // model that chose to say nothing.
+      if (args.onReasoningDelta) {
+        const reasoning = joinThinkingParts(selectOne(json, ep.responseMap.text));
+        if (reasoning) args.onReasoningDelta(reasoning);
+      }
       if (ep.responseMap.toolCalls) {
         emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls), ep.responseMap.toolCallShape);
       }
@@ -819,6 +864,13 @@ export class ManifestInterpreter implements AdapterInstance {
         const payload = trimmed.slice(5).trim();
         if (payload === "[DONE]") return;
         args.onStreamEvent?.(payload);
+        // Before the manifest decides anything: reason from the payload's own field names, so a
+        // provider whose persisted manifest predates this still yields its reasoning. See
+        // `reasoningDeltaOf` for why this is not a selector.
+        if (args.onReasoningDelta) {
+          const reasoning = reasoningDeltaOf(payload);
+          if (reasoning) args.onReasoningDelta(reasoning);
+        }
         let json: unknown;
         try {
           json = JSON.parse(payload);

@@ -6,6 +6,7 @@
  * backoff honoring Retry-After) and propagates cancellation via AbortSignal.
  */
 import { ManifestHttpError } from "./manifest-interpreter.js";
+import { describeSilentStream, emptyTally, noteStreamEvent, type StreamTally } from "./stream-shape.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
 import { classify, classifyHttp, reasonFromBody, type ErrorClass } from "./errors.js";
@@ -43,6 +44,13 @@ export interface ExecuteTextArgs {
   /** Called once with whatever usage the upstream reported; also fills `TextExecution.usage()`. */
   onUsage?: (usage: UsageTokens) => void;
   onFinish?: (reason: string | undefined) => void;
+  /**
+   * The model's reasoning, as it streams. Forwarded to the adapter unchanged, and accumulated
+   * separately so the ledger can tell "the provider sent nothing" from "the provider sent
+   * reasoning and never reached its answer" — a distinction that used to be invisible and that
+   * cost one turn 46 seconds and an empty bubble.
+   */
+  onReasoning?: (text: string) => void;
   signal?: AbortSignal;
   maxAttempts?: number;
 }
@@ -68,7 +76,26 @@ export interface TextExecution {
    * label had been conflating, with no evidence to tell them apart.
    */
   observation: () => string | undefined;
+  /**
+   * The reasoning the last attempt streamed, when it streamed any. Bounded by `MAX_REASONING_CHARS`
+   * — this is the engine's own copy, kept so the ledger can say whether reasoning happened at all;
+   * a live reader gets every delta through `ExecuteTextArgs.onReasoning`, which is not capped.
+   */
+  reasoning: () => string | undefined;
+  /**
+   * The last attempt's finish reason in the OpenAI vocabulary (`"length"` == the output cap was
+   * reached). `undefined` when the provider never named one. The engine used to forward this
+   * straight to the caller and keep nothing, so a ledger row could not say *why* a stream stopped.
+   */
+  finishReason: () => string | undefined;
 }
+
+/**
+ * Cap on the engine's own reasoning buffer. Generous — the measured failure carried 25 k characters
+ * — but finite, because a provider that streams unbounded reasoning must not be able to grow the
+ * process without limit.
+ */
+export const MAX_REASONING_CHARS = 200_000;
 
 export const MAX_ATTEMPTS_DEFAULT = 6;
 
@@ -103,6 +130,10 @@ export class ExecutionEngine {
     // (bounded here, at the capture point) rather than a growing buffer: only the sample is ever
     // worth the bytes.
     let observation: string | undefined;
+    // The last attempt's reasoning and finish reason, reset with `observation` so all three
+    // describe the same candidate the ledger row will blame.
+    let reasoning = "";
+    let finishReason: string | undefined;
     const SAMPLE_CHARS = 240;
     async function* stream(): AsyncGenerator<string, void, void> {
       for (let i = 0; i < attempts; i++) {
@@ -117,9 +148,13 @@ export class ExecutionEngine {
         }
         let emitted = false;
         let toolCalls = 0;
-        let events = 0;
-        let firstEvent: string | undefined;
+        // What this attempt's stream carried, classified as it arrives — see `stream-shape.ts`. A
+        // bare counter could say only "events arrived and none of them were text", which is worded
+        // identically for a wrong-shape stream and for a model that reasoned and never answered.
+        let tally: StreamTally = emptyTally();
         observation = undefined;
+        reasoning = "";
+        finishReason = undefined;
         // **A tool call is delivered output, so it marks the candidate as `served`.** `served` is
         // what `wrapLedger` tests (`model-router.ts:429`) and what names the provider on the row,
         // and it was being set from `chunks` alone — so a turn whose entire output is a tool call
@@ -158,11 +193,18 @@ export class ExecutionEngine {
             { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, reasoning: args.reasoning, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); },
               // See `TextArgs.onStreamEvent`. The sample is truncated here, at the capture point,
               // because only the engine knows how much evidence a row can afford.
-              onStreamEvent: payload => {
-                events++;
-                firstEvent ??= payload.length > SAMPLE_CHARS ? payload.slice(0, SAMPLE_CHARS) + "…" : payload;
+              onStreamEvent: payload => noteStreamEvent(tally, payload, SAMPLE_CHARS),
+              // Kept beside the forwarded callback: the caller gets the reasoning as it arrives, and
+              // the engine keeps its own bounded copy so the ledger row can say whether reasoning
+              // was the reason the turn produced no answer.
+              onReasoningDelta: t => {
+                if (reasoning.length < MAX_REASONING_CHARS) reasoning += t;
+                args.onReasoning?.(t);
               },
-              onFinish: args.onFinish },
+              onFinish: r => {
+                finishReason = r;
+                args.onFinish?.(r);
+              } },
             args.signal,
           )) {
             if (!emitted) {
@@ -175,12 +217,22 @@ export class ExecutionEngine {
           // Delivered nothing: this is the arm the ledger's PARSE_ERROR-with-no-evidence rows come
           // from, so keep what the stream actually carried before the success return discards it.
           // Zero events is a finding of its own ("the provider sent nothing at all"), so it is
-          // worded rather than left undefined — the same three states the Rust describe() names.
+          // worded rather than left undefined — the same distinction the Rust `describe()` draws.
           if (!emitted && toolCalls === 0) {
-            observation =
-              events === 0
-                ? "stream carried no SSE events at all"
-                : `stream carried ${events} SSE event(s), none matched the manifest's delta selector; first: ${firstEvent}`;
+            observation = describeSilentStream(tally, finishReason);
+            // **The attempt is recorded, because an attempt happened.** The chain held only
+            // failures, so a provider that answered 200 and streamed 8197 events while producing
+            // nothing left no trace in it — and `Activity` then printed "no attempt recorded —
+            // nothing was tried for this model" directly beneath the row proving otherwise. The
+            // status is 200 because that is what the provider returned: this is not a failed
+            // request, it is a request that was answered and whose answer was not usable.
+            //
+            // Deliberately NOT a reason to advance to the next candidate. Advancing is a behaviour
+            // change (the plan has already run; another provider might answer, and might answer
+            // differently on every retry), so it is left to a decision of its own rather than
+            // smuggled in with the bookkeeping. `health.recordResult` above still says OK, because
+            // the key and the provider did their job.
+            fallbackChain.push({ candidate: c, cls: "NO_OUTPUT", status: 200 });
           }
           return; // success
         } catch (e) {
@@ -235,6 +287,8 @@ export class ExecutionEngine {
       chunks: stream(),
       usage: () => usageBox.value,
       observation: () => observation,
+      reasoning: () => (reasoning.length ? reasoning : undefined),
+      finishReason: () => finishReason,
     };
   }
 

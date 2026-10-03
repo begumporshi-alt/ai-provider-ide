@@ -48,6 +48,12 @@ export type GenerateFn = (
 
 export type AgentEvent =
   | { type: "assistant"; text: string }
+  /**
+   * The model's reasoning for the round-trip in flight. Its own event, never folded into
+   * `assistant`: reasoning is the model's notes, and a UI that rendered it as prose would be
+   * quoting the notes as the answer. See `TextRequest.onReasoning`.
+   */
+  | { type: "reasoning"; text: string }
   | { type: "tool_call"; call: import("@aiprovider/router-core").ToolCall }
   | { type: "tool_result"; call: import("@aiprovider/router-core").ToolCall; result: string; ok: boolean }
   | { type: "done"; text: string; iterations: number };

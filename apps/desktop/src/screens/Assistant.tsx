@@ -67,6 +67,19 @@ interface Msg {
   id: string;
   role: "user" | "assistant" | "tool";
   content: string;
+  /**
+   * The model's own reasoning for this turn, when it produced any. Kept beside `content` rather
+   * than spliced into it: reasoning is the model's notes, not its answer, and a transcript that
+   * merged the two would quote the notes as the reply.
+   *
+   * It is kept even when the turn produced **no answer at all**, which is the case it exists for.
+   * Measured 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`): extended thinking is on by
+   * default, `max_tokens` covers reasoning *and* answer, and a turn whose reasoning outran the
+   * 8192-token budget streamed 25 000 characters of thinking, no text, and left the user staring
+   * at an empty bubble for 46 seconds. The reasoning was there the whole time; nothing was
+   * listening for it.
+   */
+  reasoning?: string;
   /** Set on an assistant turn that requested tool calls, so the next turn can replay them. */
   tool_calls?: unknown;
   /** Set on a tool result turn, linking it to its originating call. */
@@ -1616,6 +1629,13 @@ function Chat({
    *  new list (the transcript of the old session is context, not live state). */
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
+  /**
+   * The agent run's reasoning so far. Live-only, exactly like `streamedText`: it describes the run
+   * in flight, and the transcript that replaces it when the run ends is rebuilt from the loop's
+   * messages. It exists so a run that spends 40 s thinking shows *that it is thinking* rather than
+   * a still status line.
+   */
+  const [streamedReasoning, setStreamedReasoning] = useState("");
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
   // Tokens this agent run has spent so far — every model call in the loop reports, and the live
@@ -1957,6 +1977,10 @@ function Chat({
     }
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
+    } else if (ev.type === "reasoning") {
+      // Accumulated, not replaced: an agent turn is several round-trips and the panel shows the
+      // whole run's deliberation, the same way `streamedText` shows the whole run's prose.
+      setStreamedReasoning((t) => t + ev.text);
     } else if (ev.type === "tool_call") {
       setAgentItems((l) => [...l, { name: ev.call.name ?? "?", args: tryParseArgs(ev.call.arguments), status: "calling" }]);
       // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
@@ -2036,6 +2060,7 @@ function Chat({
         return;
       }
       setStreamedText("");
+      setStreamedReasoning("");
       setAgentItems([]);
       setRunUsage({ tokensIn: 0, tokensOut: 0 });
       // The previous run's review is about to be superseded — and leaving it up while a new run
@@ -2181,6 +2206,7 @@ function Chat({
         setPendingConfirm(null);
         setAgentItems([]);
         setStreamedText("");
+        setStreamedReasoning("");
         abortRef.current = null;
         // P5: publish the change set in `finally`, not on the success path. A run the user stopped
         // or that threw has still written every file it got to before that, and those are exactly
@@ -2201,6 +2227,14 @@ function Chat({
     const recalled = useMemory ? await recallContext(trimmed) : [];
     if (recalled.length > 0) recordRecall(userNode, recalled);
     let streamed = "";
+    // The model's reasoning, and when it was last painted. Time-based rather than count-based: a
+    // fixed "every Nth delta" is wrong at both ends of the range — the measured failure carried
+    // **8197** deltas, where one React render each would stall the window, while a short 20-delta
+    // thought would render its first delta and then nothing until the stream ended, showing an
+    // open but effectively empty panel for the whole turn. A clock interval is right for both.
+    let reasoned = "";
+    let lastReasoningPaint = 0;
+    const REASONING_PAINT_MS = 80;
     try {
       // The same replay the agent path uses. Sharing it is the fix: this path used to map only
       // {role, content}, so a session that had used agent mode sent its tool results with no
@@ -2226,6 +2260,16 @@ function Chat({
             },
           ],
           onFinish: setFinishReason,
+          // Rendered live, throttled. A reasoning-heavy turn is otherwise indistinguishable from a
+          // hung request: the panel filling in is the only signal that the model is working.
+          onReasoning: (t) => {
+            reasoned += t;
+            const now = Date.now();
+            if (now - lastReasoningPaint >= REASONING_PAINT_MS) {
+              lastReasoningPaint = now;
+              setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
+            }
+          },
           // P7: per-request params, and the provider's own token report for the meter's tooltip
           // (estimate vs what the request actually cost). The running totals are NOT accumulated
           // here — they are read back from the ledger, which is the same record the Usage screen
@@ -2244,6 +2288,12 @@ function Chat({
         setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed } : x)));
         // Scroll is handled by the sticky-follow effect on `msgs` — following per token here would
         // also fight the user when they have scrolled up to read.
+      }
+      // The tail the throttle above skipped. This is the flush that matters most: the last deltas
+      // before a model runs out of output budget are the ones that say what it was doing when it
+      // stopped, and dropping them would truncate the reasoning exactly where it got interesting.
+      if (reasoned) {
+        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
       }
       const served = exec.served();
       const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
@@ -2493,6 +2543,7 @@ function Chat({
     setAgentItems([]);
     setTodos([]);
     setStreamedText("");
+    setStreamedReasoning("");
     setEditingId(null);
     setEditDraft("");
     setSessionTitle("");
@@ -2870,6 +2921,7 @@ function Chat({
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive
                   raw={streamedText}
+                  reasoning={streamedReasoning}
                   items={agentItems}
                   waiting={pendingConfirm?.call.name ?? null}
                   stopping={stopping}
@@ -2879,7 +2931,17 @@ function Chat({
                 // A turn that only requested tools has no prose of its own. Rendering the
                 // empty-content placeholder there is what left a bare "…" under a tool call —
                 // indistinguishable from a model that answered with nothing.
-                m.content.trim() ? <AssistantContent raw={m.content} /> : null
+                <>
+                  {/* The reasoning leads the answer, folded away — the order the model produced it
+                      in. A turn that reasoned and then answered shows both; a turn that reasoned
+                      and ran out of output budget shows the reasoning instead of the empty bubble
+                      it used to show, which is the difference between "nothing happened" and
+                      "here is what it was doing". */}
+                  {m.reasoning ? (
+                    <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
+                  ) : null}
+                  {m.content.trim() ? <AssistantContent raw={m.content} /> : null}
+                </>
               )
             ) : (
               <>
@@ -3412,6 +3474,62 @@ function ToolResultBubble({ content, call }: { content: string; call?: ToolCallR
 }
 
 /**
+ * The model's reasoning, folded away above its answer.
+ *
+ * Reasoning models stream their deliberation as a separate channel (`thinking_delta` on Anthropic,
+ * `reasoning_content` on the OpenAI-compatible gateways). It is not the answer and must not read as
+ * one — hence folded, labelled, and visually subordinate. But it must not be *discarded* either,
+ * which is what the app did until 2026-10-02: `chunkMap.delta` is `$.delta.text`, so every thinking
+ * delta was dropped, and a turn whose reasoning outran its output budget arrived as nothing at all.
+ * The ledger filed it `PARSE_ERROR` against a manifest that was correct, and the user watched an
+ * empty bubble fill the screen for 46 seconds while 25 000 characters of the model's actual work
+ * went past unread.
+ *
+ * Open while streaming and closed afterwards, unless the reader says otherwise. Streaming reasoning
+ * is the only evidence that a long turn is progressing rather than hung; a *finished* reasoning
+ * block is mostly noise on top of the answer, so it collapses itself once there is an answer to
+ * read. Either way the character count stays visible, because 25 000 characters and 40 characters
+ * are different findings.
+ */
+function ReasoningPanel({ text, streaming }: { text: string; streaming?: boolean }) {
+  // `null` = the reader has not expressed a preference, so follow the stream. An explicit toggle
+  // then sticks, including through the moment streaming ends.
+  const [choice, setChoice] = useState<boolean | null>(null);
+  const open = choice ?? Boolean(streaming);
+  return (
+    <div
+      className="mb-1.5 rounded border"
+      style={{ borderColor: "var(--border)" }}
+      data-testid="reasoning-panel"
+    >
+      <button
+        type="button"
+        onClick={() => setChoice(!open)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px]"
+        style={{ color: "var(--text-dim)" }}
+        data-testid="reasoning-toggle"
+      >
+        <span aria-hidden>{open ? "▾" : "▸"}</span>
+        <span>{streaming ? "Thinking…" : "Thought process"}</span>
+        <span style={{ color: "var(--text-faint)" }}>
+          · {text.length.toLocaleString()} characters
+        </span>
+      </button>
+      {open && (
+        <div
+          className="max-h-60 overflow-auto whitespace-pre-wrap break-words border-t px-2 py-1.5 text-[11px]"
+          style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+          data-testid="reasoning-body"
+        >
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * The live status line (2026-10-02).
  *
  * Replaces the bare "…" an in-flight turn showed while nothing had streamed yet — the three dots
@@ -3482,12 +3600,14 @@ function formatElapsed(s: number): string {
 /** Live view of an in-flight agent turn: the status line, streamed text plus this turn's calls, grouped as they run. */
 function AgentLive({
   raw,
+  reasoning,
   items,
   waiting,
   stopping,
   usage,
 }: {
   raw: string;
+  reasoning: string;
   items: AgentItem[];
   waiting: string | null;
   stopping: boolean;
@@ -3505,6 +3625,10 @@ function AgentLive({
   return (
     <>
       <AgentStatus items={items} waiting={waiting} stopping={stopping} usage={usage} />
+      {/* Above the prose, folded, open while it streams — the run's own record of what it is
+          working through. A reasoning-heavy round-trip is otherwise a status line that has not
+          changed for 40 seconds, which reads as a hang. */}
+      {reasoning.trim() ? <ReasoningPanel text={reasoning} streaming /> : null}
       {raw.trim() ? <Markdown source={raw} /> : null}
       {steps.length > 0 && <ToolRunGroup steps={steps} live />}
     </>

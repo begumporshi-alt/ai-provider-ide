@@ -160,6 +160,15 @@ async function oracle(req, res, path) {
 
     let content;
     let toolCall;
+    /**
+     * Reasoning-only: the OpenAI-compatible spelling of the failure that produced the "the agent
+     * is not replying" report (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`). The model
+     * spends its whole output budget deliberating and never opens a text block, so a client that
+     * reads only `delta.content` receives **nothing** while 8192 events go past. Driven by a
+     * `think:` prefix because the real trigger is a provider-side default (`thinking` on) that a
+     * request cannot portably express — the point here is the client's handling of the shape.
+     */
+    const reasoningOnly = /^think:/i.test(String(last));
     if (system.includes("Tier-2 code adapters")) {
       // The Tier-2 round: a fenced envelope the extractor can parse.
       content = "```json\n" + JSON.stringify(CODE_ENVELOPE, null, 2) + "\n```";
@@ -205,6 +214,10 @@ async function oracle(req, res, path) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.
       toolCall = { name: "list_dir", arguments: JSON.stringify({ path: "." }) };
+      content = "";
+    } else if (reasoningOnly) {
+      // No answer at all — the model never got past thinking. `content` must stay empty, or the
+      // test would be asserting on a reply the real provider never sends.
       content = "";
     } else {
       content = tools && sawToolResult
@@ -262,6 +275,23 @@ async function oracle(req, res, path) {
       })}\n\n`);
       res.write(`data: ${JSON.stringify({
         choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      })}\n\n`);
+    } else if (reasoningOnly) {
+      // Reasoning deltas only, then the limit. The words are fixed so a spec can assert on the
+      // text that reached the panel rather than merely that *something* rendered.
+      const reasoning = "The user is asking about the release checklist. I should read the changelog first, then the tags, then report only the differences.";
+      for (const w of reasoning.split(" ")) {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: w + " " } }] })}\n\n`);
+        // Slow enough (≈2 s for the sentence) that a spec can observe the panel while the turn is
+        // still running — "open and filling" is the state that distinguishes progress from a hang,
+        // and an instant reply could never show it.
+        await sleep(90);
+      }
+      // `max_tokens` covers reasoning AND answer on this shape, and the reasoning took all of it:
+      // the stream ends at the output limit with no text block ever opened. This is the fact that
+      // separates "the model reasoned too long" from "the manifest cannot read this provider".
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "length" }],
       })}\n\n`);
     } else {
       // A `slow:` prefix on the user's message makes the reply take a few seconds instead of

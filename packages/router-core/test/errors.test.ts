@@ -4,7 +4,7 @@
  * about the network) — plus the reason passthrough that keeps the provider's own words.
  */
 import { describe, expect, it } from "vitest";
-import { classify, classifyHttp, reasonFromBody } from "../src/errors.js";
+import { MAX_REASON_CHARS, classify, classifyHttp, reasonFromBody } from "../src/errors.js";
 import { HealthTracker } from "../src/health-tracker.js";
 import type { ApiKeyRecord } from "../src/domain.js";
 
@@ -72,12 +72,36 @@ describe("reasonFromBody", () => {
       .toBe("content-blocked: content-blocked (request id: x)");
   });
 
-  it("falls back to the raw body and truncates", () => {
+  it("keeps a validation error whole enough to state its rule", () => {
+    // Measured from agentrouter.org on 2026-10-02, verbatim apart from the ids. It is 186
+    // characters before the aggregator's own request/trace suffixes, so the old 120-character cut
+    // landed at "Each `…" — dropping both the offending id and the sentence that names the rule.
+    // A live 400 showing that row could not be diagnosed, which is the whole job of this field.
+    const message =
+      "unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_bogus_123. " +
+      "Each `tool_result` block must have a corresponding `tool_use` block in the previous message.";
+    const got = reasonFromBody(JSON.stringify({ error: { message } }))!;
+
+    expect(got).toContain("toolu_bogus_123");
+    expect(got).toContain("must have a corresponding");
+    expect(got).not.toContain("…");
+  });
+
+  it("falls back to the raw body and truncates a runaway one", () => {
     expect(reasonFromBody("plain refusal text")).toBe("plain refusal text");
-    const long = "x".repeat(200);
+    const long = "x".repeat(MAX_REASON_CHARS + 300);
     const got = reasonFromBody(long)!;
-    expect(got.length).toBeLessThanOrEqual(120);
+    expect(got.length).toBeLessThanOrEqual(MAX_REASON_CHARS + 1); // the ellipsis is the extra
     expect(got.endsWith("…")).toBe(true);
+  });
+
+  it("cuts on a code point, so a split surrogate never reaches the ledger", () => {
+    const got = reasonFromBody("🙂".repeat(MAX_REASON_CHARS + 10))!;
+    const lone = [...got].some((c) => {
+      const cp = c.codePointAt(0) ?? 0;
+      return cp >= 0xd800 && cp <= 0xdfff;
+    });
+    expect(lone).toBe(false);
   });
 });
 
