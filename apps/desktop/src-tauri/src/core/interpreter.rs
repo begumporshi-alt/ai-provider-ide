@@ -493,13 +493,33 @@ impl ManifestInterpreter {
             // `reasoning_values` yields only the keys the caller asked for, so a request with no
             // setting adds nothing and the template's `{{…?}}` placeholders omit their fields —
             // the provider's own default, which is the contract for "unset".
+            //
+            // The one interaction the rendering cannot express (audit 2026-10-03 R3): Anthropic
+            // rejects a thinking-enabled request that also carries `temperature != 1` or a
+            // `tool_choice` naming a specific tool — a guaranteed upstream 400 filed as
+            // BAD_REQUEST_SCHEMA, burning failover candidates. The constraint belongs to the
+            // upstream that defines `thinking`, so the marker is the template declaring the
+            // `{{thinking?}}` placeholder: a manifest that declares it speaks the dialect the
+            // rule governs. The caller's temperature is dropped (the provider's default is 1)
+            // and a forced choice is clamped to the dialect's own `auto`.
+            let mut thinking_enabled_on_anthropic = false;
             if let Some(effort) = reasoning {
-                for (key, value) in reasoning_values(effort, effective_max_tokens) {
+                let rendered = reasoning_values(effort, effective_max_tokens);
+                thinking_enabled_on_anthropic = rendered.iter().any(|(k, v)| {
+                    *k == "thinking" && v.get("type").and_then(Value::as_str) == Some("enabled")
+                }) && ep
+                    .request_template
+                    .values()
+                    .filter_map(Value::as_str)
+                    .any(|s| s.contains("{{thinking?}}"));
+                for (key, value) in rendered {
                     values.insert(key.to_string(), value);
                 }
             }
             if let Some(t) = temperature {
-                values.insert("temperature".to_string(), Value::from(t));
+                if !thinking_enabled_on_anthropic {
+                    values.insert("temperature".to_string(), Value::from(t));
+                }
             }
             if let Some(v) = shaped_tools {
                 values.insert("tools".to_string(), v);
@@ -509,6 +529,13 @@ impl ManifestInterpreter {
                 // provider (agentrouter.org) accepts `tool_choice` only as an object, so the OpenAI
                 // string `"auto"` is a 400 upstream; the map declares `{type:"auto"}` and friends.
                 // `None` omits the field entirely — the same signal as a form the map does not name.
+                let clamped;
+                let v: &Value = if thinking_enabled_on_anthropic {
+                    clamped = serde_json::json!("auto");
+                    &clamped
+                } else {
+                    v
+                };
                 if let Some(mapped) = translate_tool_choice(v, ep.tool_choice_map.as_ref()) {
                     values.insert("toolChoice".to_string(), mapped);
                 }
@@ -1189,19 +1216,18 @@ fn reasoning_values(
 ) -> Vec<(&'static str, Value)> {
     let budget = thinking_budget(effort, max_tokens);
     if budget == 0 {
-        return vec![
-            (
-                "thinking",
-                serde_json::json!({ "type": "disabled" }),
-            ),
-            ("thinkingConfig", serde_json::json!({ "thinkingBudget": 0 })),
-        ];
+        // Audit 2026-10-03 R4: the off rendering is per-dialect, and `thinkingBudget: 0` is not
+        // the portable off switch it looks like — Gemini allows it only on 2.5 **Flash**; 2.5
+        // **Pro** has a 128 floor and cannot disable thinking, so an explicit `off` on a Pro
+        // model was a deterministic 400. So `thinkingConfig` is omitted: the placeholder drops
+        // the field, and the provider's own default governs — which on Pro is the only legal
+        // answer, and on Flash costs an explicit "no thinking" that degrades to dynamic
+        // thinking. Anthropic keeps its probed spelling (agentrouter.org, 2026-10-02; the TS
+        // reference still sends both keys — recorded in the drift register).
+        return vec![("thinking", serde_json::json!({ "type": "disabled" }))];
     }
     vec![
-        (
-            "thinking",
-            serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
-        ),
+        ("thinking", serde_json::json!({ "type": "enabled", "budget_tokens": budget })),
         ("reasoningEffort", serde_json::json!(effort.as_str())),
         ("thinkingConfig", serde_json::json!({ "thinkingBudget": budget })),
     ]
@@ -2074,7 +2100,8 @@ mod tests {
         // lines the builtins now carry (`builtin_templates.rs`).
         let mut manifest = anthropic_manifest();
         manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
-        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] = json!("{{thinking?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
         let mut openai_fixture = openai_manifest();
         openai_fixture["endpoints"]["generateText"]["requestTemplate"]["reasoning_effort"] =
             json!("{{reasoningEffort?}}");
@@ -2088,7 +2115,8 @@ mod tests {
         args.reasoning = Some(ReasoningEffort::Off);
         let _ = &cancel;
         drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
-        let body: Value = serde_json::from_str(&off.only_request().body.as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(off.only_request().body.as_deref().unwrap()).unwrap();
         assert_eq!(body["thinking"], json!({ "type": "disabled" }));
 
         let high = FakeHttp::new(vec![Scripted::text(200, answer)]);
@@ -2097,7 +2125,8 @@ mod tests {
         args.stream = false;
         args.reasoning = Some(ReasoningEffort::High);
         drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
-        let body: Value = serde_json::from_str(&high.only_request().body.as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(high.only_request().body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body["thinking"],
             json!({ "type": "enabled", "budget_tokens": 6144 }),
@@ -2113,9 +2142,123 @@ mod tests {
         args.stream = false;
         args.reasoning = Some(ReasoningEffort::Medium);
         drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
-        let body: Value = serde_json::from_str(&openai.only_request().body.as_deref().unwrap()).unwrap();
+        let body: Value =
+            serde_json::from_str(openai.only_request().body.as_deref().unwrap()).unwrap();
         assert_eq!(body["reasoning_effort"], "medium");
         assert!(body.get("thinking").is_none(), "the anthropic field stays home");
+    }
+
+    /// Audit 2026-10-03 R3: Anthropic rejects a thinking-enabled request whose temperature is not
+    /// 1 or whose `tool_choice` names a tool — a guaranteed upstream 400 that failover then files
+    /// as BAD_REQUEST_SCHEMA, burning candidates on. With thinking enabled, the caller's
+    /// temperature is dropped and a forced choice is clamped to the dialect's own `auto`; without
+    /// it, both are forwarded untouched. The marker is the template declaring `{{thinking?}}` —
+    /// the placeholder is what makes the manifest speak the dialect the rule governs.
+    #[tokio::test]
+    async fn a_thinking_enabled_request_drops_the_temperature_and_clamps_the_tool_choice() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["temperature"] =
+            json!("{{temperature?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["tool_choice"] =
+            json!("{{toolChoice?}}");
+        manifest["endpoints"]["generateText"]["toolChoiceMap"] = json!({
+            "auto": { "type": "auto" },
+            "function": { "type": "tool", "name": "{{toolChoice.function.name}}" }
+        });
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let cancel = Cancel::new();
+        let forced = json!({ "type": "function", "function": { "name": "write_file" } });
+
+        let thinking = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, thinking.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        args.temperature = Some(0.7);
+        args.tool_choice = Some(&forced);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(thinking.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "thinking is on: the caller's temperature must not ride along:
+{body}"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "auto" }),
+            "a forced choice is clamped to the dialect's own auto:
+{body}"
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        let plain = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, plain.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.temperature = Some(0.7);
+        args.tool_choice = Some(&forced);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(plain.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["temperature"], 0.7,
+            "no thinking: the caller's temperature is forwarded:
+{body}"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "write_file" }),
+            "no thinking: the forced choice is forwarded through the map, not clamped:
+{body}"
+        );
+    }
+
+    /// Audit 2026-10-03 R4: `off` must not send `thinkingBudget: 0` — Gemini allows it only on
+    /// 2.5 **Flash**; 2.5 **Pro** has a 128 floor and cannot disable thinking, so an explicit
+    /// `off` on a Pro model was a deterministic 400. On a template that declares only the Gemini
+    /// placeholder, off renders nothing at all (the provider's default governs); the enabled
+    /// levels still carry a real budget. The Anthropic spelling keeps its probed
+    /// `{type:"disabled"}` — pinned by `the_thinking_knob_reaches_the_wire_in_the_dialect_s_own_field`.
+    #[tokio::test]
+    async fn reasoning_off_omits_the_gemini_thinking_config() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinkingConfig"] =
+            json!("{{thinkingConfig?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let cancel = Cancel::new();
+
+        let off = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, off.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Off);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(off.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("thinkingConfig").is_none(),
+            "off must not send thinkingBudget: 0 — 2.5 Pro refuses it:
+{body}"
+        );
+
+        let high = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, high.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(high.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body["thinkingConfig"]["thinkingBudget"].as_u64().unwrap_or(0) >= 1024,
+            "an enabled level still carries a real budget:
+{body}"
+        );
     }
 
     /// Unset: no field at all — the provider's own default. A fresh cancel per case: a stream
@@ -2124,7 +2267,8 @@ mod tests {
     async fn the_thinking_knob_is_absent_when_unset() {
         let mut manifest = anthropic_manifest();
         manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
-        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] = json!("{{thinking?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
         let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
         let bare = FakeHttp::new(vec![Scripted::text(200, answer)]);
         let interp = interpreter(&manifest, bare.clone());

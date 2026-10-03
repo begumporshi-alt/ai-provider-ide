@@ -111,6 +111,9 @@ pub(crate) async fn chat_h(
                     // model settles, and probes liveness between turns with an empty chunk —
                     // which must reach the client as nothing.
                     BridgeMsg::Delta(t) if t.is_empty() => {}
+                    // The bridge's held-prose liveness frame (audit 2026-10-03 R2): it exists to
+                    // disarm FIRST_MSG_TIMEOUT, never to reach the wire.
+                    BridgeMsg::Liveness => {}
                     BridgeMsg::Delta(t) => {
                         streamed.push_str(&t);
                         // The first content frame opens the message the way OpenAI does it, so
@@ -229,6 +232,8 @@ pub(crate) async fn chat_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            // Carries nothing by design; see the streaming arm (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
             BridgeMsg::Reasoning(t) => reasoning.push_str(&t),
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => finish_reason = Some(reason),
@@ -350,6 +355,9 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
+            // The bridge's held-prose liveness frame — carries nothing for a model list or an
+            // image reply (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
             BridgeMsg::ToolCalls(_) => {}
             // No reasoning to carry in a model list or an image reply — enumerated so the match
             // stays exhaustive.
@@ -457,6 +465,9 @@ pub(crate) async fn image_h(
             }
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
+            // The bridge's held-prose liveness frame — carries nothing for a model list or an
+            // image reply (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
             BridgeMsg::ToolCalls(_) => {}
             // No reasoning to carry in a model list or an image reply — enumerated so the match
             // stays exhaustive.

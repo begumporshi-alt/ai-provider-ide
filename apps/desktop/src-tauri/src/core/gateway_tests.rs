@@ -91,6 +91,8 @@ struct SynthBridge {
     reasoning: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
     empty_delta: AtomicBool,
+    /// Send one `Liveness` frame, then pause past any short first-message bound a test sets.
+    liveness_then_pause: AtomicBool,
     /// Answer nothing at all: stand in for a worker webview whose JS the OS suspended
     /// after the request was already admitted.
     silent: AtomicBool,
@@ -118,6 +120,7 @@ impl SynthBridge {
             tool_calls: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
+            liveness_then_pause: AtomicBool::new(false),
             silent: AtomicBool::new(false),
             fail_status: AtomicUsize::new(0),
             fail_retry_after: AtomicUsize::new(0),
@@ -157,6 +160,11 @@ impl SynthBridge {
     fn fail_with(&self, status: u16) {
         self.fail_status.store(status as usize, Ordering::Relaxed);
     }
+    /// Send one `Liveness` frame first, then pause before any real message — the shape the real
+    /// bridge produces while `ProseGate` holds a gateway-mode turn's prose.
+    fn announce_liveness_then_pause(&self, on: bool) {
+        self.liveness_then_pause.store(on, Ordering::Relaxed);
+    }
     /// Same, but the failure also carries the provider's own cooldown — the value that has
     /// to reach the client as `Retry-After` instead of the middleware's 1s floor.
     fn fail_with_cooldown(&self, status: u16, retry_after_ms: u64) {
@@ -186,9 +194,16 @@ impl Bridge for SynthBridge {
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
+        let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
         let fail = self.fail_status.load(Ordering::Relaxed);
         let fail_retry_after = self.fail_retry_after.load(Ordering::Relaxed);
         std::thread::spawn(move || {
+            if liveness_then_pause {
+                // The real bridge's held-prose shape: liveness first, silence after. The pause
+                // must outlive whatever first-message bound the test set.
+                replies.reply(req.request_id, BridgeMsg::Liveness);
+                std::thread::sleep(Duration::from_millis(400));
+            }
             if slow > 0 {
                 std::thread::sleep(Duration::from_millis(slow as u64 * 20));
             }
@@ -232,6 +247,21 @@ impl Bridge for SynthBridge {
                 }
                 "responses" => {
                     // Same synthetic text output as chat; responses_h wraps it into Responses API frames.
+                    if with_tools {
+                        // The bridge's pass-through contract (router_bridge.rs): ToolCalls then
+                        // Done. A Responses stream must turn that into function_call items and a
+                        // terminal `response.completed`, or the client hangs.
+                        replies.reply(
+                            req.request_id,
+                            BridgeMsg::ToolCalls(json!([{
+                                "id": "call_1",
+                                "type": "function",
+                                "function": { "name": "write_file", "arguments": "{\"path\":\"a.txt\"}" }
+                            }])),
+                        );
+                        replies.reply(req.request_id, BridgeMsg::Done);
+                        return;
+                    }
                     replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                     replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
                     replies.reply(req.request_id, BridgeMsg::Done);
@@ -630,6 +660,49 @@ async fn empty_delta_is_not_a_wire_event() {
     );
 }
 
+/// Audit 2026-10-03 R2: `FIRST_MSG_TIMEOUT` bounds only the wait for the bridge's *first*
+/// message, and a `Liveness` frame is a message. A bridge that announces liveness and then works
+/// past the bound — the shape the real bridge produces while `ProseGate` holds a gateway-mode
+/// turn's prose — must serve its answer instead of being killed at the bound.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_liveness_frame_disarms_the_first_message_bound() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    // 100 ms bound; the bridge pauses 400 ms behind its liveness frame. The default 30 s would
+    // make this test indistinguishable from pass/fail on timing alone.
+    s.core.set_first_msg_timeout(Duration::from_millis(100));
+    s.bridge.announce_liveness_then_pause(true);
+
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("content-type", "application/json")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("[DONE]") {
+            break;
+        }
+    }
+    assert!(
+        acc.contains("Hel") && acc.contains("lo"),
+        "the answer never arrived — the bound fired anyway:
+{acc}"
+    );
+    assert!(
+        !acc.contains("the router produced no response"),
+        "the first-message 503 reached a client the bridge had announced itself to:
+{acc}"
+    );
+}
+
 /// OpenAI ends every SSE stream with `data: [DONE]` and opens the message with a delta
 /// carrying `role: "assistant"`. Third-party clients — WorkBuddy's custom-provider
 /// adapter among them — read for that sentinel instead of waiting on EOF, and expect the
@@ -806,6 +879,81 @@ async fn responses_api_stream_events() {
     ] {
         assert!(acc.contains(ev), "missing {ev}");
     }
+}
+
+/// Audit 2026-10-03 R1: a pass-through tool-call turn on the *streaming* Responses path used to
+/// end after the three opening events — no `function_call` items, no terminal event — so a
+/// Codex-style client hung until its own timeout. The non-streaming path and both other dialects
+/// were already correct; this pins the fourth.
+#[tokio::test(flavor = "multi_thread")]
+async fn responses_stream_tool_calls_reach_a_terminal_event() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_tool_calls(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/responses", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("content-type", "application/json")
+        .json(&json!({
+            "model": "mock-fast",
+            "input": [{ "role": "user", "content": "write the file" }],
+            "stream": true,
+            "tools": [{ "type": "function", "name": "write_file",
+                        "parameters": { "type": "object", "properties": { "path": { "type": "string" } } } }],
+            "tool_choice": "auto"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("response.completed") {
+            break;
+        }
+    }
+    for ev in [
+        "response.created",
+        "response.output_item.added",
+        "response.function_call_arguments.done",
+        "response.output_item.done",
+        "response.completed",
+    ] {
+        assert!(
+            acc.contains(ev),
+            "missing {ev} in a tool-call stream:
+{acc}"
+        );
+    }
+    assert!(
+        acc.contains("write_file"),
+        "the call never reached the client:
+{acc}"
+    );
+    // The terminal `output` carries the calls as top-level `function_call` items — what a client
+    // walks to find the work it must do.
+    let completed = acc
+        .lines()
+        .rev()
+        .find_map(|l| {
+            let d = l.strip_prefix("data:")?;
+            let v: Value = serde_json::from_str(d.trim()).ok()?;
+            (v["type"] == "response.completed").then_some(v)
+        })
+        .expect("a response.completed event");
+    let output = &completed["response"]["output"];
+    let call = output
+        .as_array()
+        .expect("an output array")
+        .iter()
+        .find(|it| it["type"] == "function_call")
+        .expect("a function_call item in the terminal output");
+    assert_eq!(call["call_id"], "call_1");
+    assert_eq!(call["name"], "write_file");
+    assert_eq!(call["status"], "completed");
 }
 
 #[tokio::test(flavor = "multi_thread")]

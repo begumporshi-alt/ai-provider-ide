@@ -409,6 +409,12 @@ pub struct BridgeRequest {
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
     Delta(String),
+    /// A frame that carries nothing and is not a wire event in any dialect. The bridge sends it
+    /// while `ProseGate` holds a gateway-mode turn's prose: every text chunk is being withheld,
+    /// so without it the first `BridgeMsg` a tool-less client sees lands at end-of-generation —
+    /// and `FIRST_MSG_TIMEOUT` killed any completion that outlived 30 s on the default config.
+    /// Its only job is to disarm that first-message bound; every streaming handler drops it.
+    Liveness,
     /// The model's **reasoning**, as it streams — upstream-gated pass-through on its own channel,
     /// never folded into `Delta`: reasoning is the model's notes, and a client that wanted it
     /// rendered as the answer would be quoting the notes as the reply.
@@ -827,14 +833,8 @@ const MAX_FROZEN_BLOCKS: usize = 256;
 
 /// Gateway-side tools that can change the workspace — or, for `http_request`, send data out of
 /// it. Everything else only reads.
-pub const MUTATING_TOOLS: [&str; 6] = [
-    "write_file",
-    "edit_file",
-    "mkdir",
-    "run_command",
-    "http_request",
-    "apply_patch",
-];
+pub const MUTATING_TOOLS: [&str; 6] =
+    ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///

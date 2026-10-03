@@ -405,6 +405,9 @@ pub(crate) async fn messages_h(
             let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
+                    // The bridge's held-prose liveness frame: it exists to disarm
+                    // FIRST_MSG_TIMEOUT and is never a wire event (audit 2026-10-03 R2).
+                    BridgeMsg::Liveness => {}
                     BridgeMsg::Delta(t) => {
                         streamed.push_str(&t);
                         tracing::info!(request_id = id, delta_len = t.len(), "anthropic stream delta received");
@@ -538,6 +541,8 @@ pub(crate) async fn messages_h(
                 );
                 full.push_str(&t);
             }
+            // Carries nothing by design; see the stream arm (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
             // See the stream arm: thinking_delta blocks carry replay signatures; not improvised.
             BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}

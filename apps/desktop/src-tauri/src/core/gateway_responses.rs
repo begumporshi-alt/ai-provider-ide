@@ -311,6 +311,9 @@ pub(crate) async fn responses_h(
             let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
+                    // The bridge's held-prose liveness frame: it exists to disarm
+                    // FIRST_MSG_TIMEOUT and is never a wire event (audit 2026-10-03 R2).
+                    BridgeMsg::Liveness => {}
                     BridgeMsg::Delta(t) => {
                         text.push_str(&t);
                         yield ev("response.output_text.delta", json!({ "type": "response.output_text.delta", "item_id": format!("{rid}_out"),
@@ -398,7 +401,51 @@ pub(crate) async fn responses_h(
                 }
                 yield ev("response.completed", json!({ "type": "response.completed", "response": response }));
             } else {
-                return;
+                // A pass-through tool-call turn used to `return` here having emitted only the
+                // three opening events — no `function_call` items, no terminal event of any
+                // kind — so a Codex-style client hung until its own timeout. The calls were
+                // collected above; they were just never emitted. This is the same terminal
+                // sequence the text arm emits, with the calls as its payload.
+                yield ev("response.output_text.done", json!({ "type": "response.output_text.done", "item_id": format!("{rid}_out"),
+                "output_index": 0, "content_index": 0, "text": text.clone() }));
+                let mut content_parts: Vec<Value> = vec![json!({ "type": "output_text", "text": text.clone(), "annotations": [] })];
+                for (call_id, name, args) in &tool_calls {
+                    yield ev("response.output_item.added", json!({ "type": "response.output_item.added", "output_index": 0,
+                        "item": { "id": format!("{rid}_fc_{call_id}"), "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() } }));
+                    yield ev("response.function_call_arguments.done", json!({ "type": "response.function_call_arguments.done", "item_id": format!("{rid}_fc_{call_id}"),
+                        "output_index": 0, "arguments": args.to_string() }));
+                    content_parts.push(json!({ "type": "function_call", "call_id": call_id, "name": name, "arguments": args.to_string() }));
+                }
+                yield ev("response.content_part.done", json!({ "type": "response.content_part.done", "item_id": format!("{rid}_out"),
+                    "output_index": 0, "content_index": 0, "part": { "type": "output_text", "text": text.clone(), "annotations": [] } }));
+                yield ev("response.output_item.done", json!({ "type": "response.output_item.done", "output_index": 0,
+                    "item": { "id": format!("{rid}_out"), "type": "message", "role": "assistant", "status": "completed",
+                        "content": content_parts } }));
+                // A call-only turn's calls go into the terminal `output` as top-level
+                // `function_call` items — where the Responses contract puts them and what a
+                // client walks to find the work it must do. The text arm folds them into the
+                // message's content instead, because there the turn is defined by the text.
+                let mut output: Vec<Value> = vec![json!({ "type": "message", "role": "assistant", "content": content_parts })];
+                for (call_id, name, args) in &tool_calls {
+                    output.push(json!({ "id": format!("{rid}_fc_{call_id}"), "type": "function_call", "call_id": call_id,
+                        "name": name, "arguments": args.to_string(), "status": "completed" }));
+                }
+                let resolved_tool_choice = stream_tools
+                    .as_ref()
+                    .map(|_| json!("auto"))
+                    .or(tool_choice.clone())
+                    .unwrap_or(json!("auto"));
+                let (status, incomplete) = responses_status(finish_reason.as_deref());
+                let mut response = json!({ "id": rid, "object": "response", "status": status,
+                    "output": output,
+                    "usage": { "input_tokens": usage.map(|(p, _c)| p).unwrap_or(0), "output_tokens": usage.map(|(_p, c)| c).unwrap_or(0) },
+                    "tools": stream_tools.unwrap_or(json!([])),
+                    "tool_choice": resolved_tool_choice
+                });
+                if let Some(details) = incomplete {
+                    response["incomplete_details"] = details;
+                }
+                yield ev("response.completed", json!({ "type": "response.completed", "response": response }));
             }
             drop(slot);
         };
@@ -418,6 +465,8 @@ pub(crate) async fn responses_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            // Carries nothing by design; see the stream arm (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
             // See the stream arm: the reasoning-item contract is deferred until a client asks.
             BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}

@@ -334,12 +334,26 @@ impl Job {
                         return;
                     }
                     turn_text.push_str(&visible);
-                    if let Some(text) = gate.offer(&visible) {
-                        // Emitting is also the liveness check. `reply` answers `false` when nobody
-                        // is listening any more, and aborting here is what stops us paying for
-                        // tokens no one will read.
-                        if !replies.reply(id, BridgeMsg::Delta(text)) {
-                            cancel.cancel();
+                    match gate.offer(&visible) {
+                        Some(text) => {
+                            // Emitting is also the liveness check. `reply` answers `false` when nobody
+                            // is listening any more, and aborting here is what stops us paying for
+                            // tokens no one will read.
+                            if !replies.reply(id, BridgeMsg::Delta(text)) {
+                                cancel.cancel();
+                            }
+                        }
+                        None => {
+                            // The gate held the chunk, so nothing went out — and held prose was
+                            // exactly the case where the gateway could stay silent past
+                            // FIRST_MSG_TIMEOUT: the first message a tool-less client would see
+                            // landed at end-of-generation, and a healthy long completion was
+                            // killed mid-flight (audit 2026-10-03 R2). A held chunk proves the
+                            // bridge is working, so say so. The frame is also the disconnect
+                            // check the emitted path gets for free.
+                            if !replies.reply(id, BridgeMsg::Liveness) {
+                                cancel.cancel();
+                            }
                         }
                     }
                 };
@@ -685,7 +699,9 @@ mod tests {
     use futures_util::StreamExt;
 
     use crate::core::adapter::{
-        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs, ReasoningEffort,};
+        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult,
+        ReasoningEffort, TextArgs,
+    };
     use crate::core::engine::{
         AllAttemptsFailed, AttemptError, AttemptLabel, AttemptOutcome, ErrorClass, FailureKind,
     };
@@ -1413,6 +1429,46 @@ mod tests {
         assert_eq!(delta_text(&msgs), "hello");
         assert_eq!(delta_count(&msgs), 2, "nothing is held, so nothing is batched");
         assert_eq!(adapter.text_calls(), 1);
+    }
+
+    /// Audit 2026-10-03 R2: while the gate holds a gateway-mode turn's prose, every held chunk is
+    /// announced as a `Liveness` frame. Without it the first `BridgeMsg` a tool-less client sees
+    /// lands at end-of-generation, and `FIRST_MSG_TIMEOUT` killed any completion that outlived
+    /// 30 s — a healthy long answer, on the default config. Passing mode never holds, so it never
+    /// announces.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_prose_announces_a_liveness_frame_per_chunk() {
+        let adapter = Scripted::text(vec![ScriptedTurn::saying(&["hel", "lo"])]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let msgs = drain(&bridge, chat("m1")).await;
+
+        let liveness = msgs.iter().filter(|m| matches!(m, BridgeMsg::Liveness)).count();
+        assert_eq!(
+            liveness, 2,
+            "one frame per held chunk, both before the release:
+{msgs:?}"
+        );
+        // The prose still arrives exactly once, after the turn settles — the frames changed the
+        // timing evidence, not the prose contract.
+        assert_eq!(delta_text(&msgs), "hello");
+        assert_eq!(delta_count(&msgs), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn passing_mode_announces_no_liveness() {
+        let adapter = Scripted::text(vec![ScriptedTurn::saying(&["hel", "lo"])]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let mut req = chat("m1");
+        req.body["tools"] = json!([client_tool("client_side_thing")]);
+        let msgs = drain(&bridge, req).await;
+
+        assert!(
+            !msgs.iter().any(|m| matches!(m, BridgeMsg::Liveness)),
+            "nothing is held, so nothing is announced:
+{msgs:?}"
+        );
     }
 
     /// Reasoning rides its own `BridgeMsg` variant and bypasses `ProseGate`: gateway mode holds a
