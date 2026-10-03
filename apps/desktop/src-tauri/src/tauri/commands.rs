@@ -636,6 +636,24 @@ pub fn crash_clear_all(store: State<'_, Arc<store::Store>>) -> Result<usize, Com
     Ok(crash_report::clear_all_crash_reports(&app_data_dir(&store)))
 }
 
+/// What this app binary was built from, to compare against whatever is serving the gateway.
+///
+/// The app and `aiproviderd` are separate binaries from one crate, so "is the gateway I am talking
+/// to older than me?" is a question only an identity can answer — see `core/build_id.rs`.
+#[derive(serde::Serialize)]
+pub struct BuildIdentity {
+    pub commit: String,
+    pub source_fp: String,
+}
+
+#[tauri::command]
+pub fn app_build_identity() -> BuildIdentity {
+    BuildIdentity {
+        commit: crate::core::build_id::COMMIT.to_string(),
+        source_fp: crate::core::build_id::SOURCE_FP.to_string(),
+    }
+}
+
 /// D51: mint the UI's own credential and return the secret.
 ///
 /// This is the one place TypeScript receives a secret — a local, revocable token for its own
@@ -778,6 +796,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::tauri::commands::crash_read,
         crate::tauri::commands::crash_clear,
         crate::tauri::commands::crash_clear_all,
+        // Which build this app binary is, so the Control screen can tell when the process
+        // answering it was built from different sources.
+        crate::tauri::commands::app_build_identity,
         // The login-item service (Phase 6): install, remove and report the launchd agent that
         // runs `aiproviderd` without the app.
         crate::tauri::service_cmds::service_install,

@@ -2289,6 +2289,10 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/admin/keys/{id}", delete(admin::key_revoke_h))
         .route("/admin/spend", get(admin::spend_h))
         .route("/admin/spend/cap", post(admin::spend_cap_set_h))
+        // Which sources the answering process was built from, so the app can tell a stale
+        // companion binary from a fresh one. Keyed like its neighbours — `/health` is the one
+        // unauthenticated route and deliberately reports a single bit.
+        .route("/admin/build", get(admin::build_h))
         .route("/admin/providers", get(admin::providers_list_h).post(admin::provider_upsert_h))
         .route("/admin/providers/{id}", delete(admin::provider_delete_h))
         .route("/admin/api-keys", get(admin::api_keys_list_h).post(admin::api_key_upsert_h))

@@ -489,6 +489,30 @@ pub async fn provider_delete_h(
     (StatusCode::OK, Json(json!({ "ok": true }))).into_response()
 }
 
+/// `GET /admin/build` — what the process answering this request was built from.
+///
+/// **Behind the key, deliberately.** `/health` reports exactly one bit and never the version
+/// (`core/gateway.rs`), because it has to answer a client that does not hold a key yet — so the
+/// build identity cannot live there without turning an unauthenticated probe into a version
+/// oracle. The UI authenticates for every other `/admin/*` read already, and this is that caller.
+///
+/// It exists so the app can detect the one failure mode that is otherwise invisible: the
+/// login-item service still running a binary built before the current sources. See
+/// `core/build_id.rs`.
+pub async fn build_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
+    if let Err(r) = authorize(&core, &headers).await {
+        return *r;
+    }
+    (
+        StatusCode::OK,
+        Json(json!({
+            "commit": crate::core::build_id::COMMIT,
+            "source_fp": crate::core::build_id::SOURCE_FP,
+        })),
+    )
+        .into_response()
+}
+
 pub async fn spend_h(State(core): State<Arc<GatewayCore>>, headers: HeaderMap) -> Response {
     if let Err(r) = authorize(&core, &headers).await {
         return *r;

@@ -18,7 +18,9 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { clampConcurrency, MAX_PER_PROVIDER } from "@aiprovider/router-core";
 import { Button, EmptyState, StatusDot, type Health } from "../components/atoms";
 import {
+  appBuildIdentity,
   bootstrap,
+  gatewayBuildIdentity,
   gatewayInjectionStats,
   gatewayLogTail,
   gatewayMemoryEnabled,
@@ -38,6 +40,7 @@ import {
   serviceUninstall,
   setGatewayMutationEnabled,
   setGatewayToolsEnabled,
+  type BuildIdentity,
   type GatewayLogLine,
   type GatewaySpendStatus,
   type GatewayStatus,
@@ -194,6 +197,12 @@ interface ControlData {
   injection: InjectionStats | null;
   facts: MemoryStats | null;
   service: ServiceStatus | null;
+  /**
+   * This app's build identity beside the answering gateway's — the one comparison that catches a
+   * stale companion binary. Either side is `null` when it could not be read, and unreadable is not
+   * a mismatch, so the warning stays quiet rather than firing on every old build.
+   */
+  build: { app: BuildIdentity | null; gateway: BuildIdentity | null } | null;
   /** Set only when the *host itself* did not answer — a per-switch failure is reported per row. */
   hostError: string | null;
 }
@@ -207,6 +216,7 @@ const EMPTY: ControlData = {
   injection: null,
   facts: null,
   service: null,
+  build: null,
   hostError: null,
 };
 
@@ -222,16 +232,19 @@ function useControlData(tick: number) {
   const [loading, setLoading] = useState(true);
 
   const load = useCallback(async () => {
-    const [gateway, spend, memory, tools, mutation, injection, facts, service] = await Promise.all([
-      gatewayStatus().catch(() => null),
-      gatewaySpendStatus().catch(() => null),
-      gatewayMemoryEnabled().catch(() => null),
-      gatewayToolsEnabled().catch(() => null),
-      gatewayMutationEnabled().catch(() => null),
-      gatewayInjectionStats().catch(() => null),
-      memoryStats().catch(() => null),
-      serviceStatus().catch(() => null),
-    ]);
+    const [gateway, spend, memory, tools, mutation, injection, facts, service, appBuild, gatewayBuild] =
+      await Promise.all([
+        gatewayStatus().catch(() => null),
+        gatewaySpendStatus().catch(() => null),
+        gatewayMemoryEnabled().catch(() => null),
+        gatewayToolsEnabled().catch(() => null),
+        gatewayMutationEnabled().catch(() => null),
+        gatewayInjectionStats().catch(() => null),
+        memoryStats().catch(() => null),
+        serviceStatus().catch(() => null),
+        appBuildIdentity().catch(() => null),
+        gatewayBuildIdentity().catch(() => null),
+      ]);
     setData({
       gateway,
       spend,
@@ -241,6 +254,7 @@ function useControlData(tick: number) {
       injection,
       facts,
       service,
+      build: { app: appBuild, gateway: gatewayBuild },
       hostError:
         gateway === null && memory === null
           ? "The app's host process did not answer. Switches are disabled until it does."
@@ -714,6 +728,19 @@ function GatewayTab({
             // `loaded` alone is a job between restarts — the shape a throttled `KeepAlive` leaves —
             // and reporting that as running is how a card ends up hiding a gateway that is down.
             const up = loaded && pid !== null;
+            // A gateway built from other sources is the quiet failure: it answers every request
+            // normally, so the only symptom is that a change appears to have done nothing. Known
+            // on both sides is required — see the note on `ControlData.build`.
+            const gw = d.build?.gateway ?? null;
+            const app = d.build?.app ?? null;
+            const staleBuild =
+              gw !== null &&
+              app !== null &&
+              gw.source_fp !== "unknown" &&
+              app.source_fp !== "unknown" &&
+              gw.source_fp !== app.source_fp
+                ? { gw, app }
+                : null;
             return (
               <div className="mt-2">
                 <div className="flex items-center gap-3 text-[13px]">
@@ -728,6 +755,13 @@ function GatewayTab({
                           : "Not installed"}
                   </span>
                 </div>
+                {staleBuild && (
+                  <p className="mt-1.5 text-[11px]" style={{ color: "var(--danger)" }}>
+                    The gateway answering this app was built from different sources (
+                    {staleBuild.gw.commit} vs {staleBuild.app.commit}). It still answers normally, so
+                    a change can look like it did nothing. Rebuild both with <b>pnpm dev:up</b>.
+                  </p>
+                )}
                 {running && installed && !up && (
                   <p className="mt-1.5 text-[11px]" style={{ color: "var(--text-dim)" }}>
                     The app gateway is running and owns the port. <b>Start</b> stops it first, then
