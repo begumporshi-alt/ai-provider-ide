@@ -1851,6 +1851,10 @@ mod tests {
         }
     }
 
+    // Unix-only twice over: the symlink API is `std::os::unix`, and the property under test — the
+    // reader refusing a path that escapes the root through a link — is exercised through it. A
+    // Windows build has no such test to run, only a compile to survive.
+    #[cfg(unix)]
     #[test]
     fn symlink_escaping_the_root_is_refused() {
         let r = root();

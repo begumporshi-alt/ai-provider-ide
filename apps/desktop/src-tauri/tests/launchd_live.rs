@@ -49,6 +49,11 @@
 //! cargo build --no-default-features --bin aiproviderd
 //! ```
 
+// launchd is macOS-only, and the file's two tests use unix-only APIs (`PermissionsExt`, the
+// `LaunchAgents` plist). Elsewhere the file must compile to nothing — a Windows CI machine has no
+// business building a launchd test, only refusing to.
+#![cfg(target_os = "macos")]
+
 use ai_provider_router_lib::core::service::{self, Paths};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
