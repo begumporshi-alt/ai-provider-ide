@@ -227,6 +227,21 @@ const failNext = new Map<string, string>();
  */
 const failDelay = new Map<string, number>();
 /**
+ * An answer a spec has canned for `cmd`, returned instead of the shim's own on **every** call until
+ * `respondClear`.
+ *
+ * `failNext` covers "the read failed"; this covers its sibling, "the read answered a shape the UI
+ * cannot render" — which is how a *render* crash becomes reachable at all. A screen that maps over
+ * a list it trusts throws when the host hands it something that is not a list, and the error
+ * boundary is the only thing standing between that and a blank window.
+ *
+ * Sticky rather than one-shot, unlike `failNext`, and not for convenience: React StrictMode
+ * double-invokes a mount effect here, so the screen issues the read twice. A one-shot is consumed
+ * by the first of those, whose result the second read then overwrites — the poison lands and is
+ * immediately undone, and the crash under test never happens.
+ */
+const respondNext = new Map<string, unknown>();
+/**
  * A tool call the harness will hold OPEN, so a spec can exercise Stop while a tool is really
  * running. `tool_run` for that name answers only when the hold elapses or a `tool_cancel` for the
  * call arrives — whichever first.
@@ -636,6 +651,20 @@ let eventSeq = 0;
     failNext.set(cmd, message);
     if (afterMs > 0) failDelay.set(cmd, afterMs);
   },
+  /**
+   * Answer `cmd` with `value` on every call until `respondClear` — the sibling of `failNext`, for
+   * "the host answered a shape the screen cannot render". Sticky because a screen can read the same
+   * command twice for a single mount (React StrictMode double-invokes effects here), and a one-shot
+   * would be consumed by the read whose result is then overwritten.
+   */
+  respond: (cmd: string, value: unknown): void => {
+    respondNext.set(cmd, value);
+  },
+  /** Unset one canned answer, or all of them when `cmd` is omitted. */
+  respondClear: (cmd?: string): void => {
+    if (cmd === undefined) respondNext.clear();
+    else respondNext.delete(cmd);
+  },
   /** What a gateway tool run answers — see `toolRunResult` above. */
   toolRunResult: (next: Partial<typeof toolRunResult>): void => {
     Object.assign(toolRunResult, next);
@@ -774,6 +803,13 @@ async function handle(cmd: string, args: Record<string, unknown>): Promise<unkno
     throw new Error(failure);
   }
   const result = await dispatch(cmd, toRustArgs(args));
+  // A canned answer, checked before the shim's own case and after `failNext`, so an arranged
+  // failure still wins. Sticky, and `has`/`get` rather than a truthiness read, because `null` and
+  // `undefined` are exactly the shapes a spec wants to hand a screen. Returns before `persist()`
+  // for the same reason `failNext` does: this call committed nothing the shim holds.
+  if (respondNext.has(cmd)) {
+    return respondNext.get(cmd);
+  }
   persist(); // commit before the webview sees the reply, as the Rust host does
   return result;
 }
