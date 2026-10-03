@@ -22,6 +22,24 @@ describe("parseContextWindow", () => {
     expect(parseContextWindow({ max_context_length: 8000 })).toBe(8000);
   });
 
+  it("reads an input-token limit as the window, in both conventions", () => {
+    // The spelling the WorkBuddy host contract asks a custom model entry for, which relays publish
+    // as either `max_input_tokens` or `maxInputTokens`. An unrecognised name is not a cosmetic gap:
+    // the row lands with no window and every consumer downstream falls back to 8,192.
+    expect(parseContextWindow({ max_input_tokens: 200000 })).toBe(200000);
+    expect(parseContextWindow({ maxInputTokens: 128000 })).toBe(128000);
+  });
+
+  it("never reads an output cap as the window", () => {
+    // The trap this function has to avoid. `max_tokens` and `max_output_tokens` are answer budgets,
+    // an order of magnitude below a window — believing one costs the whole conversation, because the
+    // router trims to fit it and the meter reports it as the model's capacity.
+    expect(parseContextWindow({ max_tokens: 8192 })).toBeUndefined();
+    expect(parseContextWindow({ max_output_tokens: 8192 })).toBeUndefined();
+    // A real window alongside an output cap is read from the window, not the cap.
+    expect(parseContextWindow({ max_tokens: 8192, max_input_tokens: 200000 })).toBe(200000);
+  });
+
   it("returns undefined when the provider published none — never a guess", () => {
     expect(parseContextWindow({ id: "x" })).toBeUndefined();
     expect(parseContextWindow(null)).toBeUndefined();
