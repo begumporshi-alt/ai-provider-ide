@@ -81,9 +81,13 @@ packages/adapter-spec/   the manifest grammar (zod) — the frozen contract
 ```
 
 Inside `apps/desktop/src-tauri/`, the `src/core/` half is deliberately Tauri-free, and a headless
-binary target (`aiproviderd`) builds from it — phase 1 of detaching the gateway from the UI process,
-tracked in [the dev book's headless chapter](docs/dev-book/10-headless-service.md). It does **not**
-serve completions yet; the desktop app is the only supported way to run the gateway.
+binary target (`aiproviderd`) builds from it — the gateway detached from the UI process, tracked in
+[the dev book's headless chapter](docs/dev-book/10-headless-service.md). The daemon serves the same
+routes as the in-app gateway (`/v1/chat/completions`, `/health`, the admin API), reads the **same**
+data directory (providers, manifests, keys, settings), and on macOS installs as a launchd service
+(`aiproviderd install` / `status` / `uninstall`; default port 8800 unless the store carries one).
+The desktop app runs the identical gateway in-process — so run one *or* the other against a data
+directory, not both at once (same port, same SQLite store).
 
 The repository root holds only the audience-facing documents — `README.md`, `USER_GUIDE.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md` and `LICENSE`. Everything else is in
