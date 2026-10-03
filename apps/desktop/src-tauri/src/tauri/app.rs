@@ -156,6 +156,9 @@ pub fn run() {
             // Panics during setup itself will print to stderr but won't produce a report —
             // that's an acceptable tradeoff since such panics are rare and obvious.
             crash_report::install_panic_hook(data_dir.clone());
+            // Reports written before the id/timestamp unit fix carry a fifth-millennium name.
+            // Re-home them once here so the listing sorts and reads correctly from now on.
+            crash_report::repair_legacy_reports(&data_dir);
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: opening store");
             let store = Arc::new(
                 store::Store::open(&data_dir).map_err(|e| format!("store init failed: {e}"))?,

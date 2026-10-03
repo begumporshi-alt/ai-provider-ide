@@ -344,6 +344,9 @@ async fn main() {
         }
     };
     crash_report::install_panic_hook(dir.clone());
+    // Reports written before the id/timestamp unit fix carry a fifth-millennium name. Re-home
+    // them once here so the listing sorts and reads correctly from now on.
+    crash_report::repair_legacy_reports(&dir);
     // Point the file-backed vault at this dir so secrets land next to the SQLite DB.
     ai_provider_router_lib::core::vault::set_data_dir(&dir);
 
