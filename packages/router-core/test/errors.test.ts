@@ -4,7 +4,7 @@
  * about the network) — plus the reason passthrough that keeps the provider's own words.
  */
 import { describe, expect, it } from "vitest";
-import { MAX_REASON_CHARS, classify, classifyHttp, reasonFromBody } from "../src/errors.js";
+import { MAX_REASON_CHARS, classify, classifyFailure, classifyHttp, detectStatedTimeout, reasonFromBody } from "../src/errors.js";
 import { HealthTracker } from "../src/health-tracker.js";
 import type { ApiKeyRecord } from "../src/domain.js";
 
@@ -131,5 +131,44 @@ describe("execution-engine consumes the body", () => {
     const err = await interp.listModels("key:t").catch((e) => e);
     expect(err).toBeInstanceOf(ManifestHttpError);
     expect(reasonFromBody(err.body)).toContain("content-blocked");
+  });
+});
+
+describe("a provider that states its own cause inside a 2xx", () => {
+  // Measured 2026-10-03 on `vice` (`deepseek-v4-flash`): HTTP 200 carrying
+  // {"message":"The request timed out. Please try again.","code":"timeout"}. The engine read the
+  // status alone, found it healthy, and filed PARSE_ERROR — naming our reader for a failure the
+  // provider had explained, and counting it as provider drift into the bargain.
+  const relayTimeout = JSON.stringify({
+    message: "The request timed out. Please try again.",
+    code: "timeout",
+  });
+
+  it("names the timeout instead of blaming the parser", () => {
+    expect(detectStatedTimeout(relayTimeout)).toBe("timeout");
+    expect(classifyFailure("PARSE_ERROR", relayTimeout)).toBe("TIMEOUT");
+  });
+
+  it("reads the nested error envelope too", () => {
+    const nested = JSON.stringify({ error: { code: "gateway_timeout" } });
+    expect(detectStatedTimeout(nested)).toBe("gateway_timeout");
+    expect(classifyFailure("PARSE_ERROR", nested)).toBe("TIMEOUT");
+  });
+
+  it("does not fire on an answer that merely discusses timeouts", () => {
+    // Why this detector insists on a structured envelope: there is no status to gate on here, and a
+    // model writing a fetch wrapper with a timeout is not a timeout failure.
+    expect(classifyFailure("PARSE_ERROR", "Here is a wrapper with a 30s timeout")).toBe("PARSE_ERROR");
+    expect(detectStatedTimeout(JSON.stringify({ text: "set a timeout of 5s" }))).toBeUndefined();
+    expect(
+      detectStatedTimeout(JSON.stringify({ choices: [{ message: { content: "timeout" } }] })),
+    ).toBeUndefined();
+  });
+
+  it("keeps the fallback when the body states nothing", () => {
+    // Unreadable is still our side of the contract when the provider said nothing at all.
+    expect(classifyFailure("PARSE_ERROR", "<html>502 Bad Gateway</html>")).toBe("PARSE_ERROR");
+    expect(classifyFailure("PARSE_ERROR", undefined)).toBe("PARSE_ERROR");
+    expect(detectStatedTimeout('data: {"delta":"hi"}')).toBeUndefined();
   });
 });

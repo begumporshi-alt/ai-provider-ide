@@ -9,7 +9,7 @@ import { ManifestHttpError } from "./manifest-interpreter.js";
 import { describeSilentStream, emptyTally, noteStreamEvent, type StreamTally } from "./stream-shape.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { Candidate } from "./route-planner.js";
-import { classify, classifyHttp, reasonFromBody, type ErrorClass } from "./errors.js";
+import { classify, classifyFailure, classifyHttp, reasonFromBody, type ErrorClass } from "./errors.js";
 import { COOLDOWN_FLOOR_MS, type HealthTracker } from "./health-tracker.js";
 import type { ProviderLimiter } from "./concurrency.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
@@ -242,7 +242,14 @@ export class ExecutionEngine {
           // A delivered tool call also ends failover: the consumer holds a tool call the next
           // candidate would re-issue, so the predicate folds the tool-call count in.
           if (emitted || toolCalls > 0) {
-            const cls = e instanceof ManifestHttpError ? classify(e.status) === "OK" ? "PARSE_ERROR" : classifyHttp(e.status, e.body) : "NETWORK";
+            // A body that names its own cause outranks the status: a relay answering 200 with
+            // `{"code":"timeout"}` is a timeout, not a shape we failed to read.
+            const cls = e instanceof ManifestHttpError
+              ? classifyFailure(
+                  classify(e.status) === "OK" ? "PARSE_ERROR" : classifyHttp(e.status, e.body),
+                  e.body,
+                )
+              : "NETWORK";
             fallbackChain.push({ candidate: c, cls, status: e instanceof ManifestHttpError ? e.status : 0 });
             throw e;
           }
@@ -250,9 +257,12 @@ export class ExecutionEngine {
           // gate (`CLIENT_GATE` — the provider refused the caller, not the key) and a 402 as
           // billing rather than a network fault. The mid-stream arm keeps its precedence.
           const cls = e instanceof ManifestHttpError
-            ? e.kind === "mid-stream" || classify(e.status) === "OK"
-              ? "PARSE_ERROR"
-              : classifyHttp(e.status, e.body)
+            ? classifyFailure(
+                e.kind === "mid-stream" || classify(e.status) === "OK"
+                  ? "PARSE_ERROR"
+                  : classifyHttp(e.status, e.body),
+                e.body,
+              )
             : "NETWORK";
           const outcome: AttemptOutcome = {
             candidate: c,

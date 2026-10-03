@@ -95,6 +95,79 @@ export function classify(status: number, bodyHint?: "schema" | "not_found" | "cl
 }
 
 /**
+ * Codes a provider uses when it gives up on a request upstream.
+ *
+ * Short on purpose, in the manner of `client-gate.ts`'s marker lists: each entry is a code seen in
+ * a real response, and a gateway that words it differently is simply not recognised — the caller
+ * then falls back to the class it would have chosen anyway.
+ */
+const TIMEOUT_CODES = new Set([
+  "timeout",
+  "timed_out",
+  "request_timeout",
+  "gateway_timeout",
+  "upstream_timeout",
+  "deadline_exceeded",
+]);
+
+/**
+ * Whether a response body **is** an error envelope naming a timeout, and which code said so.
+ *
+ * The detectors in `client-gate.ts` are gated by an error status. This one has the opposite problem:
+ * it exists for a body that arrived with a **2xx**, because a relay typically answers `200` and puts
+ * its own refusal in the body. With no status to gate on, a substring match is not safe — a good
+ * answer may *discuss* timeouts, and this repository has already paid for that lesson once when a
+ * response that merely mentioned a failure was filed as one (`NO_OUTPUT`).
+ *
+ * So the body must parse as JSON and the name must sit in a recognisable field, in either envelope
+ * providers publish: `{ "error": { "code": … } }` or `{ "code": … }`.
+ *
+ * Measured 2026-10-03 on `vice` (`deepseek-v4-flash`): HTTP 200 carrying
+ * `{"message":"The request timed out. Please try again.","code":"timeout"}`, which the engine filed
+ * as `PARSE_ERROR` — a word about our reader, for a failure the provider had explained.
+ */
+export function detectStatedTimeout(body: string | undefined | null): string | undefined {
+  if (!body) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const payload = parsed as Record<string, unknown>;
+  const inner = payload.error;
+  const envelopes: Record<string, unknown>[] =
+    inner && typeof inner === "object" ? [inner as Record<string, unknown>, payload] : [payload];
+  for (const envelope of envelopes) {
+    for (const field of ["code", "type", "status"]) {
+      const value = envelope[field];
+      if (typeof value === "string" && TIMEOUT_CODES.has(value.toLowerCase())) return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `fallback`, unless the body names a cause this taxonomy knows.
+ *
+ * One function so that both failure arms of the engine decide it the same way. They read the status
+ * alone, so a relay answering `200` with a stated cause collapsed to `PARSE_ERROR` whatever the body
+ * said — and `PARSE_ERROR` counts as provider **drift**. Drift is a provider failing to honour the
+ * shape it declared; a provider saying "I timed out" is honouring it, which is the same reasoning
+ * that keeps `NO_OUTPUT` out of the drift set.
+ *
+ * Only a stated timeout is recognised today, because it is the one that has been measured. A
+ * billing or content-policy refusal arriving inside a 2xx belongs here too, on the day one is seen.
+ */
+export function classifyFailure(
+  fallback: ErrorClass,
+  body: string | undefined | null,
+): ErrorClass {
+  return detectStatedTimeout(body) ? "TIMEOUT" : fallback;
+}
+
+/**
  * The provider's own words for why it refused, short enough for a chain entry.
  *
  * Before this existed the classifier kept only the class token, so an upstream
