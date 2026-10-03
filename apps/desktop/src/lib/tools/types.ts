@@ -61,6 +61,12 @@ export type AgentEvent =
    * stream short) and the loop is re-asking the same iteration. `attempt` counts re-asks.
    */
   | { type: "truncation_retry"; attempt: number }
+  /**
+   * The model reasoned (its thinking channel carried text) but sent no answer at all — its
+   * entire output budget went to thinking — and the loop is re-asking the same iteration with
+   * thinking forced off. `attempt` counts fallbacks.
+   */
+  | { type: "no_output_retry"; attempt: number }
   | { type: "done"; text: string; iterations: number; truncated?: boolean };
 
 export interface AgentLoopOptions {

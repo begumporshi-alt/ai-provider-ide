@@ -155,6 +155,85 @@ describe("runAgentLoop", () => {
     expect(out.truncated).toBe(false);
   });
 
+  it("falls back to thinking-off when the model answers with reasoning only", async () => {
+    // 2026-10-03, live on agentrouter/deepseek-v4-flash: ~8180 thinking deltas, zero text — the
+    // whole output budget spent reasoning. LiteLLM's fallback pattern applied to our own failure
+    // class: the engine classifies NO_OUTPUT with evidence, and the loop re-asks once with
+    // thinking forced off — the one lever that works even against a provider that ignores
+    // budget tokens.
+    const events: AgentEvent[] = [];
+    const reasoningFor: string[] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      reasoningFor.push(req.reasoning ?? "(unset)");
+      if (calls === 1) {
+        req.onReasoning?.("thinking hard");
+        req.onFinish?.("length");
+        return streamOf("");
+      }
+      req.onFinish?.("stop");
+      return streamOf("Here is the answer.");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(calls).toBe(2);
+    expect(reasoningFor).toEqual(["(unset)", "off"]);
+    expect(out.text).toBe("Here is the answer.");
+    expect(events).toContainEqual({ type: "no_output_retry", attempt: 1 });
+  });
+
+  it("fails loudly when even the thinking-off re-ask answers nothing", async () => {
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      req.onReasoning?.("still thinking");
+      req.onFinish?.("length");
+      return streamOf("");
+    };
+
+    await expect(
+      runAgentLoop({
+        model: "m",
+        messages: [{ role: "user", content: "go" }],
+        registry: AGENT_TOOLS,
+        generate: model,
+        host: { async run() { return { ok: true, output: "" }; } },
+      }),
+    ).rejects.toThrow(/re-asked once with thinking off/);
+    expect(calls).toBe(2);
+  });
+
+  it("does not fall back when an empty stream carried no reasoning", async () => {
+    // Empty text with a silent thinking channel is not the NO_OUTPUT class — that predicate is
+    // "reasoning without an answer" (the engine files this shape PARSE_ERROR instead). This
+    // model declares no finish selector either, so no callback ever fires.
+    let calls = 0;
+    const model: GenerateFn = async () => {
+      calls += 1;
+      return streamOf("");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+    });
+
+    expect(calls).toBe(1);
+    expect(out.text).toBe("");
+  });
+
   it("honours a denial from the confirm gate without touching the host", async () => {
     const calls: Array<{ name: string }> = [];
     const host: ToolHost = {

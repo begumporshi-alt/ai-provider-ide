@@ -2010,6 +2010,11 @@ function Chat({
       // never said. The notice stays as the bubble's prefix until the retry's own text appends
       // after it; a truncated `done` above records the outcome in the run's steps.
       setStreamedText("⏳ the model's stream ended early — re-asking…\n\n");
+    } else if (ev.type === "no_output_retry") {
+      // The model reasoned through its whole output budget and never answered. Thinking off is
+      // the one lever that works even against a provider that ignores budget tokens, so the
+      // fallback forces it and the bubble says why.
+      setStreamedText("⏳ the model answered with thinking only — re-asking with thinking off…\n\n");
     } else if (ev.type === "reasoning") {
       // Accumulated, not replaced: an agent turn is several round-trips and the panel shows the
       // whole run's deliberation, the same way `streamedText` shows the whole run's prose.
@@ -2145,10 +2150,13 @@ function Chat({
           generate: (req, opts) =>
             router.generateText(
               {
+                // The run config's level is spread BEFORE the request on purpose: the loop's own
+                // reasoning override — the NO_OUTPUT fallback's forced "off" — must win over this
+                // panel's setting, or the fallback could not turn thinking off.
+                ...(thinking ? { reasoning: thinking } : {}),
                 ...req,
                 ...(typeof temperature === "number" ? { temperature } : {}),
                 ...(typeof maxTokens === "number" ? { maxTokens } : {}),
-                ...(thinking ? { reasoning: thinking } : {}),
                 onUsage: (u) => {
                   req.onUsage?.(u);
                   setLastUsage(u);
