@@ -36,18 +36,18 @@ pub(crate) async fn chat_h(
         );
     };
     // §3.4 compatibility contract: only reject truly incompatible parameters.
-    // Tools/tool_choice/response_format are now forwarded to upstream providers.
-    for unsupported in ["functions"] {
-        if req.get(unsupported).is_some_and(|v| !v.is_null()) {
-            return err(
-                StatusCode::BAD_REQUEST,
-                openai_error(
-                    &format!("{unsupported} is not supported yet"),
-                    "invalid_request",
-                    Some("unsupported_parameter"),
-                ),
-            );
-        }
+    // Tools/tool_choice/response_format are now forwarded to upstream providers. `functions` —
+    // the pre-tools OpenAI spelling — is the one parameter still refused, and the refusal names
+    // it. (It was a one-element `for` loop: this is the only member the list has left.)
+    if req.get("functions").is_some_and(|v| !v.is_null()) {
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error(
+                "functions is not supported yet",
+                "invalid_request",
+                Some("unsupported_parameter"),
+            ),
+        );
     }
     if req.get("model").and_then(Value::as_str).unwrap_or("").is_empty() {
         return err(
