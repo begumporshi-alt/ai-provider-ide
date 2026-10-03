@@ -48,7 +48,7 @@ import {
   type ToolCallRef,
   type ToolStep,
 } from "../lib/tools/render";
-import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core";
+import type { ChatMessage, ReasoningEffort, ToolCall, UsageTokens } from "@aiprovider/router-core";
 import {
   estimateTokens, DEFAULT_CONTEXT_WINDOW, userContent, textOfContent, compressWithSummary, type CatalogModel,
 } from "@aiprovider/router-core";
@@ -638,6 +638,16 @@ interface AssistantSettings {
    *  value in the row and silently restore it on the next load. */
   temperature?: number | null;
   maxTokens?: number | null;
+  /**
+   * How much the model should think, per request. `null`/absent means "unset — leave the
+   * provider's own default", the same convention as the two fields above and for the same
+   * reason: clearing it has to overwrite the stored level, not vanish from the row.
+   *
+   * Validated against `THINKING_LEVELS` on read rather than trusted, like `approvalMode`: an
+   * unknown string from a future build would otherwise be rendered as a selected value the
+   * select cannot show, and reach the wire as no field at all — a silent downgrade.
+   */
+  thinking?: ReasoningEffort | null;
   /** Editable system prompts. Empty or absent = the built-in constant; also written as "" for the
    *  same reason as above (a cleared prompt has to overwrite the stored one). */
   systemPrompt?: string;
@@ -663,6 +673,14 @@ interface AssistantSettings {
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
+
+/**
+ * The thinking levels the composer offers, in the order they render. `""` — the provider's own
+ * default — is deliberately NOT in this list: it is the unset state of the select, rendered as
+ * its own option, so "unset" is a real chooseable value rather than a missing one that a future
+ * build could mistake for a level.
+ */
+const THINKING_LEVELS: readonly ReasoningEffort[] = ["off", "low", "medium", "high"];
 
 async function loadAssistantSettings(): Promise<AssistantSettings> {
   try {
@@ -715,6 +733,9 @@ export function AssistantScreen() {
   const [maxIterations, setMaxIterations] = useState(DEFAULT_MAX_ITERATIONS);
   const [temperature, setTemperature] = useState<number | "">("");
   const [maxTokens, setMaxTokens] = useState<number | "">("");
+  // The thinking level. `""` is "unset" — send no field and leave the provider's own default,
+  // which is the behaviour of every build before this one, so an untouched screen is unchanged.
+  const [thinking, setThinking] = useState<ReasoningEffort | "">("");
   // System-prompt editor state — a string means "editing", null means "closed".
   const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
   const [customSystemPrompt, setCustomSystemPrompt] = useState("");
@@ -776,6 +797,11 @@ export function AssistantScreen() {
       }
       if (stored.maxTokens === null) setMaxTokens("");
       else if (typeof stored.maxTokens === "number" && stored.maxTokens > 0) setMaxTokens(Math.round(stored.maxTokens));
+      // Validated against the known levels, never trusted: a word a future build invented would
+      // otherwise be stored as a selection the select cannot show, or reach the wire as no field
+      // while the UI claimed a level. Anything unrecognised stays unset, which is the honest
+      // reading of "this build does not know that level".
+      if (THINKING_LEVELS.includes(stored.thinking as ReasoningEffort)) setThinking(stored.thinking as ReasoningEffort);
       if (typeof stored.systemPrompt === "string") setCustomSystemPrompt(stored.systemPrompt);
       if (typeof stored.noToolsSystem === "string") setCustomNoToolsSystem(stored.noToolsSystem);
       if (typeof stored.agentSystem === "string") setCustomAgentSystem(stored.agentSystem);
@@ -812,6 +838,8 @@ export function AssistantScreen() {
       // look like it worked and then quietly come back on the next load.
       temperature: typeof temperature === "number" ? temperature : null,
       maxTokens: typeof maxTokens === "number" ? maxTokens : null,
+      // `null` for unset, for the same round-trip reason as the two above.
+      thinking: thinking === "" ? null : thinking,
       // Always written, empty string included: same reason, for the three prompts.
       systemPrompt: customSystemPrompt,
       noToolsSystem: customNoToolsSystem,
@@ -819,7 +847,7 @@ export function AssistantScreen() {
       // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
       searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
-    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
+    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
       customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider],
   );
 
@@ -838,7 +866,7 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
       customSystemPrompt, customNoToolsSystem, customAgentSystem]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
@@ -1034,8 +1062,10 @@ export function AssistantScreen() {
           onPlanModeChange={setPlanMode}
           temperature={temperature}
           maxTokens={maxTokens}
+          thinking={thinking}
           onTemperatureChange={setTemperature}
           onMaxTokensChange={setMaxTokens}
+          onThinkingChange={setThinking}
           systemPrompt={customSystemPrompt || undefined}
           noToolsSystem={customNoToolsSystem || undefined}
           agentSystemPrompt={customAgentSystem || undefined}
@@ -1465,8 +1495,10 @@ function Chat({
   onPlanModeChange,
   temperature,
   maxTokens,
+  thinking,
   onTemperatureChange,
   onMaxTokensChange,
+  onThinkingChange,
   systemPrompt,
   noToolsSystem,
   agentSystemPrompt,
@@ -1494,8 +1526,12 @@ function Chat({
   /** Owned by `AssistantScreen`, like `root` — see the note on the composer strip below. */
   temperature: number | "";
   maxTokens: number | "";
+  /** How much the model should think, or `""` for the provider's own default. Owned by
+   *  `AssistantScreen` for the same reason as the two above. */
+  thinking: ReasoningEffort | "";
   onTemperatureChange: (v: number | "") => void;
   onMaxTokensChange: (v: number | "") => void;
+  onThinkingChange: (v: ReasoningEffort | "") => void;
   systemPrompt?: string;
   noToolsSystem?: string;
   /** Named `agentSystemPrompt` rather than `agentSystem`: the latter is the module-level builder
@@ -2045,12 +2081,16 @@ function Chat({
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
           // P7: pass through per-request temperature/maxTokens and capture usage for the meter.
+          // The thinking level rides the same path: the interpreter renders it into whichever
+          // field the serving dialect declares (`thinking`, `reasoning_effort`, `thinkingConfig`),
+          // and an unset level sends nothing at all.
           generate: (req, opts) =>
             router.generateText(
               {
                 ...req,
                 ...(typeof temperature === "number" ? { temperature } : {}),
                 ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+                ...(thinking ? { reasoning: thinking } : {}),
                 onUsage: (u) => {
                   req.onUsage?.(u);
                   setLastUsage(u);
@@ -2192,6 +2232,9 @@ function Chat({
           // shows; incrementing both would double-count every turn.
           ...(typeof temperature === "number" ? { temperature } : {}),
           ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+          // Same three-way: a chosen level travels, `""` sends nothing and leaves the provider's
+          // own default in place.
+          ...(thinking ? { reasoning: thinking } : {}),
           onUsage: setLastUsage,
         },
         { signal: ac.signal },
@@ -3056,6 +3099,29 @@ function Chat({
             className="mono no-spin w-20 rounded border px-1 py-0.5 text-[11px]"
             style={inputStyle}
           />
+        </label>
+        {/* The thinking level. It sits here, beside temperature and max tokens, because it is the
+            same kind of thing: a per-request parameter whose blank means "the provider's own
+            default". It is also the answer to a failure this app used to file as a parse error —
+            a model that thinks by default can spend the whole output budget and never write an
+            answer, and `off` is the escape hatch where the provider has one. */}
+        <label className="flex items-center gap-1">
+          thinking
+          <select
+            value={thinking}
+            onChange={(e) => onThinkingChange(e.target.value as ReasoningEffort | "")}
+            disabled={busy}
+            aria-label="How much the model should think before answering (default uses the provider's own setting)"
+            title="Sent as the field this provider's dialect declares (Anthropic thinking, OpenAI reasoning_effort, Gemini thinkingConfig). Below 'default', 'off' asks the provider to disable thinking where it has a way to — where it has none, nothing is sent and its own default stands."
+            data-testid="thinking-select"
+            className="mono rounded border px-1 py-0.5 text-[11px]"
+            style={inputStyle}
+          >
+            <option value="">default</option>
+            {THINKING_LEVELS.map((l) => (
+              <option key={l} value={l}>{l}</option>
+            ))}
+          </select>
         </label>
         <button
           type="button"

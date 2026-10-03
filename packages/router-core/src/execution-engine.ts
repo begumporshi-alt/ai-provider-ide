@@ -33,6 +33,8 @@ export interface ExecuteTextArgs {
   stream: boolean;
   maxTokens?: number;
   temperature?: number;
+  /** How much the model should think — forwarded untouched to the adapter's render. */
+  reasoning?: import("./ports.js").ReasoningEffort;
   tools?: unknown;
   toolChoice?: unknown;
   responseFormat?: unknown;
@@ -153,7 +155,7 @@ export class ExecutionEngine {
             // way the caller — the gateway bridge, which forwards it host-side — ever learns the
             // token counts. Dropping the caller's callback here left every gateway response
             // reporting `usage: null` even on requests that had usage.
-            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); },
+            { model: c.model.nativeId, messages: args.messages, stream: args.stream, maxTokens: args.maxTokens, temperature: args.temperature, reasoning: args.reasoning, tools: args.tools, toolChoice: args.toolChoice, responseFormat: args.responseFormat, onToolCall, onUsage: lastUsage => { usageBox.value = lastUsage; args.onUsage?.(lastUsage); },
               // See `TextArgs.onStreamEvent`. The sample is truncated here, at the capture point,
               // because only the engine knows how much evidence a row can afford.
               onStreamEvent: payload => {

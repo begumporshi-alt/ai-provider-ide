@@ -83,8 +83,8 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::core::adapter::{
-    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, StreamObservation,
-    TextArgs, ToolCall,
+    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, ReasoningEffort,
+    StreamObservation, TextArgs, ToolCall,
 };
 use crate::core::dialect_shaping;
 use crate::core::engine::{AttemptError, FailureKind};
@@ -411,6 +411,7 @@ impl ManifestInterpreter {
                 stream,
                 max_tokens,
                 temperature,
+                reasoning,
                 tools,
                 tool_choice,
                 response_format,
@@ -483,10 +484,19 @@ impl ManifestInterpreter {
             }
             // `args.maxTokens ?? this.m.limits?.maxOutputTokens` — nullish, so a caller-supplied
             // zero survives and only an absent value falls through to the manifest's ceiling.
-            if let Some(limit) =
-                max_tokens.or_else(|| self.view.limits.and_then(|l| l.max_output_tokens))
-            {
+            let effective_max_tokens =
+                max_tokens.or_else(|| self.view.limits.and_then(|l| l.max_output_tokens));
+            if let Some(limit) = effective_max_tokens {
                 values.insert("maxTokens".to_string(), Value::from(limit));
+            }
+            // The caller's thinking knob, rendered into whatever field(s) the template declares.
+            // `reasoning_values` yields only the keys the caller asked for, so a request with no
+            // setting adds nothing and the template's `{{…?}}` placeholders omit their fields —
+            // the provider's own default, which is the contract for "unset".
+            if let Some(effort) = reasoning {
+                for (key, value) in reasoning_values(effort, effective_max_tokens) {
+                    values.insert(key.to_string(), value);
+                }
             }
             if let Some(t) = temperature {
                 values.insert("temperature".to_string(), Value::from(t));
@@ -1134,6 +1144,45 @@ fn thinking_text(selected: &Value) -> String {
         }
     }
     parts.join("")
+}
+
+/// The request-template values for the caller's thinking knob — the Rust mirror of
+/// `reasoningValues` (`manifest-interpreter.ts`), keyed for the optional placeholders the builtin
+/// dialects declare: Anthropic `{{thinking?}}`, the OpenAI-compatible dialect `{{reasoningEffort?}}`,
+/// Gemini `{{thinkingConfig?}}`. Empty keys are never yielded, so a dialect whose template declares
+/// none of them is untouched.
+fn reasoning_values(
+    effort: ReasoningEffort,
+    max_tokens: Option<u64>,
+) -> Vec<(&'static str, Value)> {
+    match effort {
+        ReasoningEffort::Off => vec![
+            (
+                "thinking",
+                serde_json::json!({ "type": "disabled" }),
+            ),
+            ("thinkingConfig", serde_json::json!({ "thinkingBudget": 0 })),
+        ],
+        level => {
+            // One budget table for every dialect that thinks in tokens (see
+            // `ReasoningEffort::budget_tokens`). Anthropic requires `1024 <= budget_tokens <
+            // max_tokens`, so the budget is clamped under the ceiling this request carries —
+            // floored at the API minimum, never above it.
+            let budget = level
+                .budget_tokens()
+                .unwrap_or(1024)
+                .min(max_tokens.map_or(u64::MAX, |mt| mt.saturating_sub(1024)))
+                .max(1024);
+            vec![
+                (
+                    "thinking",
+                    serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+                ),
+                ("reasoningEffort", serde_json::json!(level.as_str())),
+                ("thinkingConfig", serde_json::json!({ "thinkingBudget": budget })),
+            ]
+        }
+    }
 }
 
 /// A usage block, or `None` when it carried nothing readable.
@@ -1864,6 +1913,7 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,
@@ -1941,9 +1991,10 @@ mod tests {
 
     /// A unary reply's thinking blocks join onto the reasoning channel — the counterpart of
     /// `select_text` reading past them (`joinThinkingParts` on the TypeScript side). The fixture's
-    /// selector is patched to the production mixed-array read (`$.content`, as the builtin has
-    /// carried since 2026-09-29): the fixture's own `$.content[0].text` is the pre-fix shape that
-    /// a thinking-first reply resolves to nothing.
+    /// selector is patched to the mixed-array read; that the **template** declares it is pinned
+    /// separately below, by a test that goes through the real builtin — this one cannot notice a
+    /// template going stale, which is exactly how the Rust half kept block 0 for a month after the
+    /// TypeScript half stopped.
     #[tokio::test]
     async fn a_unary_reply_s_thinking_blocks_reach_the_reasoning_channel() {
         let mut manifest = anthropic_manifest();
@@ -1963,6 +2014,107 @@ mod tests {
         let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
         assert_eq!(text, "ok");
         assert_eq!(reasoning.join(""), "the note");
+    }
+
+    /// **The stale-selector regression, through the real builtin.** `$.content[0].text` reads block
+    /// 0, and on a thinking-first reply block 0 is the thinking block — so the answer arrived empty
+    /// while the row looked like a success and every non-streaming client saw `content: ""`.
+    /// `c325784` fixed the TypeScript template; the Rust one kept the old path, and the test above
+    /// could not tell because it patches the selector itself. This asserts against **the template**,
+    /// so a future edit that restores block 0 fails here.
+    ///
+    /// Measured live 2026-10-02 through this template against agentrouter: `deepseek-v4-flash`
+    /// answers `Reply with exactly: ok` with exactly this body shape when thinking is on.
+    #[tokio::test]
+    async fn the_anthropic_builtin_reads_a_thinking_first_unary_reply() {
+        let manifest =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"thinking","thinking":"the note","signature":"s"},{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("deepseek-v4-flash");
+        args.stream = false;
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "ok", "the answer comes from the text block, whatever leads the array");
+    }
+
+    /// The thinking knob reaches the wire in each dialect's own field — and nowhere when unset.
+    /// Anthropic: an object, `off` a real request, `high` clamped under the output ceiling
+    /// (Anthropic requires `1024 <= budget_tokens < max_tokens`; the fixture's limit is 8192).
+    /// OpenAI: the level word. The Rust values come from the same table as the TypeScript's.
+    #[tokio::test]
+    async fn the_thinking_knob_reaches_the_wire_in_the_dialect_s_own_field() {
+        // The trimmed fixtures predate the knob, so the placeholders are declared here — the same
+        // lines the builtins now carry (`builtin_templates.rs`).
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] = json!("{{thinking?}}");
+        let mut openai_fixture = openai_manifest();
+        openai_fixture["endpoints"]["generateText"]["requestTemplate"]["reasoning_effort"] =
+            json!("{{reasoningEffort?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+
+        let off = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, off.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Off);
+        let _ = &cancel;
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value = serde_json::from_str(&off.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+
+        let high = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, high.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value = serde_json::from_str(&high.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 7168 }),
+            "8192 clamped under the fixture's 8192-token ceiling"
+        );
+
+        let openai = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )]);
+        let interp = interpreter(&openai_fixture, openai.clone());
+        let mut args = text_args("gpt-4o");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Medium);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value = serde_json::from_str(&openai.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("thinking").is_none(), "the anthropic field stays home");
+    }
+
+    /// Unset: no field at all — the provider's own default. A fresh cancel per case: a stream
+    /// dropped un-drained cancels the shared token, and a cancelled request answers Transport.
+    #[tokio::test]
+    async fn the_thinking_knob_is_absent_when_unset() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] = json!("{{thinking?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let bare = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, bare.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = None;
+        let result = interp.generate_text("key:t", args, &cancel).await;
+        if let Err(e) = &result {
+            eprintln!("ISO ERR: {e:?}");
+        }
+        assert!(result.is_ok());
     }
 
     /* ------------------------------------------- tool_choice: the dialect's own shape */
@@ -2087,6 +2239,7 @@ mod tests {
             stream: false,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: tools.as_ref(),
             tool_choice: tool_choice.as_ref(),
             response_format: None,

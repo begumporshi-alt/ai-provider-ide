@@ -22,6 +22,10 @@ function openaiCompat(baseUrl: string, extra?: { textHeaders?: Record<string, st
           model: "{{model}}",
           messages: "{{messages}}",
           stream: "{{stream}}",
+          // The caller's thinking knob (see `reasoningValues`). `{{…?}}` — omitted when unset, and
+          // the OpenAI-compatible vocabulary has no portable "off": omitting leaves the provider's
+          // own default, which for a reasoning model may still think.
+          reasoning_effort: "{{reasoningEffort?}}",
           max_tokens: "{{maxTokens?}}",
           temperature: "{{temperature?}}",
           // §3.4 tool calling. All three are `{{x?}}`: when the caller supplies no tools the
@@ -110,6 +114,11 @@ function anthropicCompat(baseUrl: string): AdapterManifest {
           system: "{{system?}}",
           stream: "{{stream}}",
           max_tokens: "{{maxTokens}}", // anthropic REQUIRES max_tokens — not optional here
+          // The caller's thinking knob (see `reasoningValues`): `{type:"disabled"}` for off —
+          // the one portable off switch in the three dialects, and the measured fix for a model
+          // that spends its whole output budget thinking — or `{type:"enabled",budget_tokens}`
+          // clamped under this request's max_tokens.
+          thinking: "{{thinking?}}",
           // v1.1 amendment: translate the internal OpenAI tool_choice (string "auto"/"none" or
           // {type:"function",function:{name}}) into Anthropic's object form via `toolChoiceMap`:
           //   "none"     -> {type:"none"}                  (never call tools)
@@ -285,10 +294,14 @@ function geminiCompat(baseUrl: string): AdapterManifest {
           // as an unknown field.
           toolConfig: "{{toolChoice?}}",
           // GenerationConfig carries the knobs the dialect names differently; `maxOutputTokens`
-          // is required to be nested, not top-level.
+          // is required to be nested, not top-level. The whole `thinkingConfig` is one value
+          // (`{{thinkingConfig?}}`, an object from `reasoningValues`): budget 0 for off, the
+          // shared budget table otherwise — nesting a `{{…?}}` omission here would leave an
+          // empty `thinkingConfig` behind.
           generationConfig: {
             maxOutputTokens: "{{maxTokens?}}",
             temperature: "{{temperature?}}",
+            thinkingConfig: "{{thinkingConfig?}}",
           },
         },
         // One declaration, no `type`/`function` wrapping, `parameters` always present (Gemini

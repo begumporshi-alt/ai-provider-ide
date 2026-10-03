@@ -371,6 +371,22 @@ impl Job {
                     }
                 };
 
+                // The client's thinking knob. Two spellings, and the order between them is the
+                // reference's own precedence: `reasoning.effort` is canonical (what a
+                // Responses-shaped client sends, and what the ingress normalizer produces from a
+                // Codex client's `reasoning_effort`), and `reasoning_effort` is the OpenAI-chat
+                // alias that survives for a generic client. Read from the NORMALIZED body, and
+                // canonical first, so a client that sends both gets the field it means rather than
+                // the one it aliased.
+                //
+                // `ReasoningEffort::parse` answers `None` for an unknown word — which renders as
+                // no field at all, the provider's own default, rather than a guessed level.
+                let reasoning = body
+                    .pointer("/reasoning/effort")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| body.get("reasoning_effort").and_then(|v| v.as_str()))
+                    .and_then(crate::core::adapter::ReasoningEffort::parse);
+
                 let text_req = crate::core::router::TextRequest {
                     model: model.clone(),
                     // Cloned per turn: `TextRequest` owns its messages and `generate_text` consumes
@@ -380,6 +396,7 @@ impl Job {
                     messages: messages.clone(),
                     max_tokens,
                     temperature,
+                    reasoning,
                     tools: tools.clone(),
                     tool_choice: tool_choice.clone(),
                     response_format: response_format.clone(),
@@ -668,8 +685,7 @@ mod tests {
     use futures_util::StreamExt;
 
     use crate::core::adapter::{
-        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs,
-    };
+        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs, ReasoningEffort,};
     use crate::core::engine::{
         AllAttemptsFailed, AttemptError, AttemptLabel, AttemptOutcome, ErrorClass, FailureKind,
     };
@@ -878,6 +894,7 @@ mod tests {
         /// The `tools` array the adapter was handed, per call — so a test asserts what the bridge
         /// actually put on the wire rather than what it meant to.
         seen_tools: Mutex<Vec<Option<Value>>>,
+        seen_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
         /// The `messages` array the adapter was handed, per call. The sandbox's own output is only
         /// visible from here: a tool result reaches the model, never the client.
         seen_messages: Mutex<Vec<Vec<Value>>>,
@@ -890,6 +907,7 @@ mod tests {
                 images: Mutex::new(VecDeque::new()),
                 text_calls: Mutex::new(0),
                 seen_tools: Mutex::new(Vec::new()),
+                seen_reasoning: Mutex::new(Vec::new()),
                 seen_messages: Mutex::new(Vec::new()),
             })
         }
@@ -900,6 +918,7 @@ mod tests {
                 images: Mutex::new(replies.into()),
                 text_calls: Mutex::new(0),
                 seen_tools: Mutex::new(Vec::new()),
+                seen_reasoning: Mutex::new(Vec::new()),
                 seen_messages: Mutex::new(Vec::new()),
             })
         }
@@ -914,6 +933,10 @@ mod tests {
 
         fn messages_seen(&self, nth: usize) -> Vec<Value> {
             self.seen_messages.lock().unwrap().get(nth).cloned().unwrap_or_default()
+        }
+
+        fn reasoning_seen(&self, nth: usize) -> Option<ReasoningEffort> {
+            self.seen_reasoning.lock().unwrap().get(nth).cloned().flatten()
         }
     }
 
@@ -937,6 +960,7 @@ mod tests {
         {
             *self.text_calls.lock().unwrap() += 1;
             self.seen_tools.lock().unwrap().push(args.tools.cloned());
+            self.seen_reasoning.lock().unwrap().push(args.reasoning);
             self.seen_messages.lock().unwrap().push(args.messages.to_vec());
 
             // Taken here, fired at exhaustion. They cannot ride the chunk stream — it is strings
@@ -1415,6 +1439,45 @@ mod tests {
         assert_eq!(delta_text(&msgs), "hello", "the prose path is unchanged");
         assert_eq!(delta_count(&msgs), 1, "gateway mode still releases the prose once");
         assert!(matches!(msgs.last(), Some(BridgeMsg::Done)));
+    }
+
+    /// The client's thinking knob survives ingress: `reasoning_effort` (OpenAI chat) and
+    /// `reasoning.effort` (the Codex/Responses shape the normalizer produces) both reach the
+    /// adapter as a parsed level, and an unknown word reaches it as `None` — the provider's
+    /// default, not a guessed level.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_client_s_reasoning_effort_reaches_the_adapter() {
+        let adapter = Scripted::text(vec![
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+        ]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let mut low = chat("m1");
+        low.body["reasoning_effort"] = json!("low");
+        drain(&bridge, low).await;
+        assert_eq!(adapter.reasoning_seen(0), Some(ReasoningEffort::Low));
+
+        let mut codex = chat("m1");
+        codex.body["reasoning"] = json!({ "effort": "high" });
+        drain(&bridge, codex).await;
+        assert_eq!(adapter.reasoning_seen(1), Some(ReasoningEffort::High));
+
+        let mut unknown = chat("m1");
+        unknown.body["reasoning_effort"] = json!("maximum");
+        drain(&bridge, unknown).await;
+        assert_eq!(adapter.reasoning_seen(2), None, "an unknown word is not a guess");
+
+        // Both spellings on one body: the canonical `reasoning.effort` wins. The ingress normalizer
+        // deliberately leaves a client's pre-existing `reasoning` alone rather than letting the
+        // alias overwrite it, so reading the alias first would contradict the reference.
+        let mut both = chat("m1");
+        both.body["reasoning"] = json!({ "effort": "low" });
+        both.body["reasoning_effort"] = json!("high");
+        drain(&bridge, both).await;
+        assert_eq!(adapter.reasoning_seen(3), Some(ReasoningEffort::Low), "canonical beats alias");
     }
 
     #[tokio::test(flavor = "multi_thread")]

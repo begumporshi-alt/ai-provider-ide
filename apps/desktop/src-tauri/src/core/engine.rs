@@ -48,7 +48,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::core::adapter::{
-    AdapterFactory, Cancel, ImageArgs, StreamObservation, TextArgs, ToolCall,
+    AdapterFactory, Cancel, ImageArgs, ReasoningEffort, StreamObservation, TextArgs, ToolCall,
 };
 use crate::core::limiter::ProviderLimiter;
 use crate::core::persist::{ApiKeyRow, ProviderRow};
@@ -1011,6 +1011,8 @@ pub struct ExecuteTextArgs<'a> {
     pub stream: bool,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — forwarded untouched to the adapter's render.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<Value>,
     pub tool_choice: Option<Value>,
     pub response_format: Option<Value>,
@@ -1289,6 +1291,7 @@ pub async fn execute_text(
                     stream: args.stream,
                     max_tokens: args.max_tokens,
                     temperature: args.temperature,
+                    reasoning: args.reasoning,
                     tools: args.tools.as_ref(),
                     tool_choice: args.tool_choice.as_ref(),
                     response_format: args.response_format.as_ref(),
@@ -3454,6 +3457,7 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,

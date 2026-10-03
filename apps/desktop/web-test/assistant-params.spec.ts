@@ -98,6 +98,43 @@ test("blank parameters are omitted rather than sent as zero", async ({ page }) =
   const body = await lastChatBody(page);
   expect(body).not.toHaveProperty("temperature");
   expect(body).not.toHaveProperty("max_tokens");
+  // The same contract for the thinking level: unset leaves the provider's own default in place
+  // rather than sending a level the user never chose.
+  expect(body).not.toHaveProperty("reasoning_effort");
+});
+
+test("the thinking level reaches the provider in the dialect's own field", async ({ page }) => {
+  await openAssistant(page);
+
+  // The seeded provider is served by `openai-compat`, whose template declares
+  // `reasoning_effort: "{{reasoningEffort?}}"`. The interpreter renders the caller's level into
+  // whichever field the *serving dialect* names, so this is the assertion that the whole path
+  // carried it: composer → run config → `TextRequest` → the body the mock provider received.
+  await page.getByTestId("thinking-select").selectOption("high");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello there");
+  await page.getByRole("button", { name: "Send" }).click();
+  const body = await lastChatBody(page);
+  expect(body.reasoning_effort).toBe("high");
+
+  // `off` is a real request on the Anthropic dialect (`thinking:{type:"disabled"}`) and a
+  // best-effort *omit* here: the OpenAI-compatible vocabulary has no portable off switch, so
+  // nothing is sent and the provider's own default stands. Asserted rather than skipped, because
+  // the alternative — inventing a field this dialect gives no meaning to — is the failure mode.
+  await page.getByTestId("thinking-select").selectOption("off");
+  await page.getByPlaceholder(/Message your assistant/).fill("hello again");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect
+    .poll(
+      async () =>
+        (await store<EgressLogEntry[]>(page, "requests")).filter(
+          (r) => r.url.endsWith("/chat/completions") && r.body,
+        ).length,
+      { timeout: 30_000 },
+    )
+    .toBeGreaterThan(1);
+  const offBody = await lastChatBody(page);
+  expect(offBody).not.toHaveProperty("reasoning_effort");
+  expect(offBody).not.toHaveProperty("thinking");
 });
 
 test("the context meter shows the chosen model's window and a growing estimate", async ({ page }) => {
@@ -198,6 +235,7 @@ test("parameters and a custom prompt survive a reload, and clearing one survives
   const temp = page.getByLabel(/Temperature for this request/);
   const prompt = page.getByLabel(/no-tools guard/);
   await temp.fill("0.7");
+  await page.getByTestId("thinking-select").selectOption("medium");
   await page.getByRole("button", { name: /system prompt/ }).click();
   await prompt.fill("Answer only in haiku.");
   await page.getByRole("button", { name: "Done" }).click();
@@ -208,20 +246,24 @@ test("parameters and a custom prompt survive a reload, and clearing one survives
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await expect(page.getByLabel(/Temperature for this request/)).toHaveValue("0.7");
+  await expect(page.getByTestId("thinking-select")).toHaveValue("medium");
   await page.getByRole("button", { name: /system prompt/ }).click();
   await expect(page.getByLabel(/no-tools guard/)).toHaveValue("Answer only in haiku.");
 
   // Clearing has to be as durable as setting. `undefined` is dropped by `JSON.stringify`, so a
   // cleared field saved as `undefined` left the previous value in the row: the box emptied, the
-  // setting did not, and the old value reappeared here. The write sends an explicit null/"" now.
+  // setting did not, and the old value reappeared here. The write sends an explicit null/"" now —
+  // which is why the level is saved as `null` rather than omitted when it is back to "default".
   await page.getByLabel(/no-tools guard/).fill("");
   await page.getByRole("button", { name: "Done" }).click();
   await page.getByLabel(/Temperature for this request/).fill("");
+  await page.getByTestId("thinking-select").selectOption("");
   await page.waitForTimeout(400);
 
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await expect(page.getByLabel(/Temperature for this request/)).toHaveValue("");
+  await expect(page.getByTestId("thinking-select")).toHaveValue("");
   await page.getByRole("button", { name: /system prompt/ }).click();
   await expect(page.getByLabel(/no-tools guard/)).toHaveValue("");
 });

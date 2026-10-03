@@ -376,3 +376,72 @@ describe("tool turns on replay: only a dialect that asks is reshaped", () => {
     ]);
   });
 });
+
+describe("the caller's thinking knob (`reasoningValues`)", () => {
+  it("renders into each dialect's own request field", async () => {
+    // Anthropic: an object with a budget. OpenAI: the level word. Gemini: a nested config. One
+    // value per dialect, from one caller setting — so the three levels mean the same thing
+    // everywhere and the request template is where a dialect's own shape is declared.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "medium" });
+    expect(a.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "medium" });
+    expect(o.lastBody()!.reasoning_effort).toBe("medium");
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "low" });
+    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toEqual({
+      thinkingBudget: 1024,
+    });
+  });
+
+  it("off is a real request on Anthropic and budget 0 on Gemini, an omission on OpenAI", async () => {
+    // Probed 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`): `thinking:{type:"disabled"}`
+    // is answered in a fraction of the all-thinking time — the real fix for a model that would
+    // otherwise spend its entire output budget thinking. The OpenAI-compatible vocabulary has no
+    // portable off, so omitting (the provider's default) is the honest rendering there.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect(a.lastBody()!.thinking).toEqual({ type: "disabled" });
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toEqual({
+      thinkingBudget: 0,
+    });
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect(o.lastBody()).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("clamps the thinking budget under the request's output ceiling, per Anthropic's rule", async () => {
+    // Anthropic requires `1024 <= budget_tokens < max_tokens`. At the manifest's 8192 default a
+    // "high" 8192 budget would be rejected whole — so it lands at 7168; a tiny ceiling floors the
+    // budget at the API minimum rather than sending something illegal.
+    const high = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(high.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high" });
+    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 7168 });
+
+    const tiny = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(tiny.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 1500 });
+    expect(tiny.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+  });
+
+  it("an unset knob puts none of the fields on the wire", async () => {
+    // The contract for "unset" is the provider's own default: no field, no guess.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(a.lastBody()).not.toHaveProperty("thinking");
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(o.lastBody()).not.toHaveProperty("reasoning_effort");
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(g.lastBody()!.generationConfig as Record<string, unknown>).not.toHaveProperty("thinkingConfig");
+  });
+});

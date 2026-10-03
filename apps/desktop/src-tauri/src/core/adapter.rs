@@ -145,12 +145,64 @@ pub struct ToolCall {
 /// caller's own argument struct — see `execute_text`'s `forward_tool` for the shape that works and
 /// the reasoning. A shape diagnosis was made here, falsified against a 60-line reproduction, and
 /// replaced by the call-site one; the seam did not need changing.
+/// How much the model should think, mapped per dialect at render time (`interpreter.rs`'s
+/// `reasoning_values`). `Off` is a real request on the Anthropic dialect
+/// (`thinking: {type:"disabled"}` — probed 2026-10-02: agentrouter's reasoning models answer in a
+/// fraction of the time with it) and a best-effort omit on dialects that have no portable off
+/// switch. The mirror of `ReasoningEffort` in `ports.ts`; the budget table is shared by doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "off",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+
+    /// The wire spellings clients use. `minimal` (OpenAI's newer level) maps to `Low`, and the
+    /// "no thinking" words various clients send all map to `Off`; an unknown word is `None` — the
+    /// provider's default, not a guess.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" | "none" | "disabled" => Some(ReasoningEffort::Off),
+            "minimal" | "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            _ => None,
+        }
+    }
+
+    /// The shared budget table — see `reasoningValues` in `manifest-interpreter.ts` for the doc:
+    /// one table so the three levels mean the same thing on every dialect that thinks in tokens.
+    pub fn budget_tokens(self) -> Option<u64> {
+        match self {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some(1024),
+            ReasoningEffort::Medium => Some(4096),
+            ReasoningEffort::High => Some(8192),
+        }
+    }
+}
+
 pub struct TextArgs<'a> {
     pub model: String,
     pub messages: &'a [Value],
     pub stream: bool,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — rendered into the dialect's own request field by the
+    /// interpreter (`reasoning_values`), and omitted entirely when `None`, which leaves the
+    /// provider's own default.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<&'a Value>,
     pub tool_choice: Option<&'a Value>,
     pub response_format: Option<&'a Value>,
@@ -939,6 +991,7 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,

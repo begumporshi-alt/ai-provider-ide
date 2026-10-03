@@ -28,6 +28,50 @@ function toolPartTemplates(
 }
 
 /**
+ * One budget table for every dialect that thinks in **tokens** — Anthropic's `budget_tokens` and
+ * Gemini's `thinkingBudget` — so the three effort levels mean the same thing everywhere. Anthropic
+ * additionally requires `1024 <= budget_tokens < max_tokens`, so the budget is clamped under the
+ * ceiling this request actually carries (floored at the API minimum) rather than trusted.
+ */
+const REASONING_BUDGETS: Record<Exclude<import("./ports.js").ReasoningEffort, "off">, number> = {
+  low: 1024,
+  medium: 4096,
+  high: 8192,
+};
+
+/**
+ * The request-template values for the caller's thinking knob, keyed for the optional placeholders
+ * the builtin dialects declare: Anthropic reads `{{thinking?}}` (an object — `renderTemplate`
+ * substitutes non-string JSON verbatim), the OpenAI-compatible dialect reads `{{reasoningEffort?}}`,
+ * and Gemini reads `{{thinkingConfig?}}`.
+ *
+ * Empty when the caller set nothing: every placeholder is `{{…?}}`, so the fields are omitted and
+ * the provider's own default governs — which is the whole contract for "unset". `Off` is a real
+ * request where the dialect allows one (Anthropic `thinking: {type:"disabled"}`, Gemini budget 0)
+ * and an omission where it does not (the OpenAI-compatible vocabulary has no portable off; the
+ * provider's default may still think — measured on agentrouter, whose models think by default,
+ * which is precisely why the Anthropic off switch matters).
+ */
+export function reasoningValues(
+  effort: import("./ports.js").ReasoningEffort | undefined,
+  maxTokens: number | undefined,
+): Record<string, unknown> {
+  if (!effort) return {};
+  if (effort === "off") {
+    return { thinking: { type: "disabled" }, thinkingConfig: { thinkingBudget: 0 } };
+  }
+  let budget = REASONING_BUDGETS[effort];
+  if (typeof maxTokens === "number") {
+    budget = Math.max(1024, Math.min(budget, maxTokens - 1024));
+  }
+  return {
+    thinking: { type: "enabled", budget_tokens: budget },
+    reasoningEffort: effort,
+    thinkingConfig: { thinkingBudget: budget },
+  };
+}
+
+/**
  * Cached-prompt tokens from a usage block, in whichever dialect reports them.
  *
  * OpenAI-shaped blocks nest it as `prompt_tokens_details.cached_tokens`; Anthropic puts
@@ -125,6 +169,8 @@ export interface TextArgs {
   stream: boolean;
   maxTokens?: number;
   temperature?: number;
+  /** How much the model should think — rendered per dialect by `reasoningValues`. */
+  reasoning?: import("./ports.js").ReasoningEffort;
   tools?: unknown;
   toolChoice?: unknown;
   responseFormat?: unknown;
@@ -646,6 +692,11 @@ export class ManifestInterpreter implements AdapterInstance {
       messages: dialectMessages,
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
+      // The caller's thinking knob, rendered into whatever field(s) this dialect's template
+      // declares. `reasoningValues` returns only the keys the caller asked for, so a request with
+      // no setting adds nothing and the template's `{{…?}}` placeholders omit their fields — the
+      // provider's own default, which is the contract for "unset".
+      ...reasoningValues(args.reasoning, args.maxTokens ?? this.m.limits?.maxOutputTokens),
       temperature: args.temperature,
       // v1.1 amendment (2026-10-01): the declarations are shaped per dialect before they reach the
       // placeholder. `{{tools}}` alone ships OpenAI's `{type:"function", function:{…}}` wrapping,

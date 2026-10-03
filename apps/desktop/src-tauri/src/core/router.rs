@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::core::adapter::{AdapterFactory, Cancel};
+use crate::core::adapter::{AdapterFactory, Cancel, ReasoningEffort};
 use crate::core::engine::{
     execute_image, execute_text, AllAttemptsFailed, AttemptOutcome, ExecuteImageArgs,
     ExecuteTextArgs, HealthTracker, TextFailure, TextSuccess,
@@ -353,6 +353,9 @@ pub struct TextRequest<'a> {
     pub messages: Vec<Value>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — rendered per dialect by the interpreter
+    /// (`reasoning_values`); `None` leaves the provider's own default.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<Value>,
     pub tool_choice: Option<Value>,
     pub response_format: Option<Value>,
@@ -920,6 +923,7 @@ impl<'a> ModelRouter<'a> {
             messages,
             max_tokens,
             temperature,
+            reasoning,
             tools,
             tool_choice,
             response_format,
@@ -1007,6 +1011,7 @@ impl<'a> ModelRouter<'a> {
                 stream: true,
                 max_tokens,
                 temperature,
+                reasoning,
                 tools,
                 tool_choice,
                 response_format,
@@ -1424,6 +1429,7 @@ impl<'a> ModelRouter<'a> {
                 stream: false,
                 max_tokens: Some(req.max_tokens),
                 temperature: None,
+                reasoning: None,
                 tools: None,
                 tool_choice: None,
                 response_format: None,
@@ -2148,6 +2154,7 @@ mod tests {
             messages: vec![json!({ "role": "user", "content": "hi" })],
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,

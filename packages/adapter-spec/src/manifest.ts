@@ -451,6 +451,13 @@ export const REQUEST_FIELD_WHITELIST: Record<string, ReadonlySet<string>> = {
     // and without it even the builtin anthropic template failed lint, so a generated one never
     // had a chance.
     "system",
+    // The caller's thinking knob (2026-10-02). Three names for one caller-supplied value, because
+    // the three dialects spell it differently: `thinking` (Anthropic), `reasoning_effort` (OpenAI
+    // chat) and `thinkingConfig` (Gemini). Same trust footing as `tool_choice` and `toolConfig` —
+    // the manifest can only say *where* the caller's level goes, never invent one — and the same
+    // shape of omission: leaving them out makes every generated manifest that declares the field
+    // fail lint, which is exactly how `toolConfig` was caught.
+    "thinking", "reasoning_effort", "thinkingConfig",
   ]),
   generateImage: new Set(["model", "prompt", "size"]),
   listModels: new Set<string>(),

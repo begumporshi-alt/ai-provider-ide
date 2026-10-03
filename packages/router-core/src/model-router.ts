@@ -163,6 +163,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       tools: req.tools,
       toolChoice: req.toolChoice,
       responseFormat: req.responseFormat,
+      reasoning: req.reasoning,
       onToolCall: req.onToolCall,
       // Forwarded so the caller can report usage onward (the gateway sends it host-side); the
       // engine keeps its own copy for the ledger regardless.
