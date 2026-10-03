@@ -1018,6 +1018,10 @@ pub struct ExecuteTextArgs<'a> {
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     /// Forwarded untouched, like `on_tool_call` — the finish reason mapped to the OpenAI vocabulary.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// Forwarded untouched, like `on_finish` — the model's reasoning, as it streams. Kept out of the
+    /// chunk stream and out of the disposition entirely: reasoning is not delivered output, so a
+    /// stream that carries only reasoning is still a drained stream for every classification.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     pub max_attempts: Option<usize>,
     /// Mark the last system message block with `cache_control` on egress. See
     /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
@@ -1268,6 +1272,17 @@ pub async fn execute_text(
                         cb(reason);
                     }
                 };
+                // The same shape again, and deliberately NOTHING beside the forward: no counter, no
+                // `emitted`, no disposition. Reasoning is not delivered output — a stream that only
+                // reasoned is still a drained stream (`NO_OUTPUT` when the observation says it
+                // reasoned), and the pass-through consumer renders what it receives without that
+                // changing what the turn was.
+                let mut caller_on_reasoning = args.on_reasoning.as_deref_mut();
+                let mut forward_reasoning = |text: &str| {
+                    if let Some(cb) = caller_on_reasoning.as_deref_mut() {
+                        cb(text);
+                    }
+                };
                 let text_args = TextArgs {
                     model: candidate.model.native_id.clone(),
                     messages: &args.messages,
@@ -1280,6 +1295,7 @@ pub async fn execute_text(
                     on_tool_call: Some(&mut forward_tool),
                     on_usage: Some(&mut record_usage),
                     on_finish: Some(&mut forward_finish),
+                    on_reasoning: Some(&mut forward_reasoning),
                     prompt_cache_enabled: args.prompt_cache_enabled,
                     observation: Some(&mut observation),
                 };
@@ -3444,6 +3460,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }

@@ -316,6 +316,11 @@ pub(crate) async fn responses_h(
                         yield ev("response.output_text.delta", json!({ "type": "response.output_text.delta", "item_id": format!("{rid}_out"),
                             "output_index": 0, "content_index": 0, "delta": t }));
                     }
+                    // Reasoning is carried by the bridge, but this dialect does not forward it: the
+                    // Responses-API shape for reasoning is the OpenAI reasoning-item/summary
+                    // contract, a design of its own — deferred until a client asks. The
+                    // `reasoning_content` convention lives on the chat-completions surface.
+                    BridgeMsg::Reasoning(_) => {}
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -413,6 +418,8 @@ pub(crate) async fn responses_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            // See the stream arm: the reasoning-item contract is deferred until a client asks.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => provider_finish = Some(reason),
             BridgeMsg::Done => {

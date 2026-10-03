@@ -361,6 +361,10 @@ pub struct TextRequest<'a> {
     /// The finish reason, mapped to the OpenAI vocabulary by the serving dialect's
     /// `responseFinishMap` — the word an OpenAI-shaped client switches on.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// The model's reasoning, as it streams — forwarded to the engine untouched, and never mixed
+    /// into the chunk stream. See [`crate::core::adapter::TextArgs::on_reasoning`] for why the
+    /// channel exists and why firing it must not change any disposition.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
     /// Whether to mark the system prompt with `cache_control` on egress so a provider with
@@ -922,6 +926,7 @@ impl<'a> ModelRouter<'a> {
             on_tool_call,
             on_usage,
             on_finish,
+            on_reasoning,
             max_attempts,
             prompt_cache_enabled,
         } = req;
@@ -988,6 +993,13 @@ impl<'a> ModelRouter<'a> {
                     cb(r);
                 }
             };
+            // The same local-closure shape again, and again deliberately nothing beside the forward.
+            let mut caller_on_reasoning = on_reasoning;
+            let mut forward_reasoning = |t: &str| {
+                if let Some(cb) = caller_on_reasoning.as_deref_mut() {
+                    cb(t);
+                }
+            };
             let args = ExecuteTextArgs {
                 plan,
                 messages,
@@ -1001,6 +1013,7 @@ impl<'a> ModelRouter<'a> {
                 on_tool_call: Some(&mut forward_tool),
                 on_usage: Some(&mut forward_usage),
                 on_finish: Some(&mut forward_finish),
+                on_reasoning: Some(&mut forward_reasoning),
                 max_attempts,
                 prompt_cache_enabled,
             };
@@ -1417,6 +1430,8 @@ impl<'a> ModelRouter<'a> {
                 on_tool_call: None,
                 on_usage: None,
                 on_finish: None,
+                // The summarizer/generator's own call: it consumes the answer, not the notes.
+                on_reasoning: None,
                 max_attempts: None,
                 // Read from the router settings rather than hardcoded off, so the operator's
                 // toggle governs this path too. `CompleteRequest` carries no flag of its own:
@@ -1910,6 +1925,9 @@ mod tests {
         usage: Mutex<VecDeque<Option<UsageTokens>>>,
         /// Per text call: `[(payload, repeat)]` noted into `args.observation`, in order.
         observations: Mutex<VecDeque<Vec<(String, u32)>>>,
+        /// Per text call: reasoning texts fired through `args.on_reasoning`, in order — the
+        /// upstream-gated channel a real adapter delivers a reasoning stream through.
+        reasoning: Mutex<VecDeque<Vec<String>>>,
         image: Mutex<VecDeque<Result<ImageReply, AttemptError>>>,
         calls: Mutex<Vec<String>>,
     }
@@ -1969,6 +1987,12 @@ mod tests {
             Arc::clone(self)
         }
 
+        fn with_reasoning(self: &Arc<Self>, batches: Vec<Vec<&str>>) -> Arc<Self> {
+            *self.reasoning.lock().unwrap() =
+                batches.into_iter().map(|b| b.into_iter().map(String::from).collect()).collect();
+            Arc::clone(self)
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -1999,11 +2023,19 @@ mod tests {
             let brk = self.breaks.lock().unwrap().pop_front().flatten();
             let usage = self.usage.lock().unwrap().pop_front().flatten();
             let observation = self.observations.lock().unwrap().pop_front().unwrap_or_default();
+            let reasoning = self.reasoning.lock().unwrap().pop_front().unwrap_or_default();
             Box::pin(async move {
                 match next {
                     None => Err(AttemptError::Transport),
                     Some(Err(e)) => Err(e),
                     Some(Ok(chunks)) => {
+                        // Reasoning first — the order the model produces it in — and through its
+                        // own callback, never the chunk stream.
+                        if let Some(cb) = args.on_reasoning.as_deref_mut() {
+                            for t in reasoning {
+                                cb(&t);
+                            }
+                        }
                         if let Some(cb) = args.on_tool_call.as_deref_mut() {
                             for call in tools {
                                 cb(call);
@@ -2122,6 +2154,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }
@@ -2427,6 +2460,40 @@ mod tests {
         // Anthropic stream shares, which is what the old positional sample quoted.
         assert!(detail.contains("thinking_delta"), "{detail}");
         assert!(!detail.contains("message_start"), "{detail}");
+    }
+
+    /// The reasoning reaches its own callback — and is still not delivered output: zero chunks,
+    /// and the row, whose observation saw the same reasoning on the wire, is `NO_OUTPUT`, not ok.
+    /// The fake scripts the observation and the reasoning separately (a real interpreter derives
+    /// both from the same payloads); scripting both is what lets this test pin the whole contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_reaches_its_own_callback_without_becoming_output() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&[])])
+            .with_reasoning(vec![vec!["thinking it", " through"]])
+            .with_observations(vec![vec![(
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it through\"}}]}",
+                1,
+            )]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+        // Leaked because `TextRequest<'static>` outlives any local the test could borrow from —
+        // the same idiom the tool-call test below uses.
+        let got: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let on_reasoning: &'static mut (dyn FnMut(&str) + Send) =
+            Box::leak(Box::new(move |t: &str| got.lock().unwrap().push(t.to_string())));
+        let mut req = text_req("m1");
+        req.on_reasoning = Some(on_reasoning);
+        let served = router
+            .generate_text(req, &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("nothing threw — the stream drained");
+
+        assert_eq!(served.candidate.provider.id, "p1");
+        assert_eq!(*got.lock().unwrap(), vec!["thinking it".to_string(), " through".to_string()]);
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "error", "reasoning is not delivered output");
+        assert_eq!(row.error_class.as_deref(), Some("NO_OUTPUT"));
     }
 
     /// A stream that DID deliver is not described: the output itself answers what the provider

@@ -125,6 +125,23 @@ pub(crate) async fn chat_h(
                             "choices": [{ "index": 0, "delta": delta }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
                     }
+                    BridgeMsg::Reasoning(t) if t.is_empty() => {}
+                    BridgeMsg::Reasoning(t) => {
+                        // The OpenAI-compatible convention (DeepSeek-origin; OpenRouter and
+                        // LiteLLM normalise to it): reasoning rides `delta.reasoning_content`,
+                        // never `delta.content`. The role opens the *message* once, on whichever
+                        // frame arrives first — reasoning usually precedes the answer — so the
+                        // `started` flag is shared with the content arm.
+                        let delta = if started {
+                            json!({ "reasoning_content": t })
+                        } else {
+                            started = true;
+                            json!({ "role": "assistant", "reasoning_content": t })
+                        };
+                        let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion.chunk", "model": model,
+                            "choices": [{ "index": 0, "delta": delta }] });
+                        yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
+                    }
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -201,6 +218,10 @@ pub(crate) async fn chat_h(
     }
 
     let mut full = String::new();
+    // The model's reasoning, upstream-gated. `full` is the answer and feeds the memory capture;
+    // the notes ride beside it as `message.reasoning_content`, per the DeepSeek-origin convention
+    // the OpenAI-compatible ecosystem normalised to.
+    let mut reasoning = String::new();
     let mut tool_calls_json: Option<String> = None;
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
@@ -208,6 +229,7 @@ pub(crate) async fn chat_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            BridgeMsg::Reasoning(t) => reasoning.push_str(&t),
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {
@@ -260,6 +282,12 @@ pub(crate) async fn chat_h(
             // `max_tokens` must not read as a finished answer (drift D86).
             let reason = finish_reason.take().unwrap_or_else(|| "stop".to_string());
             let mut choice = json!({ "index": 0, "message": { "role": "assistant", "content": clean_assistant_text(&full) }, "finish_reason": reason });
+            if !reasoning.is_empty() {
+                // The sibling of the streaming field, mirroring DeepSeek's non-stream shape.
+                // Passed through as the upstream sent it — never summarised, never merged into
+                // `content`.
+                choice["message"]["reasoning_content"] = Value::String(reasoning);
+            }
             if let Some(tc) = tool_calls_json {
                 let parsed: Value = serde_json::from_str(&tc).unwrap_or_default();
                 if !parsed.is_null() {
@@ -323,6 +351,9 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
+            // No reasoning to carry in a model list or an image reply — enumerated so the match
+            // stays exhaustive.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Usage { .. } => {}
             // Model listing and image generation carry no chat finish reason.
             BridgeMsg::Finish(_) => {}
@@ -427,6 +458,9 @@ pub(crate) async fn image_h(
             BridgeMsg::Done => break,
             BridgeMsg::Delta(_) => {}
             BridgeMsg::ToolCalls(_) => {}
+            // No reasoning to carry in a model list or an image reply — enumerated so the match
+            // stays exhaustive.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Usage { .. } => {}
             // Model listing and image generation carry no chat finish reason.
             BridgeMsg::Finish(_) => {}

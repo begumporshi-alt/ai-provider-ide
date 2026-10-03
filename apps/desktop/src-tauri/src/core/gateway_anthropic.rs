@@ -411,6 +411,12 @@ pub(crate) async fn messages_h(
                         let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
                     }
+                    // Reasoning is carried by the bridge, but this dialect does not forward it: the
+                    // `reasoning_content` convention belongs to the OpenAI-compatible surface
+                    // (DeepSeek-origin; OpenRouter and LiteLLM normalise to it). The Anthropic wire
+                    // shape would be `thinking_delta` blocks, which carry signatures a client must
+                    // replay verbatim — a contract of its own, deliberately not improvised here.
+                    BridgeMsg::Reasoning(_) => {}
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -532,6 +538,8 @@ pub(crate) async fn messages_h(
                 );
                 full.push_str(&t);
             }
+            // See the stream arm: thinking_delta blocks carry replay signatures; not improvised.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {

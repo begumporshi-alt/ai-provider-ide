@@ -359,6 +359,17 @@ impl Job {
                         finish_reason = Some(reason);
                     }
                 };
+                // Upstream-gated pass-through on its own channel, deliberately bypassing the gate:
+                // `ProseGate` holds a turn's *prose* back across tool-loop turns, and reasoning is
+                // not part of any turn's answer — a turn that reasons while deciding to call tools
+                // still showed the client what it was working through, which is the point of
+                // forwarding it at all. The liveness check matches `on_chunk`: a client that
+                // stopped listening cancels the request here too.
+                let mut on_reasoning = |text: &str| {
+                    if !replies.reply(id, BridgeMsg::Reasoning(text.to_string())) {
+                        cancel.cancel();
+                    }
+                };
 
                 let text_req = crate::core::router::TextRequest {
                     model: model.clone(),
@@ -375,6 +386,7 @@ impl Job {
                     on_tool_call: Some(&mut on_tool_call),
                     on_usage: Some(&mut on_usage),
                     on_finish: Some(&mut on_finish),
+                    on_reasoning: Some(&mut on_reasoning),
                     max_attempts: None,
                     prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };
@@ -799,6 +811,9 @@ mod tests {
         then_error: Option<AttemptError>,
         tool_calls: Vec<ToolCall>,
         usage: Option<UsageTokens>,
+        /// Reasoning texts fired through `args.on_reasoning` at the turn's end — the upstream-gated
+        /// channel, which the bridge forwards on its own `BridgeMsg` variant.
+        reasoning: Vec<String>,
     }
 
     impl ScriptedTurn {
@@ -809,6 +824,7 @@ mod tests {
                 then_error: None,
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: Vec::new(),
             }
         }
 
@@ -819,6 +835,7 @@ mod tests {
                 then_error: None,
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: Vec::new(),
             }
         }
 
@@ -834,6 +851,11 @@ mod tests {
 
         fn reporting(mut self, usage: UsageTokens) -> Self {
             self.usage = Some(usage);
+            self
+        }
+
+        fn reasoning(mut self, texts: Vec<&str>) -> Self {
+            self.reasoning = texts.into_iter().map(String::from).collect();
             self
         }
     }
@@ -919,8 +941,10 @@ mod tests {
 
             // Taken here, fired at exhaustion. They cannot ride the chunk stream — it is strings
             // only — and they cannot be derived from the text, which is empty on a tool-call turn.
+            // Reasoning takes the same path: its own callback, fired like a real adapter's stream.
             let on_tool_call = args.on_tool_call.take();
             let on_usage = args.on_usage.take();
+            let on_reasoning = args.on_reasoning.take();
             let next = self.turns.lock().unwrap().pop_front();
 
             Box::pin(async move {
@@ -928,15 +952,22 @@ mod tests {
                 // it cannot reach the provider. A test that under-scripts its turns sees the
                 // request fail rather than silently finishing.
                 let Some(turn) = next else { return Err(AttemptError::Transport) };
-                let ScriptedTurn { chunks, refusal, then_error, tool_calls, usage } = turn;
+                let ScriptedTurn { chunks, refusal, then_error, tool_calls, usage, reasoning } =
+                    turn;
                 if let Some(err) = refusal {
                     return Err(err);
                 }
 
                 let mut on_tool_call = on_tool_call;
                 let mut on_usage = on_usage;
+                let mut on_reasoning = on_reasoning;
                 let body = stream::iter(chunks.into_iter().map(Ok::<String, AttemptError>));
                 let tail = stream::once(async move {
+                    if let Some(cb) = on_reasoning.as_deref_mut() {
+                        for t in reasoning {
+                            cb(&t);
+                        }
+                    }
                     if let Some(cb) = on_tool_call.as_deref_mut() {
                         for call in tool_calls {
                             cb(call);
@@ -1358,6 +1389,32 @@ mod tests {
         assert_eq!(delta_text(&msgs), "hello");
         assert_eq!(delta_count(&msgs), 2, "nothing is held, so nothing is batched");
         assert_eq!(adapter.text_calls(), 1);
+    }
+
+    /// Reasoning rides its own `BridgeMsg` variant and bypasses `ProseGate`: gateway mode holds a
+    /// turn's *prose* back until the model settles, and reasoning is not part of any turn's answer.
+    /// (The fake fires its callbacks at the turn's end like a real adapter's stream, so what this
+    /// pins is the channel and the prose outcome, not inter-chunk timing.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_streams_as_its_own_messages_and_bypasses_the_prose_gate() {
+        let adapter = Scripted::text(vec![
+            ScriptedTurn::saying(&["hel", "lo"]).reasoning(vec!["thinking", " harder"])
+        ]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let msgs = drain(&bridge, chat("m1")).await;
+
+        let reasoning: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BridgeMsg::Reasoning(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.join(""), "thinking harder", "the reasoning reached the client");
+        assert_eq!(delta_text(&msgs), "hello", "the prose path is unchanged");
+        assert_eq!(delta_count(&msgs), 1, "gateway mode still releases the prose once");
+        assert!(matches!(msgs.last(), Some(BridgeMsg::Done)));
     }
 
     #[tokio::test(flavor = "multi_thread")]

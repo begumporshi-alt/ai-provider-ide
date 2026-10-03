@@ -267,6 +267,10 @@ pub(crate) async fn gemini_h(
                         let chunk = json!({ "candidates": [{ "content": { "parts": [{ "text": t }], "role": "model" }, "index": 0 }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                     }
+                    // Reasoning is carried by the bridge, but this dialect does not forward it: the
+                    // `reasoning_content` convention belongs to the OpenAI-compatible surface. The
+                    // Gemini shape would be `thought: true` parts — deferred until a client asks.
+                    BridgeMsg::Reasoning(_) => {}
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -335,6 +339,8 @@ pub(crate) async fn gemini_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            // See the stream arm: thought parts are deferred until a client asks.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => provider_finish = Some(reason),
             BridgeMsg::Done => {

@@ -417,6 +417,7 @@ impl ManifestInterpreter {
                 on_tool_call,
                 on_usage,
                 on_finish,
+                on_reasoning,
                 prompt_cache_enabled,
                 observation,
             } = args;
@@ -616,7 +617,7 @@ impl ManifestInterpreter {
             }
 
             if !streaming {
-                return unary_text(ep, &res.body, on_tool_call, on_usage, on_finish);
+                return unary_text(ep, &res.body, on_tool_call, on_usage, on_finish, on_reasoning);
             }
             let Some(spec) = spec else {
                 // Unreachable: `streaming` implies a spec. Written as a match rather than an
@@ -635,6 +636,7 @@ impl ManifestInterpreter {
                 on_tool_call,
                 on_usage,
                 on_finish,
+                on_reasoning,
                 observation,
                 pending: PendingCalls::new(),
                 last_usage: None,
@@ -895,6 +897,9 @@ fn wants_usage(view: &ManifestView, ep: &TextEndpoint) -> bool {
 /// rather than uniform.
 struct UnaryTextStream<'a> {
     chunk: Option<String>,
+    /// The joined thinking text, fired through `on_reasoning` on the first poll — `None` when the
+    /// body had none or the caller passed no callback.
+    reasoning: Option<String>,
     /// `Some` when the manifest declares a non-stream `toolCalls` path — the selection, or `Null`
     /// when it resolved to nothing. `emit_tool_calls` treats `Null` as an empty list, which is what
     /// the source's `[undefined]` amounts to.
@@ -910,6 +915,7 @@ struct UnaryTextStream<'a> {
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     done: bool,
 }
 
@@ -918,6 +924,13 @@ impl Stream for UnaryTextStream<'_> {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // Reasoning before the answer, on the same poll that yields the text — the order the model
+        // produced it in. `take()` makes it once-only.
+        if let Some(reasoning) = this.reasoning.take() {
+            if let Some(cb) = this.on_reasoning.as_deref_mut() {
+                cb(&reasoning);
+            }
+        }
         if let Some(text) = this.chunk.take() {
             return Poll::Ready(Some(Ok(text)));
         }
@@ -1010,12 +1023,27 @@ fn unary_text<'a>(
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError> {
     let json: Value = serde_json::from_str(body).map_err(|_| AttemptError::Transport)?;
 
     // `if (typeof text === "string") yield text;` — a miss yields nothing, and an empty string *is*
     // yielded, because the guard is on the type and not on truthiness.
     let chunk = select_text(&json, &ep.response_map.text).map_err(|_| AttemptError::Transport)?;
+
+    // The reasoning, when the reply was mostly reasoning: the **thinking** blocks of the same mixed
+    // array `select_text` reads past (`thinking_text`). Fired on the stream's first poll — the
+    // source fires inside its generator body, so a stream that is never drained reports nothing.
+    let reasoning = match on_reasoning.is_some() {
+        true => {
+            let joined = select_one(&json, &ep.response_map.text)
+                .map_err(|_| AttemptError::Transport)?
+                .map(thinking_text)
+                .unwrap_or_default();
+            (!joined.is_empty()).then_some(joined)
+        }
+        false => None,
+    };
 
     // The selector runs whenever the manifest declares the path, even with no callback — it is an
     // argument, so it is evaluated before `emitToolCalls` can return early.
@@ -1057,6 +1085,7 @@ fn unary_text<'a>(
 
     Ok(Box::pin(UnaryTextStream {
         chunk,
+        reasoning,
         tool_calls,
         tool_call_shape: ep.response_map.tool_call_shape.clone(),
         usage,
@@ -1064,8 +1093,47 @@ fn unary_text<'a>(
         on_tool_call,
         on_usage,
         on_finish,
+        on_reasoning,
         done: false,
     }))
+}
+
+/// The reasoning text one SSE payload carried, or `None` — the Rust mirror of `reasoningDeltaOf`
+/// (`stream-shape.ts`), keyed on the payload's own field names rather than a manifest selector.
+///
+/// Only a non-empty string counts: some gateways send `thinking: ""` on the block announcement and
+/// some send an object (OpenRouter's `reasoning_details`), and neither is text to forward.
+fn reasoning_delta(json: &Value) -> Option<&str> {
+    let delta = json
+        .get("delta")
+        .filter(|d| d.is_object())
+        .or_else(|| json.pointer("/choices/0/delta").filter(|d| d.is_object()))?;
+    for key in ["thinking", "reasoning_content", "reasoning"] {
+        if let Some(s) = delta.get(key).and_then(Value::as_str) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// The **thinking** blocks of a mixed block array, joined — the unary counterpart of
+/// `reasoning_delta`. `select_text` is careful to read *past* a thinking block so the answer behind
+/// it still arrives; this is what the thinking itself becomes instead of being dropped. A
+/// `redacted_thinking` block carries no text (the provider withheld it), so it contributes nothing.
+fn thinking_text(selected: &Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(blocks) = selected.as_array() {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                if let Some(s) = block.get("thinking").and_then(Value::as_str) {
+                    parts.push(s);
+                }
+            }
+        }
+    }
+    parts.join("")
 }
 
 /// A usage block, or `None` when it carried nothing readable.
@@ -1181,6 +1249,7 @@ struct TextStream<'a> {
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// Noted per `data:` event whether or not the manifest can read it — the engine reads this
     /// only when the stream delivered nothing, which is the one case where the count and a sample
     /// of the first event are the difference between two findings with different owners.
@@ -1279,6 +1348,17 @@ impl TextStream<'_> {
         let Ok(json) = serde_json::from_str::<Value>(payload) else {
             return LineStep::Continue;
         };
+
+        // ---- reasoning, before the manifest decides anything. Read from the payload's own field
+        // names (`reasoning_delta`), so a provider whose persisted manifest predates the channel
+        // still yields its reasoning — the same call the TypeScript side made, for the same
+        // reason. Fired through its own channel and deliberately NOT yielded as a chunk: reasoning
+        // is not the answer, and it must not mark the attempt served (see `TextArgs::on_reasoning`).
+        if let Some(text) = reasoning_delta(&json) {
+            if let Some(cb) = self.on_reasoning.as_deref_mut() {
+                cb(text);
+            }
+        }
 
         // ---- errorMap: keys only, and the test is JavaScript truthiness, not presence.
         for path in &self.plan.error_paths {
@@ -1790,6 +1870,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
             // provider — reports no cache fields either way (measured 2026-09-28).
             prompt_cache_enabled: false,
@@ -1810,6 +1891,78 @@ mod tests {
     /// A `data:` line carrying one OpenAI-shaped delta.
     fn delta_line(text: &str) -> String {
         format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}")
+    }
+
+    // ------------------------------------------- the reasoning channel
+
+    /// A reasoning delta reaches its own channel and never the chunk stream — the OpenAI-compatible
+    /// `reasoning_content` spelling, detected by field name with no manifest selector involved.
+    #[tokio::test]
+    async fn a_reasoning_delta_reaches_its_own_channel_not_the_chunk_stream() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line("answer"),
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking a\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" bit more\"}}]}",
+            "data: [DONE]",
+        ])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("gpt-4o");
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "answer", "reasoning never rides the chunk stream");
+        assert_eq!(reasoning.join(""), "thinking a bit more");
+    }
+
+    /// The Anthropic spelling (`delta.thinking`). The empty-string announcement is skipped — it is
+    /// the block opener, not text — and the text delta behind it still yields.
+    #[tokio::test]
+    async fn the_anthropic_thinking_spelling_reaches_the_same_channel() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            "data: {\"delta\":{\"thinking\":\"\",\"type\":\"thinking_delta\"}}",
+            "data: {\"delta\":{\"thinking\":\"the plan:\",\"type\":\"thinking_delta\"}}",
+            "data: {\"delta\":{\"text\":\"done\",\"type\":\"text_delta\"}}",
+            "data: {\"type\":\"message_stop\"}",
+        ])]);
+        let interp = interpreter(&anthropic_manifest(), http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("claude-x");
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "done");
+        assert_eq!(reasoning.join(""), "the plan:");
+    }
+
+    /// A unary reply's thinking blocks join onto the reasoning channel — the counterpart of
+    /// `select_text` reading past them (`joinThinkingParts` on the TypeScript side). The fixture's
+    /// selector is patched to the production mixed-array read (`$.content`, as the builtin has
+    /// carried since 2026-09-29): the fixture's own `$.content[0].text` is the pre-fix shape that
+    /// a thinking-first reply resolves to nothing.
+    #[tokio::test]
+    async fn a_unary_reply_s_thinking_blocks_reach_the_reasoning_channel() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"thinking","thinking":"the note"},{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "ok");
+        assert_eq!(reasoning.join(""), "the note");
     }
 
     /* ------------------------------------------- tool_choice: the dialect's own shape */
@@ -1940,6 +2093,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             prompt_cache_enabled: false,
             observation: None,
         };

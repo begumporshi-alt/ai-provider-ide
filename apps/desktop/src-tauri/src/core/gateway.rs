@@ -409,6 +409,16 @@ pub struct BridgeRequest {
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
     Delta(String),
+    /// The model's **reasoning**, as it streams — upstream-gated pass-through on its own channel,
+    /// never folded into `Delta`: reasoning is the model's notes, and a client that wanted it
+    /// rendered as the answer would be quoting the notes as the reply.
+    ///
+    /// The OpenAI-compatible convention (DeepSeek-origin, normalised by OpenRouter and LiteLLM) is
+    /// `delta.reasoning_content` in a stream and `message.reasoning_content` off it; only dialects
+    /// whose clients read that field forward it. Emitted as it arrives, deliberately bypassing
+    /// `ProseGate` — the gate holds *prose* back across tool-loop turns, and reasoning is not part
+    /// of any turn's answer.
+    Reasoning(String),
     /// Client-declared tool calls to hand back untouched (pass-through mode only).
     ToolCalls(Value),
     Result(Value),

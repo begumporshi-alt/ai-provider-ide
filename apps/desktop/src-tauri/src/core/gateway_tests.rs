@@ -87,6 +87,8 @@ struct SynthBridge {
     slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
     /// Make the synthetic model answer with tool calls instead of a plain finish.
     tool_calls: AtomicBool,
+    /// Prepend a reasoning message — the upstream-gated pass-through channel.
+    reasoning: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
     empty_delta: AtomicBool,
     /// Answer nothing at all: stand in for a worker webview whose JS the OS suspended
@@ -114,6 +116,7 @@ impl SynthBridge {
             cancels: AtomicUsize::new(0),
             slow: AtomicUsize::new(0),
             tool_calls: AtomicBool::new(false),
+            reasoning: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             silent: AtomicBool::new(false),
             fail_status: AtomicUsize::new(0),
@@ -143,6 +146,9 @@ impl SynthBridge {
     }
     fn answer_with_tool_calls(&self, on: bool) {
         self.tool_calls.store(on, Ordering::Relaxed);
+    }
+    fn answer_with_reasoning(&self, on: bool) {
+        self.reasoning.store(on, Ordering::Relaxed);
     }
     fn answer_with_empty_delta(&self, on: bool) {
         self.empty_delta.store(on, Ordering::Relaxed);
@@ -178,6 +184,7 @@ impl Bridge for SynthBridge {
         // and one fewer step to forget.
         let slow = self.slow.load(Ordering::Relaxed);
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
+        let with_reasoning = self.reasoning.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let fail = self.fail_status.load(Ordering::Relaxed);
         let fail_retry_after = self.fail_retry_after.load(Ordering::Relaxed);
@@ -201,6 +208,11 @@ impl Bridge for SynthBridge {
                 "chat" => {
                     if with_empty {
                         replies.reply(req.request_id, BridgeMsg::Delta(String::new()));
+                    }
+                    if with_reasoning {
+                        // Before the prose — the order a reasoning model produces them in.
+                        replies
+                            .reply(req.request_id, BridgeMsg::Reasoning("Working it out".into()));
                     }
                     replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                     replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
@@ -319,6 +331,61 @@ async fn criterion8_stream_with_master_key() {
     assert!(acc.contains("Hel"));
     assert!(acc.contains("lo"));
     assert!(acc.contains("finish_reason") && acc.contains("stop"), "stream must terminate: {acc}");
+}
+
+/// The OpenAI-compatible convention (DeepSeek-origin; OpenRouter and LiteLLM normalise to it):
+/// reasoning rides `delta.reasoning_content`, never `delta.content`, and the role opens the
+/// *message* on whichever frame arrives first — reasoning usually precedes the answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn reasoning_streams_as_delta_reasoning_content_with_the_role_on_the_first_frame() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_reasoning(true);
+
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("finish_reason") {
+            break;
+        }
+    }
+    assert!(acc.contains("\"reasoning_content\":\"Working it out\""), "{acc}");
+    // The first frame carries the role, whichever channel opens the message.
+    let first_frame = acc.split("\n\n").find(|f| f.contains("delta")).unwrap_or("");
+    assert!(first_frame.contains("\"role\":\"assistant\""), "first frame: {first_frame}");
+    // And the reasoning never leaked into the answer channel.
+    assert!(acc.contains("\"content\":\"Hel\""), "the answer is unchanged: {acc}");
+    assert!(!acc.contains("\"content\":\"Working"), "reasoning is not content: {acc}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_stream_reasoning_lands_on_message_reasoning_content() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_reasoning(true);
+
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "Hello");
+    assert_eq!(body["choices"][0]["message"]["reasoning_content"], "Working it out");
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -167,6 +167,22 @@ pub struct TextArgs<'a> {
     /// app's truncation warning tests `reason == "length"`, and the gateway writes the value onto an
     /// OpenAI-shaped `finish_reason`. See `dialect_shaping::translate_finish_reason`.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// The model's **reasoning**, as it streams — its own channel, never mixed into the chunk
+    /// stream, because reasoning is the model's notes and a consumer that rendered it as prose
+    /// would be quoting the notes as the answer.
+    ///
+    /// Detected by the payload's **own field names** (`delta.thinking` for Anthropic,
+    /// `delta.reasoning_content` for the OpenAI-compatible gateways, `delta.reasoning` for the
+    /// third spelling), not by a manifest selector: a provider wired up before this existed has no
+    /// selector to add, and the TypeScript side made the same call for the same reason. `None` (the
+    /// default) means the caller does not want reasoning and the adapter discards it — a reasoning
+    /// stream still produces zero chunks, so a caller that ignores this channel sees exactly what
+    /// it saw before.
+    ///
+    /// **Reasoning is not delivered output.** Firing this must not mark the attempt served, end
+    /// failover, or change any disposition — the `NO_OUTPUT` classification for a stream that
+    /// reasoned and never answered depends on that staying true.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// Mark the last system message block with `cache_control: {"type":"ephemeral"}` on egress.
     /// Off by default; a provider without prefix caching will ignore or reject the field, so
     /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
@@ -929,6 +945,7 @@ mod tests {
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             prompt_cache_enabled: false,
             observation: None,
         }
