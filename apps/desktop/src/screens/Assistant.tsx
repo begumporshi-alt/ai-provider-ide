@@ -1843,16 +1843,25 @@ function Chat({
     stickToBottom();
   }, [msgs, streamedText, agentItems, stickToBottom]);
 
-  // P7: context window for the chosen model — looked up from the catalog. A qualified id
-  // `slug/native` needs to resolve the provider to find the catalog row; a bare id scans all carriers.
+  // P7: context window for the chosen model. Same rule as the request path
+  // (`model-router.ts`): the narrowest window published by *any* carrier of this model, because
+  // failover may serve the request from any of them. Two rules for one model is how the meter and
+  // the router end up disagreeing about the same conversation.
+  //
+  // `null` when no carrier published a window. The catalog is the only source that knows, and the
+  // conservative default the router falls back to is a safety choice for the *request*, not a fact
+  // about the model — showing it here would state a capacity nothing ever claimed. Measured: 58 of
+  // 82 catalog rows carry no window, and every one of them read as "8,192" in this meter while the
+  // router was separately planning against 200k for the same model.
   const modelWindow = useMemo(() => {
-    if (!chosen) return DEFAULT_CONTEXT_WINDOW;
-    const rows = catalog.all();
-    const nativeId = chosen.includes("/") ? chosen.split("/")[1]! : chosen;
-    const matching = rows.find((m) => m.nativeId === nativeId && m.modality === "text");
-    return typeof matching?.contextWindow === "number" && matching.contextWindow > 0
-      ? matching.contextWindow
-      : DEFAULT_CONTEXT_WINDOW;
+    if (!chosen) return null;
+    const nativeId = chosen.includes("/") ? chosen.split("/").slice(1).join("/") : chosen;
+    const windows = catalog
+      .all()
+      .filter((m) => m.nativeId === nativeId && m.modality === "text")
+      .map((m) => m.contextWindow)
+      .filter((w): w is number => typeof w === "number" && w > 0);
+    return windows.length > 0 ? Math.min(...windows) : null;
   }, [chosen, tick]);
   // P7: estimated prompt tokens for the NEXT send — the system turn the mode implies, the replayed
   // history, and the draft in the composer. The system turn is included because it is not small:
@@ -1874,8 +1883,11 @@ function Chat({
     ];
     return estimateTokens(all);
   }, [msgs, draftText, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
-  // P7: context meter — fraction of the window consumed.
-  const contextUsedRatio = Math.min(1, currentPromptTokens / modelWindow);
+  // P7: context meter — fraction of the window consumed, or `null` when no carrier published a
+  // window. A bar scaled to a number the catalog never claimed would be the same invention in a
+  // different shape.
+  const contextUsedRatio =
+    modelWindow === null ? null : Math.min(1, currentPromptTokens / modelWindow);
   // Join each tool result to the call that declared it, so the transcript can render an
   // `edit_file`/`write_file` as the change itself. The arguments live on the assistant turn, not
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
@@ -2659,7 +2671,10 @@ function Chat({
   const compactNow = useCallback(async () => {
     if (busy || msgs.length === 0) return;
     setNotice(null);
-    const budget = Math.max(256, Math.floor(modelWindow * 0.75));
+    // Compaction sizes itself off the conservative default when no window is published. That is the
+    // *request* path, where under-sending is the safe direction — unlike the meter, which must not
+    // present the same default as the model's capacity.
+    const budget = Math.max(256, Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75));
     try {
       const result = await compressWithSummary(replayHistory(msgs), budget, createSummarizer(chosen));
       if (!result.compressed) {
@@ -3194,12 +3209,16 @@ function Chat({
           ✎ system prompt
         </button>
         {/* Context meter. Position and colour together, because the colour alone is a claim the
-            user cannot check: the numbers say how full the window is and the bar makes it skimmable. */}
+            user cannot check: the numbers say how full the window is and the bar makes it skimmable.
+            With no published window there is no share to state, so it says so instead of inventing
+            a denominator. */}
         <span
           className="ml-auto flex items-center gap-1.5"
           title={
-            `${currentPromptTokens.toLocaleString()} estimated prompt tokens of ${modelWindow.toLocaleString()} ` +
-            `window for ${chosen || "the default model"}` +
+            `${currentPromptTokens.toLocaleString()} estimated prompt tokens` +
+            (modelWindow === null
+              ? ` — no context window is published for ${chosen || "the default model"}, so the share used cannot be shown`
+              : ` of ${modelWindow.toLocaleString()} window for ${chosen || "the default model"}`) +
             // `?? 0` is not defensive noise: `UsageTokens` declares both counts as required, but the
             // interpreter passes whatever the provider's usage block actually had (`usageOf` returns
             // `undefined` for a missing field), so a provider that omits one reaches here as
@@ -3214,15 +3233,25 @@ function Chat({
               className="block h-full"
               style={{
                 // A sliver for any non-zero share, so "nearly empty" is visible at all; a true zero
-                // stays zero rather than claiming a percent that is not there.
-                width: currentPromptTokens === 0 ? "0%" : `${Math.max(1, Math.round(contextUsedRatio * 100))}%`,
+                // stays zero rather than claiming a percent that is not there — and an unpublished
+                // window fills nothing, because there is no percent to draw.
+                width:
+                  contextUsedRatio === null || currentPromptTokens === 0
+                    ? "0%"
+                    : `${Math.max(1, Math.round(contextUsedRatio * 100))}%`,
                 background:
-                  contextUsedRatio > 0.9 ? "var(--danger)" : contextUsedRatio > 0.7 ? "var(--warn)" : "var(--success)",
+                  contextUsedRatio === null
+                    ? "var(--text-faint)"
+                    : contextUsedRatio > 0.9
+                      ? "var(--danger)"
+                      : contextUsedRatio > 0.7
+                        ? "var(--warn)"
+                        : "var(--success)",
               }}
             />
           </span>
           <span className="mono">
-            {formatTokens(currentPromptTokens)} / {formatTokens(modelWindow)}
+            {formatTokens(currentPromptTokens)} / {modelWindow === null ? "unknown" : formatTokens(modelWindow)}
           </span>
         </span>
         {/* Session totals from the ledger. "Σ" and the tooltip say *this app's whole ledger*, not
