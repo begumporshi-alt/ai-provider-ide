@@ -287,13 +287,21 @@ fn meta_json(meta: &Option<String>, key: &str) -> Option<String> {
 /// A session's worth of preview text: the first user message, truncated. Falls back to the
 /// first message of any role, then to nothing — a session of only tool calls still deserves
 /// a row in the index.
+///
+/// The cap is in **bytes** — what a `String` and a `TEXT` column both measure — but a
+/// byte-indexed slice landing mid-UTF-8 would panic, so the cut walks back to a boundary first.
+/// A stored message already clipped to `…` puts that three-byte char exactly across the cap.
 fn preview_of(label: &str) -> String {
     let flat = label.split_whitespace().collect::<Vec<_>>().join(" ");
-    if flat.len() <= 120 {
-        flat
-    } else {
-        format!("{}…", &flat[..120])
+    const CAP: usize = 120;
+    if flat.len() <= CAP {
+        return flat;
     }
+    let mut cut = CAP;
+    while !flat.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &flat[..cut])
 }
 
 /// The session index, newest first. Sessions with no `session_id` are excluded rather than
@@ -751,6 +759,26 @@ mod context_graph_tests {
         assert_eq!(rows[0].tool_calls, 2);
         assert_eq!(rows[0].model.as_deref(), Some("a/b"));
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Regression: the recorder clips a preview to 119 chars + `…`, which puts that three-byte char
+    /// exactly across the 120-byte cap. The old byte-indexed slice panicked there, and with
+    /// `panic = "abort"` in the release profile that took the whole app down on every history load.
+    #[test]
+    fn a_preview_cut_inside_a_multibyte_char_does_not_panic() {
+        let clipped = format!("{}…", "a".repeat(119));
+        assert_eq!(clipped.len(), 122);
+        assert!(!clipped.is_char_boundary(120), "byte 120 lands inside `…`");
+        assert_eq!(preview_of(&clipped), clipped, "the cut walks back onto the boundary");
+
+        // A four-byte char straddling the cap walks back three bytes, not zero.
+        let emoji = format!("a{}", "😀".repeat(31));
+        assert!(!emoji.is_char_boundary(120));
+        assert_eq!(preview_of(&emoji).len(), 120);
+
+        // Short labels, and labels exactly at the cap, are returned untouched.
+        assert_eq!(preview_of("hi"), "hi");
+        assert_eq!(preview_of(&"a".repeat(120)), "a".repeat(120));
     }
 
     #[test]
