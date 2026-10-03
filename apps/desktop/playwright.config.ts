@@ -23,7 +23,12 @@ export default defineConfig({
   // failure here is real and should be seen at once.
   retries: process.env.CI ? 2 : 0,
   timeout: 120_000, // the wizard runs real probes + AI rounds + a QuickJS gate; allow headroom
-  expect: { timeout: 30_000 },
+  // CI's assertion budget is doubled to match the runner, not the app: the full suite takes
+  // 3.0 minutes on an M-series dev machine and 7.4 minutes on the hosted macOS runner (measured
+  // 2026-10-03, same commits), a ~2.5× slowdown that surfaced as a different ~30 s spec stall in
+  // almost every run. The 30 s budget was calibrated on the dev machine; on the runner it failed
+  // healthy interactions. Retries above catch what even this does not.
+  expect: { timeout: process.env.CI ? 60_000 : 30_000 },
   reporter: process.env.CI ? "list" : [["list"], ["html", { open: "never", outputFolder: "web-test/.report" }]],
 
   use: {
