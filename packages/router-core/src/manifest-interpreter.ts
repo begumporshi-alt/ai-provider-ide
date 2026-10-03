@@ -30,15 +30,50 @@ function toolPartTemplates(
 
 /**
  * One budget table for every dialect that thinks in **tokens** — Anthropic's `budget_tokens` and
- * Gemini's `thinkingBudget` — so the three effort levels mean the same thing everywhere. Anthropic
- * additionally requires `1024 <= budget_tokens < max_tokens`, so the budget is clamped under the
- * ceiling this request actually carries (floored at the API minimum) rather than trusted.
+ * Gemini's `thinkingBudget` — so the three effort levels mean the same thing everywhere. The
+ * ceiling that table is clamped under is `thinkingBudget`'s business, not this table's.
  */
 const REASONING_BUDGETS: Record<Exclude<import("./ports.js").ReasoningEffort, "off">, number> = {
   low: 1024,
   medium: 4096,
   high: 8192,
 };
+
+/**
+ * The share of the output cap reserved for the answer itself.
+ *
+ * The provider's rule is only `budget_tokens < max_tokens`, so reserving the API's 1024-token
+ * minimum satisfies it while leaving the answer almost nothing — and a prompt that reasons hard then
+ * spends the entire cap thinking and never opens a text block. Measured on a real turn at the
+ * manifest's 8192 default: 8197 `thinking_delta` events, `stop_reason: max_tokens`, zero text, and
+ * the Assistant rendered nothing at all. The same prompt at a 64000 cap answered, using 13211 tokens
+ * for thinking *and* answer together.
+ *
+ * This allowance only bites when the cap is tight: a generous cap leaves the requested level
+ * untouched, so a configuration already known to work keeps behaving identically.
+ */
+export const MIN_ANSWER_TOKENS = 2048;
+
+/**
+ * The thinking budget for a request, kept inside the cap that request carries.
+ *
+ * Returns 0 — "do not ask for thinking" — for a cap too small to hold a legal budget and the
+ * answer's allowance both. A budget the provider will refuse is worse than none.
+ *
+ * `thinking_budget` (`core/interpreter.rs`) is the Rust mirror of this; the two move together.
+ */
+export function thinkingBudget(
+  effort: Exclude<import("./ports.js").ReasoningEffort, "off">,
+  maxTokens: number | undefined,
+): number {
+  const wanted = Math.max(1024, REASONING_BUDGETS[effort]);
+  if (typeof maxTokens !== "number") return wanted;
+  if (maxTokens <= 1024) return 0;
+  // The answer's allowance comes out first, then the API minimum is the floor. `budget_tokens <
+  // max_tokens` holds at every cap above 1024: both `maxTokens - MIN_ANSWER_TOKENS` and 1024 are
+  // below the cap, so their maximum is too.
+  return Math.max(1024, Math.min(wanted, maxTokens - MIN_ANSWER_TOKENS));
+}
 
 /**
  * The request-template values for the caller's thinking knob, keyed for the optional placeholders
@@ -51,19 +86,18 @@ const REASONING_BUDGETS: Record<Exclude<import("./ports.js").ReasoningEffort, "o
  * request where the dialect allows one (Anthropic `thinking: {type:"disabled"}`, Gemini budget 0)
  * and an omission where it does not (the OpenAI-compatible vocabulary has no portable off; the
  * provider's default may still think — measured on agentrouter, whose models think by default,
- * which is precisely why the Anthropic off switch matters).
+ * which is precisely why the Anthropic off switch matters). A cap too small to hold thinking plus an
+ * answer renders the same way as `off`, for the same reason: the alternative is a request the
+ * provider refuses, or a turn that produces no text.
  */
 export function reasoningValues(
   effort: import("./ports.js").ReasoningEffort | undefined,
   maxTokens: number | undefined,
 ): Record<string, unknown> {
   if (!effort) return {};
-  if (effort === "off") {
+  const budget = effort === "off" ? 0 : thinkingBudget(effort, maxTokens);
+  if (budget === 0) {
     return { thinking: { type: "disabled" }, thinkingConfig: { thinkingBudget: 0 } };
-  }
-  let budget = REASONING_BUDGETS[effort];
-  if (typeof maxTokens === "number") {
-    budget = Math.max(1024, Math.min(budget, maxTokens - 1024));
   }
   return {
     thinking: { type: "enabled", budget_tokens: budget },

@@ -471,16 +471,34 @@ describe("the caller's thinking knob (`reasoningValues`)", () => {
   });
 
   it("clamps the thinking budget under the request's output ceiling, per Anthropic's rule", async () => {
-    // Anthropic requires `1024 <= budget_tokens < max_tokens`. At the manifest's 8192 default a
-    // "high" 8192 budget would be rejected whole — so it lands at 7168; a tiny ceiling floors the
-    // budget at the API minimum rather than sending something illegal.
+    // Anthropic requires `1024 <= budget_tokens < max_tokens`, and the answer needs room inside the
+    // same cap — thinking runs first, so a budget that leaves the answer nothing is how a turn ends
+    // with zero text. At the manifest's 8192 default a "high" 8192 budget lands at 6144, which
+    // reserves 2048 for the answer; a tiny ceiling floors the budget at the API minimum instead of
+    // sending something illegal.
     const high = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(high.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high" });
-    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 7168 });
+    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 6144 });
 
     const tiny = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
     await drain(tiny.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 1500 });
     expect(tiny.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+
+    // A cap that cannot hold thinking and an answer both asks for none at all, rather than a budget
+    // the provider refuses — the regression for the turn that spent its whole cap thinking, "high"
+    // requested or not, and rendered nothing.
+    const starved = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(starved.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 1024 });
+    expect(starved.lastBody()!.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("a generous ceiling leaves the requested level alone", async () => {
+    // The allowance is a reserve, not a tax: at a cap with room to spare the level's own budget is
+    // what reaches the wire. This is the configuration the reasoning fix was measured against —
+    // 64000 answered using 13211 tokens — so it must not shift.
+    const high = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(high.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 64000 });
+    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 8192 });
   });
 
   it("an unset knob puts none of the fields on the wire", async () => {

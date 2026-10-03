@@ -1146,6 +1146,38 @@ fn thinking_text(selected: &Value) -> String {
     parts.join("")
 }
 
+/// The share of the output cap reserved for the answer itself.
+///
+/// The provider's rule is only `budget_tokens < max_tokens`, so reserving the API's 1024-token
+/// minimum satisfies it while leaving the answer almost nothing — and a prompt that reasons hard
+/// then spends the entire cap thinking and never opens a text block. Measured on a real turn at the
+/// default 8192 cap: 8197 `thinking_delta` events, `stop_reason: max_tokens`, zero text, and the
+/// Assistant rendered nothing at all. The same prompt at a 64000 cap answered, using 13211 tokens
+/// for thinking *and* answer together.
+///
+/// This allowance only bites when the cap is tight. A generous cap leaves the requested level
+/// untouched, so a configuration already known to work keeps behaving identically.
+const MIN_ANSWER_TOKENS: u64 = 2048;
+
+/// The thinking budget for a request, kept inside the cap that request carries.
+///
+/// Returns 0 — "do not ask for thinking" — for `Off`, and for a cap too small to hold a legal
+/// budget and the answer's allowance both. Sending a budget the provider will refuse is worse than
+/// sending none.
+fn thinking_budget(effort: ReasoningEffort, max_tokens: Option<u64>) -> u64 {
+    // `Off` carries no budget at all, and it is the one level the floors below must never raise.
+    let Some(wanted) = effort.budget_tokens() else { return 0 };
+    let wanted = wanted.max(1024);
+    let Some(cap) = max_tokens else { return wanted };
+    if cap <= 1024 {
+        return 0;
+    }
+    // The answer's allowance comes out first, then the API minimum is the floor. `budget_tokens <
+    // max_tokens` holds at every cap above 1024: both `cap - MIN_ANSWER_TOKENS` and 1024 are below
+    // `cap`, so their maximum is too.
+    wanted.min(cap.saturating_sub(MIN_ANSWER_TOKENS)).max(1024)
+}
+
 /// The request-template values for the caller's thinking knob — the Rust mirror of
 /// `reasoningValues` (`manifest-interpreter.ts`), keyed for the optional placeholders the builtin
 /// dialects declare: Anthropic `{{thinking?}}`, the OpenAI-compatible dialect `{{reasoningEffort?}}`,
@@ -1155,34 +1187,24 @@ fn reasoning_values(
     effort: ReasoningEffort,
     max_tokens: Option<u64>,
 ) -> Vec<(&'static str, Value)> {
-    match effort {
-        ReasoningEffort::Off => vec![
+    let budget = thinking_budget(effort, max_tokens);
+    if budget == 0 {
+        return vec![
             (
                 "thinking",
                 serde_json::json!({ "type": "disabled" }),
             ),
             ("thinkingConfig", serde_json::json!({ "thinkingBudget": 0 })),
-        ],
-        level => {
-            // One budget table for every dialect that thinks in tokens (see
-            // `ReasoningEffort::budget_tokens`). Anthropic requires `1024 <= budget_tokens <
-            // max_tokens`, so the budget is clamped under the ceiling this request carries —
-            // floored at the API minimum, never above it.
-            let budget = level
-                .budget_tokens()
-                .unwrap_or(1024)
-                .min(max_tokens.map_or(u64::MAX, |mt| mt.saturating_sub(1024)))
-                .max(1024);
-            vec![
-                (
-                    "thinking",
-                    serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
-                ),
-                ("reasoningEffort", serde_json::json!(level.as_str())),
-                ("thinkingConfig", serde_json::json!({ "thinkingBudget": budget })),
-            ]
-        }
+        ];
     }
+    vec![
+        (
+            "thinking",
+            serde_json::json!({ "type": "enabled", "budget_tokens": budget }),
+        ),
+        ("reasoningEffort", serde_json::json!(effort.as_str())),
+        ("thinkingConfig", serde_json::json!({ "thinkingBudget": budget })),
+    ]
 }
 
 /// A usage block, or `None` when it carried nothing readable.
@@ -2078,8 +2100,8 @@ mod tests {
         let body: Value = serde_json::from_str(&high.only_request().body.as_deref().unwrap()).unwrap();
         assert_eq!(
             body["thinking"],
-            json!({ "type": "enabled", "budget_tokens": 7168 }),
-            "8192 clamped under the fixture's 8192-token ceiling"
+            json!({ "type": "enabled", "budget_tokens": 6144 }),
+            "8192 clamped under the fixture's 8192-token ceiling, keeping the answer's allowance"
         );
 
         let openai = FakeHttp::new(vec![Scripted::text(
@@ -3677,6 +3699,69 @@ mod tests {
         assert_eq!(
             anthropic.capabilities(),
             crate::core::manifest_view::Capabilities { text: true, image: false }
+        );
+    }
+
+    /// The arithmetic that decides whether an answer is possible at all: thinking must not be able
+    /// to consume the whole cap. Regression for the turn that spent 8192 tokens thinking, opened no
+    /// text block, and left the Assistant rendering nothing.
+    #[test]
+    fn thinking_never_consumes_the_answer_s_allowance() {
+        let (low, medium, high) =
+            (ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High);
+
+        // The failing configuration: a hard prompt, High thinking, the built-in 8192 cap. It has to
+        // leave a real answer allowance rather than the API's 1024-token minimum.
+        assert_eq!(thinking_budget(high, Some(8192)), 8192 - MIN_ANSWER_TOKENS);
+
+        // A generous cap leaves the requested level alone, so the configuration the merged fix was
+        // measured against — 64000, which answered using 13211 tokens — behaves exactly as before.
+        assert_eq!(thinking_budget(high, Some(64_000)), 8192);
+        assert_eq!(thinking_budget(medium, Some(64_000)), 4096);
+        assert_eq!(thinking_budget(low, Some(64_000)), 1024);
+
+        // No cap: the level's own budget, unchanged.
+        assert_eq!(thinking_budget(high, None), 8192);
+
+        // `Off` never gets a budget back, whatever the cap.
+        assert_eq!(thinking_budget(ReasoningEffort::Off, Some(64_000)), 0);
+        assert_eq!(thinking_budget(ReasoningEffort::Off, None), 0);
+
+        // A cap that cannot hold a legal budget and the answer both yields none, rather than one
+        // the provider would refuse.
+        assert_eq!(thinking_budget(high, Some(1024)), 0);
+        assert_eq!(thinking_budget(high, Some(500)), 0);
+
+        // `1024 <= budget_tokens < max_tokens`, at every cap that permits thinking at all. The old
+        // clamp returned `max_tokens` itself for a small cap — the one value the API rejects.
+        for cap in [1025u64, 1500, 2048, 3072, 8192, 100_000] {
+            for level in [low, medium, high] {
+                let budget = thinking_budget(level, Some(cap));
+                assert!(budget >= 1024, "{level:?} at {cap}: {budget} is under the API minimum");
+                assert!(budget < cap, "{level:?} at {cap}: {budget} must stay under the cap");
+            }
+        }
+    }
+
+    /// The allowance has to reach the wire. A budget computed and then not rendered would fix
+    /// nothing, and `reasoning_values` is the only path the knob takes to a request.
+    #[test]
+    fn the_rendered_thinking_block_carries_the_reduced_budget() {
+        let blocks = reasoning_values(ReasoningEffort::High, Some(8192));
+        let thinking = blocks
+            .iter()
+            .find(|(key, _)| *key == "thinking")
+            .map(|(_, value)| value)
+            .expect("High renders a thinking block");
+        assert_eq!(thinking["budget_tokens"], json!(8192 - MIN_ANSWER_TOKENS));
+
+        // A starved cap asks for no thinking at all, rather than an illegal budget.
+        let disabled = reasoning_values(ReasoningEffort::High, Some(1024));
+        assert!(
+            disabled
+                .iter()
+                .any(|(key, value)| *key == "thinking" && value["type"] == json!("disabled")),
+            "a cap that cannot hold thinking must render it disabled: {disabled:?}"
         );
     }
 
