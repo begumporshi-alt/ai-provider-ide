@@ -117,6 +117,8 @@ fn openai_text(extra: &OpenAiExtras) -> Value {
             "model": "{{model}}",
             "messages": "{{messages}}",
             "stream": "{{stream}}",
+            // The caller's thinking knob (see `reasoning_values`): omitted when unset.
+            "reasoning_effort": "{{reasoningEffort?}}",
             "max_tokens": "{{maxTokens?}}",
             "temperature": "{{temperature?}}",
             "tools": "{{tools?}}",
@@ -213,6 +215,9 @@ pub fn anthropic_compat(base_url: &str) -> Value {
                     "system": "{{system?}}",
                     "stream": "{{stream}}",
                     "max_tokens": "{{maxTokens}}",
+                    // The caller's thinking knob: `{type:"disabled"}` for off — the one portable
+                    // off switch in the three dialects — or enabled with a clamped budget.
+                    "thinking": "{{thinking?}}",
                     "tools": "{{tools?}}",
                     "tool_choice": "{{toolChoice?}}"
                 },
@@ -276,7 +281,16 @@ pub fn anthropic_compat(base_url: &str) -> Value {
                     "refusal": "content_filter"
                 },
                 "responseMap": {
-                    "text": "$.content[0].text",
+                    // **The path is the block ARRAY, not block 0** — the TypeScript template has
+                    // read it this way since `c325784` ("read anthropic text from the block array,
+                    // not block 0"); this is the Rust half arriving late. `content` is a mixed array
+                    // and which block leads is the provider's choice: a reasoning model puts its
+                    // `thinking` block first, so `$.content[0].text` is absent on a perfectly good
+                    // response and the caller received empty text. Measured live 2026-10-02 through
+                    // this template — agentrouter's `deepseek-v4-flash` answers a unary request with
+                    // `[{"type":"thinking",…},{"type":"text","text":"ok"}]`, which the old selector
+                    // read as nothing at all. `select_text` picks the text blocks out of the array.
+                    "text": "$.content",
                     "usage": "$.usage",
                     // Non-stream: `content` is a MIXED array (text blocks + tool_use blocks), and
                     // the jsonpath subset has no filter expressions, so the interpreter filters by
@@ -357,7 +371,8 @@ pub fn gemini_compat(base_url: &str) -> Value {
                     "toolConfig": "{{toolChoice?}}",
                     "generationConfig": {
                         "maxOutputTokens": "{{maxTokens?}}",
-                        "temperature": "{{temperature?}}"
+                        "temperature": "{{temperature?}}",
+                        "thinkingConfig": "{{thinkingConfig?}}"
                     }
                 },
                 // v1.1 dialect shaping (ported 2026-10-01). Mirrors `builtin-templates.ts:281-333`.

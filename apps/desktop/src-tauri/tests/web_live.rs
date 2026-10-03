@@ -43,7 +43,9 @@ fn web_search_serves_real_results() {
     let Ok((backend, hits)) = search else {
         let e = search.unwrap_err();
         if e.contains("bot check") || e.contains("rate limit") {
-            println!("SKIP — the engine is rate-limiting this client right now; not a verification");
+            println!(
+                "SKIP — the engine is rate-limiting this client right now; not a verification"
+            );
             return;
         }
         panic!("live search: {e}");

@@ -409,6 +409,22 @@ pub struct BridgeRequest {
 #[derive(Debug, Clone)]
 pub enum BridgeMsg {
     Delta(String),
+    /// A frame that carries nothing and is not a wire event in any dialect. The bridge sends it
+    /// while `ProseGate` holds a gateway-mode turn's prose: every text chunk is being withheld,
+    /// so without it the first `BridgeMsg` a tool-less client sees lands at end-of-generation —
+    /// and `FIRST_MSG_TIMEOUT` killed any completion that outlived 30 s on the default config.
+    /// Its only job is to disarm that first-message bound; every streaming handler drops it.
+    Liveness,
+    /// The model's **reasoning**, as it streams — upstream-gated pass-through on its own channel,
+    /// never folded into `Delta`: reasoning is the model's notes, and a client that wanted it
+    /// rendered as the answer would be quoting the notes as the reply.
+    ///
+    /// The OpenAI-compatible convention (DeepSeek-origin, normalised by OpenRouter and LiteLLM) is
+    /// `delta.reasoning_content` in a stream and `message.reasoning_content` off it; only dialects
+    /// whose clients read that field forward it. Emitted as it arrives, deliberately bypassing
+    /// `ProseGate` — the gate holds *prose* back across tool-loop turns, and reasoning is not part
+    /// of any turn's answer.
+    Reasoning(String),
     /// Client-declared tool calls to hand back untouched (pass-through mode only).
     ToolCalls(Value),
     Result(Value),
@@ -817,14 +833,8 @@ const MAX_FROZEN_BLOCKS: usize = 256;
 
 /// Gateway-side tools that can change the workspace — or, for `http_request`, send data out of
 /// it. Everything else only reads.
-pub const MUTATING_TOOLS: [&str; 6] = [
-    "write_file",
-    "edit_file",
-    "mkdir",
-    "run_command",
-    "http_request",
-    "apply_patch",
-];
+pub const MUTATING_TOOLS: [&str; 6] =
+    ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
 
 /// Audit H1b: is `tool` permitted on the gateway path? `Some(reason)` = refused.
 ///
@@ -2279,6 +2289,10 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .route("/admin/keys/{id}", delete(admin::key_revoke_h))
         .route("/admin/spend", get(admin::spend_h))
         .route("/admin/spend/cap", post(admin::spend_cap_set_h))
+        // Which sources the answering process was built from, so the app can tell a stale
+        // companion binary from a fresh one. Keyed like its neighbours — `/health` is the one
+        // unauthenticated route and deliberately reports a single bit.
+        .route("/admin/build", get(admin::build_h))
         .route("/admin/providers", get(admin::providers_list_h).post(admin::provider_upsert_h))
         .route("/admin/providers/{id}", delete(admin::provider_delete_h))
         .route("/admin/api-keys", get(admin::api_keys_list_h).post(admin::api_key_upsert_h))

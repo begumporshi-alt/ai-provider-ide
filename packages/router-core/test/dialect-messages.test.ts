@@ -129,10 +129,18 @@ describe("anthropic-compat: system hoist + role remap", () => {
     // Anthropic declares no `contentField`, so plain-string content stays a plain string.
     const assistant = msgs.find((m) => m.role === "assistant")!;
     expect(assistant.content).toBe("Hi there");
-    const result = msgs.find((m) => m.role === "user" && Array.isArray(m.content))!;
-    expect(result.content).toEqual([
-      { type: "tool_result", tool_use_id: "call_123", content: "result of tool call" },
-    ]);
+    // **Flipped 2026-10-02.** This used to pin a `tool_result` block for `MESSAGES`' result, whose
+    // `call_123` no turn in the payload declares. Reproduced against agentrouter.org's Anthropic
+    // route: a `tool_result` addressing a call the request does not contain is refused outright —
+    // `unexpected \`messages.2.content.0: tool_use_id\` found in \`tool_result\` blocks: <id>` — so
+    // that shape 400'd the whole turn, which is the live failure this came from. A block can only
+    // be legal when the call it answers is present, so the result rides as an ordinary user turn
+    // instead and the model still reads the output.
+    expect(wire).not.toContain("tool_result");
+    const result = msgs.find(
+      (m) => m.role === "user" && JSON.stringify(m.content).includes("result of tool call"),
+    )!;
+    expect(result).toBeDefined();
   });
 
   it("surfaces finish_reason from stop_reason via onFinish, in the OpenAI vocabulary", async () => {
@@ -155,6 +163,26 @@ describe("anthropic-compat: system hoist + role remap", () => {
     const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, onFinish: (r) => { finish = r; } });
     expect(finish).toBe("length");
+  });
+
+  it("a caller's output budget overrides the manifest's, which is the lever for a reasoning model", async () => {
+    // `max_tokens` on this dialect covers the model's **reasoning and its answer together**, and
+    // the manifest's own `limits.maxOutputTokens` (8192) is a request-side default, not a property
+    // of the model. Measured 2026-10-02 against `agentrouter.org` (`deepseek-v4-flash`): at 8192 a
+    // hard prompt spent every token thinking and opened no text block at all (`stop_reason:
+    // max_tokens`, `output_tokens: 8192`, zero text); the same prompt at 64000 answered, having
+    // used 13211. So the caller's value MUST win — the composer's "max tokens" field is what makes
+    // such a model usable, and letting the manifest's default override it would silently put the
+    // working lever out of reach.
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, maxTokens: 32000 });
+    expect(lastBody()!.max_tokens).toBe(32000);
+
+    // And with no caller value the manifest's limit is what goes on the wire — the budget the
+    // truncation above happened at.
+    const bare = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(bare.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(bare.lastBody()!.max_tokens).toBe(8192);
   });
 
   it("passes an unnamed reason through raw rather than dropping it", async () => {
@@ -220,6 +248,47 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: (r) => { finish = r; } });
     // `tool_use` maps to OpenAI's `tool_calls`.
     expect(finish).toBe("tool_calls");
+  });
+
+  it("a declared-finish stream that ends without a finish reason fires onFinish(undefined) — the truncation signal", async () => {
+    // The agent loop's truncation retry is built on this distinction: the callback FIRING with
+    // undefined means the provider closed a stream whose manifest declares a finish selector —
+    // measured 2026-10-03 on vyceai/deepseek: prose arrived, the finish reason never did, and the
+    // turn read as a clean success. A callback that never fires (next test) means no selector was
+    // declared and the caller cannot judge.
+    let fired = false;
+    let finish: string | undefined;
+    // One text delta and then [DONE] — the shape a cut-off provider produces.
+    const http = new FakeHttp(() => ({
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+        `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "First, let me check" } })}`,
+        "data: [DONE]",
+      ],
+    }));
+    const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: (r) => { fired = true; finish = r; } });
+    expect(fired).toBe(true);
+    expect(finish).toBeUndefined();
+  });
+
+  it("a manifest that declares no finish selector never fires onFinish", async () => {
+    let fired = false;
+    const tmpl = JSON.parse(JSON.stringify(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1")));
+    delete tmpl.endpoints.generateText.stream.finish;
+    delete tmpl.endpoints.generateText.responseFinish;
+    const http = new FakeHttp(() => ({
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+        `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}`,
+        `data: ${JSON.stringify({ type: "message_stop" })}`,
+      ],
+    }));
+    const interp = new ManifestInterpreter(tmpl, { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: () => { fired = true; } });
+    expect(fired).toBe(false);
   });
 });
 
@@ -374,5 +443,117 @@ describe("tool turns on replay: only a dialect that asks is reshaped", () => {
       { type: "tool_result", tool_use_id: "c1", content: "file a" },
       { type: "tool_result", tool_use_id: "c2", content: "file b" },
     ]);
+  });
+
+  it("anthropic-compat never sends a tool_result whose call the request does not declare", async () => {
+    // The exact 400 the live app hit on 2026-10-02, reproduced against agentrouter.org with a
+    // hand-built body. A result naming a call that is not in the request is refused as
+    //   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: .
+    // — note the EMPTY id list, which is the signature of a missing `tool_call_id`: the shaper used
+    // to fall back to `""` and render the block anyway, so `tool_use_id: ""` went out and the whole
+    // turn was refused. An id that names nothing can never be paired, by any dialect.
+    const orphaned = [
+      { role: "user", content: "read it" },
+      { role: "assistant", content: "Reading." }, // declares no call at all
+      { role: "tool", content: "file a", tool_call_id: "c1" }, // answers a call that is gone
+      { role: "tool", content: "no id was recorded" }, // `tool_call_id` missing entirely
+    ];
+    const { interp, lastBody } = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(interp, { model: "claude-x", messages: orphaned, stream: false });
+
+    const wire = JSON.stringify(lastBody());
+    expect(wire).not.toContain("tool_result");
+    expect(wire).not.toContain('"tool_use_id"');
+    // The output is not discarded along with the block: the role map turns each into an ordinary
+    // user turn, so the model still sees what the tool produced.
+    expect(wire).toContain("file a");
+    expect(wire).toContain("no id was recorded");
+  });
+});
+
+describe("the caller's thinking knob (`reasoningValues`)", () => {
+  it("renders into each dialect's own request field", async () => {
+    // Anthropic: an object with a budget. OpenAI: the level word. Gemini: a nested config. One
+    // value per dialect, from one caller setting — so the three levels mean the same thing
+    // everywhere and the request template is where a dialect's own shape is declared.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "medium" });
+    expect(a.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "medium" });
+    expect(o.lastBody()!.reasoning_effort).toBe("medium");
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "low" });
+    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toEqual({
+      thinkingBudget: 1024,
+    });
+  });
+
+  it("off is a real request on Anthropic and budget 0 on Gemini, an omission on OpenAI", async () => {
+    // Probed 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`): `thinking:{type:"disabled"}`
+    // is answered in a fraction of the all-thinking time — the real fix for a model that would
+    // otherwise spend its entire output budget thinking. The OpenAI-compatible vocabulary has no
+    // portable off, so omitting (the provider's default) is the honest rendering there.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect(a.lastBody()!.thinking).toEqual({ type: "disabled" });
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toEqual({
+      thinkingBudget: 0,
+    });
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
+    expect(o.lastBody()).not.toHaveProperty("reasoning_effort");
+  });
+
+  it("clamps the thinking budget under the request's output ceiling, per Anthropic's rule", async () => {
+    // Anthropic requires `1024 <= budget_tokens < max_tokens`, and the answer needs room inside the
+    // same cap — thinking runs first, so a budget that leaves the answer nothing is how a turn ends
+    // with zero text. At the manifest's 8192 default a "high" 8192 budget lands at 6144, which
+    // reserves 2048 for the answer; a tiny ceiling floors the budget at the API minimum instead of
+    // sending something illegal.
+    const high = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(high.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high" });
+    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 6144 });
+
+    const tiny = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(tiny.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 1500 });
+    expect(tiny.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 1024 });
+
+    // A cap that cannot hold thinking and an answer both asks for none at all, rather than a budget
+    // the provider refuses — the regression for the turn that spent its whole cap thinking, "high"
+    // requested or not, and rendered nothing.
+    const starved = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(starved.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 1024 });
+    expect(starved.lastBody()!.thinking).toEqual({ type: "disabled" });
+  });
+
+  it("a generous ceiling leaves the requested level alone", async () => {
+    // The allowance is a reserve, not a tax: at a cap with room to spare the level's own budget is
+    // what reaches the wire. This is the configuration the reasoning fix was measured against —
+    // 64000 answered using 13211 tokens — so it must not shift.
+    const high = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(high.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "high", maxTokens: 64000 });
+    expect(high.lastBody()!.thinking).toEqual({ type: "enabled", budget_tokens: 8192 });
+  });
+
+  it("an unset knob puts none of the fields on the wire", async () => {
+    // The contract for "unset" is the provider's own default: no field, no guess.
+    const a = capture("anthropic-compat", { content: [{ type: "text", text: "ok" }] });
+    await drain(a.interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(a.lastBody()).not.toHaveProperty("thinking");
+
+    const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(o.lastBody()).not.toHaveProperty("reasoning_effort");
+
+    const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
+    await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false });
+    expect(g.lastBody()!.generationConfig as Record<string, unknown>).not.toHaveProperty("thinkingConfig");
   });
 });

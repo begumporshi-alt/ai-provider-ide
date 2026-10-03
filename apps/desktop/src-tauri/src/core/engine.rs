@@ -48,7 +48,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 
 use crate::core::adapter::{
-    AdapterFactory, Cancel, ImageArgs, StreamObservation, TextArgs, ToolCall,
+    AdapterFactory, Cancel, ImageArgs, ReasoningEffort, StreamObservation, TextArgs, ToolCall,
 };
 use crate::core::limiter::ProviderLimiter;
 use crate::core::persist::{ApiKeyRow, ProviderRow};
@@ -86,6 +86,17 @@ pub enum ErrorClass {
     BadRequestSchema,
     /// A 2xx whose body could not be parsed, or a stream that broke mid-flight.
     ParseError,
+    /// **The provider answered and composed nothing a caller could use** — a 200 with no text and
+    /// no tool call. Distinct from `ParseError`, which is about a shape this router cannot read:
+    /// here there is nothing to read, because the model never wrote an answer.
+    ///
+    /// The measured cause (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended thinking
+    /// is on by default, `max_tokens` covers reasoning **and** answer, and the reasoning consumed
+    /// the whole 8192-token budget, so the stream ended at `stop_reason: max_tokens` having opened
+    /// no text block. Four such turns in 75 minutes, each ~40 s of waiting and an empty bubble,
+    /// filed as a parse error against a manifest that was correct. The TypeScript union gained the
+    /// same member on the same day; this is the mirror, not a divergence.
+    NoOutput,
     /// 5xx — the provider is unwell; another provider is the better answer.
     ServerError,
     /// 408.
@@ -145,12 +156,13 @@ pub enum BodyHint {
 /// union spelled out verbatim. A variant added without a spelling fails there — which is the
 /// point: the wire spellings are a cross-language contract, and a new class that quietly
 /// rendered as `{:?}` would be a spelling nobody agreed to.
-pub const ALL_CLASSES: [ErrorClass; 12] = [
+pub const ALL_CLASSES: [ErrorClass; 13] = [
     ErrorClass::AuthFailed,
     ErrorClass::RateLimited,
     ErrorClass::NotFound,
     ErrorClass::BadRequestSchema,
     ErrorClass::ParseError,
+    ErrorClass::NoOutput,
     ErrorClass::ServerError,
     ErrorClass::Timeout,
     ErrorClass::Network,
@@ -189,6 +201,7 @@ impl ErrorClass {
             ErrorClass::NotFound => "NOT_FOUND",
             ErrorClass::BadRequestSchema => "BAD_REQUEST_SCHEMA",
             ErrorClass::ParseError => "PARSE_ERROR",
+            ErrorClass::NoOutput => "NO_OUTPUT",
             ErrorClass::ServerError => "SERVER_ERROR",
             ErrorClass::Timeout => "TIMEOUT",
             ErrorClass::Network => "NETWORK",
@@ -244,6 +257,21 @@ pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
     ErrorClass::Network
 }
 
+/// Longest provider reason kept, in code points. Mirror of `errors.ts:MAX_REASON_CHARS` — these two
+/// are a pair a reader compares, so a divergence would mean the app and the daemon report the same
+/// refusal at different lengths.
+///
+/// 120 was too tight for the message the field exists to carry. Measured from `agentrouter.org`'s
+/// Anthropic route (2026-10-02), a rejected `tool_result` answers with 186 characters *before* the
+/// aggregator appends its own request/trace ids:
+///
+///   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_x.
+///   Each `tool_result` block must have a corresponding `tool_use` block in the previous message.
+///
+/// The old cut landed at "Each `…", dropping both the offending id and the rule that explains it,
+/// so a live 400 could not be diagnosed from the ledger. The cap only bounds a text column.
+pub const MAX_REASON_CHARS: usize = 400;
+
 /// The provider's own words for why it refused, short enough for a chain entry.
 ///
 /// Rust mirror of `errors.ts:reasonFromBody` — one of the pair a reader compares. Before this
@@ -271,8 +299,8 @@ pub fn reason_from_body(body: Option<&str>) -> Option<String> {
     let reason = reason.unwrap();
     // char-counted, not byte-counted: a CJK error message (the measurement saw 无效的令牌) would
     // panic on a byte slice that splits a code point.
-    Some(if reason.chars().count() > 120 {
-        format!("{}…", reason.chars().take(117).collect::<String>())
+    Some(if reason.chars().count() > MAX_REASON_CHARS {
+        format!("{}…", reason.chars().take(MAX_REASON_CHARS).collect::<String>())
     } else {
         reason
     })
@@ -998,6 +1026,8 @@ pub struct ExecuteTextArgs<'a> {
     pub stream: bool,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — forwarded untouched to the adapter's render.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<Value>,
     pub tool_choice: Option<Value>,
     pub response_format: Option<Value>,
@@ -1005,6 +1035,10 @@ pub struct ExecuteTextArgs<'a> {
     pub on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     /// Forwarded untouched, like `on_tool_call` — the finish reason mapped to the OpenAI vocabulary.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// Forwarded untouched, like `on_finish` — the model's reasoning, as it streams. Kept out of the
+    /// chunk stream and out of the disposition entirely: reasoning is not delivered output, so a
+    /// stream that carries only reasoning is still a drained stream for every classification.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     pub max_attempts: Option<usize>,
     /// Mark the last system message block with `cache_control` on egress. See
     /// [`crate::core::router::TextRequest::prompt_cache_enabled`] for the read-side note.
@@ -1255,18 +1289,31 @@ pub async fn execute_text(
                         cb(reason);
                     }
                 };
+                // The same shape again, and deliberately NOTHING beside the forward: no counter, no
+                // `emitted`, no disposition. Reasoning is not delivered output — a stream that only
+                // reasoned is still a drained stream (`NO_OUTPUT` when the observation says it
+                // reasoned), and the pass-through consumer renders what it receives without that
+                // changing what the turn was.
+                let mut caller_on_reasoning = args.on_reasoning.as_deref_mut();
+                let mut forward_reasoning = |text: &str| {
+                    if let Some(cb) = caller_on_reasoning.as_deref_mut() {
+                        cb(text);
+                    }
+                };
                 let text_args = TextArgs {
                     model: candidate.model.native_id.clone(),
                     messages: &args.messages,
                     stream: args.stream,
                     max_tokens: args.max_tokens,
                     temperature: args.temperature,
+                    reasoning: args.reasoning,
                     tools: args.tools.as_ref(),
                     tool_choice: args.tool_choice.as_ref(),
                     response_format: args.response_format.as_ref(),
                     on_tool_call: Some(&mut forward_tool),
                     on_usage: Some(&mut record_usage),
                     on_finish: Some(&mut forward_finish),
+                    on_reasoning: Some(&mut forward_reasoning),
                     prompt_cache_enabled: args.prompt_cache_enabled,
                     observation: Some(&mut observation),
                 };
@@ -1337,8 +1384,28 @@ pub async fn execute_text(
 
             // `:106-107` — the stream ended and the attempt served, so the loop stops rather than
             // advancing. This is why the source's `if (!served)` guard has nothing to guard.
-            let observation =
-                if emitted || tool_calls > 0 { None } else { Some(Box::new(observation)) };
+            let drained = !(emitted || tool_calls > 0);
+            let observation = if drained { Some(Box::new(observation)) } else { None };
+            // **The attempt is recorded, because an attempt happened.** The chain held only
+            // failures, so a provider that answered 200 and streamed thousands of events while
+            // producing nothing left no trace in it — and the chain then read as if the model had
+            // never been tried. The status is 200 because that is what the provider returned: this
+            // is not a failed request, it is a request that was answered and whose answer was not
+            // usable. Deliberately NOT a reason to advance to the next candidate — the plan has
+            // already run, and changing that is a behaviour decision, not bookkeeping. Key health
+            // still says OK below, because the key and the provider did their job.
+            if drained {
+                attempts.push(labelled(
+                    AttemptOutcome {
+                        cls: ErrorClass::NoOutput,
+                        status: 200,
+                        retry_after_ms: None,
+                        reason: None,
+                        label: None,
+                    },
+                    &candidate,
+                ));
+            }
             break 'plan Ended::Served { candidate, observation };
         }
         Ended::Spent
@@ -1599,6 +1666,10 @@ impl HealthTracker {
             ErrorClass::NotFound
             | ErrorClass::BadRequestSchema
             | ErrorClass::ParseError
+            // The provider honoured its contract and the model never wrote an answer — nothing here
+            // is evidence against the credential, and counting it would cool a healthy key for a
+            // request-side cause.
+            | ErrorClass::NoOutput
             | ErrorClass::ServerError
             | ErrorClass::Timeout
             | ErrorClass::Network
@@ -1744,11 +1815,28 @@ mod tests {
         // not JSON: the raw text is still the provider's own words
         assert_eq!(reason_from_body(Some("plain refusal")).as_deref(), Some("plain refusal"));
         // char-counted truncation: a CJK message must not panic on a split code point
-        let long = "无".repeat(200);
+        let long = "无".repeat(MAX_REASON_CHARS + 100);
         let got = reason_from_body(Some(&long)).unwrap();
-        assert!(got.chars().count() <= 120);
+        assert!(got.chars().count() <= MAX_REASON_CHARS + 1);
         assert!(got.ends_with('…'));
         assert_eq!(reason_from_body(None), None);
+    }
+
+    #[test]
+    fn a_validation_error_keeps_the_rule_that_explains_it() {
+        // Measured from agentrouter.org's Anthropic route (2026-10-02), verbatim apart from the id.
+        // It is 186 characters before the aggregator appends its own request/trace suffixes, so the
+        // old 120-character cut landed at "Each `…" and dropped both the offending id and the rule —
+        // thereby making a live 400 undiagnosable from the ledger, which is this field's whole job.
+        let message = "unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: \
+                       toolu_bogus_123. Each `tool_result` block must have a corresponding `tool_use` \
+                       block in the previous message.";
+        let body = serde_json::json!({ "error": { "message": message } }).to_string();
+        let got = reason_from_body(Some(&body)).unwrap();
+
+        assert!(got.contains("toolu_bogus_123"), "{got}");
+        assert!(got.contains("must have a corresponding"), "{got}");
+        assert!(!got.ends_with('…'), "the rule must survive: {got}");
     }
 
     #[test]
@@ -2235,12 +2323,15 @@ mod tests {
     /// a wire spelling fails here instead of quietly rendering as its `Debug` form. `CLIENT_GATE`
     /// and `BILLING` joined both unions on 2026-09-29: a gated 401 is not about the key, and a
     /// 402 is not about the network.
-    const TS_SPELLINGS: [&str; 11] = [
+    const TS_SPELLINGS: [&str; 12] = [
         "AUTH_FAILED",
         "RATE_LIMITED",
         "NOT_FOUND",
         "BAD_REQUEST_SCHEMA",
         "PARSE_ERROR",
+        // Gained 2026-10-02 on both sides of the port: a stream that reasoned and never answered
+        // is not a parse error. See `ErrorClass::NoOutput`.
+        "NO_OUTPUT",
         "SERVER_ERROR",
         "TIMEOUT",
         "NETWORK",
@@ -2297,6 +2388,21 @@ mod tests {
         assert_eq!(attempt_budget(0, None), 0);
         assert_eq!(attempt_budget(3, Some(9)), 3);
         assert_eq!(attempt_budget(9, Some(3)), 3);
+    }
+
+    #[test]
+    fn no_output_is_neither_drift_nor_key_retryable() {
+        // The provider honoured its contract and the model never wrote an answer. Drift would push
+        // a healthy provider toward repair for a request-side cause; key-retryability would rotate
+        // through every other key of the provider for a decision no key took part in.
+        assert!(!ErrorClass::NoOutput.is_drift());
+        assert!(!is_retryable_with_next_key(ErrorClass::NoOutput));
+        // And the tracker's own match leaves the key untouched — the arm is exhaustive, so this is
+        // the behavioural half of the same claim.
+        let tracker = HealthTracker::default();
+        tracker.record_result("k", ErrorClass::NoOutput, None, now_ms());
+        // No assertion beyond "this ran and changed nothing observable" — the entry is created
+        // lazily and stays at its defaults, which is the point.
     }
 
     #[test]
@@ -3383,12 +3489,14 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }

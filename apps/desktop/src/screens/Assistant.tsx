@@ -48,7 +48,7 @@ import {
   type ToolCallRef,
   type ToolStep,
 } from "../lib/tools/render";
-import type { ChatMessage, ToolCall, UsageTokens } from "@aiprovider/router-core";
+import type { ChatMessage, ReasoningEffort, ToolCall, UsageTokens } from "@aiprovider/router-core";
 import {
   estimateTokens, DEFAULT_CONTEXT_WINDOW, userContent, textOfContent, compressWithSummary, type CatalogModel,
 } from "@aiprovider/router-core";
@@ -67,6 +67,19 @@ interface Msg {
   id: string;
   role: "user" | "assistant" | "tool";
   content: string;
+  /**
+   * The model's own reasoning for this turn, when it produced any. Kept beside `content` rather
+   * than spliced into it: reasoning is the model's notes, not its answer, and a transcript that
+   * merged the two would quote the notes as the reply.
+   *
+   * It is kept even when the turn produced **no answer at all**, which is the case it exists for.
+   * Measured 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`): extended thinking is on by
+   * default, `max_tokens` covers reasoning *and* answer, and a turn whose reasoning outran the
+   * 8192-token budget streamed 25 000 characters of thinking, no text, and left the user staring
+   * at an empty bubble for 46 seconds. The reasoning was there the whole time; nothing was
+   * listening for it.
+   */
+  reasoning?: string;
   /** Set on an assistant turn that requested tool calls, so the next turn can replay them. */
   tool_calls?: unknown;
   /** Set on a tool result turn, linking it to its originating call. */
@@ -638,6 +651,16 @@ interface AssistantSettings {
    *  value in the row and silently restore it on the next load. */
   temperature?: number | null;
   maxTokens?: number | null;
+  /**
+   * How much the model should think, per request. `null`/absent means "unset — leave the
+   * provider's own default", the same convention as the two fields above and for the same
+   * reason: clearing it has to overwrite the stored level, not vanish from the row.
+   *
+   * Validated against `THINKING_LEVELS` on read rather than trusted, like `approvalMode`: an
+   * unknown string from a future build would otherwise be rendered as a selected value the
+   * select cannot show, and reach the wire as no field at all — a silent downgrade.
+   */
+  thinking?: ReasoningEffort | null;
   /** Editable system prompts. Empty or absent = the built-in constant; also written as "" for the
    *  same reason as above (a cleared prompt has to overwrite the stored one). */
   systemPrompt?: string;
@@ -663,6 +686,14 @@ interface AssistantSettings {
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
+
+/**
+ * The thinking levels the composer offers, in the order they render. `""` — the provider's own
+ * default — is deliberately NOT in this list: it is the unset state of the select, rendered as
+ * its own option, so "unset" is a real chooseable value rather than a missing one that a future
+ * build could mistake for a level.
+ */
+const THINKING_LEVELS: readonly ReasoningEffort[] = ["off", "low", "medium", "high"];
 
 async function loadAssistantSettings(): Promise<AssistantSettings> {
   try {
@@ -715,6 +746,9 @@ export function AssistantScreen() {
   const [maxIterations, setMaxIterations] = useState(DEFAULT_MAX_ITERATIONS);
   const [temperature, setTemperature] = useState<number | "">("");
   const [maxTokens, setMaxTokens] = useState<number | "">("");
+  // The thinking level. `""` is "unset" — send no field and leave the provider's own default,
+  // which is the behaviour of every build before this one, so an untouched screen is unchanged.
+  const [thinking, setThinking] = useState<ReasoningEffort | "">("");
   // System-prompt editor state — a string means "editing", null means "closed".
   const [editingPrompt, setEditingPrompt] = useState<string | null>(null);
   const [customSystemPrompt, setCustomSystemPrompt] = useState("");
@@ -776,6 +810,11 @@ export function AssistantScreen() {
       }
       if (stored.maxTokens === null) setMaxTokens("");
       else if (typeof stored.maxTokens === "number" && stored.maxTokens > 0) setMaxTokens(Math.round(stored.maxTokens));
+      // Validated against the known levels, never trusted: a word a future build invented would
+      // otherwise be stored as a selection the select cannot show, or reach the wire as no field
+      // while the UI claimed a level. Anything unrecognised stays unset, which is the honest
+      // reading of "this build does not know that level".
+      if (THINKING_LEVELS.includes(stored.thinking as ReasoningEffort)) setThinking(stored.thinking as ReasoningEffort);
       if (typeof stored.systemPrompt === "string") setCustomSystemPrompt(stored.systemPrompt);
       if (typeof stored.noToolsSystem === "string") setCustomNoToolsSystem(stored.noToolsSystem);
       if (typeof stored.agentSystem === "string") setCustomAgentSystem(stored.agentSystem);
@@ -812,6 +851,8 @@ export function AssistantScreen() {
       // look like it worked and then quietly come back on the next load.
       temperature: typeof temperature === "number" ? temperature : null,
       maxTokens: typeof maxTokens === "number" ? maxTokens : null,
+      // `null` for unset, for the same round-trip reason as the two above.
+      thinking: thinking === "" ? null : thinking,
       // Always written, empty string included: same reason, for the three prompts.
       systemPrompt: customSystemPrompt,
       noToolsSystem: customNoToolsSystem,
@@ -819,7 +860,7 @@ export function AssistantScreen() {
       // `null` for "none" — a cleared provider has to overwrite the stored one, not vanish.
       searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
-    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
+    [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
       customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider],
   );
 
@@ -838,7 +879,7 @@ export function AssistantScreen() {
     saveAll();
     // `root` is written by the debounced effect below; depending on it here would write twice.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens,
+  }, [hydrated, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
       customSystemPrompt, customNoToolsSystem, customAgentSystem]);
 
   // ...but the root is typed one character at a time, so it is debounced instead.
@@ -1034,8 +1075,10 @@ export function AssistantScreen() {
           onPlanModeChange={setPlanMode}
           temperature={temperature}
           maxTokens={maxTokens}
+          thinking={thinking}
           onTemperatureChange={setTemperature}
           onMaxTokensChange={setMaxTokens}
+          onThinkingChange={setThinking}
           systemPrompt={customSystemPrompt || undefined}
           noToolsSystem={customNoToolsSystem || undefined}
           agentSystemPrompt={customAgentSystem || undefined}
@@ -1465,8 +1508,10 @@ function Chat({
   onPlanModeChange,
   temperature,
   maxTokens,
+  thinking,
   onTemperatureChange,
   onMaxTokensChange,
+  onThinkingChange,
   systemPrompt,
   noToolsSystem,
   agentSystemPrompt,
@@ -1494,8 +1539,12 @@ function Chat({
   /** Owned by `AssistantScreen`, like `root` — see the note on the composer strip below. */
   temperature: number | "";
   maxTokens: number | "";
+  /** How much the model should think, or `""` for the provider's own default. Owned by
+   *  `AssistantScreen` for the same reason as the two above. */
+  thinking: ReasoningEffort | "";
   onTemperatureChange: (v: number | "") => void;
   onMaxTokensChange: (v: number | "") => void;
+  onThinkingChange: (v: ReasoningEffort | "") => void;
   systemPrompt?: string;
   noToolsSystem?: string;
   /** Named `agentSystemPrompt` rather than `agentSystem`: the latter is the module-level builder
@@ -1580,6 +1629,13 @@ function Chat({
    *  new list (the transcript of the old session is context, not live state). */
   const [todos, setTodos] = useState<TodoItem[]>([]);
   const [streamedText, setStreamedText] = useState("");
+  /**
+   * The agent run's reasoning so far. Live-only, exactly like `streamedText`: it describes the run
+   * in flight, and the transcript that replaces it when the run ends is rebuilt from the loop's
+   * messages. It exists so a run that spends 40 s thinking shows *that it is thinking* rather than
+   * a still status line.
+   */
+  const [streamedReasoning, setStreamedReasoning] = useState("");
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
   // Tokens this agent run has spent so far — every model call in the loop reports, and the live
@@ -1787,16 +1843,25 @@ function Chat({
     stickToBottom();
   }, [msgs, streamedText, agentItems, stickToBottom]);
 
-  // P7: context window for the chosen model — looked up from the catalog. A qualified id
-  // `slug/native` needs to resolve the provider to find the catalog row; a bare id scans all carriers.
+  // P7: context window for the chosen model. Same rule as the request path
+  // (`model-router.ts`): the narrowest window published by *any* carrier of this model, because
+  // failover may serve the request from any of them. Two rules for one model is how the meter and
+  // the router end up disagreeing about the same conversation.
+  //
+  // `null` when no carrier published a window. The catalog is the only source that knows, and the
+  // conservative default the router falls back to is a safety choice for the *request*, not a fact
+  // about the model — showing it here would state a capacity nothing ever claimed. Measured: 58 of
+  // 82 catalog rows carry no window, and every one of them read as "8,192" in this meter while the
+  // router was separately planning against 200k for the same model.
   const modelWindow = useMemo(() => {
-    if (!chosen) return DEFAULT_CONTEXT_WINDOW;
-    const rows = catalog.all();
-    const nativeId = chosen.includes("/") ? chosen.split("/")[1]! : chosen;
-    const matching = rows.find((m) => m.nativeId === nativeId && m.modality === "text");
-    return typeof matching?.contextWindow === "number" && matching.contextWindow > 0
-      ? matching.contextWindow
-      : DEFAULT_CONTEXT_WINDOW;
+    if (!chosen) return null;
+    const nativeId = chosen.includes("/") ? chosen.split("/").slice(1).join("/") : chosen;
+    const windows = catalog
+      .all()
+      .filter((m) => m.nativeId === nativeId && m.modality === "text")
+      .map((m) => m.contextWindow)
+      .filter((w): w is number => typeof w === "number" && w > 0);
+    return windows.length > 0 ? Math.min(...windows) : null;
   }, [chosen, tick]);
   // P7: estimated prompt tokens for the NEXT send — the system turn the mode implies, the replayed
   // history, and the draft in the composer. The system turn is included because it is not small:
@@ -1818,8 +1883,11 @@ function Chat({
     ];
     return estimateTokens(all);
   }, [msgs, draftText, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
-  // P7: context meter — fraction of the window consumed.
-  const contextUsedRatio = Math.min(1, currentPromptTokens / modelWindow);
+  // P7: context meter — fraction of the window consumed, or `null` when no carrier published a
+  // window. A bar scaled to a number the catalog never claimed would be the same invention in a
+  // different shape.
+  const contextUsedRatio =
+    modelWindow === null ? null : Math.min(1, currentPromptTokens / modelWindow);
   // Join each tool result to the call that declared it, so the transcript can render an
   // `edit_file`/`write_file` as the change itself. The arguments live on the assistant turn, not
   // the tool turn, so this pairing is the only way the completed transcript can show a diff.
@@ -1916,11 +1984,41 @@ function Chat({
         recordStep(run, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
       } else if (ev.type === "done") {
         iterationsRef.current = ev.iterations;
-        recordStep(run, "done", ev.iterations ? `${ev.iterations} iterations` : "done", undefined, true);
+        recordStep(
+          run,
+          "done",
+          ev.truncated
+            ? `${ev.iterations} iterations — stream truncated`
+            : ev.iterations
+              ? `${ev.iterations} iterations`
+              : "done",
+          undefined,
+          // A truncated turn is not a clean finish: the step reads as failed so the dashboard's
+          // reader asks what the stream actually carried instead of trusting the answer.
+          !ev.truncated,
+        );
+      } else if (ev.type === "truncation_retry") {
+        // Not a recorded step: a re-ask is the loop repairing itself, and it only matters if it
+        // fails. The bubble below says it while it happens.
       }
     }
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
+    } else if (ev.type === "truncation_retry") {
+      // The abandoned attempt's partial prose is dropped, not concatenated: the retry's text is
+      // the answer being built, and two attempts joined would read as one sentence the model
+      // never said. The notice stays as the bubble's prefix until the retry's own text appends
+      // after it; a truncated `done` above records the outcome in the run's steps.
+      setStreamedText("⏳ the model's stream ended early — re-asking…\n\n");
+    } else if (ev.type === "no_output_retry") {
+      // The model reasoned through its whole output budget and never answered. Thinking off is
+      // the one lever that works even against a provider that ignores budget tokens, so the
+      // fallback forces it and the bubble says why.
+      setStreamedText("⏳ the model answered with thinking only — re-asking with thinking off…\n\n");
+    } else if (ev.type === "reasoning") {
+      // Accumulated, not replaced: an agent turn is several round-trips and the panel shows the
+      // whole run's deliberation, the same way `streamedText` shows the whole run's prose.
+      setStreamedReasoning((t) => t + ev.text);
     } else if (ev.type === "tool_call") {
       setAgentItems((l) => [...l, { name: ev.call.name ?? "?", args: tryParseArgs(ev.call.arguments), status: "calling" }]);
       // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
@@ -2000,6 +2098,7 @@ function Chat({
         return;
       }
       setStreamedText("");
+      setStreamedReasoning("");
       setAgentItems([]);
       setRunUsage({ tokensIn: 0, tokensOut: 0 });
       // The previous run's review is about to be superseded — and leaving it up while a new run
@@ -2045,9 +2144,16 @@ function Chat({
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
           // P7: pass through per-request temperature/maxTokens and capture usage for the meter.
+          // The thinking level rides the same path: the interpreter renders it into whichever
+          // field the serving dialect declares (`thinking`, `reasoning_effort`, `thinkingConfig`),
+          // and an unset level sends nothing at all.
           generate: (req, opts) =>
             router.generateText(
               {
+                // The run config's level is spread BEFORE the request on purpose: the loop's own
+                // reasoning override — the NO_OUTPUT fallback's forced "off" — must win over this
+                // panel's setting, or the fallback could not turn thinking off.
+                ...(thinking ? { reasoning: thinking } : {}),
                 ...req,
                 ...(typeof temperature === "number" ? { temperature } : {}),
                 ...(typeof maxTokens === "number" ? { maxTokens } : {}),
@@ -2141,6 +2247,7 @@ function Chat({
         setPendingConfirm(null);
         setAgentItems([]);
         setStreamedText("");
+        setStreamedReasoning("");
         abortRef.current = null;
         // P5: publish the change set in `finally`, not on the success path. A run the user stopped
         // or that threw has still written every file it got to before that, and those are exactly
@@ -2161,6 +2268,14 @@ function Chat({
     const recalled = useMemory ? await recallContext(trimmed) : [];
     if (recalled.length > 0) recordRecall(userNode, recalled);
     let streamed = "";
+    // The model's reasoning, and when it was last painted. Time-based rather than count-based: a
+    // fixed "every Nth delta" is wrong at both ends of the range — the measured failure carried
+    // **8197** deltas, where one React render each would stall the window, while a short 20-delta
+    // thought would render its first delta and then nothing until the stream ended, showing an
+    // open but effectively empty panel for the whole turn. A clock interval is right for both.
+    let reasoned = "";
+    let lastReasoningPaint = 0;
+    const REASONING_PAINT_MS = 80;
     try {
       // The same replay the agent path uses. Sharing it is the fix: this path used to map only
       // {role, content}, so a session that had used agent mode sent its tool results with no
@@ -2186,12 +2301,25 @@ function Chat({
             },
           ],
           onFinish: setFinishReason,
+          // Rendered live, throttled. A reasoning-heavy turn is otherwise indistinguishable from a
+          // hung request: the panel filling in is the only signal that the model is working.
+          onReasoning: (t) => {
+            reasoned += t;
+            const now = Date.now();
+            if (now - lastReasoningPaint >= REASONING_PAINT_MS) {
+              lastReasoningPaint = now;
+              setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
+            }
+          },
           // P7: per-request params, and the provider's own token report for the meter's tooltip
           // (estimate vs what the request actually cost). The running totals are NOT accumulated
           // here — they are read back from the ledger, which is the same record the Usage screen
           // shows; incrementing both would double-count every turn.
           ...(typeof temperature === "number" ? { temperature } : {}),
           ...(typeof maxTokens === "number" ? { maxTokens } : {}),
+          // Same three-way: a chosen level travels, `""` sends nothing and leaves the provider's
+          // own default in place.
+          ...(thinking ? { reasoning: thinking } : {}),
           onUsage: setLastUsage,
         },
         { signal: ac.signal },
@@ -2201,6 +2329,12 @@ function Chat({
         setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed } : x)));
         // Scroll is handled by the sticky-follow effect on `msgs` — following per token here would
         // also fight the user when they have scrolled up to read.
+      }
+      // The tail the throttle above skipped. This is the flush that matters most: the last deltas
+      // before a model runs out of output budget are the ones that say what it was doing when it
+      // stopped, and dropping them would truncate the reasoning exactly where it got interesting.
+      if (reasoned) {
+        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
       }
       const served = exec.served();
       const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
@@ -2450,6 +2584,7 @@ function Chat({
     setAgentItems([]);
     setTodos([]);
     setStreamedText("");
+    setStreamedReasoning("");
     setEditingId(null);
     setEditDraft("");
     setSessionTitle("");
@@ -2565,7 +2700,10 @@ function Chat({
   const compactNow = useCallback(async () => {
     if (busy || msgs.length === 0) return;
     setNotice(null);
-    const budget = Math.max(256, Math.floor(modelWindow * 0.75));
+    // Compaction sizes itself off the conservative default when no window is published. That is the
+    // *request* path, where under-sending is the safe direction — unlike the meter, which must not
+    // present the same default as the model's capacity.
+    const budget = Math.max(256, Math.floor((modelWindow ?? DEFAULT_CONTEXT_WINDOW) * 0.75));
     try {
       const result = await compressWithSummary(replayHistory(msgs), budget, createSummarizer(chosen));
       if (!result.compressed) {
@@ -2827,6 +2965,7 @@ function Chat({
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive
                   raw={streamedText}
+                  reasoning={streamedReasoning}
                   items={agentItems}
                   waiting={pendingConfirm?.call.name ?? null}
                   stopping={stopping}
@@ -2836,7 +2975,17 @@ function Chat({
                 // A turn that only requested tools has no prose of its own. Rendering the
                 // empty-content placeholder there is what left a bare "…" under a tool call —
                 // indistinguishable from a model that answered with nothing.
-                m.content.trim() ? <AssistantContent raw={m.content} /> : null
+                <>
+                  {/* The reasoning leads the answer, folded away — the order the model produced it
+                      in. A turn that reasoned and then answered shows both; a turn that reasoned
+                      and ran out of output budget shows the reasoning instead of the empty bubble
+                      it used to show, which is the difference between "nothing happened" and
+                      "here is what it was doing". */}
+                  {m.reasoning ? (
+                    <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
+                  ) : null}
+                  {m.content.trim() ? <AssistantContent raw={m.content} /> : null}
+                </>
               )
             ) : (
               <>
@@ -3057,6 +3206,29 @@ function Chat({
             style={inputStyle}
           />
         </label>
+        {/* The thinking level. It sits here, beside temperature and max tokens, because it is the
+            same kind of thing: a per-request parameter whose blank means "the provider's own
+            default". It is also the answer to a failure this app used to file as a parse error —
+            a model that thinks by default can spend the whole output budget and never write an
+            answer, and `off` is the escape hatch where the provider has one. */}
+        <label className="flex items-center gap-1">
+          thinking
+          <select
+            value={thinking}
+            onChange={(e) => onThinkingChange(e.target.value as ReasoningEffort | "")}
+            disabled={busy}
+            aria-label="How much the model should think before answering (default uses the provider's own setting)"
+            title="Sent as the field this provider's dialect declares (Anthropic thinking, OpenAI reasoning_effort, Gemini thinkingConfig). Below 'default', 'off' asks the provider to disable thinking where it has a way to — where it has none, nothing is sent and its own default stands."
+            data-testid="thinking-select"
+            className="mono rounded border px-1 py-0.5 text-[11px]"
+            style={inputStyle}
+          >
+            <option value="">default</option>
+            {THINKING_LEVELS.map((l) => (
+              <option key={l} value={l}>{l}</option>
+            ))}
+          </select>
+        </label>
         <button
           type="button"
           onClick={onEditPrompts}
@@ -3066,12 +3238,16 @@ function Chat({
           ✎ system prompt
         </button>
         {/* Context meter. Position and colour together, because the colour alone is a claim the
-            user cannot check: the numbers say how full the window is and the bar makes it skimmable. */}
+            user cannot check: the numbers say how full the window is and the bar makes it skimmable.
+            With no published window there is no share to state, so it says so instead of inventing
+            a denominator. */}
         <span
           className="ml-auto flex items-center gap-1.5"
           title={
-            `${currentPromptTokens.toLocaleString()} estimated prompt tokens of ${modelWindow.toLocaleString()} ` +
-            `window for ${chosen || "the default model"}` +
+            `${currentPromptTokens.toLocaleString()} estimated prompt tokens` +
+            (modelWindow === null
+              ? ` — no context window is published for ${chosen || "the default model"}, so the share used cannot be shown`
+              : ` of ${modelWindow.toLocaleString()} window for ${chosen || "the default model"}`) +
             // `?? 0` is not defensive noise: `UsageTokens` declares both counts as required, but the
             // interpreter passes whatever the provider's usage block actually had (`usageOf` returns
             // `undefined` for a missing field), so a provider that omits one reaches here as
@@ -3086,15 +3262,25 @@ function Chat({
               className="block h-full"
               style={{
                 // A sliver for any non-zero share, so "nearly empty" is visible at all; a true zero
-                // stays zero rather than claiming a percent that is not there.
-                width: currentPromptTokens === 0 ? "0%" : `${Math.max(1, Math.round(contextUsedRatio * 100))}%`,
+                // stays zero rather than claiming a percent that is not there — and an unpublished
+                // window fills nothing, because there is no percent to draw.
+                width:
+                  contextUsedRatio === null || currentPromptTokens === 0
+                    ? "0%"
+                    : `${Math.max(1, Math.round(contextUsedRatio * 100))}%`,
                 background:
-                  contextUsedRatio > 0.9 ? "var(--danger)" : contextUsedRatio > 0.7 ? "var(--warn)" : "var(--success)",
+                  contextUsedRatio === null
+                    ? "var(--text-faint)"
+                    : contextUsedRatio > 0.9
+                      ? "var(--danger)"
+                      : contextUsedRatio > 0.7
+                        ? "var(--warn)"
+                        : "var(--success)",
               }}
             />
           </span>
           <span className="mono">
-            {formatTokens(currentPromptTokens)} / {formatTokens(modelWindow)}
+            {formatTokens(currentPromptTokens)} / {modelWindow === null ? "unknown" : formatTokens(modelWindow)}
           </span>
         </span>
         {/* Session totals from the ledger. "Σ" and the tooltip say *this app's whole ledger*, not
@@ -3346,6 +3532,62 @@ function ToolResultBubble({ content, call }: { content: string; call?: ToolCallR
 }
 
 /**
+ * The model's reasoning, folded away above its answer.
+ *
+ * Reasoning models stream their deliberation as a separate channel (`thinking_delta` on Anthropic,
+ * `reasoning_content` on the OpenAI-compatible gateways). It is not the answer and must not read as
+ * one — hence folded, labelled, and visually subordinate. But it must not be *discarded* either,
+ * which is what the app did until 2026-10-02: `chunkMap.delta` is `$.delta.text`, so every thinking
+ * delta was dropped, and a turn whose reasoning outran its output budget arrived as nothing at all.
+ * The ledger filed it `PARSE_ERROR` against a manifest that was correct, and the user watched an
+ * empty bubble fill the screen for 46 seconds while 25 000 characters of the model's actual work
+ * went past unread.
+ *
+ * Open while streaming and closed afterwards, unless the reader says otherwise. Streaming reasoning
+ * is the only evidence that a long turn is progressing rather than hung; a *finished* reasoning
+ * block is mostly noise on top of the answer, so it collapses itself once there is an answer to
+ * read. Either way the character count stays visible, because 25 000 characters and 40 characters
+ * are different findings.
+ */
+function ReasoningPanel({ text, streaming }: { text: string; streaming?: boolean }) {
+  // `null` = the reader has not expressed a preference, so follow the stream. An explicit toggle
+  // then sticks, including through the moment streaming ends.
+  const [choice, setChoice] = useState<boolean | null>(null);
+  const open = choice ?? Boolean(streaming);
+  return (
+    <div
+      className="mb-1.5 rounded border"
+      style={{ borderColor: "var(--border)" }}
+      data-testid="reasoning-panel"
+    >
+      <button
+        type="button"
+        onClick={() => setChoice(!open)}
+        aria-expanded={open}
+        className="flex w-full items-center gap-1.5 px-2 py-1 text-left text-[11px]"
+        style={{ color: "var(--text-dim)" }}
+        data-testid="reasoning-toggle"
+      >
+        <span aria-hidden>{open ? "▾" : "▸"}</span>
+        <span>{streaming ? "Thinking…" : "Thought process"}</span>
+        <span style={{ color: "var(--text-faint)" }}>
+          · {text.length.toLocaleString()} characters
+        </span>
+      </button>
+      {open && (
+        <div
+          className="max-h-60 overflow-auto whitespace-pre-wrap break-words border-t px-2 py-1.5 text-[11px]"
+          style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+          data-testid="reasoning-body"
+        >
+          {text}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
  * The live status line (2026-10-02).
  *
  * Replaces the bare "…" an in-flight turn showed while nothing had streamed yet — the three dots
@@ -3416,12 +3658,14 @@ function formatElapsed(s: number): string {
 /** Live view of an in-flight agent turn: the status line, streamed text plus this turn's calls, grouped as they run. */
 function AgentLive({
   raw,
+  reasoning,
   items,
   waiting,
   stopping,
   usage,
 }: {
   raw: string;
+  reasoning: string;
   items: AgentItem[];
   waiting: string | null;
   stopping: boolean;
@@ -3439,6 +3683,10 @@ function AgentLive({
   return (
     <>
       <AgentStatus items={items} waiting={waiting} stopping={stopping} usage={usage} />
+      {/* Above the prose, folded, open while it streams — the run's own record of what it is
+          working through. A reasoning-heavy round-trip is otherwise a status line that has not
+          changed for 40 seconds, which reads as a hang. */}
+      {reasoning.trim() ? <ReasoningPanel text={reasoning} streaming /> : null}
       {raw.trim() ? <Markdown source={raw} /> : null}
       {steps.length > 0 && <ToolRunGroup steps={steps} live />}
     </>

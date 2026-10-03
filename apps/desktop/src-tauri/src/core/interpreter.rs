@@ -83,8 +83,8 @@ use futures_util::{Stream, StreamExt};
 use serde_json::{Map, Value};
 
 use crate::core::adapter::{
-    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, StreamObservation,
-    TextArgs, ToolCall,
+    AdapterInstance, Cancel, ImageArgs, ImageReply, ModelEntry, PingResult, ReasoningEffort,
+    StreamObservation, TextArgs, ToolCall,
 };
 use crate::core::dialect_shaping;
 use crate::core::engine::{AttemptError, FailureKind};
@@ -411,12 +411,14 @@ impl ManifestInterpreter {
                 stream,
                 max_tokens,
                 temperature,
+                reasoning,
                 tools,
                 tool_choice,
                 response_format,
                 on_tool_call,
                 on_usage,
                 on_finish,
+                on_reasoning,
                 prompt_cache_enabled,
                 observation,
             } = args;
@@ -482,13 +484,42 @@ impl ManifestInterpreter {
             }
             // `args.maxTokens ?? this.m.limits?.maxOutputTokens` — nullish, so a caller-supplied
             // zero survives and only an absent value falls through to the manifest's ceiling.
-            if let Some(limit) =
-                max_tokens.or_else(|| self.view.limits.and_then(|l| l.max_output_tokens))
-            {
+            let effective_max_tokens =
+                max_tokens.or_else(|| self.view.limits.and_then(|l| l.max_output_tokens));
+            if let Some(limit) = effective_max_tokens {
                 values.insert("maxTokens".to_string(), Value::from(limit));
             }
+            // The caller's thinking knob, rendered into whatever field(s) the template declares.
+            // `reasoning_values` yields only the keys the caller asked for, so a request with no
+            // setting adds nothing and the template's `{{…?}}` placeholders omit their fields —
+            // the provider's own default, which is the contract for "unset".
+            //
+            // The one interaction the rendering cannot express (audit 2026-10-03 R3): Anthropic
+            // rejects a thinking-enabled request that also carries `temperature != 1` or a
+            // `tool_choice` naming a specific tool — a guaranteed upstream 400 filed as
+            // BAD_REQUEST_SCHEMA, burning failover candidates. The constraint belongs to the
+            // upstream that defines `thinking`, so the marker is the template declaring the
+            // `{{thinking?}}` placeholder: a manifest that declares it speaks the dialect the
+            // rule governs. The caller's temperature is dropped (the provider's default is 1)
+            // and a forced choice is clamped to the dialect's own `auto`.
+            let mut thinking_enabled_on_anthropic = false;
+            if let Some(effort) = reasoning {
+                let rendered = reasoning_values(effort, effective_max_tokens);
+                thinking_enabled_on_anthropic = rendered.iter().any(|(k, v)| {
+                    *k == "thinking" && v.get("type").and_then(Value::as_str) == Some("enabled")
+                }) && ep
+                    .request_template
+                    .values()
+                    .filter_map(Value::as_str)
+                    .any(|s| s.contains("{{thinking?}}"));
+                for (key, value) in rendered {
+                    values.insert(key.to_string(), value);
+                }
+            }
             if let Some(t) = temperature {
-                values.insert("temperature".to_string(), Value::from(t));
+                if !thinking_enabled_on_anthropic {
+                    values.insert("temperature".to_string(), Value::from(t));
+                }
             }
             if let Some(v) = shaped_tools {
                 values.insert("tools".to_string(), v);
@@ -498,6 +529,13 @@ impl ManifestInterpreter {
                 // provider (agentrouter.org) accepts `tool_choice` only as an object, so the OpenAI
                 // string `"auto"` is a 400 upstream; the map declares `{type:"auto"}` and friends.
                 // `None` omits the field entirely — the same signal as a form the map does not name.
+                let clamped;
+                let v: &Value = if thinking_enabled_on_anthropic {
+                    clamped = serde_json::json!("auto");
+                    &clamped
+                } else {
+                    v
+                };
                 if let Some(mapped) = translate_tool_choice(v, ep.tool_choice_map.as_ref()) {
                     values.insert("toolChoice".to_string(), mapped);
                 }
@@ -616,7 +654,7 @@ impl ManifestInterpreter {
             }
 
             if !streaming {
-                return unary_text(ep, &res.body, on_tool_call, on_usage, on_finish);
+                return unary_text(ep, &res.body, on_tool_call, on_usage, on_finish, on_reasoning);
             }
             let Some(spec) = spec else {
                 // Unreachable: `streaming` implies a spec. Written as a match rather than an
@@ -635,6 +673,7 @@ impl ManifestInterpreter {
                 on_tool_call,
                 on_usage,
                 on_finish,
+                on_reasoning,
                 observation,
                 pending: PendingCalls::new(),
                 last_usage: None,
@@ -895,6 +934,9 @@ fn wants_usage(view: &ManifestView, ep: &TextEndpoint) -> bool {
 /// rather than uniform.
 struct UnaryTextStream<'a> {
     chunk: Option<String>,
+    /// The joined thinking text, fired through `on_reasoning` on the first poll — `None` when the
+    /// body had none or the caller passed no callback.
+    reasoning: Option<String>,
     /// `Some` when the manifest declares a non-stream `toolCalls` path — the selection, or `Null`
     /// when it resolved to nothing. `emit_tool_calls` treats `Null` as an empty list, which is what
     /// the source's `[undefined]` amounts to.
@@ -910,6 +952,7 @@ struct UnaryTextStream<'a> {
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     done: bool,
 }
 
@@ -918,6 +961,13 @@ impl Stream for UnaryTextStream<'_> {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
+        // Reasoning before the answer, on the same poll that yields the text — the order the model
+        // produced it in. `take()` makes it once-only.
+        if let Some(reasoning) = this.reasoning.take() {
+            if let Some(cb) = this.on_reasoning.as_deref_mut() {
+                cb(&reasoning);
+            }
+        }
         if let Some(text) = this.chunk.take() {
             return Poll::Ready(Some(Ok(text)));
         }
@@ -1010,12 +1060,27 @@ fn unary_text<'a>(
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError> {
     let json: Value = serde_json::from_str(body).map_err(|_| AttemptError::Transport)?;
 
     // `if (typeof text === "string") yield text;` — a miss yields nothing, and an empty string *is*
     // yielded, because the guard is on the type and not on truthiness.
     let chunk = select_text(&json, &ep.response_map.text).map_err(|_| AttemptError::Transport)?;
+
+    // The reasoning, when the reply was mostly reasoning: the **thinking** blocks of the same mixed
+    // array `select_text` reads past (`thinking_text`). Fired on the stream's first poll — the
+    // source fires inside its generator body, so a stream that is never drained reports nothing.
+    let reasoning = match on_reasoning.is_some() {
+        true => {
+            let joined = select_one(&json, &ep.response_map.text)
+                .map_err(|_| AttemptError::Transport)?
+                .map(thinking_text)
+                .unwrap_or_default();
+            (!joined.is_empty()).then_some(joined)
+        }
+        false => None,
+    };
 
     // The selector runs whenever the manifest declares the path, even with no callback — it is an
     // argument, so it is evaluated before `emitToolCalls` can return early.
@@ -1057,6 +1122,7 @@ fn unary_text<'a>(
 
     Ok(Box::pin(UnaryTextStream {
         chunk,
+        reasoning,
         tool_calls,
         tool_call_shape: ep.response_map.tool_call_shape.clone(),
         usage,
@@ -1064,8 +1130,107 @@ fn unary_text<'a>(
         on_tool_call,
         on_usage,
         on_finish,
+        on_reasoning,
         done: false,
     }))
+}
+
+/// The reasoning text one SSE payload carried, or `None` — the Rust mirror of `reasoningDeltaOf`
+/// (`stream-shape.ts`), keyed on the payload's own field names rather than a manifest selector.
+///
+/// Only a non-empty string counts: some gateways send `thinking: ""` on the block announcement and
+/// some send an object (OpenRouter's `reasoning_details`), and neither is text to forward.
+fn reasoning_delta(json: &Value) -> Option<&str> {
+    let delta = json
+        .get("delta")
+        .filter(|d| d.is_object())
+        .or_else(|| json.pointer("/choices/0/delta").filter(|d| d.is_object()))?;
+    for key in ["thinking", "reasoning_content", "reasoning"] {
+        if let Some(s) = delta.get(key).and_then(Value::as_str) {
+            if !s.is_empty() {
+                return Some(s);
+            }
+        }
+    }
+    None
+}
+
+/// The **thinking** blocks of a mixed block array, joined — the unary counterpart of
+/// `reasoning_delta`. `select_text` is careful to read *past* a thinking block so the answer behind
+/// it still arrives; this is what the thinking itself becomes instead of being dropped. A
+/// `redacted_thinking` block carries no text (the provider withheld it), so it contributes nothing.
+fn thinking_text(selected: &Value) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if let Some(blocks) = selected.as_array() {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) == Some("thinking") {
+                if let Some(s) = block.get("thinking").and_then(Value::as_str) {
+                    parts.push(s);
+                }
+            }
+        }
+    }
+    parts.join("")
+}
+
+/// The share of the output cap reserved for the answer itself.
+///
+/// The provider's rule is only `budget_tokens < max_tokens`, so reserving the API's 1024-token
+/// minimum satisfies it while leaving the answer almost nothing — and a prompt that reasons hard
+/// then spends the entire cap thinking and never opens a text block. Measured on a real turn at the
+/// default 8192 cap: 8197 `thinking_delta` events, `stop_reason: max_tokens`, zero text, and the
+/// Assistant rendered nothing at all. The same prompt at a 64000 cap answered, using 13211 tokens
+/// for thinking *and* answer together.
+///
+/// This allowance only bites when the cap is tight. A generous cap leaves the requested level
+/// untouched, so a configuration already known to work keeps behaving identically.
+const MIN_ANSWER_TOKENS: u64 = 2048;
+
+/// The thinking budget for a request, kept inside the cap that request carries.
+///
+/// Returns 0 — "do not ask for thinking" — for `Off`, and for a cap too small to hold a legal
+/// budget and the answer's allowance both. Sending a budget the provider will refuse is worse than
+/// sending none.
+fn thinking_budget(effort: ReasoningEffort, max_tokens: Option<u64>) -> u64 {
+    // `Off` carries no budget at all, and it is the one level the floors below must never raise.
+    let Some(wanted) = effort.budget_tokens() else { return 0 };
+    let wanted = wanted.max(1024);
+    let Some(cap) = max_tokens else { return wanted };
+    if cap <= 1024 {
+        return 0;
+    }
+    // The answer's allowance comes out first, then the API minimum is the floor. `budget_tokens <
+    // max_tokens` holds at every cap above 1024: both `cap - MIN_ANSWER_TOKENS` and 1024 are below
+    // `cap`, so their maximum is too.
+    wanted.min(cap.saturating_sub(MIN_ANSWER_TOKENS)).max(1024)
+}
+
+/// The request-template values for the caller's thinking knob — the Rust mirror of
+/// `reasoningValues` (`manifest-interpreter.ts`), keyed for the optional placeholders the builtin
+/// dialects declare: Anthropic `{{thinking?}}`, the OpenAI-compatible dialect `{{reasoningEffort?}}`,
+/// Gemini `{{thinkingConfig?}}`. Empty keys are never yielded, so a dialect whose template declares
+/// none of them is untouched.
+fn reasoning_values(
+    effort: ReasoningEffort,
+    max_tokens: Option<u64>,
+) -> Vec<(&'static str, Value)> {
+    let budget = thinking_budget(effort, max_tokens);
+    if budget == 0 {
+        // Audit 2026-10-03 R4: the off rendering is per-dialect, and `thinkingBudget: 0` is not
+        // the portable off switch it looks like — Gemini allows it only on 2.5 **Flash**; 2.5
+        // **Pro** has a 128 floor and cannot disable thinking, so an explicit `off` on a Pro
+        // model was a deterministic 400. So `thinkingConfig` is omitted: the placeholder drops
+        // the field, and the provider's own default governs — which on Pro is the only legal
+        // answer, and on Flash costs an explicit "no thinking" that degrades to dynamic
+        // thinking. Anthropic keeps its probed spelling (agentrouter.org, 2026-10-02; the TS
+        // reference still sends both keys — recorded in the drift register).
+        return vec![("thinking", serde_json::json!({ "type": "disabled" }))];
+    }
+    vec![
+        ("thinking", serde_json::json!({ "type": "enabled", "budget_tokens": budget })),
+        ("reasoningEffort", serde_json::json!(effort.as_str())),
+        ("thinkingConfig", serde_json::json!({ "thinkingBudget": budget })),
+    ]
 }
 
 /// A usage block, or `None` when it carried nothing readable.
@@ -1181,6 +1346,7 @@ struct TextStream<'a> {
     on_tool_call: Option<&'a mut (dyn FnMut(ToolCall) + Send)>,
     on_usage: Option<&'a mut (dyn FnMut(UsageTokens) + Send)>,
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// Noted per `data:` event whether or not the manifest can read it — the engine reads this
     /// only when the stream delivered nothing, which is the one case where the count and a sample
     /// of the first event are the difference between two findings with different owners.
@@ -1279,6 +1445,17 @@ impl TextStream<'_> {
         let Ok(json) = serde_json::from_str::<Value>(payload) else {
             return LineStep::Continue;
         };
+
+        // ---- reasoning, before the manifest decides anything. Read from the payload's own field
+        // names (`reasoning_delta`), so a provider whose persisted manifest predates the channel
+        // still yields its reasoning — the same call the TypeScript side made, for the same
+        // reason. Fired through its own channel and deliberately NOT yielded as a chunk: reasoning
+        // is not the answer, and it must not mark the attempt served (see `TextArgs::on_reasoning`).
+        if let Some(text) = reasoning_delta(&json) {
+            if let Some(cb) = self.on_reasoning.as_deref_mut() {
+                cb(text);
+            }
+        }
 
         // ---- errorMap: keys only, and the test is JavaScript truthiness, not presence.
         for path in &self.plan.error_paths {
@@ -1784,12 +1961,14 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             // Off: every caller below asserts on an unmarked body, and `agnes` — the configured
             // provider — reports no cache fields either way (measured 2026-09-28).
             prompt_cache_enabled: false,
@@ -1810,6 +1989,298 @@ mod tests {
     /// A `data:` line carrying one OpenAI-shaped delta.
     fn delta_line(text: &str) -> String {
         format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"{text}\"}}}}]}}")
+    }
+
+    // ------------------------------------------- the reasoning channel
+
+    /// A reasoning delta reaches its own channel and never the chunk stream — the OpenAI-compatible
+    /// `reasoning_content` spelling, detected by field name with no manifest selector involved.
+    #[tokio::test]
+    async fn a_reasoning_delta_reaches_its_own_channel_not_the_chunk_stream() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line("answer"),
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking a\"}}]}",
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\" bit more\"}}]}",
+            "data: [DONE]",
+        ])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("gpt-4o");
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "answer", "reasoning never rides the chunk stream");
+        assert_eq!(reasoning.join(""), "thinking a bit more");
+    }
+
+    /// The Anthropic spelling (`delta.thinking`). The empty-string announcement is skipped — it is
+    /// the block opener, not text — and the text delta behind it still yields.
+    #[tokio::test]
+    async fn the_anthropic_thinking_spelling_reaches_the_same_channel() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            "data: {\"delta\":{\"thinking\":\"\",\"type\":\"thinking_delta\"}}",
+            "data: {\"delta\":{\"thinking\":\"the plan:\",\"type\":\"thinking_delta\"}}",
+            "data: {\"delta\":{\"text\":\"done\",\"type\":\"text_delta\"}}",
+            "data: {\"type\":\"message_stop\"}",
+        ])]);
+        let interp = interpreter(&anthropic_manifest(), http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("claude-x");
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "done");
+        assert_eq!(reasoning.join(""), "the plan:");
+    }
+
+    /// A unary reply's thinking blocks join onto the reasoning channel — the counterpart of
+    /// `select_text` reading past them (`joinThinkingParts` on the TypeScript side). The fixture's
+    /// selector is patched to the mixed-array read; that the **template** declares it is pinned
+    /// separately below, by a test that goes through the real builtin — this one cannot notice a
+    /// template going stale, which is exactly how the Rust half kept block 0 for a month after the
+    /// TypeScript half stopped.
+    #[tokio::test]
+    async fn a_unary_reply_s_thinking_blocks_reach_the_reasoning_channel() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"thinking","thinking":"the note"},{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+        let cancel = Cancel::new();
+        let mut reasoning: Vec<String> = Vec::new();
+        let mut collect = |t: &str| reasoning.push(t.to_string());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.on_reasoning = Some(&mut collect);
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "ok");
+        assert_eq!(reasoning.join(""), "the note");
+    }
+
+    /// **The stale-selector regression, through the real builtin.** `$.content[0].text` reads block
+    /// 0, and on a thinking-first reply block 0 is the thinking block — so the answer arrived empty
+    /// while the row looked like a success and every non-streaming client saw `content: ""`.
+    /// `c325784` fixed the TypeScript template; the Rust one kept the old path, and the test above
+    /// could not tell because it patches the selector itself. This asserts against **the template**,
+    /// so a future edit that restores block 0 fails here.
+    ///
+    /// Measured live 2026-10-02 through this template against agentrouter: `deepseek-v4-flash`
+    /// answers `Reply with exactly: ok` with exactly this body shape when thinking is on.
+    #[tokio::test]
+    async fn the_anthropic_builtin_reads_a_thinking_first_unary_reply() {
+        let manifest =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"content":[{"type":"thinking","thinking":"the note","signature":"s"},{"type":"text","text":"ok"}]}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("deepseek-v4-flash");
+        args.stream = false;
+        let out = drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let text: String = out.into_iter().filter_map(|r| r.ok()).collect();
+        assert_eq!(text, "ok", "the answer comes from the text block, whatever leads the array");
+    }
+
+    /// The thinking knob reaches the wire in each dialect's own field — and nowhere when unset.
+    /// Anthropic: an object, `off` a real request, `high` clamped under the output ceiling
+    /// (Anthropic requires `1024 <= budget_tokens < max_tokens`; the fixture's limit is 8192).
+    /// OpenAI: the level word. The Rust values come from the same table as the TypeScript's.
+    #[tokio::test]
+    async fn the_thinking_knob_reaches_the_wire_in_the_dialect_s_own_field() {
+        // The trimmed fixtures predate the knob, so the placeholders are declared here — the same
+        // lines the builtins now carry (`builtin_templates.rs`).
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
+        let mut openai_fixture = openai_manifest();
+        openai_fixture["endpoints"]["generateText"]["requestTemplate"]["reasoning_effort"] =
+            json!("{{reasoningEffort?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+
+        let off = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, off.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Off);
+        let _ = &cancel;
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(off.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["thinking"], json!({ "type": "disabled" }));
+
+        let high = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, high.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(high.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["thinking"],
+            json!({ "type": "enabled", "budget_tokens": 6144 }),
+            "8192 clamped under the fixture's 8192-token ceiling, keeping the answer's allowance"
+        );
+
+        let openai = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"choices":[{"message":{"content":"ok"}}]}"#,
+        )]);
+        let interp = interpreter(&openai_fixture, openai.clone());
+        let mut args = text_args("gpt-4o");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Medium);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(openai.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(body["reasoning_effort"], "medium");
+        assert!(body.get("thinking").is_none(), "the anthropic field stays home");
+    }
+
+    /// Audit 2026-10-03 R3: Anthropic rejects a thinking-enabled request whose temperature is not
+    /// 1 or whose `tool_choice` names a tool — a guaranteed upstream 400 that failover then files
+    /// as BAD_REQUEST_SCHEMA, burning candidates on. With thinking enabled, the caller's
+    /// temperature is dropped and a forced choice is clamped to the dialect's own `auto`; without
+    /// it, both are forwarded untouched. The marker is the template declaring `{{thinking?}}` —
+    /// the placeholder is what makes the manifest speak the dialect the rule governs.
+    #[tokio::test]
+    async fn a_thinking_enabled_request_drops_the_temperature_and_clamps_the_tool_choice() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["temperature"] =
+            json!("{{temperature?}}");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["tool_choice"] =
+            json!("{{toolChoice?}}");
+        manifest["endpoints"]["generateText"]["toolChoiceMap"] = json!({
+            "auto": { "type": "auto" },
+            "function": { "type": "tool", "name": "{{toolChoice.function.name}}" }
+        });
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let cancel = Cancel::new();
+        let forced = json!({ "type": "function", "function": { "name": "write_file" } });
+
+        let thinking = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, thinking.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        args.temperature = Some(0.7);
+        args.tool_choice = Some(&forced);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(thinking.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("temperature").is_none(),
+            "thinking is on: the caller's temperature must not ride along:
+{body}"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "auto" }),
+            "a forced choice is clamped to the dialect's own auto:
+{body}"
+        );
+        assert_eq!(body["thinking"]["type"], "enabled");
+
+        let plain = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, plain.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.temperature = Some(0.7);
+        args.tool_choice = Some(&forced);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(plain.only_request().body.as_deref().unwrap()).unwrap();
+        assert_eq!(
+            body["temperature"], 0.7,
+            "no thinking: the caller's temperature is forwarded:
+{body}"
+        );
+        assert_eq!(
+            body["tool_choice"],
+            json!({ "type": "tool", "name": "write_file" }),
+            "no thinking: the forced choice is forwarded through the map, not clamped:
+{body}"
+        );
+    }
+
+    /// Audit 2026-10-03 R4: `off` must not send `thinkingBudget: 0` — Gemini allows it only on
+    /// 2.5 **Flash**; 2.5 **Pro** has a 128 floor and cannot disable thinking, so an explicit
+    /// `off` on a Pro model was a deterministic 400. On a template that declares only the Gemini
+    /// placeholder, off renders nothing at all (the provider's default governs); the enabled
+    /// levels still carry a real budget. The Anthropic spelling keeps its probed
+    /// `{type:"disabled"}` — pinned by `the_thinking_knob_reaches_the_wire_in_the_dialect_s_own_field`.
+    #[tokio::test]
+    async fn reasoning_off_omits_the_gemini_thinking_config() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinkingConfig"] =
+            json!("{{thinkingConfig?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let cancel = Cancel::new();
+
+        let off = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, off.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::Off);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(off.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body.get("thinkingConfig").is_none(),
+            "off must not send thinkingBudget: 0 — 2.5 Pro refuses it:
+{body}"
+        );
+
+        let high = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, high.clone());
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = Some(ReasoningEffort::High);
+        drain(interp.generate_text("key:t", args, &cancel).await.unwrap()).await;
+        let body: Value =
+            serde_json::from_str(high.only_request().body.as_deref().unwrap()).unwrap();
+        assert!(
+            body["thinkingConfig"]["thinkingBudget"].as_u64().unwrap_or(0) >= 1024,
+            "an enabled level still carries a real budget:
+{body}"
+        );
+    }
+
+    /// Unset: no field at all — the provider's own default. A fresh cancel per case: a stream
+    /// dropped un-drained cancels the shared token, and a cancelled request answers Transport.
+    #[tokio::test]
+    async fn the_thinking_knob_is_absent_when_unset() {
+        let mut manifest = anthropic_manifest();
+        manifest["endpoints"]["generateText"]["responseMap"]["text"] = json!("$.content");
+        manifest["endpoints"]["generateText"]["requestTemplate"]["thinking"] =
+            json!("{{thinking?}}");
+        let answer = r#"{"content":[{"type":"text","text":"ok"}]}"#;
+        let bare = FakeHttp::new(vec![Scripted::text(200, answer)]);
+        let interp = interpreter(&manifest, bare.clone());
+        let cancel = Cancel::new();
+        let mut args = text_args("claude-x");
+        args.stream = false;
+        args.reasoning = None;
+        let result = interp.generate_text("key:t", args, &cancel).await;
+        if let Err(e) = &result {
+            eprintln!("ISO ERR: {e:?}");
+        }
+        assert!(result.is_ok());
     }
 
     /* ------------------------------------------- tool_choice: the dialect's own shape */
@@ -1934,12 +2405,14 @@ mod tests {
             stream: false,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: tools.as_ref(),
             tool_choice: tool_choice.as_ref(),
             response_format: None,
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             prompt_cache_enabled: false,
             observation: None,
         };
@@ -3370,6 +3843,69 @@ mod tests {
         assert_eq!(
             anthropic.capabilities(),
             crate::core::manifest_view::Capabilities { text: true, image: false }
+        );
+    }
+
+    /// The arithmetic that decides whether an answer is possible at all: thinking must not be able
+    /// to consume the whole cap. Regression for the turn that spent 8192 tokens thinking, opened no
+    /// text block, and left the Assistant rendering nothing.
+    #[test]
+    fn thinking_never_consumes_the_answer_s_allowance() {
+        let (low, medium, high) =
+            (ReasoningEffort::Low, ReasoningEffort::Medium, ReasoningEffort::High);
+
+        // The failing configuration: a hard prompt, High thinking, the built-in 8192 cap. It has to
+        // leave a real answer allowance rather than the API's 1024-token minimum.
+        assert_eq!(thinking_budget(high, Some(8192)), 8192 - MIN_ANSWER_TOKENS);
+
+        // A generous cap leaves the requested level alone, so the configuration the merged fix was
+        // measured against — 64000, which answered using 13211 tokens — behaves exactly as before.
+        assert_eq!(thinking_budget(high, Some(64_000)), 8192);
+        assert_eq!(thinking_budget(medium, Some(64_000)), 4096);
+        assert_eq!(thinking_budget(low, Some(64_000)), 1024);
+
+        // No cap: the level's own budget, unchanged.
+        assert_eq!(thinking_budget(high, None), 8192);
+
+        // `Off` never gets a budget back, whatever the cap.
+        assert_eq!(thinking_budget(ReasoningEffort::Off, Some(64_000)), 0);
+        assert_eq!(thinking_budget(ReasoningEffort::Off, None), 0);
+
+        // A cap that cannot hold a legal budget and the answer both yields none, rather than one
+        // the provider would refuse.
+        assert_eq!(thinking_budget(high, Some(1024)), 0);
+        assert_eq!(thinking_budget(high, Some(500)), 0);
+
+        // `1024 <= budget_tokens < max_tokens`, at every cap that permits thinking at all. The old
+        // clamp returned `max_tokens` itself for a small cap — the one value the API rejects.
+        for cap in [1025u64, 1500, 2048, 3072, 8192, 100_000] {
+            for level in [low, medium, high] {
+                let budget = thinking_budget(level, Some(cap));
+                assert!(budget >= 1024, "{level:?} at {cap}: {budget} is under the API minimum");
+                assert!(budget < cap, "{level:?} at {cap}: {budget} must stay under the cap");
+            }
+        }
+    }
+
+    /// The allowance has to reach the wire. A budget computed and then not rendered would fix
+    /// nothing, and `reasoning_values` is the only path the knob takes to a request.
+    #[test]
+    fn the_rendered_thinking_block_carries_the_reduced_budget() {
+        let blocks = reasoning_values(ReasoningEffort::High, Some(8192));
+        let thinking = blocks
+            .iter()
+            .find(|(key, _)| *key == "thinking")
+            .map(|(_, value)| value)
+            .expect("High renders a thinking block");
+        assert_eq!(thinking["budget_tokens"], json!(8192 - MIN_ANSWER_TOKENS));
+
+        // A starved cap asks for no thinking at all, rather than an illegal budget.
+        let disabled = reasoning_values(ReasoningEffort::High, Some(1024));
+        assert!(
+            disabled
+                .iter()
+                .any(|(key, value)| *key == "thinking" && value["type"] == json!("disabled")),
+            "a cap that cannot hold thinking must render it disabled: {disabled:?}"
         );
     }
 

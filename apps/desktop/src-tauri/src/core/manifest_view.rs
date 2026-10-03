@@ -519,7 +519,10 @@ mod tests {
                         "tool_choice": "{{toolChoice?}}"
                     },
                     "responseMap": {
-                        "text": "$.content[0].text",
+                        // The block ARRAY, matching the builtin (`builtin_templates.rs`) and the
+                        // TypeScript template — a copy that drifts is a second answer to "what does
+                        // the anthropic template look like".
+                        "text": "$.content",
                         "usage": "$.usage",
                         "toolCalls": "$.content"
                     },

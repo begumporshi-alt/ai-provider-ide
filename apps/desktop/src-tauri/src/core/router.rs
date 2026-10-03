@@ -62,7 +62,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::core::adapter::{AdapterFactory, Cancel};
+use crate::core::adapter::{AdapterFactory, Cancel, ReasoningEffort};
 use crate::core::engine::{
     execute_image, execute_text, AllAttemptsFailed, AttemptOutcome, ExecuteImageArgs,
     ExecuteTextArgs, HealthTracker, TextFailure, TextSuccess,
@@ -353,6 +353,9 @@ pub struct TextRequest<'a> {
     pub messages: Vec<Value>,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — rendered per dialect by the interpreter
+    /// (`reasoning_values`); `None` leaves the provider's own default.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<Value>,
     pub tool_choice: Option<Value>,
     pub response_format: Option<Value>,
@@ -361,6 +364,10 @@ pub struct TextRequest<'a> {
     /// The finish reason, mapped to the OpenAI vocabulary by the serving dialect's
     /// `responseFinishMap` — the word an OpenAI-shaped client switches on.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// The model's reasoning, as it streams — forwarded to the engine untouched, and never mixed
+    /// into the chunk stream. See [`crate::core::adapter::TextArgs::on_reasoning`] for why the
+    /// channel exists and why firing it must not change any disposition.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// How many candidates this request may try. `None` is [`crate::core::engine::MAX_ATTEMPTS_DEFAULT`].
     pub max_attempts: Option<usize>,
     /// Whether to mark the system prompt with `cache_control` on egress so a provider with
@@ -916,12 +923,14 @@ impl<'a> ModelRouter<'a> {
             messages,
             max_tokens,
             temperature,
+            reasoning,
             tools,
             tool_choice,
             response_format,
             on_tool_call,
             on_usage,
             on_finish,
+            on_reasoning,
             max_attempts,
             prompt_cache_enabled,
         } = req;
@@ -988,6 +997,13 @@ impl<'a> ModelRouter<'a> {
                     cb(r);
                 }
             };
+            // The same local-closure shape again, and again deliberately nothing beside the forward.
+            let mut caller_on_reasoning = on_reasoning;
+            let mut forward_reasoning = |t: &str| {
+                if let Some(cb) = caller_on_reasoning.as_deref_mut() {
+                    cb(t);
+                }
+            };
             let args = ExecuteTextArgs {
                 plan,
                 messages,
@@ -995,12 +1011,14 @@ impl<'a> ModelRouter<'a> {
                 stream: true,
                 max_tokens,
                 temperature,
+                reasoning,
                 tools,
                 tool_choice,
                 response_format,
                 on_tool_call: Some(&mut forward_tool),
                 on_usage: Some(&mut forward_usage),
                 on_finish: Some(&mut forward_finish),
+                on_reasoning: Some(&mut forward_reasoning),
                 max_attempts,
                 prompt_cache_enabled,
             };
@@ -1113,13 +1131,29 @@ impl<'a> ModelRouter<'a> {
                 //
                 // This is the arm the 154 `PARSE_ERROR` rows in the live ledger came from — no status,
                 // an empty chain, and no way to tell "the provider sent nothing" from "it sent a shape
-                // the manifest cannot read". The observation is the evidence that tells them apart.
+                // the manifest cannot read". The observation is the evidence that tells them apart —
+                // and, since the classified observation, whether the stream was reasoning at all: a
+                // model that carried reasoning text but no answer is `NO_OUTPUT` (the mirror of the
+                // TypeScript decision on `exec.reasoning()`), not a parse error against a manifest
+                // that was correct. The chain is no longer empty here either — the engine records the
+                // drained attempt (`NO_OUTPUT`, status 200) — so the row no longer claims nothing
+                // was tried beneath evidence that a provider streamed for forty seconds.
                 Ok(success) => (
                     ledger_row(now, TEXT, &source),
                     success.usage,
                     &success.attempts,
                     None,
-                    if cancelled { "CANCELLED" } else { "PARSE_ERROR" },
+                    if cancelled {
+                        "CANCELLED"
+                    } else if success
+                        .observation
+                        .as_deref()
+                        .is_some_and(|o| o.reasoning_carried > 0)
+                    {
+                        "NO_OUTPUT"
+                    } else {
+                        "PARSE_ERROR"
+                    },
                     None,
                     success.observation.as_deref().and_then(|o| o.describe()),
                 ),
@@ -1395,12 +1429,15 @@ impl<'a> ModelRouter<'a> {
                 stream: false,
                 max_tokens: Some(req.max_tokens),
                 temperature: None,
+                reasoning: None,
                 tools: None,
                 tool_choice: None,
                 response_format: None,
                 on_tool_call: None,
                 on_usage: None,
                 on_finish: None,
+                // The summarizer/generator's own call: it consumes the answer, not the notes.
+                on_reasoning: None,
                 max_attempts: None,
                 // Read from the router settings rather than hardcoded off, so the operator's
                 // toggle governs this path too. `CompleteRequest` carries no flag of its own:
@@ -1894,6 +1931,9 @@ mod tests {
         usage: Mutex<VecDeque<Option<UsageTokens>>>,
         /// Per text call: `[(payload, repeat)]` noted into `args.observation`, in order.
         observations: Mutex<VecDeque<Vec<(String, u32)>>>,
+        /// Per text call: reasoning texts fired through `args.on_reasoning`, in order — the
+        /// upstream-gated channel a real adapter delivers a reasoning stream through.
+        reasoning: Mutex<VecDeque<Vec<String>>>,
         image: Mutex<VecDeque<Result<ImageReply, AttemptError>>>,
         calls: Mutex<Vec<String>>,
     }
@@ -1953,6 +1993,12 @@ mod tests {
             Arc::clone(self)
         }
 
+        fn with_reasoning(self: &Arc<Self>, batches: Vec<Vec<&str>>) -> Arc<Self> {
+            *self.reasoning.lock().unwrap() =
+                batches.into_iter().map(|b| b.into_iter().map(String::from).collect()).collect();
+            Arc::clone(self)
+        }
+
         fn calls(&self) -> Vec<String> {
             self.calls.lock().unwrap().clone()
         }
@@ -1983,11 +2029,19 @@ mod tests {
             let brk = self.breaks.lock().unwrap().pop_front().flatten();
             let usage = self.usage.lock().unwrap().pop_front().flatten();
             let observation = self.observations.lock().unwrap().pop_front().unwrap_or_default();
+            let reasoning = self.reasoning.lock().unwrap().pop_front().unwrap_or_default();
             Box::pin(async move {
                 match next {
                     None => Err(AttemptError::Transport),
                     Some(Err(e)) => Err(e),
                     Some(Ok(chunks)) => {
+                        // Reasoning first — the order the model produces it in — and through its
+                        // own callback, never the chunk stream.
+                        if let Some(cb) = args.on_reasoning.as_deref_mut() {
+                            for t in reasoning {
+                                cb(&t);
+                            }
+                        }
                         if let Some(cb) = args.on_tool_call.as_deref_mut() {
                             for call in tools {
                                 cb(call);
@@ -2100,12 +2154,14 @@ mod tests {
             messages: vec![json!({ "role": "user", "content": "hi" })],
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             max_attempts: None,
             prompt_cache_enabled: false,
         }
@@ -2326,8 +2382,13 @@ mod tests {
     /// 154 live rows said `PARSE_ERROR` with no status and an empty chain — indistinguishable
     /// between "the provider streamed nothing" and "it streamed a shape the manifest cannot
     /// read". The observation is what tells them apart, and this pins the engine's half of it.
+    ///
+    /// The `reasoning_content` shape is reasoning — the OpenAI-compatible spelling of Anthropic's
+    /// `thinking` — so this row is `NO_OUTPUT`, not a parse error: the shape is read fine, and
+    /// what it contains is a model thinking rather than answering. Filed `PARSE_ERROR` before the
+    /// classification existed, which sent the operator to a manifest that was already correct.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_drained_stream_s_row_carries_what_the_stream_actually_held() {
+    async fn a_reasoning_content_stream_drains_to_no_output_not_a_parse_error() {
         let store = one_provider();
         let adapter = Scripted::new(vec![chunks(&[])]).with_observations(vec![vec![(
             "{\"choices\":[{\"delta\":{\"reasoning_content\":\"...\"}}]}",
@@ -2342,10 +2403,104 @@ mod tests {
             .expect("nothing threw — the stream drained clean");
 
         let row = &rows(&router.ledger())[0];
-        assert_eq!(row.error_class.as_deref(), Some("PARSE_ERROR"));
+        assert_eq!(row.error_class.as_deref(), Some("NO_OUTPUT"));
         let detail = row.failure_detail.as_deref().expect("the observation reached the row");
         assert!(detail.contains("3 SSE event"), "the count: {detail}");
-        assert!(detail.contains("reasoning_content"), "a sample of the first event: {detail}");
+        assert!(detail.contains("choices[0].delta.reasoning_content"), "the field: {detail}");
+        assert!(detail.contains("every delta was model reasoning"), "{detail}");
+    }
+
+    /// The failure that motivated the classification, replayed through the router with the
+    /// envelopes captured from `agentrouter.org` (`deepseek-v4-flash`) on 2026-10-02: extended
+    /// thinking is on by default, `max_tokens` covers reasoning **and** answer, and the thinking
+    /// consumed the whole 8192-token budget — 8197 events, zero text, `stop_reason: max_tokens`.
+    /// Filed `PARSE_ERROR` against a correct manifest with an empty chain before; now the row
+    /// names the class, the cause, the lever, and the attempt that was actually made.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_reasoning_only_anthropic_stream_names_the_cause_the_lever_and_the_attempt() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&[])]).with_observations(vec![vec![
+            ("{\"content_block\":null,\"delta\":null,\"error\":null,\"index\":0,\"message\":null,\"type\":\"message_start\"}", 1),
+            ("{\"content_block\":{\"signature\":\"\",\"thinking\":\"\",\"type\":\"thinking\"},\"delta\":null,\"error\":null,\"index\":0,\"message\":null,\"type\":\"content_block_start\"}", 1),
+            ("{\"content_block\":null,\"delta\":{\"thinking\":\"The user is asking about the release checklist.\",\"type\":\"thinking_delta\"},\"error\":null,\"index\":0,\"message\":null,\"type\":\"content_block_delta\"}", 2),
+            ("{\"content_block\":null,\"delta\":{\"stop_reason\":\"max_tokens\",\"stop_sequence\":null},\"error\":null,\"index\":0,\"message\":null,\"type\":\"message_delta\",\"usage\":{\"input_tokens\":2310,\"output_tokens\":8192}}", 1),
+            ("{\"content_block\":null,\"delta\":null,\"error\":null,\"index\":0,\"message\":null,\"type\":\"message_stop\"}", 1),
+        ]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        let served = router
+            .generate_text(text_req("m1"), &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("nothing threw — the provider answered 200 and the stream drained");
+
+        // The engine's own reading is unchanged: the stream resolved, so it is a served turn at
+        // the engine layer and the provider's health still says OK. The ledger is where the
+        // honesty lives.
+        assert_eq!(served.candidate.provider.id, "p1");
+
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "error");
+        assert_eq!(row.error_class.as_deref(), Some("NO_OUTPUT"));
+        // No provider is named on the row — none produced a token — but the chain beside it now
+        // names the attempt that was made, instead of reading as if nothing had been tried.
+        assert_eq!(row.provider_id, None);
+        assert_eq!(row.http_status, None);
+        let chain = serde_json::from_str::<serde_json::Value>(
+            row.fallback_chain_json.as_deref().expect("the chain is always Some"),
+        )
+        .expect("the chain parses");
+        assert_eq!(chain[0]["cls"], "NO_OUTPUT");
+        assert_eq!(chain[0]["provider"], "p1");
+        assert_eq!(chain[0]["key"], "k1");
+
+        let detail = row.failure_detail.as_deref().expect("the stream evidence reached the row");
+        assert!(detail.contains("6 SSE event"), "the count: {detail}");
+        assert!(detail.contains("every delta was model reasoning"), "{detail}");
+        assert!(detail.contains("delta.thinking"), "{detail}");
+        assert!(detail.contains("the selector is not at fault"), "{detail}");
+        // The actionable half: `stop_reason: max_tokens` becomes the lever, in the provider's own
+        // words rather than a translation.
+        assert!(detail.contains("output budget"), "{detail}");
+        assert!(detail.contains("max output tokens"), "{detail}");
+        // And the quoted sample is a delta, never `message_start` — the lifecycle opener every
+        // Anthropic stream shares, which is what the old positional sample quoted.
+        assert!(detail.contains("thinking_delta"), "{detail}");
+        assert!(!detail.contains("message_start"), "{detail}");
+    }
+
+    /// The reasoning reaches its own callback — and is still not delivered output: zero chunks,
+    /// and the row, whose observation saw the same reasoning on the wire, is `NO_OUTPUT`, not ok.
+    /// The fake scripts the observation and the reasoning separately (a real interpreter derives
+    /// both from the same payloads); scripting both is what lets this test pin the whole contract.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_reaches_its_own_callback_without_becoming_output() {
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&[])])
+            .with_reasoning(vec![vec!["thinking it", " through"]])
+            .with_observations(vec![vec![(
+                "{\"choices\":[{\"delta\":{\"reasoning_content\":\"thinking it through\"}}]}",
+                1,
+            )]]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+        // Leaked because `TextRequest<'static>` outlives any local the test could borrow from —
+        // the same idiom the tool-call test below uses.
+        let got: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+        let on_reasoning: &'static mut (dyn FnMut(&str) + Send) =
+            Box::leak(Box::new(move |t: &str| got.lock().unwrap().push(t.to_string())));
+        let mut req = text_req("m1");
+        req.on_reasoning = Some(on_reasoning);
+        let served = router
+            .generate_text(req, &opts("ui"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect("nothing threw — the stream drained");
+
+        assert_eq!(served.candidate.provider.id, "p1");
+        assert_eq!(*got.lock().unwrap(), vec!["thinking it".to_string(), " through".to_string()]);
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "error", "reasoning is not delivered output");
+        assert_eq!(row.error_class.as_deref(), Some("NO_OUTPUT"));
     }
 
     /// A stream that DID deliver is not described: the output itself answers what the provider

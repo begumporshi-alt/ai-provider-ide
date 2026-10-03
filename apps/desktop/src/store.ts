@@ -1668,6 +1668,40 @@ export async function gatewaySpendStatus(): Promise<GatewaySpendStatus> {
   return fetchAdminAs("GET", "/admin/spend", isGatewaySpendStatus);
 }
 
+/**
+ * Which sources a binary was built from.
+ *
+ * Two binaries come out of one crate — this app and the login-item `aiproviderd` — and only one of
+ * them serves the gateway. Rebuilding one and not the other leaves a gateway running older code
+ * that answers every request normally, so the only symptom is that a change appears to have done
+ * nothing.
+ */
+export interface BuildIdentity {
+  commit: string;
+  source_fp: string;
+}
+
+/** This app binary's own build identity. */
+export async function appBuildIdentity(): Promise<BuildIdentity> {
+  return invoke<BuildIdentity>("app_build_identity");
+}
+
+/**
+ * The build identity of whatever process is serving the gateway, or `null` when it cannot be read.
+ *
+ * `null` is **not** a discrepancy: a gateway built before this route existed answers 404, and
+ * "cannot compare" must not render as "different build".
+ */
+export async function gatewayBuildIdentity(): Promise<BuildIdentity | null> {
+  try {
+    const raw = (await fetchAdmin("GET", "/admin/build")) as Partial<BuildIdentity> | null;
+    if (typeof raw?.commit !== "string" || typeof raw?.source_fp !== "string") return null;
+    return { commit: raw.commit, source_fp: raw.source_fp };
+  } catch {
+    return null;
+  }
+}
+
 /** The login-item service: launchd's word on whether the agent is installed and up. */
 export interface ServiceStatus {
   plistPresent: boolean;

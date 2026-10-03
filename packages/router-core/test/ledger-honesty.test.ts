@@ -28,17 +28,23 @@ function withBaseUrl(m: ReturnType<NonNullable<(typeof PROVIDER_PROFILES)["openr
 
 const MODELS = { status: 200, body: { data: [{ id: "gpt-4o" }] } };
 
-/** One enabled provider, one key, one text model. Enough to fail in a controlled way. */
-function setup(responder: (url: string) => Resp) {
+/** One enabled provider, one key, one text model. Enough to fail in a controlled way.
+ *
+ *  `slug` selects the built-in profile, so a dialect-specific case can be pinned without a second
+ *  copy of this scaffold. Defaults to the OpenAI-compatible one the rest of the file uses. */
+function setup(
+  responder: (url: string) => Resp,
+  slug: keyof typeof PROVIDER_PROFILES = "openrouter",
+) {
   const vault = new FakeVault();
   const registry = new ProviderRegistry(vault);
   const http = new FakeHttp(responder);
   const adapters = new AdapterRuntime(http);
   const p = registry.addProvider({
-    id: "pA", slug: "openrouter", name: "Agnes", type: "builtin",
+    id: "pA", slug, name: "Agnes", type: "builtin",
     baseUrl: "https://a.test/api/v1", status: "enabled", rotationStrategy: "priority",
   });
-  adapters.register(p.id, withBaseUrl(PROVIDER_PROFILES.openrouter!(), "https://a.test/api/v1"));
+  adapters.register(p.id, withBaseUrl(PROVIDER_PROFILES[slug]!(), "https://a.test/api/v1"));
   const ledger = new UsageLedger();
   const catalog = new ModelCatalog(registry, adapters);
   const router = new ModelRouter(registry, adapters, catalog, ledger);
@@ -210,6 +216,41 @@ describe("a stream that completes without serving is not a success", () => {
     // The other half of the drained arm: the provider DID answer, with events the manifest's
     // chunkMap does not select. Before the observation existed this row was byte-identical to the
     // empty-body one above — 154 of them in the live ledger for one provider, undiagnosable.
+    //
+    // The shape is deliberately NOT `reasoning_content`: that field is recognisable as reasoning,
+    // so it is classified `NO_OUTPUT` with its own test below. This case is the residue — a shape
+    // nothing in the app has a name for — which is the one that still belongs to `PARSE_ERROR`.
+    const s = setup((url) =>
+      url.endsWith("/models")
+        ? MODELS
+        : {
+            status: 200,
+            lines: [
+              `data: ${JSON.stringify({ choices: [{ delta: { answer: "the model said this somewhere else" } }] })}`,
+              `data: ${JSON.stringify({ choices: [{ delta: { reply: "and this" } }] })}`,
+              "data: [DONE]",
+            ],
+          },
+    );
+    await arm(s);
+
+    const exec = await ask(s);
+    expect(await collect(exec.chunks)).toBe("");
+
+    const row = s.ledger.query()[0]!;
+    expect(row.errorClass).toBe("PARSE_ERROR");
+    const detail = row.failureDetail!;
+    expect(detail).toContain("2 SSE event");
+    expect(detail).toContain("none matched the manifest's delta selector");
+    // And it did NOT mistake an unknown field for reasoning, which would have blamed the model
+    // for the manifest's gap.
+    expect(detail).not.toContain("model reasoning");
+  });
+
+  it("an OpenAI-compatible reasoning stream is NO_OUTPUT, not a parse error", async () => {
+    // `reasoning_content` is reasoning — the OpenAI-compatible spelling of Anthropic's `thinking`.
+    // Filing it as `PARSE_ERROR` said "this manifest cannot read the shape", which is false: the
+    // shape is read, and what it contains is the model thinking rather than answering.
     const s = setup((url) =>
       url.endsWith("/models")
         ? MODELS
@@ -228,11 +269,90 @@ describe("a stream that completes without serving is not a success", () => {
     expect(await collect(exec.chunks)).toBe("");
 
     const row = s.ledger.query()[0]!;
-    expect(row.errorClass).toBe("PARSE_ERROR");
+    expect(row.errorClass).toBe("NO_OUTPUT");
     const detail = row.failureDetail!;
     expect(detail).toContain("2 SSE event");
-    expect(detail).toContain("reasoning_content");
-    expect(detail).toContain("none matched the manifest's delta selector");
+    expect(detail).toContain("delta.reasoning_content");
+    expect(detail).toContain("every delta was model reasoning");
+  });
+
+  it("a reasoning-only Anthropic stream stops blaming the manifest", async () => {
+    // The events below were captured from `agentrouter.org` (`deepseek-v4-flash`) on 2026-10-02,
+    // while diagnosing an "the agent is not replying" report. The manifest is the pinned
+    // `agentrouter` profile — the Anthropic route, chosen exactly because the OpenAI one answers
+    // `content: ""` with the output in `reasoning_content` (see `builtin-templates.ts:438`) — and
+    // its `chunkMap.delta` is `$.delta.text`. A `thinking_delta` correctly never matches that, so
+    // the row's "none matched the manifest's delta selector" pointed at a file that was already
+    // right, quoting `message_start`, an event every Anthropic stream opens with. 8198 events.
+    const at = (o: Record<string, unknown>) => `data: ${JSON.stringify(o)}`;
+    const thinkingDelta = (t: string) => ({
+      content_block: null, delta: { thinking: t, type: "thinking_delta" },
+      error: null, index: 0, message: null, type: "content_block_delta",
+    });
+    const empty = { content_block: null, delta: null, error: null, index: 0, message: null };
+    const s = setup(
+      (url) =>
+        url.endsWith("/models")
+          ? MODELS
+          : {
+              status: 200,
+              lines: [
+                at({ ...empty, type: "message_start", message: { id: "m1", role: "assistant" } }),
+                at({ ...empty, type: "content_block_start", content_block: { type: "thinking", thinking: "", signature: "" } }),
+                at(thinkingDelta("The user just said")),
+                at(thinkingDelta(" hi.")),
+                // The real stream's ending, and the whole point: the model did not run out of
+                // things to say, it ran out of **output budget**. `max_tokens` covers thinking
+                // *and* answer on this endpoint, and the thinking took all 8192 of them.
+                at({ ...empty, type: "message_delta", delta: { stop_reason: "max_tokens", stop_sequence: null }, usage: { input_tokens: 2310, output_tokens: 8192 } }),
+                at({ ...empty, type: "message_stop" }),
+              ],
+            },
+      "agentrouter",
+    );
+    await arm(s);
+
+    // The reasoning is delivered to the caller as it streams — this is what the Assistant now
+    // renders, and the reason a turn like this shows 25 000 characters of thinking instead of an
+    // empty bubble.
+    let live = "";
+    const exec = await s.router.generateText({
+      model: "gpt-4o",
+      messages: [{ role: "user", content: "hi" }],
+      onReasoning: (t) => { live += t; },
+    });
+    expect(await collect(exec.chunks)).toBe("");
+
+    const row = s.ledger.query()[0]!;
+    // The class: the provider answered and wrote no answer. NOT a parse error — nothing failed to
+    // parse, and the manifest is correct.
+    expect(row.errorClass).toBe("NO_OUTPUT");
+    const detail = row.failureDetail!;
+    // The finding that was missing: the model reasoned and never emitted text, so there is no
+    // manifest to go and fix.
+    expect(detail).toContain("every delta was model reasoning");
+    expect(detail).toContain("delta.thinking");
+    expect(detail).toContain("the selector is not at fault");
+    // And the evidence quoted is a delta, not the lifecycle event every stream opens with.
+    expect(detail).not.toContain("message_start");
+    // `stop_reason: max_tokens` reaches the row as the actionable half: what to change.
+    expect(detail).toContain("output budget");
+    expect(detail).toContain("raise this provider's max output tokens");
+
+    // The reasoning itself reached the live channel, whole.
+    expect(live).toBe("The user just said hi.");
+
+    // And the attempt is named. The chain held only failures, so a provider that streamed 8197
+    // events while producing nothing left no trace — and Activity then printed "no attempt
+    // recorded — nothing was tried for this model" under the row proving the opposite.
+    expect(row.fallbackChain?.map((a) => a.cls)).toEqual(["NO_OUTPUT"]);
+    // The harness registers the provider under the profile key (`agentrouter`); the live database
+    // names the same provider "agent-router". Asserting the harness's own name, not the live one.
+    expect(row.fallbackChain?.[0]?.candidate.provider.slug).toBe("agentrouter");
+    expect(row.fallbackChain?.[0]?.status).toBe(200);
+    // Notably NOT drift: the provider honoured its contract. Counting it would push a healthy
+    // provider toward repair for a request-side cause.
+    expect(row.providerId).toBeUndefined();
   });
 
   it("an aborted request is logged as CANCELLED, not as ok", async () => {

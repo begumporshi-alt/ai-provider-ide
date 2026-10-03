@@ -12,6 +12,7 @@ import { tagModality as tagModalityFrom } from "./modality.js";
 import type { AdapterInstance } from "./adapter-instance.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
 import { shapeMessageContent, textOfContent } from "./content-parts.js";
+import { reasoningDeltaOf } from "./stream-shape.js";
 import {
   attachToolParts, readToolCalls, shapeToolDeclarations, type ToolCallShape, type ToolPartTemplates,
 } from "./tool-shaping.js";
@@ -25,6 +26,84 @@ function toolPartTemplates(
   templates: Record<string, Record<string, unknown>> | undefined,
 ): ToolPartTemplates {
   return { toolCall: templates?.toolCall, toolResult: templates?.toolResult };
+}
+
+/**
+ * One budget table for every dialect that thinks in **tokens** — Anthropic's `budget_tokens` and
+ * Gemini's `thinkingBudget` — so the three effort levels mean the same thing everywhere. The
+ * ceiling that table is clamped under is `thinkingBudget`'s business, not this table's.
+ */
+const REASONING_BUDGETS: Record<Exclude<import("./ports.js").ReasoningEffort, "off">, number> = {
+  low: 1024,
+  medium: 4096,
+  high: 8192,
+};
+
+/**
+ * The share of the output cap reserved for the answer itself.
+ *
+ * The provider's rule is only `budget_tokens < max_tokens`, so reserving the API's 1024-token
+ * minimum satisfies it while leaving the answer almost nothing — and a prompt that reasons hard then
+ * spends the entire cap thinking and never opens a text block. Measured on a real turn at the
+ * manifest's 8192 default: 8197 `thinking_delta` events, `stop_reason: max_tokens`, zero text, and
+ * the Assistant rendered nothing at all. The same prompt at a 64000 cap answered, using 13211 tokens
+ * for thinking *and* answer together.
+ *
+ * This allowance only bites when the cap is tight: a generous cap leaves the requested level
+ * untouched, so a configuration already known to work keeps behaving identically.
+ */
+export const MIN_ANSWER_TOKENS = 2048;
+
+/**
+ * The thinking budget for a request, kept inside the cap that request carries.
+ *
+ * Returns 0 — "do not ask for thinking" — for a cap too small to hold a legal budget and the
+ * answer's allowance both. A budget the provider will refuse is worse than none.
+ *
+ * `thinking_budget` (`core/interpreter.rs`) is the Rust mirror of this; the two move together.
+ */
+export function thinkingBudget(
+  effort: Exclude<import("./ports.js").ReasoningEffort, "off">,
+  maxTokens: number | undefined,
+): number {
+  const wanted = Math.max(1024, REASONING_BUDGETS[effort]);
+  if (typeof maxTokens !== "number") return wanted;
+  if (maxTokens <= 1024) return 0;
+  // The answer's allowance comes out first, then the API minimum is the floor. `budget_tokens <
+  // max_tokens` holds at every cap above 1024: both `maxTokens - MIN_ANSWER_TOKENS` and 1024 are
+  // below the cap, so their maximum is too.
+  return Math.max(1024, Math.min(wanted, maxTokens - MIN_ANSWER_TOKENS));
+}
+
+/**
+ * The request-template values for the caller's thinking knob, keyed for the optional placeholders
+ * the builtin dialects declare: Anthropic reads `{{thinking?}}` (an object — `renderTemplate`
+ * substitutes non-string JSON verbatim), the OpenAI-compatible dialect reads `{{reasoningEffort?}}`,
+ * and Gemini reads `{{thinkingConfig?}}`.
+ *
+ * Empty when the caller set nothing: every placeholder is `{{…?}}`, so the fields are omitted and
+ * the provider's own default governs — which is the whole contract for "unset". `Off` is a real
+ * request where the dialect allows one (Anthropic `thinking: {type:"disabled"}`, Gemini budget 0)
+ * and an omission where it does not (the OpenAI-compatible vocabulary has no portable off; the
+ * provider's default may still think — measured on agentrouter, whose models think by default,
+ * which is precisely why the Anthropic off switch matters). A cap too small to hold thinking plus an
+ * answer renders the same way as `off`, for the same reason: the alternative is a request the
+ * provider refuses, or a turn that produces no text.
+ */
+export function reasoningValues(
+  effort: import("./ports.js").ReasoningEffort | undefined,
+  maxTokens: number | undefined,
+): Record<string, unknown> {
+  if (!effort) return {};
+  const budget = effort === "off" ? 0 : thinkingBudget(effort, maxTokens);
+  if (budget === 0) {
+    return { thinking: { type: "disabled" }, thinkingConfig: { thinkingBudget: 0 } };
+  }
+  return {
+    thinking: { type: "enabled", budget_tokens: budget },
+    reasoningEffort: effort,
+    thinkingConfig: { thinkingBudget: budget },
+  };
 }
 
 /**
@@ -125,6 +204,8 @@ export interface TextArgs {
   stream: boolean;
   maxTokens?: number;
   temperature?: number;
+  /** How much the model should think — rendered per dialect by `reasoningValues`. */
+  reasoning?: import("./ports.js").ReasoningEffort;
   tools?: unknown;
   toolChoice?: unknown;
   responseFormat?: unknown;
@@ -153,8 +234,31 @@ export interface TextArgs {
    * the stream), because only the caller knows how much evidence a ledger row can afford.
    */
   onStreamEvent?: (payload: string) => void;
-  /** Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
-   *  `responseFinish` selector. Absent if the provider never emitted one. */
+  /**
+   * The model's **reasoning**, as it streams. Separated from `chunks` on purpose: reasoning is not
+   * the answer, and a caller that put it in the transcript would be quoting the model's notes as if
+   * they were its reply.
+   *
+   * It exists because reasoning is otherwise *lost*, and losing it turns a slow answer into no
+   * answer at all. Measured 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`, extended thinking
+   * on by default): a request whose reasoning outruns `max_tokens` streams 8192 `thinking_delta`
+   * events, zero `text_delta`, and ends at `stop_reason: max_tokens`. `chunkMap.delta` is
+   * `$.delta.text`, so every one of those events was dropped, the caller received nothing, and the
+   * turn was filed as a parse error — for a provider that had answered perfectly and a model that
+   * had simply not reached its answer yet.
+   *
+   * Fires once per carrier event, in order. Never fires for a non-reasoning model.
+   */
+  onReasoningDelta?: (text: string) => void;
+  /**
+   * Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
+   * `responseFinish` selector, translated into the OpenAI vocabulary. **The callback firing is
+   * itself a signal**: it fires only when the stream declares a finish selector (`stream.finish` or
+   * `responseFinish`) or a reason was actually seen — so a call with `undefined` means the provider
+   * closed a declared-finish stream without one, i.e. a truncation, while a callback that never
+   * fires means this manifest gives the caller no way to judge. Firing unconditionally would make
+   * those two unreadable as distinct.
+   */
   onFinish?: (reason: string | undefined) => void;
 }
 
@@ -265,6 +369,27 @@ const TEXT_BLOCK_TYPES = new Set(["text", "input_text", "output_text"]);
  */
 function selectText(json: unknown, path: string): string | undefined {
   return joinTextParts(selectOne(json, path));
+}
+
+/**
+ * The **thinking** blocks of a mixed block array, joined. The unary counterpart of
+ * `reasoningDeltaOf`: `selectText` is careful to read *past* a thinking block so the answer behind
+ * it still arrives, which is why a reasoning-only reply came back empty with nothing to show for
+ * it. This is what that path shows instead — the reasoning itself.
+ *
+ * Block type first, then the field: a `thinking` block carries its text in `thinking`, and a
+ * `redacted_thinking` block carries none at all (the provider withheld it), so it contributes
+ * nothing and is not an error.
+ */
+function joinThinkingParts(v: unknown): string | undefined {
+  if (!Array.isArray(v)) return undefined;
+  const parts: string[] = [];
+  for (const item of v) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (o.type === "thinking" && typeof o.thinking === "string") parts.push(o.thinking);
+  }
+  return parts.length ? parts.join("") : undefined;
 }
 
 /** Join a selected value into text — a string as-is, a mixed block array by its text parts. */
@@ -646,6 +771,11 @@ export class ManifestInterpreter implements AdapterInstance {
       messages: dialectMessages,
       stream: args.stream,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
+      // The caller's thinking knob, rendered into whatever field(s) this dialect's template
+      // declares. `reasoningValues` returns only the keys the caller asked for, so a request with
+      // no setting adds nothing and the template's `{{…?}}` placeholders omit their fields — the
+      // provider's own default, which is the contract for "unset".
+      ...reasoningValues(args.reasoning, args.maxTokens ?? this.m.limits?.maxOutputTokens),
       temperature: args.temperature,
       // v1.1 amendment (2026-10-01): the declarations are shaped per dialect before they reach the
       // placeholder. `{{tools}}` alone ships OpenAI's `{type:"function", function:{…}}` wrapping,
@@ -702,6 +832,13 @@ export class ManifestInterpreter implements AdapterInstance {
       const json: unknown = jsonBody(await res.text(), url);
       const text = selectText(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
+      // The reasoning, when the reply was mostly reasoning. Read from the same mixed array
+      // `selectText` reads past, so a thinking-only body is no longer indistinguishable from a
+      // model that chose to say nothing.
+      if (args.onReasoningDelta) {
+        const reasoning = joinThinkingParts(selectOne(json, ep.responseMap.text));
+        if (reasoning) args.onReasoningDelta(reasoning);
+      }
       if (ep.responseMap.toolCalls) {
         emitToolCalls(args.onToolCall, selectOne(json, ep.responseMap.toolCalls), ep.responseMap.toolCallShape);
       }
@@ -768,6 +905,13 @@ export class ManifestInterpreter implements AdapterInstance {
         const payload = trimmed.slice(5).trim();
         if (payload === "[DONE]") return;
         args.onStreamEvent?.(payload);
+        // Before the manifest decides anything: reason from the payload's own field names, so a
+        // provider whose persisted manifest predates this still yields its reasoning. See
+        // `reasoningDeltaOf` for why this is not a selector.
+        if (args.onReasoningDelta) {
+          const reasoning = reasoningDeltaOf(payload);
+          if (reasoning) args.onReasoningDelta(reasoning);
+        }
         let json: unknown;
         try {
           json = JSON.parse(payload);
@@ -884,9 +1028,18 @@ export class ManifestInterpreter implements AdapterInstance {
         });
       }
       // Forward finish reason (v1.1 `responseFinish` surfacing), translated into the OpenAI
-      // vocabulary at the single report site — both collectors above store the RAW reason. Absent
-      // when the provider never emitted one or the abort flag is set: a cancelled stream has none.
-      if (args.onFinish && !signal?.aborted) {
+      // vocabulary at the single report site — both collectors above store the RAW reason. The
+      // guard is the contract's load-bearing half: firing only when a finish selector is declared
+      // (or a reason was seen anyway) is what makes "fired with undefined" readable by the caller
+      // as *truncated* rather than *unknown* — the distinction the agent loop's truncation retry
+      // is built on. A cancelled stream has none, and fires nothing.
+      if (
+        args.onFinish &&
+        !signal?.aborted &&
+        (ep.stream.finish !== undefined ||
+          ep.responseFinish !== undefined ||
+          finishReason !== undefined)
+      ) {
         args.onFinish(
           finishReason === undefined
             ? undefined

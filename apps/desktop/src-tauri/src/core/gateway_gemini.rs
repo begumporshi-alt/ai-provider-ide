@@ -262,11 +262,18 @@ pub(crate) async fn gemini_h(
             let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
+                    // The bridge's held-prose liveness frame: it exists to disarm
+                    // FIRST_MSG_TIMEOUT and is never a wire event (audit 2026-10-03 R2).
+                    BridgeMsg::Liveness => {}
                     BridgeMsg::Delta(t) => {
                         streamed.push_str(&t);
                         let chunk = json!({ "candidates": [{ "content": { "parts": [{ "text": t }], "role": "model" }, "index": 0 }] });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(chunk.to_string()));
                     }
+                    // Reasoning is carried by the bridge, but this dialect does not forward it: the
+                    // `reasoning_content` convention belongs to the OpenAI-compatible surface. The
+                    // Gemini shape would be `thought: true` parts — deferred until a client asks.
+                    BridgeMsg::Reasoning(_) => {}
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -335,6 +342,10 @@ pub(crate) async fn gemini_h(
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
+            // Carries nothing by design; see the stream arm (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
+            // See the stream arm: thought parts are deferred until a client asks.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => provider_finish = Some(reason),
             BridgeMsg::Done => {

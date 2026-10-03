@@ -19,13 +19,20 @@ function streamOf(...chunks: string[]): TextStream {
   };
 }
 
-/** A model script: each call to `generate` consumes one step. `calls` are emitted via onToolCall. */
-function fakeModel(steps: Array<{ text: string; calls?: ToolCall[] }>): GenerateFn {
+/** A model script: each call to `generate` consumes one step. `calls` are emitted via onToolCall;
+ *  `truncated` fires `onFinish(undefined)` (a declared-finish stream that ended without one) and
+ *  `finish` fires it with the given reason. Neither set = the manifest declares no selector, and
+ *  the callback never fires. */
+function fakeModel(
+  steps: Array<{ text: string; calls?: ToolCall[]; truncated?: boolean; finish?: string }>,
+): GenerateFn {
   let i = 0;
   return async (req) => {
     const step = steps[Math.min(i, steps.length - 1)];
     i += 1;
     step.calls?.forEach((c) => req.onToolCall?.(c));
+    if (step.truncated) req.onFinish?.(undefined);
+    else if (step.finish !== undefined) req.onFinish?.(step.finish);
     return streamOf(step.text);
   };
 }
@@ -66,6 +73,165 @@ describe("runAgentLoop", () => {
     const result = events.find((e) => e.type === "tool_result");
     expect(result && result.type === "tool_result" && result.ok).toBe(true);
     expect(result && result.type === "tool_result" && result.result).toBe("result-for-read_file");
+  });
+
+  it("re-asks a truncated stream and returns the retried answer", async () => {
+    // 2026-10-03, live on vice/deepseek-v4-flash: "First, let me check" arrived, the tool call
+    // never did, and the old loop recorded the turn as a clean one-iteration success. A
+    // declared-finish stream that ends without its finish reason is a truncation; the loop
+    // re-asks the same iteration instead of accepting it.
+    const events: AgentEvent[] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      if (calls === 1) {
+        req.onFinish?.(undefined);
+        return streamOf("First, let me check");
+      }
+      req.onFinish?.("stop");
+      return streamOf("Here is the answer.");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(calls).toBe(2);
+    expect(out.text).toBe("Here is the answer.");
+    expect(out.truncated).toBe(false);
+    expect(events).toContainEqual({ type: "truncation_retry", attempt: 1 });
+  });
+
+  it("flags the turn when every re-ask truncates too", async () => {
+    const events: AgentEvent[] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      req.onFinish?.(undefined);
+      return streamOf("First, let me che");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    // The original attempt plus both re-asks, then the turn is accepted and flagged rather than
+    // retried forever.
+    expect(calls).toBe(3);
+    expect(out.truncated).toBe(true);
+    const done = events.find((e) => e.type === "done");
+    expect(done && done.type === "done" && done.truncated).toBe(true);
+  });
+
+  it("accepts a finish-less turn without retrying when no finish selector is declared", async () => {
+    // The interpreter fires onFinish only for a declared selector, so a callback that never fires
+    // means the loop has no way to judge — the old behavior stands: one call, no retry.
+    let calls = 0;
+    const model: GenerateFn = async () => {
+      calls += 1;
+      return streamOf("just an answer");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+    });
+
+    expect(calls).toBe(1);
+    expect(out.text).toBe("just an answer");
+    expect(out.truncated).toBe(false);
+  });
+
+  it("falls back to thinking-off when the model answers with reasoning only", async () => {
+    // 2026-10-03, live on agentrouter/deepseek-v4-flash: ~8180 thinking deltas, zero text — the
+    // whole output budget spent reasoning. LiteLLM's fallback pattern applied to our own failure
+    // class: the engine classifies NO_OUTPUT with evidence, and the loop re-asks once with
+    // thinking forced off — the one lever that works even against a provider that ignores
+    // budget tokens.
+    const events: AgentEvent[] = [];
+    const reasoningFor: string[] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      reasoningFor.push(req.reasoning ?? "(unset)");
+      if (calls === 1) {
+        req.onReasoning?.("thinking hard");
+        req.onFinish?.("length");
+        return streamOf("");
+      }
+      req.onFinish?.("stop");
+      return streamOf("Here is the answer.");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(calls).toBe(2);
+    expect(reasoningFor).toEqual(["(unset)", "off"]);
+    expect(out.text).toBe("Here is the answer.");
+    expect(events).toContainEqual({ type: "no_output_retry", attempt: 1 });
+  });
+
+  it("fails loudly when even the thinking-off re-ask answers nothing", async () => {
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      req.onReasoning?.("still thinking");
+      req.onFinish?.("length");
+      return streamOf("");
+    };
+
+    await expect(
+      runAgentLoop({
+        model: "m",
+        messages: [{ role: "user", content: "go" }],
+        registry: AGENT_TOOLS,
+        generate: model,
+        host: { async run() { return { ok: true, output: "" }; } },
+      }),
+    ).rejects.toThrow(/re-asked once with thinking off/);
+    expect(calls).toBe(2);
+  });
+
+  it("does not fall back when an empty stream carried no reasoning", async () => {
+    // Empty text with a silent thinking channel is not the NO_OUTPUT class — that predicate is
+    // "reasoning without an answer" (the engine files this shape PARSE_ERROR instead). This
+    // model declares no finish selector either, so no callback ever fires.
+    let calls = 0;
+    const model: GenerateFn = async () => {
+      calls += 1;
+      return streamOf("");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+    });
+
+    expect(calls).toBe(1);
+    expect(out.text).toBe("");
   });
 
   it("honours a denial from the confirm gate without touching the host", async () => {

@@ -15,7 +15,13 @@ export default defineConfig({
   testMatch: /.*\.spec\.ts$/,
   fullyParallel: false, // one in-memory store per browser page; serialize to keep stories independent
   workers: 1,
-  retries: 0,
+  // CI-only retries, and the reason is measured rather than assumed: across three 2026-10-03 CI
+  // runs a different timing-sensitive spec failed each time on a ~30 s UI stall (composer's
+  // /clear, then the shortcuts palette, then both again) while every one of them passed locally,
+  // in under a second, on the same commits. A runner stall is not a regression; failing the
+  // whole gate on it taught the operator to re-run blind. Local runs keep zero retries — a
+  // failure here is real and should be seen at once.
+  retries: process.env.CI ? 2 : 0,
   timeout: 120_000, // the wizard runs real probes + AI rounds + a QuickJS gate; allow headroom
   expect: { timeout: 30_000 },
   reporter: process.env.CI ? "list" : [["list"], ["html", { open: "never", outputFolder: "web-test/.report" }]],

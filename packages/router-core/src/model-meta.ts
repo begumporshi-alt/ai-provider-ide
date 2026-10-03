@@ -19,7 +19,16 @@ function toPositiveInt(v: unknown): number | undefined {
 
 /**
  * Prompt budget in tokens, or `undefined` when the provider published none.
- * OpenRouter uses `context_length`; the other names cover the common variants.
+ *
+ * OpenRouter uses `context_length`; the other names cover the common variants, including the
+ * `maxInputTokens` spelling that this file's header notes the WorkBuddy host contract asks a
+ * custom model entry for.
+ *
+ * Output caps (`max_tokens`, `max_output_tokens`) are deliberately **not** read. They look like
+ * windows and sit an order of magnitude below one, so a provider publishing `max_tokens: 8192`
+ * would have this report an 8,192-token window — and the router would then trim a 200k
+ * conversation to fit it while the meter showed 8,192 as the model's capacity. A missing window
+ * stays missing and the caller falls back conservatively; a wrong one is silently believed.
  */
 export function parseContextWindow(raw: unknown): number | undefined {
   if (!raw || typeof raw !== "object") return undefined;
@@ -29,7 +38,9 @@ export function parseContextWindow(raw: unknown): number | undefined {
     toPositiveInt(r.context_window) ??
     toPositiveInt(r.contextWindow) ??
     toPositiveInt(r.max_context_length) ??
-    toPositiveInt(r.maxContextLength)
+    toPositiveInt(r.maxContextLength) ??
+    toPositiveInt(r.max_input_tokens) ??
+    toPositiveInt(r.maxInputTokens)
   );
 }
 

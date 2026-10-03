@@ -145,12 +145,64 @@ pub struct ToolCall {
 /// caller's own argument struct — see `execute_text`'s `forward_tool` for the shape that works and
 /// the reasoning. A shape diagnosis was made here, falsified against a 60-line reproduction, and
 /// replaced by the call-site one; the seam did not need changing.
+/// How much the model should think, mapped per dialect at render time (`interpreter.rs`'s
+/// `reasoning_values`). `Off` is a real request on the Anthropic dialect
+/// (`thinking: {type:"disabled"}` — probed 2026-10-02: agentrouter's reasoning models answer in a
+/// fraction of the time with it) and a best-effort omit on dialects that have no portable off
+/// switch. The mirror of `ReasoningEffort` in `ports.ts`; the budget table is shared by doc.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReasoningEffort::Off => "off",
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+        }
+    }
+
+    /// The wire spellings clients use. `minimal` (OpenAI's newer level) maps to `Low`, and the
+    /// "no thinking" words various clients send all map to `Off`; an unknown word is `None` — the
+    /// provider's default, not a guess.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "off" | "none" | "disabled" => Some(ReasoningEffort::Off),
+            "minimal" | "low" => Some(ReasoningEffort::Low),
+            "medium" => Some(ReasoningEffort::Medium),
+            "high" => Some(ReasoningEffort::High),
+            _ => None,
+        }
+    }
+
+    /// The shared budget table — see `reasoningValues` in `manifest-interpreter.ts` for the doc:
+    /// one table so the three levels mean the same thing on every dialect that thinks in tokens.
+    pub fn budget_tokens(self) -> Option<u64> {
+        match self {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some(1024),
+            ReasoningEffort::Medium => Some(4096),
+            ReasoningEffort::High => Some(8192),
+        }
+    }
+}
+
 pub struct TextArgs<'a> {
     pub model: String,
     pub messages: &'a [Value],
     pub stream: bool,
     pub max_tokens: Option<u64>,
     pub temperature: Option<f64>,
+    /// How much the model should think — rendered into the dialect's own request field by the
+    /// interpreter (`reasoning_values`), and omitted entirely when `None`, which leaves the
+    /// provider's own default.
+    pub reasoning: Option<ReasoningEffort>,
     pub tools: Option<&'a Value>,
     pub tool_choice: Option<&'a Value>,
     pub response_format: Option<&'a Value>,
@@ -167,6 +219,22 @@ pub struct TextArgs<'a> {
     /// app's truncation warning tests `reason == "length"`, and the gateway writes the value onto an
     /// OpenAI-shaped `finish_reason`. See `dialect_shaping::translate_finish_reason`.
     pub on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
+    /// The model's **reasoning**, as it streams — its own channel, never mixed into the chunk
+    /// stream, because reasoning is the model's notes and a consumer that rendered it as prose
+    /// would be quoting the notes as the answer.
+    ///
+    /// Detected by the payload's **own field names** (`delta.thinking` for Anthropic,
+    /// `delta.reasoning_content` for the OpenAI-compatible gateways, `delta.reasoning` for the
+    /// third spelling), not by a manifest selector: a provider wired up before this existed has no
+    /// selector to add, and the TypeScript side made the same call for the same reason. `None` (the
+    /// default) means the caller does not want reasoning and the adapter discards it — a reasoning
+    /// stream still produces zero chunks, so a caller that ignores this channel sees exactly what
+    /// it saw before.
+    ///
+    /// **Reasoning is not delivered output.** Firing this must not mark the attempt served, end
+    /// failover, or change any disposition — the `NO_OUTPUT` classification for a stream that
+    /// reasoned and never answered depends on that staying true.
+    pub on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
     /// Mark the last system message block with `cache_control: {"type":"ephemeral"}` on egress.
     /// Off by default; a provider without prefix caching will ignore or reject the field, so
     /// this is opt-in per operator. See `TextRequest::prompt_cache_enabled` for the read-side
@@ -182,51 +250,217 @@ pub struct TextArgs<'a> {
 
 /// What one upstream stream carried, counted at the source.
 ///
-/// Deliberately two facts, not a buffer: how many `data:` events arrived, and a truncated sample of
-/// the first. That is the minimum that separates "the provider streamed nothing" from "it streamed a
-/// shape this manifest cannot read" — two findings with different owners — and it is also the most
+/// Deliberately counts, not a buffer: how many `data:` events arrived, what **kind** of delta each
+/// one carried, and truncated samples. The kinds are the minimum that separates three findings with
+/// different owners — "the provider streamed nothing", "it streamed a shape this manifest cannot
+/// read", and "it streamed reasoning and the model never wrote an answer" — and samples are the most
 /// a ledger row can afford, since the payload is provider output and a full body would put user
 /// content in the database at whatever length the provider chose.
+///
+/// The classification is the Rust mirror of `stream-shape.ts` (which was built from the same
+/// captured `agentrouter.org` envelopes), and the two must agree about a given wire shape: the same
+/// request classifies through whichever engine serves it, and two records of one request that
+/// contradict each other is a defect class this codebase has fixed twice.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct StreamObservation {
     pub events: u32,
     pub first: Option<String>,
+    /// Deltas that carried the **answer** (`delta.text` / `delta.content`).
+    pub text: u32,
+    /// Payloads classified as reasoning, **including** a `content_block_start` that only announces
+    /// a thinking block — an announcement makes the reasoning real before its deltas arrive.
+    pub reasoning: u32,
+    /// Reasoning deltas that carried reasoning *text*. The `NO_OUTPUT` classification keys on this,
+    /// not on `reasoning`: the TypeScript classifies from accumulated reasoning *content*, which an
+    /// announcement contributes none of, so a stream that announced thinking and carried nothing is
+    /// `PARSE_ERROR` on both engines.
+    pub reasoning_carried: u32,
+    /// Deltas that carried tool-call fragments (`partial_json` / `tool_calls`).
+    pub tool: u32,
+    /// Anthropic's lifecycle events, which legitimately carry no delta.
+    pub lifecycle: u32,
+    /// Parsed but unrecognised, or not JSON at all.
+    pub other: u32,
+    /// The first payload that actually **carried a delta** — the representative sample. Positional
+    /// sampling quoted `message_start`, an event every Anthropic stream opens with, which is how a
+    /// row could stand for 8198 events while distinguishing none of them.
+    pub first_delta: Option<String>,
+    /// The reasoning field the stream used (`delta.thinking` vs `delta.reasoning_content` — an
+    /// Anthropic reasoning model vs an OpenAI-compatible one), named so an operator can judge the
+    /// finding. Set from carried deltas only: an announcement would name a key that is still null.
+    pub reasoning_field: Option<String>,
+    /// The raw finish reason seen on the stream (`delta.stop_reason` / `finish_reason`) — the
+    /// evidence that turns "the model reasoned" into "the model spent its output budget reasoning".
+    pub finish: Option<String>,
+}
+
+/// Anthropic's lifecycle events. They legitimately carry no delta, so a stream of only these is
+/// "the provider answered and had nothing to say" rather than a shape failure.
+const LIFECYCLE_TYPES: [&str; 6] = [
+    "message_start",
+    "message_delta",
+    "message_stop",
+    "ping",
+    "content_block_start",
+    "content_block_stop",
+];
+
+/// The truncated sample of a payload, cut on a char boundary.
+///
+/// The cap is in **bytes** — what a `TEXT` column and a `String` both measure — but a byte-indexed
+/// slice landing mid-UTF-8 would panic, so the cut walks back to a boundary first.
+fn sample(payload: &str, cap: usize) -> String {
+    if payload.len() <= cap {
+        return payload.to_string();
+    }
+    let mut cut = cap;
+    while !payload.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    format!("{}…", &payload[..cut])
 }
 
 impl StreamObservation {
-    /// The first event's sample cap, in **bytes** — what a `TEXT` column and a `String` both
-    /// measure. 240 bytes: enough to show a delta shape or an error envelope, small next to a
-    /// row's other text columns.
+    /// The sample cap, in bytes. 240: enough to show a delta shape or an error envelope, small next
+    /// to a row's other text columns.
     const SAMPLE_CHARS: usize = 240;
 
+    /// Record one `data:` payload. Called for every event, before any selector runs — a payload the
+    /// provider sent is evidence even when nothing downstream can read it.
+    ///
+    /// Classification keys on the payload's **own field names**, not on a manifest selector: the two
+    /// dialects put reasoning in two different places (`delta.thinking` for Anthropic,
+    /// `delta.reasoning_content` for the OpenAI-compatible gateways), and a provider wired up before
+    /// this existed has no selector to add — measured on the live `agent-router` manifest, whose
+    /// persisted `chunkMap` is `{delta}` alone.
     pub fn note(&mut self, payload: &str) {
         self.events += 1;
         if self.first.is_none() {
-            let sample = if payload.len() > Self::SAMPLE_CHARS {
-                // Char-boundary safe: a byte-indexed slice landing mid-UTF-8 would panic.
-                let mut cut = Self::SAMPLE_CHARS;
-                while !payload.is_char_boundary(cut) {
-                    cut -= 1;
-                }
-                format!("{}…", &payload[..cut])
-            } else {
-                payload.to_string()
-            };
-            self.first = Some(sample);
+            self.first = Some(sample(payload, Self::SAMPLE_CHARS));
+        }
+        let Ok(json) = serde_json::from_str::<serde_json::Value>(payload) else {
+            self.other += 1;
+            return;
+        };
+        // The raw finish reason, wherever the dialect puts it on a stream chunk. Raw, deliberately:
+        // this is evidence about the wire, not the OpenAI translation.
+        if self.finish.is_none() {
+            let finish = json
+                .pointer("/delta/stop_reason")
+                .or_else(|| json.pointer("/choices/0/finish_reason"))
+                .or_else(|| json.get("stop_reason"))
+                .and_then(|v| v.as_str());
+            if let Some(f) = finish {
+                self.finish = Some(f.to_string());
+            }
+        }
+        // The delta object, wherever this dialect puts it: top level for Anthropic, `choices[0]`
+        // for a raw OpenAI chunk.
+        let delta = json.get("delta").filter(|d| d.is_object()).map(|d| (d, ""));
+        let delta = delta.or_else(|| {
+            let d = json.pointer("/choices/0/delta")?;
+            d.as_object().map(|_| (d, "choices[0]."))
+        });
+        let Some((delta, path)) = delta else {
+            // No delta object. A `content_block_start` announcing a thinking block still makes the
+            // reasoning real before its deltas arrive — but it names no stream field and is not a
+            // carried delta, exactly like the TypeScript tally.
+            if json.pointer("/content_block/type").and_then(|t| t.as_str()) == Some("thinking") {
+                self.reasoning += 1;
+                return;
+            }
+            match json.get("type").and_then(|t| t.as_str()) {
+                Some(t) if LIFECYCLE_TYPES.contains(&t) => self.lifecycle += 1,
+                _ => self.other += 1,
+            }
+            return;
+        };
+        let dtype = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        // Text first: `text` is Anthropic's field, `content` is OpenAI's, `text_delta` the declared
+        // discriminator. Any of the three means this event carried the answer.
+        if dtype == "text_delta"
+            || delta.get("text").is_some_and(|v| v.is_string())
+            || delta.get("content").is_some_and(|v| v.is_string())
+        {
+            self.text += 1;
+            self.carried(payload);
+        } else if dtype == "thinking_delta" || delta.get("thinking").is_some_and(|v| v.is_string())
+        {
+            self.reasoning += 1;
+            self.reasoning_carried += 1;
+            self.reasoning_field.get_or_insert_with(|| format!("{path}delta.thinking"));
+            self.carried(payload);
+        } else if delta.get("reasoning_content").is_some_and(|v| v.is_string())
+            || dtype == "reasoning"
+        {
+            self.reasoning += 1;
+            self.reasoning_carried += 1;
+            self.reasoning_field.get_or_insert_with(|| format!("{path}delta.reasoning_content"));
+            self.carried(payload);
+        } else if dtype == "input_json_delta"
+            || delta.get("partial_json").is_some_and(|v| v.is_string())
+            || delta.get("tool_calls").is_some_and(|v| v.is_array())
+        {
+            self.tool += 1;
+            self.carried(payload);
+        } else {
+            self.other += 1;
         }
     }
 
-    /// The ledger wording. `None` when nothing was observed — the engine only asks on a drained
-    /// stream, but a drained stream with zero events is "the provider sent nothing", which is
-    /// itself worth stating once rather than implying.
-    pub fn describe(&self) -> Option<String> {
-        match (self.events, self.first.as_deref()) {
-            (0, _) => Some("stream carried no SSE events at all".to_string()),
-            (n, Some(first)) => Some(format!(
-                "stream carried {n} SSE event(s), none matched the manifest's delta selector; first: {first}"
-            )),
-            (n, None) => Some(format!("stream carried {n} SSE event(s) with no readable payload")),
+    /// A payload that carried the delta itself: worth sampling as the representative one.
+    /// An announcement is not one — see the `content_block_start` arm.
+    fn carried(&mut self, payload: &str) {
+        if self.first_delta.is_none() {
+            self.first_delta = Some(sample(payload, Self::SAMPLE_CHARS));
         }
+    }
+
+    /// The ledger wording for a stream that yielded nothing — the Rust mirror of
+    /// `describeSilentStream` (`stream-shape.ts`), word for word where the words are the contract.
+    ///
+    /// Three findings, which a reader acts on differently:
+    ///  - nothing at all → the provider sent no events
+    ///  - every delta reasoning → the provider behaved correctly and the model never emitted text,
+    ///    so there is no manifest to fix and the selector is not at fault
+    ///  - otherwise → a shape the manifest does not select, with a representative delta quoted
+    pub fn describe(&self) -> Option<String> {
+        if self.events == 0 {
+            return Some("stream carried no SSE events at all".to_string());
+        }
+        let quoted = self.first_delta.as_deref().or(self.first.as_deref());
+        let Some(quoted) = quoted else {
+            return Some(format!(
+                "stream carried {} SSE event(s) with no readable payload",
+                self.events
+            ));
+        };
+        let head = format!(
+            "stream carried {} SSE event(s), none matched the manifest's delta selector",
+            self.events
+        );
+        if self.text == 0 && self.tool == 0 && self.reasoning > 0 {
+            // The measured case (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended
+            // thinking is on by default, `max_tokens` covers thinking **and** answer, and the
+            // thinking consumed the whole 8192-token budget. Probed: the same prompt answers at
+            // 64000, and answers in 9 s with thinking disabled. The advice is the actionable half;
+            // the finding above it is what a reader must be able to trust first. `finish` is the
+            // raw dialect word or the OpenAI translation — either means the output cap.
+            let advice = match self.finish.as_deref() {
+                Some("max_tokens") | Some("length") => {
+                    "; the model spent its entire output budget reasoning and stopped at the limit \
+                     before answering a word — raise this provider's max output tokens, or turn \
+                     thinking off for it"
+                }
+                _ => "; the model stopped before answering",
+            };
+            let field = self.reasoning_field.as_deref().unwrap_or("reasoning");
+            return Some(format!(
+                "{head}; every delta was model reasoning ({field}) and no text was sent, so the \
+                 selector is not at fault{advice}; first delta: {quoted}"
+            ));
+        }
+        Some(format!("{head}; first: {quoted}"))
     }
 }
 
@@ -392,6 +626,201 @@ mod tests {
         assert!(d.contains("2 SSE event"), "{d}");
         assert!(d.contains("none matched the manifest's delta selector"), "{d}");
         assert!(d.contains("{\"choices\":[]}"), "the sample is in the wording: {d}");
+    }
+
+    // ---------- the stream-shape mirrors (`stream-shape.test.ts`) ----------
+    //
+    // The envelopes below were captured from `agentrouter.org` (`deepseek-v4-flash`) on 2026-10-02
+    // while diagnosing an "the agent is not replying" report, the same fixtures the TypeScript side
+    // pins. The two engines must agree about a given wire shape: whichever one serves a request
+    // writes its row, and two records of one request that contradict each other is the defect class
+    // this classification exists to end.
+
+    /// Every `data:` payload of one stream, through one observation.
+    fn observed(payloads: &[serde_json::Value]) -> StreamObservation {
+        let mut o = StreamObservation::default();
+        for p in payloads {
+            o.note(&p.to_string());
+        }
+        o
+    }
+
+    fn at(t: &str) -> serde_json::Value {
+        serde_json::json!({
+            "content_block": null, "delta": null, "error": null, "index": 0, "message": null,
+            "type": t,
+        })
+    }
+
+    fn thinking_delta(text: &str) -> serde_json::Value {
+        serde_json::json!({
+            "content_block": null, "delta": {"thinking": text, "type": "thinking_delta"},
+            "error": null, "index": 0, "message": null, "type": "content_block_delta",
+        })
+    }
+
+    #[test]
+    fn a_reasoning_only_anthropic_stream_is_not_reported_as_a_manifest_defect() {
+        let o = observed(&[
+            at("message_start"),
+            serde_json::json!({
+                "content_block": {"signature": "", "thinking": "", "type": "thinking"},
+                "delta": null, "error": null, "index": 0, "message": null, "type": "content_block_start",
+            }),
+            at("ping"),
+            thinking_delta("Confirmed"),
+            thinking_delta(" the plan"),
+            serde_json::json!({
+                "content_block": null, "delta": {"signature": "abc", "type": "signature_delta"},
+                "error": null, "index": 0, "message": null, "type": "content_block_delta",
+            }),
+            at("content_block_stop"),
+            serde_json::json!({
+                "content_block": null, "delta": {"stop_reason": "max_tokens", "stop_sequence": null},
+                "error": null, "index": 0, "message": null,
+                "type": "message_delta",
+                "usage": {"input_tokens": 2310, "output_tokens": 8192},
+            }),
+            at("message_stop"),
+        ]);
+        assert_eq!(
+            o.reasoning, 3,
+            "the announcement and the two thinking deltas; the signature delta is other"
+        );
+        assert_eq!(o.reasoning_carried, 2, "only the thinking deltas carried reasoning text");
+        assert_eq!(o.text, 0);
+        assert_eq!(
+            o.first_delta.as_deref(),
+            Some(thinking_delta("Confirmed").to_string().as_str())
+        );
+        assert_eq!(o.finish.as_deref(), Some("max_tokens"));
+
+        let d = o.describe().expect("described");
+        assert!(d.contains("every delta was model reasoning"), "{d}");
+        assert!(d.contains("delta.thinking"), "{d}");
+        assert!(d.contains("no text was sent"), "{d}");
+        assert!(d.contains("the selector is not at fault"), "{d}");
+        // `stop_reason: max_tokens` reaches the wording as the actionable half: what to change.
+        assert!(d.contains("output budget"), "{d}");
+        assert!(d.contains("max output tokens"), "{d}");
+        // And the quoted sample is a delta, never `message_start` — the lifecycle opener every
+        // Anthropic stream shares, which is what the old positional sample quoted.
+        assert!(d.contains("thinking_delta"), "{d}");
+        assert!(!d.contains("message_start"), "{d}");
+    }
+
+    #[test]
+    fn without_a_finish_reason_the_finding_still_stands_with_weaker_advice() {
+        let mut o =
+            observed(&[at("message_start"), thinking_delta("a thought"), at("message_stop")]);
+        // Strip the finish the message_delta carried, simulating a provider that never named one.
+        o.finish = None;
+        let d = o.describe().expect("described");
+        assert!(d.contains("every delta was model reasoning"), "{d}");
+        assert!(d.contains("stopped before answering"), "{d}");
+        assert!(!d.contains("output budget"), "{d}");
+    }
+
+    #[test]
+    fn an_openai_reasoning_content_stream_names_that_field_not_the_anthropic_one() {
+        let o = observed(&[
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": "thinking..."}}]}),
+            serde_json::json!({"choices": [{"delta": {"reasoning_content": "more"}}]}),
+        ]);
+        assert_eq!(o.reasoning, 2);
+        assert_eq!(o.reasoning_carried, 2);
+        assert_eq!(o.reasoning_field.as_deref(), Some("choices[0].delta.reasoning_content"));
+        let d = o.describe().expect("described");
+        assert!(d.contains("2 SSE event"), "{d}");
+        assert!(d.contains("every delta was model reasoning"), "{d}");
+        assert!(d.contains("choices[0].delta.reasoning_content"), "{d}");
+    }
+
+    #[test]
+    fn a_thinking_announcement_counts_as_reasoning_but_carries_no_delta() {
+        // The announcement makes the reasoning real before its deltas arrive, but it names no
+        // stream field (the key is still null) and is not a carried delta — so a stream of only an
+        // announcement is `PARSE_ERROR`, the same call the TypeScript makes from accumulated
+        // *content*, which an announcement contributes none of.
+        let o = observed(&[serde_json::json!({
+            "content_block": {"signature": "", "thinking": "", "type": "thinking"},
+            "delta": null, "error": null, "index": 0, "message": null, "type": "content_block_start",
+        })]);
+        assert_eq!(o.reasoning, 1);
+        assert_eq!(o.reasoning_carried, 0);
+        assert!(o.reasoning_field.is_none());
+        assert!(o.first_delta.is_none());
+    }
+
+    #[test]
+    fn text_is_recognised_from_either_dialect_s_field_and_ends_the_reasoning_arm() {
+        let o = observed(&[
+            thinking_delta("first, think"),
+            serde_json::json!({
+                "content_block": null, "delta": {"text": "then answer", "type": "text_delta"},
+                "error": null, "index": 0, "message": null, "type": "content_block_delta",
+            }),
+            serde_json::json!({"choices": [{"delta": {"content": " openai"}}]}),
+        ]);
+        assert_eq!(o.text, 2);
+        assert_eq!(o.reasoning, 1);
+        // A stream that answered is not described as reasoning-only — the output itself is the
+        // answer to "what did the provider send", which is why describe() is only asked on a
+        // drained stream at all. The tally is what keeps the classification honest.
+        let d = o.describe().expect("described");
+        assert!(!d.contains("model reasoning"), "{d}");
+    }
+
+    #[test]
+    fn lifecycle_events_are_counted_and_never_sampled_as_deltas() {
+        let o = observed(&[
+            at("message_start"),
+            at("ping"),
+            at("content_block_stop"),
+            at("message_stop"),
+        ]);
+        assert_eq!(o.lifecycle, 4);
+        assert_eq!(o.text, 0);
+        assert_eq!(o.reasoning, 0);
+        assert!(o.first_delta.is_none(), "no delta ever arrived");
+        assert!(o.first.is_some(), "the first event is still the sample");
+    }
+
+    #[test]
+    fn tool_call_framing_is_recognised_so_a_tool_turn_is_never_filed_empty() {
+        let o = observed(&[
+            serde_json::json!({
+                "content_block": null, "delta": {"partial_json": "{\"pa", "type": "input_json_delta"},
+                "error": null, "index": 1, "message": null, "type": "content_block_delta",
+            }),
+            serde_json::json!({"choices": [{"delta": {"tool_calls": [{"id": "c1"}]}}]}),
+        ]);
+        assert_eq!(o.tool, 2);
+    }
+
+    #[test]
+    fn a_non_json_payload_is_other_evidence_not_a_second_failure() {
+        let mut o = StreamObservation::default();
+        o.note("<html>502</html>");
+        assert_eq!(o.other, 1);
+        let d = o.describe().expect("described");
+        assert!(d.contains("<html>502</html>"), "{d}");
+        assert!(!d.contains("model reasoning"), "{d}");
+    }
+
+    #[test]
+    fn the_finish_reason_is_taken_from_wherever_the_dialect_puts_it() {
+        // Anthropic nests it under `delta` on `message_delta`; OpenAI puts `finish_reason` on the
+        // choice. Either one means the output cap, which is the only fact the advice needs.
+        let anthropic = observed(&[serde_json::json!({
+            "content_block": null, "delta": {"stop_reason": "max_tokens", "stop_sequence": null},
+            "error": null, "index": 0, "message": null, "type": "message_delta",
+        })]);
+        assert_eq!(anthropic.finish.as_deref(), Some("max_tokens"));
+        let openai = observed(&[serde_json::json!({
+            "choices": [{"delta": {}, "finish_reason": "length"}],
+        })]);
+        assert_eq!(openai.finish.as_deref(), Some("length"));
     }
 
     #[test]
@@ -562,12 +991,14 @@ mod tests {
             stream: true,
             max_tokens: None,
             temperature: None,
+            reasoning: None,
             tools: None,
             tool_choice: None,
             response_format: None,
             on_tool_call: None,
             on_usage: None,
             on_finish: None,
+            on_reasoning: None,
             prompt_cache_enabled: false,
             observation: None,
         }

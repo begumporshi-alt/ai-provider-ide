@@ -405,12 +405,21 @@ pub(crate) async fn messages_h(
             let mut finish_reason: Option<String> = None;
             while let Some(msg) = slot.recv().await {
                 match msg {
+                    // The bridge's held-prose liveness frame: it exists to disarm
+                    // FIRST_MSG_TIMEOUT and is never a wire event (audit 2026-10-03 R2).
+                    BridgeMsg::Liveness => {}
                     BridgeMsg::Delta(t) => {
                         streamed.push_str(&t);
                         tracing::info!(request_id = id, delta_len = t.len(), "anthropic stream delta received");
                         let d = json!({ "type": "content_block_delta", "index": 0, "delta": { "type": "text_delta", "text": t } });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().event("content_block_delta").data(d.to_string()));
                     }
+                    // Reasoning is carried by the bridge, but this dialect does not forward it: the
+                    // `reasoning_content` convention belongs to the OpenAI-compatible surface
+                    // (DeepSeek-origin; OpenRouter and LiteLLM normalise to it). The Anthropic wire
+                    // shape would be `thinking_delta` blocks, which carry signatures a client must
+                    // replay verbatim — a contract of its own, deliberately not improvised here.
+                    BridgeMsg::Reasoning(_) => {}
                     BridgeMsg::Result(_) => {}
                     BridgeMsg::Finish(reason) => finish_reason = Some(reason),
                     BridgeMsg::Done => {
@@ -532,6 +541,10 @@ pub(crate) async fn messages_h(
                 );
                 full.push_str(&t);
             }
+            // Carries nothing by design; see the stream arm (audit 2026-10-03 R2).
+            BridgeMsg::Liveness => {}
+            // See the stream arm: thinking_delta blocks carry replay signatures; not improvised.
+            BridgeMsg::Reasoning(_) => {}
             BridgeMsg::Result(_) => {}
             BridgeMsg::Finish(reason) => finish_reason = Some(reason),
             BridgeMsg::Done => {

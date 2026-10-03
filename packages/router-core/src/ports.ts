@@ -95,12 +95,26 @@ export type ChatMessage = {
   tool_calls?: unknown;
 };
 
+/**
+ * How much the model should think, mapped per dialect at request-render time (`reasoningValues` in
+ * `manifest-interpreter.ts`). `Off` is a real request on the Anthropic dialect
+ * (`thinking: {type:"disabled"}` — probed 2026-10-02: agentrouter's reasoning models answer in a
+ * fraction of the time with it) and a best-effort omit on dialects that have no portable off switch.
+ */
+export type ReasoningEffort = "off" | "low" | "medium" | "high";
+
 export interface TextRequest {
   model: string;
   messages: ChatMessage[];
   /** §3.4 compatibility contract: both supported, passed through when the manifest allows. */
   maxTokens?: number;
   temperature?: number;
+  /**
+   * How much the model should think. Rendered into the dialect's own request field by the
+   * interpreter (`reasoningValues`) — Anthropic `thinking`, OpenAI `reasoning_effort`, Gemini
+   * `thinkingConfig` — and omitted entirely when unset, which leaves the provider's own default.
+   */
+  reasoning?: ReasoningEffort;
   /** Tool calling support (§3.4) */
   tools?: unknown;
   toolChoice?: unknown;
@@ -123,6 +137,16 @@ export interface TextRequest {
    * `responseFinish` selector. Absent if the provider never emitted one.
    */
   onFinish?: (reason: string | undefined) => void;
+  /**
+   * The model's **reasoning**, as it streams — its own channel, never mixed into `chunks`.
+   *
+   * A caller that renders it gets to show the model's thinking; a caller that ignores it still
+   * gains, because the engine keeps its own copy and uses it to classify a turn that produced no
+   * answer. Without this the reasoning was discarded at the interpreter and a model whose thinking
+   * outran its output budget (measured: 8192 tokens of `thinking_delta`, zero `text_delta`) looked
+   * exactly like a provider that sent nothing. See `TextArgs.onReasoningDelta`.
+   */
+  onReasoning?: (text: string) => void;
 }
 
 /**

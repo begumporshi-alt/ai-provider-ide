@@ -80,6 +80,11 @@ packages/router-core/    routing, adapter runtime, model catalog, onboarding orc
 packages/adapter-spec/   the manifest grammar (zod) — the frozen contract
 ```
 
+Inside `apps/desktop/src-tauri/`, the `src/core/` half is deliberately Tauri-free, and a headless
+binary target (`aiproviderd`) builds from it — phase 1 of detaching the gateway from the UI process,
+tracked in [the dev book's headless chapter](docs/dev-book/10-headless-service.md). It does **not**
+serve completions yet; the desktop app is the only supported way to run the gateway.
+
 The repository root holds only the audience-facing documents — `README.md`, `USER_GUIDE.md`,
 `CONTRIBUTING.md`, `SECURITY.md`, `CHANGELOG.md` and `LICENSE`. Everything else is in
 [`docs/`](docs/) — design notes, session records, audits — with the visual diagrams in

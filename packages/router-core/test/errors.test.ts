@@ -4,7 +4,7 @@
  * about the network) — plus the reason passthrough that keeps the provider's own words.
  */
 import { describe, expect, it } from "vitest";
-import { classify, classifyHttp, reasonFromBody } from "../src/errors.js";
+import { MAX_REASON_CHARS, classify, classifyFailure, classifyHttp, detectStatedTimeout, reasonFromBody } from "../src/errors.js";
 import { HealthTracker } from "../src/health-tracker.js";
 import type { ApiKeyRecord } from "../src/domain.js";
 
@@ -72,12 +72,36 @@ describe("reasonFromBody", () => {
       .toBe("content-blocked: content-blocked (request id: x)");
   });
 
-  it("falls back to the raw body and truncates", () => {
+  it("keeps a validation error whole enough to state its rule", () => {
+    // Measured from agentrouter.org on 2026-10-02, verbatim apart from the ids. It is 186
+    // characters before the aggregator's own request/trace suffixes, so the old 120-character cut
+    // landed at "Each `…" — dropping both the offending id and the sentence that names the rule.
+    // A live 400 showing that row could not be diagnosed, which is the whole job of this field.
+    const message =
+      "unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_bogus_123. " +
+      "Each `tool_result` block must have a corresponding `tool_use` block in the previous message.";
+    const got = reasonFromBody(JSON.stringify({ error: { message } }))!;
+
+    expect(got).toContain("toolu_bogus_123");
+    expect(got).toContain("must have a corresponding");
+    expect(got).not.toContain("…");
+  });
+
+  it("falls back to the raw body and truncates a runaway one", () => {
     expect(reasonFromBody("plain refusal text")).toBe("plain refusal text");
-    const long = "x".repeat(200);
+    const long = "x".repeat(MAX_REASON_CHARS + 300);
     const got = reasonFromBody(long)!;
-    expect(got.length).toBeLessThanOrEqual(120);
+    expect(got.length).toBeLessThanOrEqual(MAX_REASON_CHARS + 1); // the ellipsis is the extra
     expect(got.endsWith("…")).toBe(true);
+  });
+
+  it("cuts on a code point, so a split surrogate never reaches the ledger", () => {
+    const got = reasonFromBody("🙂".repeat(MAX_REASON_CHARS + 10))!;
+    const lone = [...got].some((c) => {
+      const cp = c.codePointAt(0) ?? 0;
+      return cp >= 0xd800 && cp <= 0xdfff;
+    });
+    expect(lone).toBe(false);
   });
 });
 
@@ -107,5 +131,44 @@ describe("execution-engine consumes the body", () => {
     const err = await interp.listModels("key:t").catch((e) => e);
     expect(err).toBeInstanceOf(ManifestHttpError);
     expect(reasonFromBody(err.body)).toContain("content-blocked");
+  });
+});
+
+describe("a provider that states its own cause inside a 2xx", () => {
+  // Measured 2026-10-03 on `vice` (`deepseek-v4-flash`): HTTP 200 carrying
+  // {"message":"The request timed out. Please try again.","code":"timeout"}. The engine read the
+  // status alone, found it healthy, and filed PARSE_ERROR — naming our reader for a failure the
+  // provider had explained, and counting it as provider drift into the bargain.
+  const relayTimeout = JSON.stringify({
+    message: "The request timed out. Please try again.",
+    code: "timeout",
+  });
+
+  it("names the timeout instead of blaming the parser", () => {
+    expect(detectStatedTimeout(relayTimeout)).toBe("timeout");
+    expect(classifyFailure("PARSE_ERROR", relayTimeout)).toBe("TIMEOUT");
+  });
+
+  it("reads the nested error envelope too", () => {
+    const nested = JSON.stringify({ error: { code: "gateway_timeout" } });
+    expect(detectStatedTimeout(nested)).toBe("gateway_timeout");
+    expect(classifyFailure("PARSE_ERROR", nested)).toBe("TIMEOUT");
+  });
+
+  it("does not fire on an answer that merely discusses timeouts", () => {
+    // Why this detector insists on a structured envelope: there is no status to gate on here, and a
+    // model writing a fetch wrapper with a timeout is not a timeout failure.
+    expect(classifyFailure("PARSE_ERROR", "Here is a wrapper with a 30s timeout")).toBe("PARSE_ERROR");
+    expect(detectStatedTimeout(JSON.stringify({ text: "set a timeout of 5s" }))).toBeUndefined();
+    expect(
+      detectStatedTimeout(JSON.stringify({ choices: [{ message: { content: "timeout" } }] })),
+    ).toBeUndefined();
+  });
+
+  it("keeps the fallback when the body states nothing", () => {
+    // Unreadable is still our side of the contract when the provider said nothing at all.
+    expect(classifyFailure("PARSE_ERROR", "<html>502 Bad Gateway</html>")).toBe("PARSE_ERROR");
+    expect(classifyFailure("PARSE_ERROR", undefined)).toBe("PARSE_ERROR");
+    expect(detectStatedTimeout('data: {"delta":"hi"}')).toBeUndefined();
   });
 });

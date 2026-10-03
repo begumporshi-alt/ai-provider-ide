@@ -80,9 +80,11 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 const CACHE_TTL: Duration = Duration::from_secs(15 * 60);
 const CACHE_MAX_ENTRIES: usize = 32;
 
-fn fetch_cache() -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
-    static CELL: OnceLock<std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>> =
-        OnceLock::new();
+fn fetch_cache(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>> {
+    static CELL: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (std::time::Instant, String)>>,
+    > = OnceLock::new();
     CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -91,11 +93,7 @@ fn cache_insert(url: String, text: String, at: std::time::Instant) {
     let mut cache = fetch_cache().lock().unwrap();
     if cache.len() >= CACHE_MAX_ENTRIES && !cache.contains_key(&url) {
         // Evict the oldest entry rather than refusing: a full cache must not disable caching.
-        if let Some(oldest) = cache
-            .iter()
-            .min_by_key(|(_, (t, _))| *t)
-            .map(|(k, _)| k.clone())
-        {
+        if let Some(oldest) = cache.iter().min_by_key(|(_, (t, _))| *t).map(|(k, _)| k.clone()) {
             cache.remove(&oldest);
         }
     }
@@ -144,10 +142,7 @@ fn forbidden_ip(ip: IpAddr) -> bool {
 pub fn check_public_http_url(raw: &str) -> Result<reqwest::Url, String> {
     let url = reqwest::Url::parse(raw).map_err(|e| format!("bad URL: {e}"))?;
     if url.scheme() != "http" && url.scheme() != "https" {
-        return Err(format!(
-            "only http(s) URLs are supported, not \"{}\"",
-            url.scheme()
-        ));
+        return Err(format!("only http(s) URLs are supported, not \"{}\"", url.scheme()));
     }
     if !url.username().is_empty() || url.password().is_some() {
         return Err("URLs with embedded credentials are refused".into());
@@ -158,17 +153,14 @@ pub fn check_public_http_url(raw: &str) -> Result<reqwest::Url, String> {
             // A literal IP (brackets stripped for IPv6) needs no resolution; a name must
             // actually resolve, and every resolved address is checked — the textual host is
             // not the boundary, the address behind it is.
-            let literal = domain
-                .trim_start_matches('[')
-                .trim_end_matches(']')
-                .parse::<IpAddr>()
-                .ok();
+            let literal =
+                domain.trim_start_matches('[').trim_end_matches(']').parse::<IpAddr>().ok();
             match literal {
                 Some(ip) => vec![ip],
                 None => {
-                    let resolved = (domain, port).to_socket_addrs().map_err(|e| {
-                        format!("cannot resolve host \"{domain}\": {e}")
-                    })?;
+                    let resolved = (domain, port)
+                        .to_socket_addrs()
+                        .map_err(|e| format!("cannot resolve host \"{domain}\": {e}"))?;
                     resolved.map(|sa: SocketAddr| sa.ip()).collect()
                 }
             }
@@ -235,22 +227,16 @@ pub fn http_get(url: &reqwest::Url) -> Result<Vec<u8>, String> {
         let total = resp.content_length();
         if let Some(n) = total {
             if n as usize > MAX_BODY_BYTES {
-                return Err(format!(
-                    "response is {n} bytes, over the {MAX_BODY_BYTES}-byte cap"
-                ));
+                return Err(format!("response is {n} bytes, over the {MAX_BODY_BYTES}-byte cap"));
             }
         }
         let mut body: Vec<u8> = Vec::new();
         let mut resp = resp;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("reading the response failed: {e}"))?
+        while let Some(chunk) =
+            resp.chunk().await.map_err(|e| format!("reading the response failed: {e}"))?
         {
             if body.len() + chunk.len() > MAX_BODY_BYTES {
-                return Err(format!(
-                    "response exceeds the {MAX_BODY_BYTES}-byte cap"
-                ));
+                return Err(format!("response exceeds the {MAX_BODY_BYTES}-byte cap"));
             }
             body.extend_from_slice(&chunk);
         }
@@ -282,11 +268,7 @@ pub fn web_fetch_text(raw_url: &str) -> Result<String, String> {
     } else {
         String::new()
     };
-    let mut text = if looks_like_html(&body) {
-        html_to_text(&raw)
-    } else {
-        raw
-    };
+    let mut text = if looks_like_html(&body) { html_to_text(&raw) } else { raw };
     if text.len() > MAX_TEXT_BYTES {
         let mut cut = MAX_TEXT_BYTES;
         while !text.is_char_boundary(cut) {
@@ -313,7 +295,10 @@ pub fn web_fetch_text(raw_url: &str) -> Result<String, String> {
 /// that sniffing serves the model better.
 fn looks_like_html(body: &[u8]) -> bool {
     let head = String::from_utf8_lossy(&body[..body.len().min(512)]).to_lowercase();
-    head.contains("<html") || head.contains("<!doctype") || head.contains("<body") || head.contains("<head")
+    head.contains("<html")
+        || head.contains("<!doctype")
+        || head.contains("<body")
+        || head.contains("<head")
 }
 
 // ── HTML → text ──────────────────────────────────────────────────────────────────────────
@@ -453,12 +438,11 @@ fn percent_decode(s: &str) -> String {
 pub fn parse_ddg_lite(html: &str) -> Vec<WebSearchHit> {
     let anchor_re = Regex::new(r#"(?is)<a\b([^>]*)>(.*?)</a>"#).expect("constant");
     let href_re = Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#).expect("constant");
-    let snippet_re = Regex::new(r#"(?is)<td[^>]*class=["']?result-snippet["']?[^>]*>(.*?)</td>"#).expect("constant");
+    let snippet_re = Regex::new(r#"(?is)<td[^>]*class=["']?result-snippet["']?[^>]*>(.*?)</td>"#)
+        .expect("constant");
 
-    let snippets: Vec<String> = snippet_re
-        .captures_iter(html)
-        .map(|c| html_to_text(&c[1]))
-        .collect();
+    let snippets: Vec<String> =
+        snippet_re.captures_iter(html).map(|c| html_to_text(&c[1])).collect();
 
     let mut hits: Vec<WebSearchHit> = Vec::new();
     for caps in anchor_re.captures_iter(html) {
@@ -495,14 +479,14 @@ pub fn parse_ddg_lite(html: &str) -> Vec<WebSearchHit> {
 /// links, `result__snippet` blurbs). The two templates are the first two chain backends: same
 /// provider, but a markup change on one page does not touch the other.
 pub fn parse_ddg_html(html: &str) -> Vec<WebSearchHit> {
-    let link_re = Regex::new(r#"(?is)<a\b[^>]*class=["']result__a["'][^>]*>(.*?)</a>"#).expect("constant");
+    let link_re =
+        Regex::new(r#"(?is)<a\b[^>]*class=["']result__a["'][^>]*>(.*?)</a>"#).expect("constant");
     let href_re = Regex::new(r#"(?i)href\s*=\s*["']([^"']+)["']"#).expect("constant");
-    let snippet_re = Regex::new(r#"(?is)<a\b[^>]*class=["']result__snippet["'][^>]*>(.*?)</a>"#).expect("constant");
+    let snippet_re = Regex::new(r#"(?is)<a\b[^>]*class=["']result__snippet["'][^>]*>(.*?)</a>"#)
+        .expect("constant");
 
-    let snippets: Vec<String> = snippet_re
-        .captures_iter(html)
-        .map(|c| html_to_text(&c[1]))
-        .collect();
+    let snippets: Vec<String> =
+        snippet_re.captures_iter(html).map(|c| html_to_text(&c[1])).collect();
 
     let mut hits: Vec<WebSearchHit> = Vec::new();
     for caps in link_re.captures_iter(html) {
@@ -544,11 +528,15 @@ pub fn parse_ddg_html(html: &str) -> Vec<WebSearchHit> {
 /// markup surprises, reachable because the search backends bypass the public-URL guard (the
 /// guard governs what the MODEL may fetch, not what the app's own configured services are).
 pub fn parse_searxng(html: &str) -> Vec<WebSearchHit> {
-    let article_re = Regex::new(r#"(?is)<article\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>(.*?)</article>"#)
-        .expect("constant");
-    let link_re = Regex::new(r#"(?is)<a\b([^>]*)href=["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("constant");
-    let content_re = Regex::new(r#"(?is)<p\b[^>]*class=["'][^"']*\bcontent\b[^"']*["'][^>]*>(.*?)</p>"#)
-        .expect("constant");
+    let article_re = Regex::new(
+        r#"(?is)<article\b[^>]*class=["'][^"']*\bresult\b[^"']*["'][^>]*>(.*?)</article>"#,
+    )
+    .expect("constant");
+    let link_re =
+        Regex::new(r#"(?is)<a\b([^>]*)href=["']([^"']+)["'][^>]*>(.*?)</a>"#).expect("constant");
+    let content_re =
+        Regex::new(r#"(?is)<p\b[^>]*class=["'][^"']*\bcontent\b[^"']*["'][^>]*>(.*?)</p>"#)
+            .expect("constant");
 
     let mut hits: Vec<WebSearchHit> = Vec::new();
     for caps in article_re.captures_iter(html) {
@@ -564,10 +552,7 @@ pub fn parse_searxng(html: &str) -> Vec<WebSearchHit> {
         if title.is_empty() {
             continue;
         }
-        let snippet = content_re
-            .captures(block)
-            .map(|c| html_to_text(&c[1]))
-            .unwrap_or_default();
+        let snippet = content_re.captures(block).map(|c| html_to_text(&c[1])).unwrap_or_default();
         hits.push(WebSearchHit { title, url, snippet });
         if hits.len() >= 10 {
             break;
@@ -580,23 +565,31 @@ pub fn parse_searxng(html: &str) -> Vec<WebSearchHit> {
 /// list of them.
 type SearchBackend = fn(&str) -> Result<Vec<WebSearchHit>, String>;
 
-/// The vault account holding the optional search key, as `"<provider>|<key>"` with provider
-/// `brave` or `tavily`. Written by the Assistant's settings UI through the `vault_put`
-/// command; the chain reads it at call time, so saving a key takes effect on the next search
-/// without a restart. Absent = keyless mode, the zero-config default.
+/// The dynamic form of a backend for the failover chain: a trait object, so tests can pass
+/// closures that count calls (`fn` pointers cannot close over state).
+type DynSearchBackend<'a> = &'a (dyn Fn(&str) -> Result<Vec<WebSearchHit>, String> + 'a);
+
+// The key tier below — a vault-stored Brave/Tavily key and the plumbing that serves it — is held
+// ready, not wired: no settings field for a search key exists yet, so nothing reachable from a
+// release build uses it. The tests at the bottom of this file drive `chain_for` and the parsers
+// directly, which is what keeps the tier exercised; wiring it is one entry at the HEAD of the
+// backend list (see `web_search`'s doc comment).
+#[allow(dead_code)]
 const SEARCH_KEY_ACCOUNT: &str = "websearch";
 
 /// The key-tier backends. These are official APIs — the stable path the keyless chain defers
 /// to whenever the user has configured a key. Each parses the provider's JSON and needs a
 /// `POST`-or-header variant of the fetch, so they carry their own thin request code instead of
 /// `http_get`.
+#[allow(dead_code)]
 fn search_brave(query: &str) -> Result<Vec<WebSearchHit>, String> {
     let secret = vault_secret()?;
     let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
     if key.is_empty() {
         return Err("no key configured".into());
     }
-    let mut url = reqwest::Url::parse("https://api.search.brave.com/res/v1/web/search").expect("constant");
+    let mut url =
+        reqwest::Url::parse("https://api.search.brave.com/res/v1/web/search").expect("constant");
     url.query_pairs_mut().append_pair("q", query);
     url.query_pairs_mut().append_pair("count", "10");
     let body = http_get_with_headers(
@@ -606,6 +599,7 @@ fn search_brave(query: &str) -> Result<Vec<WebSearchHit>, String> {
     parse_brave_json(&body)
 }
 
+#[allow(dead_code)]
 fn search_tavily(query: &str) -> Result<Vec<WebSearchHit>, String> {
     let secret = vault_secret()?;
     let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
@@ -614,13 +608,14 @@ fn search_tavily(query: &str) -> Result<Vec<WebSearchHit>, String> {
     }
     let body = http_post_json(
         "https://api.tavily.com/search",
-        &key,
+        key,
         &serde_json::json!({ "api_key": key, "query": query, "max_results": 10 }).to_string(),
     )?;
     parse_tavily_json(&body)
 }
 
 /// The stored `<provider>|<key>` secret, if one is configured and well-formed.
+#[allow(dead_code)]
 fn vault_secret() -> Result<String, String> {
     match crate::core::vault::get(SEARCH_KEY_ACCOUNT) {
         Ok(Some(secret)) if secret.contains('|') && !secret.ends_with('|') => Ok(secret),
@@ -630,6 +625,7 @@ fn vault_secret() -> Result<String, String> {
 }
 
 /// Parse Brave's web-search JSON: `web.results[]` of `{title, url, description}`.
+#[allow(dead_code)]
 fn parse_brave_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("Brave returned non-JSON: {e}"))?;
@@ -650,6 +646,7 @@ fn parse_brave_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
 }
 
 /// Parse Tavily's JSON: `results[]` of `{title, url, content}`.
+#[allow(dead_code)]
 fn parse_tavily_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("Tavily returned non-JSON: {e}"))?;
@@ -669,12 +666,14 @@ fn parse_tavily_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
         .collect())
 }
 
+#[allow(dead_code)]
 fn snip(s: &str) -> String {
     s.chars().take(120).collect()
 }
 
 /// GET with extra headers — the shape `http_get` cannot express (Brave authenticates by
 /// header). Same timeout and no-redirect discipline.
+#[allow(dead_code)]
 fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -700,6 +699,7 @@ fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result
 
 /// POST JSON with a bearer-free `Content-Type` body — Tavily authenticates in the body. Same
 /// timeout and no-redirect discipline as `http_get`.
+#[allow(dead_code)]
 fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -727,6 +727,7 @@ fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
 
 /// The keyless backends, tried in order after any key tier. A self-hosted SearXNG slots in at
 /// the TAIL (see [`parse_searxng`]).
+#[allow(dead_code)]
 fn keyless_backends() -> Vec<(&'static str, SearchBackend)> {
     vec![("DuckDuckGo", search_ddg_lite), ("DuckDuckGo (html)", search_ddg_html)]
 }
@@ -734,6 +735,7 @@ fn keyless_backends() -> Vec<(&'static str, SearchBackend)> {
 /// The chain as a pure function of the configured secret, which is what makes the tiering
 /// testable without touching the vault. The key backend goes at the HEAD: when the user
 /// configured one, it is the answer they asked for; the keyless backends become the fallback.
+#[allow(dead_code)]
 fn chain_for(secret: Option<&str>) -> Vec<(&'static str, SearchBackend)> {
     let mut out: Vec<(&'static str, SearchBackend)> = Vec::new();
     match secret.map(str::trim).filter(|s| !s.is_empty()) {
@@ -746,6 +748,7 @@ fn chain_for(secret: Option<&str>) -> Vec<(&'static str, SearchBackend)> {
 }
 
 /// The chain as the app will run it: whatever key the user configured, then the keyless pair.
+#[allow(dead_code)]
 fn search_backends() -> Vec<(&'static str, SearchBackend)> {
     let secret = crate::core::vault::get(SEARCH_KEY_ACCOUNT).ok().flatten();
     chain_for(secret.as_deref())
@@ -756,7 +759,7 @@ fn search_backends() -> Vec<(&'static str, SearchBackend)> {
 /// the failover logic is testable with closures and no network.
 pub fn run_search_chain(
     query: &str,
-    backends: &[(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)],
+    backends: &[(&'static str, DynSearchBackend<'_>)],
 ) -> Result<(&'static str, Vec<WebSearchHit>), String> {
     let mut failures: Vec<String> = Vec::new();
     for (name, backend) in backends {
@@ -768,10 +771,7 @@ pub fn run_search_chain(
             Err(e) => failures.push(format!("{name}: {e}")),
         }
     }
-    Err(format!(
-        "every search backend failed — {}",
-        failures.join("; ")
-    ))
+    Err(format!("every search backend failed — {}", failures.join("; ")))
 }
 
 /// Query DuckDuckGo's lite page and parse the results.
@@ -801,9 +801,9 @@ fn search_ddg_html(query: &str) -> Result<Vec<WebSearchHit>, String> {
     Ok(hits)
 }
 
-/// Query a SearXNG instance and parse the results. Held ready, not wired into the chain —
-/// see [`parse_searxng`]. Wiring it is one entry in `web_search`'s backend list plus this
-/// request; the base URL is a placeholder to be replaced by the configured instance's.
+// Query a SearXNG instance and parse the results. Held ready, not wired into the chain — see
+// [`parse_searxng`]. Wiring it is one entry in `web_search`'s backend list plus this request;
+// the base URL is a placeholder to be replaced by the configured instance's.
 // fn search_searxng — removed until a settings field exists for the instance URL, so the
 // build carries no unreachable code; the parser above is the tested half and stays.
 
@@ -822,12 +822,16 @@ pub fn web_search(query: &str) -> Result<(&'static str, Vec<WebSearchHit>), Stri
     let query: String = query.chars().take(300).collect();
     let names: [&'static str; 2] = ["DuckDuckGo", "DuckDuckGo (html)"];
     let backends: Vec<SearchBackend> = vec![search_ddg_lite, search_ddg_html];
-    let dyn_backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
-        names
-            .iter()
-            .zip(backends.iter())
-            .map(|(n, f)| (*n, f as &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>))
-            .collect();
+    let dyn_backends: Vec<(&'static str, DynSearchBackend<'_>)> = names
+        .iter()
+        .zip(backends.iter())
+        .map(|(n, f)| {
+            // The unsize coercion needs an annotated coercion site; a bare tuple would leave
+            // `f` a fn pointer.
+            let f: DynSearchBackend<'_> = f;
+            (*n, f)
+        })
+        .collect();
     run_search_chain(&query, &dyn_backends)
 }
 
@@ -857,12 +861,14 @@ pub fn http_request(
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
     runtime().block_on(async {
-        let m: reqwest::Method = method
-            .parse()
-            .map_err(|e| format!("bad method: {e}"))?;
+        let m: reqwest::Method = method.parse().map_err(|e| format!("bad method: {e}"))?;
         let mut req = client.request(m, url.clone());
         for (name, value) in headers {
-            if name.contains('\r') || name.contains('\n') || value.contains('\r') || value.contains('\n') {
+            if name.contains('\r')
+                || name.contains('\n')
+                || value.contains('\r')
+                || value.contains('\n')
+            {
                 return Err(format!("header \"{name}\" contains a line break — refused"));
             }
             req = req.header(name.as_str(), value.as_str());
@@ -881,15 +887,15 @@ pub fn http_request(
             return Err(format!("redirected to {loc} — request that URL directly"));
         }
         let mut out = format!("HTTP {status}");
-        if let Some(ct) = resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok()) {
+        if let Some(ct) =
+            resp.headers().get(reqwest::header::CONTENT_TYPE).and_then(|v| v.to_str().ok())
+        {
             out.push_str(&format!(" ({ct})"));
         }
         let mut bytes: Vec<u8> = Vec::new();
         let mut resp = resp;
-        while let Some(chunk) = resp
-            .chunk()
-            .await
-            .map_err(|e| format!("reading the response failed: {e}"))?
+        while let Some(chunk) =
+            resp.chunk().await.map_err(|e| format!("reading the response failed: {e}"))?
         {
             if bytes.len() + chunk.len() > MAX_RESPONSE_BYTES {
                 bytes.extend_from_slice(&chunk[..MAX_RESPONSE_BYTES - bytes.len()]);
@@ -1072,7 +1078,8 @@ mod tests {
 
     #[test]
     fn the_chain_takes_the_first_backend_that_answers() {
-        let fail = |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
+        let fail =
+            |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
         let serve = |_q: &str| -> Result<Vec<WebSearchHit>, String> {
             Ok(vec![WebSearchHit {
                 title: "hit".into(),
@@ -1080,8 +1087,7 @@ mod tests {
                 snippet: String::new(),
             }])
         };
-        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
-            vec![("A", &fail), ("B", &serve)];
+        let backends: Vec<(&'static str, DynSearchBackend<'_>)> = vec![("A", &fail), ("B", &serve)];
         let (served, hits) = run_search_chain("q", &backends).expect("B serves");
         assert_eq!(served, "B");
         assert_eq!(hits.len(), 1);
@@ -1089,9 +1095,9 @@ mod tests {
 
     #[test]
     fn the_chain_aggregates_every_failure_when_all_backends_fail() {
-        let fail = |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
-        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
-            vec![("A", &fail), ("B", &fail)];
+        let fail =
+            |_q: &str| -> Result<Vec<WebSearchHit>, String> { Err("backend is down".into()) };
+        let backends: Vec<(&'static str, DynSearchBackend<'_>)> = vec![("A", &fail), ("B", &fail)];
         let err = run_search_chain("q", &backends).expect_err("all fail");
         assert!(err.contains("A: backend is down"), "{err}");
         assert!(err.contains("B: backend is down"), "{err}");
@@ -1107,7 +1113,7 @@ mod tests {
                 snippet: String::new(),
             }])
         };
-        let backends: Vec<(&'static str, &dyn Fn(&str) -> Result<Vec<WebSearchHit>, String>)> =
+        let backends: Vec<(&'static str, DynSearchBackend<'_>)> =
             vec![("A", &empty), ("B", &serve)];
         let (served, _) = run_search_chain("q", &backends).expect("B serves");
         assert_eq!(served, "B");
@@ -1155,9 +1161,7 @@ mod tests {
         }
         // The oldest insert (index 0) was evicted to make room; the newest survives.
         assert!(cache_lookup("https://cache-test.invalid/0").is_none());
-        assert!(
-            cache_lookup(&format!("https://cache-test.invalid/{CACHE_MAX_ENTRIES}")).is_some()
-        );
+        assert!(cache_lookup(&format!("https://cache-test.invalid/{CACHE_MAX_ENTRIES}")).is_some());
     }
 
     // ── the key tier ─────────────────────────────────────────────────────
@@ -1168,7 +1172,11 @@ mod tests {
         assert_eq!(chain_for(Some("brave|TAV-KEY")).len(), 3, "brave at the head");
         assert_eq!(chain_for(Some("tavily|tvly-123")).len(), 3, "tavily at the head");
         assert_eq!(chain_for(Some("  ")).len(), 2, "a blank secret is no key");
-        assert_eq!(chain_for(Some("gibberish")).len(), 2, "an unknown provider is ignored, not fatal");
+        assert_eq!(
+            chain_for(Some("gibberish")).len(),
+            2,
+            "an unknown provider is ignored, not fatal"
+        );
         let names: Vec<&str> = chain_for(Some("brave|k")).iter().map(|(n, _)| *n).collect();
         assert_eq!(names, vec!["Brave", "DuckDuckGo", "DuckDuckGo (html)"]);
     }

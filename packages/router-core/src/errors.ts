@@ -10,6 +10,18 @@ export type ErrorClass =
   | "NOT_FOUND"
   | "BAD_REQUEST_SCHEMA"
   | "PARSE_ERROR"
+  /**
+   * The provider answered and composed nothing a caller could use — a 200 with no text and no tool
+   * call. Distinct from `PARSE_ERROR`, which is about a shape this router cannot read: here there
+   * is nothing to read, because the model never wrote an answer.
+   *
+   * The measured cause (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`): extended thinking is
+   * on by default, `max_tokens` covers reasoning **and** answer, and the reasoning consumed the
+   * whole 8192-token budget, so the stream ended at `stop_reason: max_tokens` having opened no text
+   * block. Four such turns in 75 minutes, each ~40 s of waiting and an empty bubble, filed as a
+   * parse error against a manifest that was correct.
+   */
+  | "NO_OUTPUT"
   | "SERVER_ERROR"
   | "TIMEOUT"
   | "NETWORK"
@@ -17,7 +29,13 @@ export type ErrorClass =
   | "BILLING"
   | "OK";
 
-/** Errors that count toward provider drift (§2.10). */
+/**
+ * Errors that count toward provider drift (§2.10).
+ *
+ * `NO_OUTPUT` is deliberately absent. Drift is the provider failing to honour the shape it declared;
+ * a reasoning model that ran out of output budget is the provider honouring its contract exactly,
+ * and counting it would push a healthy provider toward repair for a request-side cause.
+ */
 export const DRIFT_CLASSES: ReadonlySet<ErrorClass> = new Set([
   "NOT_FOUND",
   "BAD_REQUEST_SCHEMA",
@@ -77,14 +95,105 @@ export function classify(status: number, bodyHint?: "schema" | "not_found" | "cl
 }
 
 /**
+ * Codes a provider uses when it gives up on a request upstream.
+ *
+ * Short on purpose, in the manner of `client-gate.ts`'s marker lists: each entry is a code seen in
+ * a real response, and a gateway that words it differently is simply not recognised — the caller
+ * then falls back to the class it would have chosen anyway.
+ */
+const TIMEOUT_CODES = new Set([
+  "timeout",
+  "timed_out",
+  "request_timeout",
+  "gateway_timeout",
+  "upstream_timeout",
+  "deadline_exceeded",
+]);
+
+/**
+ * Whether a response body **is** an error envelope naming a timeout, and which code said so.
+ *
+ * The detectors in `client-gate.ts` are gated by an error status. This one has the opposite problem:
+ * it exists for a body that arrived with a **2xx**, because a relay typically answers `200` and puts
+ * its own refusal in the body. With no status to gate on, a substring match is not safe — a good
+ * answer may *discuss* timeouts, and this repository has already paid for that lesson once when a
+ * response that merely mentioned a failure was filed as one (`NO_OUTPUT`).
+ *
+ * So the body must parse as JSON and the name must sit in a recognisable field, in either envelope
+ * providers publish: `{ "error": { "code": … } }` or `{ "code": … }`.
+ *
+ * Measured 2026-10-03 on `vice` (`deepseek-v4-flash`): HTTP 200 carrying
+ * `{"message":"The request timed out. Please try again.","code":"timeout"}`, which the engine filed
+ * as `PARSE_ERROR` — a word about our reader, for a failure the provider had explained.
+ */
+export function detectStatedTimeout(body: string | undefined | null): string | undefined {
+  if (!body) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const payload = parsed as Record<string, unknown>;
+  const inner = payload.error;
+  const envelopes: Record<string, unknown>[] =
+    inner && typeof inner === "object" ? [inner as Record<string, unknown>, payload] : [payload];
+  for (const envelope of envelopes) {
+    for (const field of ["code", "type", "status"]) {
+      const value = envelope[field];
+      if (typeof value === "string" && TIMEOUT_CODES.has(value.toLowerCase())) return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * `fallback`, unless the body names a cause this taxonomy knows.
+ *
+ * One function so that both failure arms of the engine decide it the same way. They read the status
+ * alone, so a relay answering `200` with a stated cause collapsed to `PARSE_ERROR` whatever the body
+ * said — and `PARSE_ERROR` counts as provider **drift**. Drift is a provider failing to honour the
+ * shape it declared; a provider saying "I timed out" is honouring it, which is the same reasoning
+ * that keeps `NO_OUTPUT` out of the drift set.
+ *
+ * Only a stated timeout is recognised today, because it is the one that has been measured. A
+ * billing or content-policy refusal arriving inside a 2xx belongs here too, on the day one is seen.
+ */
+export function classifyFailure(
+  fallback: ErrorClass,
+  body: string | undefined | null,
+): ErrorClass {
+  return detectStatedTimeout(body) ? "TIMEOUT" : fallback;
+}
+
+/**
  * The provider's own words for why it refused, short enough for a chain entry.
  *
  * Before this existed the classifier kept only the class token, so an upstream
  * `400 {"error":{"code":"content-blocked",…}}` reached the operator as "schema" — a word about
  * *our* request shape, for a refusal that was about the provider's content policy. The raw signal
  * is appended, not reformatted: `error.code` when the body names one, else `error.message`, else
- * the body itself, all truncated to 120 characters.
+ * the body itself, truncated to `MAX_REASON_CHARS`.
  */
+
+/**
+ * Longest provider reason kept, counted in **code points**.
+ *
+ * 120 was too tight for the message this exists to carry. Measured against `agentrouter.org`'s
+ * Anthropic route on 2026-10-02, a rejected `tool_result` answers with 186 characters before the
+ * aggregator appends its own request/trace ids:
+ *
+ *   unexpected `messages.2.content.0: tool_use_id` found in `tool_result` blocks: toolu_x.
+ *   Each `tool_result` block must have a corresponding `tool_use` block in the previous message.
+ *
+ * The old cut landed at "Each `…", dropping BOTH the offending id and the rule that explains it —
+ * so a live 400 could not be diagnosed from the ledger at all, which is the same
+ * evidence-truncated-where-it-matters defect as the stream sample. The cap exists only to bound a
+ * text column; a validation error that cannot state its rule is not evidence.
+ */
+export const MAX_REASON_CHARS = 400;
+
 export function reasonFromBody(body: string | undefined | null): string | undefined {
   if (!body) return undefined;
   let reason: string | undefined;
@@ -103,5 +212,8 @@ export function reasonFromBody(body: string | undefined | null): string | undefi
     // not JSON — the raw text is still the provider's own words
   }
   reason ??= body;
-  return reason.length > 120 ? reason.slice(0, 117) + "…" : reason;
+  // Code points, not `slice`: a UTF-16 cut can land between a surrogate pair and leave a lone half
+  // in the ledger — the same rule the Rust mirror's `chars()` and the stream sample follow.
+  const points = Array.from(reason);
+  return points.length <= MAX_REASON_CHARS ? reason : `${points.slice(0, MAX_REASON_CHARS).join("")}…`;
 }

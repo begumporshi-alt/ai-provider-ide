@@ -38,6 +38,27 @@ export const DEFAULT_MAX_ITERATIONS = 8;
  *  either way — but a value of 5000 would just be a slow way to burn tokens. */
 export const MAX_ITERATIONS_CAP = 50;
 
+/**
+ * How many times a NO_OUTPUT turn — the model reasoned through its whole output budget and sent
+ * no answer (`NO_OUTPUT`, measured twice 2026-10-03 on agentrouter/deepseek-v4-flash: ~8180
+ * thinking deltas, zero text) — is re-asked with **thinking forced off** before the turn is
+ * given up as an error. This is LiteLLM's fallback pattern applied to our own failure class: the
+ * engine already classifies the failure with evidence, so the loop can react to it. One fallback
+ * only: a model that answers nothing even without thinking is not answering today.
+ */
+export const NO_OUTPUT_RETRIES = 1;
+
+/**
+ * How many times a truncated stream is re-asked before the turn is accepted and flagged.
+ *
+ * A stream whose manifest declares a finish selector but ends without one is a provider cutting
+ * the response short. Measured 2026-10-03 on `vice/deepseek-v4-flash`: the model streamed
+ * "First, let me check", the tool call never arrived, and the old loop recorded the turn as a
+ * clean one-iteration success — the user saw intent and then silence. Each retry is a full model
+ * call, so the cap keeps a flaky reseller from tripling every turn's cost.
+ */
+export const TRUNCATION_RETRIES = 2;
+
 /** Clamp a user-supplied ceiling into `[1, MAX_ITERATIONS_CAP]`. Non-finite and non-numeric
  *  input falls back to the default rather than to 1: a corrupted setting should degrade to the
  *  value that works, not to a loop that gives up immediately. */
@@ -70,6 +91,10 @@ function parseArgs(raw?: string): Record<string, unknown> {
 
 export interface AgentLoopResult {
   text: string;
+  /** True when the accepted final turn's stream was truncated — the provider closed a
+   *  declared-finish stream without a finish reason and every re-ask truncated too. The text is
+   *  the model's last partial answer, not a complete one; the UI is expected to say so. */
+  truncated: boolean;
   /** Full conversation after this turn, conversation-only (no system turn). Feed back as the
    *  next turn's `messages` to replay tool calls correctly. */
   messages: ChatMessage[];
@@ -93,22 +118,49 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   const tools = registryToOpenAI(registry);
 
   let lastText = "";
+  let truncationRetries = 0;
+  let noOutputRetries = 0;
+  // Set once the NO_OUTPUT fallback has fired: every attempt afterwards asks for thinking off,
+  // so the knob's level never re-arms mid-turn.
+  let forceNoReasoning = false;
 
   for (let iter = 1; iter <= maxIterations; iter++) {
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
 
     const collected: ToolCall[] = [];
     let text = "";
+    // The finish signal, captured at its single report point. `finishReported` is the load-bearing
+    // half: the interpreter fires `onFinish` only when the stream declares a finish selector, so
+    // *reported with undefined* means the provider cut a declared stream short, while *never
+    // reported* means this manifest gives the loop no way to judge — accepted as before.
+    let finishReported = false;
+    let finishReason: string | undefined;
+    // The same predicate the engine's NO_OUTPUT classification uses (`exec.reasoning()` non-empty
+    // exactly when the model composed something it never turned into an answer): the thinking
+    // channel carried text and the answer's did not.
+    let reasoningSeen = false;
     const stream = await generate(
       {
         model,
         messages: opts.system ? [{ role: "system" as const, content: opts.system }, ...messages] : messages,
         tools,
         toolChoice: tools ? "auto" : undefined,
+        ...(forceNoReasoning ? { reasoning: "off" as const } : {}),
         onToolCall: (call) => {
           collected.push(call);
         },
-        onFinish: opts.onFinish,
+        onFinish: (reason) => {
+          finishReported = true;
+          finishReason = reason;
+          opts.onFinish?.(reason);
+        },
+        // Forwarded as its own event rather than appended to `text`: an agent turn's reasoning
+        // must not land in the transcript, where it would be replayed to the provider on the next
+        // round-trip as if the model had already said it.
+        onReasoning: (t) => {
+          if (t) reasoningSeen = true;
+          onEvent?.({ type: "reasoning", text: t });
+        },
       },
       { signal },
     );
@@ -120,10 +172,38 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
     lastText = text;
 
-    // Terminal turn: the model produced a final answer with no tool calls.
+    // Terminal turn: the model produced a final answer with no tool calls — unless the stream was
+    // cut, or the model never answered at all. A declared-finish stream that ended without a
+    // finish reason is a truncation: re-ask the same iteration. A turn that is all reasoning and
+    // no answer is the NO_OUTPUT class: re-ask with thinking forced off, which is the one lever
+    // that works even against a provider that ignores budget tokens. After the caps, accept the
+    // text but flag it (truncation) or fail loudly (no answer after the fallback), so the UI can
+    // say what happened instead of going silent.
     if (collected.length === 0) {
-      onEvent?.({ type: "done", text, iterations: iter });
-      return { text, messages };
+      const truncated = finishReported && finishReason === undefined;
+      const noAnswer = text === "" && reasoningSeen && finishReported;
+      if (truncated && truncationRetries < TRUNCATION_RETRIES) {
+        truncationRetries += 1;
+        iter -= 1; // the for's increment restores it: the retry re-runs this iteration number
+        onEvent?.({ type: "truncation_retry", attempt: truncationRetries });
+        continue;
+      }
+      if (noAnswer && noOutputRetries < NO_OUTPUT_RETRIES) {
+        noOutputRetries += 1;
+        forceNoReasoning = true;
+        iter -= 1;
+        onEvent?.({ type: "no_output_retry", attempt: noOutputRetries });
+        continue;
+      }
+      if (noAnswer && noOutputRetries >= NO_OUTPUT_RETRIES) {
+        throw new Error(
+          "the model spent its output budget on reasoning and still answered nothing — " +
+            "re-asked once with thinking off and it happened again. Raise the model's output " +
+            "cap in its manifest, or pick a model that answers without thinking.",
+        );
+      }
+      onEvent?.({ type: "done", text, iterations: iter, truncated });
+      return { text, messages, truncated };
     }
 
     // Replay the assistant turn with its tool_calls so the provider accepts the results.
@@ -251,9 +331,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
   }
 
-  // Hit the iteration ceiling: hand back the last answer rather than spinning forever.
+  // Hit the iteration ceiling: hand back the last answer rather than spinning forever. The ceiling
+  // exit is not a truncation — every stream here declared its own finish — so the flag stays off.
   onEvent?.({ type: "done", text: lastText, iterations: maxIterations });
-  return { text: lastText, messages };
+  return { text: lastText, messages, truncated: false };
 }
 
 /** The marker `read_image` writes: `READ_IMAGE:<media>;base64,<payload>` then `path:`/`bytes:` lines. */

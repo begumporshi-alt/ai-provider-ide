@@ -334,12 +334,26 @@ impl Job {
                         return;
                     }
                     turn_text.push_str(&visible);
-                    if let Some(text) = gate.offer(&visible) {
-                        // Emitting is also the liveness check. `reply` answers `false` when nobody
-                        // is listening any more, and aborting here is what stops us paying for
-                        // tokens no one will read.
-                        if !replies.reply(id, BridgeMsg::Delta(text)) {
-                            cancel.cancel();
+                    match gate.offer(&visible) {
+                        Some(text) => {
+                            // Emitting is also the liveness check. `reply` answers `false` when nobody
+                            // is listening any more, and aborting here is what stops us paying for
+                            // tokens no one will read.
+                            if !replies.reply(id, BridgeMsg::Delta(text)) {
+                                cancel.cancel();
+                            }
+                        }
+                        None => {
+                            // The gate held the chunk, so nothing went out — and held prose was
+                            // exactly the case where the gateway could stay silent past
+                            // FIRST_MSG_TIMEOUT: the first message a tool-less client would see
+                            // landed at end-of-generation, and a healthy long completion was
+                            // killed mid-flight (audit 2026-10-03 R2). A held chunk proves the
+                            // bridge is working, so say so. The frame is also the disconnect
+                            // check the emitted path gets for free.
+                            if !replies.reply(id, BridgeMsg::Liveness) {
+                                cancel.cancel();
+                            }
                         }
                     }
                 };
@@ -359,6 +373,33 @@ impl Job {
                         finish_reason = Some(reason);
                     }
                 };
+                // Upstream-gated pass-through on its own channel, deliberately bypassing the gate:
+                // `ProseGate` holds a turn's *prose* back across tool-loop turns, and reasoning is
+                // not part of any turn's answer — a turn that reasons while deciding to call tools
+                // still showed the client what it was working through, which is the point of
+                // forwarding it at all. The liveness check matches `on_chunk`: a client that
+                // stopped listening cancels the request here too.
+                let mut on_reasoning = |text: &str| {
+                    if !replies.reply(id, BridgeMsg::Reasoning(text.to_string())) {
+                        cancel.cancel();
+                    }
+                };
+
+                // The client's thinking knob. Two spellings, and the order between them is the
+                // reference's own precedence: `reasoning.effort` is canonical (what a
+                // Responses-shaped client sends, and what the ingress normalizer produces from a
+                // Codex client's `reasoning_effort`), and `reasoning_effort` is the OpenAI-chat
+                // alias that survives for a generic client. Read from the NORMALIZED body, and
+                // canonical first, so a client that sends both gets the field it means rather than
+                // the one it aliased.
+                //
+                // `ReasoningEffort::parse` answers `None` for an unknown word — which renders as
+                // no field at all, the provider's own default, rather than a guessed level.
+                let reasoning = body
+                    .pointer("/reasoning/effort")
+                    .and_then(|v| v.as_str())
+                    .or_else(|| body.get("reasoning_effort").and_then(|v| v.as_str()))
+                    .and_then(crate::core::adapter::ReasoningEffort::parse);
 
                 let text_req = crate::core::router::TextRequest {
                     model: model.clone(),
@@ -369,12 +410,14 @@ impl Job {
                     messages: messages.clone(),
                     max_tokens,
                     temperature,
+                    reasoning,
                     tools: tools.clone(),
                     tool_choice: tool_choice.clone(),
                     response_format: response_format.clone(),
                     on_tool_call: Some(&mut on_tool_call),
                     on_usage: Some(&mut on_usage),
                     on_finish: Some(&mut on_finish),
+                    on_reasoning: Some(&mut on_reasoning),
                     max_attempts: None,
                     prompt_cache_enabled: self.host.settings().prompt_cache_enabled,
                 };
@@ -656,7 +699,8 @@ mod tests {
     use futures_util::StreamExt;
 
     use crate::core::adapter::{
-        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult, TextArgs,
+        AdapterInstance, Capabilities, ImageArgs, ImageReply, ModelEntry, PingResult,
+        ReasoningEffort, TextArgs,
     };
     use crate::core::engine::{
         AllAttemptsFailed, AttemptError, AttemptLabel, AttemptOutcome, ErrorClass, FailureKind,
@@ -799,6 +843,9 @@ mod tests {
         then_error: Option<AttemptError>,
         tool_calls: Vec<ToolCall>,
         usage: Option<UsageTokens>,
+        /// Reasoning texts fired through `args.on_reasoning` at the turn's end — the upstream-gated
+        /// channel, which the bridge forwards on its own `BridgeMsg` variant.
+        reasoning: Vec<String>,
     }
 
     impl ScriptedTurn {
@@ -809,6 +856,7 @@ mod tests {
                 then_error: None,
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: Vec::new(),
             }
         }
 
@@ -819,6 +867,7 @@ mod tests {
                 then_error: None,
                 tool_calls: Vec::new(),
                 usage: None,
+                reasoning: Vec::new(),
             }
         }
 
@@ -834,6 +883,11 @@ mod tests {
 
         fn reporting(mut self, usage: UsageTokens) -> Self {
             self.usage = Some(usage);
+            self
+        }
+
+        fn reasoning(mut self, texts: Vec<&str>) -> Self {
+            self.reasoning = texts.into_iter().map(String::from).collect();
             self
         }
     }
@@ -856,6 +910,7 @@ mod tests {
         /// The `tools` array the adapter was handed, per call — so a test asserts what the bridge
         /// actually put on the wire rather than what it meant to.
         seen_tools: Mutex<Vec<Option<Value>>>,
+        seen_reasoning: Mutex<Vec<Option<ReasoningEffort>>>,
         /// The `messages` array the adapter was handed, per call. The sandbox's own output is only
         /// visible from here: a tool result reaches the model, never the client.
         seen_messages: Mutex<Vec<Vec<Value>>>,
@@ -868,6 +923,7 @@ mod tests {
                 images: Mutex::new(VecDeque::new()),
                 text_calls: Mutex::new(0),
                 seen_tools: Mutex::new(Vec::new()),
+                seen_reasoning: Mutex::new(Vec::new()),
                 seen_messages: Mutex::new(Vec::new()),
             })
         }
@@ -878,6 +934,7 @@ mod tests {
                 images: Mutex::new(replies.into()),
                 text_calls: Mutex::new(0),
                 seen_tools: Mutex::new(Vec::new()),
+                seen_reasoning: Mutex::new(Vec::new()),
                 seen_messages: Mutex::new(Vec::new()),
             })
         }
@@ -892,6 +949,10 @@ mod tests {
 
         fn messages_seen(&self, nth: usize) -> Vec<Value> {
             self.seen_messages.lock().unwrap().get(nth).cloned().unwrap_or_default()
+        }
+
+        fn reasoning_seen(&self, nth: usize) -> Option<ReasoningEffort> {
+            self.seen_reasoning.lock().unwrap().get(nth).cloned().flatten()
         }
     }
 
@@ -915,12 +976,15 @@ mod tests {
         {
             *self.text_calls.lock().unwrap() += 1;
             self.seen_tools.lock().unwrap().push(args.tools.cloned());
+            self.seen_reasoning.lock().unwrap().push(args.reasoning);
             self.seen_messages.lock().unwrap().push(args.messages.to_vec());
 
             // Taken here, fired at exhaustion. They cannot ride the chunk stream — it is strings
             // only — and they cannot be derived from the text, which is empty on a tool-call turn.
+            // Reasoning takes the same path: its own callback, fired like a real adapter's stream.
             let on_tool_call = args.on_tool_call.take();
             let on_usage = args.on_usage.take();
+            let on_reasoning = args.on_reasoning.take();
             let next = self.turns.lock().unwrap().pop_front();
 
             Box::pin(async move {
@@ -928,15 +992,22 @@ mod tests {
                 // it cannot reach the provider. A test that under-scripts its turns sees the
                 // request fail rather than silently finishing.
                 let Some(turn) = next else { return Err(AttemptError::Transport) };
-                let ScriptedTurn { chunks, refusal, then_error, tool_calls, usage } = turn;
+                let ScriptedTurn { chunks, refusal, then_error, tool_calls, usage, reasoning } =
+                    turn;
                 if let Some(err) = refusal {
                     return Err(err);
                 }
 
                 let mut on_tool_call = on_tool_call;
                 let mut on_usage = on_usage;
+                let mut on_reasoning = on_reasoning;
                 let body = stream::iter(chunks.into_iter().map(Ok::<String, AttemptError>));
                 let tail = stream::once(async move {
+                    if let Some(cb) = on_reasoning.as_deref_mut() {
+                        for t in reasoning {
+                            cb(&t);
+                        }
+                    }
                     if let Some(cb) = on_tool_call.as_deref_mut() {
                         for call in tool_calls {
                             cb(call);
@@ -1358,6 +1429,111 @@ mod tests {
         assert_eq!(delta_text(&msgs), "hello");
         assert_eq!(delta_count(&msgs), 2, "nothing is held, so nothing is batched");
         assert_eq!(adapter.text_calls(), 1);
+    }
+
+    /// Audit 2026-10-03 R2: while the gate holds a gateway-mode turn's prose, every held chunk is
+    /// announced as a `Liveness` frame. Without it the first `BridgeMsg` a tool-less client sees
+    /// lands at end-of-generation, and `FIRST_MSG_TIMEOUT` killed any completion that outlived
+    /// 30 s — a healthy long answer, on the default config. Passing mode never holds, so it never
+    /// announces.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn held_prose_announces_a_liveness_frame_per_chunk() {
+        let adapter = Scripted::text(vec![ScriptedTurn::saying(&["hel", "lo"])]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let msgs = drain(&bridge, chat("m1")).await;
+
+        let liveness = msgs.iter().filter(|m| matches!(m, BridgeMsg::Liveness)).count();
+        assert_eq!(
+            liveness, 2,
+            "one frame per held chunk, both before the release:
+{msgs:?}"
+        );
+        // The prose still arrives exactly once, after the turn settles — the frames changed the
+        // timing evidence, not the prose contract.
+        assert_eq!(delta_text(&msgs), "hello");
+        assert_eq!(delta_count(&msgs), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn passing_mode_announces_no_liveness() {
+        let adapter = Scripted::text(vec![ScriptedTurn::saying(&["hel", "lo"])]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let mut req = chat("m1");
+        req.body["tools"] = json!([client_tool("client_side_thing")]);
+        let msgs = drain(&bridge, req).await;
+
+        assert!(
+            !msgs.iter().any(|m| matches!(m, BridgeMsg::Liveness)),
+            "nothing is held, so nothing is announced:
+{msgs:?}"
+        );
+    }
+
+    /// Reasoning rides its own `BridgeMsg` variant and bypasses `ProseGate`: gateway mode holds a
+    /// turn's *prose* back until the model settles, and reasoning is not part of any turn's answer.
+    /// (The fake fires its callbacks at the turn's end like a real adapter's stream, so what this
+    /// pins is the channel and the prose outcome, not inter-chunk timing.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reasoning_streams_as_its_own_messages_and_bypasses_the_prose_gate() {
+        let adapter = Scripted::text(vec![
+            ScriptedTurn::saying(&["hel", "lo"]).reasoning(vec!["thinking", " harder"])
+        ]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let msgs = drain(&bridge, chat("m1")).await;
+
+        let reasoning: Vec<String> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                BridgeMsg::Reasoning(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(reasoning.join(""), "thinking harder", "the reasoning reached the client");
+        assert_eq!(delta_text(&msgs), "hello", "the prose path is unchanged");
+        assert_eq!(delta_count(&msgs), 1, "gateway mode still releases the prose once");
+        assert!(matches!(msgs.last(), Some(BridgeMsg::Done)));
+    }
+
+    /// The client's thinking knob survives ingress: `reasoning_effort` (OpenAI chat) and
+    /// `reasoning.effort` (the Codex/Responses shape the normalizer produces) both reach the
+    /// adapter as a parsed level, and an unknown word reaches it as `None` — the provider's
+    /// default, not a guessed level.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_client_s_reasoning_effort_reaches_the_adapter() {
+        let adapter = Scripted::text(vec![
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+            ScriptedTurn::saying(&["ok"]),
+        ]);
+        let bridge = bridge_with(adapter.clone(), Host::gateway_tools());
+
+        let mut low = chat("m1");
+        low.body["reasoning_effort"] = json!("low");
+        drain(&bridge, low).await;
+        assert_eq!(adapter.reasoning_seen(0), Some(ReasoningEffort::Low));
+
+        let mut codex = chat("m1");
+        codex.body["reasoning"] = json!({ "effort": "high" });
+        drain(&bridge, codex).await;
+        assert_eq!(adapter.reasoning_seen(1), Some(ReasoningEffort::High));
+
+        let mut unknown = chat("m1");
+        unknown.body["reasoning_effort"] = json!("maximum");
+        drain(&bridge, unknown).await;
+        assert_eq!(adapter.reasoning_seen(2), None, "an unknown word is not a guess");
+
+        // Both spellings on one body: the canonical `reasoning.effort` wins. The ingress normalizer
+        // deliberately leaves a client's pre-existing `reasoning` alone rather than letting the
+        // alias overwrite it, so reading the alias first would contradict the reference.
+        let mut both = chat("m1");
+        both.body["reasoning"] = json!({ "effort": "low" });
+        both.body["reasoning_effort"] = json!("high");
+        drain(&bridge, both).await;
+        assert_eq!(adapter.reasoning_seen(3), Some(ReasoningEffort::Low), "canonical beats alias");
     }
 
     #[tokio::test(flavor = "multi_thread")]
