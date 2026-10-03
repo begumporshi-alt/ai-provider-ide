@@ -42,20 +42,28 @@ export function SettingsScreen() {
   const [crashCount, setCrashCount] = useState<number>(0);
   const [expanded, setExpanded] = useState<boolean>(false);
   const [crashes, setCrashes] = useState<CrashReport[]>([]);
+  const [crashesLoading, setCrashesLoading] = useState<boolean>(true);
   const [crashing, setCrashing] = useState<boolean>(false);
 
-  const loadCrashInfo = async () => {
-    const n = await getCrashCount();
-    setCrashCount(n);
-    if (n > 0 && expanded) {
-      const ids = await listCrashes();
-      const reports = (await Promise.all(ids.map((id) => readCrash(id))))
-        .filter((r): r is CrashReport => r !== null);
-      setCrashes(reports);
+  const loadCrashInfo = async (wantList: boolean) => {
+    setCrashesLoading(true);
+    try {
+      const n = await getCrashCount();
+      setCrashCount(n);
+      if (n > 0 && wantList) {
+        const ids = await listCrashes();
+        const reports = (await Promise.all(ids.map((id) => readCrash(id))))
+          .filter((r): r is CrashReport => r !== null);
+        setCrashes(reports);
+      }
+    } finally {
+      setCrashesLoading(false);
     }
   };
 
-  useEffect(() => { void loadCrashInfo(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // The reports themselves are only read once the panel is open, so opening it has to re-run the
+  // load — keying the effect on `expanded` is what makes the list appear.
+  useEffect(() => { void loadCrashInfo(expanded); }, [expanded]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleClearAll = async () => {
     setCrashing(true);
@@ -139,7 +147,9 @@ export function SettingsScreen() {
             </div>
           )}
           {expanded && crashes.length === 0 && (
-            <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>Loading…</p>
+            <p className="mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              {crashesLoading ? "Loading…" : "No crash reports to show."}
+            </p>
           )}
         </div>
       )}
