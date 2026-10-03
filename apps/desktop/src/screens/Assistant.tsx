@@ -1984,11 +1984,32 @@ function Chat({
         recordStep(run, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
       } else if (ev.type === "done") {
         iterationsRef.current = ev.iterations;
-        recordStep(run, "done", ev.iterations ? `${ev.iterations} iterations` : "done", undefined, true);
+        recordStep(
+          run,
+          "done",
+          ev.truncated
+            ? `${ev.iterations} iterations — stream truncated`
+            : ev.iterations
+              ? `${ev.iterations} iterations`
+              : "done",
+          undefined,
+          // A truncated turn is not a clean finish: the step reads as failed so the dashboard's
+          // reader asks what the stream actually carried instead of trusting the answer.
+          !ev.truncated,
+        );
+      } else if (ev.type === "truncation_retry") {
+        // Not a recorded step: a re-ask is the loop repairing itself, and it only matters if it
+        // fails. The bubble below says it while it happens.
       }
     }
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
+    } else if (ev.type === "truncation_retry") {
+      // The abandoned attempt's partial prose is dropped, not concatenated: the retry's text is
+      // the answer being built, and two attempts joined would read as one sentence the model
+      // never said. The notice stays as the bubble's prefix until the retry's own text appends
+      // after it; a truncated `done` above records the outcome in the run's steps.
+      setStreamedText("⏳ the model's stream ended early — re-asking…\n\n");
     } else if (ev.type === "reasoning") {
       // Accumulated, not replaced: an agent turn is several round-trips and the panel shows the
       // whole run's deliberation, the same way `streamedText` shows the whole run's prose.

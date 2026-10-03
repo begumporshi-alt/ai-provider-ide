@@ -135,6 +135,24 @@ re-probing against direct `api.anthropic.com`.)
 Off, or clamp to 128 for Pro-class models; `reasoning_values`'s key list already has the
 per-dialect seams.
 
+### R5. A truncated stream records `ok`, and the agent loop treats it as a finished answer
+
+Found live, 2026-10-03 17:03 (`agent_runs` run-1791025437301, ledger row 2788), not by code
+reading: the Assistant's model streamed "First, let me check", the provider (vyceai.com's
+deepseek endpoint, unstable all day — `TIMEOUT` at 13:43, a mid-loop upstream timeout at 12:55)
+closed the stream before any tool call arrived, and the loop's terminal-turn contract — "no tool
+calls in the response = final answer" (`agentLoop.ts:128`) — ended the run as a clean
+one-iteration success. `agent_runs` recorded `status=ok, iterations=1, tool_calls=0`; the ledger
+row said `ok`. The user saw the model announce intent and then go silent, with nothing to read
+and nothing to retry. The engine's drained-stream honesty (`NO_OUTPUT`/`PARSE_ERROR` in
+`model-router.ts`) only covers streams that carried **nothing**; a stream that carries prose and
+then dies is indistinguishable from a complete answer.
+
+**Fix direction:** make the finish signal meaningful — the interpreter should fire `onFinish`
+only when the stream declares a finish selector, so *fired with `undefined`* reads as truncated
+while *never fired* reads as unknowable; the loop re-asks a truncated iteration (bounded) and
+flags the turn; the ok ledger row carries the evidence.
+
 ---
 
 ## P3 — minor
@@ -274,6 +292,7 @@ little; the client-gate marker lists (`client_gate.rs:19-31`) are fine at curren
 | R2 | P1 | **Fixed 2026-10-03** — new `BridgeMsg::Liveness` variant; the bridge replies with it whenever `ProseGate` holds a chunk, so the first-message bound is disarmed by evidence the bridge is working rather than by the turn completing. Every dialect's handler ignores it deliberately (ten match sites, compiler-driven). Pinned twice: `held_prose_announces_a_liveness_frame_per_chunk` + `passing_mode_announces_no_liveness` (router_bridge — the emission), and `a_liveness_frame_disarms_the_first_message_bound` (gateway_tests — the property, with the bound shortened to 100 ms against a 400 ms pause). An empty-`Delta` frame was rejected: only the chat handler filters empty deltas; Gemini and Anthropic would have forwarded it to the wire. |
 | R3 | P2 | **Fixed 2026-10-03** — when the caller's reasoning knob renders `thinking: enabled` **and** the dialect's template declares `{{thinking?}}`, the interpreter now (a) drops the caller's `temperature` entirely — the two fields together are a 400 on Anthropic-dialect providers — and (b) clamps a forced `tool_choice` to `{"type":"auto"}` rather than mapping a named tool through `toolChoiceMap`, since a tool the model cannot skip is incompatible with a thinking turn that may answer without calling anything. Thinking-off requests are byte-identical to before. Pinned by `a_thinking_enabled_request_drops_the_temperature_and_clamps_the_tool_choice` (interpreter), which asserts the on-case fields are absent and the off-case temperature and forced choice are forwarded unchanged; falsified by removing the guard (temperature reappears). The TS reference renders `Off`/on with the same table but has no equivalent guard — recorded as drift, see the drift register. |
 | R4 | P2 | **Fixed 2026-10-03** — `reasoning_values`' `Off` rendering is now per-dialect where it matters: Anthropic keeps its probed `{"type":"disabled"}` (both engines' tests pin that spelling), and the Gemini `thinkingConfig` key is **omitted** instead of sending `thinkingBudget: 0`, which Gemini 2.5 Pro (128 floor, thinking cannot be disabled) rejects with a 400. The tradeoff is recorded in the code: 2.5 Flash loses explicit-off and falls back to the provider's own default. Pinned by `reasoning_off_omits_the_gemini_thinking_config` (interpreter): `Off` yields no `thinkingConfig` on a `{{thinkingConfig?}}` template, `High` still yields `thinkingBudget ≥ 1024`. **The TS reference still sends both keys** — left as-is deliberately under the don't-move-the-reference-under-a-port rule; the divergence is registered in the drift register (`07-drift-register.md`). |
+| R5 | P2 | **Fixed 2026-10-03** (same day, found live) — the finish signal is now meaningful end to end. **Interpreter:** `onFinish` fires only when the stream declares a finish selector (`stream.finish`/`responseFinish`) or a reason was seen, so *fired with `undefined`* is readable as truncated and *never fired* as unknowable — pinned by two `dialect-messages` specs (declared-but-absent fires `undefined`; selector-less never fires). **Agent loop:** a truncated iteration is re-asked up to twice (`TRUNCATION_RETRIES`), then accepted with `done.truncated` / `result.truncated` so the UI can say what happened — pinned by three `agentLoop` specs (recovered on re-ask, flagged after the cap, one-call passthrough when no selector is declared), falsified by stashing the two src files (1 + 3 failures against the old code). **Assistant:** a truncated turn records a `done` step with `ok=false` reading "stream truncated", and the in-flight bubble announces each re-ask. **Ledger:** the ok row now carries `failure_detail` naming the truncation when the stream was cut — status stays `ok` because text *was* served, but the evidence travels with it. Not covered: providers that close cleanly without any finish mechanism are untouched; the `NO_OUTPUT` case (the whole output budget spent on reasoning, measured live the same day on agentrouter/deepseek) keeps its existing classification — that is a budget problem, not a truncation one. |
 
 Gates after the fixes (final run, 2026-10-03): `cargo fmt` clean repo-wide ·
 `cargo clippy --lib --tests -- -D warnings` clean (the pre-existing failures from the

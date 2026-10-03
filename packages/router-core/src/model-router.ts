@@ -150,6 +150,12 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       compressed = compressMessages(req.messages, budget);
     }
 
+    // Captured at the single report point; the caller's callback still fires untouched. With the
+    // interpreter's contract — `onFinish` fires only when the stream declares a finish selector —
+    // "fired with undefined" is a provider that closed the stream short, and that is exactly the
+    // evidence the ok row below used to drop: a truncated answer read as a clean success.
+    let finishReported = false;
+    let finishReason: string | undefined;
     const exec = await this.engine.executeText({
       plan,
       messages: compressed.messages,
@@ -168,7 +174,11 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       // Forwarded so the caller can report usage onward (the gateway sends it host-side); the
       // engine keeps its own copy for the ledger regardless.
       onUsage: req.onUsage,
-      onFinish: req.onFinish,
+      onFinish: (reason) => {
+        finishReported = true;
+        finishReason = reason;
+        req.onFinish?.(reason);
+      },
       onReasoning: req.onReasoning,
       signal: opts?.signal,
     });
@@ -180,6 +190,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
       t0,
       opts?.signal,
       opts?.appKeyId,
+      finishReported ? { reason: finishReason } : undefined,
     );
   }
 
@@ -423,6 +434,7 @@ export class ModelRouter implements RouterFacade, AiTextPort {
     t0: number,
     signal?: AbortSignal,
     appKeyId?: string,
+    finish?: { reason: string | undefined },
   ): TextExecution {
     const ledger = this.ledger;
     const router = this;
@@ -497,6 +509,14 @@ export class ModelRouter implements RouterFacade, AiTextPort {
           requestedModel,
           model: served?.model.nativeId ?? requestedModel,
           status: "ok",
+          // A declared-finish stream that ended without its finish reason is a truncation, and
+          // the row must say so: status stays ok (text WAS served) but the evidence travels with
+          // it, the same way a failed attempt's evidence does. The agent loop's retry consumes
+          // the same signal live; this is the after-the-fact half.
+          failureDetail:
+            finish && finish.reason === undefined
+              ? "the stream ended without the finish reason its manifest declares — the provider closed it short, so this text may be truncated"
+              : undefined,
           latencyMs: Date.now() - t0,
           tokensIn,
           tokensOut,

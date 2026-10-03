@@ -250,8 +250,15 @@ export interface TextArgs {
    * Fires once per carrier event, in order. Never fires for a non-reasoning model.
    */
   onReasoningDelta?: (text: string) => void;
-  /** Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
-   *  `responseFinish` selector. Absent if the provider never emitted one. */
+  /**
+   * Finish reason callback: fires once with the dialect's finish_reason, surfaced via the manifest's
+   * `responseFinish` selector, translated into the OpenAI vocabulary. **The callback firing is
+   * itself a signal**: it fires only when the stream declares a finish selector (`stream.finish` or
+   * `responseFinish`) or a reason was actually seen — so a call with `undefined` means the provider
+   * closed a declared-finish stream without one, i.e. a truncation, while a callback that never
+   * fires means this manifest gives the caller no way to judge. Firing unconditionally would make
+   * those two unreadable as distinct.
+   */
   onFinish?: (reason: string | undefined) => void;
 }
 
@@ -1021,9 +1028,18 @@ export class ManifestInterpreter implements AdapterInstance {
         });
       }
       // Forward finish reason (v1.1 `responseFinish` surfacing), translated into the OpenAI
-      // vocabulary at the single report site — both collectors above store the RAW reason. Absent
-      // when the provider never emitted one or the abort flag is set: a cancelled stream has none.
-      if (args.onFinish && !signal?.aborted) {
+      // vocabulary at the single report site — both collectors above store the RAW reason. The
+      // guard is the contract's load-bearing half: firing only when a finish selector is declared
+      // (or a reason was seen anyway) is what makes "fired with undefined" readable by the caller
+      // as *truncated* rather than *unknown* — the distinction the agent loop's truncation retry
+      // is built on. A cancelled stream has none, and fires nothing.
+      if (
+        args.onFinish &&
+        !signal?.aborted &&
+        (ep.stream.finish !== undefined ||
+          ep.responseFinish !== undefined ||
+          finishReason !== undefined)
+      ) {
         args.onFinish(
           finishReason === undefined
             ? undefined

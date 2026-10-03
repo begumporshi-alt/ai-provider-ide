@@ -56,7 +56,12 @@ export type AgentEvent =
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; call: import("@aiprovider/router-core").ToolCall }
   | { type: "tool_result"; call: import("@aiprovider/router-core").ToolCall; result: string; ok: boolean }
-  | { type: "done"; text: string; iterations: number };
+  /**
+   * The model's stream ended before it declared a finish (the provider cut a declared-finish
+   * stream short) and the loop is re-asking the same iteration. `attempt` counts re-asks.
+   */
+  | { type: "truncation_retry"; attempt: number }
+  | { type: "done"; text: string; iterations: number; truncated?: boolean };
 
 export interface AgentLoopOptions {
   model: string;

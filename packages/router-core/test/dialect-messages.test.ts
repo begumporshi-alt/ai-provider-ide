@@ -249,6 +249,47 @@ describe("gemini-compat: assistant→model, tool→user, no system field", () =>
     // `tool_use` maps to OpenAI's `tool_calls`.
     expect(finish).toBe("tool_calls");
   });
+
+  it("a declared-finish stream that ends without a finish reason fires onFinish(undefined) — the truncation signal", async () => {
+    // The agent loop's truncation retry is built on this distinction: the callback FIRING with
+    // undefined means the provider closed a stream whose manifest declares a finish selector —
+    // measured 2026-10-03 on vyceai/deepseek: prose arrived, the finish reason never did, and the
+    // turn read as a clean success. A callback that never fires (next test) means no selector was
+    // declared and the caller cannot judge.
+    let fired = false;
+    let finish: string | undefined;
+    // One text delta and then [DONE] — the shape a cut-off provider produces.
+    const http = new FakeHttp(() => ({
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+        `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "First, let me check" } })}`,
+        "data: [DONE]",
+      ],
+    }));
+    const interp = new ManifestInterpreter(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1"), { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: (r) => { fired = true; finish = r; } });
+    expect(fired).toBe(true);
+    expect(finish).toBeUndefined();
+  });
+
+  it("a manifest that declares no finish selector never fires onFinish", async () => {
+    let fired = false;
+    const tmpl = JSON.parse(JSON.stringify(BUILTIN_TEMPLATES["anthropic-compat"]("https://api.test/v1")));
+    delete tmpl.endpoints.generateText.stream.finish;
+    delete tmpl.endpoints.generateText.responseFinish;
+    const http = new FakeHttp(() => ({
+      status: 200,
+      lines: [
+        `data: ${JSON.stringify({ type: "content_block_start", index: 0, content_block: { type: "text", text: "" } })}`,
+        `data: ${JSON.stringify({ type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } })}`,
+        `data: ${JSON.stringify({ type: "message_stop" })}`,
+      ],
+    }));
+    const interp = new ManifestInterpreter(tmpl, { http, vars: {} });
+    await drain(interp, { model: "claude-x", messages: [{ role: "user", content: "hi" }], stream: true, onFinish: () => { fired = true; } });
+    expect(fired).toBe(false);
+  });
 });
 
 /**
