@@ -341,6 +341,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0019_onboarding_failed_state", rebuild_onboarding_failed_state),
     ("0020_session_titles", add_session_titles_table),
     ("0021_ledger_failure_detail", add_ledger_failure_detail),
+    ("0022_manifest_thinking_placeholder", backfill_manifest_thinking_placeholder),
 ];
 
 /// One legacy graph node, paired with the stable id it should have carried.
@@ -1113,6 +1114,68 @@ fn add_ledger_failure_detail(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result
     Ok(())
 }
 
+/// 0022 — declare the thinking knob on Anthropic-dialect manifests that predate it.
+///
+/// The builtin `anthropic_compat` template gained `{{thinking?}}` with the reasoning knob
+/// (2026-10-02), and `reasoning_values` has filled the values map since — but a value only
+/// reaches the wire through a placeholder the template actually declares. Manifests frozen
+/// before that date, and every user-edited copy since, name no `thinking` field, so the knob
+/// renders into nothing. Measured 2026-10-03 on a user-edited agentrouter manifest: the
+/// Assistant's `thinking: "medium"` went out on the wire as **no thinking field at all**, the
+/// provider's own default did the thinking, and the turn spent the entire 8192-token output
+/// budget on `thinking_delta` with `NO_OUTPUT` for the answer — twice, identically. The knob
+/// was not broken; it was unwired, and nothing anywhere said so.
+///
+/// **Anthropic dialect only, deliberately.** Its off spelling (`{"type":"disabled"}`) is probed,
+/// and it is the dialect whose providers default thinking on. The OpenAI and Gemini templates
+/// are left alone: injecting `reasoning_effort` into a request a provider has never seen is a
+/// 400 risk with no measured failure to justify it.
+///
+/// The value is the optional placeholder, not a bare `{{thinking}}`: rendering *only when the
+/// knob is set* is the contract for "unset" — the provider's own default. Idempotent by the
+/// key's presence, and rows whose JSON does not parse are skipped rather than fatal: a
+/// migration failure fails `Store::open`, which is app startup, and a corrupt manifest body is
+/// the editor's problem, not the boot path's.
+fn backfill_manifest_thinking_placeholder(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    // The LIKE is a pre-filter; the dialect field is the decision. Every matching row is loaded,
+    // parsed, and keyed precisely in Rust — a body that merely mentions the dialect in a model
+    // id must not be touched.
+    let rows: Vec<(String, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT id, body_json FROM manifests WHERE body_json LIKE '%anthropic-messages-v1%'",
+        )?;
+        let rows = stmt
+            .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (id, body) in rows {
+        let Ok(mut v) = serde_json::from_str::<serde_json::Value>(&body) else {
+            continue;
+        };
+        if v["dialect"].as_str() != Some("anthropic-messages-v1") {
+            continue;
+        }
+        let Some(template) = v
+            .get_mut("endpoints")
+            .and_then(|e| e.get_mut("generateText"))
+            .and_then(|g| g.get_mut("requestTemplate"))
+            .and_then(serde_json::Value::as_object_mut)
+        else {
+            continue;
+        };
+        if template.contains_key("thinking") {
+            continue;
+        }
+        template.insert("thinking".to_string(), serde_json::json!("{{thinking?}}"));
+        tx.execute(
+            "UPDATE manifests SET body_json = ?1 WHERE id = ?2",
+            rusqlite::params![v.to_string(), id],
+        )?;
+    }
+    Ok(())
+}
+
 /// Guarded so the migration can be re-run against a table that already carries the column — an
 /// `ALTER TABLE ADD COLUMN` for an existing column is an error, and a failed migration fails
 /// `Store::open`, which is app startup.
@@ -1273,6 +1336,79 @@ mod tests {
         );
     }
 
+    /// 0022's whole job: a manifest frozen before the knob existed — measured live on a
+    /// user-edited agentrouter manifest, where `thinking: "medium"` reached the wire as nothing
+    /// at all — gains the placeholder, while a manifest that already declares it and a
+    /// different dialect are untouched.
+    #[test]
+    fn the_thinking_placeholder_reaches_anthropic_manifests_that_predate_it() {
+        let dir = std::env::temp_dir().join(format!("aip-thinking-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let s = Store::open(&dir).expect("open+migrate");
+
+        let legacy_anthropic = r#"{"manifestVersion":1,"kind":"declarative","dialect":"anthropic-messages-v1","provider":{"baseUrl":"https://agentrouter.org/v1"},"endpoints":{"generateText":{"requestTemplate":{"model":"{{model}}","messages":"{{messages}}","max_tokens":"{{maxTokens}}"}}},"limits":{"maxOutputTokens":8192}}"#;
+        let declared_anthropic = r#"{"manifestVersion":1,"kind":"declarative","dialect":"anthropic-messages-v1","endpoints":{"generateText":{"requestTemplate":{"thinking":"{{thinking?}}"}}}}"#;
+        let openai = r#"{"manifestVersion":1,"kind":"declarative","dialect":"openai-chat-v1","endpoints":{"generateText":{"requestTemplate":{"model":"{{model}}"}}}}"#;
+        {
+            let conn = s.conn.lock().unwrap();
+            for (pid, slug) in [("p1", "legacy"), ("p2", "declared"), ("p3", "openai")] {
+                conn.execute(
+                    "INSERT INTO providers (id, slug, name, base_url, status, created_at, updated_at)
+                     VALUES (?1, ?2, ?2, 'https://x.test', 'enabled', 1, 1)",
+                    rusqlite::params![pid, slug],
+                )
+                .unwrap();
+            }
+            // One manifest row per provider (UNIQUE(provider_id)).
+            for (pid, id, body) in [
+                ("p1", "m-legacy", legacy_anthropic),
+                ("p2", "m-declared", declared_anthropic),
+                ("p3", "m-openai", openai),
+            ] {
+                conn.execute(
+                    "INSERT INTO manifests (id, provider_id, version, origin, body_json, created_at, is_active)
+                     VALUES (?1, ?2, 1, 'user-edited', ?3, 1, 1)",
+                    rusqlite::params![id, pid, body],
+                )
+                .unwrap();
+            }
+        }
+
+        // The migration ran at open against an empty table, so seeding the legacy shape
+        // afterwards and driving the step directly is the state a re-run must heal.
+        {
+            let mut conn = s.conn.lock().unwrap();
+            let tx = conn.transaction().unwrap();
+            backfill_manifest_thinking_placeholder(&tx).unwrap();
+            tx.commit().unwrap();
+        }
+
+        let conn = s.conn.lock().unwrap();
+        let body = |id: &str| -> String {
+            conn.query_row(
+                "SELECT body_json FROM manifests WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let healed: serde_json::Value = serde_json::from_str(&body("m-legacy")).unwrap();
+        assert_eq!(
+            healed["endpoints"]["generateText"]["requestTemplate"]["thinking"], "{{thinking?}}",
+            "the knob's placeholder is declared, so reasoning values can reach the wire"
+        );
+        assert_eq!(
+            healed["endpoints"]["generateText"]["requestTemplate"]["max_tokens"], "{{maxTokens}}",
+            "nothing else in the template moves"
+        );
+        assert_eq!(
+            body("m-declared"),
+            declared_anthropic,
+            "a manifest that already declares the key is byte-identical"
+        );
+        assert_eq!(body("m-openai"), openai, "the openai dialect is not repaired");
+    }
+
     #[test]
     fn migrations_apply_once_and_are_idempotent() {
         let dir = std::env::temp_dir().join(format!("aip-test-{}", std::process::id()));
@@ -1280,11 +1416,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0021 data migrations.
-        assert_eq!(info.schema_version, 21);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0022 data migrations.
+        assert_eq!(info.schema_version, 22);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(21, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(22, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

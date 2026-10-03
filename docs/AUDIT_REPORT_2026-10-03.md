@@ -153,6 +153,25 @@ only when the stream declares a finish selector, so *fired with `undefined`* rea
 while *never fired* reads as unknowable; the loop re-asks a truncated iteration (bounded) and
 flags the turn; the ok ledger row carries the evidence.
 
+### R6. The thinking knob is a silent no-op when the serving manifest declares no thinking placeholder
+
+Found live 2026-10-03, twice, identically: the Assistant's `thinking: "medium"` on a
+**user-edited** agentrouter manifest (anthropic-messages-v1, frozen before the builtin gained
+`{{thinking?}}` on 2026-10-02) rendered into nothing — the request template names no `thinking`
+field, so `reasoning_values` filled a values map no placeholder ever read. The wire carried no
+thinking field at all, the provider's own default did the thinking, and the turn spent the
+entire 8192-token output budget on `thinking_delta` with `NO_OUTPUT` for the answer. The knob's
+off position was equally unreachable, so the ledger's own advice ("turn thinking off for it")
+could not be followed without hand-editing the manifest. This is the industry's known failure
+mode for capability-scoped knobs — LiteLLM answers it with per-model capability metadata plus
+`drop_params` warnings, OpenRouter with per-model `supported_parameters` — and the shared rule
+is: **a knob must never be a silent no-op, and stored adapter config is upgraded in place.**
+
+**Fix direction:** a versioned data migration heals every stored Anthropic-dialect manifest
+(the dialect whose off spelling is probed and whose providers default thinking on); the
+remaining half — a run-config warning when the chosen model's manifest lacks the placeholder —
+is recorded below as open.
+
 ---
 
 ## P3 — minor
@@ -293,6 +312,7 @@ little; the client-gate marker lists (`client_gate.rs:19-31`) are fine at curren
 | R3 | P2 | **Fixed 2026-10-03** — when the caller's reasoning knob renders `thinking: enabled` **and** the dialect's template declares `{{thinking?}}`, the interpreter now (a) drops the caller's `temperature` entirely — the two fields together are a 400 on Anthropic-dialect providers — and (b) clamps a forced `tool_choice` to `{"type":"auto"}` rather than mapping a named tool through `toolChoiceMap`, since a tool the model cannot skip is incompatible with a thinking turn that may answer without calling anything. Thinking-off requests are byte-identical to before. Pinned by `a_thinking_enabled_request_drops_the_temperature_and_clamps_the_tool_choice` (interpreter), which asserts the on-case fields are absent and the off-case temperature and forced choice are forwarded unchanged; falsified by removing the guard (temperature reappears). The TS reference renders `Off`/on with the same table but has no equivalent guard — recorded as drift, see the drift register. |
 | R4 | P2 | **Fixed 2026-10-03** — `reasoning_values`' `Off` rendering is now per-dialect where it matters: Anthropic keeps its probed `{"type":"disabled"}` (both engines' tests pin that spelling), and the Gemini `thinkingConfig` key is **omitted** instead of sending `thinkingBudget: 0`, which Gemini 2.5 Pro (128 floor, thinking cannot be disabled) rejects with a 400. The tradeoff is recorded in the code: 2.5 Flash loses explicit-off and falls back to the provider's own default. Pinned by `reasoning_off_omits_the_gemini_thinking_config` (interpreter): `Off` yields no `thinkingConfig` on a `{{thinkingConfig?}}` template, `High` still yields `thinkingBudget ≥ 1024`. **The TS reference still sends both keys** — left as-is deliberately under the don't-move-the-reference-under-a-port rule; the divergence is registered in the drift register (`07-drift-register.md`). |
 | R5 | P2 | **Fixed 2026-10-03** (same day, found live) — the finish signal is now meaningful end to end. **Interpreter:** `onFinish` fires only when the stream declares a finish selector (`stream.finish`/`responseFinish`) or a reason was seen, so *fired with `undefined`* is readable as truncated and *never fired* as unknowable — pinned by two `dialect-messages` specs (declared-but-absent fires `undefined`; selector-less never fires). **Agent loop:** a truncated iteration is re-asked up to twice (`TRUNCATION_RETRIES`), then accepted with `done.truncated` / `result.truncated` so the UI can say what happened — pinned by three `agentLoop` specs (recovered on re-ask, flagged after the cap, one-call passthrough when no selector is declared), falsified by stashing the two src files (1 + 3 failures against the old code). **Assistant:** a truncated turn records a `done` step with `ok=false` reading "stream truncated", and the in-flight bubble announces each re-ask. **Ledger:** the ok row now carries `failure_detail` naming the truncation when the stream was cut — status stays `ok` because text *was* served, but the evidence travels with it. Not covered: providers that close cleanly without any finish mechanism are untouched; the `NO_OUTPUT` case (the whole output budget spent on reasoning, measured live the same day on agentrouter/deepseek) keeps its existing classification — that is a budget problem, not a truncation one. |
+| R6 | P2 | **Fixed 2026-10-03** (same day, found live) — data migration `0022_manifest_thinking_placeholder` (`store.rs`): every stored manifest whose body is the `anthropic-messages-v1` dialect and whose `generateText.requestTemplate` lacks the key gains `"thinking": "{{thinking?}}"` — the optional placeholder, so unset still means the provider's own default. Anthropic dialect only, deliberately: its off spelling is probed and it is the dialect that defaults thinking on; the OpenAI/Gemini templates stay untouched (injecting `reasoning_effort` into a request a provider has never seen is a 400 risk with no measured failure behind it). Pinned by `the_thinking_placeholder_reaches_anthropic_manifests_that_predate_it` (a legacy manifest heals, a pre-declared one is byte-identical, an openai-dialect one is untouched), and the version-sequence assertions move to 22. **Open half:** the run-config UI still lets a knob be set that a manifest cannot carry — a warning when the chosen model's manifest declares no thinking placeholder is the remaining honesty work. |
 
 Gates after the fixes (final run, 2026-10-03): `cargo fmt` clean repo-wide ·
 `cargo clippy --lib --tests -- -D warnings` clean (the pre-existing failures from the
