@@ -159,15 +159,10 @@ impl HttpPort for RecordingPort {
             }
 
             let started = Instant::now();
-            let response = builder
-                .send()
-                .await
-                .map_err(|e| HttpError::new(format!("transport: {e}")))?;
+            let response =
+                builder.send().await.map_err(|e| HttpError::new(format!("transport: {e}")))?;
             let status = response.status().as_u16();
-            let body = response
-                .text()
-                .await
-                .map_err(|e| HttpError::new(format!("body: {e}")))?;
+            let body = response.text().await.map_err(|e| HttpError::new(format!("body: {e}")))?;
             self.captures.lock().unwrap().push(Capture {
                 request: req,
                 status,
@@ -232,7 +227,8 @@ async fn call(
         .expect("the response phase — a 4xx surfaces here with the provider's own words");
     let text: String = stream.filter_map(|r| async move { r.ok() }).collect().await;
 
-    let index = port.captures.lock().unwrap().len().checked_sub(1).expect("the call sent a request");
+    let index =
+        port.captures.lock().unwrap().len().checked_sub(1).expect("the call sent a request");
     let sent = port.sent()[index].clone();
     let received = port.received()[index].clone();
     let (status, ms) = {
@@ -261,7 +257,8 @@ fn probe() -> Option<Probe> {
     }
     Some(Probe {
         key,
-        base_url: std::env::var("AIPROBE_BASE_URL").unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
+        base_url: std::env::var("AIPROBE_BASE_URL")
+            .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
         model: std::env::var("AIPROBE_MODEL").unwrap_or_else(|_| DEFAULT_MODEL.to_string()),
         user_agent: std::env::var("AIPROBE_UA").unwrap_or_else(|_| default_user_agent()),
     })
@@ -321,7 +318,10 @@ async fn the_thinking_knob_reaches_the_provider() {
     // reaching here means every request was accepted; these lines pin that it also answered.
     for (label, o) in [("unset", &unset), ("off", &off), ("high", &high)] {
         assert_eq!(o.status, 200, "{label}: HTTP {}", o.status);
-        assert!(!o.text.trim().is_empty(), "{label}: the provider accepted the request but wrote no text");
+        assert!(
+            !o.text.trim().is_empty(),
+            "{label}: the provider accepted the request but wrote no text"
+        );
     }
 }
 
@@ -366,6 +366,8 @@ fn answer_has_thinking(o: &Outcome) -> bool {
     o.received
         .get("content")
         .and_then(|c| c.as_array())
-        .map(|blocks| blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking")))
+        .map(|blocks| {
+            blocks.iter().any(|b| b.get("type").and_then(|t| t.as_str()) == Some("thinking"))
+        })
         .unwrap_or(false)
 }

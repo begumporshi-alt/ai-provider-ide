@@ -67,11 +67,7 @@ fn source_fingerprint(src: &std::path::Path) -> u64 {
     hash
 }
 
-fn collect_rs(
-    root: &std::path::Path,
-    dir: &std::path::Path,
-    out: &mut Vec<(String, u64, u64)>,
-) {
+fn collect_rs(root: &std::path::Path, dir: &std::path::Path, out: &mut Vec<(String, u64, u64)>) {
     let Ok(entries) = std::fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();

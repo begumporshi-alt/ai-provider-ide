@@ -27,6 +27,8 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Read;
+// Test-only: the zip writer's `write_all` needs the trait, and nothing in the library does.
+#[cfg(test)]
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -35,9 +37,9 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
-use serde::{Deserialize, Serialize};
-use regex::Regex;
 use base64::Engine as _;
+use regex::Regex;
+use serde::{Deserialize, Serialize};
 
 /// Executables that may start. Everything else is refused, including anything destructive
 /// (`rm`, `mv` to `rm`-like effect is bounded by confinement) or network-facing.
@@ -743,10 +745,8 @@ pub fn tool_cancel(call_id: &str) -> Result<bool, String> {
             std::thread::sleep(Duration::from_millis(CANCEL_GRACE_MS));
             // Presence in the map means the runner has not returned yet — that is the liveness
             // test. (Checking the pid directly would race reaping and possible pid reuse.)
-            let still_running = running_children()
-                .lock()
-                .map(|map| map.contains_key(&id))
-                .unwrap_or(false);
+            let still_running =
+                running_children().lock().map(|map| map.contains_key(&id)).unwrap_or(false);
             if still_running {
                 signal_group(pid, libc::SIGKILL);
             }
@@ -765,11 +765,7 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
 /// `call_id` is the model's tool-call id when the caller has one (the Assistant does; the
 /// gateway and direct calls do not). With an id, the child is registered for cancellation; without
 /// one it simply runs to completion or timeout, exactly as before.
-fn do_run_command_with(
-    args: &serde_json::Value,
-    root: &Path,
-    call_id: Option<&str>,
-) -> ToolResult {
+fn do_run_command_with(args: &serde_json::Value, root: &Path, call_id: Option<&str>) -> ToolResult {
     match (|| -> Result<String, String> {
         let program = arg_str(args, "program")?;
         if !allowed_programs().contains(program.as_str()) {
@@ -1125,7 +1121,11 @@ pub fn git_summary(root: &Path) -> Result<GitSummary, String> {
         if err.contains("not a git repository") {
             return Ok(summary);
         }
-        return Err(if err.trim().is_empty() { "git status failed".into() } else { err.trim().to_string() });
+        return Err(if err.trim().is_empty() {
+            "git status failed".into()
+        } else {
+            err.trim().to_string()
+        });
     }
     summary.is_repo = true;
     for line in out.lines() {
@@ -1164,10 +1164,7 @@ pub fn git_summary(root: &Path) -> Result<GitSummary, String> {
             } else {
                 &xy[1..]
             };
-            summary.files.push(GitFileEntry {
-                path: path.to_string(),
-                status: status.to_string(),
-            });
+            summary.files.push(GitFileEntry { path: path.to_string(), status: status.to_string() });
         }
     }
     // Line counts: `--numstat HEAD` covers staged+unstaged against the last commit. A repo with
@@ -1404,7 +1401,9 @@ fn do_read_document(args: &serde_json::Value, root: &Path) -> ToolResult {
         };
         let text = text.trim().to_string();
         if text.is_empty() {
-            return Err(format!("{rel} contains no extractable text (scanned images have no text layer)"));
+            return Err(format!(
+                "{rel} contains no extractable text (scanned images have no text layer)"
+            ));
         }
         if text.len() > MAX_READ_BYTES {
             let mut cut = MAX_READ_BYTES;
@@ -1430,7 +1429,8 @@ fn do_read_document(args: &serde_json::Value, root: &Path) -> ToolResult {
 /// full XML parse — the OOXML body is machine-generated and the tolerance is the point.
 fn docx_text(path: &Path, rel: &str) -> Result<String, String> {
     let file = fs::File::open(path).map_err(|e| format!("cannot open {rel}: {e}"))?;
-    let mut archive = zip::ZipArchive::new(file).map_err(|e| format!("{rel} is not a readable DOCX: {e}"))?;
+    let mut archive =
+        zip::ZipArchive::new(file).map_err(|e| format!("{rel} is not a readable DOCX: {e}"))?;
     let mut xml = String::new();
     archive
         .by_name("word/document.xml")
@@ -1455,7 +1455,13 @@ fn docx_text(path: &Path, rel: &str) -> Result<String, String> {
 /// result under a marker; the Assistant's loop strips it out and attaches the image as a real
 /// content part (the same wire shape chat attachments use), leaving the model a short text
 /// receipt. A non-vision model will see the receipt and can say so.
-const IMAGE_EXTENSIONS: &[(&str, &str)] = &[("png", "image/png"), ("jpg", "image/jpeg"), ("jpeg", "image/jpeg"), ("gif", "image/gif"), ("webp", "image/webp")];
+const IMAGE_EXTENSIONS: &[(&str, &str)] = &[
+    ("png", "image/png"),
+    ("jpg", "image/jpeg"),
+    ("jpeg", "image/jpeg"),
+    ("gif", "image/gif"),
+    ("webp", "image/webp"),
+];
 
 fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
     match (|| -> Result<String, String> {
@@ -1466,11 +1472,8 @@ fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
-        let media = IMAGE_EXTENSIONS
-            .iter()
-            .find(|(e, _)| *e == ext)
-            .map(|(_, m)| *m)
-            .ok_or_else(|| {
+        let media =
+            IMAGE_EXTENSIONS.iter().find(|(e, _)| *e == ext).map(|(_, m)| *m).ok_or_else(|| {
                 format!(
                     "\"{ext}\" is not a supported image — supported: {}",
                     IMAGE_EXTENSIONS.iter().map(|(e, _)| *e).collect::<Vec<_>>().join(", ")
@@ -1481,10 +1484,7 @@ fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
             return Err(format!("{rel} is over the 4 MB image cap"));
         }
         let b64 = base64::engine::general_purpose::STANDARD.encode(&bytes);
-        Ok(format!(
-            "READ_IMAGE:{media};base64,{b64}\npath: {rel}\nbytes: {}",
-            bytes.len()
-        ))
+        Ok(format!("READ_IMAGE:{media};base64,{b64}\npath: {rel}\nbytes: {}", bytes.len()))
     })() {
         Ok(text) => ToolResult::ok(text),
         Err(e) => ToolResult::err(e),
@@ -1502,10 +1502,13 @@ fn do_http_request(args: &serde_json::Value) -> ToolResult {
         match args.get("headers") {
             Some(serde_json::Value::Object(map)) => {
                 for (k, v) in map {
-                    headers.push((k.clone(), match v {
-                        serde_json::Value::String(s) => s.clone(),
-                        other => other.to_string(),
-                    }));
+                    headers.push((
+                        k.clone(),
+                        match v {
+                            serde_json::Value::String(s) => s.clone(),
+                            other => other.to_string(),
+                        },
+                    ));
                 }
             }
             Some(serde_json::Value::Null) | None => {}
@@ -1516,7 +1519,9 @@ fn do_http_request(args: &serde_json::Value) -> ToolResult {
             Some(serde_json::Value::Null) | None => None,
             Some(_) => return Err("\"body\" must be a string".into()),
         };
-        if body.is_some() && matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS") {
+        if body.is_some()
+            && matches!(method.to_ascii_uppercase().as_str(), "GET" | "HEAD" | "OPTIONS")
+        {
             return Err(format!("{method} does not carry a body — use POST/PUT/PATCH"));
         }
         crate::core::web::http_request(method, &url, &headers, body)
@@ -1551,9 +1556,7 @@ fn do_apply_patch(args: &serde_json::Value, root: &Path) -> ToolResult {
                     .collect()
             };
             let had_trailing_newline = file.is_new
-                || fs::read_to_string(&target)
-                    .map(|s| s.ends_with('\n'))
-                    .unwrap_or(true);
+                || fs::read_to_string(&target).map(|s| s.ends_with('\n')).unwrap_or(true);
             let mut cursor = 0usize;
             for (i, hunk) in file.hunks.iter().enumerate() {
                 if hunk.before.is_empty() {
@@ -1642,15 +1645,18 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchFile>, String> {
             in_hunk = true;
             continue;
         }
-        if line.starts_with("--- ") {
-            pending_old = Some(line[4..].trim().to_string());
+        if let Some(old) = line.strip_prefix("--- ") {
+            pending_old = Some(old.trim().to_string());
             in_hunk = false;
             continue; // the +++ line decides the target path
         }
-        if line.starts_with("+++ ") {
-            let path = strip_prefix(&line[4..]);
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let path = strip_prefix(rest);
             if path.is_empty() {
-                return Err("file deletion is not supported — remove the file with a command instead".into());
+                return Err(
+                    "file deletion is not supported — remove the file with a command instead"
+                        .into(),
+                );
             }
             let is_new = pending_old.as_deref() == Some("/dev/null");
             // A new +++ header closes the previous file: a multi-file patch would otherwise
@@ -1685,11 +1691,11 @@ fn parse_unified_patch(patch: &str) -> Result<Vec<PatchFile>, String> {
             in_hunk = false;
         }
     }
-        if let Some(f) = current.take() {
-            files.push(f);
-        }
-        files.retain(|f| !f.hunks.is_empty());
-        Ok(files)
+    if let Some(f) = current.take() {
+        files.push(f);
+    }
+    files.retain(|f| !f.hunks.is_empty());
+    Ok(files)
 }
 
 /// Execute one tool call. Never panics on model input: every failure is a `ToolResult`.
@@ -1948,10 +1954,7 @@ mod tests {
         ] {
             let argv: Vec<String> = argv.into_iter().map(String::from).collect();
             let denial = gh_denial(&argv);
-            assert!(
-                denial.is_some(),
-                "gh {argv:?} should be refused by the gate"
-            );
+            assert!(denial.is_some(), "gh {argv:?} should be refused by the gate");
         }
     }
 
@@ -1971,10 +1974,7 @@ mod tests {
         ] {
             let argv: Vec<String> = argv.into_iter().map(String::from).collect();
             let denial = gh_denial(&argv);
-            assert!(
-                denial.is_none(),
-                "gh {argv:?} should pass the gate: {denial:?}"
-            );
+            assert!(denial.is_none(), "gh {argv:?} should pass the gate: {denial:?}");
         }
     }
 
@@ -2094,9 +2094,7 @@ mod tests {
     fn read_image_serves_base64_under_the_marker() {
         let dir = root();
         // 1x1 PNG, a real image so the extension and content path are both exercised.
-        let png: &[u8] = &[
-            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D,
-        ];
+        let png: &[u8] = &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D];
         fs::write(dir.join("dot.png"), png).unwrap();
         let res = do_read_image(&obj(&[("path", serde_json::json!("dot.png"))]), &dir);
         assert!(res.ok, "{:?}", res.error);
@@ -2177,10 +2175,7 @@ diff --git a/a.txt b/a.txt
             fs::read_to_string(dir.join("a.txt")).unwrap(),
             "one\ninserted\ntwo\nthree\nfour\nFIVE\n"
         );
-        assert_eq!(
-            fs::read_to_string(dir.join("new/nested.txt")).unwrap(),
-            "hello\nworld\n"
-        );
+        assert_eq!(fs::read_to_string(dir.join("new/nested.txt")).unwrap(), "hello\nworld\n");
     }
 
     #[test]

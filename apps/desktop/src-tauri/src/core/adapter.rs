@@ -378,10 +378,10 @@ impl StreamObservation {
         let dtype = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
         // Text first: `text` is Anthropic's field, `content` is OpenAI's, `text_delta` the declared
         // discriminator. Any of the three means this event carried the answer.
-        if dtype == "text_delta" || delta.get("text").is_some_and(|v| v.is_string()) {
-            self.text += 1;
-            self.carried(payload);
-        } else if delta.get("content").is_some_and(|v| v.is_string()) {
+        if dtype == "text_delta"
+            || delta.get("text").is_some_and(|v| v.is_string())
+            || delta.get("content").is_some_and(|v| v.is_string())
+        {
             self.text += 1;
             self.carried(payload);
         } else if dtype == "thinking_delta" || delta.get("thinking").is_some_and(|v| v.is_string())

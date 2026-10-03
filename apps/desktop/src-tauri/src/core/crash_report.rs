@@ -209,8 +209,7 @@ fn iso_id(ms: i64) -> String {
     let ms = ms.max(0);
     let (days, rem) = (ms / 86_400_000, ms % 86_400_000);
     let (y, mo, d) = civil_from_days(days);
-    let (h, mi, s, milli) =
-        (rem / 3_600_000, (rem / 60_000) % 60, (rem / 1_000) % 60, rem % 1_000);
+    let (h, mi, s, milli) = (rem / 3_600_000, (rem / 60_000) % 60, (rem / 1_000) % 60, rem % 1_000);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}.{mi:02}.{s:02}.{milli:03}Z")
 }
 

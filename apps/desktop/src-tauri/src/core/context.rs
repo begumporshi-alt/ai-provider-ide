@@ -471,8 +471,7 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
                 if let Some(n) = by_id.get(to.as_str()) {
                     // Prefer the full text stored in meta over the clipped label: artifact labels
                     // are 80-character previews, but a resumed run replays the whole result.
-                    let text =
-                        meta_text(&n.meta, "text").unwrap_or_else(|| n.label.clone());
+                    let text = meta_text(&n.meta, "text").unwrap_or_else(|| n.label.clone());
                     let entry = results_of.entry(from.as_str()).or_default();
                     entry.0.push(text);
                     // First id wins: a call is answered by one artifact in practice, and an id

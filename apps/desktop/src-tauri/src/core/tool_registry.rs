@@ -498,8 +498,16 @@ mod tests {
         for on in [true, false] {
             let names: Vec<&str> = gateway_tool_set(on).iter().map(|t| t.name).collect();
             for r in [
-                "read_file", "list_dir", "search_files", "file_info", "todo_write",
-                "web_fetch", "web_search", "glob", "read_document", "read_image",
+                "read_file",
+                "list_dir",
+                "search_files",
+                "file_info",
+                "todo_write",
+                "web_fetch",
+                "web_search",
+                "glob",
+                "read_document",
+                "read_image",
             ] {
                 assert!(names.contains(&r), "{r} missing when mutation_enabled={on}");
             }
