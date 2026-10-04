@@ -793,7 +793,7 @@ pub fn retention_job(store: &Store) -> Result<(), String> {
 /// The daily half of §4: run [`retention_job`] every 24 hours until the process ends. The boot
 /// pass is the caller's synchronous run; this is the "nightly" the doc comment always promised.
 /// Spawned onto whichever runtime the host has — Tauri's for the app, the daemon's own.
-pub async fn retention_interval(store: Arc<Store>) {
+pub async fn retention_interval(store: std::sync::Arc<Store>) {
     let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
     ticker.tick().await; // an interval fires immediately; the boot pass already ran
     loop {
