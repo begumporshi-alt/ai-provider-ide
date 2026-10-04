@@ -21,6 +21,7 @@ import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
+import { gatewayGenerate } from "../lib/gateway-turn";
 import { useUi } from "../ui-state";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
@@ -172,17 +173,16 @@ function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<st
       .map((m) => `${m.role}: ${m.content}`)
       .join("\n")
       .slice(0, SUMMARIZER_INPUT_CHARS);
-    const exec = await router.generateText(
-      {
-        model,
-        messages: [
-          { role: "system", content: SUMMARY_PROMPT },
-          { role: "user", content: transcript },
-        ],
-        maxTokens: SUMMARIZER_MAX_TOKENS,
-      },
-      { skipCompression: true, source: "ui" },
-    );
+    // A1 Phase 1: served by the gateway engine, so the summarizer's spend lands in the same
+    // ledger the gateway writes — the "ledgered like any other" comment below is now literal.
+    const exec = await gatewayGenerate({
+      model,
+      messages: [
+        { role: "system", content: SUMMARY_PROMPT },
+        { role: "user", content: transcript },
+      ],
+      maxTokens: SUMMARIZER_MAX_TOKENS,
+    });
     let out = "";
     for await (const chunk of exec.chunks) out += chunk;
     return out.trim();
@@ -2196,7 +2196,12 @@ function Chat({
           // field the serving dialect declares (`thinking`, `reasoning_effort`, `thinkingConfig`),
           // and an unset level sends nothing at all.
           generate: (req, opts) =>
-            router.generateText(
+            // A1 Phase 1: the loop's generate port is the gateway engine — the same serving
+            // path ZCode and Claude Code drive. `opts` carries the loop's abort signal; the
+            // TS engine's `summarize` hook is not passed because context compression is no
+            // longer this call's business (server-side, or the client-side
+            // `compressWithSummary` above).
+            gatewayGenerate(
               {
                 // The run config's level is spread BEFORE the request on purpose: the loop's own
                 // reasoning override — the NO_OUTPUT fallback's forced "off" — must win over this
@@ -2216,7 +2221,7 @@ function Chat({
                   }));
                 },
               },
-              { ...opts, summarize: createSummarizer(chosen) },
+              { signal: opts?.signal },
             ),
           host,
           // Clamped again at the call site: this is the number that actually bounds the spend,
@@ -2334,7 +2339,10 @@ function Chat({
       // remembered from an earlier conversation.
       const recallMsg = memoryBlock(recalled);
       const systemPromptText = noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt;
-      const exec = await router.generateText(
+      // A1 Phase 1: this turn is served by the gateway engine — the same ingress, admission
+      // control, ledger, and failover every external client gets. `AIP-Memory: off` inside
+      // `gatewayGenerate` keeps the webview's own recall (`recalled`) the only memory block.
+      const exec = await gatewayGenerate(
         {
           model: chosen,
           messages: [
@@ -2387,24 +2395,24 @@ function Chat({
       if (reasoned) {
         setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
       }
+      // A1 Phase 1: attribution rides the wire's optional `served_by` terminal field. The
+      // fallback chain is gateway-internal and does not ride yet — the one trace field the old
+      // engine showed that this path does not.
       const served = exec.served();
       const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
         role: "assistant",
-        model: served?.model.nativeId ?? chosen,
-        provider: served?.provider.id,
+        model: served?.model ?? chosen,
+        provider: served?.provider,
         text: streamed,
       });
       rec.edge(userNode, assistantNode, "follows");
       lastNodeRef.current = assistantNode;
       setTrace({
         ms: Date.now() - t0,
-        provider: served ? registry.getProvider(served.provider.id)?.name : undefined,
-        key: served?.key.label,
-        model: served?.model.nativeId,
-        fallbacks: exec.fallbackChain().map((a) => ({
-          provider: registry.getProvider(a.candidate.provider.id)?.name ?? a.candidate.provider.slug,
-          key: a.candidate.key.label, cls: a.cls,
-        })),
+        provider: served?.provider ? registry.getProvider(served.provider)?.name : undefined,
+        key: served?.key,
+        model: served?.model ?? chosen,
+        fallbacks: [],
         // **A stream the user stopped is not a success**, and this path reaches here without
         // throwing: the engine's loop returns on an aborted signal rather than raising, so the
         // `catch` below never sees it and the trace printed `✓ 680ms` for a cancelled request. That

@@ -2879,8 +2879,144 @@ async function egressStream(req: WireReq, onEvent: string): Promise<null> {
 // ...and so does the admin transport. Bound before the patch so an egress call can never
 // re-enter the interceptor.
 const nativeFetch: typeof fetch = globalThis.fetch.bind(globalThis);
+
+// ---------------------------------------------------------------------------
+// A1 Phase 1: the Assistant reaches the engine over the gateway's HTTP seam
+// (`lib/gateway-turn.ts` → `POST /v1/chat/completions`). The harness cannot run the Rust
+// gateway, so this interceptor stands in for its **ingress** only: it delegates to the same
+// TS engine this page already booted (`store.ts`'s `router` — the serving half D95 tracks),
+// and re-shapes the exec into the gateway's SSE wire (delta content / reasoning_content, a
+// terminal chunk carrying finish_reason beside usage, `[DONE]`, and an `error` frame on
+// failure — the shapes `gateway-turn.test.ts` pins). What it deliberately does NOT model:
+// admission control, idempotency, the memory layer, and the Rust failover chain — those are
+// the Rust suite's surface. The ledger row is written exactly as before, by the engine's own
+// `UsageLedger` callback through `/admin/ledger`, so attribution specs see the same rows.
+// ---------------------------------------------------------------------------
+type EngineRouter = {
+  generateText: (
+    req: Record<string, unknown>,
+    opts?: Record<string, unknown>,
+  ) => Promise<{
+    chunks: AsyncIterable<string>;
+    served?: () =>
+      | { model?: { nativeId?: string }; provider?: { id?: string }; key?: { label?: string } }
+      | undefined;
+  }>;
+};
+let engineRouter: EngineRouter | undefined;
+
+async function tryServeCompletion(
+  input: RequestInfo | URL,
+  init?: RequestInit,
+): Promise<Response | null> {
+  if (typeof input !== "string" && !(input instanceof URL)) return null;
+  let url: URL;
+  try {
+    url = new URL(typeof input === "string" ? input : input.href, location.href);
+  } catch {
+    return null;
+  }
+  if (!isLocal(url.hostname) || url.pathname !== "/v1/chat/completions") return null;
+  // **Only the gateway's own listener.** Without this the interceptor would also claim the
+  // egress dials to providers whose OpenAI-compatible path is `/v1/chat/completions` (the mock
+  // oracle's is), and the engine would re-enter itself through the patched fetch until the
+  // attempt budget ran out — PARSE_ERROR wrapping RATE_LIMITED, five layers deep.
+  if (url.port !== String(gatewayStatus.port)) return null;
+
+  let parsed: Record<string, unknown>;
+  try {
+    parsed = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+  } catch {
+    return new Response(JSON.stringify({ error: { message: "invalid JSON body" } }), { status: 400 });
+  }
+  if (!engineRouter) {
+    // The app boots after this module; by the first turn the singleton exists. Same module
+    // instance the UI uses — the import is a handle, not a second engine.
+    engineRouter = (await import("../src/store")).router as unknown as EngineRouter;
+  }
+
+  const encoder = new TextEncoder();
+  const stream = new ReadableStream<Uint8Array>({
+    async start(controller) {
+      const send = (obj: unknown): void => {
+        controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
+      };
+      try {
+        const exec = await engineRouter!.generateText({
+          model: parsed.model,
+          messages: parsed.messages,
+          ...(Array.isArray(parsed.tools)
+            ? { tools: parsed.tools, toolChoice: parsed.tool_choice }
+            : {}),
+          ...(typeof parsed.temperature === "number" ? { temperature: parsed.temperature } : {}),
+          ...(typeof parsed.max_tokens === "number" ? { maxTokens: parsed.max_tokens } : {}),
+          ...(typeof parsed.reasoning_effort === "string"
+            ? { reasoning: parsed.reasoning_effort }
+            : {}),
+          // The engine's ToolCall is {id?, name, arguments}; the wire shape is OpenAI's
+          // {id, type, function: {name, arguments}} — same translation the engine itself
+          // performs in `toWireToolCalls` before replaying a turn.
+          onToolCall: (call: { id?: string; name?: string; arguments?: string }) => {
+            send({
+              choices: [
+                {
+                  delta: {
+                    tool_calls: [
+                      {
+                        id: call.id,
+                        type: "function",
+                        function: { name: call.name, arguments: call.arguments },
+                      },
+                    ],
+                  },
+                },
+              ],
+            });
+          },
+          onReasoning: (text: string) => {
+            if (text) send({ choices: [{ delta: { reasoning_content: text } }] });
+          },
+        });
+        for await (const chunk of exec.chunks) {
+          send({ choices: [{ delta: { content: chunk } }] });
+        }
+        const served = exec.served?.();
+        send({
+          choices: [
+            {
+              index: 0,
+              delta: {},
+              finish_reason: "stop",
+              usage: { prompt_tokens: 0, completion_tokens: 0 },
+              // Serving attribution, for the trace panel: which provider/key actually answered.
+              served_by: served
+                ? {
+                    provider: served.provider?.id,
+                    model: served.model?.nativeId,
+                    key: served.key?.label,
+                  }
+                : undefined,
+            },
+          ],
+        });
+        controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+        controller.close();
+      } catch (e) {
+        send({ error: { message: String((e as Error).message ?? e) } });
+        controller.close();
+      }
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
 globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> =>
-  (await tryServeAdmin(input, init)) ?? nativeFetch(input as RequestInfo, init)) as typeof fetch;
+  (await tryServeCompletion(input, init)) ??
+  (await tryServeAdmin(input, init)) ??
+  nativeFetch(input as RequestInfo, init)) as typeof fetch;
 (globalThis as unknown as {
   __TAURI_EVENT_PLUGIN_INTERNALS__: { unregisterListener: (event: string, eventId: number) => void };
 }).__TAURI_EVENT_PLUGIN_INTERNALS__ = {

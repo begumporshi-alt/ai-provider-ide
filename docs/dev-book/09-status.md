@@ -85,6 +85,17 @@ the pin). Five new specs; D97 Fixed. A4: the decomposition plan the row demanded
 six submodules behind a re-exporting root, moves pending; D98 Half. Rust suite re-measured at
 **1,521** after this work (1,516 before it).
 
+**2026-10-04 — A1 Phase 1: the Assistant is a gateway client.** The dual-runtime measurement
+(D95) showed the drift surface is the *serving path*, and the Assistant was its only
+UI-side customer. The chat turn, the agent loop's `generate` port, and the client-side
+summarizer now call the gateway ingress through `lib/gateway-turn.ts` — same admission control,
+same ledger, same failover as ZCode and Claude Code; the webview's own recall stays the only
+memory block via `AIP-Memory: off`. Six wire specs pin the shapes the Rust side emits. Two
+deliberate interim costs, both recorded in D95: the Assistant's trace panel no longer shows
+which provider/key served (attribution lives in the ledger/Activity until the wire carries it),
+and the Assistant now requires a running gateway — the router is the product, and its flagship
+client dogfoods it. Desktop TS suite re-measured at **454** (+6).
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.
