@@ -672,51 +672,79 @@ pub struct MemoryPruneStats {
     pub decayed: usize,
 }
 
-/// §6.2 retention for the `memories` table. Called on idle, never from the request path.
+/// One bounded chunk of §6.2 retention: each policy deletes at most `chunk` rows.
 ///
-/// Two absolute exemptions, because both survive on the operator's say-so rather than on recency:
-/// **pinned** and **L3**. Everything else is data this layer produced by itself and can unproduce —
-/// an atom nobody has re-confirmed in four months is not a fact, it is a guess with a timestamp.
-///
-/// `DELETE` is safe against the FTS index: `memories_ad` fires per row.
-pub fn prune(store: &Store) -> Result<MemoryPruneStats, String> {
+/// The retention scheduler (`core/retention.rs`) calls this in a loop under a wall-clock budget;
+/// [`prune`] is this with an unbounded chunk. The split exists for the store's one writer lock:
+/// every request shares it with housekeeping, and SQLite has no statement timeout, so the
+/// worst-case hold has to be bounded by the statement itself rather than by the table.
+pub fn prune_step(store: &Store, chunk: i64) -> Result<MemoryPruneStats, String> {
     let mut stats = MemoryPruneStats::default();
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let now = now_ms();
 
     stats.l0_expired = conn
         .execute(
-            "DELETE FROM memories WHERE layer = 'L0' AND pinned = 0 AND updated_at < ?1",
-            params![now - L0_TTL_DAYS * 86_400_000],
+            "WITH victims AS (
+               SELECT rowid FROM memories
+                WHERE layer = 'L0' AND pinned = 0 AND updated_at < ?1
+                LIMIT ?2
+             )
+             DELETE FROM memories WHERE rowid IN (SELECT rowid FROM victims)",
+            params![now - L0_TTL_DAYS * 86_400_000, chunk],
         )
         .map_err(|e| e.to_string())?;
 
     // Newest N per session survive. A window function is the only readable way to express "per
-    // session" — the correlated-subquery form is quadratic over every L0 row in the table.
+    // session" — the correlated-subquery form is quadratic over every L0 row in the table. The
+    // LIMIT rides the *victims* select, so `chunk` bounds rows deleted, not rows scanned; the
+    // window still runs per batch, and a backlog pays that per batch rather than once.
     stats.l0_ring = conn
         .execute(
-            "DELETE FROM memories
-              WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
-                AND rowid NOT IN (
-                  SELECT rowid FROM (
-                    SELECT rowid, ROW_NUMBER() OVER (
-                      PARTITION BY session_id ORDER BY updated_at DESC, id
-                    ) AS rn
-                    FROM memories WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
-                  ) WHERE rn <= ?1
-                )",
-            params![L0_RING_PER_SESSION as i64],
+            "WITH victims AS (
+               SELECT rowid FROM memories
+                WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
+                  AND rowid NOT IN (
+                    SELECT rowid FROM (
+                      SELECT rowid, ROW_NUMBER() OVER (
+                        PARTITION BY session_id ORDER BY updated_at DESC, id
+                      ) AS rn
+                      FROM memories WHERE layer = 'L0' AND pinned = 0 AND session_id IS NOT NULL
+                    ) WHERE rn <= ?1
+                  )
+                LIMIT ?2
+             )
+             DELETE FROM memories WHERE rowid IN (SELECT rowid FROM victims)",
+            params![L0_RING_PER_SESSION as i64, chunk],
         )
         .map_err(|e| e.to_string())?;
 
     stats.decayed = conn
         .execute(
-            "DELETE FROM memories WHERE layer IN ('L1','L2') AND pinned = 0 AND updated_at < ?1",
-            params![now - prune_cutoff_ms()],
+            "WITH victims AS (
+               SELECT rowid FROM memories
+                WHERE layer IN ('L1','L2') AND pinned = 0 AND updated_at < ?1
+                LIMIT ?2
+             )
+             DELETE FROM memories WHERE rowid IN (SELECT rowid FROM victims)",
+            params![now - prune_cutoff_ms(), chunk],
         )
         .map_err(|e| e.to_string())?;
 
     Ok(stats)
+}
+
+/// §6.2 retention for the `memories` table. Called on idle, never from the request path.
+///
+/// Two absolute exemptions, because both survive on the operator's say-so rather than on recency:
+/// **pinned** and **L3**. Everything else is data this layer produced by itself and can unproduce —
+/// an atom nobody has re-confirmed in four months is not a fact, it is a guess with a timestamp.
+///
+/// `DELETE` is safe against the FTS index: `memories_ad` fires per row. The full drain — every
+/// policy, every row — is [`prune_step`] with an unbounded chunk, so there is exactly one
+/// definition of each policy in this file.
+pub fn prune(store: &Store) -> Result<MemoryPruneStats, String> {
+    prune_step(store, i64::MAX)
 }
 
 pub fn set_pinned(store: &Store, id: &str, pinned: bool) -> Result<bool, String> {

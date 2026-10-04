@@ -314,29 +314,37 @@ pub struct PruneStats {
     pub sessions_reaped: usize,
 }
 
-/// Bound the tables: ring per session, TTL on turns, TTL on idle sessions.
+/// One bounded chunk of live-context retention: each policy deletes at most `chunk` rows.
 ///
-/// Runs on idle rather than per request — pruning inside the request path would add a second write
-/// to the hottest code in the app.
-pub fn prune(store: &Store) -> Result<PruneStats, String> {
+/// Same reason as `memory::prune_step`: the scheduler calls this in a loop under a wall-clock
+/// budget, and the one writer lock every request shares has to be held by small statements.
+pub fn prune_step(store: &Store, chunk: i64) -> Result<PruneStats, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
 
     // Keep the newest MAX_TURNS_PER_SESSION per session. `seq` is monotonic, so "keep the rows
     // whose seq is above the nth largest" is the ring without a per-session loop.
     let turns_by_count = conn
         .execute(
-            "DELETE FROM session_turns WHERE id IN (
+            "WITH victims AS (
                SELECT t.id FROM session_turns t
-               WHERE (SELECT COUNT(*) FROM session_turns x
-                      WHERE x.session_id = t.session_id AND x.seq >= t.seq) > ?1
-             )",
-            params![MAX_TURNS_PER_SESSION as i64],
+                WHERE (SELECT COUNT(*) FROM session_turns x
+                        WHERE x.session_id = t.session_id AND x.seq >= t.seq) > ?1
+                LIMIT ?2
+             )
+             DELETE FROM session_turns WHERE id IN (SELECT id FROM victims)",
+            params![MAX_TURNS_PER_SESSION as i64, chunk],
         )
         .map_err(|e| e.to_string())?;
 
     let turn_cutoff = now_ms() - TURN_TTL_DAYS * 86_400_000;
     let turns_by_age = conn
-        .execute("DELETE FROM session_turns WHERE ts < ?1", params![turn_cutoff])
+        .execute(
+            "WITH victims AS (
+               SELECT id FROM session_turns WHERE ts < ?1 LIMIT ?2
+             )
+             DELETE FROM session_turns WHERE id IN (SELECT id FROM victims)",
+            params![turn_cutoff, chunk],
+        )
         .map_err(|e| e.to_string())?;
 
     // Sessions are reaped only after their turns are gone, so the FK never fires: a session with
@@ -344,10 +352,14 @@ pub fn prune(store: &Store) -> Result<PruneStats, String> {
     let session_cutoff = now_ms() - SESSION_TTL_DAYS * 86_400_000;
     let sessions_reaped = conn
         .execute(
-            "DELETE FROM router_sessions
-             WHERE last_seen_at < ?1
-               AND NOT EXISTS (SELECT 1 FROM session_turns t WHERE t.session_id = router_sessions.id)",
-            params![session_cutoff],
+            "WITH victims AS (
+               SELECT id FROM router_sessions
+                WHERE last_seen_at < ?1
+                  AND NOT EXISTS (SELECT 1 FROM session_turns t WHERE t.session_id = router_sessions.id)
+                LIMIT ?2
+             )
+             DELETE FROM router_sessions WHERE id IN (SELECT id FROM victims)",
+            params![session_cutoff, chunk],
         )
         .map_err(|e| e.to_string())?;
 
@@ -355,6 +367,15 @@ pub fn prune(store: &Store) -> Result<PruneStats, String> {
     // three separate statements, so a partial write is impossible to express here and the
     // literal makes that explicit (clippy::field_reassign_with_default).
     Ok(PruneStats { turns_by_count, turns_by_age, sessions_reaped })
+}
+
+/// Bound the tables: ring per session, TTL on turns, TTL on idle sessions.
+///
+/// Runs on idle rather than per request — pruning inside the request path would add a second write
+/// to the hottest code in the app. The full drain is [`prune_step`] with an unbounded chunk, so
+/// there is exactly one definition of each policy in this file.
+pub fn prune(store: &Store) -> Result<PruneStats, String> {
+    prune_step(store, i64::MAX)
 }
 
 #[cfg(test)]

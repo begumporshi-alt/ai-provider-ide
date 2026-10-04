@@ -41,6 +41,17 @@ installed daemon, and the chain had no test, which is why the gap survived two a
 is pinned now. Three new specs, all `gateway_tests`; D90 in
 [`07-drift-register.md`](07-drift-register.md) carries the full evidence trail.
 
+**2026-10-04 — retention passes bounded, and observable.** Reading LiteLLM's spend-log
+cleaner (batch size, run budget, stop reason) exposed the gap in the same day's D89 fix: the
+scheduler's prunes were unbounded single-statement DELETEs on the store's one writer lock, so a
+six-figure backlog — the very state the module exists because of — could have held that lock
+for the length of one statement. Policies now live once per module as `prune_step(chunk)`
+(victims-CTE, the LIMIT on the victims select), `prune()` delegates with an unbounded chunk so
+admin routes keep full-drain semantics, and the scheduler deletes in 500-row batches under a
+5-second budget checked between batches — a pass can be slow, but the lock hold is one batch.
+Every pass records an outcome (counts, skip, `budget_exhausted`); the budget never fires on a
+healthy store. Six `retention` specs; D91 in [`07-drift-register.md`](07-drift-register.md).
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.
