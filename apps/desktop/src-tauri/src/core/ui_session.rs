@@ -33,6 +33,41 @@ use crate::core::vault;
 /// key rather than needing to know about a second kind of credential.
 pub const UI_SESSION_ID: &str = "ak-ui";
 
+/// How long one UI session credential stays authoritative (audit 2026-10-03 S2).
+///
+/// The mint already revokes on gateway stop, so a token could not outlive the session it was
+/// minted for — but *within* a session it lived forever, and a session can run for weeks on the
+/// daemon. 24h bounds what a stolen bearer is worth. The webview heals the expiry itself: the
+/// auth path refuses an expired credential (the key provider drops it — see
+/// `vault_app_key_provider`), the request answers 401, and `gateway-client.ts`'s 401 retry drops
+/// its cached copy and re-`ensure`s — which rotates the stale row. One wasted round trip per
+/// TTL is the entire cost of a bounded credential.
+pub const SESSION_TTL_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// The row's `created_at`, or `None` when there is no row.
+fn created_at(store: &Store) -> Result<Option<i64>, rusqlite::Error> {
+    let conn = store.conn.lock().unwrap();
+    conn.query_row(
+        "SELECT created_at FROM gateway_keys WHERE id = ?1",
+        rusqlite::params![UI_SESSION_ID],
+        |r| r.get(0),
+    )
+    .optional()
+}
+
+/// Is the current credential past [`SESSION_TTL_MS`]? A missing row is expired by definition —
+/// there is nothing there to authorise with.
+pub fn expired(store: &Store) -> bool {
+    created_at(store).ok().flatten().map(|t| now_ms() - t > SESSION_TTL_MS).unwrap_or(true)
+}
+
 /// Shown nowhere — the row exists to authorise the secret, not for a human to read.
 const UI_SESSION_LABEL: &str = "UI session (internal)";
 
@@ -65,8 +100,24 @@ pub fn ensure_with(
 ) -> Result<String, String> {
     let account = format!("{APP_KEY_PREFIX}{UI_SESSION_ID}");
 
+    // A stale credential is **rotated, not renewed in place**. The delete must come *first*:
+    // `persist::gateway_key_delete` is a hard delete — row AND vault entry — so reversing the
+    // order (the first draft) deleted the fresh secret it had just written and left the
+    // credential with no vault half at all. Delete clears both halves; the mint below then
+    // writes a new secret into the emptied slot, and the row re-stamp is what the app-key memo
+    // invalidates on. The id stays `ak-ui`, so nothing else learns anything happened.
+    let stale =
+        created_at(store).ok().flatten().map(|t| now_ms() - t > SESSION_TTL_MS).unwrap_or(false);
+    if stale {
+        persist::gateway_key_delete(store, UI_SESSION_ID)
+            .map_err(|e| format!("could not re-stamp the session key: {e}"))?;
+    }
+
     let secret = match get(&account) {
-        Some(s) if !s.is_empty() => s,
+        // `!stale` is not redundant with the delete above: the delete clears the *real* vault,
+        // and `get` is injected — a test's map (or any other half) can still be holding the
+        // stale secret here, and stale must never be handed back.
+        Some(s) if !s.is_empty() && !stale => s,
         _ => {
             let s = generate_random_key();
             put(&account, &s).map_err(|e| format!("could not store the session key: {e}"))?;
@@ -251,5 +302,55 @@ mod tests {
             !row_exists(&s, UI_SESSION_ID).unwrap(),
             "a revoked session row must not be treated as live"
         );
+    }
+
+    /// The S2 half: a credential past its TTL is **rotated**, not renewed in place. The next
+    /// `ensure` mints fresh, overwrites the vault entry, and re-stamps the row — the old bearer
+    /// stops working even though the id never changed.
+    #[test]
+    fn a_stale_credential_is_rotated_by_the_next_ensure() {
+        let s = tmp();
+        let stored = std::cell::RefCell::new(std::collections::HashMap::<String, String>::new());
+        let put = |a: &str, v: &str| {
+            stored.borrow_mut().insert(a.to_string(), v.to_string());
+            Ok(())
+        };
+        let first = ensure_with(&s, &|a: &str| stored.borrow().get(a).cloned(), &put).unwrap();
+        assert!(!expired(&s), "a just-minted credential is live for the whole TTL");
+
+        // Backdate the row past the TTL — the same state a session two days old is in.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute(
+                "UPDATE gateway_keys SET created_at = created_at - ?1 WHERE id = ?2",
+                rusqlite::params![SESSION_TTL_MS + 60_000, UI_SESSION_ID],
+            )
+            .unwrap();
+        }
+        assert!(expired(&s), "the backdated row reads as expired");
+
+        let second = ensure_with(&s, &|a: &str| stored.borrow().get(a).cloned(), &put).unwrap();
+        assert_ne!(second, first, "a stale credential is rotated, not handed out again");
+        assert!(!expired(&s), "the rotation re-stamps the row");
+        assert_eq!(
+            stored.borrow().get(&format!("{APP_KEY_PREFIX}{UI_SESSION_ID}")).map(String::as_str),
+            Some(second.as_str()),
+            "and the vault entry is the rotated secret, not the stale one"
+        );
+    }
+
+    /// The probe the auth path leans on: no row means expired (there is nothing to authorise
+    /// with), and a fresh mint means live.
+    #[test]
+    fn expired_reads_the_row_not_the_vault() {
+        let s = tmp();
+        assert!(expired(&s), "no row: nothing to authorise with");
+        let stored = std::cell::RefCell::new(std::collections::HashMap::<String, String>::new());
+        let _ = ensure_with(&s, &|_: &str| None, &|a, v| {
+            stored.borrow_mut().insert(a.to_string(), v.to_string());
+            Ok(())
+        })
+        .unwrap();
+        assert!(!expired(&s));
     }
 }

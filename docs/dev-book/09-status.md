@@ -63,6 +63,17 @@ bug. Operationally: the `.pre-install` snapshot pile was swept to the rotation p
 `500098f` installed (37 removed, newest 5 kept; the pile had reached 42 files / ~811 MB
 because rotation only runs at `dev-up` time — the next sweep is free, the habit is the fix).
 
+**2026-10-04 — S1+S2: the local exposure is closed.** The audit's only true vulnerability pair,
+registered yesterday as D93/D94. CORS is exact-match now — the production webview origin
+(`tauri://localhost` and its Windows/Linux siblings) plus the pinned Vite dev port, and the
+`localhost*` prefix wildcards that trusted every local port on the machine are gone. The
+webview's admin bearer carries a 24h TTL enforced at both ends: the auth path refuses an
+expired credential outright, and `ensure` rotates the stale row, so the webview's own 401
+retry heals the expiry with one wasted round trip. The end-to-end spec caught the rotation's
+first draft deleting the secret it had just written — `gateway_key_delete` is a hard delete of
+row *and* vault entry, and the fixed ordering is pinned in `ensure_with`'s comment. Four new
+specs; D93/D94 in [`07-drift-register.md`](07-drift-register.md) carry the evidence.
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.

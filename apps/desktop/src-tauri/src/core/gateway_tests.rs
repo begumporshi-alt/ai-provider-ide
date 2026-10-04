@@ -1623,6 +1623,61 @@ fn the_ui_session_credential_authenticates_at_the_gate() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// S2 end to end, through the production provider and the real vault: a credential past its TTL
+/// stops authenticating even though the id and the secret are unchanged — and the webview's own
+/// healing path (401 → re-`ensure`, which rotates → retry) restores it. The mint-time revoke
+/// bounded a stolen token by the gateway's lifetime; the TTL bounds it inside one.
+#[test]
+fn an_expired_ui_session_credential_stops_authenticating_until_the_mint_rotates_it() {
+    let dir = std::env::temp_dir().join(format!("aip-uisession-ttl-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+
+    // The real mint and the real provider — vault writes land in the test binary's temp vault.
+    let secret = crate::core::ui_session::ensure(&store).expect("the mint must succeed");
+    let core = Arc::new(
+        GatewayCore::new(Arc::new(SynthBridge::new()), Arc::new(|| Some("sk-aip-master".into())))
+            .with_app_keys(super::vault_app_key_provider(store.clone()))
+            .with_store(store.clone()),
+    );
+    assert_eq!(
+        core.app_key_for(&secret).as_deref(),
+        Some(crate::core::ui_session::UI_SESSION_ID),
+        "a fresh credential authenticates"
+    );
+
+    // Backdate past the TTL. Same id, same secret — the auth path must refuse it anyway.
+    {
+        let conn = store.conn.lock().unwrap();
+        conn.execute(
+            "UPDATE gateway_keys SET created_at = created_at - ?1 WHERE id = ?2",
+            rusqlite::params![
+                crate::core::ui_session::SESSION_TTL_MS + 60_000,
+                crate::core::ui_session::UI_SESSION_ID
+            ],
+        )
+        .unwrap();
+    }
+    assert!(crate::core::ui_session::expired(&store), "the backdated row reads as expired");
+    assert_eq!(
+        core.app_key_for(&secret),
+        None,
+        "an expired credential authenticates nobody, whatever it says"
+    );
+
+    // The webview's healing path: the 401 drops the cached copy, the re-ensure rotates, the
+    // retry authenticates. One wasted round trip per TTL is the entire cost.
+    let fresh = crate::core::ui_session::ensure(&store).expect("the rotation must succeed");
+    assert_ne!(fresh, secret, "rotation mints fresh rather than handing the stale bearer back");
+    assert_eq!(
+        core.app_key_for(&fresh).as_deref(),
+        Some(crate::core::ui_session::UI_SESSION_ID),
+        "the rotation self-heals without any restart"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// No store means no authoritative id set, so nothing is memoised. This is what keeps
 /// `r4_revoked_app_key_rejected_immediately` honest: that harness mutates the provider's vec
 /// directly, and a cache would have masked the change.
@@ -3787,6 +3842,27 @@ fn cors_rejects_non_local_origin() {
         resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
         "a non-local origin must not get CORS headers"
     );
+}
+
+/// S1 (audit 2026-10-03): the allowlist is exact-match, not a prefix. The former
+/// `http://localhost*` wildcard trusted every local port — a malicious page on any dev server,
+/// tool, or debug port on this machine could read gateway responses, and the gateway holds
+/// provider keys. Same host, different port: somebody else's page.
+#[test]
+fn cors_denies_localhost_origins_that_are_not_the_dev_port() {
+    for origin in [
+        "http://localhost:5555",
+        "http://127.0.0.1:3000",
+        "http://localhost:14200",
+        "http://localhost.evil.example",
+    ] {
+        let mut resp = cors_response();
+        apply_cors(&mut resp, Some(&HeaderValue::from_str(origin).unwrap()));
+        assert!(
+            resp.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN).is_none(),
+            "{origin} must not be granted a CORS read"
+        );
+    }
 }
 
 #[test]

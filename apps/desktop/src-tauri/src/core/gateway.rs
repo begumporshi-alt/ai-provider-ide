@@ -262,6 +262,16 @@ pub fn vault_app_key_provider(store: Arc<crate::core::store::Store>) -> AppKeyPr
         let ids = crate::core::persist::active_gateway_key_ids(&store).unwrap_or_default();
         ids.into_iter()
             .filter_map(|id| {
+                // The UI session credential expires (audit 2026-10-03 S2): past its TTL this
+                // provider simply does not offer it, so the bearer answers 401 and the webview's
+                // 401 retry re-`ensure`s — which rotates the stale row — instead of the key
+                // authenticating for as long as the process runs. The headless daemon has no
+                // webview to self-heal; an operator there uses the master key or a real app key.
+                if crate::core::ui_session::is_ui_session(&id)
+                    && crate::core::ui_session::expired(&store)
+                {
+                    return None;
+                }
                 let secret = vault::get(&format!("{APP_KEY_PREFIX}{id}")).ok().flatten()?;
                 Some(AppKey { id, secret })
             })
@@ -2210,9 +2220,13 @@ async fn ensure_retry_after(req: Request<Body>, next: Next) -> Response {
 /// while the gateway listens on `http://127.0.0.1:<port>`. Without CORS headers the browser's
 /// same-origin policy blocks every `fetch()` the UI makes.
 ///
-/// Allowed origins: `tauri://localhost`, `http://localhost*`, `http://127.0.0.1*`. External
-/// clients (curl, AI Hub) send no `Origin` header and are unaffected — CORS is a browser-only
-/// mechanism.
+/// Allowed origins, **exact-match** (audit 2026-10-03 S1): `tauri://localhost` is the production
+/// webview on macOS, `http(s)://tauri.localhost` the same on Windows/Linux, and
+/// `http://localhost:1420` / `http://127.0.0.1:1420` the Vite dev server the webview is served
+/// from in `tauri dev`. The former `http://localhost*` / `http://127.0.0.1*` prefix wildcards
+/// trusted every local port — a malicious page on any dev server or tool on this machine could
+/// read gateway responses, and the gateway holds provider keys. External clients (curl, AI Hub)
+/// send no `Origin` header and are unaffected — CORS is a browser-only mechanism.
 ///
 /// `OPTIONS` preflight is answered here (204 No Content) before any route or auth check, so an
 /// unauthenticated preflight never reaches `check_gateway_key`. This is correct: a preflight
@@ -2230,14 +2244,20 @@ async fn cors_headers(req: Request<Body>, next: Next) -> Response {
     resp
 }
 
-/// Set CORS headers on a response, allowing the request's origin if it is local.
+/// Set CORS headers on a response, allowing exactly the origins the UI is served from.
 fn apply_cors(resp: &mut Response, origin: Option<&HeaderValue>) {
+    const ALLOWED: [&str; 5] = [
+        "tauri://localhost",
+        "http://tauri.localhost",
+        "https://tauri.localhost",
+        // The dev server's port is pinned by `tauri.conf.json` (`devUrl`) — an exact match, not
+        // a prefix: port 5555 on the same host is somebody else's page.
+        "http://localhost:1420",
+        "http://127.0.0.1:1420",
+    ];
     let Some(origin) = origin else { return };
     let Ok(s) = origin.to_str() else { return };
-    let allowed = s == "tauri://localhost"
-        || s.starts_with("http://localhost")
-        || s.starts_with("http://127.0.0.1");
-    if !allowed {
+    if !ALLOWED.contains(&s) {
         return;
     }
     let h = resp.headers_mut();
