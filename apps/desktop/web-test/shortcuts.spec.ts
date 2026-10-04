@@ -292,6 +292,9 @@ test("the palette's Search conversations focuses the History box", async ({ page
   await page.getByPlaceholder(/Message your assistant/).fill("hello there");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
+  // The session is recorded when the run ENDS, not when the reply text first appears — searching
+  // before that found a History with no sessions and no search box (CI artifact, 2026-10-04).
+  await awaitTurnDone(page);
 
   await openPalette(page);
   await page.getByLabel("Command palette search").fill("search conv");

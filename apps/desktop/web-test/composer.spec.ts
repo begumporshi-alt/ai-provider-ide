@@ -207,6 +207,10 @@ test("/clear starts a new conversation", async ({ page }) => {
   await page.getByTestId("composer-input").fill("remember this text");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("remember this text").first()).toBeVisible({ timeout: 30_000 });
+  // Wait for the run to END, not just the reply text to appear: commands submitted mid-run are
+  // refused by design, and on the slow runner the reply text beats the run's completion (CI
+  // artifact, 2026-10-04 — /clear typed and swallowed, transcript never cleared).
+  await expect(page.getByText("System AI (mock)")).toBeVisible({ timeout: 60_000 });
 
   await page.getByTestId("composer-input").type("/clear");
   await page.keyboard.press("Enter");
