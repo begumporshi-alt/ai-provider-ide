@@ -19,6 +19,17 @@ two P2 defects in the reasoning-effort branch (Anthropic thinking × temperature
 and in the "Parked or unfinished" row below; this chapter's other cells predate the audit and were
 not re-measured by it.
 
+**2026-10-04 — memory retention scheduling, the headless half.** The same day's full audit
+([`../AUDIT_REPORT_2026-10-04.md`](../AUDIT_REPORT_2026-10-04.md)) found the memory/live-context
+prunes running only off a webview timer — true in the daemon, which serves both prune routes and
+scheduled neither. Fixed in `core/retention.rs`: one task per core, a boot pass then a pass every
+30 minutes, both prunes gated on the memory master toggle the same rule the webview applies;
+spawned at daemon boot and on `gateway_enable`, claimed once per core so enable cycles never
+stack schedulers. Agent runs and the ledger stay with `persist::retention_job` (fixed earlier the
+same day, 500098f) — activity records, written regardless of the toggle, bounded by removal; see
+the module doc before touching that rule. Pinned by 3 `retention` specs; recorded as D89 in
+[`07-drift-register.md`](07-drift-register.md).
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.

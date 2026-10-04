@@ -776,6 +776,10 @@ pub struct GatewayCore {
     /// client and is invisible at a layer with no review step, which is exactly why skills were kept
     /// frontend-only. Off means `inject_context` strips `metadata.aip` and does nothing else.
     memory_enabled: AtomicBool,
+    /// Claimed by whichever caller first spawns the retention scheduler for this core, so a
+    /// disable/enable cycle — or a daemon boot racing its own listener — never stacks a second
+    /// one. See `core/retention.rs`.
+    retention_claimed: AtomicBool,
     /// Bound on the bridge's first response to a request; see `FIRST_MSG_TIMEOUT`.
     first_msg_timeout: Mutex<Duration>,
     /// §5.5: composed memory blocks frozen per `(scope, session)`, so the bytes at system position 0
@@ -904,6 +908,7 @@ impl GatewayCore {
             store: None,
             allowlist: None,
             memory_enabled: AtomicBool::new(false),
+            retention_claimed: AtomicBool::new(false),
             first_msg_timeout: Mutex::new(FIRST_MSG_TIMEOUT),
             memory_freeze: Mutex::new(HashMap::new()),
             memory_freeze_ttl: Mutex::new(MEMORY_FREEZE_TTL),
@@ -1088,6 +1093,15 @@ impl GatewayCore {
     /// Whether the memory/context layer may recall and inject. Off by default; see the field.
     pub fn memory_enabled(&self) -> bool {
         self.memory_enabled.load(Ordering::Relaxed)
+    }
+
+    /// Claim the right to spawn the retention scheduler for this core. True exactly once per
+    /// core; every later claimant — a re-enabled gateway, a boot that races its own listener —
+    /// must stand down rather than stack a second scheduler.
+    pub fn claim_retention_scheduler(&self) -> bool {
+        self.retention_claimed
+            .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
     }
 
     /// Flip the host-side memory toggle. Takes effect on the next request.

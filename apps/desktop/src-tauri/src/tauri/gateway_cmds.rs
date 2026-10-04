@@ -15,6 +15,7 @@ use crate::core::egress_port::EgressPort;
 use crate::core::gateway::{self, GatewayCore, HostSettings};
 use crate::core::injection_log::InjectionStats;
 use crate::core::ledger::{StoreLedgerSink, UsageLedger};
+use crate::core::retention;
 use crate::core::router::{RouterSettings, RouterStore, SharedRouterState};
 use crate::core::router_bridge::{BridgeHost, RouterBridge};
 use crate::core::store::Store;
@@ -216,6 +217,13 @@ pub async fn gateway_enable(app: AppHandle, port: Option<u16>) -> Result<u16, St
     let handle = gateway::spawn(state.core.clone(), port.unwrap_or(gateway::DEFAULT_PORT)).await?;
     log_to_file(&app, &format!("enable: listener bound in {}ms", t_bind.elapsed().as_millis()));
     state.core.set_running(true);
+
+    // The retention scheduler, same as the daemon runs at boot (2026-10-04 audit, P2). Spawned
+    // on every enable; the core's claim guard makes every claimant after the first stand down,
+    // so disable/enable cycles never stack schedulers. It coexists with the webview timer —
+    // two idempotent bounded DELETE scans per half hour under one connection lock.
+    tauri::async_runtime::spawn(retention::interval(state.core.clone()));
+
     let bound = handle.addr.port();
     *state.server.lock().unwrap() = Some(handle);
     log_to_file(&app, &format!("enabled on port {bound}"));

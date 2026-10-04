@@ -60,6 +60,7 @@ pub mod orchestrator;
 pub mod persist;
 pub mod planner;
 pub mod pricing;
+pub mod retention;
 pub mod router;
 pub mod router_bridge;
 pub mod sandbox;

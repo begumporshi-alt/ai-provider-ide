@@ -22,7 +22,7 @@ use ai_provider_router_lib::core::{
     egress_port::EgressPort,
     gateway,
     ledger::{StoreLedgerSink, UsageLedger},
-    persist,
+    persist, retention,
     router::{RouterSettings, RouterStore, SharedRouterState},
     router_bridge::{BridgeHost, RouterBridge},
     service, store,
@@ -450,14 +450,20 @@ async fn main() {
 
     // The app sets this from the Start button; a service is always on, so it is set at boot.
     core.set_running(true);
+    let core = Arc::new(core);
 
-    let handle = match gateway::spawn(Arc::new(core), port).await {
+    let handle = match gateway::spawn(core.clone(), port).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("aiproviderd: {e}");
             std::process::exit(1);
         }
     };
+
+    // Retention needs a scheduler that does not depend on any webview existing (2026-10-04
+    // audit, P2): memory, live context, and agent runs are bounded here, headless or not. The
+    // boot pass fires immediately; the claim guard means a re-exec can never stack a second.
+    tokio::spawn(retention::interval(core.clone()));
 
     println!("aiproviderd {version} listening on {}", handle.addr);
     println!("GET /health is live; completion routes are served by the Rust router core.");
