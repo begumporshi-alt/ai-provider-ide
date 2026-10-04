@@ -85,6 +85,17 @@ async function sendSlowTurn(page: Page): Promise<void> {
   await expect(page.getByRole("button", { name: /Stop$/ })).toBeVisible({ timeout: 10_000 });
 }
 
+/**
+ * Wait for the turn to actually end — the status line with the mock's latency only renders when
+ * the run has finished. The palette refuses New chat while a turn runs (by design), so a chord
+ * pressed before this line exists is silently eaten: measured against CI failure artifacts
+ * (2026-10-04), both flaky shortcuts failures were the chord landing mid-run — locally the mock's
+ * reply beats the keypress, on the 2.5× slower runner it does not.
+ */
+async function awaitTurnDone(page: Page): Promise<void> {
+  await expect(page.getByText("System AI (mock)")).toBeVisible({ timeout: REPLY_TIMEOUT });
+}
+
 async function openAssistant(page: Page): Promise<void> {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
@@ -183,6 +194,7 @@ test("new chat starts a fresh conversation from the keyboard", async ({ page }) 
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
   await expect(page.getByText("remember this")).toBeVisible();
+  await awaitTurnDone(page);
 
   await pressMod(page, "Shift+O");
 
@@ -246,6 +258,7 @@ test("conversation search filters the session list and keeps the detail in step"
     await page.getByPlaceholder(/Message your assistant/).fill(text);
     await page.getByRole("button", { name: "Send" }).click();
     await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: REPLY_TIMEOUT });
+    await awaitTurnDone(page);
     await pressMod(page, "Shift+O");
   }
 
