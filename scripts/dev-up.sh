@@ -148,6 +148,17 @@ if [ -f "$DB" ]; then
         cp -p "$DB" "$DB_BAK"
         if [ -f "$DB-wal" ]; then cp -p "$DB-wal" "$DB_BAK-wal" || die "could not back up the WAL" 1; fi
         if [ -f "$DB-shm" ]; then cp -p "$DB-shm" "$DB_BAK-shm" || die "could not back up the SHM" 1; fi
+
+# Rotate: one snapshot per dev-up run is one per rebuild, and each is a full database copy.
+# Keep the newest ROTATE_KEEP of each kind — a backup that is never pruned is just a second
+# data directory wearing a disguise (measured 2026-10-04: ~28 snapshots, ~80 MB).
+ROTATE_KEEP=5
+for pattern in "bin/aiproviderd.bak-*" "ai-provider-router.db.pre-install-*.bak"; do
+    # shellcheck disable=SC2086
+    ls -t "$DATA_DIR"/$pattern 2>/dev/null | tail -n +$((ROTATE_KEEP + 1)) | while IFS= read -r old; do
+        rm -f "$old" && echo "    rotated $(basename "$old")"
+    done
+done
     fi
     echo "    database -> $(basename "$DB_BAK")"
 fi
@@ -178,10 +189,15 @@ step "Installing the service"
 if launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
     echo "    job is registered — swapping the binary and restarting it"
     NEW_BIN="$DATA_DIR/bin/.aiproviderd.new-$$"
+    # The temp file is removed by the rename below; if `install` or `mv` dies mid-write, the EXIT
+    # trap takes it with the script — a half-written dotfile next to the live binary is exactly
+    # the kind of debris that outlives the run that made it.
+    trap 'rm -f "$NEW_BIN"' EXIT
     install -m 755 "$SERVICE_BIN" "$NEW_BIN" \
         || die "could not write $NEW_BIN" 3
     mv -f "$NEW_BIN" "$DATA_DIR/bin/aiproviderd" \
         || die "could not replace $DATA_DIR/bin/aiproviderd" 3
+    trap - EXIT
     launchctl kickstart -k "$DOMAIN/$LABEL" \
         || die "the job is registered but would not restart — see $DATA_DIR/aiproviderd.err.log" 3
 else

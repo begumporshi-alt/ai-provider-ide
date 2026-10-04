@@ -646,7 +646,7 @@ pub struct LedgerRow {
     /// Bounded evidence for a failure the class label cannot explain — today the drained-empty
     /// stream arm (`PARSE_ERROR`, no status, empty chain): what the provider's stream actually
     /// carried. Truncated at the capture point; never a full body. `None` for every other row, and
-    /// for every row written before migration 0018.
+    /// for every row written before migration 0021.
     #[serde(default)]
     pub failure_detail: Option<String>,
 }
@@ -739,13 +739,18 @@ pub fn ledger_recent(
     ledger_recent_rows(&store, limit)
 }
 
-/// Nightly/on-start rollup job (§4): aggregate complete months into ledger_rollups
-/// (idempotent ON CONFLICT DO UPDATE). Kept as one fixed statement.
-#[cfg(feature = "app")]
-#[tauri::command]
-pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
-    let conn = store.conn.lock().unwrap();
-    let month_from = now_ms() - 62 * 24 * 3600 * 1000; // only complete months older than ~2 mo
+/// The retention job shared by the app and the daemon (§4): roll complete months into
+/// `ledger_rollups`, drop raw ledger entries past the 90-day cap — only after they have been
+/// rolled up — and age agent runs out. Idempotent; run at boot and then daily. There was a time
+/// this existed only as an app-boot call with the SQL duplicated in `gateway_cmds`, which the
+/// 2026-10-04 audit measured as `ledger_rollups` = 0 rows after 15 days of traffic; the daemon,
+/// which can run for months without the app ever starting, had no pass at all.
+///
+/// Errors propagate; callers decide whether a failed pass blocks anything (at boot: never).
+pub fn retention_job(store: &Store) -> Result<(), String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let now = now_ms();
+    let month_from = now - 62 * 24 * 3600 * 1000; // only complete months older than ~2 mo
     conn.execute(
         "INSERT INTO ledger_rollups (month, provider_id, model, modality, requests, failures, tokens_in, tokens_out, cost_estimate_micros)
          SELECT strftime('%Y-%m', ts/1000, 'unixepoch') AS month,
@@ -761,11 +766,49 @@ pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandErro
            tokens_in=excluded.tokens_in, tokens_out=excluded.tokens_out,
            cost_estimate_micros=excluded.cost_estimate_micros",
         params![month_from],
-    )?;
-    // Raw entries kept 90 days (§4); only after they've been rolled up.
-    let cutoff = now_ms() - 90 * 24 * 3600 * 1000;
-    conn.execute("DELETE FROM ledger WHERE ts < ?1 AND ts < ?2", params![cutoff, month_from])?;
+    )
+    .map_err(|e| e.to_string())?;
+    // Raw entries kept 90 days (§4); only after they've been rolled up (everything below the cap
+    // is below the rollup horizon too, so nothing is deleted unaggregated).
+    let cutoff = now - 90 * 24 * 3600 * 1000;
+    conn.execute("DELETE FROM ledger WHERE ts < ?1", params![cutoff]).map_err(|e| e.to_string())?;
+    // Agent-run retention. Finished runs older than 30 days go, steps following by FK cascade.
+    // A run stuck `running` for more than 7 days is DELETED, not re-marked: the orchestrator's
+    // own rule is that a status we did not observe is unknown, and writing `error` over it would
+    // invent a fact — removal is retention, not judgment, and it is what stops the Activity
+    // screen from reading as a turn still in progress days after the crash that orphaned it.
+    conn.execute(
+        "DELETE FROM agent_runs WHERE status != 'running' AND COALESCE(ended_at, started_at) < ?1",
+        params![now - 30 * 24 * 3600 * 1000],
+    )
+    .map_err(|e| e.to_string())?;
+    conn.execute(
+        "DELETE FROM agent_runs WHERE status = 'running' AND started_at < ?1",
+        params![now - 7 * 24 * 3600 * 1000],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// The daily half of §4: run [`retention_job`] every 24 hours until the process ends. The boot
+/// pass is the caller's synchronous run; this is the "nightly" the doc comment always promised.
+/// Spawned onto whichever runtime the host has — Tauri's for the app, the daemon's own.
+pub async fn retention_interval(store: Arc<Store>) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(24 * 60 * 60));
+    ticker.tick().await; // an interval fires immediately; the boot pass already ran
+    loop {
+        ticker.tick().await;
+        if let Err(e) = retention_job(&store) {
+            tracing::warn!("retention job failed (non-fatal): {e}");
+        }
+    }
+}
+
+/// Nightly/on-start rollup job (§4): the Tauri-command face of [`retention_job`].
+#[cfg(feature = "app")]
+#[tauri::command]
+pub fn ledger_rollup_run(store: State<'_, Arc<Store>>) -> Result<(), CommandError> {
+    retention_job(&store).map_err(CommandError)
 }
 
 // ---------- onboarding sessions (§2.1: wizard resumes after restart) ----------
@@ -2732,6 +2775,124 @@ mod drift_history_tests {
     fn an_empty_history_is_empty_not_an_error() {
         let (store, dir) = tmp_store("empty");
         assert!(list_drift_events(&store, 50).unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    fn temp_store(tag: &str) -> (Arc<Store>, std::path::PathBuf) {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let dir = std::env::temp_dir().join(format!("aip-retention-{tag}-{n}"));
+        let _ = std::fs::remove_dir_all(&dir);
+        (Arc::new(Store::open(&dir).unwrap()), dir)
+    }
+
+    fn day(n: i64) -> i64 {
+        now_ms() - n * 24 * 3600 * 1000
+    }
+
+    fn ledger_row(ts: i64, provider: &str) -> String {
+        format!(
+            "INSERT INTO ledger (ts, modality, provider_id, model, status, tokens_in, tokens_out, cost_estimate_micros)
+             VALUES ({ts}, 'text', '{provider}', 'm1', 'ok', 10, 20, 5)"
+        )
+    }
+
+    #[test]
+    fn the_retention_job_rolls_up_old_months_deletes_their_raw_rows_and_ages_agent_runs_out() {
+        let (store, dir) = temp_store("job");
+        // Captured once: `day()` re-reads the clock, and a 1ms drift between the insert and the
+        // assertion below would read as a different row.
+        let recent_ts = day(10);
+        {
+            let conn = store.conn.lock().unwrap();
+            // Three ledger ages: 400d and 100d are past the rollup horizon (62d) and the cap
+            // (90d); 10d stays untouched. Two providers in the oldest month prove the grouping.
+            conn.execute(&ledger_row(day(400), "p1"), []).unwrap();
+            conn.execute(&ledger_row(day(400), "p2"), []).unwrap();
+            conn.execute(&ledger_row(day(100), "p1"), []).unwrap();
+            conn.execute(&ledger_row(recent_ts, "p1"), []).unwrap();
+            // Four agent runs covering every retention arm.
+            conn.execute(
+                "INSERT INTO agent_runs (id, session_id, model, status, started_at, ended_at)
+                 VALUES ('ok-old', 's1', 'm1', 'ok', ?1, ?1)",
+                params![day(40)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, session_id, model, status, started_at, ended_at)
+                 VALUES ('ok-new', 's1', 'm1', 'ok', ?1, ?1)",
+                params![day(1)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, session_id, model, status, started_at)
+                 VALUES ('stuck-old', 's1', 'm1', 'running', ?1)",
+                params![day(8)],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO agent_runs (id, session_id, model, status, started_at)
+                 VALUES ('stuck-new', 's1', 'm1', 'running', ?1)",
+                params![day(1)],
+            )
+            .unwrap();
+        }
+
+        retention_job(&store).unwrap();
+
+        let conn = store.conn.lock().unwrap();
+        // Three (month, provider) groups — the rollup keys on (month, provider_id, model), so the
+        // 400d month holds one row per provider (requests = 1 each) and the 100d month holds p1's.
+        let (rollup_rows, distinct_months, total_requests): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT month), COALESCE(SUM(requests), 0)
+                 FROM ledger_rollups",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(rollup_rows, 3, "one rollup row per (month, provider) past the horizon");
+        assert_eq!(distinct_months, 2, "400d and 100d always land in different months");
+        assert_eq!(total_requests, 3, "every rolled-up raw row is counted exactly once");
+
+        // Raw rows: only the recent one survives.
+        let raw: i64 = conn.query_row("SELECT COUNT(*) FROM ledger", [], |r| r.get(0)).unwrap();
+        assert_eq!(raw, 1, "everything past the 90-day cap is gone, nothing younger");
+        let (kept_ts, kept_tokens): (i64, i64) = conn
+            .query_row("SELECT ts, tokens_in FROM ledger", [], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap();
+        assert_eq!(kept_ts, recent_ts, "the surviving row is the recent one");
+        assert_eq!(kept_tokens, 10, "its values are unaggregated originals");
+
+        // Agent runs: finished-and-old deleted, finished-and-recent kept, stuck-and-old deleted
+        // (not re-marked — the status we did not observe is unknown), stuck-and-recent kept.
+        let ids = |conn: &rusqlite::Connection| -> Vec<String> {
+            let mut stmt = conn.prepare("SELECT id FROM agent_runs ORDER BY id").unwrap();
+            stmt.query_map([], |r| r.get::<_, String>(0)).unwrap().map(|x| x.unwrap()).collect()
+        };
+        assert_eq!(ids(&conn), vec!["ok-new", "stuck-new"]);
+
+        // A second pass is idempotent: no new rollup rows, no further deletions.
+        drop(conn);
+        retention_job(&store).unwrap();
+        let conn = store.conn.lock().unwrap();
+        let (rollup_rows_again, raw_again, runs_again): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM ledger_rollups),
+                        (SELECT COUNT(*) FROM ledger),
+                        (SELECT COUNT(*) FROM agent_runs)",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((rollup_rows_again, raw_again, runs_again), (3, 1, 2));
+        drop(conn);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

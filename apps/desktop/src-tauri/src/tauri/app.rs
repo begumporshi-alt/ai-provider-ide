@@ -179,6 +179,9 @@ pub fn run() {
             let allow = Arc::new(egress::AllowList(RwLock::new(initial_allow_hosts(&store))));
             let egress_state = Arc::new(egress::EgressState::new(allow, store.clone()));
             gateway_cmds::run_rollup(&store);
+            // And daily for as long as the process lives — a machine that sleeps through boot
+            // windows gets this one.
+            tauri::async_runtime::spawn(crate::core::persist::retention_interval(store.clone()));
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: rollup done");
             // Read before `store` is handed to `app.manage` — after that it is gone.
             let startup = gateway::gateway_startup(&store);

@@ -915,30 +915,13 @@ pub fn manage(app: &mut tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// §4 rollup job on startup (idempotent; errors never block boot).
+/// §4 retention job on startup (idempotent; errors never block boot). The body lives in
+/// `core::persist::retention_job`, shared with the daemon — this wrapper used to carry its own
+/// copy of the SQL, which is how the two drifted silently for as long as they did.
 pub fn run_rollup(store: &Arc<Store>) {
-    let Ok(conn) = store.conn.lock() else { return };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let month_from = now - 62 * 24 * 3600 * 1000;
-    let _ = conn.execute(
-        "INSERT INTO ledger_rollups (month, provider_id, model, modality, requests, failures, tokens_in, tokens_out, cost_estimate_micros)
-         SELECT strftime('%Y-%m', ts/1000, 'unixepoch') AS month,
-                COALESCE(provider_id,''), model, modality,
-                COUNT(*), SUM(CASE WHEN status != 'ok' THEN 1 ELSE 0 END),
-                SUM(tokens_in), SUM(tokens_out), SUM(cost_estimate_micros)
-         FROM ledger WHERE ts < ?1
-         GROUP BY month, provider_id, model, modality
-         ON CONFLICT(month, provider_id, model, modality) DO UPDATE SET
-           requests=excluded.requests, failures=excluded.failures,
-           tokens_in=excluded.tokens_in, tokens_out=excluded.tokens_out,
-           cost_estimate_micros=excluded.cost_estimate_micros",
-        rusqlite::params![month_from],
-    );
-    let cutoff = now - 90 * 24 * 3600 * 1000;
-    let _ = conn.execute("DELETE FROM ledger WHERE ts < ?1", rusqlite::params![cutoff]);
+    if let Err(e) = crate::core::persist::retention_job(store) {
+        tracing::warn!("retention job failed (non-fatal): {e}");
+    }
 }
 
 #[cfg(test)]

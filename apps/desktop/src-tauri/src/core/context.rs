@@ -575,13 +575,27 @@ pub fn set_session_title(
     Ok(())
 }
 
-/// Wipe every trace of a session from the context graph and its title metadata.
+/// Wipe every trace of a session: the context graph, its title metadata, its agent runs (steps
+/// follow by FK cascade), and its memories.
+///
+/// One transaction, and wider than it used to be: `session_id` is a bare TEXT column on
+/// `agent_runs` and `memories` with no FK to cascade from, so deleting the graph rows left the
+/// run history and captured memories alive — a session the UI said never existed still showed
+/// activity and knowledge, which the 2026-10-04 audit measured against the live database. The
+/// live-context rows (`router_sessions`/`session_turns`) are deliberately not touched: they are
+/// the resume mechanism and are bounded by the retention prune, not by the user's delete.
 pub fn delete_session(store: &Store, session_id: &str) -> Result<(), String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM context_nodes WHERE session_id = ?1", params![session_id])
+    let tx = conn.unchecked_transaction().map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM context_nodes WHERE session_id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
-    conn.execute("DELETE FROM session_titles WHERE session_id = ?1", params![session_id])
+    tx.execute("DELETE FROM session_titles WHERE session_id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM agent_runs WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    tx.execute("DELETE FROM memories WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
+    tx.commit().map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -835,6 +849,67 @@ mod context_graph_tests {
         assert_eq!(rows.len(), 1, "the row is indexed rather than aborting the call");
         assert_eq!(rows[0].preview.chars().count(), 120, "119 characters plus the ellipsis");
         assert!(rows[0].preview.ends_with('…'), "preview: {}", rows[0].preview);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The 2026-10-04 audit measured this against the live database: a deleted session's graph
+    /// rows went, but its agent runs, agent steps, and memories survived — a session the UI said
+    /// never existed, still visible in Activity and Memory. All of it follows the delete now.
+    #[test]
+    fn deleting_a_session_takes_its_agent_runs_memories_and_graph_rows_with_it() {
+        let (s, d) = temp_store("delete-session");
+
+        let mut gone = node("message:s-1:1", "message");
+        gone.session_id = Some("s-1".into());
+        let mut kept = node("message:s-2:1", "message");
+        kept.session_id = Some("s-2".into());
+        record(&s, &[gone, kept], &[]).unwrap();
+
+        {
+            let conn = s.conn.lock().unwrap();
+            for (id, session) in [("run-gone", "s-1"), ("run-kept", "s-2")] {
+                conn.execute(
+                    "INSERT INTO agent_runs (id, session_id, model, status, started_at)
+                     VALUES (?1, ?2, 'm', 'ok', 1)",
+                    rusqlite::params![id, session],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO agent_steps (run_id, seq, ts, kind, detail)
+                     VALUES (?1, 1, 1, 'tool_call', 'x')",
+                    rusqlite::params![id],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO memories (id, layer, text, session_id, created_at, updated_at)
+                     VALUES (?1, 'L0', 'remembered', ?2, 1, 1)",
+                    rusqlite::params![format!("mem-{id}"), session],
+                )
+                .unwrap();
+            }
+        }
+
+        delete_session(&s, "s-1").unwrap();
+
+        let conn = s.conn.lock().unwrap();
+        let count = |table: &str, filter: &str| -> i64 {
+            conn.query_row(&format!("SELECT COUNT(*) FROM {table} WHERE {filter}"), [], |r| {
+                r.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(count("context_nodes", "session_id = 's-1'"), 0, "graph rows go");
+        assert_eq!(count("context_nodes", "session_id = 's-2'"), 1, "other sessions untouched");
+        assert_eq!(count("agent_runs", "session_id = 's-1'"), 0, "agent runs go");
+        assert_eq!(count("agent_steps", "run_id = 'run-gone'"), 0, "steps follow by cascade");
+        assert_eq!(count("agent_steps", "run_id = 'run-kept'"), 1, "other runs' steps untouched");
+        assert_eq!(count("memories", "session_id = 's-1'"), 0, "memories go");
+        assert_eq!(
+            count("memories", "session_id = 's-2'"),
+            1,
+            "other sessions' memories untouched"
+        );
+        drop(conn);
         let _ = std::fs::remove_dir_all(&d);
     }
 

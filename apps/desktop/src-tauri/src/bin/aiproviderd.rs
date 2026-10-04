@@ -358,6 +358,15 @@ async fn main() {
         }
     };
 
+    // §4 retention, on boot and daily. The app ran this at startup since it existed; the daemon
+    // — which can run for months without the app ever starting — never did, so the rollup table
+    // stayed empty and agent runs accumulated forever. Errors are non-fatal by the same rule as
+    // the app's boot pass.
+    if let Err(e) = persist::retention_job(&store) {
+        eprintln!("aiproviderd: retention job failed (non-fatal): {e}");
+    }
+    tokio::spawn(persist::retention_interval(store.clone()));
+
     let port = gateway::persisted_gateway_port(&store).unwrap_or(SERVICE_DEFAULT_PORT);
 
     // Build the egress (25a), the adapter runtime (25c), and the router store (25b).
