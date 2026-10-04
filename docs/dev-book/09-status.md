@@ -52,6 +52,17 @@ admin routes keep full-drain semantics, and the scheduler deletes in 500-row bat
 Every pass records an outcome (counts, skip, `budget_exhausted`); the budget never fires on a
 healthy store. Six `retention` specs; D91 in [`07-drift-register.md`](07-drift-register.md).
 
+**2026-10-04 — audit hygiene: every open finding now has a row.** The 10-04 audit's P3
+complained that S1/S2 and A1–A4 lived only in dated reports, where nothing pins them. They are
+rows now: D93–D98 carry each finding quoted, with the file it lives in, and status **Open** —
+the register, not the reports, is the backlog. M1/M2 became D90 earlier the same day. One item
+resolved instead of registered: D90's noted Gemini `finishReason: "STOP"` oddity is
+**Correct** (D92) — Google's API genuinely ends function-call turns with `STOP`, the pin
+`gemini_tool_turn_still_reports_stop` predates the question, and the tempting repair is the
+bug. Operationally: the `.pre-install` snapshot pile was swept to the rotation policy
+`500098f` installed (37 removed, newest 5 kept; the pile had reached 42 files / ~811 MB
+because rotation only runs at `dev-up` time — the next sweep is free, the habit is the fix).
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.
