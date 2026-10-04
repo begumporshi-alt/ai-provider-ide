@@ -1,7 +1,12 @@
 # 10 — Headless service mode
 
-**Status:** Phase 1 landed 2026-09-23 — the code is split and `aiproviderd` builds and serves. Phases
-2–6 are still plan only. **Phase 1 does not serve completions**, and is not meant to: see §2.1.1.
+**Status (2026-10-04):** the headless plan is landed through the increments this chapter tracks
+(25a–25f and on): the router core is Rust, the webview worker and its TS bridge are deleted, and
+`aiproviderd` **serves completions** through a Rust-native `RouterBridge` — the 503 placeholder
+§2.1.1 describes was deleted in 25f, along with `Bridge::ready`. What follows from Phase 5e
+onward is the *current* architecture; §2.1.1 and the Phase-1 acceptance audit below are the dated
+record of how the split began, kept because the measured facts in them (ports, keychain, `/health`
+contract) still hold.
 
 **Question answered:** what it takes to detach the gateway from the webview process so it survives UI
 quit, crash, and reload.

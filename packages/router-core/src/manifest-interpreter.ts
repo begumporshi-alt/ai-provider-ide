@@ -83,12 +83,12 @@ export function thinkingBudget(
  *
  * Empty when the caller set nothing: every placeholder is `{{…?}}`, so the fields are omitted and
  * the provider's own default governs — which is the whole contract for "unset". `Off` is a real
- * request where the dialect allows one (Anthropic `thinking: {type:"disabled"}`, Gemini budget 0)
- * and an omission where it does not (the OpenAI-compatible vocabulary has no portable off; the
- * provider's default may still think — measured on agentrouter, whose models think by default,
- * which is precisely why the Anthropic off switch matters). A cap too small to hold thinking plus an
- * answer renders the same way as `off`, for the same reason: the alternative is a request the
- * provider refuses, or a turn that produces no text.
+ * request where a dialect has an off switch (Anthropic `thinking: {type:"disabled"}`) and an
+ * omission where it does not: Gemini's `thinkingBudget: 0` is refused outright by 2.5 Pro (a
+ * 128-token floor), and the OpenAI-compatible vocabulary has no portable off at all — the
+ * provider's default may still think, which is precisely why the Anthropic switch matters. A cap
+ * too small to hold thinking plus an answer renders the same way as `off`, for the same reason:
+ * the alternative is a request the provider refuses, or a turn that produces no text.
  */
 export function reasoningValues(
   effort: import("./ports.js").ReasoningEffort | undefined,
@@ -97,7 +97,11 @@ export function reasoningValues(
   if (!effort) return {};
   const budget = effort === "off" ? 0 : thinkingBudget(effort, maxTokens);
   if (budget === 0) {
-    return { thinking: { type: "disabled" }, thinkingConfig: { thinkingBudget: 0 } };
+    // Anthropic has a real off switch; Gemini does not — 2.5 Pro refuses `thinkingBudget: 0`
+    // outright, so omitting lets the provider's default govern, the same honest rendering the
+    // OpenAI-compatible vocabulary gets. The D87 reconciliation: the Rust port has rendered it
+    // this way since 2026-10-03; this file was the last one sending the field.
+    return { thinking: { type: "disabled" } };
   }
   return {
     thinking: { type: "enabled", budget_tokens: budget },

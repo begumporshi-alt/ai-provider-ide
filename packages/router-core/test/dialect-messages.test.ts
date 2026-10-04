@@ -502,9 +502,10 @@ describe("the caller's thinking knob (`reasoningValues`)", () => {
 
     const g = capture("gemini-compat", { candidates: [{ content: { parts: [{ text: "ok" }] } }] });
     await drain(g.interp, { model: "models/gemini-2.0-flash", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
-    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toEqual({
-      thinkingBudget: 0,
-    });
+    // D87 reconciliation: `thinkingBudget: 0` is a deterministic 400 on 2.5 Pro, so `off` omits
+    // the field entirely — the Rust port has pinned exactly this since 2026-10-03
+    // (`reasoning_off_omits_the_gemini_thinking_config`); this pin demanded the opposite until now.
+    expect((g.lastBody()!.generationConfig as Record<string, unknown>).thinkingConfig).toBeUndefined();
 
     const o = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
     await drain(o.interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: false, reasoning: "off" });
