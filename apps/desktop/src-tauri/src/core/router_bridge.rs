@@ -299,6 +299,11 @@ impl Job {
         };
         let mut gate = ProseGate::new(ownership);
 
+        // Serving attribution for the turn that ends the request (A1 Phase 2): captured per
+        // successful `generate_text`, emitted as `BridgeMsg::Served` before the terminal `Done`
+        // so the OpenAI-shaped handlers can put `served_by` on the wire.
+        let mut last_served: Option<(String, String, String)> = None;
+
         for _turn in 1..=MAX_TOOL_ITERATIONS {
             if cancel.is_cancelled() {
                 return Ok(());
@@ -429,9 +434,15 @@ impl Job {
             }
 
             match result {
-                Ok(_) => {}
-                // Cancellation is not a failure to report — the client asked us to stop, so there
-                // is nobody left to read a status code.
+                Ok(success) => {
+                    last_served = Some((
+                        success.candidate.provider.id.clone(),
+                        success.candidate.model.native_id.clone(),
+                        success.candidate.key.label.clone(),
+                    ));
+                }
+                // Cancellation is not a failure to report — the client asked us to stop, so there is
+                // nobody left to read a status code.
                 Err(RouterError::Text(failure))
                     if matches!(failure.as_ref(), TextFailure::Cancelled { .. }) =>
                 {
@@ -439,6 +450,19 @@ impl Job {
                 }
                 Err(err) => return Err(err),
             }
+
+            let emit_served = |replies: &ReplyHandle| {
+                if let Some((provider, model, key)) = &last_served {
+                    let _ = replies.reply(
+                        id,
+                        BridgeMsg::Served {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            key: key.clone(),
+                        },
+                    );
+                }
+            };
 
             match decide_turn(mercury.len(), collected.len(), ownership) {
                 // No calls at all: the model answered and the turn is over. This is the only text
@@ -452,6 +476,7 @@ impl Job {
                     if let Some(reason) = finish_reason.take() {
                         let _ = replies.reply(id, BridgeMsg::Finish(reason));
                     }
+                    emit_served(replies);
                     let _ = replies.reply(id, BridgeMsg::Done);
                     return Ok(());
                 }
@@ -461,6 +486,7 @@ impl Job {
                     let wire = to_wire_tool_calls(&collected);
                     let calls = Value::Array(wire.wire.iter().map(|c| c.to_json()).collect());
                     let _ = replies.reply(id, BridgeMsg::ToolCalls(calls));
+                    emit_served(replies);
                     let _ = replies.reply(id, BridgeMsg::Done);
                     return Ok(());
                 }
@@ -479,6 +505,16 @@ impl Job {
         // receives nothing at all cannot tell "gave up" from "broke".
         if let Some(text) = gate.release() {
             let _ = replies.reply(id, BridgeMsg::Delta(text));
+        }
+        if let Some((provider, model, key)) = &last_served {
+            let _ = replies.reply(
+                id,
+                BridgeMsg::Served {
+                    provider: provider.clone(),
+                    model: model.clone(),
+                    key: key.clone(),
+                },
+            );
         }
         let _ = replies.reply(id, BridgeMsg::Done);
         Ok(())

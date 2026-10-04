@@ -322,6 +322,8 @@ pub(crate) async fn gemini_h(
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+                    BridgeMsg::Served { .. } => {}
                 }
             }
             drop(slot);
@@ -384,6 +386,8 @@ pub(crate) async fn gemini_h(
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+            BridgeMsg::Served { .. } => {}
         }
     }
     drop(slot);

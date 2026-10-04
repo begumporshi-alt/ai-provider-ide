@@ -494,6 +494,8 @@ pub(crate) async fn messages_h(
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+                    BridgeMsg::Served { .. } => {}
                 }
             }
             // A tool turn already closed the text block above; a plain text turn closes it here.
@@ -591,6 +593,8 @@ pub(crate) async fn messages_h(
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+            BridgeMsg::Served { .. } => {}
         }
     }
     drop(slot);

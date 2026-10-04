@@ -166,6 +166,9 @@ pub(crate) async fn chat_h(
             // The chunk itself is not terminal — the bridge follows it with the turn's usage and
             // `Done`, and the terminal chunk below owes the client both (audit 2026-10-03 M2).
             let mut tool_turn = false;
+            // Serving attribution (A1 Phase 2): arrives just before `Done`, rides the terminal
+            // chunk as `served_by`.
+            let mut served_by: Option<Value> = None;
             // The provider's own finish reason, already in the OpenAI vocabulary. Absent for a
             // dialect that declares no `responseFinish`, where `stop` stays the honest default.
             let mut finish_reason: Option<String> = None;
@@ -217,26 +220,32 @@ pub(crate) async fn chat_h(
                             let _ = finish_capture(p, &streamed);
                         }
                         let (pt, ct) = usage.unwrap_or((0, 0));
+                        let mut terminal = json!({
+                            "id": format!("gw-{id}"),
+                            "object": "chat.completion.chunk",
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {},
+                                // The provider's reason when it declared one — a truncation at
+                                // `max_tokens` must not read as `stop` (drift D86).
+                                "finish_reason": finish_reason
+                                    .take()
+                                    .unwrap_or_else(|| if tool_turn { "tool_calls" } else { "stop" }.to_string()),
+                                "usage": {
+                                    "prompt_tokens": pt,
+                                    "completion_tokens": ct,
+                                    "total_tokens": pt + ct
+                                }
+                            }]
+                        });
+                        // Serving attribution (A1 Phase 2): present when the turn was served at
+                        // all; omitted when it was not, so clients can tell the difference.
+                        if let Some(sb) = served_by.take() {
+                            terminal["choices"][0]["served_by"] = sb;
+                        }
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
-                            json!({
-                                "id": format!("gw-{id}"),
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {},
-                                    // The provider's reason when it declared one — a truncation at
-                                    // `max_tokens` must not read as `stop` (drift D86).
-                                    "finish_reason": finish_reason
-                                        .take()
-                                        .unwrap_or_else(|| if tool_turn { "tool_calls" } else { "stop" }.to_string()),
-                                    "usage": {
-                                        "prompt_tokens": pt,
-                                        "completion_tokens": ct,
-                                        "total_tokens": pt + ct
-                                    }
-                                }]
-                            }).to_string(),
+                            terminal.to_string(),
                         ));
                         // OpenAI terminates every stream with `data: [DONE]`. Clients that wait
                         // for that sentinel rather than for EOF otherwise hang until the socket
@@ -279,6 +288,9 @@ pub(crate) async fn chat_h(
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    BridgeMsg::Served { provider, model, key } => {
+                        served_by = Some(json!({ "provider": provider, "model": model, "key": key }));
+                    }
                 }
             }
             drop(slot);
@@ -299,6 +311,8 @@ pub(crate) async fn chat_h(
     let mut usage: Option<(u64, u64)> = None;
     let mut err_info: Option<(u16, String, Option<u64>)> = None;
     let mut finish_reason: Option<String> = None;
+    // Serving attribution (A1 Phase 2), top-level on the body when the turn was served.
+    let mut served_by: Option<Value> = None;
     while let Some(msg) = slot.recv().await {
         match msg {
             BridgeMsg::Delta(t) => full.push_str(&t),
@@ -324,6 +338,9 @@ pub(crate) async fn chat_h(
             }
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
+            }
+            BridgeMsg::Served { provider, model, key } => {
+                served_by = Some(json!({ "provider": provider, "model": model, "key": key }));
             }
         }
     }
@@ -373,10 +390,15 @@ pub(crate) async fn chat_h(
             if let Some((pt, ct)) = usage {
                 choice["usage"] = json!({ "prompt_tokens": pt, "completion_tokens": ct });
             }
-            let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
+            let mut payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
                     "choices": [choice],
-                    "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct })) })
-                .to_string();
+                    "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct })) });
+            // Serving attribution (A1 Phase 2), top-level and omitted when the turn was never
+            // served — the same omit-means-never-served rule the terminal chunk follows.
+            if let Some(sb) = served_by.take() {
+                payload["served_by"] = sb;
+            }
+            let payload = payload.to_string();
             // §A3: the completed response becomes the replay for this key's next identical
             // request. Best-effort — a store failure costs the *next* retry its replay, never
             // this response.
@@ -422,6 +444,8 @@ pub(crate) async fn models_h(State(core): State<Arc<GatewayCore>>, headers: Head
                 )
                     .into_response()
             }
+            // Serving attribution is a text-turn frame; models and images do not emit it.
+            BridgeMsg::Served { .. } => {}
             BridgeMsg::Error { status, message, retry_after_ms } => {
                 return err_with_cooldown(
                     worker_status(status),
@@ -524,6 +548,8 @@ pub(crate) async fn image_h(
     tracing::info!(request_id = id, kind = "image", "dispatching image request");
     while let Some(msg) = slot.recv().await {
         match msg {
+            // Serving attribution is a text-turn frame; images do not emit it.
+            BridgeMsg::Served { .. } => {}
             BridgeMsg::Result(v) => {
                 return (
                     StatusCode::OK,

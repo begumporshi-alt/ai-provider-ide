@@ -91,10 +91,14 @@ UI-side customer. The chat turn, the agent loop's `generate` port, and the clien
 summarizer now call the gateway ingress through `lib/gateway-turn.ts` — same admission control,
 same ledger, same failover as ZCode and Claude Code; the webview's own recall stays the only
 memory block via `AIP-Memory: off`. Six wire specs pin the shapes the Rust side emits. Two
-deliberate interim costs, both recorded in D95: the Assistant's trace panel no longer shows
-which provider/key served (attribution lives in the ledger/Activity until the wire carries it),
-and the Assistant now requires a running gateway — the router is the product, and its flagship
-client dogfoods it. Desktop TS suite re-measured at **454** (+6).
+deliberate interim costs from that first pass were closed on 2026-10-05 (Phase 2): the Rust
+ingress now emits `served_by` — a `BridgeMsg::Served` frame before `Done`, surfaced on the
+terminal chunk and the non-stream body with omit-means-never-served semantics, pinned by three
+Rust specs — and the last two TS-engine callers, memory distillation and image generation,
+moved to the gateway. What remains of A1 is Phase 3 only: retiring the TS serving path behind
+a differential-test oracle. The Assistant requires a running gateway — the router is the
+product, and its flagship client dogfoods it. Desktop TS suite re-measured at **454** (+6);
+Rust at **1,523** (+2 served_by pins).
 
 ## Working and verified
 

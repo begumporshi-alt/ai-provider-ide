@@ -365,6 +365,8 @@ pub(crate) async fn responses_h(
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
+                    // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+                    BridgeMsg::Served { .. } => {}
                 }
             }
             if !tool_pending {
@@ -507,6 +509,8 @@ pub(crate) async fn responses_h(
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
+            // Serving attribution is OpenAI-dialect-only for now (A1 Phase 2).
+            BridgeMsg::Served { .. } => {}
         }
     }
     drop(slot);

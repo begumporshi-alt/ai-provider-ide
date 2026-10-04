@@ -90,6 +90,8 @@ struct SynthBridge {
     /// Report usage before the turn ends — the frame the real bridge's `on_usage` produces
     /// while the provider's response is still streaming (audit 2026-10-03 M1/M2).
     usage: AtomicBool,
+    /// Emit serving attribution just before `Done` (A1 Phase 2's `BridgeMsg::Served`).
+    served: AtomicBool,
     /// Prepend a reasoning message — the upstream-gated pass-through channel.
     reasoning: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
@@ -122,6 +124,7 @@ impl SynthBridge {
             slow: AtomicUsize::new(0),
             tool_calls: AtomicBool::new(false),
             usage: AtomicBool::new(false),
+            served: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             liveness_then_pause: AtomicBool::new(false),
@@ -159,6 +162,10 @@ impl SynthBridge {
     /// arm then sends ToolCalls + Done).
     fn answer_with_usage(&self, on: bool) {
         self.usage.store(on, Ordering::Relaxed);
+    }
+    /// Emit `Served { sysai, oracle-mini, key-01 }` before `Done`.
+    fn answer_with_served(&self, on: bool) {
+        self.served.store(on, Ordering::Relaxed);
     }
     fn answer_with_reasoning(&self, on: bool) {
         self.reasoning.store(on, Ordering::Relaxed);
@@ -203,6 +210,7 @@ impl Bridge for SynthBridge {
         let slow = self.slow.load(Ordering::Relaxed);
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
         let with_usage = self.usage.load(Ordering::Relaxed);
+        let with_served = self.served.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
@@ -259,6 +267,16 @@ impl Bridge for SynthBridge {
                                     "function": { "name": "write_file", "arguments": "{\"path\":\"a.txt\"}" }
                                 }])),
                             );
+                    }
+                    if with_served {
+                        replies.reply(
+                            req.request_id,
+                            BridgeMsg::Served {
+                                provider: "sysai".into(),
+                                model: "oracle-mini".into(),
+                                key: "key-01".into(),
+                            },
+                        );
                     }
                     replies.reply(req.request_id, BridgeMsg::Done);
                 }
@@ -2408,6 +2426,68 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---------- serving attribution on the wire (A1 Phase 2) ----------
+
+#[tokio::test(flavor = "multi_thread")]
+async fn served_by_rides_the_terminal_chunk() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_served(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = res.bytes_stream();
+    let mut acc = String::new();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    let terminal =
+        acc.lines().find(|l| l.contains("finish_reason")).expect("a terminal chunk exists: {acc}");
+    let chunk: Value = serde_json::from_str(terminal.trim_start_matches("data: ").trim()).unwrap();
+    assert_eq!(
+        chunk["choices"][0]["served_by"]["provider"], "sysai",
+        "attribution rides the terminal chunk: {chunk}"
+    );
+    assert_eq!(chunk["choices"][0]["served_by"]["model"], "oracle-mini");
+    assert_eq!(chunk["choices"][0]["served_by"]["key"], "key-01");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_stream_bodies_carry_served_by_and_omit_it_when_never_served() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_served(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["served_by"]["provider"], "sysai");
+    assert_eq!(body["served_by"]["model"], "oracle-mini");
+
+    // Without attribution the field is absent, not null: omit-means-never-served.
+    s.bridge.answer_with_served(false);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert!(body.get("served_by").is_none(), "an unserved turn must not claim attribution: {body}");
 }
 
 // ---------- Anthropic streaming: a tool turn must still terminate (2026-09-22) ----------

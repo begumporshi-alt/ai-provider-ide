@@ -229,11 +229,11 @@ export async function distilExchange(
   return distillAndStore(sessionId, model, [exchange], generate);
 }
 
-/** The real generator: one non-streaming call through the router, so fallback and the ledger
- *  apply exactly as they do for a user turn. */
+/** The real generator: one streaming call through the gateway engine, so the ledger and the
+ *  serving path apply exactly as they do for a user turn (A1 Phase 2). */
 async function defaultGenerator(model: string, prompt: string): Promise<string> {
-  const { router } = await import("../../store");
-  const exec = await router.generateText({ model, messages: [{ role: "user", content: prompt }] });
+  const { gatewayGenerate } = await import("../gateway-turn");
+  const exec = await gatewayGenerate({ model, messages: [{ role: "user", content: prompt }] });
   let out = "";
   for await (const chunk of exec.chunks) out += chunk;
   return out;

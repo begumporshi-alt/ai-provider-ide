@@ -2902,8 +2902,36 @@ type EngineRouter = {
       | { model?: { nativeId?: string }; provider?: { id?: string }; key?: { label?: string } }
       | undefined;
   }>;
+  generateImage: (
+    req: { model: string; prompt: string },
+    opts?: { signal?: AbortSignal },
+  ) => Promise<{ url?: string; base64?: string }>;
 };
 let engineRouter: EngineRouter | undefined;
+
+/** The image ingress: one engine call, reshaped into the OpenAI images body. */
+async function serveCompletionImage(init?: RequestInit): Promise<Response> {
+  let parsed: { model?: string; prompt?: string };
+  try {
+    parsed = JSON.parse(String(init?.body ?? "{}")) as { model?: string; prompt?: string };
+  } catch {
+    return new Response(JSON.stringify({ error: { message: "invalid JSON body" } }), { status: 400 });
+  }
+  if (!engineRouter) {
+    engineRouter = (await import("../src/store")).router as unknown as EngineRouter;
+  }
+  const res = await engineRouter.generateImage({
+    model: parsed.model ?? "",
+    prompt: parsed.prompt ?? "",
+  });
+  const item: Record<string, unknown> = {};
+  if (res.url !== undefined) item.url = res.url;
+  if (res.base64 !== undefined) item.b64_json = res.base64;
+  return new Response(
+    JSON.stringify({ created: Math.floor(Date.now() / 1000), data: [item] }),
+    { status: 200, headers: { "Content-Type": "application/json" } },
+  );
+}
 
 async function tryServeCompletion(
   input: RequestInfo | URL,
@@ -2916,12 +2944,15 @@ async function tryServeCompletion(
   } catch {
     return null;
   }
-  if (!isLocal(url.hostname) || url.pathname !== "/v1/chat/completions") return null;
+  if (!isLocal(url.hostname)) return null;
   // **Only the gateway's own listener.** Without this the interceptor would also claim the
-  // egress dials to providers whose OpenAI-compatible path is `/v1/chat/completions` (the mock
-  // oracle's is), and the engine would re-enter itself through the patched fetch until the
-  // attempt budget ran out — PARSE_ERROR wrapping RATE_LIMITED, five layers deep.
+  // egress dials to providers whose OpenAI-compatible paths are `/v1/chat/completions` and
+  // `/v1/images/generations` (the mock oracle's are), and the engine would re-enter itself
+  // through the patched fetch until the attempt budget ran out — PARSE_ERROR wrapping
+  // RATE_LIMITED, five layers deep (chat), or NETWORK (images).
   if (url.port !== String(gatewayStatus.port)) return null;
+  if (url.pathname === "/v1/images/generations") return serveCompletionImage(init);
+  if (url.pathname !== "/v1/chat/completions") return null;
 
   let parsed: Record<string, unknown>;
   try {

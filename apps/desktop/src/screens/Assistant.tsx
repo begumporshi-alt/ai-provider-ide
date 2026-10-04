@@ -21,7 +21,7 @@ import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
-import { gatewayGenerate } from "../lib/gateway-turn";
+import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
 import { useUi } from "../ui-state";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
@@ -3831,7 +3831,8 @@ function ImageBox() {
     setProgress("Queued at the router…");
     const timer = window.setTimeout(() => setProgress("Waiting for the provider…"), 1500);
     try {
-      const res = await router.generateImage({ model: chosen, prompt: prompt.trim() }, { signal: ac.signal });
+      // A1 Phase 2: served by the gateway's OpenAI-shaped image route, like every client.
+      const res = await gatewayGenerateImage({ model: chosen, prompt: prompt.trim() }, { signal: ac.signal });
       setProgress("");
       setResult({ ...res, ms: Date.now() - t0, provider: chosen.split("/")[0] });
 

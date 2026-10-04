@@ -442,6 +442,15 @@ pub enum BridgeMsg {
         prompt_tokens: u64,
         completion_tokens: u64,
     },
+    /// Serving attribution for the turn that is about to end (A1 Phase 2): which provider, model
+    /// and key actually answered. Emitted just before `Done` so the OpenAI-shaped handlers can
+    /// put `served_by` on the terminal chunk / body. The other dialects ignore it until their
+    /// clients ask for attribution.
+    Served {
+        provider: String,
+        model: String,
+        key: String,
+    },
     /// The provider's finish reason, **already mapped to the OpenAI vocabulary** by the serving
     /// dialect's `responseFinishMap` (Anthropic `max_tokens` → `length`). Not terminal: it arrives
     /// just before `Done`.

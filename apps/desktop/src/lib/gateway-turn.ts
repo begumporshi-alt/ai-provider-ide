@@ -102,33 +102,15 @@ export async function gatewayGenerate(
   if (typeof req.maxTokens === "number") body.max_tokens = req.maxTokens;
   if (req.reasoning) body.reasoning_effort = req.reasoning;
 
-  const post = async (): Promise<Response> => {
-    const [base, key] = await Promise.all([gatewayBaseUrl(), uiSessionKey()]);
-    return fetch(`${base}/v1/chat/completions`, {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${key}`,
-        "Content-Type": "application/json",
-        // The Assistant does its own recall (TS memory engine); gateway-side injection would
-        // add a second memory block and record turns the webview already governs.
-        "AIP-Memory": "off",
-      },
-      body: JSON.stringify(body),
-      signal: opts.signal,
-    });
-  };
+  let res = await gatewayPost(
+    "/v1/chat/completions",
+    body,
+    // The Assistant does its own recall (TS memory engine); gateway-side injection would add a
+    // second memory block and record turns the webview already governs.
+    { "AIP-Memory": "off" },
+    opts.signal,
+  );
 
-  let res = await post().catch((e: unknown) => {
-    throw gatewayDown(e);
-  });
-  if (res.status === 401) {
-    // The mint-time TTL (S2) may have rotated the credential under us: drop the cached copy,
-    // re-mint, retry once — the same self-healing the admin client does.
-    clearUiSession();
-    res = await post().catch((e: unknown) => {
-      throw gatewayDown(e);
-    });
-  }
   if (!res.ok) {
     const detail = await res.text().catch(() => "");
     throw new Error(`the gateway refused the turn (${res.status}): ${detail.slice(0, 400)}`);
@@ -164,12 +146,70 @@ export async function gatewayGenerate(
   return { chunks, reasoning: () => reasoningAll, served: () => served };
 }
 
+/**
+ * One image generation, over the gateway's OpenAI-shaped `/v1/images/generations`. The
+ * response is normalized to what the Image tab consumes: `url` (a provider/CDN link) or
+ * `base64` (the bytes), exactly one of which the gateway's image path produces.
+ */
+export async function gatewayGenerateImage(
+  req: { model: string; prompt: string },
+  opts: { signal?: AbortSignal } = {},
+): Promise<{ url?: string; base64?: string }> {
+  const res = await gatewayPost("/v1/images/generations", { model: req.model, prompt: req.prompt }, {}, opts.signal);
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`the gateway refused the image (${res.status}): ${detail.slice(0, 400)}`);
+  }
+  const body = (await res.json()) as {
+    data?: Array<{ url?: string; b64_json?: string }>;
+  };
+  const first = body.data?.[0] ?? {};
+  return { url: first.url, base64: first.b64_json };
+}
+
 function gatewayDown(e: unknown): Error {
   if (e instanceof DOMException && e.name === "AbortError") return e;
   return new Error(
     "the gateway is not reachable — start it on the Local Gateway screen (or run the " +
       `aiproviderd service). Underlying error: ${e instanceof Error ? e.message : String(e)}`,
   );
+}
+
+/**
+ * POST one JSON body to the gateway with the UI session credential, re-minting once on 401 —
+ * the S2 TTL may have rotated the credential under us, and the same self-healing the admin
+ * client does applies here. `AIP-Memory: off` accompanies completions' bodies that carry it;
+ * the header is per-call so images (which have no memory semantics) stay clean.
+ */
+async function gatewayPost(
+  path: string,
+  payload: Record<string, unknown>,
+  extraHeaders: Record<string, string>,
+  signal?: AbortSignal,
+): Promise<Response> {
+  const post = async (): Promise<Response> => {
+    const [base, key] = await Promise.all([gatewayBaseUrl(), uiSessionKey()]);
+    return fetch(`${base}${path}`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${key}`,
+        "Content-Type": "application/json",
+        ...extraHeaders,
+      },
+      body: JSON.stringify(payload),
+      signal,
+    });
+  };
+  let res = await post().catch((e: unknown) => {
+    throw gatewayDown(e);
+  });
+  if (res.status === 401) {
+    clearUiSession();
+    res = await post().catch((e: unknown) => {
+      throw gatewayDown(e);
+    });
+  }
+  return res;
 }
 
 /**
