@@ -30,6 +30,17 @@ same day, 500098f) — activity records, written regardless of the toggle, bound
 the module doc before touching that rule. Pinned by 3 `retention` specs; recorded as D89 in
 [`07-drift-register.md`](07-drift-register.md).
 
+**2026-10-04 — usage on the wire (audit M1/M2).** The stream's tool-call arm ended the request
+before the bridge's `Done`, dropping the provider's usage frame, the capture, and the terminal
+chunk itself — the calls went out with `finish_reason` baked into a delta and a `[DONE]` that
+made everything after invisible. The arm now runs on to `Done`: one terminal chunk carrying
+`finish_reason: "tool_calls"`, the usage, and the sentinel. The non-stream body gained
+`total_tokens` beside the two counts it already carried. M1's `usage: null` mechanism was
+already fixed in the engine (`c3660c6`, 2026-09-23) — the audit's live null was the stale
+installed daemon, and the chain had no test, which is why the gap survived two audits; the wire
+is pinned now. Three new specs, all `gateway_tests`; D90 in
+[`07-drift-register.md`](07-drift-register.md) carries the full evidence trail.
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.

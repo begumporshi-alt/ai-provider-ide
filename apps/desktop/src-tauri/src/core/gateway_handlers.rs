@@ -101,6 +101,10 @@ pub(crate) async fn chat_h(
             let mut usage: Option<(u64, u64)> = None;
             let mut started = false;
             let mut streamed = String::new();
+            // A pass-through turn: tool calls went back to the client and the turn ends on them.
+            // The chunk itself is not terminal — the bridge follows it with the turn's usage and
+            // `Done`, and the terminal chunk below owes the client both (audit 2026-10-03 M2).
+            let mut tool_turn = false;
             // The provider's own finish reason, already in the OpenAI vocabulary. Absent for a
             // dialect that declares no `responseFinish`, where `stop` stays the honest default.
             let mut finish_reason: Option<String> = None;
@@ -162,7 +166,9 @@ pub(crate) async fn chat_h(
                                     "delta": {},
                                     // The provider's reason when it declared one — a truncation at
                                     // `max_tokens` must not read as `stop` (drift D86).
-                                    "finish_reason": finish_reason.take().unwrap_or_else(|| "stop".to_string()),
+                                    "finish_reason": finish_reason
+                                        .take()
+                                        .unwrap_or_else(|| if tool_turn { "tool_calls" } else { "stop" }.to_string()),
                                     "usage": {
                                         "prompt_tokens": pt,
                                         "completion_tokens": ct,
@@ -190,8 +196,14 @@ pub(crate) async fn chat_h(
                     }
                     BridgeMsg::ToolCalls(calls) => {
                         // Pass-through: the client declared these tools and will run them
-                        // itself, so hand them back shaped for the OpenAI wire and stop.
-                        // The request ends here — the gateway does not also execute them.
+                        // itself, so hand them back shaped for the OpenAI wire. The frame
+                        // carries no `finish_reason`: the turn ends on the bridge's `Done`
+                        // arm below, which emits the one terminal chunk — with the provider's
+                        // usage and the capture it owes. Ending here instead dropped both:
+                        // usage the provider had already reported never reached the client,
+                        // and the capture the every-other-exit runs was skipped (audit
+                        // 2026-10-03 M2).
+                        tool_turn = true;
                         let payload = json!({
                             "id": format!("gw-{}", id),
                             "object": "chat.completion.chunk",
@@ -199,12 +211,9 @@ pub(crate) async fn chat_h(
                             "choices": [{
                                 "index": 0,
                                 "delta": { "tool_calls": calls },
-                                "finish_reason": "tool_calls"
                             }]
                         });
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(payload.to_string()));
-                        yield Ok::<Event, std::convert::Infallible>(Event::default().data("[DONE]"));
-                        break;
                     }
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
@@ -308,7 +317,7 @@ pub(crate) async fn chat_h(
                 [(header::CONTENT_TYPE, "application/json")],
                 json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
                     "choices": [choice],
-                    "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct })) })
+                    "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct })) })
                     .to_string(),
             )
                 .into_response();

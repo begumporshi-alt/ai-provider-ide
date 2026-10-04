@@ -87,6 +87,9 @@ struct SynthBridge {
     slow: AtomicUsize, // dispatch count to delay (for disconnect tests)
     /// Make the synthetic model answer with tool calls instead of a plain finish.
     tool_calls: AtomicBool,
+    /// Report usage before the turn ends — the frame the real bridge's `on_usage` produces
+    /// while the provider's response is still streaming (audit 2026-10-03 M1/M2).
+    usage: AtomicBool,
     /// Prepend a reasoning message — the upstream-gated pass-through channel.
     reasoning: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
@@ -118,6 +121,7 @@ impl SynthBridge {
             cancels: AtomicUsize::new(0),
             slow: AtomicUsize::new(0),
             tool_calls: AtomicBool::new(false),
+            usage: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             liveness_then_pause: AtomicBool::new(false),
@@ -149,6 +153,12 @@ impl SynthBridge {
     }
     fn answer_with_tool_calls(&self, on: bool) {
         self.tool_calls.store(on, Ordering::Relaxed);
+    }
+    /// Report `Usage { 123, 45 }` before the turn ends, with and without tool calls — the
+    /// frame order the real bridge produces (`on_usage` fires during the run; the pass-through
+    /// arm then sends ToolCalls + Done).
+    fn answer_with_usage(&self, on: bool) {
+        self.usage.store(on, Ordering::Relaxed);
     }
     fn answer_with_reasoning(&self, on: bool) {
         self.reasoning.store(on, Ordering::Relaxed);
@@ -192,6 +202,7 @@ impl Bridge for SynthBridge {
         // and one fewer step to forget.
         let slow = self.slow.load(Ordering::Relaxed);
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
+        let with_usage = self.usage.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
@@ -231,6 +242,12 @@ impl Bridge for SynthBridge {
                     }
                     replies.reply(req.request_id, BridgeMsg::Delta("Hel".into()));
                     replies.reply(req.request_id, BridgeMsg::Delta("lo".into()));
+                    if with_usage {
+                        replies.reply(
+                            req.request_id,
+                            BridgeMsg::Usage { prompt_tokens: 123, completion_tokens: 45 },
+                        );
+                    }
                     if with_tools {
                         // Pass-through: the client declared these, so the gateway hands
                         // them straight back and never executes them itself.
@@ -2049,6 +2066,102 @@ async fn pass_through_non_stream_returns_tool_calls() {
     assert_eq!(body["choices"][0]["finish_reason"], "tool_calls");
     assert_eq!(body["choices"][0]["message"]["tool_calls"][0]["function"]["name"], "write_file");
     assert_eq!(body["choices"][0]["message"]["role"], "assistant");
+}
+
+// ---------- usage on the wire (audit 2026-10-03 M1/M2) ----------
+//
+// The provider's usage reached the ledger but not the client: the non-stream body printed
+// `usage: null` even when the bridge reported usage, and the stream's tool-call arm ended
+// the request before the usage frame was ever read.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn non_stream_chat_carries_the_provider_usage() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_usage(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body["usage"]["prompt_tokens"], 123,
+        "the provider's usage reaches the client: {body}"
+    );
+    assert_eq!(body["usage"]["completion_tokens"], 45);
+    assert_eq!(body["usage"]["total_tokens"], 168);
+    assert_eq!(body["choices"][0]["finish_reason"], "stop");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn stream_chat_carries_the_provider_usage_in_the_terminal_chunk() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_usage(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = res.bytes_stream();
+    let mut acc = String::new();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert_eq!(acc.matches("[DONE]").count(), 1, "one sentinel, at the end: {acc}");
+    // The terminal chunk is the one with a finish_reason; it must carry the usage beside it.
+    let terminal =
+        acc.lines().find(|l| l.contains("finish_reason")).expect("a terminal chunk exists: {acc}");
+    assert!(terminal.contains("\"finish_reason\":\"stop\""), "{terminal}");
+    assert!(terminal.contains("\"prompt_tokens\":123"), "{terminal}");
+    assert!(terminal.contains("\"completion_tokens\":45"), "{terminal}");
+    assert!(terminal.contains("\"total_tokens\":168"), "{terminal}");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stream_tool_turn_keeps_usage_the_done_sentinel_and_one_finish() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_tool_calls(true);
+    s.bridge.answer_with_usage(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = res.bytes_stream();
+    let mut acc = String::new();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    assert!(acc.contains("write_file"), "the calls reach the client: {acc}");
+    assert_eq!(
+        acc.matches("[DONE]").count(),
+        1,
+        "the sentinel comes once, from the terminal chunk: {acc}"
+    );
+    // The tool-call delta itself does not end the turn — the terminal chunk does, and it
+    // carries both the real finish reason and the usage the provider reported.
+    let terminal =
+        acc.lines().find(|l| l.contains("finish_reason")).expect("a terminal chunk exists: {acc}");
+    assert!(terminal.contains("\"finish_reason\":\"tool_calls\""), "{terminal}");
+    assert!(terminal.contains("\"prompt_tokens\":123"), "{terminal}");
+    assert!(terminal.contains("\"total_tokens\":168"), "{terminal}");
+    assert!(
+        !acc.contains("\"finish_reason\":\"stop\""),
+        "a tool turn must not read as a complete answer: {acc}"
+    );
 }
 
 // ---------- Anthropic streaming: a tool turn must still terminate (2026-09-22) ----------
