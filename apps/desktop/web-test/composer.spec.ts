@@ -80,6 +80,37 @@ async function attach(page: Page, name: string, mimeType: string, buffer: Buffer
   await page.getByTestId("composer-file-input").setInputFiles({ name, mimeType, buffer });
 }
 
+/**
+ * Paste files onto the composer exactly as a clipboard paste delivers them: a real ClipboardEvent
+ * carrying a File. The default handler does nothing with a screenshot on the clipboard, which is
+ * why the path exists at all. `clipboardData` is defined rather than passed to the constructor:
+ * it is a readonly member and some Chromium builds ignore it in the init dictionary.
+ */
+async function pasteIntoComposer(page: Page, base64: string, name = "pasted.png"): Promise<void> {
+  await page.getByTestId("composer-input").evaluate((el, payload) => {
+    const bin = atob(payload.b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], payload.name, { type: "image/png" }));
+    const ev = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: dt });
+    el.dispatchEvent(ev);
+  }, { b64: base64, name });
+}
+
+/** How many chat requests the harness has recorded so far. */
+async function chatRequestCount(page: Page): Promise<number> {
+  const reqs = await page.evaluate(
+    () =>
+      (
+        (window as unknown as { __webTest: { store: Record<string, () => unknown> } }).__webTest.store
+          .requests!() as { url: string; body: string | null }[]
+      ),
+  );
+  return reqs.filter((r) => r.url.endsWith("/chat/completions") && r.body).length;
+}
+
 test("an attached image reaches the provider as an image part", async ({ page }) => {
   await openAssistant(page, /oracle-vision/);
 
@@ -378,21 +409,7 @@ test("Previous results offers answers from this conversation and inserts one", a
 test("a pasted image is attached, because a screenshot is the fastest context there is", async ({ page }) => {
   await openAssistant(page, /oracle-vision/);
 
-  // The default paste handler does nothing with a screenshot on the clipboard, so this path did not
-  // exist before. Dispatched as a real ClipboardEvent with a file, which is what a paste of an image
-  // actually delivers.
-  await page.getByTestId("composer-input").evaluate((el, b64) => {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
-    const dt = new DataTransfer();
-    dt.items.add(new File([bytes], "pasted.png", { type: "image/png" }));
-    const ev = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
-    // Defined rather than passed to the constructor: `clipboardData` is a readonly member and some
-    // Chromium builds ignore it in the init dictionary.
-    Object.defineProperty(ev, "clipboardData", { value: dt });
-    el.dispatchEvent(ev);
-  }, PNG_1PX_BASE64);
+  await pasteIntoComposer(page, PNG_1PX_BASE64);
 
   await expect(page.getByTestId("attachment-chip")).toContainText("pasted.png");
 
@@ -466,3 +483,88 @@ test("a text file still lands in the draft, and the context meter now counts it"
   await expect(page.getByTestId("add-context-button")).toContainText("Add context");
 });
 
+
+test("two text files in one gesture both land in the draft", async ({ page }) => {
+  await openAssistant(page, /oracle-flash/);
+
+  // One gesture, two files: addFiles appends once per file with an await between appends, and the
+  // append used to compose from the render's draft — the second file's block overwrote the
+  // first's, silently losing attached context with no notice.
+  await page.getByTestId("composer-file-input").setInputFiles([
+    { name: "first.md", mimeType: "text/markdown", buffer: Buffer.from("# First\n\nalpha content\n", "utf8") },
+    { name: "second.md", mimeType: "text/markdown", buffer: Buffer.from("# Second\n\nbeta content\n", "utf8") },
+  ]);
+
+  const draft = page.getByTestId("composer-input");
+  await expect(draft).toHaveValue(/first\.md:/);
+  await expect(draft).toHaveValue(/alpha content/);
+  await expect(draft).toHaveValue(/second\.md:/);
+  await expect(draft).toHaveValue(/beta content/);
+  // Both, in order — not the second having replaced the first.
+  const value = await draft.inputValue();
+  expect(value.indexOf("first.md")).toBeLessThan(value.indexOf("second.md"));
+  expect(value.indexOf("alpha content")).toBeLessThan(value.indexOf("beta content"));
+});
+
+test("a double Enter sends one turn, not two", async ({ page }) => {
+  await openAssistant(page, /oracle-mini/);
+
+  // The @-expansion awaits the host per path before the parent can go busy — the window a second
+  // Enter used to fall straight through. Both keydowns are dispatched in the same tick, because a
+  // Playwright-serialised second press would land after the expansion resolved and never hit the
+  // window the bug lives in.
+  await page.getByTestId("composer-input").type("summarise @read");
+  const menu = page.getByTestId("mention-menu");
+  await expect(menu).toBeVisible();
+  await menu.getByRole("option", { name: /README\.md/ }).click();
+  await expect(page.getByTestId("composer-input")).toHaveValue(/@README\.md/);
+
+  await page.getByTestId("composer-input").evaluate((el) => {
+    for (let i = 0; i < 2; i += 1) {
+      el.dispatchEvent(
+        new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+      );
+    }
+  });
+
+  // One user turn in the transcript, and exactly one chat request on the wire.
+  await expect(page.getByText("summarise @README.md")).toHaveCount(1);
+  await expect(page.locator("div.whitespace-pre-wrap").last()).toBeVisible({ timeout: 30_000 });
+  expect(await chatRequestCount(page)).toBe(1);
+});
+
+test("a send that races a pending paste still carries the image, once", async ({ page }) => {
+  await openAssistant(page, /oracle-vision/);
+
+  // Text first, so a send during the paste has something to send: the old composer fired a turn
+  // without the image (the base64 read was still pending), then the chip ghosted onto the next
+  // turn. Paste and Enter are dispatched in the SAME JS tick — a forced branch, since no async
+  // read can resolve inside one tick — so the send is deterministically refused by the attaching
+  // gate, the chip appears, and the second Enter sends text and image together. Without the gate
+  // this spec sees two chat requests, the first image-less.
+  await page.getByTestId("composer-input").fill("what is this?");
+  await page.getByTestId("composer-input").evaluate((el, b64) => {
+    const bin = atob(b64);
+    const bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i += 1) bytes[i] = bin.charCodeAt(i);
+    const dt = new DataTransfer();
+    dt.items.add(new File([bytes], "pasted.png", { type: "image/png" }));
+    const ev = new ClipboardEvent("paste", { bubbles: true, cancelable: true });
+    Object.defineProperty(ev, "clipboardData", { value: dt });
+    el.dispatchEvent(ev);
+    el.dispatchEvent(
+      new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }),
+    );
+  }, PNG_1PX_BASE64);
+
+  await expect(page.getByTestId("attachment-chip")).toContainText("pasted.png");
+  await page.getByTestId("composer-input").press("Enter");
+
+  const body = await lastChatBody(page);
+  expect(userTurn(body).content).toEqual([
+    { type: "text", text: "what is this?" },
+    { type: "image_url", image_url: { url: `data:image/png;base64,${PNG_1PX_BASE64}` } },
+  ]);
+  // The refused Enter must not have produced a second, image-less request.
+  expect(await chatRequestCount(page)).toBe(1);
+});

@@ -213,6 +213,37 @@ export function Composer({
   const [mentionPick, setMentionPick] = useState(0);
   const [slashPick, setSlashPick] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  // Mirror of the draft for writers that run outside a render's closure: `addFiles` appends once
+  // per file with an `await readAsText` between appends, and the running closure still holds the
+  // gesture-time render — composing from `draft` there would overwrite every earlier file's block
+  // with the last one's, silently. Every write of the draft goes through `writeDraft`, which keeps
+  // this ref, the state, and the parent's copy in step.
+  const draftRef = useRef("");
+  // The synchronous send lock: set in `send` before its first await, released by the effect below.
+  const sendingRef = useRef(false);
+  // True while `addFiles` is reading dropped or pasted files. Send is refused during the window:
+  // a turn sent while a paste's base64 read is pending would leave the image out of the request
+  // and let its chip ghost onto the next one. A ref, not state, because `send` must see it in the
+  // same tick the paste landed — a render may not have happened yet; the state copy below exists
+  // only so the Send button can show the refusal.
+  const attachingRef = useRef(false);
+  const [attaching, setAttaching] = useState(false);
+
+  function writeDraft(next: string) {
+    draftRef.current = next;
+    setDraft(next);
+    onDraftChange(next);
+  }
+
+  useEffect(() => {
+    // Releases the send lock. `busy` going true means the parent took the turn — its own guard
+    // covers re-entry from there. `draft` becoming non-empty again means the user typed after a
+    // send the parent did not take (e.g. no model chosen — `runTurn` returns before setting busy),
+    // which is the only other way out: without it a refused send would lock the composer until
+    // reload. Both matter, and neither fires early: the effect only re-runs when `busy` or `draft`
+    // actually changes, and nothing between `send`'s lock and its clear touches either.
+    if (busy || draft) sendingRef.current = false;
+  }, [busy, draft]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [projectPickerOpen, setProjectPickerOpen] = useState(false);
   const pickerRef = useRef<HTMLInputElement | null>(null);
@@ -224,8 +255,7 @@ export function Composer({
   useEffect(() => {
     if (!seed || seed.nonce === seenSeed.current) return;
     seenSeed.current = seed.nonce;
-    setDraft(seed.text);
-    onDraftChange(seed.text);
+    writeDraft(seed.text);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -317,9 +347,12 @@ export function Composer({
    * under-reporting before this menu existed.
    */
   function appendToDraft(block: string) {
-    const next = `${draft.trimEnd()}${draft.trim() ? "\n\n" : ""}${block}`;
-    setDraft(next);
-    onDraftChange(next);
+    // Composed from the ref, not the render's `draft`: the closure running this was created at the
+    // gesture that started `addFiles`, and appends are separated by awaits — the state this
+    // closure sees is the pre-append draft for every file but the first.
+    const prev = draftRef.current;
+    const next = `${prev.trimEnd()}${prev.trim() ? "\n\n" : ""}${block}`;
+    writeDraft(next);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
       if (!el) return;
@@ -336,6 +369,19 @@ export function Composer({
   }
 
   async function addFiles(list: FileList | File[]) {
+    // The gate is the point (see `attaching`): between this and the reads below, a Send would
+    // compose its request from the pre-attachment closure and drop the files it claims to carry.
+    attachingRef.current = true;
+    setAttaching(true);
+    try {
+      await addFilesInner(list);
+    } finally {
+      attachingRef.current = false;
+      setAttaching(false);
+    }
+  }
+
+  async function addFilesInner(list: FileList | File[]) {
     const incoming = Array.from(list);
     const images: Attachment[] = [];
     for (const file of incoming) {
@@ -415,8 +461,7 @@ export function Composer({
   function pickMention(path: string) {
     if (mentionStart === null) return;
     const { text, caret: nextCaret } = applyMention(draft, mentionStart, caret, path);
-    setDraft(text);
-    onDraftChange(text);
+    writeDraft(text);
     setMentionStart(null);
     requestAnimationFrame(() => {
       const el = textareaRef.current;
@@ -430,8 +475,7 @@ export function Composer({
   function runSlash(command: SlashCommand) {
     // Cleared first: every one of these acts on the screen, and leaving "/clear" in the box invites
     // a second Enter that would send it as a message.
-    setDraft("");
-    onDraftChange("");
+    writeDraft("");
     setAttachments([]);
     setMentionStart(null);
     // A per-turn instruction belongs to the turn, not the composer: `/clear` starts a new chat, and
@@ -447,13 +491,18 @@ export function Composer({
   }
 
   async function send() {
-    if (busy || sendDisabled) return;
+    if (busy || sendDisabled || attachingRef.current || sendingRef.current) return;
     if (parsedSlash) {
       runSlash(parsedSlash.command);
       return;
     }
     const text = draft.trim();
     if (!text && attachments.length === 0) return;
+    // Set synchronously, before the first await: the @-expansion below awaits the host per path,
+    // and during that window a second Enter passes the `busy` guard (the parent has not seen the
+    // turn yet) and re-runs the whole expansion from the same stale closure. Released by the
+    // effect after the state block, not here — see it for the two arms.
+    sendingRef.current = true;
     const turnInstruction = instruction;
 
     let body = text;
@@ -483,12 +532,11 @@ export function Composer({
       }
     }
 
-    setDraft("");
+    writeDraft("");
     setAttachments([]);
     setMentionStart(null);
     setCaret(0);
     setInstruction("");
-    onDraftChange("");
     onInstructionChange?.("");
     onSend(body, attachments, inlined, turnInstruction);
   }
@@ -503,7 +551,7 @@ export function Composer({
         // Tab would fire a destructive `/clear` from a key people press to move focus.
         e.preventDefault();
         const c = slashMatches[slashPick];
-        if (c) setDraft(`/${c.name}`);
+        if (c) writeDraft(`/${c.name}`);
         return;
       }
       if (e.key === "Enter" && !e.shiftKey) {
@@ -677,9 +725,8 @@ export function Composer({
             value={draft}
             rows={1}
             onChange={(e) => {
-              setDraft(e.target.value);
+              writeDraft(e.target.value);
               setCaret(e.target.selectionStart ?? 0);
-              onDraftChange(e.target.value);
               syncMenus(e.target.value, e.target.selectionStart ?? 0);
             }}
             onKeyUp={(e) => { setCaret(e.currentTarget.selectionStart ?? 0); syncMenus(draft, e.currentTarget.selectionStart ?? 0); }}
@@ -763,7 +810,7 @@ export function Composer({
             {busy ? (
               <Button variant="danger" onClick={onStop}>■ Stop</Button>
             ) : (
-              <Button variant="primary" disabled={sendDisabled} onClick={() => void send()}>
+              <Button variant="primary" disabled={sendDisabled || attaching} onClick={() => void send()}>
                 Send
                 {/* aria-hidden: decoration on the button's face. The accessible name stays exactly
                     "Send", which the specs (and screen readers) match on. */}
