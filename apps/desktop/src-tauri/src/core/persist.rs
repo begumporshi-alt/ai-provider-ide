@@ -787,6 +787,14 @@ pub fn retention_job(store: &Store) -> Result<(), String> {
         params![now - 7 * 24 * 3600 * 1000],
     )
     .map_err(|e| e.to_string())?;
+    // Idempotency replay slots: a cache, not a record (§A3). 24h of retries is the window.
+    // Inline on the connection this job already holds — `idempotency_prune` re-locks
+    // `store.conn`, and this mutex is not reentrant.
+    conn.execute(
+        "DELETE FROM idempotency_keys WHERE created_at < ?1",
+        params![now - IDEMPOTENCY_TTL_MS],
+    )
+    .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -1289,6 +1297,106 @@ pub fn gateway_key_insert(store: &Store, id: &str, label: &str) -> Result<(), Co
     )?;
     Ok(())
 }
+
+// ---------- idempotency (§A3) ----------
+//
+// The replay cache behind `Idempotency-Key` on `POST /v1/chat/completions` (table 0023). The
+// design the D97 row settled on: scope per caller, fingerprint = the raw request body (byte
+// comparison, no hash crate, no canonicalisation), errors are never cached (a failed request's
+// retry re-executes), and the table is a replay cache — 24h, pruned by `retention_job`.
+
+/// The outcome of claiming an idempotency slot for one `(key, scope)`.
+#[derive(Debug)]
+pub enum IdempotencyBegin {
+    /// This caller's first attempt with this key: dispatch may proceed, and
+    /// [`idempotency_complete`] owes the row its response.
+    Reserved,
+    /// The exact same request already completed: serve `body` with `status` instead of
+    /// dispatching, and mark the response `Idempotency-Replayed`.
+    Replay { status: u16, body: String },
+    /// Either a different body under the same key, or the same body still in flight. Both are
+    /// 409s; the caller picks the message.
+    Conflict { in_progress: bool },
+}
+
+/// Claim (or match) the slot for `(key, scope)`. `fingerprint` is the raw request body.
+///
+/// Store failures propagate — but the HTTP caller treats them as "no dedup", never as a failed
+/// request: an outage in the replay cache must not take completions down with it.
+pub fn idempotency_begin(
+    store: &Store,
+    key: &str,
+    scope: &str,
+    fingerprint: &str,
+) -> Result<IdempotencyBegin, CommandError> {
+    use rusqlite::OptionalExtension;
+    /// What one stored slot reads back as: fingerprint, status code (None = in flight), body.
+    type StoredSlot = (String, Option<i64>, Option<String>);
+    let conn = store.conn.lock().map_err(|e| CommandError(e.to_string()))?;
+    let row = |conn: &rusqlite::Connection| -> Result<Option<StoredSlot>, CommandError> {
+        Ok(conn
+            .query_row(
+                "SELECT fingerprint, status_code, response_body FROM idempotency_keys
+                  WHERE key = ?1 AND scope = ?2",
+                params![key, scope],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .optional()?)
+    };
+
+    if let Some((fp, status, body)) = row(&conn)? {
+        return Ok(if fp != fingerprint {
+            IdempotencyBegin::Conflict { in_progress: false }
+        } else {
+            match (status, body) {
+                (Some(code), Some(b)) => IdempotencyBegin::Replay { status: code as u16, body: b },
+                // Same key, same body, no response yet: a concurrent attempt holds the slot.
+                _ => IdempotencyBegin::Conflict { in_progress: true },
+            }
+        });
+    }
+
+    let inserted = conn.execute(
+        "INSERT OR IGNORE INTO idempotency_keys (key, scope, fingerprint, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+        params![key, scope, fingerprint, now_ms()],
+    )?;
+    if inserted == 1 {
+        return Ok(IdempotencyBegin::Reserved);
+    }
+    // Lost a same-key race. Re-read: the winner either has a response (replay) or not
+    // (in-flight conflict). A fingerprint mismatch here is a conflict like any other.
+    match row(&conn)? {
+        Some((fp, status, body)) if fp == fingerprint => Ok(match (status, body) {
+            (Some(code), Some(b)) => IdempotencyBegin::Replay { status: code as u16, body: b },
+            _ => IdempotencyBegin::Conflict { in_progress: true },
+        }),
+        Some(_) => Ok(IdempotencyBegin::Conflict { in_progress: false }),
+        None => Ok(IdempotencyBegin::Conflict { in_progress: true }),
+    }
+}
+
+/// Store the completed response for a reserved slot. Best-effort at the call site: a failure
+/// here costs the *next* retry its replay, never the in-flight response.
+pub fn idempotency_complete(
+    store: &Store,
+    key: &str,
+    scope: &str,
+    status: u16,
+    body: &str,
+) -> Result<(), CommandError> {
+    let conn = store.conn.lock().map_err(|e| CommandError(e.to_string()))?;
+    conn.execute(
+        "UPDATE idempotency_keys SET status_code = ?3, response_body = ?4
+          WHERE key = ?1 AND scope = ?2",
+        params![key, scope, status as i64, body],
+    )?;
+    Ok(())
+}
+
+/// How long a completed slot stays replayable. A retry after 24h re-executes — generous for
+/// clients, bounded for the table.
+pub const IDEMPOTENCY_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
 pub fn gateway_key_revoke(store: &Store, id: &str) -> Result<(), CommandError> {
     let conn = store.conn.lock().unwrap();

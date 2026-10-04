@@ -342,7 +342,30 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0020_session_titles", add_session_titles_table),
     ("0021_ledger_failure_detail", add_ledger_failure_detail),
     ("0022_manifest_thinking_placeholder", backfill_manifest_thinking_placeholder),
+    ("0023_idempotency_keys", create_idempotency_keys),
 ];
+
+/// §A3: the replay cache behind `Idempotency-Key` on `POST /v1/chat/completions`.
+///
+/// Keyed `(key, scope)` — scope is the caller's app-key id, or `master` — so two clients cannot
+/// collide on one key. `fingerprint` is the **raw request body**: the client's body is the
+/// request's identity, byte comparison needs no hash crate, and no canonicalisation can silently
+/// equate two different requests. `status_code`/`response_body` are written on completion and
+/// are what a replay serves; a row without them is a reservation still in flight.
+fn create_idempotency_keys(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        "CREATE TABLE IF NOT EXISTS idempotency_keys (
+           key           TEXT NOT NULL,
+           scope         TEXT NOT NULL,
+           fingerprint   TEXT NOT NULL,
+           status_code   INTEGER,
+           response_body TEXT,
+           created_at    INTEGER NOT NULL,
+           PRIMARY KEY (key, scope)
+         );
+         CREATE INDEX IF NOT EXISTS idx_idempotency_created ON idempotency_keys(created_at);",
+    )
+}
 
 /// One legacy graph node, paired with the stable id it should have carried.
 struct LegacyNode {
@@ -1416,11 +1439,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0022 data migrations.
-        assert_eq!(info.schema_version, 22);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0023 data migrations.
+        assert_eq!(info.schema_version, 23);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(22, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(23, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1453,6 +1476,7 @@ mod tests {
             "memory_pending",
             "memory_principal_policy",
             "router_model_context",
+            "idempotency_keys",
         ] {
             let n: i64 = conn
                 .query_row(

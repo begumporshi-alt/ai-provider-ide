@@ -33,8 +33,8 @@ Set on open, and asserted by a test rather than assumed:
 
 ## Tables
 
-25 tables, plus `sqlite_sequence` and four FTS shadow tables (`memories_fts_data`, `_idx`, `_docsize`,
-`_config`), which is why `sqlite_master` reports 31.
+26 tables, plus `sqlite_sequence` and four FTS shadow tables (`memories_fts_data`, `_idx`, `_docsize`,
+`_config`), which is why `sqlite_master` reports 32.
 
 The authoritative list is the array in the `migrations_apply_once_and_are_idempotent` test in `core/store.rs`. **If
 you add a table, add it there too** — that assertion is what catches a migration that silently did not run.
@@ -45,7 +45,7 @@ you add a table, add it there too** — that assertion is what catches a migrati
 | Model catalog | `models_cache`, `model_aliases` |
 | Usage | `ledger`, `ledger_rollups` |
 | Self-healing | `drift_events`, `onboarding_sessions`, `generator_audit` |
-| Gateway | `gateway_keys`, `settings` |
+| Gateway | `gateway_keys`, `settings`, `idempotency_keys` |
 | Context graph | `context_nodes`, `context_edges` |
 | Skills | `skills` |
 | Agent loop | `agent_runs`, `agent_steps` |

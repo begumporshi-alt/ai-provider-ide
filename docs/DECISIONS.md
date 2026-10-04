@@ -1707,3 +1707,23 @@ that is not drift (then the rethrown path needs its own health record).
 - **Revisit if:** a transcript needs per-call timing or the approval decision shown on the row; or a
   turn's calls exceed what a collapsed card can summarise legibly, at which point the header should
   carry counts per tool name.
+
+## 2026-10-04 — Idempotency on `/v1`: scoped keys, byte fingerprints, replay-cache semantics
+
+- **Decision:** `POST /v1/chat/completions` honours `Idempotency-Key` (D97). The slot is keyed
+  `(key, scope)` where scope is the caller's app-key id or `master` — two clients cannot collide
+  on one key. The fingerprint is the **raw request body, compared as bytes**: the body is the
+  request's identity, byte equality needs no hash crate, and no canonicalisation can silently
+  equate two different requests. A key reused with a different body is `409 conflict`; the same
+  body still in flight is `409` with an in-progress message; a completed identical request is
+  replayed byte-for-byte with `Idempotency-Replayed: true`. Errors are never cached — a failed
+  request's retry re-executes, which is the semantics a retry actually wants.
+- **Streaming is refused a key (400), not silently deduplicated.** A replay must return the
+  *first* byte stream; reserving that is a different feature with different storage, and a
+  silent no-dedup would betray clients that asked for the guarantee.
+- **The table is a cache, not a record:** 24h replay window, pruned by `retention_job` alongside
+  the ledger and agent-run bounds. Store failures degrade to "no dedup", never to a failed
+  completion.
+- **Revisit if:** a client needs stream replays (reserve the terminal SSE frame), or
+  canonicalisation becomes necessary (very large bodies, header-dependent semantics) — at which
+  point the fingerprint grows into a hash and the stored scope gains a normalized-body column.

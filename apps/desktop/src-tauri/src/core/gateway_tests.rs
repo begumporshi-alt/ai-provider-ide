@@ -336,6 +336,42 @@ fn test_core(key: Arc<Mutex<Option<String>>>) -> (Arc<GatewayCore>, Arc<SynthBri
     (core, bridge)
 }
 
+/// Same, with a store attached — the idempotency replay cache (§A3) is store-backed, so its
+/// tests need a core that has one. Kept separate from `test_core` rather than threaded through
+/// it, so the ~hundred storeless tests keep proving a storeless core.
+fn test_core_with_store(
+    key: Arc<Mutex<Option<String>>>,
+    store: Arc<crate::core::store::Store>,
+) -> (Arc<GatewayCore>, Arc<SynthBridge>) {
+    let bridge = Arc::new(SynthBridge::new());
+    let core = GatewayCore::new(bridge.clone(), Arc::new(move || key.lock().unwrap().clone()))
+        .with_store(store);
+    (Arc::new(core), bridge)
+}
+
+/// `start`, with a store-backed core. Returns the dir so it outlives the server.
+async fn start_with_idem_store(
+    key: Arc<Mutex<Option<String>>>,
+    tag: &str,
+) -> (TestServer, std::path::PathBuf) {
+    let dir = std::env::temp_dir().join(format!("aip-gw-idem-{}-{}", tag, std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let store = Arc::new(crate::core::store::Store::open(&dir).unwrap());
+    let (core, bridge) = test_core_with_store(key, store);
+    core.set_running(true);
+    let handle = spawn(core.clone(), 0).await.expect("bind ephemeral");
+    (
+        TestServer {
+            client: reqwest::Client::new(),
+            base: format!("http://{}", handle.addr),
+            core,
+            bridge,
+            _handle: handle,
+        },
+        dir,
+    )
+}
+
 async fn start(key: Arc<Mutex<Option<String>>>) -> TestServer {
     let (core, bridge) = test_core(key);
     core.set_running(true);
@@ -2217,6 +2253,161 @@ async fn a_stream_tool_turn_keeps_usage_the_done_sentinel_and_one_finish() {
         !acc.contains("\"finish_reason\":\"stop\""),
         "a tool turn must not read as a complete answer: {acc}"
     );
+}
+
+// ---------- idempotency on /v1 (§A3) ----------
+//
+// The D97 row's design: scope per caller, fingerprint = the raw body, errors never cached,
+// replay serves the first response byte-for-byte with `Idempotency-Replayed: true`.
+
+#[tokio::test(flavor = "multi_thread")]
+async fn an_idempotency_key_replays_the_first_response_and_dispatches_once() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let (s, _dir) = start_with_idem_store(key, "replay").await;
+    let first = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("idempotency-key", "req-1")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(first.status(), 200);
+    assert_eq!(s.bridge.dispatched(), 1, "one dispatch for one key");
+    let body1: Value = first.json().await.unwrap();
+
+    let second = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("idempotency-key", "req-1")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 200);
+    assert_eq!(
+        second.headers().get("idempotency-replayed").map(|v| v.to_str().unwrap()),
+        Some("true"),
+        "the replay is marked as one"
+    );
+    let body2: Value = second.json().await.unwrap();
+    assert_eq!(body1, body2, "the replay serves the first response byte-for-byte");
+    assert_eq!(s.bridge.dispatched(), 1, "a replay never re-dispatches");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_same_key_with_a_different_body_is_a_conflict() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let (s, _dir) = start_with_idem_store(key, "conflict").await;
+    let base = chat_body(false);
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("idempotency-key", "req-1")
+        .json(&base)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let mut different = base.clone();
+    different["messages"][0]["content"] = json!("a different prompt");
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("idempotency-key", "req-1")
+        .json(&different)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 409, "key reuse across bodies is a conflict");
+    assert_eq!(s.bridge.dispatched(), 1, "the conflicting request never dispatched");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_streaming_request_refuses_an_idempotency_key() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .header("idempotency-key", "req-1")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 400, "replaying a byte stream is a different feature");
+}
+
+/// Scope separation, at the store level: the same key under two callers is two slots.
+#[test]
+fn idempotency_slots_are_scoped_per_caller() {
+    let dir = std::env::temp_dir().join(format!("aip-idem-scope-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = crate::core::store::Store::open(&dir).unwrap();
+
+    let r1 = crate::core::persist::idempotency_begin(&s, "req-1", "ak-1", "body-a").unwrap();
+    let r2 = crate::core::persist::idempotency_begin(&s, "req-1", "ak-2", "body-b").unwrap();
+    let r3 = crate::core::persist::idempotency_begin(&s, "req-1", "master", "body-a").unwrap();
+    assert!(matches!(r1, crate::core::persist::IdempotencyBegin::Reserved));
+    assert!(matches!(r2, crate::core::persist::IdempotencyBegin::Reserved));
+    assert!(matches!(r3, crate::core::persist::IdempotencyBegin::Reserved));
+    // The same key+scope replays; a different body under the same pair conflicts.
+    let again = crate::core::persist::idempotency_begin(&s, "req-1", "ak-1", "body-zzz").unwrap();
+    assert!(matches!(again, crate::core::persist::IdempotencyBegin::Conflict { .. }));
+    let replay = crate::core::persist::idempotency_begin(&s, "req-1", "ak-1", "body-a").unwrap();
+    assert!(matches!(
+        replay,
+        crate::core::persist::IdempotencyBegin::Conflict { in_progress: true }
+    ));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The replay cache is a cache: retention prunes what is past the window.
+#[test]
+fn retention_job_prunes_expired_idempotency_slots() {
+    let dir = std::env::temp_dir().join(format!("aip-idem-prune-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let s = crate::core::store::Store::open(&dir).unwrap();
+
+    {
+        let conn = s.conn.lock().unwrap();
+        let old = now_ms() - crate::core::persist::IDEMPOTENCY_TTL_MS - 60_000;
+        conn.execute(
+            "INSERT INTO idempotency_keys (key, scope, fingerprint, status_code, response_body, created_at)
+             VALUES ('old', 'master', 'f', 200, '{}', ?1)",
+            rusqlite::params![old],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO idempotency_keys (key, scope, fingerprint, created_at)
+             VALUES ('fresh', 'master', 'f', ?1)",
+            rusqlite::params![now_ms()],
+        )
+        .unwrap();
+    }
+
+    crate::core::persist::retention_job(&s).unwrap();
+    let conn = s.conn.lock().unwrap();
+    let left: Vec<String> = {
+        let mut stmt = conn.prepare("SELECT key FROM idempotency_keys").unwrap();
+        stmt.query_map([], |r| r.get(0)).unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    drop(conn);
+    assert_eq!(left, vec!["fresh".to_string()], "expired slots go, live ones stay");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---------- Anthropic streaming: a tool turn must still terminate (2026-09-22) ----------

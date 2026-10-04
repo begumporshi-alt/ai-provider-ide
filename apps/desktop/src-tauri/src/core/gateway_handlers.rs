@@ -19,6 +19,7 @@ use crate::core::gateway::{
     forwarded_headers, openai_error, peer_ip, try_slot, worker_status, BridgeMsg, BridgeRequest,
     GatewayCore,
 };
+use crate::core::persist;
 
 pub(crate) async fn chat_h(
     State(core): State<Arc<GatewayCore>>,
@@ -67,6 +68,66 @@ pub(crate) async fn chat_h(
             obj.remove("tool_choice");
             obj.remove("response_format");
         }
+    }
+
+    // §A3 idempotency, on `Idempotency-Key`. Scoped to the caller — the app-key id, or `master`
+    // for the master key — so two clients cannot collide on one key. The fingerprint is the raw
+    // body: it is the request's identity, and byte comparison cannot silently equate two
+    // different requests. Streaming is refused a key rather than silently deduplicated — a
+    // replay must return the first byte stream, and reserving that is a different feature.
+    let idem_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+        .filter(|k| !k.trim().is_empty());
+    if wants_stream && idem_key.is_some() {
+        return err(
+            StatusCode::BAD_REQUEST,
+            openai_error(
+                "idempotency keys apply to non-streaming requests only",
+                "invalid_request",
+                None,
+            ),
+        );
+    }
+    let idem_scope = app_key.clone().unwrap_or_else(|| "master".to_string());
+    let idem_begin = match (&idem_key, core.store()) {
+        (Some(k), Some(store)) => {
+            match persist::idempotency_begin(store, k, &idem_scope, &body) {
+                Ok(b) => Some(b),
+                // A store that cannot host the replay cache degrades to no dedup — never to a
+                // failed request.
+                Err(e) => {
+                    tracing::warn!("idempotency lookup failed (continuing without): {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    match idem_begin {
+        Some(persist::IdempotencyBegin::Replay { status, body: cached }) => {
+            let mut r = (
+                StatusCode::from_u16(status).unwrap_or(StatusCode::OK),
+                [(header::CONTENT_TYPE, "application/json")],
+                cached,
+            )
+                .into_response();
+            r.headers_mut().insert(
+                header::HeaderName::from_static("idempotency-replayed"),
+                header::HeaderValue::from_static("true"),
+            );
+            return r;
+        }
+        Some(persist::IdempotencyBegin::Conflict { in_progress }) => {
+            let msg = if in_progress {
+                "a request with this idempotency key is already in progress"
+            } else {
+                "this idempotency key was already used with a different request body"
+            };
+            return err(StatusCode::CONFLICT, openai_error(msg, "conflict", None));
+        }
+        Some(persist::IdempotencyBegin::Reserved) | None => {}
     }
 
     let mut slot = match try_slot(&core).await {
@@ -312,14 +373,20 @@ pub(crate) async fn chat_h(
             if let Some((pt, ct)) = usage {
                 choice["usage"] = json!({ "prompt_tokens": pt, "completion_tokens": ct });
             }
-            let mut r = (
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, "application/json")],
-                json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
+            let payload = json!({ "id": format!("gw-{id}"), "object": "chat.completion", "model": model,
                     "choices": [choice],
                     "usage": usage.as_ref().map(|(pt, ct)| json!({ "prompt_tokens": pt, "completion_tokens": ct, "total_tokens": pt + ct })) })
-                    .to_string(),
-            )
+                .to_string();
+            // §A3: the completed response becomes the replay for this key's next identical
+            // request. Best-effort — a store failure costs the *next* retry its replay, never
+            // this response.
+            if let (Some(k), Some(store)) = (&idem_key, core.store()) {
+                if let Err(e) = persist::idempotency_complete(store, k, &idem_scope, 200, &payload)
+                {
+                    tracing::warn!("idempotency store failed (non-fatal): {e}");
+                }
+            }
+            let mut r = (StatusCode::OK, [(header::CONTENT_TYPE, "application/json")], payload)
                 .into_response();
             apply_memory_headers(&mut r, &outcome);
             r

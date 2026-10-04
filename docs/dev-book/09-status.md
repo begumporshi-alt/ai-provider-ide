@@ -74,6 +74,17 @@ first draft deleting the secret it had just written — `gateway_key_delete` is 
 row *and* vault entry, and the fixed ordering is pinned in `ensure_with`'s comment. Four new
 specs; D93/D94 in [`07-drift-register.md`](07-drift-register.md) carry the evidence.
 
+**2026-10-04 — idempotency on `/v1` (A3 closed), and the engine decomposition plan (A4).**
+`POST /v1/chat/completions` now honours `Idempotency-Key`: scoped per caller, fingerprinted on
+the raw body, replays byte-for-byte, conflicts on reuse, refuses a key on streams, 24h replay
+window pruned by retention. The design decision is in `DECISIONS.md`; the table is 0023 (the
+suite re-runs migrations against fixtures, so it is `IF NOT EXISTS` like its siblings — the
+first draft deadlocked `retention_job` by re-locking the store's mutex, and the inline form is
+the pin). Five new specs; D97 Fixed. A4: the decomposition plan the row demanded exists at
+[`../ENGINE_DECOMPOSITION_PLAN_2026-10-04.md`](../ENGINE_DECOMPOSITION_PLAN_2026-10-04.md) —
+six submodules behind a re-exporting root, moves pending; D98 Half. Rust suite re-measured at
+**1,521** after this work (1,516 before it).
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.
