@@ -167,6 +167,49 @@ export async function gatewayGenerateImage(
   return { url: first.url, base64: first.b64_json };
 }
 
+/**
+ * The wizard/repair AI port (`AiTextPort.complete`, A1 Phase 3), backed by the gateway and
+ * routed at the **System AI model** — the same model `ModelRouter.complete` used to pick, so
+ * `excludeProviderIds` is deliberately not expressible here: naming the System AI model IS the
+ * exclusion, because the planner routes to that model's own provider. The port throws when no
+ * System AI model is configured, which is what `systemAiAvailable()` gates on.
+ */
+export function gatewaySystemAiPort(getModel: () => string | undefined): {
+  complete(req: {
+    prompt: string;
+    system?: string;
+    maxTokens: number;
+    timeoutMs: number;
+    excludeProviderIds: string[];
+  }): Promise<string>;
+} {
+  return {
+    async complete(req) {
+      const model = getModel();
+      if (!model) {
+        throw new Error("no System AI model is configured — pick one in Router Settings");
+      }
+      const messages: unknown[] = [
+        ...(req.system ? [{ role: "system", content: req.system }] : []),
+        { role: "user", content: req.prompt },
+      ];
+      const ac = new AbortController();
+      const timer = window.setTimeout(() => ac.abort(), Math.max(req.timeoutMs, 1_000));
+      try {
+        const exec = await gatewayGenerate(
+          { model, messages, maxTokens: req.maxTokens },
+          { signal: ac.signal },
+        );
+        let out = "";
+        for await (const chunk of exec.chunks) out += chunk;
+        return out;
+      } finally {
+        window.clearTimeout(timer);
+      }
+    },
+  };
+}
+
 function gatewayDown(e: unknown): Error {
   if (e instanceof DOMException && e.name === "AbortError") return e;
   return new Error(

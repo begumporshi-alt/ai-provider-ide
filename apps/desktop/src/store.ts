@@ -7,6 +7,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type { Modality } from "@aiprovider/adapter-spec";
 import { fetchAdmin, fetchAdminAs } from "./lib/gateway-client";
+import { gatewaySystemAiPort } from "./lib/gateway-turn";
 import {
   arrayOf,
   expectShape,
@@ -307,7 +308,9 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
     const contract = await runContractSuite(adapter, { secretRef, consent: { text: false, image: false } });
     const plan = await new RepairOrchestrator({
       http,
-      ai: router,
+      // A1 Phase 3: the repair AI is a gateway client at the System AI model — the TS engine
+      // no longer serves any production generation.
+      ai: gatewaySystemAiPort(() => router.settings.systemAi?.model),
       systemLabel: routerSettingsLabel(),
       currentManifest: adapter.manifest,
       currentVersion: 1,

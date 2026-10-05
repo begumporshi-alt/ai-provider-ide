@@ -9,6 +9,7 @@
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
+import { gatewaySystemAiPort } from "../lib/gateway-turn";
 import {
   BUILTIN_TEMPLATES,
   OnboardingOrchestrator,
@@ -263,7 +264,7 @@ export function OnboardingScreen() {
     setCodeApproved(false);
     try {
       const ranked = await generateCandidates({
-        ai: router,
+        ai: gatewaySystemAiPort(() => router.settings.systemAi?.model),
         systemLabel: systemLabel(),
         report: orch.session.probeReport!,
         baseUrl,
@@ -311,7 +312,7 @@ export function OnboardingScreen() {
     setCodeApproved(false);
     try {
       const candidate = await generateCodeCandidate({
-        ai: router,
+        ai: gatewaySystemAiPort(() => router.settings.systemAi?.model),
         systemLabel: systemLabel(),
         report: orch.session.probeReport!,
         baseUrl: orch.session.input.baseUrl,
