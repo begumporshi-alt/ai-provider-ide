@@ -33,8 +33,8 @@ Set on open, and asserted by a test rather than assumed:
 
 ## Tables
 
-26 tables, plus `sqlite_sequence` and four FTS shadow tables (`memories_fts_data`, `_idx`, `_docsize`,
-`_config`), which is why `sqlite_master` reports 32.
+28 tables (27 `CREATE TABLE` + the `memories_fts` virtual table), plus `sqlite_sequence` and four FTS shadow
+tables (`memories_fts_data`, `_idx`, `_docsize`, `_config`), which is why `sqlite_master` reports 33.
 
 The authoritative list is the array in the `migrations_apply_once_and_are_idempotent` test in `core/store.rs`. **If
 you add a table, add it there too** — that assertion is what catches a migration that silently did not run.
@@ -44,13 +44,13 @@ you add a table, add it there too** — that assertion is what catches a migrati
 | Providers and keys | `providers`, `api_keys`, `manifests` |
 | Model catalog | `models_cache`, `model_aliases` |
 | Usage | `ledger`, `ledger_rollups` |
-| Self-healing | `drift_events`, `onboarding_sessions`, `generator_audit` |
+| Self-healing | `drift_events`, `onboarding_sessions` (+ `onboarding_sessions_fixed`, the 0019 rebuild), `generator_audit` |
 | Gateway | `gateway_keys`, `settings`, `idempotency_keys` |
 | Context graph | `context_nodes`, `context_edges` |
 | Skills | `skills` |
 | Agent loop | `agent_runs`, `agent_steps` |
 | Memory | `memories`, `memories_fts` |
-| Live session context | `router_sessions`, `session_turns`, `session_state`, `memory_pending`, `memory_principal_policy`, `router_model_context` |
+| Live session context | `router_sessions`, `session_turns`, `session_state`, `session_titles`, `memory_pending`, `memory_principal_policy`, `router_model_context` |
 | Migrations | `schema_version` |
 
 ### Two things about specific tables
@@ -67,10 +67,11 @@ There are **two lists** and they are numbered as **one sequence**:
 
 ```rust
 const MIGRATIONS: &[(&str, &str)] = &[ … ];                 // 0001..0006, SQL
-const DATA_MIGRATIONS: &[(&str, fn(&Transaction) -> Result<()>)] = &[ … ];  // 0007..0015, Rust
+const DATA_MIGRATIONS: &[(&str, fn(&Transaction) -> Result<()>)] = &[ … ];  // 0007..0023, Rust
 ```
 
-A data migration's version is `MIGRATIONS.len() + idx + 1`.
+A data migration's version is `MIGRATIONS.len() + idx + 1`. The pair is asserted at **23** total
+(`store.rs`, `assert_eq!(info.schema_version, 23)`).
 
 **The trap:** appending a new SQL migration to `MIGRATIONS` shifts the version number of **every** data
 migration by one. On any database that already applied them, each data migration would then be re-run under a
@@ -89,8 +90,11 @@ Migrations run on every app launch and must be safe to re-run.
 
 ## Current state of the live database
 
-Measured read-only. On 2026-09-22 this contradicted a reasonable assumption; it no longer does, and the
-before/after is worth keeping because the gap was real for a day:
+**The 2026-09-22/23 snapshot below is kept as a lesson, not as current state** — its point was the gap
+between "defined in code" and "applied to the live database", which is a gap every reader should know exists.
+Code sits at `schema_version` **23** (`0023_idempotency_keys`, added 2026-10-04); the live database on any
+given machine is at whatever version its last-launched build applied, and the migration runner closes the gap
+on the next launch. That is the mechanism; the story below is why the distinction once mattered:
 
 | | Before the rebuild | After (2026-09-22) |
 |---|---|---|
@@ -106,14 +110,9 @@ across real traffic — could not produce a single row until the app was reinsta
 
 All 1530 rows predate the column, so `NULL` is the correct value for every one of them. **That is not the same
 as "the providers reported zero cached tokens"** — see the next section. Closing D8 made the column *writable*;
-it did not produce any data.
-
-**0016 is in the same position today, and that is why this table is worth keeping.** Migration
-`0016_ledger_app_key` is defined in code — **16** versions now — but the live database is still at
-`schema_version` **15**, with no `ledger.app_key_id` column: the installed bundle predates it, exactly as it
-did for 0015. Per-app attribution is therefore wired and tested and will record nothing until the app is
-rebuilt and relaunched. Reading `app_key_id IS NULL` before that would be reading the absence of a *column*,
-not the absence of spend.
+it did not produce any data. The same trap then recurred with `0016_ledger_app_key` (per-app attribution wrote
+nothing until the bundle shipped it), which is why this section states the rule and keeps one example rather
+than tracking the current version in prose — for that, read `store.rs`'s assertion, which cannot go stale.
 
 ## Identifier rules
 
@@ -151,9 +150,23 @@ Two behaviours that surprise people, both deliberate.
 
 ## Retention
 
-Both the capture queue and the memory tables are filled by **gateway** traffic, not by the app's own chat. That
-is why their schedulers start in `App.tsx` rather than on the Memory screen: a screen-scoped scheduler would
-stop pruning whenever Memory was not the open screen.
+Three schedulers, over different tables — knowing which is which explains most "when does X get deleted"
+questions:
+
+1. **`persist::retention_job`** (Rust; boot + every 24 h, in both the app and the `aiproviderd` daemon) —
+   monthly ledger rollups, raw-ledger deletion past 90 days (only after rollup), agent-run aging (finished
+   >30 d deleted; `running` >7 d deleted, because a status we did not observe is unknown), and the idempotency
+   prune. Until 2026-10-04 this job existed but nothing called it in the daemon, which is exactly the defect
+   the daemon wiring closed.
+2. **`core/retention.rs`** (Rust; every 30 min per core, 5 s pass budget, 500-row chunks, single-flight) —
+   memory and live-context prunes, plus the drift evaluation. Runs only while a core is alive, and only one
+   scheduler per core no matter how many times the gateway is re-enabled.
+3. **The webview timer** (`src/lib/memory/retention.ts`, started in `App.tsx` so no single screen owns it) —
+   a bounded belt-and-braces pass when the desktop UI is open; the daemon has no webview, which is why (1)
+   and (2) live in Rust.
+
+Both the capture queue and the memory tables are filled by **gateway** traffic, not by the app's own chat
+(the Assistant sends `AIP-Memory: off`).
 
 ## Next
 

@@ -119,6 +119,19 @@ specs on the snippet builders in `lib/connect-ide.ts`, five browser specs on the
 mint round-trips into Per-app keys, and the wrong `/v1` form is asserted *absent*, not merely
 the right form present.
 
+**2026-10-05 — the dev book caught up with the serving path (D99).** A doc-vs-code audit found that the
+architecture chapters still described the *pre-A1* system: ch. 02 had the router core in a webview behind a
+hidden `gateway-worker.ts` window (deleted) and called headless a "v2 extension point" (shipped 2026-10-04);
+ch. 08 said a closed window means a `503` and carried the superseded 5-in-15-minutes drift rule; ch. 03 said
+125 commands; ch. 01's scale numbers were the 2026-09-22 tree. All are re-measured and rewritten against HEAD:
+ch. 02 now tells the three-runtime story (webview oracle, Rust host, `aiproviderd` daemon) with the Rust
+request path; ch. 08's pipeline carries the spend/idempotency gate and `served_by`; ch. 03 documents the 36
+`/admin` routes, the idempotency contract, the measured egress budgets and the invariant-2 UI-session
+carve-out; ch. 04 fixes the table list (`session_titles`, `onboarding_sessions_fixed`) and the migration
+range; ch. 11's "no implementation yet" status is corrected; and the root `ARCHITECTURE.md` carries a
+supersession banner rather than a silent rewrite. Numbers were verified in code, not quoted: 131 registered
+commands (143 defined), 8 public + 36 admin routes, 29 CREATE TABLEs, 23 migrations, 75,189 Rust lines.
+
 ## Working and verified
 
 Each of these has a test, a gate step, or a measurement behind it — not just a merged commit.
@@ -136,7 +149,7 @@ Each of these has a test, a gate step, or a measurement behind it — not just a
 | Agent loop | Sandboxed tools, visible step trail | `agent-turn.spec.ts`, `tauri/tools.rs` |
 | Gateway keys | Per-app keys, **per-app monthly budgets**, global monthly spend cap | `tauri/commands.rs`, `gateway_keys` table (0017) |
 | Ledger | Tokens, cost, latency, error class, prompt-cache `cached_tokens`, per-app `app_key_id` | Migrations 0015–0016 — 18 columns, **all live: measured 2026-09-26 the DB sits at `schema_version` 17**, `0016_ledger_app_key` was applied 2026-09-23 14:09:19, and `ledger.app_key_id` and `idx_ledger_app_key_ts` both exist. This cell used to read *"0016 is in the source but not in the installed database… the live DB sits at `schema_version` 15"* — true when measured, false from 14:09 on 2026-09-23, never revisited (D69). `cached_tokens` is no longer all-`NULL` either: **11 of 1574** rows carry one. **0 of 1574** carry an `app_key_id`, which is the honest state of attribution — the column exists and its writer has produced nothing yet |
-| Schema | **21** versions, count asserted, rewind-tested. (This cell said **17** from 2026-09-23 to 2026-10-01 while the code went to 20 — the exact staleness this chapter warns about; re-measured 2026-10-01 at `0021_ledger_failure_detail`: fresh-DB `schema_version` 21, `MIGRATIONS.len() + DATA_MIGRATIONS.len()` asserted 21) | `core/store.rs` migration count test |
+| Schema | **23** versions, count asserted, rewind-tested. (This cell said **17** from 2026-09-23 to 2026-10-01 while the code went to 20 — the exact staleness this chapter warns about; re-measured 2026-10-01 at `0021_ledger_failure_detail`; stale again at **21** from 2026-10-01 to 2026-10-05 while 0022/0023 landed, re-measured 2026-10-05: fresh-DB `schema_version` 23, `MIGRATIONS.len() + DATA_MIGRATIONS.len()` asserted 23) | `core/store.rs` migration count test |
 | Headless service — Phase 1 | Rust split into `core/` (Tauri-independent) and `tauri/`; **`core/` no longer compiles Tauri at all** — `default = ["app"]` with both Tauri crates `optional` and every `tauri` mention behind `#[cfg(feature = "app")]`, so `cargo build --bin aiproviderd --no-default-features` drops `tauri`/`wry`/WebKitGTK from the graph entirely. `aiproviderd` builds and serves `GET /health` → 200 `{"status":"ok"}` on macOS, Windows and Linux. **Serves completions** via the Rust-native `RouterBridge` (Phase 4b; `HeadlessBridge` deleted 25f). Phase 6 closed 2026-09-26: the `.app` bundle's `Contents/MacOS/aiproviderd` is the Tauri-free binary, verified by `scripts/check-bundled-aiproviderd-links.sh` (an `otool -L` gate that counts WebKit/wry/gtk dylib matches; 0 = pass); run via `scripts/substitute-tauri-free-aiproviderd.sh` (`pnpm build:headless`) after every `tauri build`, since the bundler always overwrites it with the default-features (WebKit-linked) target | `src/bin/aiproviderd.rs`, `src/core/`, `src/tauri/`; [10](10-headless-service.md) §2.1.1, Phase 6; CI steps "Substitute the Tauri-free aiproviderd into the bundle" and "Verify bundled aiproviderd links no WebKit" in `.github/workflows/release.yml`; D56–D57 record the null-instrument history |
 | Governance | Apache-2.0, changelog, security policy, weekly audit, and a **self-verifying** release workflow — the preflight refuses an unprovisioned build and the artefact is read back and must be notarized | `LICENSE`, `.github/workflows/`, `scripts/release-preflight.sh`, `scripts/verify-release-signature.sh` |
 | Doc links | Every relative link and image in every markdown file resolves | `scripts/check-doc-links.mjs`, a gate step |
@@ -439,7 +452,7 @@ mechanism nobody had built and described it wrongly, so they were deleted rather
 ```bash
 PATH="$HOME/.cargo/bin:$PATH" pnpm ci:local          # the whole gate
 sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
-  "SELECT MAX(version) FROM schema_version;"          # expect 17
+  "SELECT MAX(version) FROM schema_version;"          # expect 23 (the live DB lags the code until the next launch — that is the mechanism, not a defect)
 sqlite3 "file:$HOME/Library/Application Support/dev.aiprovider.router/ai-provider-router.db?mode=ro" \
   "SELECT COUNT(*) FROM pragma_table_info('ledger') WHERE name='cached_tokens';"   # expect 1
 cargo clippy --manifest-path apps/desktop/src-tauri/Cargo.toml --all-targets -- -D warnings  # expect clean

@@ -31,9 +31,15 @@ is testable, and each is here because breaking it is a security or correctness r
 an `imageUrl` from an image generation — may be fetched by the egress gateway, scoped to that request only and
 never persisted to the allowlist.
 
+**One carve-out to #2, added when the screens moved to the admin HTTP surface (D51):** the webview holds a
+*credential* — the 24-hour UI-session bearer (`ui_session_key`) it uses to `fetch()` the `/admin/*` routes.
+What it never holds is a provider key. The credential lives in a `let` only (never persisted, never logged —
+"a secret that survives a reload is a secret that can be extracted from a compromised webview"), expires after
+24 hours, is rotated by the next `ensure` past expiry, and is revoked when the gateway stops.
+
 ## The HTTP surface
 
-Eight routes, registered in `core/gateway.rs:1938-1945`. Seven are the OpenAI-compatible surface below,
+Eight public routes, registered in `core/gateway.rs:2309-2316`. Seven are the OpenAI-compatible surface below,
 every one of which translates to a single canonical
 OpenAI-shaped chat body before dispatch, which is why memory injection has one shape at four call sites rather
 than four implementations.
@@ -56,6 +62,24 @@ unauthenticated answer is a statement that the route exists.
 
 `/v1/embeddings` is out of scope for v1; the modality enum is the extension point.
 
+### The admin surface
+
+Beside the public eight sit **36 `/admin/*` paths** (`core/gateway.rs:2326+`) that the app's own screens use
+for settings, keys, spend, providers, manifests, memory, ledger and tool management. They authenticate with
+the same `check_gateway_key` as `/v1` — the webview talks to them over `fetch()` with its 24-hour UI-session
+bearer (the invariant-2 carve-out above), not with the master key. `GET /admin/settings/background` is an
+example of the one place a plain screen read crosses HTTP rather than IPC; the split is deliberate, so the
+same surface can later serve remote or headless operators behind a real credential.
+
+### Idempotency on `/v1/chat/completions`
+
+A non-streaming POST may carry an `Idempotency-Key` (backed by the `idempotency_keys` table, migration 0023).
+The scope is the caller — the per-app key id, or `master` — and the fingerprint is the raw request body
+bytes. First call reserves, then completes with the response body; a repeat answers the cached body with
+`Idempotency-Replayed: true`; the same key with different bytes answers `409`; errors are never cached; keys
+expire after 24 h and are pruned inline by the daily retention job. **Streaming requests carrying a key are
+refused with `400`** — replaying a stream is a different contract, not this one.
+
 ### Merged model IDs
 
 Catalog entries are exposed as `<provider-slug>/<native-id>` — `openrouter/gpt-4o`, `b.ai/qwen3-flash`. A **bare
@@ -71,10 +95,10 @@ the alias map is the only mechanism.
 |---|---|---|
 | `401` | Invalid or revoked key. **A healthy gateway answers 401 to a bad key** | key check |
 | `401` | `"no master key configured"` — the secrets file holds no `masterkey` account, so there is nothing to compare against | master-key check |
-| `429` | `"router at capacity"` — the gateway's own admission ceiling was hit | `core/gateway.rs:1302`, `:1315` |
-| `429` | `"too many failed auth attempts — backing off"` — 30s backoff after repeated bad keys | `core/gateway.rs:1437` |
+| `429` | `"router at capacity"` — the gateway's own admission ceiling was hit | admission semaphores, `core/gateway.rs` |
+| `429` | `"too many failed auth attempts — backing off"` — per-IP backoff after repeated bad keys (doubling from 500 ms, capped) | per-IP backoff map, `core/gateway.rs` |
 | `429` | Upstream `RATE_LIMITED`, including a cooled key's wait | execution engine |
-| `503` | `"AI-Provider Router core unavailable — is the app open?"` — the webview is gone | `core/gateway.rs:1668` |
+| `503` | `"AI-Provider Router gateway is stopped"` — no listener in this process (the app shows when it is delegating to the launchd daemon instead) | stopped-gateway branch, `core/gateway.rs:1478` |
 | `503` | `"master key unavailable — the secrets file could not be read"` — the read did not complete; a local fault, not a bad credential | master-key check |
 
 > **`503 master key unavailable` is not a bug, and it precedes authentication.** The gateway reads `masterkey`
@@ -113,11 +137,14 @@ One "request timeout" cannot serve every phase, so the budget is per phase.
 | Budget | Default |
 |---|---|
 | Connect | 10 s |
-| First byte | 30 s |
-| Idle stream | 60 s, reset on every chunk — long generations are not "timed out" at 30 s |
-| Max attempts per request | 6, across the whole plan |
+| Upstream headers | 20 s (`UPSTREAM_HEADER_TIMEOUT`) |
+| Upstream first byte | 20 s (`UPSTREAM_FIRST_BYTE_TIMEOUT`) |
+| Upstream idle stream | 120 s, reset on every chunk — long generations are not "timed out" |
+| Gateway first message | 30 s (`FIRST_MSG_TIMEOUT`) — bounds the wait for the bridge's first frame, then `503` |
+| Max attempts per request | 6, across the whole plan (`PLAN_BUDGET` 26 s bounds the whole chain) |
+| Upstream transport retries | 1, pre-header transport errors only — a header stall is deliberately *not* retried |
 | Backoff | Jittered exponential, honouring `Retry-After` |
-| Per-provider concurrency cap | 4, with a bounded queue |
+| Per-provider concurrency cap | 4 (`PER_PROVIDER_DEFAULT`), with a bounded queue |
 
 ### Concurrency is two semaphores, not one
 
@@ -134,15 +161,20 @@ the same mechanism.
 
 ## The IPC surface
 
-125 commands, registered in `tauri/commands.rs::handlers()`. Grouped by module:
+131 commands, registered in `tauri/commands.rs::handlers()` (143 `#[tauri::command]` functions are defined
+across the crate; the rest are wrappers the registration does not need). Grouped by defining module:
 
 | Module | Count | Covers |
 |---|---|---|
-| `commands` (local) | 53 | vault, egress, store, settings, context, history, skills, agent, memory, capture |
-| `gateway_cmds` | 32 | gateway lifecycle, keys, spend, tools, memory switch, logs, worker callbacks |
+| `commands` (local) | 62 | vault, egress, store, settings, context, history, skills, agent, memory, capture |
 | `persist` | 28 | providers, keys, manifests, catalog, aliases, ledger, onboarding, audit, drift, config |
-| `tools` | 4 | tool policy, root checks, `tool_run` |
+| `gateway_cmds` | 25 | gateway lifecycle, keys, spend, tools, memory switch, logs, workbuddy sync trigger |
+| `tools_cmds` | 8 | tool policy, root checks, `tool_run` |
+| `service_cmds` | 5 | launchd agent install/uninstall/start/stop/status |
 | `workbuddy` | 3 | sync, status, model set |
+
+Re-measured 2026-10-05 — the previous counts here (125 registered; 53/32/28/4/3) predate the service
+commands, `ui_session_key` and the tool-policy expansion.
 
 Two rules, both of which have cost a blank screen before:
 

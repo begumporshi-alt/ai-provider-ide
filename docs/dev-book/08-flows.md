@@ -7,15 +7,17 @@ together, because most confusing behaviour is one of them being mistaken for the
 
 ![Gateway request pipeline: auth, capacity, context and memory, upstream dispatch, response finalization](../../diagrams/memory-context-gateway-read-path.svg)
 
-Five stages, and every one of them runs before the provider is contacted:
+**Six stages, and every one of them runs before the provider is contacted.** (The stage count grew from five
+on 2026-10-04/05: spend moved out of auth's shadow, and idempotency became its own gate.)
 
 | Stage | What happens |
 |---|---|
-| 1 · Auth | Master key, then per-app keys. A `401` here is the healthy answer to a bad key |
-| 2 · Capacity | `try_slot` — 8 in flight, 32 queued. Overflow is a `429`, not a stall |
-| 3 · Context + memory | `inject_context` under a 15 ms budget. Scoped recall of L1–L3; a skip carries its reason on a header |
-| 4 · Capture + upstream | `prepare_capture`, then `bridge.dispatch` into the router core, then the provider through a 6-header allowlist |
-| 5 · Response | `finish_capture` plus memory headers |
+| 1 · Auth | Master key, then per-app keys (`gwkey:ak-*`). Bearer for OpenAI-style callers, `x-api-key` for Anthropic, `x-goog-api-key` for Gemini. A `401` here is the healthy answer to a bad key |
+| 2 · Spend + idempotency | After auth, the spend gate (`402 spend_cap_exceeded` global, `402 app_budget_exceeded` per-app). A non-streaming request carrying an `Idempotency-Key` then reserves: a replay answers the cached body with `Idempotency-Replayed: true`, a same-key-different-body conflict answers `409`, and streaming + key is a `400` |
+| 3 · Capacity | `try_slot` — 8 in flight, 32 queued. Overflow is a `429`, not a stall |
+| 4 · Context + memory | `inject_context` under a 15 ms budget. Scoped recall of L1–L3; a skip carries its reason on a header. The Assistant sends `AIP-Memory: off` and does its own recall |
+| 5 · Capture + upstream | `prepare_capture`, then `core.dispatch` into the Rust `RouterBridge`, then the provider through a 6-header allowlist |
+| 6 · Response | `finish_capture` plus memory headers. The terminal SSE chunk carries `finish_reason`, `usage` and `served_by` — the provider attribution the Activity screen shows |
 
 **All four ingress dialects converge on one canonical chat body before dispatch.** That is why stage 3 has a
 single implementation rather than four, and why memory injection is not dialect-specific.
@@ -30,9 +32,11 @@ the plan — the next key, or the next provider — *is* the retry. There is no 
 - A `401` or `429` **cools the key** rather than deprioritising it, and the planner **drops** cooled keys. So
   the earliest a client can be served is when the *first* cooled key frees up — which is why the client-facing
   `Retry-After` is the **shortest** named wait, not the longest.
-- A whole plan is bounded at **6 attempts**.
-- `5 drift-class errors within 15 minutes across 2 or more models`, while those models succeed elsewhere, is
-  the drift signal that starts a repair — see [02](02-architecture.md).
+- A whole plan is bounded at **6 attempts** (and a `PLAN_BUDGET` of 26 s bounds the whole chain below the
+  gateway's own 30 s first-message timeout).
+- Drift is **not** a per-request signal: the Rust monitor (`core/drift.rs`) reads the ledger on the 30-minute
+  retention pass and flags a provider whose **1-hour window** holds drift-class failures while the same
+  requested model *succeeded elsewhere* — see [02](02-architecture.md).
 
 ### The other flows
 
@@ -64,15 +68,17 @@ Zen are OpenAI-compatible, so the realistic first run needs no AI at all.
 
 | Step | You do | Under the hood |
 |---|---|---|
-| 5 · Use it | Chat and image generation in the Assistant, or point Cursor, Codex, a script or a chat UI at the local gateway | Both paths hit the same router with the same rotation and failover. The Assistant recalls **unscoped**; the gateway path recalls **scoped** and injects into the canonical body. Per-app gateway keys let you revoke one client without rotating the master key |
+| 5 · Use it | Chat and image generation in the Assistant, or point ZCode, Claude Code, Cursor, a script or a chat UI at the local gateway — the Gateway screen's **Connect your IDE** panel mints a per-app key and prints the exact config for each | Every path hits the same router with the same rotation and failover — the Assistant is a gateway client now too, over loopback HTTP. The Assistant recalls **unscoped**; the gateway path recalls **scoped** and injects into the canonical body. Per-app gateway keys let you revoke one client without rotating the master key |
 | 6 · Observe | Activity, History, and the drift events on a provider card | The ledger records tokens, cost, latency and error class per request, including `cached_tokens` where a provider reports it. `source` attribution separates UI, gateway and internal generator traffic |
 | 7 · Tune | Control, Memory, Skills, Agents | Control is the switchboard for cross-cutting switches — one place, not a mirror per screen. Memory atoms are born unscoped and need a human to bind scope before scoped recall can return them |
 
 ### Two things that surprise people
 
-**The gateway is not always available.** It bridges into the webview-hosted core, so if the app's window is
-reloading, crashed or closed the gateway answers `503` immediately. It is a desktop app that serves HTTP, not a
-service — see [02](02-architecture.md).
+**A stopped gateway refuses fast — and serving without a window is a choice you make.** The gateway lives in
+the Rust host, not the webview, so it does not die with the window; but quitting the app still stops it. The
+supported way to serve with no window open is the headless `aiproviderd` launchd agent (default port 8800,
+[10](10-headless-service.md)) — the app detects it at boot and delegates instead of double-binding. Either
+way, a listener that is not up answers `503` + `Retry-After: 1` immediately rather than queueing.
 
 **Memory recall looks broken on the gateway path and is not.** Every atom is born unscoped, and scoped recall
 excludes unscoped rows. Until a human binds scope, gateway recall legitimately returns nothing. Measured live

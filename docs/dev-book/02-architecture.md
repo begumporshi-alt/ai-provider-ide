@@ -1,7 +1,8 @@
 # 02 — Architecture
 
-The full design narrative is [`../ARCHITECTURE.md`](../ARCHITECTURE.md). This chapter is the part you need
-before touching anything: the split, the boundary, and the one place a change is likely to break a promise.
+The v1 design narrative is [`../ARCHITECTURE.md`](../ARCHITECTURE.md) — written when the router core lived in
+the webview, so its hosting sections are superseded (a banner there says so). **This chapter is the current
+truth**; the request path itself is in [08 Flows](08-flows.md).
 
 **Diagram:** [`../diagrams/architecture.html`](../../diagrams/architecture.html) — layers, the router, the
 gateway and key-blind egress. The request path itself is in [08 Flows](08-flows.md).
@@ -29,46 +30,48 @@ Two consequences worth stating plainly:
 - **A key must never enter webview-observable state.** The one-shot reveal is a Rust-side native action for
   this reason. Do not "simplify" it into a value returned over IPC.
 
-## Two runtimes, one process
+## Three runtimes, one codebase
 
 | Runtime | Holds | May touch |
 |---|---|---|
-| Webview (TypeScript) | The entire `router-core` package, the React UI | Nothing privileged. Talks to the host only through 125 typed IPC commands |
-| Rust host | The gateway, the egress module, the vault, SQLite | The network with credentials, the local secrets file, the filesystem |
+| Webview (TypeScript) | The React UI, `store.ts`, and the `router-core` package **as a test oracle and config layer** — settings, key tests, import validation, the repair orchestrator. It executes **no production generation** | Nothing privileged. Talks to the host through 135 registered typed IPC commands, and holds the 24-hour UI-session bearer that `/admin` fetches use |
+| Rust host (the app) | The gateway, the router (`planner`/`engine` behind `RouterBridge`), egress, the vault, SQLite, memory, tools, the retention scheduler | The network with credentials, the local secrets file, the filesystem |
+| Headless daemon (`aiproviderd`) | The same Rust serving stack with no Tauri — `cargo build --bin aiproviderd --no-default-features` compiles zero Tauri | Same as the Rust host, minus any window |
 
-Both live in one desktop process, but they are not peers. The webview is the brain and the Rust host is the
-only thing with hands.
+Until 2026-10-04 the router core ran **in the webview**, behind a hidden `gateway.html` worker window, and
+this chapter described that bridge. The A1 consolidation (D95) moved the serving path fully into Rust: the
+gateway bridges HTTP into the Rust `RouterBridge` (`core/router_bridge.rs`, a `BridgeMsg` protocol between
+the HTTP handlers and the router), and the Assistant itself became a plain gateway client over loopback
+HTTP (`src/lib/gateway-turn.ts`) — same admission, same ledger, same failover as an external IDE.
+`router-core` survives as the differential/oracle suite for tests and for config-time work;
+`packages/adapter-spec` is the frozen manifest grammar. The webview is no longer the brain; it is the
+control panel for a brain that lives in the host.
 
-### Why the gateway is Rust and not TypeScript
+### Why the serving core is Rust
 
-Three reasons, in order of weight:
+1. **Credential injection has to be somewhere audited.** Rust makes "all egress flows through one module"
+   mechanically true rather than aspirational (`core/egress.rs` is still the only place a secret meets a request).
+2. **Availability.** The webview-hosted core answered `503` whenever the window was gone — the project's main
+   structural risk for its whole v1. Closed 2026-10-04: the gateway lives in the host process, and the
+   headless `aiproviderd` (launchd agent, default port 8800) serves with no window at all. App and daemon are
+   the same code over the same SQLite store; at boot the app probes the port and **delegates** to the daemon
+   when launchd already holds it, instead of double-binding.
+3. **The vault and SQLite are Rust APIs.**
 
-1. **Credential injection has to be somewhere audited.** Putting it in Rust makes "all egress flows through one
-   module" mechanically true rather than aspirational.
-2. **The webview origin cannot call provider APIs at all** — no CORS headers from providers.
-3. **The vault and SQLite are Rust APIs.** Anything else would need a second bridge.
+### Where the 503 still comes from
 
-### The gateway bridge, and its availability cost
-
-The gateway bridges external HTTP into the router core, which lives in a **webview**. That is a real
-architectural cost, and it is documented rather than hidden:
-
-- The bridge runs in its **own hidden window** (`gateway.html` → `src/gateway-worker.ts`), not in the main app
-  window. UI render work and Vite HMR reloads therefore cannot disturb in-flight gateway requests. Rust targets
-  that window explicitly — see `GATEWAY_WINDOW` in `tauri/gateway_cmds.rs`.
-- That window is granted **only** `core:event:allow-listen` and `allow-unlisten` by `capabilities/gateway.json`.
-  No filesystem, no shell, no opener.
-- **If the webview is reloading, crashed or closed, the gateway answers `503` + `Retry-After: 1` immediately.**
-  It does not queue against a dead core.
-- The app is **single-window** by decision. A second window would instantiate a second router core.
-- A headless service mode — the gateway detached from any window — is an explicit **v2 extension point**, not a
-  v1 feature. Until it exists, the gateway's availability is bounded by the app's.
-
-> This is the project's main structural risk and it is worth being honest about: a desktop app whose HTTP
-> gateway dies with its window is not a service. The mitigation is the 503 contract plus the window policy, not
-> a claim that the problem does not exist.
+A *stopped* gateway — in-app or daemon — answers `503` + `Retry-After: 1` immediately ("AI-Provider Router
+gateway is stopped"). The branch is no longer about the webview at all: it is simply "this process has no
+listener on the port". `gateway_status.running` reflects the listener in this process, and the app says
+plainly when it is delegating to the launchd agent.
 
 ## The layer stack
+
+**This table describes the TypeScript packages — the UI plus the test oracle.** The Rust serving stack is
+flatter: `gateway.rs` (HTTP surface, admission, auth, spend gate) → `router_bridge.rs` (the driver that owns
+the tool loop and emits `BridgeMsg` frames) → `router.rs`/`planner.rs`/`engine.rs` (plan, attempt loop,
+classification) → `egress.rs` (the only credential toucher), with `persist.rs`/`store.rs` under everything
+and `retention.rs`/`drift.rs` as the off-path housekeeping.
 
 Arrows point downward. **One relaxation is deliberate and must not be "fixed":** L3 services call L1 components
 directly (`onboarding-orchestrator` → probe/generator/contract, `drift-monitor` → generator), because those L1
@@ -96,7 +99,7 @@ come from the generator. It is broken three ways, and all three are load-bearing
 |---|---|---|
 | 0 | Builtin dialect templates — static data shipped with the app | No |
 | 1 | Declarative manifests — inert data, executed by **one** interpreter | No |
-| 2 | Sandboxed code adapters — QuickJS-WASM, last resort | No at runtime |
+| 2 | Sandboxed code adapters — QuickJS (`rquickjs`, in-process Rust), last resort | No at runtime |
 
 The router's only compile-time dependencies are the interpreter and the sandbox — both fixed, shipped code. The
 generator's *output* is inert data, not a live dependency, so the runtime graph is a DAG.
@@ -126,14 +129,20 @@ smuggle a host change or an exfiltration endpoint through a generated manifest.
 
 Providers change their APIs. The system notices and repairs itself, with a human in the loop.
 
-- **Error taxonomy:** `AUTH_FAILED`, `RATE_LIMITED`, `NOT_FOUND`, `BAD_REQUEST_SCHEMA`, `PARSE_ERROR`,
-  `SERVER_ERROR`, `TIMEOUT`. Only `NOT_FOUND`, `BAD_REQUEST_SCHEMA`, `PARSE_ERROR` and provider-wide
-  `AUTH_FAILED` count as drift signals.
-- **Trigger:** at least 5 drift-class errors within 15 minutes affecting at least 2 models, while the same
-  models succeed via other providers — which is what isolates a provider-side change from our own bug.
+- **Error taxonomy:** thirteen classes live in `core/engine.rs` — `AUTH_FAILED`, `RATE_LIMITED`, `NOT_FOUND`,
+  `BAD_REQUEST_SCHEMA`, `PARSE_ERROR`, `SERVER_ERROR`, `TIMEOUT`, plus Rust-only additions such as
+  `CLIENT_GATE` (a 401/403 that refused the *client*, not the key — rotating keys would be wrong there).
+  Only `NOT_FOUND`, `BAD_REQUEST_SCHEMA`, `PARSE_ERROR` and provider-wide `AUTH_FAILED` count as drift signals.
+- **Trigger:** the Rust drift monitor (`core/drift.rs`) reads the **ledger** on every retention pass — every
+  30 minutes, not per request. A provider whose enabled traffic shows drift-class failures inside a
+  **1-hour window**, while the *same requested model succeeded via a different provider* in that window, is
+  drifting: the succeeded-elsewhere proof is what separates a provider-side API change from an upstream
+  outage (an outage belongs to cooldowns and the auth breaker, not to repair). One open event per provider;
+  the evidence lands in `drift_events` and the provider flips to `repairing`.
 - **Repair:** mark `repairing` (failover keeps traffic flowing) → re-probe → re-fingerprint deterministically
   first → only then generate a manifest **patch** → contract suite → stage a new manifest version → human
-  confirmation → hot-swap, with one-click rollback.
+  confirmation → hot-swap, with one-click rollback. The repair orchestrator is webview-side, and its AI port
+  dials the gateway like any other client (`store.ts` `buildRepairPlan` → `gatewaySystemAiPort`).
 - **Rate-limited:** at most one automatic re-probe per provider per hour. Repairs are always human-confirmed.
 - **Single-provider dead end:** if the broken provider is the user's only one, AI-assisted repair has no
   candidate model. The flow falls back to deterministic re-fingerprinting and says so.
@@ -142,8 +151,9 @@ Providers change their APIs. The system notices and repairs itself, with a human
 
 | For | Read |
 |---|---|
-| Module map, data flows, acceptance criteria | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) §§1, 3, 9 |
+| The v1 spec narrative (rationale; hosting sections superseded) | [`../ARCHITECTURE.md`](../ARCHITECTURE.md) |
 | Why a choice was made, with the date | [`../DECISIONS.md`](../DECISIONS.md) |
+| The headless service and its phases | [10 Headless service](10-headless-service.md) |
 | Memory and context subsystem | [`../GATEWAY_MEMORY_LAYER.md`](../GATEWAY_MEMORY_LAYER.md) |
 | Control screen and audit trails | [`../CONTROL_SCREEN_BUILD.md`](../CONTROL_SCREEN_BUILD.md) |
 

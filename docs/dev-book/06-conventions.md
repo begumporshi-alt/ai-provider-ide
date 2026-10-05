@@ -122,8 +122,8 @@ give each trail its **own channel**. There are four known loss shapes; see `REFE
 **This repository is public.** `pnpm key-leak-grep` is a gate step, and every fixture must be synthetic. Never
 commit a real key, token or hostname.
 
-**Docs live in `docs/`.** The root holds only `README`, `CHANGELOG`, `CONTRIBUTING`, `SECURITY` and `LICENSE`,
-plus the two overview artefacts the tooling writes there. Older memory files cite docs by bare filename — resolve
+**Docs live in `docs/`.** The root holds `README`, `CHANGELOG`, `CONTRIBUTING`, `USER_GUIDE`, `SECURITY` and
+`LICENSE`; the overview artefacts live under `docs/`. Older memory files cite docs by bare filename — resolve
 those under `docs/`.
 
 **One edit per file per batch.** A second edit to the same file lands on a stale snapshot and clobbers the

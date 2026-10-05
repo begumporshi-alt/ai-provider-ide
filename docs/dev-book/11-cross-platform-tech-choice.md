@@ -1,6 +1,12 @@
 # 11 — Cross-platform tech choice: how to run the gateway without a WebView
 
-**Status:** analysis — no implementation yet.
+**Status (2026-10-05): Path A is implemented — this chapter's analysis is now history.** The router core
+runs outside the WebView as Rust-native `RouterBridge` behind the same gateway surface, and the headless
+`aiproviderd` daemon (launchd agent, no Tauri in the build graph) ships it on macOS; see
+[10](10-headless-service.md) and [02](02-architecture.md). What was *not* done is any of the
+TS-engine-outside-a-webview mechanics this chapter weighed — the question was answered by removing the TS
+core from the serving path instead, leaving it as the test oracle. The line counts below are the
+2026-09-23 tree (`7ac97e3`), not today's.
 
 **Question answered:** which technology path lets the gateway survive the UI process on Windows,
 macOS, and Linux, while keeping the product a desktop app.

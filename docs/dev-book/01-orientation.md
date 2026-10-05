@@ -7,9 +7,12 @@ local layer. Providers are described by a **declarative JSON manifest**, so addi
 than code. An unknown API is onboarded by a guided `probe → fingerprint → contract-test → approve` wizard, with
 an AI generator as the fallback when no builtin dialect template fits.
 
-A Rust HTTP gateway re-exposes the whole router as a single OpenAI-shaped endpoint on `127.0.0.1`, so Cursor,
-Codex, a script or a chat UI can reach every configured provider through one URL and one credential, with the
-same key rotation and provider failover the built-in UI gets.
+A Rust HTTP gateway re-exposes the whole router as a single OpenAI-shaped endpoint on `127.0.0.1`, so ZCode,
+Claude Code, Cursor, a script or a chat UI can reach every configured provider through one URL and one
+credential, with the same key rotation and provider failover the built-in UI gets — and the app itself runs
+headless as a launchd service (`aiproviderd`) when a window is not wanted. Since the 2026-10-04/05 A1
+consolidation the *serving* router is Rust (`RouterBridge`); the TypeScript `router-core` package is the
+differential oracle for tests and the config-time layer, not the request path.
 
 **The security promise that shapes the whole design:** API keys live in a file-backed vault on your machine
 (`.secrets.json`, mode 600) — never in the database or logs — nothing leaves the machine, and the
@@ -21,12 +24,14 @@ Three workspace packages. The split is not cosmetic — it is what keeps the rou
 
 | Path | What it owns | Size |
 |---|---|---|
-| `apps/desktop` | Tauri shell, React UI (`src/screens/`, 13 screens), and the Rust host (`src-tauri/src/`, 29 files) | ~23,900 lines Rust, ~15,300 lines TS/TSX |
-| `packages/router-core` | Routing, adapter runtime, model catalog, onboarding orchestrator, ledger, memory engine | 34 files, ~5,500 lines |
+| `apps/desktop` | Tauri shell, React UI (`src/screens/`, 13 screens), and the Rust host + serving router (`src-tauri/src/`, 73 files) | ~75,200 lines Rust, ~15,300 lines TS/TSX |
+| `packages/router-core` | The differential/oracle engine (tests + config-time), model catalog, repair orchestration | 39 files, ~8,800 lines |
 | `packages/adapter-spec` | The manifest grammar (zod) — the frozen contract | 2 files, ~220 lines |
 
 `router-core` is UI-agnostic on purpose: it is exercised by unit tests with fake ports, with no webview and no
-network. Anything that needs the network, the vault or SQLite is a port, implemented in Rust.
+network. Anything that needs the network, the vault or SQLite is a port, implemented in Rust. Since A1 it is
+also off the production request path — the Rust engine serves; `router-core` remains the second
+implementation that keeps the Rust one honest in tests.
 
 ## Toolchain
 
@@ -78,7 +83,7 @@ is the source of truth for the sidebar; this table adds which subsystem each scr
 | Tools | Memory | `screens/Memory.tsx` | Memory atoms, scopes, recall, retention |
 | System | Control | `screens/Control.tsx` | The switchboard for cross-cutting switches |
 | System | Router Settings | `screens/Settings.tsx` | Failover, rotation, timeouts, system-AI pick |
-| System | Local Gateway | `screens/Gateway.tsx` | Enable, port, endpoint URL, master and per-app keys |
+| System | Local Gateway | `screens/Gateway.tsx` | Endpoint URL, master and per-app keys, the Connect-your-IDE setup panel, copy-paste presets |
 | — | Onboarding | `screens/Onboarding.tsx` | Reached from Providers, not in the sidebar |
 
 **The sidebar is not the full list.** `Onboarding.tsx` is a screen with no `NAV` entry — it is entered from the
@@ -96,16 +101,20 @@ documented test counts had drifted twice before this was written.
 
 | Thing | Count |
 |---|---|
-| Rust source files / lines | 29 / ~23,900 |
+| Rust source files / lines | 73 / ~75,200 |
 | Screens | 13 / ~7,300 lines |
-| Registered IPC commands | 125 |
-| HTTP routes on the gateway | 7 |
-| SQLite tables | 25 |
-| Migration versions | 15 (6 schema + 9 data) |
-| TypeScript unit cases | ~425 |
-| Browser harness specs | 14 files, 87 cases |
-| Playwright end-to-end specs | 7 files, 27 cases |
-| Rust `#[test]` | ~400 (plus `#[tokio::test]`) |
+| Registered IPC commands | 131 (143 `#[tauri::command]` defined) |
+| HTTP routes on the gateway | 8 public + 36 `/admin/*` |
+| SQLite tables | 29 |
+| Migration versions | 23 (6 schema + 17 data) |
+| TypeScript unit cases | 921 (23 adapter-spec · 463 router-core · 435 desktop src) |
+| Browser harness specs | 190 cases |
+| Playwright end-to-end specs | 4 spec files, 27 cases |
+| Rust `#[test]` | 1,527 |
+
+Re-measured 2026-10-05; the previous row (29 files / 125 commands / 15 migrations / ~425 TS cases…) was the
+2026-09-22 tree held forward for a month while the Rust serving path, headless daemon, retention, idempotency
+and drift work landed.
 
 ## Next
 

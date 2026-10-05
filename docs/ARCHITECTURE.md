@@ -1,13 +1,25 @@
 # ARCHITECTURE — AI-Provider Router
 
+> **Supersession notice (2026-10-05).** This narrative was written for the v1 design, in which the
+> router core ran **in the webview** behind a hidden gateway window and a headless service was a
+> non-goal. Both are no longer true: the serving core is Rust-native (`core/router_bridge.rs`) behind
+> the same gateway surface, the TypeScript engine is the test oracle, and the headless `aiproviderd`
+> launchd service shipped 2026-10-04. The **current** architecture story is
+> [`dev-book/02-architecture.md`](dev-book/02-architecture.md), the flows are
+> [`dev-book/08-flows.md`](dev-book/08-flows.md), and the service is
+> [`dev-book/10-headless-service.md`](dev-book/10-headless-service.md). This document is kept for the
+> design rationale — the invariants, the self-construction model, the redaction rules — most of which
+> carried over intact; its hosting and availability sections should be read as history.
+
 > Complete architecture, including the **self-construction engine** (auto-provider onboarding).
 > Built from the notebook sketch spec ([MASTER_PROMPT.md](MASTER_PROMPT.md)) plus the user
 > directive: *the IDE can automatically add and set up any new AI provider; an AI model is
 > required inside the IDE so it can self-construct if needed.*
 >
-> Status: **shipped** — v1.0.0 on macOS, 16 migrations, release workflow green. Pattern: layered modular
+> Status: **shipped** — v1.0.0 on macOS, release workflow green. Pattern: layered modular
 > monolith + hexagonal router core + registry/plugin adapter subsystem · Stack: Tauri 2 + React +
-> TypeScript + Rust host
+> TypeScript + Rust host (the "16 migrations" figure this line carried refers to the v1 tree; the
+> schema is at 23 as of 2026-10-05 — `core/store.rs` asserts it).
 >
 > **This is a spec document, and parts of it describe the plan rather than the built app.** The rules,
 > interfaces and current state live in [`dev-book/`](dev-book/README.md); known disagreements between this
