@@ -61,6 +61,18 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   provider, is not a default this product should apply on the operator's behalf. A per-provider
   header overrides it, which is what the field above is for.
 
+- **The Gateway screen walks an operator from "I use ZCode" to a working config.** The new
+  **Connect your IDE** panel on Local Gateway is the front door for using the router as a custom
+  provider from other coding agents: pick the IDE (ZCode, Claude Code, or any OpenAI-compatible
+  client), mint a per-app key named for it with one click, and copy the exact config bytes —
+  ZCode's `provider` entry for `~/.zcode/v2/config.json` (shape verified against a live
+  custom-provider entry, including the top-level `"provider"` map and the `/v1`-carrying
+  `options.baseURL`), Claude Code's `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN` pair, or a
+  base-URL/key/smoke-test card for anything else. The secret still never enters the webview:
+  minting copies it host-side to the clipboard, and the snippet carries a
+  `sk-aip-PASTE-KEY-HERE` slot to paste over. The model-id field defaults to the configured
+  System AI model, so the smoke test references a model the router is known to serve.
+
 ### Changed
 
 - **The gateway no longer advertises tools it will refuse.** Four of the eight agent tools
@@ -81,6 +93,12 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   attempt either clears the breaker or re-arms it, so a genuinely revoked key costs one `401` per
   window instead of being silently dropped forever. Applies to both the `aiproviderd` gateway and
   the in-app Assistant. See `DECISIONS.md` 2026-09-27.
+
+- **The Gateway's Claude Code preset pointed `ANTHROPIC_BASE_URL` at the `/v1` endpoint, which
+  Claude Code appends `/v1/messages` to — `/v1/v1/messages`, a guaranteed 404.** Found while
+  building the Connect-your-IDE panel, whose snippet builders pin the split (OpenAI-compatible
+  bases carry `/v1`, Anthropic bases must not) in unit and browser tests asserting the wrong
+  form *absent*.
 
 ### Fixed
 

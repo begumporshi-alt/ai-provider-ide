@@ -7,8 +7,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { useCallback, useEffect, useState } from "react";
 import { Button, Field, inputCls, inputStyle } from "../components/atoms";
 import { usd } from "../lib/format";
-import { readGatewaySettings, type GatewayStatus } from "../store";
+import { systemAiModel, readGatewaySettings, type GatewayStatus } from "../store";
 import { fetchAdmin } from "../lib/gateway-client";
+import {
+  CONNECT_KEY_PLACEHOLDER,
+  CONNECT_TARGETS,
+  buildConnectSnippet,
+  rootUrl,
+  type ConnectTarget,
+} from "../lib/connect-ide";
 
 /**
  * Audit R4: metadata only — the secret lives in the local secrets file and is never returned here.
@@ -384,6 +391,8 @@ export function GatewayScreen() {
         )}
       </section>
 
+      <ConnectIdeSection endpoint={endpoint} onMinted={refreshKeys} />
+
       <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
         <h2 className="mb-2 text-[14px] font-semibold">Copy-paste presets</h2>
         <PresetRow
@@ -403,8 +412,13 @@ export function GatewayScreen() {
         />
         <PresetRow
           label="Claude Code / anthropic-sdk"
-          code={`export ANTHROPIC_BASE_URL="${endpoint}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`}
-          onCopy={() => void copy(`export ANTHROPIC_BASE_URL="${endpoint}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`, "claude")}
+          /*
+            The root, not ${endpoint}: Claude Code appends /v1/messages to ANTHROPIC_BASE_URL
+            itself, so the /v1 form dialed /v1/v1/messages. Caught while building the
+            Connect-your-IDE panel below, whose builders pin the same rule in connect-ide.ts.
+          */
+          code={`export ANTHROPIC_BASE_URL="${rootUrl(endpoint)}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`}
+          onCopy={() => void copy(`export ANTHROPIC_BASE_URL="${rootUrl(endpoint)}"\nexport ANTHROPIC_API_KEY=<paste the copied master key>`, "claude")}
         />
         <PresetRow
           label="cURL — Anthropic /v1/messages"
@@ -451,6 +465,110 @@ export function GatewayScreen() {
         budget stays here, on the key it limits: it is a property of one app, not of the gateway.
       </p>
     </div>
+  );
+}
+
+/**
+ * "Connect your IDE" — the last mile between a per-app key and a coding agent that uses it.
+ *
+ * The Per-app keys section above manages key *lifecycle*; this panel is the guided *handoff*:
+ * pick the IDE, mint a key named for it, and get the exact config bytes to paste. What it
+ * deliberately does not do is touch the secret: minting copies it to the clipboard host-side
+ * (invariant 14), and the snippet carries a paste-over placeholder instead — the operator's
+ * two pastes are the snippet and the key, in either order, and the webview never sees the key.
+ *
+ * Snippet bodies come from `lib/connect-ide.ts` (unit-pinned), including the base-URL split the
+ * presets got wrong once: OpenAI-compatible bases carry `/v1`, Claude Code's must not.
+ */
+function ConnectIdeSection({ endpoint, onMinted }: { endpoint: string; onMinted: () => void }) {
+  const [target, setTarget] = useState<ConnectTarget>("zcode");
+  // The smoke test and the ANTHROPIC_MODEL hint want a model the router actually serves; the
+  // configured System AI model is the one id the operator has already verified end to end.
+  const [model, setModel] = useState<string>(() => systemAiModel() ?? "");
+  // ZCode keys its provider entries by UUID. Minted once per mount so the snippet is stable
+  // while the operator reads it, and fresh each visit so two pastes never collide.
+  const [providerId] = useState(() =>
+    typeof crypto.randomUUID === "function" ? crypto.randomUUID() : "00000000-0000-4000-8000-000000008787",
+  );
+  const [copied, setCopied] = useState<string | null>(null);
+  const [minted, setMinted] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const meta = CONNECT_TARGETS.find((t) => t.id === target) ?? CONNECT_TARGETS[0];
+  if (meta === undefined) return null;
+  const snippet = buildConnectSnippet(target, { endpoint, model, providerId });
+
+  async function mint() {
+    setError(null);
+    try {
+      // Same command the Per-app keys section uses — one key lifecycle, two doors to it.
+      await invoke<{ id: string; label: string }>("gateway_app_key_create", { label: meta.mintLabel });
+      onMinted();
+      setMinted(meta.mintLabel);
+    } catch (e) {
+      setError(String(e));
+    }
+  }
+
+  async function copySnippet() {
+    await navigator.clipboard.writeText(snippet).catch(() => undefined);
+    setCopied(target);
+    window.setTimeout(() => setCopied((c) => (c === target ? null : c)), 1800);
+  }
+
+  return (
+    <section className="mt-4 rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
+      <h2 className="mb-1 text-[14px] font-semibold">Connect your IDE</h2>
+      <p className="mb-3 text-[11px]" style={{ color: "var(--text-faint)" }}>
+        Hand a coding agent its own key and the exact config it needs — this router speaks what ZCode, Claude
+        Code and every OpenAI-compatible client already speak. Minting copies the new key's secret to your
+        clipboard (it is never shown here); the snippet leaves a{" "}
+        <span className="mono">{CONNECT_KEY_PLACEHOLDER}</span> slot to paste it over.
+      </p>
+
+      <div className="mb-3 flex flex-wrap gap-2">
+        {CONNECT_TARGETS.map((t) => (
+          <Button key={t.id} variant={t.id === target ? "primary" : "ghost"} onClick={() => setTarget(t.id)}>
+            {t.label}
+          </Button>
+        ))}
+      </div>
+
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <Button onClick={() => void mint()}>Mint a key for {meta.label}</Button>
+        <input
+          className={`${inputCls} w-52`}
+          style={inputStyle}
+          placeholder="Model id — e.g. provider/native"
+          aria-label="Model id for snippets"
+          value={model}
+          onChange={(e) => setModel(e.target.value)}
+        />
+      </div>
+
+      {minted && (
+        <p className="mb-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+          Key <b>{minted}</b> minted — its secret is on your clipboard. Copy the snippet, then paste the key
+          over the placeholder.
+        </p>
+      )}
+      {error && (
+        <p className="mb-2 text-[12px]" style={{ color: "var(--danger)" }}>
+          {error}
+        </p>
+      )}
+
+      <div>
+        <div className="flex items-center justify-between">
+          <span className="text-[12px] font-medium" style={{ color: "var(--text-dim)" }}>{meta.label} config</span>
+          <Button variant="ghost" onClick={() => void copySnippet()}>{copied === target ? "Copied" : "Copy"}</Button>
+        </div>
+        <pre className="mono mt-0.5 overflow-x-auto whitespace-pre-wrap rounded border p-2 text-[11px]" style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text-dim)" }}>
+          {snippet}
+        </pre>
+        <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>{meta.where}</p>
+      </div>
+    </section>
   );
 }
 
