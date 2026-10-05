@@ -39,6 +39,7 @@ pub mod compress;
 pub mod context;
 pub mod crash_report;
 pub mod dialect_shaping;
+pub mod drift;
 pub mod egress;
 pub mod egress_port;
 pub mod engine;

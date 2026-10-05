@@ -31,7 +31,7 @@ attaches its artefacts to a **draft**. The supported path is building from sourc
 | Tool | Version | Notes |
 |---|---|---|
 | Node.js | 22 | CI uses 22 |
-| pnpm | 10.12.4 | pinned via `packageManager`; corepack will pick it up |
+| pnpm | 10.12.4 | pinned via `packageManager`; run `corepack enable` once and it is picked up |
 | Rust | stable | no `rust-toolchain` file, so whatever your default is |
 | Xcode command line tools | — | for `codesign` |
 
@@ -55,6 +55,41 @@ to route through it.
 
 The full walkthrough — provider setup, pointing Cursor or a script at the gateway, where your data lives,
 and every error code — is in [`USER_GUIDE.md`](USER_GUIDE.md).
+
+## Run the router, headless
+
+The desktop app is one of two ways to run the gateway. If you want the **routing service** without the UI —
+the thing other coding agents (ZCode, Claude Code, any OpenAI-compatible tool) talk to — run the daemon:
+
+```bash
+cd apps/desktop/src-tauri
+cargo build --release --bin aiproviderd --no-default-features
+./target/release/aiproviderd install     # copies itself to the data dir + registers a launchd service
+./target/release/aiproviderd status
+curl http://127.0.0.1:8800/health        # → {"status":"ok"}
+```
+
+The daemon serves the same routes as the in-app gateway on `127.0.0.1:8800` (or whatever port the store
+carries) against the same data directory — providers, keys, settings, ledger. It survives reboots and
+needs no UI; the desktop app, when you do open it, is simply its best-connected client.
+
+**Point a tool at it.** Any OpenAI-compatible client takes:
+
+```
+base URL:  http://127.0.0.1:8800/v1
+API key:   the master key (`aiproviderd mint` prints one), or a per-app key for each tool
+```
+
+```bash
+curl http://127.0.0.1:8800/v1/chat/completions \
+  -H "Authorization: Bearer <key>" -H "Content-Type: application/json" \
+  -d '{"model":"<provider>/<model>","messages":[{"role":"user","content":"hello"}]}'
+```
+
+Per-app keys (one per IDE, individually revocable, with monthly spend caps) are minted on the **AI
+Providers** screen. Claude Code speaks the Anthropic dialect — the same gateway also serves
+`/v1/messages` on the same port. Run the daemon *or* the app's in-process gateway against a data
+directory, never both (same port, same SQLite store).
 
 ## Build, sign and release
 

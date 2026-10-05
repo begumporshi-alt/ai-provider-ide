@@ -40,6 +40,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::core::drift;
 use crate::core::gateway::session_context::{self, PruneStats};
 use crate::core::gateway::GatewayCore;
 use crate::core::memory::{self, MemoryPruneStats};
@@ -88,6 +89,8 @@ pub struct RetentionPass {
     /// The memory layer's master switch was off: memory and live context were untouched, the
     /// same rule the webview scheduler applies.
     pub memory_layer_skipped: bool,
+    /// Drift triggers raised this pass (A1 follow-up: the Rust half of the drift monitor).
+    pub drift_triggers: usize,
     /// The pass stopped with work left on the table because the wall-clock budget ran out; the
     /// remainder waits for the next tick. On small tables this is always false — the budget is
     /// insurance for a backlog, not a feature a healthy store ever sees.
@@ -105,6 +108,13 @@ pub fn pass(
     let Some(store) = store else {
         return Ok(out);
     };
+
+    // Drift detection is gateway activity, not memory-layer state: evaluated **ungated**, the
+    // same rule `persist::retention_job` applies to the ledger and agent runs it tends. This is
+    // the Rust half of the drift monitor (A1 follow-up): the TS monitor went blind when
+    // generation moved to the gateway, and this pass is what keeps the repair flow fed.
+    out.drift_triggers = drift::evaluate(store, now_ms())?.len();
+
     if !memory_enabled {
         out.memory_layer_skipped = true;
         return Ok(out);
@@ -127,6 +137,13 @@ pub fn pass(
         }
     }
     Ok(out)
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 fn fold_memory(acc: &mut Option<MemoryPruneStats>, step: MemoryPruneStats) {

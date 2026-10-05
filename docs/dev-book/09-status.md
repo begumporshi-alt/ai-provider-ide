@@ -95,10 +95,11 @@ deliberate interim costs from that first pass were closed on 2026-10-05 (Phase 2
 ingress now emits `served_by` — a `BridgeMsg::Served` frame before `Done`, surfaced on the
 terminal chunk and the non-stream body with omit-means-never-served semantics, pinned by three
 Rust specs — and the last two TS-engine callers, memory distillation and image generation,
-moved to the gateway. What remains of A1 is Phase 3 only: retiring the TS serving path behind
-a differential-test oracle. The Assistant requires a running gateway — the router is the
-product, and its flagship client dogfoods it. Desktop TS suite re-measured at **454** (+6);
-Rust at **1,523** (+2 served_by pins).
+moved to the gateway. The drift monitor the TS router used to feed is answered by the Rust half now too:
+`core/drift.rs` evaluates the ledger on every retention pass (the schema's drift-class rule
+plus succeeded-elsewhere), opening drift events and flagging providers `repairing` — the
+repair flow's UI is unchanged. Rust at **1,527** (+4 drift specs). The Assistant requires a
+running gateway — the router is the product, and its flagship client dogfoods it.
 
 ## Working and verified
 
