@@ -21,7 +21,7 @@ import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
-import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
+import { gatewayGenerate, gatewayGenerateImage, type ServedBy } from "../lib/gateway-turn";
 import { useUi } from "../ui-state";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
@@ -54,8 +54,8 @@ import type { ChatMessage, ReasoningEffort, ToolCall, UsageTokens } from "@aipro
 import {
   estimateTokens, DEFAULT_CONTEXT_WINDOW, userContent, textOfContent, compressWithSummary, type CatalogModel,
 } from "@aiprovider/router-core";
-import { listLedger } from "../store";
 import { formatCost } from "../lib/ledger/format";
+import { chargeSessionUsage, emptySessionUsage } from "../lib/ledger/session-usage";
 import { shortcutFor } from "../lib/keys/shortcuts";
 import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
@@ -1707,34 +1707,31 @@ function Chat({
       .catch(() => undefined);
   }, [tick]);
 
-  // P7: aggregate session cost/tokens from the in-memory ledger.
+  // P7: aggregate session cost/tokens from the usage the turns themselves report.
   //
-  // Called at the end of every turn rather than only from an effect on `tick`: a ledger append
-  // does not bump the store tick (the sink is a detached `fetchAdmin`), so a tick-only readout
-  // showed the totals from *before* the turn the user just watched finish. The effect below keeps
-  // it live for traffic this screen did not initiate.
-  const refreshUsageTotals = useCallback(() => {
-    let micros = 0;
-    let rows = 0;
-    let unpriced = 0;
-    let inTokens = 0;
-    let outTokens = 0;
-    for (const e of listLedger()) {
-      if (e.source === "ui" && e.status === "ok") {
-        rows += 1;
-        // Same rule Activity's rows use: a ledger row's cost is only meaningful when the catalog
-        // knows a price for that model. Without this check an unpriced model contributes 0 and the
-        // total reads as though the request were free.
-        if (catalog.pricingFor(e.providerId ?? "", e.model)) micros += e.costEstimateMicros ?? 0;
-        else unpriced += 1;
-        inTokens += e.tokensIn ?? 0;
-        outTokens += e.tokensOut ?? 0;
-      }
-    }
-    setSessionCost({ micros, rows, unpriced });
-    setSessionTokensIn(inTokens);
-    setSessionTokensOut(outTokens);
-  }, []);
+  // Pre-A1 this re-read the in-memory ledger after every turn. Post-A1 the Assistant's rows are
+  // written host-side as `source: "gateway"` — the same source every external client's rows carry,
+  // with no app key on those rows to tell them apart — so a ledger read can no longer say what
+  // *this* session spent (it would either show nothing or silently include ZCode's traffic). Each
+  // `runTurn` branch therefore charges its own usage as the turn completes: the plain path from the
+  // terminal usage chunk, the agent path once per completed model call. A turn whose stream died
+  // before the usage chunk reports nothing — honest, since those tokens were mostly never billed.
+  const sessionUsageRef = useRef(emptySessionUsage());
+  const addSessionUsage = useCallback(
+    (tokensIn: number, tokensOut: number, provider: string | undefined, model: string | undefined) => {
+      // Same rule Activity's rows use: a turn's cost is only meaningful when the catalog knows a
+      // price for the model that actually served it (the served ids are exactly what pricingFor
+      // wants — provider id + native id, per the bridge's Served frame). Without this check an
+      // unpriced model contributes 0 and the total reads as though the request were free.
+      const pricing = provider && model ? catalog.pricingFor(provider, model) : undefined;
+      sessionUsageRef.current = chargeSessionUsage(sessionUsageRef.current, { tokensIn, tokensOut, pricing });
+      const u = sessionUsageRef.current;
+      setSessionCost({ micros: u.micros, rows: u.rows, unpriced: u.unpriced });
+      setSessionTokensIn(u.tokensIn);
+      setSessionTokensOut(u.tokensOut);
+    },
+    [],
+  );
 
   /**
    * The cost cell: an exact total, a lower bound, or "unknown".
@@ -1750,10 +1747,6 @@ function Chat({
         ? formatCost(null)
         : `${sessionCost.unpriced > 0 ? "≥ " : ""}${formatCost(sessionCost.micros)}`;
 
-  useEffect(() => {
-    refreshUsageTotals();
-  }, [tick, refreshUsageTotals]);
-
   // P8: keep the palette honest about "New chat" — it is refused while a turn runs (same reason
   // `newChat` guards on `busy`: re-entering the loop mid-stream interleaves two runs into one
   // transcript), so the palette needs to know.
@@ -1763,6 +1756,13 @@ function Chat({
   }, [busy, setAssistantBusy]);
   // Cleared on unmount and only on unmount, so leaving the Assistant does not leave a stale "a turn
   // is running" behind for the palette to report on another screen.
+  //
+  // Deliberately NOT an abort. Unmounting is how the user reaches the Agents dashboard, whose stop
+  // button is the supported remote control for a run still in flight — an agent parked on its
+  // approval gate is stoppable from there and nowhere else (pinned by web-test/agent-approval
+  // "stopping a run parked on the approval gate unblocks it", which an abort here breaks: the run
+  // dies before the dashboard can offer its stop). A run abandoned this way still finishes and is
+  // recorded host-side; it is not an orphan, and killing it on navigation would be the bug.
   useEffect(() => () => setAssistantBusy(false), [setAssistantBusy]);
 
   // P8: the palette's one-shot intents. The request is *claimed* here — consumed only once this
@@ -2195,13 +2195,15 @@ function Chat({
           // The thinking level rides the same path: the interpreter renders it into whichever
           // field the serving dialect declares (`thinking`, `reasoning_effort`, `thinkingConfig`),
           // and an unset level sends nothing at all.
-          generate: (req, opts) =>
+          generate: async (req, opts) => {
             // A1 Phase 1: the loop's generate port is the gateway engine — the same serving
             // path ZCode and Claude Code drive. `opts` carries the loop's abort signal; the
             // TS engine's `summarize` hook is not passed because context compression is no
             // longer this call's business (server-side, or the client-side
             // `compressWithSummary` above).
-            gatewayGenerate(
+            let callIn = 0;
+            let callOut = 0;
+            const exec = await gatewayGenerate(
               {
                 // The run config's level is spread BEFORE the request on purpose: the loop's own
                 // reasoning override — the NO_OUTPUT fallback's forced "off" — must win over this
@@ -2219,10 +2221,28 @@ function Chat({
                     tokensIn: r.tokensIn + (u.prompt_tokens ?? 0),
                     tokensOut: r.tokensOut + (u.completion_tokens ?? 0),
                   }));
+                  callIn += u.prompt_tokens ?? 0;
+                  callOut += u.completion_tokens ?? 0;
                 },
               },
               { signal: opts?.signal },
-            ),
+            );
+            return {
+              ...exec,
+              // Charge the session once per completed model call, not per run: each iteration is
+              // its own billed request. The generator's `finally` runs on the loop's `break` too,
+              // so a stopped run still charges the usage it already received. Served ids only
+              // exist once the stream ends, so pricing happens here rather than in `onUsage`.
+              chunks: (async function* () {
+                try {
+                  for await (const chunk of exec.chunks) yield chunk;
+                } finally {
+                  const s = exec.served();
+                  addSessionUsage(callIn, callOut, s?.provider, s?.model);
+                }
+              })(),
+            };
+          },
           host,
           // Clamped again at the call site: this is the number that actually bounds the spend,
           // and it is reached from a setting that a future build may have written differently.
@@ -2307,8 +2327,6 @@ function Chat({
         // the writes someone wants to take back — hiding them because the turn did not finish would
         // make "revert this run" unavailable in the only case it matters most.
         setRunChanges(checkpoint.empty ? null : checkpoint.snapshot());
-        // Every iteration wrote a ledger row; the totals are stale until they are re-read.
-        refreshUsageTotals();
       }
       return;
     }
@@ -2329,6 +2347,12 @@ function Chat({
     let reasoned = "";
     let lastReasoningPaint = 0;
     const REASONING_PAINT_MS = 80;
+    // Charged to the session totals in the `finally`, once per turn. No initializer: `onUsage`
+    // (a closure TS cannot see run) is what assigns it, and an `= null` start would narrow the
+    // `finally` read to `never`. Locals because `served` is only known after the stream ends and
+    // the `finally` must see both.
+    let turnUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
+    let turnServed: ServedBy | undefined;
     try {
       // The same replay the agent path uses. Sharing it is the fix: this path used to map only
       // {role, content}, so a session that had used agent mode sent its tool results with no
@@ -2371,15 +2395,17 @@ function Chat({
             }
           },
           // P7: per-request params, and the provider's own token report for the meter's tooltip
-          // (estimate vs what the request actually cost). The running totals are NOT accumulated
-          // here — they are read back from the ledger, which is the same record the Usage screen
-          // shows; incrementing both would double-count every turn.
+          // (estimate vs what the request actually cost). The report is also what charges the
+          // session totals — captured here, accumulated once per turn in the `finally` below.
           ...(typeof temperature === "number" ? { temperature } : {}),
           ...(typeof maxTokens === "number" ? { maxTokens } : {}),
           // Same three-way: a chosen level travels, `""` sends nothing and leaves the provider's
           // own default in place.
           ...(thinking ? { reasoning: thinking } : {}),
-          onUsage: setLastUsage,
+          onUsage: (u) => {
+            turnUsage = u;
+            setLastUsage(u);
+          },
         },
         { signal: ac.signal },
       );
@@ -2399,6 +2425,7 @@ function Chat({
       // fallback chain is gateway-internal and does not ride yet — the one trace field the old
       // engine showed that this path does not.
       const served = exec.served();
+      turnServed = served;
       const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
         role: "assistant",
         model: served?.model ?? chosen,
@@ -2441,10 +2468,12 @@ function Chat({
       setBusy(false);
       setStopping(false);
       abortRef.current = null;
-      // The ledger row for this turn is already written (the sink append is awaited inside the
-      // router's wrapped stream, before the `for await` above returns), so re-reading now shows
-      // this turn's tokens and cost rather than the previous turn's.
-      refreshUsageTotals();
+      // Charge the session totals from what the turn itself reported. A stream the user stopped
+      // usually never reaches the usage chunk, so it adds nothing — honest, since those tokens
+      // were mostly never generated, let alone billed.
+      if (turnUsage) {
+        addSessionUsage(turnUsage.prompt_tokens ?? 0, turnUsage.completion_tokens ?? 0, turnServed?.provider, turnServed?.model);
+      }
     }
   }
 
@@ -2531,7 +2560,9 @@ function Chat({
   function retryTurn(i: number) {
     const point = retryPoint(msgs, i);
     if (!point) return;
-    void runTurn(point.text, point.prefix);
+    // The prompt's images ride along: dropping them made the retry a question without its
+    // attachments, and the model answered a turn it could no longer see.
+    void runTurn(point.text, point.prefix, point.attachments ?? []);
   }
 
   /** Commit the inline editor: drop this user turn and everything after it, then resend edited. */
@@ -2539,8 +2570,11 @@ function Chat({
     const text = editDraft.trim();
     if (!text) return;
     const prefix = editPoint(msgs, i);
+    // The editor changes text only, so the dropped turn's attachments are re-sent with the edited
+    // prompt — the same carry `retryTurn` does, for the same reason.
+    const attachments = msgs[i]?.attachments ?? [];
     cancelEdit();
-    void runTurn(text, prefix);
+    void runTurn(text, prefix, attachments);
   }
 
   /**
@@ -3349,7 +3383,7 @@ function Chat({
         <span
           className="mono"
           title={
-            "Totals for every request this app has routed (the ledger's in-memory window), not only this conversation" +
+            "Totals for the turns this screen has sent since it opened, as reported on each turn's wire usage — Activity shows every request the gateway routed, including other clients" +
             (sessionCost.unpriced > 0
               ? ` · ${sessionCost.unpriced} of ${sessionCost.rows} used a model with no published price, so the cost is a lower bound`
               : "")

@@ -11,6 +11,10 @@
 export interface Turn {
   role: "user" | "assistant" | "tool";
   content: string;
+  /** Optional, so the History types still fit. `retryPoint` carries the prompt's attachments back
+   *  to the caller: a retried vision turn must go out with its images, or the model answers a
+   *  question it can no longer see (measured 2026-10-05 — regenerate dropped the images). */
+  attachments?: { mediaType: string; dataBase64: string }[];
 }
 
 /**
@@ -20,15 +24,16 @@ export interface Turn {
  *
  * The prefix is `slice(0, userIndex)`, i.e. it EXCLUDES the user turn being retried: the caller
  * re-runs its text, and `runTurn` appends it fresh. Including it here would duplicate the prompt.
+ * The retried turn's attachments ride alongside the text for the same reason.
  */
 export function retryPoint<T extends Turn>(
   msgs: readonly T[],
   assistantIndex: number,
-): { text: string; prefix: T[] } | null {
+): { text: string; prefix: T[]; attachments: T["attachments"] } | null {
   const base = msgs.slice(0, assistantIndex);
   for (let k = base.length - 1; k >= 0; k--) {
     const m = base[k]!;
-    if (m.role === "user") return { text: m.content, prefix: base.slice(0, k) };
+    if (m.role === "user") return { text: m.content, prefix: base.slice(0, k), attachments: m.attachments };
   }
   return null;
 }

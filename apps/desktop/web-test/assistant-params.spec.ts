@@ -186,7 +186,7 @@ test("a blank editor field falls back to the built-in prompt", async ({ page }) 
   expect(String(msgs[0]!.content)).toContain("no tools, functions, plugins");
 });
 
-test("the session readout accumulates the ledger's tokens and cost", async ({ page }) => {
+test("the session readout accumulates the turn's reported usage and cost", async ({ page }) => {
   await openAssistant(page);
 
   await page.getByPlaceholder(/Message your assistant/).fill("hello there");
@@ -194,10 +194,11 @@ test("the session readout accumulates the ledger's tokens and cost", async ({ pa
   await lastChatBody(page);
 
   // The mock reports `usage: { prompt_tokens: 5, completion_tokens: 3 }` on the stream's final
-  // chunk, and the router writes that into the ledger; the readout is a re-read of the same rows,
-  // so it shows those numbers. Waiting on the readout rather than on the answer is the point: it
-  // is the piece that can lag.
-  const readout = page.getByTitle(/Totals for every request this app has routed/);
+  // chunk, and the readout charges the turn from that same wire report (post-A1 the Assistant's
+  // ledger rows are host-side `source: "gateway"`, indistinguishable from other clients' rows, so
+  // a ledger re-read can no longer say what this session spent). Waiting on the readout rather
+  // than on the answer is the point: it is the piece that can lag.
+  const readout = page.getByTitle(/Totals for the turns this screen has sent/);
   await expect(readout).toContainText("5 in", { timeout: 30_000 });
   await expect(readout).toContainText("3 out");
 
@@ -220,11 +221,11 @@ test("an unpriced model reports its cost as unknown, not as free", async ({ page
   await page.getByRole("button", { name: "Send" }).click();
   await lastChatBody(page);
 
-  const readout = page.getByTitle(/Totals for every request this app has routed/);
+  const readout = page.getByTitle(/Totals for the turns this screen has sent/);
   // The tokens are known even when the price is not, so they are still shown.
   await expect(readout).toContainText("5 in", { timeout: 30_000 });
-  // `—`, not `$0.00`: the ledger row's cost is 0 because no price was published, and "$0.00" would
-  // state that the request was free. The tooltip says which requests the total could not price.
+  // `—`, not `$0.00`: the turn's model has no published price, and "$0.00" would state that the
+  // request was free. The tooltip says which requests the total could not price.
   await expect(readout).toContainText("—");
   await expect(readout).not.toContainText("$0.00");
 });

@@ -2973,6 +2973,11 @@ async function tryServeCompletion(
         controller.enqueue(encoder.encode(`data: ${JSON.stringify(obj)}\n\n`));
       };
       try {
+        // The real gateway forwards the provider's usage on the wire (a `BridgeMsg::Usage` frame
+        // beside the terminal chunk); the engine reports it through this callback. Forwarding it
+        // keeps the harness faithful: the Assistant's session readout charges from the wire's
+        // usage, and a lossy {0,0} here would read every turn as free (measured 2026-10-05).
+        let usage = { prompt_tokens: 0, completion_tokens: 0 };
         const exec = await engineRouter!.generateText({
           model: parsed.model,
           messages: parsed.messages,
@@ -3007,6 +3012,12 @@ async function tryServeCompletion(
           onReasoning: (text: string) => {
             if (text) send({ choices: [{ delta: { reasoning_content: text } }] });
           },
+          onUsage: (u: { prompt_tokens?: number; completion_tokens?: number }) => {
+            usage = {
+              prompt_tokens: u.prompt_tokens ?? usage.prompt_tokens,
+              completion_tokens: u.completion_tokens ?? usage.completion_tokens,
+            };
+          },
         });
         for await (const chunk of exec.chunks) {
           send({ choices: [{ delta: { content: chunk } }] });
@@ -3018,7 +3029,7 @@ async function tryServeCompletion(
               index: 0,
               delta: {},
               finish_reason: "stop",
-              usage: { prompt_tokens: 0, completion_tokens: 0 },
+              usage,
               // Serving attribution, for the trace panel: which provider/key actually answered.
               served_by: served
                 ? {
