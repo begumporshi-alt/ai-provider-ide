@@ -459,7 +459,13 @@ pub fn attach_tool_parts(
         let is_tool = m.get("role").and_then(Value::as_str) == Some("tool");
         if let (true, Some(tool_result)) = (is_tool, tool_result) {
             let id = m.get("tool_call_id").and_then(Value::as_str).unwrap_or("").to_string();
-            let text = m.get("content").and_then(Value::as_str).unwrap_or("").to_string();
+            // `text_of_content`, not a string-only read: the gateway normalizer converts every
+            // message's string content to a `[{type:"text",text}]` array (Phase F,
+            // `ensure_array_content`) before the interpreter sees it, so a result the client sent
+            // as a plain string arrives here as an array — and a string-only read turned every
+            // tool result into an empty block (measured 2026-10-05: ZCode client,
+            // Anthropic-dialect provider, every tool result empty).
+            let text = m.get("content").map(text_of_content).unwrap_or_default();
             let mut v = Map::new();
             v.insert("id".to_string(), Value::String(id.clone()));
             v.insert(

@@ -26,6 +26,7 @@
  * behaviour it had before.
  */
 import type { ToolCall } from "./ports.js";
+import { textOfContent } from "./content-parts.js";
 
 /** `JSON.stringify` that cannot throw. Dialect blocks come from a provider's response, so a
  *  cyclic or otherwise unserialisable value is possible and must not take the request down. */
@@ -308,7 +309,12 @@ export function attachToolParts(
     if (m && typeof m === "object" && (m as Record<string, unknown>).role === "tool" && templates.toolResult) {
       const msg = m as Record<string, unknown>;
       const id = typeof msg.tool_call_id === "string" ? msg.tool_call_id : "";
-      const text = typeof msg.content === "string" ? msg.content : "";
+      // `textOfContent`, not a string-only read: the gateway normalizer converts every message's
+      // string content to a `[{type:"text",text}]` array (Phase F, `ensureArrayContent`) before the
+      // interpreter sees it, so a result the client sent as a plain string arrives here as an
+      // array — and a string-only read turned every tool result into an empty block (measured
+      // 2026-10-05: ZCode client, Anthropic-dialect provider, every tool result empty).
+      const text = textOfContent(msg.content);
       // A `tool_result` is only a legal block when the call it answers is declared in THIS request,
       // because the dialect validates that relation and rejects the whole turn when it fails —
       // `unexpected \`messages.N.content.0: tool_use_id\` found in \`tool_result\` blocks`. The block

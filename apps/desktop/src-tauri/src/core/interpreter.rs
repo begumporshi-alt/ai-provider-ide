@@ -2524,6 +2524,47 @@ mod tests {
         );
     }
 
+    /// The 2026-10-05 empty-tool-result bug, at the seam the other tests skip: the gateway
+    /// normalizer's Phase F (`ensure_array_content`) converts every message's string content into a
+    /// text-parts array BEFORE the interpreter renders it, and `attach_tool_parts` used to read a
+    /// tool result's content with a string-only check — so every client-sent tool result reached an
+    /// Anthropic-dialect provider as `content: ""`. The test runs the real pipeline in the real
+    /// order: normalize first, then render through the Anthropic builtin.
+    #[tokio::test]
+    async fn the_anthropic_builtin_keeps_tool_result_text_after_gateway_normalization() {
+        let body = crate::core::gateway_normalizer::normalize_gateway_request(
+            &json!({
+                "model": "deepseek-v4-flash",
+                "messages": [
+                    { "role": "user", "content": "list the files" },
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            { "id": "call_abc", "type": "function",
+                              "function": { "name": "ls", "arguments": "{}" } }
+                        ]
+                    },
+                    { "role": "tool", "tool_call_id": "call_abc",
+                      "content": "file-a.txt\nfile-b.txt" }
+                ]
+            }),
+            &crate::core::gateway_normalizer::NormalizeOptions::default(),
+        )
+        .body;
+        let builtin =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let rendered = rendered_body_full(&builtin, body["messages"].as_array().expect("messages").clone(), None, None)
+            .await;
+        assert_eq!(
+            rendered["messages"][2]["content"],
+            json!([
+                { "type": "tool_result", "tool_use_id": "call_abc",
+                  "content": "file-a.txt\nfile-b.txt" }
+            ])
+        );
+    }
+
     /// Gemini: declarations are wrapped in `functionDeclarations`, tool_choice becomes
     /// `toolConfig.functionCallingConfig`, `assistant`→`model`, and the content field is renamed to
     /// `parts` with a plain string wrapped as one text part (with NO `type`, which its Part proto

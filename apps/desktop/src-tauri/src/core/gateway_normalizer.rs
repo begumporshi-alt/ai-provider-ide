@@ -820,6 +820,14 @@ fn promote_input_to_messages(body: &mut Map<String, Value>) {
 
 fn ensure_array_content(messages: &mut [Value]) {
     for msg in messages.iter_mut() {
+        // `role:"tool"` keeps the content the client sent. OpenAI's schema types a tool message's
+        // content as string-or-null, and the OpenAI dialect passes messages through verbatim — an
+        // array here is a wire deviation several OpenAI-compatible upstreams reject. The other
+        // dialects read tool results with `text_of_content` (both shapes), so nothing needs the
+        // array (measured 2026-10-05).
+        if msg.get("role").and_then(Value::as_str) == Some("tool") {
+            continue;
+        }
         let text = match msg.get("content").and_then(Value::as_str) {
             Some(s) => s.to_string(),
             None => continue,
@@ -1150,6 +1158,37 @@ mod tests {
             }
             _ => assert_eq!(actual, expected),
         }
+    }
+
+    // ── Phase F ───────────────────────────────────────────────────────────
+
+    /// Phase F converts string content to a text-parts array — except on `role:"tool"`. OpenAI's
+    /// schema types a tool message's content as string-or-null and the OpenAI dialect passes
+    /// messages through verbatim, so the array would ride upstream and be rejected by
+    /// string-only upstreams. The other dialects read tool results with `text_of_content`,
+    /// which accepts both shapes.
+    #[test]
+    fn phase_f_arrays_everything_but_tool_results() {
+        let out = normalize(
+            serde_json::json!({
+                "model": "m",
+                "messages": [
+                    { "role": "user", "content": "run ls" },
+                    { "role": "assistant", "content": "", "tool_calls": [
+                        { "id": "call_1", "type": "function",
+                          "function": { "name": "ls", "arguments": "{}" } }
+                    ]},
+                    { "role": "tool", "tool_call_id": "call_1", "content": "alpha.txt\nbeta.txt" }
+                ]
+            }),
+            NormalizeOptions::default(),
+        );
+        let msgs = messages_of(&out);
+        assert_eq!(
+            msgs[0]["content"],
+            serde_json::json!([{ "type": "text", "text": "run ls" }])
+        );
+        assert_eq!(msgs[2]["content"], serde_json::json!("alpha.txt\nbeta.txt"));
     }
 
     // ── detect_client ─────────────────────────────────────────────────────

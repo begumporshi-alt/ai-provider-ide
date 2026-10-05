@@ -429,6 +429,10 @@ function promoteInputToMessages(body: Record<string, unknown>): void {
 function ensureArrayContent(messages: NormalizedMessage[]): void {
   for (const msg of messages) {
     if (!msg || typeof msg !== "object") continue;
+    // `role:"tool"` keeps the content the client sent: OpenAI's schema types a tool message's
+    // content as string-or-null, and the OpenAI dialect passes messages through verbatim (parity
+    // with the Rust normalizer's Phase F skip, measured 2026-10-05).
+    if (msg.role === "tool") continue;
     if (typeof msg.content === "string") {
       msg.content = [{ type: "text", text: msg.content }];
     }
