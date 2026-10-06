@@ -1243,13 +1243,13 @@ measured.
 **What the ledger said, and why every column of it is forced.** Row 1671: `error_class = CANCELLED`,
 `latency_ms = 30005`, `fallback_chain_json = []`, `http_status = NULL`, `tokens_in/out = 0`, and no
 egress line of any kind for the request. Only two engine paths can produce `CANCELLED` with an empty
-chain, and one is excluded by the timing: the first-iteration cancel check (`engine.rs:1013`) requires
+chain, and one is excluded by the timing: the first-iteration cancel check (`engine/text.rs:215` — `engine.rs:1013` before the D98 decomposition) requires
 `execute_text` to be entered ≥ 30 s after `generate_text` began, but the only awaits in between are
 `sync_concurrency` (synchronous) and `plan_waiting_out_cooldown`, whose wait budget is 5 s and which
 returns *immediately* when the plan is non-empty — and had the plan been empty the row would read
 `NO_ROUTE`. `t0` was measured at `04:10:57.922Z` against a dispatch log line at `04:10:57.919040Z`, so
 the task started promptly. What remains is `break 'plan Ended::Served(candidate)`
-(`engine.rs:1158`) reached with zero chunks and zero attempts, which `write_text_ledger`'s
+(`router.rs`'s plan dispatch — `engine.rs:1158` before the D98 decomposition) reached with zero chunks and zero attempts, which `write_text_ledger`'s
 `Ok(success)` arm (`router.rs:986`) files as `if cancelled { "CANCELLED" }`.
 
 **The cause.** `egress.rs:577` bounded **each** wait for a chunk with `UPSTREAM_IDLE_TIMEOUT` (120 s),
