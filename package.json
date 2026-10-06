@@ -21,6 +21,11 @@
     "build": "pnpm -r build"
   },
   "pnpm": {
-    "onlyBuiltDependencies": ["esbuild"]
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ],
+    "overrides": {
+      "source-map-js": "^1.2.2"
+    }
   }
 }
