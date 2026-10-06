@@ -21,7 +21,7 @@ import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
-import { gatewayGenerate, gatewayGenerateImage, type ServedBy } from "../lib/gateway-turn";
+import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
 import { useUi } from "../ui-state";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
@@ -63,9 +63,11 @@ import {
 } from "../lib/memory/engine";
 import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
 import {
-  agentSystem, buildAgentSystem, buildPlainRequestMessages, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
+  agentSystem, buildAgentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
 } from "../lib/chat/turn/prompt";
 import { clip, tryParseArgs, recordAgentTurn } from "../lib/chat/turn/graph-record";
+import { runPlainTurn } from "../lib/chat/turn/plain-turn";
+import type { Trace } from "../lib/chat/turn/ports";
 
 /**
  * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
@@ -138,16 +140,6 @@ function formatTokens(n: number): string {
  * Guard against the mercury-2.5 failure is answered in `lib/chat/turn/prompt.ts` — the constant
  * moved there with the system turns it belongs to.
  */
-
-interface Trace {
-  ms: number;
-  provider?: string;
-  key?: string;
-  model?: string;
-  fallbacks: { provider: string; key: string; cls: string }[];
-  error?: string;
-  finishReason?: string;
-}
 
 /**
  * One switch row inside the run-configuration panel: setting name on the left, pill switch on
@@ -2122,139 +2114,44 @@ function Chat({
     }
 
     // ---- Plain chat (no tools): stream and render as before. ----
-    const rec = ctxRef.current!;
-    const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen, text: trimmed });
-    if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
-    // P7: recall before answering. Awaited, because the block has to be in the request.
-    const recalled = useMemory ? await recallContext(trimmed) : [];
-    if (recalled.length > 0) recordRecall(userNode, recalled);
-    let streamed = "";
-    // The model's reasoning, and when it was last painted. Time-based rather than count-based: a
-    // fixed "every Nth delta" is wrong at both ends of the range — the measured failure carried
-    // **8197** deltas, where one React render each would stall the window, while a short 20-delta
-    // thought would render its first delta and then nothing until the stream ended, showing an
-    // open but effectively empty panel for the whole turn. A clock interval is right for both.
-    let reasoned = "";
-    let lastReasoningPaint = 0;
-    const REASONING_PAINT_MS = 80;
-    // Charged to the session totals in the `finally`, once per turn. No initializer: `onUsage`
-    // (a closure TS cannot see run) is what assigns it, and an `= null` start would narrow the
-    // `finally` read to `never`. Locals because `served` is only known after the stream ends and
-    // the `finally` must see both.
-    let turnUsage: { prompt_tokens: number; completion_tokens: number } | undefined;
-    let turnServed: ServedBy | undefined;
-    try {
-      // The same replay the agent path uses. Sharing it is the fix: this path used to map only
-      // {role, content}, so a session that had used agent mode sent its tool results with no
-      // tool_call_id and the provider answered 400.
-      const history = replayHistory(baseMsgs);
-      // Recalled memory goes in its own system message, never spliced into the user's text:
-      // the model must be able to tell the difference between what was just said and what was
-      // remembered from an earlier conversation.
-      const recallMsg = memoryBlock(recalled);
-      const systemPromptText = noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt;
-      // A1 Phase 1: this turn is served by the gateway engine — the same ingress, admission
-      // control, ledger, and failover every external client gets. `AIP-Memory: off` inside
-      // `gatewayGenerate` keeps the webview's own recall (`recalled`) the only memory block.
-      const exec = await gatewayGenerate(
-        {
-          model: chosen,
-          messages: buildPlainRequestMessages(systemPromptText, recallMsg, perTurn, history, {
-            content: trimmed,
-            attachments,
-          }),
-          onFinish: setFinishReason,
-          // Rendered live, throttled. A reasoning-heavy turn is otherwise indistinguishable from a
-          // hung request: the panel filling in is the only signal that the model is working.
-          onReasoning: (t) => {
-            reasoned += t;
-            const now = Date.now();
-            if (now - lastReasoningPaint >= REASONING_PAINT_MS) {
-              lastReasoningPaint = now;
-              setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
-            }
-          },
-          // P7: per-request params, and the provider's own token report for the meter's tooltip
-          // (estimate vs what the request actually cost). The report is also what charges the
-          // session totals — captured here, accumulated once per turn in the `finally` below.
-          ...(typeof temperature === "number" ? { temperature } : {}),
-          ...(typeof maxTokens === "number" ? { maxTokens } : {}),
-          // Same three-way: a chosen level travels, `""` sends nothing and leaves the provider's
-          // own default in place.
-          ...(thinking ? { reasoning: thinking } : {}),
-          onUsage: (u) => {
-            turnUsage = u;
-            setLastUsage(u);
-          },
-        },
-        { signal: ac.signal },
-      );
-      for await (const chunk of exec.chunks) {
-        streamed += chunk;
-        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed } : x)));
-        // Scroll is handled by the sticky-follow effect on `msgs` — following per token here would
-        // also fight the user when they have scrolled up to read.
-      }
-      // The tail the throttle above skipped. This is the flush that matters most: the last deltas
-      // before a model runs out of output budget are the ones that say what it was doing when it
-      // stopped, and dropping them would truncate the reasoning exactly where it got interesting.
-      if (reasoned) {
-        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, reasoning: reasoned } : x)));
-      }
-      // A1 Phase 1: attribution rides the wire's optional `served_by` terminal field. The
-      // fallback chain is gateway-internal and does not ride yet — the one trace field the old
-      // engine showed that this path does not.
-      const served = exec.served();
-      turnServed = served;
-      const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
-        role: "assistant",
-        model: served?.model ?? chosen,
-        provider: served?.provider,
-        text: streamed,
-      });
-      rec.edge(userNode, assistantNode, "follows");
-      lastNodeRef.current = assistantNode;
-      setTrace({
-        ms: Date.now() - t0,
-        provider: served?.provider ? registry.getProvider(served.provider)?.name : undefined,
-        key: served?.key,
-        model: served?.model ?? chosen,
-        fallbacks: [],
-        // **A stream the user stopped is not a success**, and this path reaches here without
-        // throwing: the engine's loop returns on an aborted signal rather than raising, so the
-        // `catch` below never sees it and the trace printed `✓ 680ms` for a cancelled request. That
-        // reads as "the model finished early" — the user's own action attributed to the provider.
-        // The partial text is still kept (a partial turn is a turn), but the line says who ended it.
-        ...(ac.signal.aborted ? { error: "stopped by you" } : {}),
-      });
-    } catch (e) {
-      if (ac.signal.aborted) {
-        setTrace({ ms: Date.now() - t0, fallbacks: [], error: "stopped by you" });
-      } else {
-        setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
-        setMsgs((m) => m.map((x) => (x.id === assistantMsg.id ? { ...x, content: streamed || `⚠ ${(e as Error).message}` } : x)));
-      }
-    } finally {
-      // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
-      // of what happened, not of what succeeded.
-      void ctxRef.current!.flush();
-      // P7: remember whatever was actually said, including a failed or stopped turn — an
-      // exchange the user abandoned is still part of the record. Distillation is not awaited.
-      if (useMemory) {
-        void rememberTurn(ctxRef.current!.sessionId, trimmed, streamed).then(() =>
-          distilTurn(ctxRef.current!.sessionId, chosen),
-        ).catch(() => { /* memory distillation is best-effort */ });
-      }
-      setBusy(false);
-      setStopping(false);
-      abortRef.current = null;
-      // Charge the session totals from what the turn itself reported. A stream the user stopped
-      // usually never reaches the usage chunk, so it adds nothing — honest, since those tokens
-      // were mostly never generated, let alone billed.
-      if (turnUsage) {
-        addSessionUsage(turnUsage.prompt_tokens ?? 0, turnUsage.completion_tokens ?? 0, turnServed?.provider, turnServed?.model);
-      }
-    }
+    // The turn engine (lib/chat/turn/plain-turn) runs the whole branch against injected ports;
+    // this is the sink of set* calls the inline code used to make, one-for-one.
+    await runPlainTurn(
+      {
+        text: trimmed,
+        baseMsgs,
+        attachments,
+        model: chosen,
+        perTurn,
+        useMemory,
+        systemPromptText: noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt,
+        // The run-config inputs are `number | ""` (blank = provider default); the engine's
+        // request type wants `undefined` for absent, so the guard moves to the call site.
+        temperature: typeof temperature === "number" ? temperature : undefined,
+        maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
+        thinking,
+        signal: ac.signal,
+        startedAt: t0,
+        assistantMsgId: assistantMsg.id,
+      },
+      {
+        generate: gatewayGenerate,
+        recorder: ctxRef.current!,
+        lastNode: lastNodeRef,
+        memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+        providerName: (id) => registry.getProvider(id)?.name,
+        patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+        onTrace: setTrace,
+        onFinishReason: setFinishReason,
+        onLastUsage: setLastUsage,
+        onBusy: setBusy,
+        onStopping: setStopping,
+        clearAbort: () => { abortRef.current = null; },
+        chargeUsage: addSessionUsage,
+        now: Date.now,
+      },
+    );
+    return;
   }
 
   /**
