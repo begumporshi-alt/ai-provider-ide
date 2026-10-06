@@ -32,7 +32,7 @@ import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
 import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import {
-  APPROVAL_MODES, INITIAL_APPROVAL, decide, withAllowAll, withTrustedTool, revertPlan,
+  APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
 } from "../lib/tools";
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
@@ -67,6 +67,7 @@ import {
 import { tryParseArgs } from "../lib/chat/turn/graph-record";
 import { runPlainTurn } from "../lib/chat/turn/plain-turn";
 import { runAgentTurn } from "../lib/chat/turn/agent-turn";
+import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
 import type { Trace } from "../lib/chat/turn/ports";
 
 /**
@@ -1443,16 +1444,19 @@ function Chat({
   });
   const [sessionTokensIn, setSessionTokensIn] = useState(0);
   const [sessionTokensOut, setSessionTokensOut] = useState(0);
-  const abortRef = useRef<AbortController | null>(null);
+  // The in-flight turn (abort handle + approval gate) lives at module level — lib/chat/turn/
+  // controller — so it outlives this screen: the Agents dashboard's stop button is the remote
+  // control for a run still in flight, reached precisely by navigating away from here.
   // True from the moment Stop is clicked until the run actually unwinds. With the sandbox's
   // `tool_cancel` in place the gap is short — a running command is signalled SIGINT (then
   // SIGKILL) and the stream aborts immediately — but it is not zero, and naming it is what keeps
   // the click from ever feeling ignored.
   const [stopping, setStopping] = useState(false);
   const stopRun = useCallback(() => {
-    if (!abortRef.current) return;
+    const turn = currentTurn();
+    if (!turn) return;
     setStopping(true);
-    abortRef.current.abort();
+    turn.stop();
   }, []);
   const listRef = useRef<HTMLDivElement>(null);
   // P4: the context graph is recorded as the conversation happens. `activeSession` rather than
@@ -1729,67 +1733,6 @@ function Chat({
   const approvalRef = useRef<ApprovalState>({ ...INITIAL_APPROVAL, mode: approvalMode });
   approvalRef.current = { mode: approvalMode, planMode, trustedTools: granted.trustedTools, allowAll: granted.allowAll };
 
-  const confirmGate = useCallback(
-    async (call: ToolCall, args: Record<string, unknown>) => {
-      const name = call.name ?? "?";
-      const verdict = decide(approvalRef.current, name);
-      // Plan mode refuses writes itself, and does so without a modal: a prompt here would let the
-      // user approve exactly the write plan mode exists to prevent, one click away from a mode
-      // they chose for a reason.
-      if (verdict.action === "allow") return { allow: true };
-      if (verdict.action === "deny") return { allow: false, reason: verdict.reason };
-      const choice = await new Promise<ApprovalChoice & { reason?: string }>((resolve) => {
-        // Stop must work while the gate is up. The loop parks on this promise, and an abort fired
-        // while it parks used to go nowhere: the controller's flag flipped, but nothing resolved
-        // the promise, so the run stayed "busy" until the modal was answered and Stop read as
-        // broken. Racing the current run's signal resolves it as a deny — the call is not run,
-        // the modal closes, and the next loop boundary throws the AbortError the catch already
-        // turns into "stopped by you".
-        const sig = abortRef.current?.signal;
-        let onAbort: (() => void) | null = null;
-        const denyForStop = () => {
-          if (onAbort && sig) sig.removeEventListener("abort", onAbort);
-          setPendingConfirm(null);
-          resolve({ allow: false, scope: "once", reason: "stopped by you — this call was not run" });
-        };
-        if (sig) {
-          if (sig.aborted) {
-            denyForStop();
-            return;
-          }
-          onAbort = denyForStop;
-          sig.addEventListener("abort", onAbort, { once: true });
-        }
-        setPendingConfirm({
-          call,
-          args,
-          resolve: (c) => {
-            if (onAbort && sig) sig.removeEventListener("abort", onAbort);
-            resolve(c);
-          },
-        });
-      });
-      if (choice.allow && choice.scope !== "once") {
-        // Applied to the ref **and** to state. State is what the render reads; the ref is what the
-        // very next call of this same run reads, and `setGranted` is not applied until React
-        // re-renders — which the loop does not wait for. Without the ref, "always allow this tool"
-        // would ask about the same tool again on the immediately following call.
-        const next = choice.scope === "session"
-          ? withAllowAll(approvalRef.current)
-          : withTrustedTool(approvalRef.current, name);
-        approvalRef.current = next;
-        setGranted({ trustedTools: next.trustedTools, allowAll: next.allowAll });
-      }
-      // A deny that Stop caused carries its own wording: the model must not read "the user denied
-      // this" out of a run the user cancelled, and the transcript step should say which happened.
-      return choice.reason ? { allow: choice.allow, reason: choice.reason } : { allow: choice.allow };
-    },
-    [],
-  );
-
-  // The paint half of the loop's events. The recording half (run steps) moved into the turn
-  // engine (lib/chat/turn/agent-turn) so a run's steps land as they arrive even if the UI is
-  // only forwarding them.
   const handleAgentEvent = useCallback((ev: AgentEvent) => {
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
@@ -1875,8 +1818,17 @@ function Chat({
     setBusy(true);
     setTrace(null);
     setFinishReason(undefined);
-    const ac = new AbortController();
-    abortRef.current = ac;
+    const turn = beginTurn(
+      {
+        approvalState: () => approvalRef.current,
+        escalate: (next) => {
+          approvalRef.current = next;
+          setGranted({ trustedTools: next.trustedTools, allowAll: next.allowAll });
+        },
+      },
+      { onConfirmRequest: setPendingConfirm, onConfirmCleared: () => setPendingConfirm(null) },
+    );
+    const ac = turn.controller;
     const t0 = Date.now();
 
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
@@ -1887,7 +1839,7 @@ function Chat({
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
         setStopping(false);
-        abortRef.current = null;
+        turn.finish();
         return;
       }
       // The turn engine (lib/chat/turn/agent-turn) runs the whole branch against injected ports:
@@ -1912,7 +1864,7 @@ function Chat({
           thinking,
           maxIterations: clampIterations(maxIterations),
           controller: ac,
-          confirm: confirmGate,
+          confirm: (call, args) => turn.confirm(call, args),
         },
         {
           generate: gatewayGenerate,
@@ -1926,7 +1878,7 @@ function Chat({
           onLastUsage: setLastUsage,
           onBusy: setBusy,
           onStopping: setStopping,
-          clearAbort: () => { abortRef.current = null; },
+          clearAbort: () => turn.finish(),
           chargeUsage: addSessionUsage,
           now: Date.now,
           orchestrator: { newRunId, startRun, registerAbort, recordStep, endRun },
@@ -1988,7 +1940,7 @@ function Chat({
         onLastUsage: setLastUsage,
         onBusy: setBusy,
         onStopping: setStopping,
-        clearAbort: () => { abortRef.current = null; },
+        clearAbort: () => turn.finish(),
         chargeUsage: addSessionUsage,
         now: Date.now,
       },
