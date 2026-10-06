@@ -334,3 +334,13 @@ export function toolEffect(name: string | undefined | null): ToolEffect {
   if (!name) return "mutate";
   return EFFECT_BY_NAME.get(name) ?? "mutate";
 }
+
+/**
+ * Register dynamically discovered tools (MCP) into the effect lookup, so the approval policy
+ * sees their declared effect instead of the fail-closed default. The fail-closed rule itself
+ * does not move: a name registered here is one a live server advertised, and anything absent
+ * from both this map and `AGENT_TOOLS` is still `"mutate"`.
+ */
+export function registerToolEffects(specs: ToolSpec[]): void {
+  for (const spec of specs) EFFECT_BY_NAME.set(spec.name, spec.effect);
+}

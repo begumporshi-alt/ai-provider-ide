@@ -9,6 +9,7 @@
  */
 import { userContent, textOfContent, type ChatMessage } from "@aiprovider/router-core";
 import { runAgentLoop, AGENT_TOOLS } from "../../tools";
+import { fetchMcpTools } from "../../tools/mcp-client";
 import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
 import { buildAgentSystem } from "./prompt";
 import { newMsgId, replayHistory } from "./messages";
@@ -123,7 +124,10 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // a system message rather than a line in the user's text so the model can tell a constraint
       // the user set from a sentence the user wrote.
       system: buildAgentSystem({ root: req.root, custom: req.customAgentPrompt, skillsBlock: req.skillsBlock, recalledMemory: ports.memory.block(recalled), planMode: req.planMode, perTurn: req.perTurn }),
-      registry: AGENT_TOOLS,
+      // MCP tools join the builtin registry when servers are configured and reachable; failure
+      // or no configuration collapses to exactly the builtin set. The fetch is cached briefly
+      // Rust-side connections stay live, so the common case is one cheap re-list per turn.
+      registry: [...AGENT_TOOLS, ...(await fetchMcpTools())],
       // Tier 2: when this request has to drop context, the dropped turns are summarized rather
       // than discarded (server-side, or the caller's client-side summarizer above the engine).
       generate: (loopReq, opts) => {

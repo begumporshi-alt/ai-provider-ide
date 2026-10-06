@@ -80,6 +80,13 @@ accumulation, refusal-as-result, and the iteration ceiling of `8` are shared fac
 sides, including a cross-language source parse in each direction. Expectations stay abstract where the loops
 intentionally differ (denial wording, empty-output handling, usage accounting).
 
+Beside the tool sandbox, `core/mcp.rs` is the MCP client: it connects to user-configured MCP servers over
+stdio JSON-RPC, and their tools join the Assistant's registry (`lib/tools/mcp.ts` merges them under
+`AGENT_TOOLS`, routed by `lib/tools/host.ts`). Effect discipline fails closed — a server's `readOnlyHint`
+annotation is the only thing that softens a tool toward `read`, absence is `mutate` and asks. The gateway's
+sandbox registry stays static: advertising third-party tools to every OpenAI-compatible client is a product
+decision, not a default.
+
 Arrows point downward. **One relaxation is deliberate and must not be "fixed":** L3 services call L1 components
 directly (`onboarding-orchestrator` → probe/generator/contract, `drift-monitor` → generator), because those L1
 modules are the pipeline's tools rather than a layer beneath it.

@@ -188,6 +188,7 @@ pub fn run() {
             app.manage(store);
             app.manage(egress_state);
             gateway_cmds::manage(app)?;
+            crate::tauri::mcp_cmds::manage(app)?;
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: state managed");
             // R1: tray is best-effort. On failure we log and fall through with close-to-quit
             // intact, so the app can never end up running with no way to reach it.

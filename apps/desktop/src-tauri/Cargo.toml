@@ -111,7 +111,7 @@ regex = "1"
 # directions. This is the constraint that decides the adapter's architecture — see §2.1.3 and D30.
 rquickjs = { version = "0.9", features = ["parallel"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "time", "net", "sync", "process", "io-util"] }
 futures-util = "0.3.34"
 thiserror = "2.0.20"
 reqwest = { version = "0.12", default-features = false, features = ["stream", "rustls-tls", "http2", "json"] }

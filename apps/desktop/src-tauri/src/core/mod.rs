@@ -55,6 +55,7 @@ pub mod ledger;
 pub mod limiter;
 pub mod manifest;
 pub mod manifest_view;
+pub mod mcp;
 pub mod memory;
 pub mod modality;
 pub mod orchestrator;

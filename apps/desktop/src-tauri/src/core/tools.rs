@@ -152,7 +152,7 @@ impl ToolResult {
     fn ok(output: impl Into<String>) -> Self {
         Self { ok: true, output: output.into(), error: None }
     }
-    fn err(message: impl Into<String>) -> Self {
+    pub(crate) fn err(message: impl Into<String>) -> Self {
         Self { ok: false, output: String::new(), error: Some(message.into()) }
     }
 }

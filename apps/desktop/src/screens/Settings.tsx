@@ -13,6 +13,8 @@ import {
 } from "../store";
 import type { CrashReport } from "../store";
 import { selectableModels } from "../lib/models/selectable";
+import { fetchMcpServers, refreshMcp, saveMcpServers } from "../lib/tools/mcp-client";
+import type { McpServerConfig } from "../lib/tools/mcp";
 import { useUi } from "../ui-state";
 import { StatusDot } from "../components/atoms";
 
@@ -236,13 +238,212 @@ export function SettingsScreen() {
         </div>
       </Section>
 
+      <McpSection />
+
       <ConfigDiagnosticsSection />
     </div>
   );
 }
 
-function ConfigDiagnosticsSection() {
-  const { bump } = useUi();
+/**
+ * MCP servers (2026-10-06): the list the Assistant's tool registry is extended with. A server is
+ * a command the app spawns and speaks JSON-RPC to; its tools join agent mode with the server's
+ * own `readOnlyHint` deciding read vs mutate (absence fails closed to mutate, so every
+ * third-party call asks first).
+ */
+function McpSection() {
+  const [servers, setServers] = useState<McpServerConfig[]>([]);
+  const [loaded, setLoaded] = useState(false);
+  const [showAdd, setShowAdd] = useState(false);
+  const [draft, setDraft] = useState({ id: "", command: "", args: "", env: "" });
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [refreshed, setRefreshed] = useState<{ tools: number; servers: number; failures: string[] } | null>(null);
+
+  useEffect(() => {
+    void fetchMcpServers().then((s) => {
+      setServers(s);
+      setLoaded(true);
+    });
+  }, []);
+
+  const persist = async (next: McpServerConfig[]) => {
+    setBusy(true);
+    setError(null);
+    try {
+      await saveMcpServers(next);
+      setServers(next);
+      setRefreshed(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doRefresh = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      const outcome = await refreshMcp();
+      const live = new Set(outcome.tools.map((t) => t.server));
+      setRefreshed({ tools: outcome.tools.length, servers: live.size, failures: outcome.failures });
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const doAdd = async () => {
+    const args = draft.args.trim() ? draft.args.trim().split(/\s+/) : [];
+    const env: Record<string, string> = {};
+    for (const line of draft.env.split("\n")) {
+      const t = line.trim();
+      if (!t) continue;
+      const eq = t.indexOf("=");
+      if (eq <= 0) {
+        setError(`Env line "${t}" is not KEY=VALUE.`);
+        return;
+      }
+      env[t.slice(0, eq)] = t.slice(eq + 1);
+    }
+    const next = [
+      ...servers,
+      { id: draft.id.trim(), command: draft.command.trim(), args, env, enabled: true },
+    ];
+    setBusy(true);
+    setError(null);
+    try {
+      await saveMcpServers(next);
+      setServers(next);
+      setDraft({ id: "", command: "", args: "", env: "" });
+      setShowAdd(false);
+      setRefreshed(null);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const btn = "rounded border px-2 py-0.5 text-[11px] disabled:opacity-50";
+  const btnStyle = { borderColor: "var(--border)", color: "var(--text-dim)", background: "transparent" };
+  const input = "rounded border px-2 py-1 text-[12px]";
+  const inputStyle = { background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" };
+
+  return (
+    <Section
+      title="MCP servers"
+      hint="Model Context Protocol servers whose tools join agent mode. Each server's own readOnlyHint decides whether a call is treated as read or as a mutation — a server that does not mark its tools asks before every call."
+    >
+      <div className="flex flex-col gap-2">
+        {!loaded && <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>Loading…</span>}
+        {loaded && servers.length === 0 && !showAdd && (
+          <span className="text-[12px]" style={{ color: "var(--text-faint)" }}>No servers configured.</span>
+        )}
+        {servers.map((s, i) => (
+          <div key={s.id} className="flex items-center gap-2">
+            <span className="mono text-[12px]" style={{ color: "var(--text)" }}>{s.id}</span>
+            <span className="mono min-w-0 flex-1 truncate text-[11px]" style={{ color: "var(--text-faint)" }}>
+              {s.command} {s.args.join(" ")}
+            </span>
+            <button
+              className={btn}
+              style={{ ...btnStyle, color: s.enabled ? "var(--success)" : "var(--text-faint)" }}
+              disabled={busy}
+              onClick={() => persist(servers.map((x, j) => (j === i ? { ...x, enabled: !x.enabled } : x)))}
+            >
+              {s.enabled ? "enabled" : "disabled"}
+            </button>
+            <button
+              className={btn}
+              style={btnStyle}
+              disabled={busy}
+              onClick={() => persist(servers.filter((_, j) => j !== i))}
+            >
+              remove
+            </button>
+          </div>
+        ))}
+      </div>
+
+      {showAdd && (
+        <div className="mt-3 flex flex-col gap-2">
+          <div className="flex gap-2">
+            <input
+              className={`${input} w-32`}
+              style={inputStyle}
+              placeholder="id (github)"
+              value={draft.id}
+              onChange={(e) => setDraft({ ...draft, id: e.target.value })}
+            />
+            <input
+              className={`${input} mono min-w-0 flex-1`}
+              style={inputStyle}
+              placeholder="command (npx, /usr/local/bin/server.py…)"
+              value={draft.command}
+              onChange={(e) => setDraft({ ...draft, command: e.target.value })}
+            />
+          </div>
+          <input
+            className={`${input} mono`}
+            style={inputStyle}
+            placeholder="arguments, space separated (-y @modelcontextprotocol/server-github)"
+            value={draft.args}
+            onChange={(e) => setDraft({ ...draft, args: e.target.value })}
+          />
+          <textarea
+            className={`${input} mono h-16`}
+            style={inputStyle}
+            placeholder={"environment, one KEY=VALUE per line (GITHUB_TOKEN=…)"}
+            value={draft.env}
+            onChange={(e) => setDraft({ ...draft, env: e.target.value })}
+          />
+          <div className="flex gap-2">
+            <button
+              className={btn}
+              style={{ ...btnStyle, borderColor: "var(--accent, var(--border))", color: "var(--text)" }}
+              disabled={busy || !draft.id.trim() || !draft.command.trim()}
+              onClick={doAdd}
+            >
+              Save server
+            </button>
+            <button className={btn} style={btnStyle} disabled={busy} onClick={() => { setShowAdd(false); setError(null); }}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      <div className="mt-3 flex flex-wrap gap-2">
+        <button
+          className={btn}
+          style={{ ...btnStyle, borderColor: "var(--accent, var(--border))", color: "var(--text)" }}
+          disabled={busy || showAdd}
+          onClick={() => { setShowAdd(true); setError(null); }}
+        >
+          Add server
+        </button>
+        <button className={btn} style={btnStyle} disabled={busy || servers.length === 0} onClick={doRefresh}>
+          {busy && refreshed === null ? "Working…" : "Connect & list tools"}
+        </button>
+      </div>
+
+      {refreshed && (
+        <p className="mt-2 text-[12px]" style={{ color: "var(--text-dim)" }}>
+          {refreshed.tools} tool{refreshed.tools === 1 ? "" : "s"} discovered from {refreshed.servers} server{refreshed.servers === 1 ? "" : "s"}
+          {refreshed.failures.length > 0 ? ` — ${refreshed.failures.join("; ")}` : "."}
+        </p>
+      )}
+      {error && (
+        <p className="mt-2 text-[12px]" style={{ color: "var(--danger, #e5484d)" }}>{error}</p>
+      )}
+    </Section>
+  );
+}
+
+function ConfigDiagnosticsSection() {  const { bump } = useUi();
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<{ ok: boolean; text: string } | null>(null);
   const [importText, setImportText] = useState("");

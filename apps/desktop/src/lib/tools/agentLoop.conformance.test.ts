@@ -177,7 +177,7 @@ async function runScenario(sc: Scenario): Promise<void> {
   expect(out.text, `${sc.name}: final text`).toBe(sc.expect.finalText);
   if (sc.expect.ceiling) {
     expect(out.truncated, `${sc.name}: the ceiling exit is not a truncation`).toBe(false);
-    const done = events.findLast((e) => e.type === "done");
+    const done = [...events].reverse().find((e) => e.type === "done");
     expect(done && "iterations" in done ? done.iterations : undefined, `${sc.name}: iterations at the ceiling`)
       .toBe(sc.expect.modelCalls);
   }

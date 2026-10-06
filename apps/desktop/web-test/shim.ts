@@ -1348,6 +1348,17 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       return TOOLS_POLICY;
     case "tools_default_root":
       return DEFAULT_WORKSPACE_ROOT;
+    // ---- MCP (Settings section) ----
+    case "mcp_servers_get":
+      // The harness has no server processes to manage; the empty list is the honest shape, and
+      // the settings section renders its "no servers configured" state against it.
+      return [];
+    case "mcp_servers_set":
+      return null;
+    case "mcp_refresh":
+      return { tools: [], failures: [] };
+    case "mcp_call":
+      return { ok: false, output: "", error: "mcp_call: the web-test harness has no MCP servers" };
     case "tool_cancel": {
       // The real host signals the child's process group; here, releasing the held call IS the
       // process dying. `false` for an unknown id mirrors the Rust return: nothing was running.

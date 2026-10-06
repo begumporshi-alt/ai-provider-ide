@@ -5,9 +5,11 @@
  * never imports it; it depends only on the `ToolHost` interface, so tests inject a fake.
  * Each call forwards to the Rust `tool_run` command, which is where the allowlist, path
  * confinement, timeout and output caps are actually enforced (tools.rs) — this file is a
- * thin, key-blind pass-through.
+ * thin, key-blind pass-through. MCP tools (`mcp_*` names) route to `mcp_call` instead, with
+ * the same result shape and the same failure mapping — one honest reason either way.
  */
 import { invoke } from "@tauri-apps/api/core";
+import { mcpTargetOf } from "./mcp";
 import type { ToolHost } from "./types";
 
 interface WireToolResult {
@@ -34,10 +36,19 @@ export function createTauriToolHost(root: string): ToolHost {
       // guarantee for a caller that does not.)
       if (signal?.aborted) return { ok: false, output: "stopped by you — this call was not run" };
 
-      const inflight = invoke<WireToolResult>("tool_run", {
-        req: { name, arguments: args, root },
-        ...(callId ? { callId } : {}),
-      });
+      // MCP tools ride their own command, routed through the dispatch map the last listing
+      // populated. A name no live server advertised fails closed rather than guessing a server.
+      const mcpTarget = name.startsWith("mcp_") ? mcpTargetOf(name) : null;
+      const inflight = mcpTarget
+        ? invoke<WireToolResult>("mcp_call", {
+            server: mcpTarget.server,
+            tool: mcpTarget.tool,
+            arguments: args,
+          })
+        : invoke<WireToolResult>("tool_run", {
+            req: { name, arguments: args, root },
+            ...(callId ? { callId } : {}),
+          });
       // The stop path. Flipping the abort signal cannot by itself end a sandbox command that is
       // already running, so the host asks the sandbox to cancel it — SIGINT, then SIGKILL, to the
       // child's whole process group — and resolves immediately. The invoke above still settles
