@@ -30,10 +30,9 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { runAgentLoop, AGENT_TOOLS, createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import {
-  APPROVAL_MODES, INITIAL_APPROVAL, decide, withAllowAll, withTrustedTool,
-  RunCheckpoint, createCheckpointingHost, revertPlan,
+  APPROVAL_MODES, INITIAL_APPROVAL, decide, withAllowAll, withTrustedTool, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
 } from "../lib/tools";
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
@@ -51,7 +50,7 @@ import {
 } from "../lib/tools/render";
 import type { ChatMessage, ReasoningEffort, ToolCall, UsageTokens } from "@aiprovider/router-core";
 import {
-  estimateTokens, DEFAULT_CONTEXT_WINDOW, userContent, textOfContent, compressWithSummary, type CatalogModel,
+  estimateTokens, DEFAULT_CONTEXT_WINDOW, textOfContent, compressWithSummary, type CatalogModel,
 } from "@aiprovider/router-core";
 import { formatCost } from "../lib/ledger/format";
 import { chargeSessionUsage, emptySessionUsage } from "../lib/ledger/session-usage";
@@ -63,10 +62,11 @@ import {
 } from "../lib/memory/engine";
 import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
 import {
-  agentSystem, buildAgentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
+  agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
 } from "../lib/chat/turn/prompt";
-import { clip, tryParseArgs, recordAgentTurn } from "../lib/chat/turn/graph-record";
+import { tryParseArgs } from "../lib/chat/turn/graph-record";
 import { runPlainTurn } from "../lib/chat/turn/plain-turn";
+import { runAgentTurn } from "../lib/chat/turn/agent-turn";
 import type { Trace } from "../lib/chat/turn/ports";
 
 /**
@@ -1469,9 +1469,6 @@ function Chat({
   const [titleDraft, setTitleDraft] = useState("");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [sessions, setSessions] = useState<HistorySession[]>([]);
-  // P6: the run currently being recorded, and the iteration count the loop reports when it ends.
-  const runIdRef = useRef<string | null>(null);
-  const iterationsRef = useRef(0);
   // P5: enabled skills are appended to the agent's instructions. Re-read on every tick so
   // installing or revoking a skill changes the agent's behaviour without restarting the app.
   const [skillsBlock, setSkillsBlock] = useState("");
@@ -1790,48 +1787,17 @@ function Chat({
     [],
   );
 
+  // The paint half of the loop's events. The recording half (run steps) moved into the turn
+  // engine (lib/chat/turn/agent-turn) so a run's steps land as they arrive even if the UI is
+  // only forwarding them.
   const handleAgentEvent = useCallback((ev: AgentEvent) => {
-    // P6: every event is appended to the run record as it arrives, not batched at the end, so a
-    // run that is stopped or crashes is still fully inspectable from the dashboard.
-    const run = runIdRef.current;
-    if (run) {
-      if (ev.type === "tool_call") {
-        recordStep(run, "tool_call", ev.call.name ?? "?", ev.call.arguments ?? undefined);
-      } else if (ev.type === "tool_result") {
-        // `refused` as well as `denied`: plan mode refuses a write on its own behalf, and the two
-        // are the same thing to the reader ("the agent did not run this") while being different
-        // things to them ("you said no" / "the mode said no"). Both render as "denied" here and the
-        // full sentence is in the recorded step. Without `refused` in this test every plan-mode
-        // refusal painted the caller's block as an unexpected failure.
-        const denied = /denied|refused/i.test(ev.result);
-        recordStep(run, denied ? "denied" : "tool_result", ev.call.name ?? "?", ev.result.slice(0, 500), ev.ok);
-      } else if (ev.type === "done") {
-        iterationsRef.current = ev.iterations;
-        recordStep(
-          run,
-          "done",
-          ev.truncated
-            ? `${ev.iterations} iterations — stream truncated`
-            : ev.iterations
-              ? `${ev.iterations} iterations`
-              : "done",
-          undefined,
-          // A truncated turn is not a clean finish: the step reads as failed so the dashboard's
-          // reader asks what the stream actually carried instead of trusting the answer.
-          !ev.truncated,
-        );
-      } else if (ev.type === "truncation_retry") {
-        // Not a recorded step: a re-ask is the loop repairing itself, and it only matters if it
-        // fails. The bubble below says it while it happens.
-      }
-    }
     if (ev.type === "assistant") {
       setStreamedText((t) => t + ev.text);
     } else if (ev.type === "truncation_retry") {
       // The abandoned attempt's partial prose is dropped, not concatenated: the retry's text is
       // the answer being built, and two attempts joined would read as one sentence the model
       // never said. The notice stays as the bubble's prefix until the retry's own text appends
-      // after it; a truncated `done` above records the outcome in the run's steps.
+      // after it; a truncated `done` records the outcome in the run's steps.
       setStreamedText("⏳ the model's stream ended early — re-asking…\n\n");
     } else if (ev.type === "no_output_retry") {
       // The model reasoned through its whole output budget and never answered. Thinking off is
@@ -1924,192 +1890,68 @@ function Chat({
         abortRef.current = null;
         return;
       }
-      setStreamedText("");
-      setStreamedReasoning("");
-      setAgentItems([]);
-      setRunUsage({ tokensIn: 0, tokensOut: 0 });
-      // The previous run's review is about to be superseded — and leaving it up while a new run
-      // writes the same files would offer a revert that restores a state two runs old.
-      setRunChanges(null);
-      // P6: open the run record before the first call, and register this controller so the
-      // orchestrator dashboard can stop the run even though it did not start it.
-      const runId = newRunId();
-      runIdRef.current = runId;
-      iterationsRef.current = 0;
-      startRun({ runId, sessionId: ctxRef.current?.sessionId ?? null, model: chosen, prompt: trimmed });
-      registerAbort(runId, ac);
-      // P5: the run's checkpoint. Every write this run makes goes through the wrapping host, which
-      // reads the file's previous contents *before* the write — that is what makes both the review
-      // diff and "revert this run" show what actually changed rather than what the model claimed.
-      const checkpoint = new RunCheckpoint();
-      const host = createCheckpointingHost(createTauriToolHost(root.trim()), checkpoint);
-      // The user's node is created here rather than inside recordAgentTurn, because the recall
-      // edges need an anchor before the run starts. Same shape as the plain-chat branch below:
-      // one node per turn, reused by everything that needs to point at it.
-      const rec = ctxRef.current!;
-      const userNode = rec.node("message", clip(trimmed, 120), { role: "user", model: chosen, text: trimmed });
-      if (lastNodeRef.current) rec.edge(lastNodeRef.current, userNode, "follows");
-      // P7: recall before the run so the agent starts from what is already known. Awaited,
-      // because the recalled block has to be in the system prompt before the first call.
-      const recalled = useMemory ? await recallContext(trimmed) : [];
-      if (recalled.length > 0) recordRecall(userNode, recalled);
-      // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
-      // tool-result turns that answer them — so the model keeps its chaining context.
-      const history: ChatMessage[] = [
-        ...replayHistory(baseMsgs),
+      // The turn engine (lib/chat/turn/agent-turn) runs the whole branch against injected ports:
+      // run record, checkpoint host, confirm gate, graph recording, memory, trace, change set.
+      await runAgentTurn(
         {
-          role: "user",
-          content: userContent(trimmed, attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
-        },
-      ];
-      try {
-        const { text: finalText, messages } = await runAgentLoop({
+          text: trimmed,
+          baseMsgs,
+          attachments,
           model: chosen,
-          messages: history,
-          // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
-          // a system message rather than a line in the user's text so the model can tell a constraint
-          // the user set from a sentence the user wrote.
-          system: buildAgentSystem({ root, custom: agentSystemPrompt, skillsBlock, recalledMemory: memoryBlock(recalled), planMode, perTurn }),
-          registry: AGENT_TOOLS,
-          // Tier 2: when this request has to drop context, the dropped turns are summarized
-          // rather than discarded. One summarizer per run, built against the chosen model.
-          // P7: pass through per-request temperature/maxTokens and capture usage for the meter.
-          // The thinking level rides the same path: the interpreter renders it into whichever
-          // field the serving dialect declares (`thinking`, `reasoning_effort`, `thinkingConfig`),
-          // and an unset level sends nothing at all.
-          generate: async (req, opts) => {
-            // A1 Phase 1: the loop's generate port is the gateway engine — the same serving
-            // path ZCode and Claude Code drive. `opts` carries the loop's abort signal; the
-            // TS engine's `summarize` hook is not passed because context compression is no
-            // longer this call's business (server-side, or the client-side
-            // `compressWithSummary` above).
-            let callIn = 0;
-            let callOut = 0;
-            const exec = await gatewayGenerate(
-              {
-                // The run config's level is spread BEFORE the request on purpose: the loop's own
-                // reasoning override — the NO_OUTPUT fallback's forced "off" — must win over this
-                // panel's setting, or the fallback could not turn thinking off.
-                ...(thinking ? { reasoning: thinking } : {}),
-                ...req,
-                ...(typeof temperature === "number" ? { temperature } : {}),
-                ...(typeof maxTokens === "number" ? { maxTokens } : {}),
-                onUsage: (u) => {
-                  req.onUsage?.(u);
-                  setLastUsage(u);
-                  // Summed, not replaced: an agent turn is several model calls, and the live
-                  // status line shows what the whole run has spent so far.
-                  setRunUsage((r) => ({
-                    tokensIn: r.tokensIn + (u.prompt_tokens ?? 0),
-                    tokensOut: r.tokensOut + (u.completion_tokens ?? 0),
-                  }));
-                  callIn += u.prompt_tokens ?? 0;
-                  callOut += u.completion_tokens ?? 0;
-                },
-              },
-              { signal: opts?.signal },
-            );
-            return {
-              ...exec,
-              // Charge the session once per completed model call, not per run: each iteration is
-              // its own billed request. The generator's `finally` runs on the loop's `break` too,
-              // so a stopped run still charges the usage it already received. Served ids only
-              // exist once the stream ends, so pricing happens here rather than in `onUsage`.
-              chunks: (async function* () {
-                try {
-                  for await (const chunk of exec.chunks) yield chunk;
-                } finally {
-                  const s = exec.served();
-                  addSessionUsage(callIn, callOut, s?.provider, s?.model);
-                }
-              })(),
-            };
-          },
-          host,
-          // Clamped again at the call site: this is the number that actually bounds the spend,
-          // and it is reached from a setting that a future build may have written differently.
-          maxIterations: clampIterations(maxIterations),
-          confirm: confirmGate,
-          onEvent: handleAgentEvent,
-          onFinish: setFinishReason,
+          perTurn,
+          useMemory,
           signal: ac.signal,
-        });
-        // The loop terminates the moment it sees an answer with no tool calls, but it does NOT
-        // append that final assistant turn — `text` is the answer and `messages` is what came
-        // before. Append it so the UI and the context graph both see the closing line.
-        const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: finalText }];
-        setMsgs(
-          fullMessages.map((m) => ({
-            id: newMsgId(),
-            role: m.role as Msg["role"],
-            // `textOfContent`: the agent loop's transcript includes the user turn we sent, which
-            // carries parts when it had images. The transcript stores text; the images stay on the
-            // turn that owns them (and the graph records the text, as before).
-            content: textOfContent(m.content),
-            ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-            ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-          })),
-        );
-        void finalText;
-        // Only this turn's messages. `runAgentLoop` seeds its working copy from `history` and
-        // returns the whole transcript, so slicing off the replayed prefix is what keeps an
-        // earlier turn from being re-recorded — and keeps the graph linear in turns.
-        lastNodeRef.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), chosen);
-        // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
-        // it is an extra model call, and a slow or failing one must not hold up the answer the
-        // user is already reading.
-      if (useMemory) {
-        void rememberTurn(ctxRef.current!.sessionId, trimmed, finalText).then(() =>
-          distilTurn(ctxRef.current!.sessionId, chosen),
-        ).catch(() => { /* memory distillation is best-effort */ });
-      }
-      // An abort mid-stream with no tool calls yet returns from the loop normally (the chunk loop
-      // just breaks), so the success path — not only the catch — must distinguish a stopped run.
-      // The trace said `✓` for a turn the user had cancelled, same lie the plain-chat path
-      // already stopped telling (it marks "stopped by you" in its own trace).
-      const stopped = ac.signal.aborted;
-      endRun(runId, stopped ? "stopped" : "ok", iterationsRef.current);
-        setTrace({
-          ms: Date.now() - t0,
-          fallbacks: [],
-          provider: "agent",
-          ...(stopped ? { error: "stopped by you" } : {}),
-        });
-      } catch (e) {
-        // The turn's own bubble, not only the trace line. A failed agent run left an empty
-        // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
-        // had not answered yet — with the only clue a thin red line above the composer.
-        const fill = (note: string) =>
-          setMsgs((m) => m.map((x) => (x.id === assistantMsg.id && !x.content.trim() ? { ...x, content: note } : x)));
-        if (ac.signal.aborted) {
-          endRun(runId, "stopped", iterationsRef.current);
-          setTrace({ ms: Date.now() - t0, fallbacks: [], error: "stopped by you" });
-          fill("⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.");
-        } else {
-          endRun(runId, "error", iterationsRef.current, (e as Error).message);
-          setTrace({ ms: Date.now() - t0, fallbacks: [], error: (e as Error).message });
-          fill(`⚠ ${(e as Error).message}`);
-        }
-      } finally {
-        // Flush here, not on the success path only. The user's node — and any recall edges
-        // anchored to it — is created before the run starts, so a stopped or failed run would
-        // otherwise leave those nodes buffered and silently prepend them to the next turn's
-        // batch. Same policy as the plain-chat branch: a partial turn is still a turn.
-        void ctxRef.current!.flush();
-        runIdRef.current = null;
-        setBusy(false);
-        setStopping(false);
-        setPendingConfirm(null);
-        setAgentItems([]);
-        setStreamedText("");
-        setStreamedReasoning("");
-        abortRef.current = null;
-        // P5: publish the change set in `finally`, not on the success path. A run the user stopped
-        // or that threw has still written every file it got to before that, and those are exactly
-        // the writes someone wants to take back — hiding them because the turn did not finish would
-        // make "revert this run" unavailable in the only case it matters most.
-        setRunChanges(checkpoint.empty ? null : checkpoint.snapshot());
-      }
+          startedAt: t0,
+          assistantMsgId: assistantMsg.id,
+          root,
+          customAgentPrompt: agentSystemPrompt,
+          skillsBlock,
+          planMode,
+          temperature: typeof temperature === "number" ? temperature : undefined,
+          maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
+          thinking,
+          maxIterations: clampIterations(maxIterations),
+          controller: ac,
+          confirm: confirmGate,
+        },
+        {
+          generate: gatewayGenerate,
+          recorder: ctxRef.current!,
+          lastNode: lastNodeRef,
+          memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+          providerName: (id) => registry.getProvider(id)?.name,
+          patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
+          onTrace: setTrace,
+          onFinishReason: setFinishReason,
+          onLastUsage: setLastUsage,
+          onBusy: setBusy,
+          onStopping: setStopping,
+          clearAbort: () => { abortRef.current = null; },
+          chargeUsage: addSessionUsage,
+          now: Date.now,
+          orchestrator: { newRunId, startRun, registerAbort, recordStep, endRun },
+          makeBaseHost: (r) => createTauriToolHost(r),
+          onAgentEvent: handleAgentEvent,
+          onAgentStart: () => {
+            setStreamedText("");
+            setStreamedReasoning("");
+            setAgentItems([]);
+            setRunUsage({ tokensIn: 0, tokensOut: 0 });
+          },
+          onRunUsageAdded: (tin, tout) =>
+            setRunUsage((r) => ({ tokensIn: r.tokensIn + tin, tokensOut: r.tokensOut + tout })),
+          onReplaceTranscript: setMsgs,
+          fillIfEmpty: (id, note) =>
+            setMsgs((m) => m.map((x) => (x.id === id && !x.content.trim() ? { ...x, content: note } : x))),
+          onRunChanges: setRunChanges,
+          clearRunUi: () => {
+            setPendingConfirm(null);
+            setAgentItems([]);
+            setStreamedText("");
+            setStreamedReasoning("");
+          },
+        },
+      );
       return;
     }
 

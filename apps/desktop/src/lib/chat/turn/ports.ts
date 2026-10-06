@@ -9,6 +9,9 @@ import type { Msg } from "./messages";
 import type { Recorder } from "../../context/recorder";
 import type { Memory } from "../../../store";
 import type { GatewayGenerateRequest, GatewayExec } from "../../gateway-turn";
+import type { AgentEvent, ToolHost } from "../../tools";
+import type { RunChangeSet } from "../../tools/changeset";
+import type { RunStatus, StepKind } from "../../agent/orchestrator";
 
 /** The trace panel's line. Built by whichever branch served the turn; rendered by the screen. */
 export interface Trace {
@@ -70,7 +73,7 @@ export interface TurnEventSink {
 }
 
 /** Everything a turn needs besides its request: its callbacks and its dependencies. */
-export interface TurnPorts extends TurnEventSink {
+export interface TurnDeps {
   generate: GeneratePort;
   /** The recorder captured at turn start — not re-read from the screen, so a session switched
    *  mid-turn cannot flush nodes into the wrong session's graph. */
@@ -82,4 +85,41 @@ export interface TurnPorts extends TurnEventSink {
   providerName(providerId: string): string | undefined;
   /** Injectable clock for the throttle and the trace's duration. */
   now(): number;
+}
+
+export interface TurnPorts extends TurnEventSink, TurnDeps {}
+
+/** The run-record seam (P6). A port rather than an import so node tests can record runs in memory
+ *  and so the engine does not pull the host-boundary module into every importer. */
+export interface RunRecordPorts {
+  newRunId(): string;
+  startRun(args: { runId: string; sessionId?: string | null; model: string; prompt?: string }): void;
+  registerAbort(runId: string, ac: AbortController): void;
+  recordStep(runId: string, kind: StepKind, label?: string, detail?: string, ok?: boolean): void;
+  endRun(runId: string, status: RunStatus, iterations: number, error?: string): void;
+}
+
+/** The agent turn's extra paint events, beyond what the plain turn emits. */
+export interface AgentTurnSink extends TurnEventSink {
+  /** Replace the whole transcript (agent runs return the full conversation; the root guard undoes
+   *  the optimistic append with it). */
+  onReplaceTranscript(msgs: Msg[]): void;
+  /** Fill an assistant bubble only while it is still empty (the failure-path wording). */
+  fillIfEmpty(id: string, note: string): void;
+  /** Every loop event, forwarded raw — the screen owns the paint half, the engine the recording. */
+  onAgentEvent(ev: AgentEvent): void;
+  /** Start-of-run resets: the streamed panels, the agent items, and the run's usage counter. */
+  onAgentStart(): void;
+  /** The run's live usage counter, summed across the loop's model calls. */
+  onRunUsageAdded(tokensIn: number, tokensOut: number): void;
+  onRunChanges(changes: RunChangeSet | null): void;
+  /** Clear the run-specific UI state (confirm modal, agent items, streamed panels) on settle. */
+  clearRunUi(): void;
+}
+
+export interface AgentTurnPorts extends AgentTurnSink, TurnDeps {
+  orchestrator: RunRecordPorts;
+  /** The un-checkpointed tool host for a workspace root; the engine wraps it with the run's
+   *  checkpoint so the change-set review stays engine-owned. */
+  makeBaseHost(root: string): ToolHost;
 }
