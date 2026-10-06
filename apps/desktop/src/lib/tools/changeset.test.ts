@@ -33,6 +33,29 @@ function fakeWorkspace(initial: Record<string, string>) {
         files.set(path, args.replace_all === true ? before.split(old).join(next) : before.replace(old, next));
         return { ok: true, output: `edited ${path}` };
       }
+      if (name === "apply_patch") {
+        // Whole-patch-or-nothing, like the host: every target must exist unless its `---` side is
+        // `/dev/null`, which makes it a creation.
+        const lines = String(args.patch ?? "").split("\n");
+        const targets: { path: string; create: boolean }[] = [];
+        let old = "";
+        for (const l of lines) {
+          if (l.startsWith("--- ")) {
+            old = l.slice(4).trim();
+            continue;
+          }
+          if (!l.startsWith("+++ ")) continue;
+          const path = l.slice(4).trim().replace(/^[ab]\//, "");
+          if (path && path !== "/dev/null") targets.push({ path, create: old === "/dev/null" });
+        }
+        if (targets.some((t) => !t.create && !files.has(t.path))) {
+          return { ok: false, output: "hunk context did not match" };
+        }
+        for (const t of targets) {
+          files.set(t.path, t.create ? "hello\n" : `${files.get(t.path)!}+patched`);
+        }
+        return { ok: true, output: `patched ${targets.length} file(s)` };
+      }
       if (name === "run_command") return { ok: true, output: "ok" };
       if (name === "mkdir") return { ok: true, output: "created" };
       return { ok: false, output: "unknown tool" };
@@ -52,6 +75,63 @@ describe("createCheckpointingHost", () => {
     expect(cp.snapshot().files).toEqual([
       { path: "a.txt", before: "one\ntwo\n", after: "one\nTWO\n" },
     ]);
+  });
+
+  it("checkpoints every file a patch names, so revert covers apply_patch", async () => {
+    // The revert gap this closes: `apply_patch` was neither a tracked writer nor a noted untracked
+    // tool, so its changes were invisible and "revert this run" reported "reverted N of N files"
+    // while the patch stayed on disk. A silent lie about restored state is the one failure this
+    // module exists to prevent.
+    const ws = fakeWorkspace({ "a.txt": "one\n", "b.txt": "two\n" });
+    const cp = new RunCheckpoint();
+    const host = createCheckpointingHost(ws.host, cp);
+
+    await host.run("apply_patch", {
+      patch: [
+        "--- a/a.txt",
+        "+++ b/a.txt",
+        "@@ -1 +1 @@",
+        "-one",
+        "+ONE",
+        "--- a/b.txt",
+        "+++ b/b.txt",
+        "@@ -1 +1 @@",
+        "-two",
+        "+TWO",
+      ].join("\n"),
+    });
+
+    const snap = cp.snapshot();
+    expect(snap.files.map((f) => f.path).sort()).toEqual(["a.txt", "b.txt"]);
+    expect(snap.files.find((f) => f.path === "a.txt")).toMatchObject({ before: "one\n" });
+    expect(snap.files.find((f) => f.path === "b.txt")).toMatchObject({ before: "two\n" });
+    expect(snap.untracked, "and it is not reported as untracked").toEqual([]);
+  });
+
+  it("captures a file the patch creates, so revert can empty it", async () => {
+    const ws = fakeWorkspace({ "a.txt": "one\n" });
+    const cp = new RunCheckpoint();
+    const host = createCheckpointingHost(ws.host, cp);
+
+    await host.run("apply_patch", {
+      patch: ["--- /dev/null", "+++ b/new.txt", "@@ -0,0 +1 @@", "+hello"].join("\n"),
+    });
+
+    expect(cp.snapshot().files).toEqual([{ path: "new.txt", before: null, after: "hello\n" }]);
+  });
+
+  it("names a patch it cannot trace rather than claiming a revert it cannot deliver", async () => {
+    const ws = fakeWorkspace({ "a.txt": "one\n" });
+    const cp = new RunCheckpoint();
+    const host = createCheckpointingHost(ws.host, cp);
+
+    // No `+++ ` header at all: nothing to capture, and the review must say so.
+    await host.run("apply_patch", { patch: "not really a diff" });
+
+    const snap = cp.snapshot();
+    expect(snap.files).toEqual([]);
+    expect(snap.untracked).toHaveLength(1);
+    expect(snap.untracked[0]).toContain("could not be read");
   });
 
   it("keeps the FIRST contents when a file is written twice in one run", async () => {

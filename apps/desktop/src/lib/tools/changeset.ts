@@ -43,6 +43,35 @@ export interface RunChangeSet {
 
 const FILE_WRITERS = new Set(["write_file", "edit_file"]);
 
+/**
+ * The paths a unified diff touches, read the way the Rust patch parser reads them.
+ *
+ * **Why this exists.** `apply_patch` is the one mutate tool whose targets live inside a *text*
+ * argument rather than a `path` field, and the first version of this wrapper matched neither the
+ * writers set nor the untracked note — so a patch's changes were invisible to the run checkpoint
+ * and "revert this run" reported "reverted N of N files" while those files kept the patch. A silent
+ * lie about restored state is the one failure this module exists to prevent.
+ *
+ * The rules are the Rust parser's, deliberately: the `+++ ` line decides the target, a `b/` or `a/`
+ * prefix is VCS noise, and a path on the `---` side of `/dev/null` is a creation (whose "before" is
+ * simply absent). A `+++ /dev/null` is a deletion, which the host refuses — skipped here rather than
+ * captured, so the two sides of the wire cannot disagree about what ran. The one ambiguity both
+ * parsers share: an *added line whose own content starts with `++ `* renders as `+++ …` and would
+ * be read as a header. Capturing a path the patch never touched is a no-op for revert (its bytes
+ * are unchanged), so the ambiguity is stated rather than defended against with a second grammar.
+ */
+export function patchPaths(patch: string): string[] {
+  const out: string[] = [];
+  for (const line of patch.split("\n")) {
+    if (!line.startsWith("+++ ")) continue;
+    const raw = line.slice(4).trim();
+    if (!raw || raw === "/dev/null") continue;
+    const path = raw.replace(/^[ab]\//, "").replace(/^[: ]+/, "");
+    if (path && !out.includes(path)) out.push(path);
+  }
+  return out;
+}
+
 /** Read a workspace file, or `null` when it is absent/unreadable. Never throws: a checkpoint
  *  that cannot be taken must not fail the tool call it was taken for. */
 async function readOrNull(host: ToolHost, path: string): Promise<string | null> {
@@ -113,6 +142,28 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
       const path = typeof args.path === "string" ? args.path : "";
 
       if (effect !== "mutate") return inner.run(name, args, opts);
+
+      // A patch names its targets inside the diff, so it is checkpointed path by path before the
+      // call is made — see `patchPaths`, and the revert gap it closes.
+      if (name === "apply_patch") {
+        const paths = patchPaths(typeof args.patch === "string" ? args.patch : "");
+        if (paths.length === 0) {
+          // A patch whose targets cannot be read is a mutation this checkpoint cannot track. Saying
+          // so beats the alternative, which is claiming a revert that would not happen.
+          checkpoint.noteUntracked("applied a patch whose target files could not be read from it");
+          return inner.run(name, args, opts);
+        }
+        for (const p of paths) {
+          if (!checkpoint.has(p)) checkpoint.captureBefore(p, await readOrNull(inner, p));
+        }
+        const res = await inner.run(name, args, opts);
+        // Same rule as the single-file writers: a cancelled write never happened. A *failed* patch
+        // changed nothing (the host fails the whole patch on any hunk mismatch), so `after` reads
+        // back as it was.
+        if (!res.ok && /stopped by you/.test(res.output)) return res;
+        for (const p of paths) checkpoint.setAfter(p, res.ok ? await readOrNull(inner, p) : null);
+        return res;
+      }
 
       if (!FILE_WRITERS.has(name) || !path) {
         // `mkdir` makes a directory; `run_command` can do anything. Neither has a file body to
