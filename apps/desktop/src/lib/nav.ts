@@ -40,6 +40,7 @@ export const NAV: readonly NavGroup[] = [
     group: "Workspace",
     items: [
       { id: "assistant", label: "Assistant", icon: "chat" },
+      { id: "compare", label: "Compare", icon: "compare" },
       { id: "models", label: "Model Browser", icon: "cube" },
       { id: "activity", label: "Activity", icon: "clock" },
     ],

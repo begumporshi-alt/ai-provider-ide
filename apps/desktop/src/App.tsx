@@ -10,6 +10,7 @@ import { Shell } from "./components/Shell";
 import { ProvidersScreen } from "./screens/Providers";
 import { ModelsScreen } from "./screens/Models";
 import { AssistantScreen } from "./screens/Assistant";
+import { CompareScreen } from "./screens/Compare";
 import { ActivityScreen } from "./screens/Activity";
 import { ContextScreen } from "./screens/Context";
 import { HistoryScreen } from "./screens/History";
@@ -89,6 +90,7 @@ export default function App() {
       {screen === "providers" && <ProvidersScreen />}
       {screen === "models" && <ModelsScreen />}
       {screen === "assistant" && <AssistantScreen />}
+      {screen === "compare" && <CompareScreen />}
       {screen === "activity" && <ActivityScreen />}
       {screen === "context" && <ContextScreen />}
       {screen === "history" && <HistoryScreen />}

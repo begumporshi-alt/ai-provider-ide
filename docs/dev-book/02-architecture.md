@@ -85,7 +85,9 @@ stdio JSON-RPC, and their tools join the Assistant's registry (`lib/tools/mcp.ts
 `AGENT_TOOLS`, routed by `lib/tools/host.ts`). Effect discipline fails closed — a server's `readOnlyHint`
 annotation is the only thing that softens a tool toward `read`, absence is `mutate` and asks. The gateway's
 sandbox registry stays static: advertising third-party tools to every OpenAI-compatible client is a product
-decision, not a default.
+decision, not a default. The Compare screen (`screens/Compare.tsx`) is the other consumer of the bare
+generate port: its lanes call `gatewayGenerate` directly — one per model, concurrently, deliberately *not*
+through `runPlainTurn`, whose transcript/recorder/memory ports are Assistant-side singletons.
 
 Arrows point downward. **One relaxation is deliberate and must not be "fixed":** L3 services call L1 components
 directly (`onboarding-orchestrator` → probe/generator/contract, `drift-monitor` → generator), because those L1

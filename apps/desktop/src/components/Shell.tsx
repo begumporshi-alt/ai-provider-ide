@@ -22,6 +22,12 @@ import { NAV, screenLabel } from "../lib/nav";
 /** 15px stroke icons keyed by the `icon` strings in `nav.ts`. Stroke inherits currentColor. */
 const ICON_PATHS: Record<string, ReactNode> = {
   chat: <path d="M4 5.5h16v10H9.5L4 19.5v-14Z" />,
+  compare: (
+    <>
+      <rect x="4" y="5.5" width="6.5" height="13" rx="1" />
+      <rect x="13.5" y="5.5" width="6.5" height="13" rx="1" />
+    </>
+  ),
   cube: <path d="M12 3l8 4.5v9L12 21l-8-4.5v-9L12 3Zm0 0v9m8-4.5L12 12 4 7.5" />,
   clock: (
     <>
