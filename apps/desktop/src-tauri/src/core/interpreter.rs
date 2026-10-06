@@ -1233,6 +1233,34 @@ fn reasoning_values(
     ]
 }
 
+/// The counts one usage report becomes, with the cached-token fallback applied.
+///
+/// **Prompt tokens fall back to the cache count, and the fallback is the 2026-10-06 measurement.**
+/// `agent-router`'s Anthropic-shaped stream reports `cache_read_input_tokens` and omits
+/// `input_tokens` / `output_tokens` on the block our selector reads, so every ledger row for a
+/// real, billed request read `0 in / 0 out` while `cached_tokens` climbed — the counter said a
+/// request that plainly used tokens used none. The fallback is the rule a mature client applies
+/// (`input ?? cacheRead + cacheWrite`, the AI-SDK shape ZCode normalises with): a partial report
+/// is worse than a floor, and the floor is *labelled* — the cached column is written beside it, so
+/// a reader can see the input figure is exactly the cached portion.
+///
+/// **It is a floor, not the input.** Uncached input is unknowable from such a stream, so the
+/// number under-reports and must not be read as the full prompt count. It applies only when the
+/// report said **nothing** about prompt tokens — missing, not zero, the same distinction
+/// `cached_tokens: None` vs `Some(0)` keeps — and only when the cache count is non-zero; a report
+/// that named prompt tokens, even `0`, is believed as written.
+fn resolved_usage(
+    prompt: Option<u64>,
+    completion: Option<u64>,
+    cached: Option<u64>,
+) -> UsageTokens {
+    let prompt = match (prompt, cached) {
+        (None, Some(cached)) if cached > 0 => cached,
+        (named, _) => named.unwrap_or(0),
+    };
+    UsageTokens::new(prompt, completion.unwrap_or(0), cached)
+}
+
 /// A usage block, or `None` when it carried nothing readable.
 ///
 /// The three-part guard is the source's (`:321`): a provider that reports **only** cache fields
@@ -1255,7 +1283,7 @@ fn read_usage(map: &Map<String, Value>, keys: Option<&UsageKeys>) -> Option<Usag
     if prompt.is_none() && completion.is_none() && cached.is_none() {
         return None;
     }
-    Some(UsageTokens::new(prompt.unwrap_or(0), completion.unwrap_or(0), cached))
+    Some(resolved_usage(prompt, completion, cached))
 }
 
 /* ------------------------------------------------------------ text: stream */
@@ -1402,9 +1430,9 @@ impl TextStream<'_> {
         }
         if let Some(usage) = self.last_usage {
             if let Some(cb) = self.on_usage.as_deref_mut() {
-                cb(UsageTokens::new(
-                    usage.prompt_tokens.unwrap_or(0),
-                    usage.completion_tokens.unwrap_or(0),
+                cb(resolved_usage(
+                    usage.prompt_tokens,
+                    usage.completion_tokens,
                     usage.cached_tokens,
                 ));
             }
@@ -3478,6 +3506,58 @@ mod tests {
         assert_eq!(out, vec![Ok("done".to_string())], "the trailing chunks carry no delta");
         let usage = seen.lock().unwrap().expect("the trailing usage chunk was read");
         assert_eq!(usage.counts(), (120, 34));
+    }
+
+    /// **The cached-token fallback, from the 2026-10-06 measurement.** `agent-router`'s
+    /// Anthropic-shaped stream reports only `cache_read_input_tokens` on the block the selector
+    /// reads, so every ledger row for a request it plainly billed read `0 in / 0 out` while
+    /// `cached_tokens` climbed. A report naming no prompt tokens now falls back to the cache count
+    /// — a labelled floor, never presented as the input — and nothing is invented on the way out:
+    /// a report that named output tokens, or none, still says exactly that.
+    #[tokio::test]
+    async fn a_usage_block_reporting_only_cached_tokens_falls_back_to_them_for_the_prompt_count() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line("done"),
+            r#"data: {"choices":[],"usage":{"cache_read_input_tokens":4480}}"#,
+            "data: [DONE]",
+        ])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+
+        let seen: Arc<Mutex<Option<UsageTokens>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let mut on_usage = move |u: UsageTokens| *sink.lock().unwrap() = Some(u);
+        let mut args = text_args("m");
+        args.on_usage = Some(&mut on_usage);
+        drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        let usage = seen.lock().unwrap().expect("the usage block was read");
+        assert_eq!(usage.prompt_tokens, 4480, "the floor stands in for the missing prompt count");
+        assert_eq!(usage.cached_tokens, Some(4480), "and the cached column still shows it is a floor");
+        assert_eq!(usage.completion_tokens, 0, "nothing reported output, and none is invented");
+    }
+
+    /// The other half of the rule: **missing, not zero.** A report that named prompt tokens —
+    /// even `0` — is believed as written, because zero is a measurement and the fallback exists
+    /// only for the absence of one.
+    #[tokio::test]
+    async fn a_reported_prompt_count_of_zero_is_believed_over_the_cache_count() {
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line("done"),
+            r#"data: {"choices":[],"usage":{"prompt_tokens":0,"cache_read_input_tokens":500}}"#,
+            "data: [DONE]",
+        ])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+
+        let seen: Arc<Mutex<Option<UsageTokens>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let mut on_usage = move |u: UsageTokens| *sink.lock().unwrap() = Some(u);
+        let mut args = text_args("m");
+        args.on_usage = Some(&mut on_usage);
+        drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        let usage = seen.lock().unwrap().expect("the usage block was read");
+        assert_eq!(usage.prompt_tokens, 0, "a named zero is a measurement, not a gap");
+        assert_eq!(usage.cached_tokens, Some(500));
     }
 
     /// The Gemini dialect exercises all three grammar features at once: `{{model}}` in the path
