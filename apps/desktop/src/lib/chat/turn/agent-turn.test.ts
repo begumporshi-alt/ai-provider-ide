@@ -115,6 +115,36 @@ function makeRequest(over: Partial<AgentTurnRequest> = {}): AgentTurnRequest {
 }
 
 describe("runAgentTurn", () => {
+  /**
+   * The seam that hid this is the replace, not the fill. `onReplaceTranscript` mints a fresh id for
+   * every message, so a notice filled *after* the replace by the optimistic message's id matches
+   * nothing — which is exactly how a ceiling exit stayed a blank bubble with the step label
+   * correctly recorded (measured again 2026-10-06, run-1791294635622, 40 iterations). The notice has
+   * to be in the content the replace hands over; that is what this asserts, and it fails against
+   * the by-id fill.
+   */
+  it("writes the ceiling notice into the closing turn, where the replace cannot lose it", async () => {
+    // A model that never stops calling tools: one iteration runs, the budget ends, and the loop
+    // exits with empty text — the shape that produced the blank bubble.
+    const { ports, runs } = makePorts({
+      steps: [{ text: "", calls: [{ id: "c1", name: "read_file", arguments: "{}" }] }],
+    });
+    await runAgentTurn(makeRequest({ maxIterations: 1, useMemory: false }), ports);
+
+    const replaced = (ports.onReplaceTranscript as ReturnType<typeof vi.fn>).mock
+      .calls[0]?.[0] as { role: string; content: string }[] | undefined;
+    expect(replaced, "the transcript was replaced").toBeTruthy();
+    const closing = replaced![replaced!.length - 1]!;
+    expect(closing.role).toBe("assistant");
+    expect(closing.content, "the notice travels inside the message").toContain("stopped at 1 iterations");
+    expect(closing.content).toContain("step budget");
+    // Nothing an id-based fill could have done: the replace already threw the old id away.
+    expect(closing.content.trim(), "and it is not empty").not.toBe("");
+    // The run does not report a clean finish either — the dashboard row says what happened.
+    const ended = runs.ended[0] as unknown[] | undefined;
+    expect(ended?.[1], "a ceiling exit is not ok").toBe("error");
+  });
+
   it("refuses the run without a workspace root, undoing the optimistic append", async () => {
     const { ports } = makePorts({});
     await runAgentTurn(makeRequest({ root: "   " }), ports);

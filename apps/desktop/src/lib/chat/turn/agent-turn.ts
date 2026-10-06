@@ -186,7 +186,22 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // The loop terminates the moment it sees an answer with no tool calls, but it does NOT append
     // that final assistant turn — `text` is the answer and `messages` is what came before. Append
     // it so the UI and the context graph both see the closing line.
-    const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: finalText }];
+    //
+    // **A ceiling exit's closing line is written here, before the replace, and that ordering is the
+    // whole fix.** `finalText` is empty on that exit — the last iteration was pure tool_use, so the
+    // model was working rather than answering — and the first attempt at saying so filled the
+    // bubble *after* the replace, by the optimistic message id. The replace mints a fresh id for
+    // every message (`newMsgId()` in the map below), so that lookup matched nothing and the notice
+    // vanished: measured again 2026-10-06 (run-1791294635622, 40 iterations, the step label
+    // recorded and the bubble still blank). Writing the notice into the content means the
+    // transcript, the context graph and the next turn's replayed history all carry it, and no id
+    // has to survive a replace for the user to be told what happened.
+    const closedOnCeiling = !finalText.trim() && hitCeiling;
+    const closingText = closedOnCeiling
+      ? `⚠ stopped at ${iterations} iterations — the step budget ran out while the model was still ` +
+        "calling tools. Raise “Steps” in the run configuration to let it go further."
+      : finalText;
+    const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: closingText }];
     ports.onReplaceTranscript(
       fullMessages.map((m) => ({
         id: newMsgId(),
@@ -203,18 +218,6 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // the whole transcript, so slicing off the replayed prefix is what keeps an earlier turn from
     // being re-recorded — and keeps the graph linear in turns.
     ports.lastNode.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), req.model);
-    // A ceiling exit's last iteration is usually pure tool_use — the model was verifying, not
-    // answering — so `finalText` arrives empty and appending it as-is is the bare assistant bubble
-    // that read as a hang (measured 2026-10-06: a run ended ok at 20 iterations with two pending
-    // `run_command` results and nothing to show for the turn). Say what actually stopped the turn,
-    // the way the stopped and failed paths below already do.
-    if (!finalText.trim() && hitCeiling) {
-      ports.fillIfEmpty(
-        req.assistantMsgId,
-        `⚠ stopped at ${iterations} iterations — the step budget ran out while the model was still ` +
-          "calling tools. Raise “Steps” in the run configuration to let it go further.",
-      );
-    }
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
     // it is an extra model call, and a slow or failing one must not hold up the answer the
     // user is already reading.
@@ -229,12 +232,32 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // The trace said `✓` for a turn the user had cancelled, same lie the plain-chat path
     // already stopped telling (it marks "stopped by you" in its own trace).
     const stopped = req.controller.signal.aborted;
-    ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations);
+    // A ceiling exit is not `ok` either. The run did what it was told — it stopped at the budget —
+    // but it stopped mid-work with no answer, and a dashboard row that says `ok` for that is the
+    // same lie as a blank bubble: the reader has to open the steps to find out nothing finished.
+    if (closedOnCeiling) {
+      ports.orchestrator.endRun(
+        runId,
+        stopped ? "stopped" : "error",
+        iterations,
+        stopped
+          ? undefined
+          : `step ceiling: ${iterations} iterations, the model was still calling tools`,
+      );
+    } else {
+      // Arity kept at three for the clean paths, as it was: only a run that ended for a reason
+      // carries one, which is also how the catch path below already calls it.
+      ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations);
+    }
     ports.onTrace({
       ms: ports.now() - req.startedAt,
       fallbacks: chain,
       provider: "agent",
-      ...(stopped ? { error: "stopped by you" } : {}),
+      ...(stopped
+        ? { error: "stopped by you" }
+        : closedOnCeiling
+          ? { error: `stopped at ${iterations} iterations — the step ceiling` }
+          : {}),
     });
   } catch (e) {
     // The turn's own bubble, not only the trace line. A failed agent run left an empty
