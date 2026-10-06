@@ -343,7 +343,20 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0021_ledger_failure_detail", add_ledger_failure_detail),
     ("0022_manifest_thinking_placeholder", backfill_manifest_thinking_placeholder),
     ("0023_idempotency_keys", create_idempotency_keys),
+    ("0024_agent_runs_parent", add_agent_runs_parent),
 ];
+
+/// 0024 — the delegation tree. `dispatch_agent` spawns a nested agent run; until now the child
+/// had no column naming its parent, so "what did the main run delegate, and what came back?"
+/// was unanswerable from the ledger — the Subagents screen needs the edge, not just two rows.
+///
+/// **Nullable on purpose.** A top-level run has no parent, and `''` would be a fake id.
+fn add_agent_runs_parent(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "agent_runs", "parent_run_id")? {
+        tx.execute_batch("ALTER TABLE agent_runs ADD COLUMN parent_run_id TEXT;")?;
+    }
+    Ok(())
+}
 
 /// §A3: the replay cache behind `Idempotency-Key` on `POST /v1/chat/completions`.
 ///
@@ -1440,10 +1453,10 @@ mod tests {
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
         // 0001 schema_v1_1 .. 0006 memories, then the 0007..0023 data migrations.
-        assert_eq!(info.schema_version, 23);
+        assert_eq!(info.schema_version, 24);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(23, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(24, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

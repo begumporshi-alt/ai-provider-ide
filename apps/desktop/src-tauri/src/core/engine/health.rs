@@ -4,7 +4,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use super::taxonomy::{COOLDOWN_FLOOR_MS, ErrorClass};
+use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
 use crate::core::persist::{ApiKeyRow, ProviderRow};
 
 /// Consecutive auth failures before a key is treated as invalid rather than merely unlucky.

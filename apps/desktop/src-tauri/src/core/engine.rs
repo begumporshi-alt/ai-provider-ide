@@ -40,22 +40,17 @@
 //! (`health-tracker.ts:23-25`); here they share one constant, and
 //! `the_enforced_floor_and_the_reported_floor_agree` is what keeps it that way.
 
-
-
-
 // ---------- the error taxonomy (moved verbatim to engine/taxonomy.rs, D98 phase 1) ----------
 
 pub mod taxonomy;
 
 pub use taxonomy::*;
 
-
 // ---------- attempt records + per-attempt policy (moved verbatim to engine/attempt.rs, D98 phase 2) ----------
 
 pub mod attempt;
 
 pub use attempt::*;
-
 
 // ---------- the plan, and the image loop over it ----------
 
@@ -70,7 +65,6 @@ pub use attempt::*;
 // (A plain comment, not a doc comment: there is no item here for it to document any more, and
 // clippy's `empty_line_after_doc_comments` would otherwise attach it to `transport_outcome`.)
 
-
 /// The root's own wall clock — the "no shared clock" convention: each module carries its copy.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
@@ -84,7 +78,6 @@ fn now_ms() -> i64 {
 pub mod image;
 
 pub use image::*;
-
 
 /// `AllAttemptsFailedError` — every candidate the budget allowed was tried, and none served.
 ///
@@ -162,26 +155,24 @@ pub mod text;
 
 pub use text::*;
 
-
 // ---------- the health records (moved verbatim to engine/health.rs, D98 phase 3) ----------
 
 pub mod health;
 
 pub use health::*;
 
-
 #[cfg(test)]
 mod tests {
+    use super::*;
     use futures_util::StreamExt;
     use std::time::Duration;
-    use super::*;
     // Only the tests name the model row: the engine reads a candidate's `model.native_id` without
     // ever spelling the type, so importing it at the top would be unused in a non-test build.
     use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs, ToolCall};
     use crate::core::limiter::ProviderLimiter;
+    use crate::core::persist::{ApiKeyRow, ModelRow, ProviderRow};
     use crate::core::planner::Candidate;
     use crate::core::usage::UsageTokens;
-    use crate::core::persist::{ApiKeyRow, ModelRow, ProviderRow};
 
     fn outcome(cls: ErrorClass, status: u16, retry_after_ms: Option<u64>) -> AttemptOutcome {
         AttemptOutcome { cls, status, retry_after_ms, reason: None, label: None }
@@ -2373,8 +2364,7 @@ mod tests {
         // candidate, so the old `Next => continue` exhausted the plan on the first 500 and a
         // transient upstream blip became a hard failure. The re-probe is the wait-and-redial the
         // plan had nowhere left to do.
-        let adapter = TextScripted::new(vec![refused(503), chunks_of(&["recovered"])])
-            .shared();
+        let adapter = TextScripted::new(vec![refused(503), chunks_of(&["recovered"])]).shared();
         let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
 
@@ -2391,10 +2381,7 @@ mod tests {
 
         assert_eq!(served.candidate.provider.id, "p1", "the same candidate serves");
         assert_eq!(adapter.calls().len(), 2, "the same key was dialled twice");
-        assert_eq!(
-            adapter.calls(),
-            vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],
-        );
+        assert_eq!(adapter.calls(), vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],);
         assert_eq!(served.attempts.len(), 1, "the 500 stays in the chain");
         assert_eq!(served.attempts[0].cls, ErrorClass::ServerError);
         assert_eq!(served.attempts[0].status, 503);

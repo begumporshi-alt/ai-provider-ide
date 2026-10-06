@@ -76,7 +76,8 @@ fn rounds_of(seen: &[Value]) -> Vec<(Value, Vec<Value>)> {
 }
 
 fn assert_conversation(seen: &[Value], expected: &Value, name: &str, call_n: usize) {
-    let fail = |detail: String| format!("conformance scenario \"{name}\", model call {call_n}: {detail}");
+    let fail =
+        |detail: String| format!("conformance scenario \"{name}\", model call {call_n}: {detail}");
 
     let rounds = rounds_of(seen);
     let expected_rounds = expected
@@ -96,11 +97,8 @@ fn assert_conversation(seen: &[Value], expected: &Value, name: &str, call_n: usi
 
     for (i, (round, want_round)) in rounds.iter().zip(expected_rounds).enumerate() {
         let (assistant, results) = round;
-        let wire_calls = assistant
-            .get("tool_calls")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let wire_calls =
+            assistant.get("tool_calls").and_then(Value::as_array).cloned().unwrap_or_default();
         let want_calls = want_round
             .get("assistantToolCalls")
             .and_then(Value::as_array)
@@ -132,11 +130,8 @@ fn assert_conversation(seen: &[Value], expected: &Value, name: &str, call_n: usi
             );
         }
 
-        let want_results = want_round
-            .get("toolResults")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
+        let want_results =
+            want_round.get("toolResults").and_then(Value::as_array).cloned().unwrap_or_default();
         assert_eq!(
             results.len(),
             want_results.len(),
@@ -146,10 +141,7 @@ fn assert_conversation(seen: &[Value], expected: &Value, name: &str, call_n: usi
 
         for (j, (result, want_result)) in results.iter().zip(&want_results).enumerate() {
             let id = result.get("tool_call_id").and_then(Value::as_str).unwrap_or_default();
-            let declared = wire_calls
-                .get(j)
-                .and_then(|c| c.get("id"))
-                .and_then(Value::as_str);
+            let declared = wire_calls.get(j).and_then(|c| c.get("id")).and_then(Value::as_str);
             assert_eq!(
                 Some(id),
                 declared,
@@ -169,7 +161,12 @@ fn assert_conversation(seen: &[Value], expected: &Value, name: &str, call_n: usi
             }
             if want_result.get("nonEmpty").and_then(Value::as_bool).unwrap_or(false) {
                 assert!(
-                    !result.get("content").and_then(Value::as_str).unwrap_or_default().trim().is_empty(),
+                    !result
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .is_empty(),
                     "{}",
                     fail(format!("round {} result {}: content is empty", i + 1, j + 1))
                 );
@@ -204,10 +201,7 @@ async fn run_scenario(sc: &Value) {
         adapter.text_calls(),
         model_calls,
         "{}",
-        fail(format!(
-            "expected {model_calls} model calls, made {}",
-            adapter.text_calls()
-        ))
+        fail(format!("expected {model_calls} model calls, made {}", adapter.text_calls()))
     );
 
     let final_text = delta_text(&msgs);

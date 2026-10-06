@@ -2582,8 +2582,13 @@ mod tests {
         .body;
         let builtin =
             crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
-        let rendered = rendered_body_full(&builtin, body["messages"].as_array().expect("messages").clone(), None, None)
-            .await;
+        let rendered = rendered_body_full(
+            &builtin,
+            body["messages"].as_array().expect("messages").clone(),
+            None,
+            None,
+        )
+        .await;
         assert_eq!(
             rendered["messages"][2]["content"],
             json!([
@@ -3532,7 +3537,11 @@ mod tests {
 
         let usage = seen.lock().unwrap().expect("the usage block was read");
         assert_eq!(usage.prompt_tokens, 4480, "the floor stands in for the missing prompt count");
-        assert_eq!(usage.cached_tokens, Some(4480), "and the cached column still shows it is a floor");
+        assert_eq!(
+            usage.cached_tokens,
+            Some(4480),
+            "and the cached column still shows it is a floor"
+        );
         assert_eq!(usage.completion_tokens, 0, "nothing reported output, and none is invented");
     }
 

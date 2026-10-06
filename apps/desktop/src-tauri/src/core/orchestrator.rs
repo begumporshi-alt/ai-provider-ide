@@ -19,6 +19,9 @@ use crate::core::store::Store;
 pub struct AgentRun {
     pub id: String,
     pub session_id: Option<String>,
+    /// The run that delegated this one, if any — `None` for top-level runs. The edge the
+    /// Subagents screen's tree is drawn from.
+    pub parent_run_id: Option<String>,
     pub model: String,
     /// `running` until the run ends one way or another. A run left `running` by a crash is
     /// reported as running rather than silently marked failed — a status we did not observe is
@@ -56,6 +59,7 @@ pub fn start(
     store: &Store,
     id: String,
     session_id: Option<String>,
+    parent_run_id: Option<String>,
     model: String,
     prompt: Option<String>,
 ) -> Result<(), String> {
@@ -64,10 +68,10 @@ pub fn start(
     }
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "INSERT INTO agent_runs (id, session_id, model, status, prompt, iterations, tool_calls, started_at)
-         VALUES (?1,?2,?3,'running',?4,0,0,?5)
+        "INSERT INTO agent_runs (id, session_id, parent_run_id, model, status, prompt, iterations, tool_calls, started_at)
+         VALUES (?1,?2,?3,?4,'running',?5,0,0,?6)
          ON CONFLICT(id) DO UPDATE SET model=excluded.model, prompt=excluded.prompt",
-        rusqlite::params![id, session_id, model, prompt, now_ms()],
+        rusqlite::params![id, session_id, parent_run_id, model, prompt, now_ms()],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -132,7 +136,7 @@ pub fn runs(store: &Store, limit: usize) -> Result<Vec<AgentRun>, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, model, status, prompt, iterations, tool_calls, started_at, ended_at, error
+            "SELECT id, session_id, parent_run_id, model, status, prompt, iterations, tool_calls, started_at, ended_at, error
              FROM agent_runs ORDER BY started_at DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -141,14 +145,15 @@ pub fn runs(store: &Store, limit: usize) -> Result<Vec<AgentRun>, String> {
             Ok(AgentRun {
                 id: r.get(0)?,
                 session_id: r.get(1)?,
-                model: r.get(2)?,
-                status: r.get(3)?,
-                prompt: r.get(4)?,
-                iterations: r.get(5)?,
-                tool_calls: r.get(6)?,
-                started_at: r.get(7)?,
-                ended_at: r.get(8)?,
-                error: r.get(9)?,
+                parent_run_id: r.get(2)?,
+                model: r.get(3)?,
+                status: r.get(4)?,
+                prompt: r.get(5)?,
+                iterations: r.get(6)?,
+                tool_calls: r.get(7)?,
+                started_at: r.get(8)?,
+                ended_at: r.get(9)?,
+                error: r.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -190,7 +195,7 @@ mod orchestrator_tests {
     #[test]
     fn a_run_is_recorded_as_it_happens_not_at_the_end() {
         let (s, d) = temp_store("record");
-        start(&s, "r1".into(), Some("s1".into()), "m".into(), Some("do it".into())).unwrap();
+        start(&s, "r1".into(), Some("s1".into()), None, "m".into(), Some("do it".into())).unwrap();
         step(&s, "r1", "tool_call".into(), Some("read_file".into()), None, None).unwrap();
         step(
             &s,
@@ -210,9 +215,25 @@ mod orchestrator_tests {
     }
 
     #[test]
+    fn a_delegated_run_carries_its_parent_link() {
+        // The Subagents screen's tree is this column: a child row names the run that spawned it,
+        // a top-level row has none.
+        let (s, d) = temp_store("parent");
+        start(&s, "p1".into(), None, None, "m".into(), Some("main task".into())).unwrap();
+        start(&s, "c1".into(), None, Some("p1".into()), "m".into(), Some("the delegated slice".into())).unwrap();
+        let all = runs(&s, 10).unwrap();
+        assert_eq!(all.len(), 2);
+        let child = all.iter().find(|r| r.id == "c1").expect("child recorded");
+        assert_eq!(child.parent_run_id.as_deref(), Some("p1"));
+        let parent = all.iter().find(|r| r.id == "p1").expect("parent recorded");
+        assert_eq!(parent.parent_run_id, None, "a top-level run has no parent");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
     fn steps_come_back_in_order_even_within_one_millisecond() {
         let (s, d) = temp_store("order");
-        start(&s, "r1".into(), None, "m".into(), None).unwrap();
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         for i in 0..5 {
             step(&s, "r1", "tool_call".into(), Some(format!("t{i}")), None, None).unwrap();
         }
@@ -227,7 +248,7 @@ mod orchestrator_tests {
     #[test]
     fn finishing_records_the_outcome_and_the_duration_is_derivable() {
         let (s, d) = temp_store("finish");
-        start(&s, "r1".into(), None, "m".into(), None).unwrap();
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         finish(&s, "r1", "ok".into(), 3, None).unwrap();
         let all = runs(&s, 10).unwrap();
         assert_eq!(all[0].status, "ok");
@@ -239,7 +260,7 @@ mod orchestrator_tests {
     #[test]
     fn a_crashed_run_stays_running_because_we_did_not_observe_otherwise() {
         let (s, d) = temp_store("crash");
-        start(&s, "r1".into(), None, "m".into(), None).unwrap();
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         assert_eq!(runs(&s, 10).unwrap()[0].status, "running");
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -247,7 +268,7 @@ mod orchestrator_tests {
     #[test]
     fn unknown_vocabularies_are_refused() {
         let (s, d) = temp_store("vocab");
-        start(&s, "r1".into(), None, "m".into(), None).unwrap();
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         assert!(step(&s, "r1", "telepathy".into(), None, None, None).is_err());
         assert!(finish(&s, "r1", "maybe".into(), 0, None).is_err());
         let _ = std::fs::remove_dir_all(&d);
@@ -256,7 +277,7 @@ mod orchestrator_tests {
     #[test]
     fn deleting_a_run_takes_its_steps_with_it() {
         let (s, d) = temp_store("cascade");
-        start(&s, "r1".into(), None, "m".into(), None).unwrap();
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         step(&s, "r1", "tool_call".into(), Some("t".into()), None, None).unwrap();
         {
             let conn = s.conn.lock().unwrap();

@@ -297,10 +297,11 @@ pub fn agent_run_start(
     store: State<'_, Arc<Store>>,
     id: String,
     session_id: Option<String>,
+    parent_run_id: Option<String>,
     model: String,
     prompt: Option<String>,
 ) -> Result<(), CommandError> {
-    orchestrator::start(&store, id, session_id, model, prompt).map_err(CommandError)
+    orchestrator::start(&store, id, session_id, parent_run_id, model, prompt).map_err(CommandError)
 }
 
 #[tauri::command]

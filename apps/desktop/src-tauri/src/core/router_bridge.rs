@@ -69,8 +69,8 @@ use crate::core::bridge_policy::{
 use crate::core::engine::TextFailure;
 use crate::core::gateway::{gateway_tool_refusal, Bridge, BridgeMsg, BridgeRequest, ReplyHandle};
 use crate::core::gateway_normalizer::{detect_client, normalize_gateway_request, NormalizeOptions};
-use crate::core::router::{chain_value, 
-    CallOptions, ImageRequest, ModelRouter, RouterError, RouterSettings, RouterStore,
+use crate::core::router::{
+    chain_value, CallOptions, ImageRequest, ModelRouter, RouterError, RouterSettings, RouterStore,
 };
 use crate::core::tool_registry::{gateway_tool_set, registry_to_openai};
 use crate::core::tool_wire::to_wire_tool_calls;
@@ -445,7 +445,9 @@ impl Job {
                         success.candidate.model.native_id.clone(),
                         success.candidate.key.label.clone(),
                     ));
-                    fallbacks.extend(chain_value(&success.attempts).as_array().cloned().unwrap_or_default());
+                    fallbacks.extend(
+                        chain_value(&success.attempts).as_array().cloned().unwrap_or_default(),
+                    );
                 }
                 // Cancellation is not a failure to report — the client asked us to stop, so there is
                 // nobody left to read a status code.

@@ -111,11 +111,9 @@ pub struct RefreshOutcome {
 pub fn servers_config(store: &Store) -> Vec<McpServerConfig> {
     let raw: Option<String> = {
         let conn = store.conn.lock().unwrap();
-        conn.query_row(
-            "SELECT value_json FROM settings WHERE key = ?",
-            [SETTINGS_KEY],
-            |r| r.get(0),
-        )
+        conn.query_row("SELECT value_json FROM settings WHERE key = ?", [SETTINGS_KEY], |r| {
+            r.get(0)
+        })
         .ok()
     };
     let Some(raw) = raw else { return Vec::new() };
@@ -131,10 +129,7 @@ pub fn save_servers_config(store: &Store, servers: &[McpServerConfig]) -> Result
             return Err(format!("server id {:?} must be 1-32 characters", s.id));
         }
         if !s.id.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
-            return Err(format!(
-                "server id {:?} may only use letters, digits, '_' and '-'",
-                s.id
-            ));
+            return Err(format!("server id {:?} may only use letters, digits, '_' and '-'", s.id));
         }
         if !seen.insert(s.id.clone()) {
             return Err(format!("duplicate server id {:?}", s.id));
@@ -204,24 +199,14 @@ impl McpClient {
             cmd.as_std_mut().process_group(0);
         }
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| format!("could not start MCP server {:?}: {e}", cfg.id))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| format!("MCP server {:?} gave no stdin", cfg.id))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| format!("MCP server {:?} gave no stdout", cfg.id))?;
+        let mut child =
+            cmd.spawn().map_err(|e| format!("could not start MCP server {:?}: {e}", cfg.id))?;
+        let stdin =
+            child.stdin.take().ok_or_else(|| format!("MCP server {:?} gave no stdin", cfg.id))?;
+        let stdout =
+            child.stdout.take().ok_or_else(|| format!("MCP server {:?} gave no stdout", cfg.id))?;
 
-        let mut client = McpClient {
-            child,
-            stdin,
-            stdout: BufReader::new(stdout),
-            next_id: 0,
-        };
+        let mut client = McpClient { child, stdin, stdout: BufReader::new(stdout), next_id: 0 };
         client
             .request(
                 "initialize",
@@ -248,17 +233,14 @@ impl McpClient {
     ) -> Result<Value, String> {
         self.next_id += 1;
         let id = self.next_id;
-        let mut line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params })
-            .to_string();
+        let mut line =
+            json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params }).to_string();
         line.push('\n');
         self.stdin
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("{method}: the server closed stdin ({e})"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("{method}: could not flush stdin ({e})"))?;
+        self.stdin.flush().await.map_err(|e| format!("{method}: could not flush stdin ({e})"))?;
 
         let wait = async {
             loop {
@@ -300,10 +282,7 @@ impl McpClient {
             .write_all(line.as_bytes())
             .await
             .map_err(|e| format!("{method}: the server closed stdin ({e})"))?;
-        self.stdin
-            .flush()
-            .await
-            .map_err(|e| format!("{method}: could not flush stdin ({e})"))
+        self.stdin.flush().await.map_err(|e| format!("{method}: could not flush stdin ({e})"))
     }
 
     /// The server's tools, following cursors.
@@ -335,11 +314,7 @@ impl McpClient {
     /// genuine `isError` from the server is the tool's answer and must not be retried.
     async fn call_tool(&mut self, name: &str, arguments: &Value) -> Result<ToolResult, String> {
         let result = self
-            .request(
-                "tools/call",
-                json!({ "name": name, "arguments": arguments }),
-                CALL_TIMEOUT_MS,
-            )
+            .request("tools/call", json!({ "name": name, "arguments": arguments }), CALL_TIMEOUT_MS)
             .await?;
         let is_error = result.get("isError").and_then(Value::as_bool).unwrap_or(false);
         let mut text = String::new();
@@ -358,7 +333,9 @@ impl McpClient {
                         if !text.is_empty() {
                             text.push('\n');
                         }
-                        text.push_str(&format!("[non-text content of type {other:?} arrived — not rendered]"));
+                        text.push_str(&format!(
+                            "[non-text content of type {other:?} arrived — not rendered]"
+                        ));
                     }
                     None => {}
                 }
@@ -380,14 +357,13 @@ fn tool_info(server: &str, entry: &Value) -> Option<McpToolInfo> {
     if tool.is_empty() {
         return None;
     }
-    let read_only = entry
-        .pointer("/annotations/readOnlyHint")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let read_only =
+        entry.pointer("/annotations/readOnlyHint").and_then(Value::as_bool).unwrap_or(false);
     // Only an object schema passes through; anything else the server declares becomes an empty
     // object schema, which the model reads as "no arguments" rather than as an uncallable tool.
     let schema_is_object =
-        entry.get("inputSchema").and_then(|s| s.get("type")).and_then(Value::as_str) == Some("object");
+        entry.get("inputSchema").and_then(|s| s.get("type")).and_then(Value::as_str)
+            == Some("object");
     let parameters = if schema_is_object {
         let s = entry.get("inputSchema").expect("checked above");
         json!({
@@ -401,10 +377,7 @@ fn tool_info(server: &str, entry: &Value) -> Option<McpToolInfo> {
         server: server.to_string(),
         tool: tool.to_string(),
         full_name: format!("mcp_{server}_{tool}"),
-        description: entry
-            .get("description")
-            .and_then(Value::as_str)
-            .map(str::to_string),
+        description: entry.get("description").and_then(Value::as_str).map(str::to_string),
         read_only,
         parameters,
     })
@@ -424,10 +397,8 @@ impl McpState {
     /// costs the healthy servers nothing; connections for servers no longer configured or
     /// disabled are dropped (killing their processes via `Drop`).
     pub async fn refresh(&self, store: &Store) -> RefreshOutcome {
-        let enabled: Vec<McpServerConfig> = servers_config(store)
-            .into_iter()
-            .filter(|s| s.enabled)
-            .collect();
+        let enabled: Vec<McpServerConfig> =
+            servers_config(store).into_iter().filter(|s| s.enabled).collect();
         let mut tools = Vec::new();
         let mut failures = Vec::new();
         let live: std::collections::HashSet<String> =
@@ -493,9 +464,7 @@ impl McpState {
         tool: &str,
         arguments: Value,
     ) -> ToolResult {
-        let Some(cfg) = servers_config(store)
-            .into_iter()
-            .find(|s| s.id == server && s.enabled)
+        let Some(cfg) = servers_config(store).into_iter().find(|s| s.id == server && s.enabled)
         else {
             return ToolResult::err(format!("unknown or disabled MCP server \"{server}\""));
         };
@@ -653,7 +622,8 @@ for line in sys.stdin:
         // A corrupt row reads as "no servers" rather than taking the feature down.
         {
             let conn = store.conn.lock().unwrap();
-            conn.execute("UPDATE settings SET value_json = 'not json' WHERE key = 'mcp'", []).unwrap();
+            conn.execute("UPDATE settings SET value_json = 'not json' WHERE key = 'mcp'", [])
+                .unwrap();
         }
         assert!(servers_config(&store).is_empty(), "garbage collapses to empty");
     }
@@ -683,9 +653,13 @@ for line in sys.stdin:
         .unwrap();
         assert!(hinted.read_only, "the hint is the only path to read");
 
-        let coerced = tool_info("srv", &json!({ "name": "t", "inputSchema": { "type": "string" } })).unwrap();
-        assert_eq!(coerced.parameters, json!({ "properties": {}, "required": [] }),
-            "a non-object schema becomes an empty object schema, not an uncallable tool");
+        let coerced =
+            tool_info("srv", &json!({ "name": "t", "inputSchema": { "type": "string" } })).unwrap();
+        assert_eq!(
+            coerced.parameters,
+            json!({ "properties": {}, "required": [] }),
+            "a non-object schema becomes an empty object schema, not an uncallable tool"
+        );
 
         assert!(tool_info("srv", &json!({ "description": "no name" })).is_none());
     }
@@ -706,18 +680,28 @@ for line in sys.stdin:
         let tick = tool_info("test", &tools[1]).expect("tick is a tool");
         assert!(tick.read_only, "readOnlyHint travels");
 
-        let ok = client.call_tool("echo", &json!({ "text": "hi" })).await.expect("the call reaches the server");
+        let ok = client
+            .call_tool("echo", &json!({ "text": "hi" }))
+            .await
+            .expect("the call reaches the server");
         assert!(ok.ok);
         assert_eq!(ok.output, "echo: hi");
 
         // A server-side isError is the tool's answer, not a transport failure.
-        let failed = client.call_tool("no_such", &json!({})).await.expect("the call still reaches the server");
+        let failed = client
+            .call_tool("no_such", &json!({}))
+            .await
+            .expect("the call still reaches the server");
         assert!(!failed.ok);
         assert_eq!(failed.output, "no such tool here");
 
-        let silent = client.call_tool("silent", &json!({})).await.expect("the call reaches the server");
+        let silent =
+            client.call_tool("silent", &json!({})).await.expect("the call reaches the server");
         assert!(silent.ok);
-        assert_eq!(silent.output, "(no output)", "empty output is reported, not passed through as nothing");
+        assert_eq!(
+            silent.output, "(no output)",
+            "empty output is reported, not passed through as nothing"
+        );
     }
 
     #[tokio::test]
@@ -754,12 +738,14 @@ for line in sys.stdin:
             "a disabled server is not listed"
         );
         assert_eq!(outcome.failures.len(), 1, "got {:?}", outcome.failures);
-        assert!(outcome.failures[0].contains("broken"), "the failure names its server: {:?}", outcome.failures);
+        assert!(
+            outcome.failures[0].contains("broken"),
+            "the failure names its server: {:?}",
+            outcome.failures
+        );
 
         // And a call routes to the right server by id.
-        let called = state
-            .call(&store, "good", "echo", json!({ "text": "again" }))
-            .await;
+        let called = state.call(&store, "good", "echo", json!({ "text": "again" })).await;
         assert!(called.ok, "the refresh left a live connection behind");
         assert_eq!(called.output, "echo: again");
 

@@ -4,10 +4,8 @@
 //! `taxonomy::ErrorClass` and `planner::Candidate`; nothing here touches a provider.
 use std::time::Duration;
 
+use super::taxonomy::{classify, reason_from_body, BodyHint, ErrorClass, COOLDOWN_FLOOR_MS};
 use crate::core::planner::Candidate;
-use super::taxonomy::{
-    classify, reason_from_body, BodyHint, COOLDOWN_FLOOR_MS, ErrorClass,
-};
 
 /// Who tried, in the two names every reader of a chain actually uses.
 ///

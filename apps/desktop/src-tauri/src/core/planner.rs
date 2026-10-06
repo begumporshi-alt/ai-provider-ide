@@ -186,9 +186,7 @@ pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) ->
 // the planner only decides on the (failures, total) it is handed.
 fn currently_failing(provider_id: &str, ctx: &impl PlanContext) -> bool {
     match ctx.provider_recent_health(provider_id) {
-        Some((failures, total)) => {
-            total >= PROVIDER_HEALTH_MIN_SAMPLES && failures >= total
-        }
+        Some((failures, total)) => total >= PROVIDER_HEALTH_MIN_SAMPLES && failures >= total,
         None => false,
     }
 }
@@ -200,7 +198,10 @@ fn currently_failing(provider_id: &str, ctx: &impl PlanContext) -> bool {
 /// model.** The second asks "would this plan be non-empty if the keys were free", which is only a
 /// meaningful question against the *same* carrier resolution the first uses; a second copy of the
 /// loop would be a second spelling of one rule, free to drift from this one.
-fn servable_carriers(input: &PlanInput<'_>, ctx: &impl PlanContext) -> Vec<(ProviderRow, ModelRow)> {
+fn servable_carriers(
+    input: &PlanInput<'_>,
+    ctx: &impl PlanContext,
+) -> Vec<(ProviderRow, ModelRow)> {
     let mut out = Vec::new();
     for w in order_carriers(resolve_wanted(input.model, ctx), ctx) {
         // **The provider check is `HealthTracker::is_provider_usable`, not an inline
@@ -228,9 +229,8 @@ fn servable_carriers(input: &PlanInput<'_>, ctx: &impl PlanContext) -> Vec<(Prov
     // order — behind, not out. A model this provider is the *only* carrier for must still plan
     // (demotion that empties the plan would break the single-provider user for the sake of
     // hygiene), and the relative order of the healthy carriers is untouched.
-    let (healthy, failing): (Vec<_>, Vec<_>) = out
-        .into_iter()
-        .partition(|(p, _)| !currently_failing(&p.id, ctx));
+    let (healthy, failing): (Vec<_>, Vec<_>) =
+        out.into_iter().partition(|(p, _)| !currently_failing(&p.id, ctx));
     let mut ordered = healthy;
     ordered.extend(failing);
     ordered
@@ -520,10 +520,7 @@ mod tests {
                 .map(|(_, _, pricing)| *pricing)
         }
         fn provider_recent_health(&self, provider_id: &str) -> Option<(i64, i64)> {
-            self.recent
-                .iter()
-                .find(|(p, _, _)| p == provider_id)
-                .map(|(_, f, t)| (*f, *t))
+            self.recent.iter().find(|(p, _, _)| p == provider_id).map(|(_, f, t)| (*f, *t))
         }
     }
 
@@ -555,7 +552,10 @@ mod tests {
     #[test]
     fn a_provider_every_recent_request_failed_on_plans_after_a_healthy_one() {
         let f = Fixture {
-            providers: vec![provider("p-bad", "bad", "round_robin"), provider("p-good", "good", "round_robin")],
+            providers: vec![
+                provider("p-bad", "bad", "round_robin"),
+                provider("p-good", "good", "round_robin"),
+            ],
             models: vec![model("p-bad", "m", "text"), model("p-good", "m", "text")],
             keys: vec![key("k-bad", "p-bad"), key("k-good", "p-good")],
             recent: vec![("p-bad".into(), 4, 4)],
@@ -581,7 +581,10 @@ mod tests {
     #[test]
     fn below_the_sample_floor_the_order_is_untouched() {
         let f = Fixture {
-            providers: vec![provider("p-bad", "bad", "round_robin"), provider("p-good", "good", "round_robin")],
+            providers: vec![
+                provider("p-bad", "bad", "round_robin"),
+                provider("p-good", "good", "round_robin"),
+            ],
             models: vec![model("p-bad", "m", "text"), model("p-good", "m", "text")],
             keys: vec![key("k-bad", "p-bad"), key("k-good", "p-good")],
             recent: vec![("p-bad".into(), 3, 3)],
@@ -594,7 +597,10 @@ mod tests {
     #[test]
     fn a_provider_with_a_mixed_recent_record_is_not_demoted() {
         let f = Fixture {
-            providers: vec![provider("p-mixed", "mixed", "round_robin"), provider("p-good", "good", "round_robin")],
+            providers: vec![
+                provider("p-mixed", "mixed", "round_robin"),
+                provider("p-good", "good", "round_robin"),
+            ],
             models: vec![model("p-mixed", "m", "text"), model("p-good", "m", "text")],
             keys: vec![key("k-mixed", "p-mixed"), key("k-good", "p-good")],
             recent: vec![("p-mixed".into(), 3, 4)],

@@ -21,7 +21,10 @@ pub fn mcp_servers_get(store: State<'_, Arc<Store>>) -> Vec<McpServerConfig> {
 /// Validate and replace the server list. Validation (id shape, duplicates, command presence)
 /// lives in `core::mcp` so a future daemon settings path enforces the same rules.
 #[tauri::command]
-pub fn mcp_servers_set(store: State<'_, Arc<Store>>, servers: Vec<McpServerConfig>) -> Result<(), String> {
+pub fn mcp_servers_set(
+    store: State<'_, Arc<Store>>,
+    servers: Vec<McpServerConfig>,
+) -> Result<(), String> {
     crate::core::mcp::save_servers_config(&store, &servers)
 }
 

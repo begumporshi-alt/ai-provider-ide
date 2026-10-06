@@ -2,8 +2,8 @@
 //! forwarding (A1), the mapped finish reason (D86), the reasoning knob (D87), the failover chain,
 //! and the same-key 5xx re-probe. The seam comments inside `execute_text` are measurement records —
 //! do not clean them up.
-use serde_json::Value;
 use futures_util::StreamExt;
+use serde_json::Value;
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -20,7 +20,7 @@ use super::attempt::{
     AttemptOutcome, SERVER_ERROR_RETRY_BACKOFF,
 };
 use super::health::HealthTracker;
-use super::taxonomy::{COOLDOWN_FLOOR_MS, ErrorClass};
+use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
 use super::{now_ms, AllAttemptsFailed};
 
 /// What one text request is asked to do. The Rust port of `executeText`'s argument

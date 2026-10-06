@@ -790,7 +790,12 @@ impl<'a> ModelRouter<'a> {
         // than an inline temporary because `PlanView` borrows it for the length of the call.
         let cursors = self.shared.cursors();
         let ledger = self.shared.ledger();
-        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors, ledger: &ledger };
+        let view = PlanView {
+            store: self.store,
+            health: self.shared.health(),
+            cursors: &cursors,
+            ledger: &ledger,
+        };
         let plan = build_plan(&input, &view, now_ms());
         if self.settings.failover_enabled {
             return plan;
@@ -826,7 +831,12 @@ impl<'a> ModelRouter<'a> {
         let input = PlanInput { model, modality, exclude_provider_ids: &[] };
         let cursors = self.shared.cursors();
         let ledger = self.shared.ledger();
-        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors, ledger: &ledger };
+        let view = PlanView {
+            store: self.store,
+            health: self.shared.health(),
+            cursors: &cursors,
+            ledger: &ledger,
+        };
         earliest_key_retry_at(&input, &view, now_ms())
     }
 

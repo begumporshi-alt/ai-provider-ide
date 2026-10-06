@@ -5,7 +5,7 @@ use crate::core::adapter::{AdapterFactory, Cancel, ImageArgs};
 use crate::core::limiter::ProviderLimiter;
 use crate::core::planner::Candidate;
 
-use super::attempt::{labelled, saturated_outcome, attempt_budget, AttemptOutcome};
+use super::attempt::{attempt_budget, labelled, saturated_outcome, AttemptOutcome};
 use super::health::HealthTracker;
 use super::taxonomy::{classify, reason_from_body, BodyHint, ErrorClass};
 use super::{transport_outcome, AllAttemptsFailed};

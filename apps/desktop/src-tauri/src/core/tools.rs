@@ -31,11 +31,11 @@ use std::io::Read;
 #[cfg(test)]
 use std::io::Write as _;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use regex::Regex;
@@ -149,7 +149,7 @@ pub struct ToolResult {
 }
 
 impl ToolResult {
-    fn ok(output: impl Into<String>) -> Self {
+    pub(crate) fn ok(output: impl Into<String>) -> Self {
         Self { ok: true, output: output.into(), error: None }
     }
     pub(crate) fn err(message: impl Into<String>) -> Self {
@@ -389,16 +389,41 @@ fn do_read_file(args: &serde_json::Value, root: &Path) -> ToolResult {
     }
 }
 
+/// Binary writes (base64) are not the text budget's problem: a generated PNG dwarfs a source
+/// file, and `generate_image` composites land here with real bytes. 8 MB matches the image
+/// readers' scale; the text path keeps its own 1 MB cap.
+const MAX_WRITE_BYTES_BINARY: usize = 8 * 1024 * 1024;
+
 fn do_write_file(args: &serde_json::Value, root: &Path) -> ToolResult {
     match (|| -> Result<String, String> {
         let rel = arg_str(args, "path")?;
         let content = arg_str(args, "content")?;
-        if content.len() > MAX_WRITE_BYTES {
-            return Err(format!("content exceeds the {MAX_WRITE_BYTES} byte cap"));
-        }
+        // `encoding` is a composite-internal extension (`generate_image` lands its bytes here);
+        // it is deliberately absent from the model-facing schema, so a model that wants binary
+        // files on disk still goes through a tool that announces itself.
+        let encoding = args.get("encoding").and_then(|v| v.as_str()).unwrap_or("utf-8");
+        let (bytes, written) = match encoding {
+            "utf-8" | "utf8" | "" => {
+                if content.len() > MAX_WRITE_BYTES {
+                    return Err(format!("content exceeds the {MAX_WRITE_BYTES} byte cap"));
+                }
+                (content.as_bytes().to_vec(), content.len())
+            }
+            "base64" => {
+                let decoded = base64::engine::general_purpose::STANDARD
+                    .decode(content.trim())
+                    .map_err(|e| format!("content is not valid base64: {e}"))?;
+                if decoded.len() > MAX_WRITE_BYTES_BINARY {
+                    return Err(format!("decoded content exceeds the {MAX_WRITE_BYTES_BINARY} byte cap"));
+                }
+                let n = decoded.len();
+                (decoded, n)
+            }
+            other => return Err(format!("unknown encoding \"{other}\" — use utf-8 or base64")),
+        };
         let path = resolve_within(root, &rel, true)?;
-        fs::write(&path, content.as_bytes()).map_err(|e| format!("cannot write: {e}"))?;
-        Ok(format!("wrote {} bytes to {}", content.len(), rel))
+        fs::write(&path, bytes).map_err(|e| format!("cannot write: {e}"))?;
+        Ok(format!("wrote {written} bytes to {rel}"))
     })() {
         Ok(text) => ToolResult::ok(text),
         Err(e) => ToolResult::err(e),
@@ -843,6 +868,14 @@ fn do_run_command_with(args: &serde_json::Value, root: &Path, call_id: Option<&s
 
         let mut child = cmd.spawn().map_err(|e| format!("cannot start \"{program}\": {e}"))?;
         let child_pid = child.id();
+
+        // `background: true` deliberately outlives this tool call, so the child is NOT registered
+        // for cancellation — Stop stops the turn, not the work; `process_kill` stops the job. The
+        // output goes to shared buffers the `process_output` job id can poll later.
+        if args.get("background").and_then(|v| v.as_bool()).unwrap_or(false) {
+            return start_background_job(child, child_pid, &program);
+        }
+
         // Registered before the pipes are read, so a cancel that arrives while the command is
         // still starting up finds it. The guard removes the entry on every exit from here on.
         let canceled = Arc::new(AtomicBool::new(false));
@@ -933,7 +966,224 @@ fn do_run_command_with(args: &serde_json::Value, root: &Path, call_id: Option<&s
     }
 }
 
-/// Reject a workspace root that would make confinement meaningless (audit C1).
+/// Job ids are session-local and monotonic — `bg-0`, `bg-1`, … — so a restarted app invalidates
+/// every old id, which is exactly the truth: the process table is in-memory and dies with it.
+static BG_JOB_SEQ: AtomicU64 = AtomicU64::new(0);
+/// How many background jobs are kept at once. Finished jobs are evicted oldest-first; a running
+/// job is never evicted, so a long watch does not lose its handle to a newer burst of starts.
+const MAX_BG_JOBS: usize = 64;
+/// Per-stream buffer cap. A chatty background process (a dev server) must not grow memory
+/// without bound; past the cap the tail is kept and a marker says so, honestly.
+const BG_BUFFER_CAP: usize = 512 * 1024;
+
+/// One background `run_command`. The child's pipes are drained by reader threads into shared
+/// buffers, so the process can never block on a full pipe while nobody is watching it.
+struct BackgroundJob {
+    pid: u32,
+    program: String,
+    started: Instant,
+    out: Arc<Mutex<Vec<u8>>>,
+    err: Arc<Mutex<Vec<u8>>>,
+    status: Arc<Mutex<JobStatus>>,
+}
+
+enum JobStatus {
+    Running,
+    Exited(i32),
+    Failed(String),
+}
+
+impl JobStatus {
+    fn label(&self) -> String {
+        match self {
+            JobStatus::Running => "running".into(),
+            JobStatus::Exited(code) => format!("exited (code {code})"),
+            JobStatus::Failed(e) => format!("failed to report an exit: {e}"),
+        }
+    }
+}
+
+fn background_jobs() -> &'static Mutex<HashMap<String, BackgroundJob>> {
+    static CELL: OnceLock<Mutex<HashMap<String, BackgroundJob>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Hand a freshly spawned child to the background table and return its job id immediately.
+/// Same spawn discipline as the foreground path (allowlist, group leader, scrubbed env) — the
+/// only difference is who waits.
+fn start_background_job(mut child: Child, pid: u32, program: &str) -> Result<String, String> {
+    fn drain<R: std::io::Read + Send + 'static>(mut pipe: R, sink: Arc<Mutex<Vec<u8>>>) {
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 8192];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        if let Ok(mut s) = sink.lock() {
+                            if s.len() < BG_BUFFER_CAP {
+                                s.extend_from_slice(&buf[..n]);
+                                if s.len() > BG_BUFFER_CAP {
+                                    s.truncate(BG_BUFFER_CAP);
+                                    s.extend_from_slice("\n…[output capped]".as_bytes());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    let stdout = child.stdout.take().ok_or_else(|| "stdout was not captured".to_string())?;
+    let stderr = child.stderr.take().ok_or_else(|| "stderr was not captured".to_string())?;
+    let out = Arc::new(Mutex::new(Vec::new()));
+    let err = Arc::new(Mutex::new(Vec::new()));
+    let status = Arc::new(Mutex::new(JobStatus::Running));
+    drain(stdout, out.clone());
+    drain(stderr, err.clone());
+
+    let exit_status = status.clone();
+    std::thread::spawn(move || {
+        let s = child.wait();
+        if let Ok(mut st) = exit_status.lock() {
+            *st = match s {
+                Ok(code) => JobStatus::Exited(code.code().unwrap_or(-1)),
+                Err(e) => JobStatus::Failed(e.to_string()),
+            };
+        }
+    });
+
+    let id = format!("bg-{}", BG_JOB_SEQ.fetch_add(1, Ordering::SeqCst));
+    let mut jobs = background_jobs().lock().map_err(|e| e.to_string())?;
+    jobs.insert(
+        id.clone(),
+        BackgroundJob { pid, program: program.to_string(), started: Instant::now(), out, err, status },
+    );
+    // Evict finished jobs oldest-first once the table is full. A RUNNING job is never evicted:
+    // losing its handle would orphan the process with no way to watch or stop it.
+    if jobs.len() > MAX_BG_JOBS {
+        let mut finished: Vec<(String, Instant)> = jobs
+            .iter()
+            .filter(|(_, j)| !matches!(*j.status.lock().unwrap(), JobStatus::Running))
+            .map(|(k, j)| (k.clone(), j.started))
+            .collect();
+        finished.sort_by_key(|(_, started)| *started);
+        while jobs.len() > MAX_BG_JOBS {
+            match finished.first() {
+                Some((k, _)) => {
+                    jobs.remove(k);
+                    finished.remove(0);
+                }
+                None => break,
+            }
+        }
+    }
+    Ok(format!(
+        "started background job {id} ({program}, pid {pid}) — poll its output with process_output, stop it with process_kill"
+    ))
+}
+
+/// `process_output`: report a background job's status and the tail of what it has printed.
+/// `wait_ms` (default 0, capped at 5 000) lets the model block briefly for a result instead of
+/// polling in a tight loop — a build that finishes in 800 ms is answerable in one call.
+fn do_process_output(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let id = arg_str(args, "job")?;
+        let wait_ms = args.get("wait_ms").and_then(|v| v.as_u64()).unwrap_or(0).min(5_000);
+        let (out, err, status, elapsed) = {
+            let jobs = background_jobs().lock().map_err(|e| e.to_string())?;
+            let job = jobs.get(&id).ok_or_else(|| {
+                format!("no background job \"{id}\" — the id is wrong, or the app restarted since it was started")
+            })?;
+            (
+                job.out.clone(),
+                job.err.clone(),
+                job.status.clone(),
+                job.started.elapsed(),
+            )
+        };
+        let deadline = Instant::now() + Duration::from_millis(wait_ms);
+        loop {
+            if !matches!(*status.lock().unwrap(), JobStatus::Running) || Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let status_label = status.lock().unwrap().label();
+
+        let tail = |buf: &Arc<Mutex<Vec<u8>>>| -> String {
+            let b = buf.lock().unwrap();
+            if b.len() <= MAX_OUTPUT_BYTES {
+                String::from_utf8_lossy(&b).into_owned()
+            } else {
+                format!("…[earlier output omitted]\n{}", String::from_utf8_lossy(&b[b.len() - MAX_OUTPUT_BYTES..]))
+            }
+        };
+        let mut text = format!(
+            "[status] {status_label} · elapsed {:.1}s · job {id}\n",
+            elapsed.as_secs_f64()
+        );
+        text.push_str(&tail(&out));
+        let stderr_tail = tail(&err);
+        if !stderr_tail.is_empty() {
+            if !text.ends_with('\n') {
+                text.push('\n');
+            }
+            text.push_str("[stderr]\n");
+            text.push_str(&stderr_tail);
+        }
+        if text.trim() == format!("[status] {status_label} · elapsed {:.1}s · job {id}", elapsed.as_secs_f64()) {
+            text.push_str(if status_label == "running" {
+                "(no output yet)"
+            } else {
+                "(no output)"
+            });
+        }
+        Ok(text)
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
+/// `process_kill`: stop a background job, with the same escalation convention as Stop — SIGINT
+/// to the process group, SIGKILL after the grace window if it is still there. The job's own
+/// runner records whatever exit follows; the model sees it on the next `process_output`.
+fn do_process_kill(args: &serde_json::Value) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let id = arg_str(args, "job")?;
+        let (pid, running) = {
+            let jobs = background_jobs().lock().map_err(|e| e.to_string())?;
+            let job = jobs
+                .get(&id)
+                .ok_or_else(|| format!("no background job \"{id}\" — the id is wrong, or the app restarted since it was started"))?;
+            let running = matches!(*job.status.lock().unwrap(), JobStatus::Running);
+            (job.pid, running)
+        };
+        if !running {
+            return Ok(format!("job {id} has already exited — nothing to stop"));
+        }
+        #[cfg(unix)]
+        {
+            signal_group(pid, libc::SIGINT);
+            let job_id = id.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(CANCEL_GRACE_MS));
+                let still_running = background_jobs()
+                    .lock()
+                    .ok()
+                    .and_then(|jobs| jobs.get(&job_id).map(|j| matches!(*j.status.lock().unwrap(), JobStatus::Running)))
+                    .unwrap_or(false);
+                if still_running {
+                    signal_group(pid, libc::SIGKILL);
+                }
+            });
+        }
+        Ok(format!("signalled job {id} to stop (SIGINT, then SIGKILL after {}ms if still running) — poll process_output for the final status", CANCEL_GRACE_MS))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
 ///
 /// `resolve_within` confines every path TO the root and does that correctly — what it cannot do is
 /// judge the root itself. A root of `/`, `$HOME`, or a system directory is confinement to nothing:
@@ -1491,6 +1741,45 @@ fn do_read_image(args: &serde_json::Value, root: &Path) -> ToolResult {
     }
 }
 
+/// `browser_screenshot`: capture the connected page (core::browser) and save it into the
+/// workspace, then hand back the same READ_IMAGE marker `read_image` returns — the agent loop
+/// turns that into an image part, so a vision model sees the page in the turn that took it.
+fn do_browser_screenshot(args: &serde_json::Value, root: &Path) -> ToolResult {
+    match (|| -> Result<String, String> {
+        let b64 = crate::core::browser::capture_screenshot(args)?;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&b64)
+            .map_err(|e| format!("the screenshot was not valid base64: {e}"))?;
+        if bytes.len() > MAX_WRITE_BYTES_BINARY {
+            return Err("the screenshot is over the 8 MB image cap".into());
+        }
+        let rel = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p.to_string(),
+            _ => format!("images/browser-{}.png", std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0)),
+        };
+        let path = resolve_within(root, &rel, false)?;
+        if path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| !e.eq_ignore_ascii_case("png"))
+            .unwrap_or(true)
+        {
+            return Err(format!("\"{rel}\" must be a .png path — the capture is a PNG"));
+        }
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).map_err(|e| format!("cannot create {rel}'s directory: {e}"))?;
+        }
+        fs::write(&path, &bytes).map_err(|e| format!("cannot write {rel}: {e}"))?;
+        Ok(format!("READ_IMAGE:image/png;base64,{b64}\npath: {rel}\nbytes: {}", bytes.len()))
+    })() {
+        Ok(text) => ToolResult::ok(text),
+        Err(e) => ToolResult::err(e),
+    }
+}
+
 /// Send one HTTP request to a public URL — the general-API caller. Registered MUTATING: a
 /// request is data leaving the machine, so it rides the approval gate and the gateway's
 /// mutation switch; the public-URL guard (core::web) still rules out the local network.
@@ -1729,6 +2018,8 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "search_files" => do_search_files(&args, &root),
         "file_info" => do_file_info(&args, &root),
         "run_command" => do_run_command_with(&args, &root, call_id),
+        "process_output" => do_process_output(&args),
+        "process_kill" => do_process_kill(&args),
         "todo_write" => do_todo_write(&args),
         "web_fetch" => do_web_fetch(&args),
         "web_search" => do_web_search(&args),
@@ -1744,6 +2035,14 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "http_request" => do_http_request(&args),
         "apply_patch" => do_apply_patch(&args, &root),
         "glob" => do_glob(&args, &root),
+        // The browser tools talk to the user's own Chrome over CDP (core::browser). Screenshot
+        // is the only one that touches the workspace: the PNG lands in it and returns the same
+        // READ_IMAGE marker read_image uses, so a vision model sees what the page looks like.
+        "browser_navigate" => crate::core::browser::browser_navigate(&args),
+        "browser_snapshot" => crate::core::browser::browser_snapshot(&args),
+        "browser_click" => crate::core::browser::browser_click(&args),
+        "browser_fill" => crate::core::browser::browser_fill(&args),
+        "browser_screenshot" => do_browser_screenshot(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }
 }
@@ -1882,6 +2181,51 @@ mod tests {
         let read = do_read_file(&obj(&[("path", serde_json::json!("skills/demo/SKILL.md"))]), &r);
         assert!(read.ok);
         assert_eq!(read.output.trim(), "# demo");
+    }
+
+    // `encoding: "base64"` is the composite write path (`generate_image` lands its bytes here).
+    // The bytes on disk must be the DECODED payload — a reader that opens the file and sees base64
+    // text means the composite wrote a text file and called it an image.
+    #[test]
+    fn base64_encoding_writes_decoded_bytes() {
+        let r = root();
+        // 0x89 PNG's first four bytes — text that would survive no UTF-8 round trip.
+        let w = do_write_file(
+            &obj(&[
+                ("path", serde_json::json!("images/generated.png")),
+                ("content", serde_json::json!("iVBORw==")),
+                ("encoding", serde_json::json!("base64")),
+            ]),
+            &r,
+        );
+        assert!(w.ok, "{:?}", w.error);
+        let bytes = fs::read(r.join("images/generated.png")).unwrap();
+        assert_eq!(bytes, vec![0x89, 0x50, 0x4E, 0x47]);
+    }
+
+    #[test]
+    fn base64_write_refuses_an_invalid_payload_and_an_unknown_encoding() {
+        let r = root();
+        let bad = do_write_file(
+            &obj(&[
+                ("path", serde_json::json!("x.bin")),
+                ("content", serde_json::json!("!!!not base64!!!")),
+                ("encoding", serde_json::json!("base64")),
+            ]),
+            &r,
+        );
+        assert!(!bad.ok);
+        assert!(bad.error.unwrap().contains("not valid base64"));
+        let unknown = do_write_file(
+            &obj(&[
+                ("path", serde_json::json!("x.bin")),
+                ("content", serde_json::json!("data")),
+                ("encoding", serde_json::json!("hex")),
+            ]),
+            &r,
+        );
+        assert!(!unknown.ok);
+        assert!(unknown.error.unwrap().contains("unknown encoding"));
     }
 
     #[test]
@@ -2398,6 +2742,155 @@ diff --git a/a.txt b/a.txt
             &dir,
         );
         assert!(!res.ok, "'..' in an argument must be refused");
+    }
+
+    // --- background run_command ---
+    //
+    // The background path hands the caller an id instead of waiting; `process_output` and
+    // `process_kill` are the only ways back in. These cover the round trip and the two failure
+    // modes the model can hit: an unknown id, and a job that will not end on its own.
+
+    fn bg_id(res: &ToolResult) -> String {
+        assert!(res.ok, "the start must succeed: {:?}", res.error);
+        // The output is "started background job bg-N (node, pid M) — poll its output with ...".
+        let marker = "started background job ";
+        let at = res
+            .output
+            .find(marker)
+            .unwrap_or_else(|| panic!("no job id in: {}", res.output));
+        let rest = &res.output[at + marker.len()..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        rest[..end].to_string()
+    }
+
+    #[test]
+    fn background_job_runs_to_completion_and_process_output_sees_it() {
+        let dir = root();
+        let start = do_run_command(
+            &serde_json::json!({
+                "program": "node",
+                "args": ["-e", "console.log('bg-done'); "],
+                "background": true,
+            }),
+            &dir,
+        );
+        let id = bg_id(&start);
+
+        // wait_ms blocks briefly so the child's output has time to arrive in one call.
+        let mut final_text = String::new();
+        for _ in 0..30 {
+            let res = do_process_output(&serde_json::json!({ "job": id, "wait_ms": 2000 }));
+            assert!(res.ok, "process_output must succeed: {:?}", res.error);
+            final_text = res.output;
+            if final_text.contains("exited") {
+                break;
+            }
+        }
+        assert!(final_text.contains("bg-done"), "got: {final_text}");
+        assert!(
+            final_text.contains("exited (code 0)"),
+            "a clean exit is the status: {final_text}"
+        );
+        assert!(final_text.contains("[status]"), "the header line is present: {final_text}");
+    }
+
+    #[test]
+    fn process_output_on_an_unknown_job_says_so() {
+        let res = do_process_output(&serde_json::json!({ "job": "bg-999999" }));
+        assert!(!res.ok);
+        assert!(
+            res.error.unwrap().contains("no background job"),
+            "the error names the cause, not just 'failed'"
+        );
+    }
+
+    #[test]
+    fn process_kill_stops_a_running_job() {
+        let dir = root();
+        // A job that would run for a minute if left alone.
+        let start = do_run_command(
+            &serde_json::json!({
+                "program": "node",
+                "args": ["-e", "setTimeout(() => {}, 60000)"],
+                "background": true,
+            }),
+            &dir,
+        );
+        let id = bg_id(&start);
+
+        let kill = do_process_kill(&serde_json::json!({ "job": id }));
+        assert!(kill.ok, "the kill must succeed: {:?}", kill.error);
+        assert!(kill.output.contains("signalled job"), "got: {}", kill.output);
+
+        // The SIGINT ends node promptly; the status must leave "running" without the SIGKILL
+        // escalation ever being needed (node does not trap SIGINT).
+        let mut stopped = false;
+        for _ in 0..30 {
+            let res = do_process_output(&serde_json::json!({ "job": id, "wait_ms": 500 }));
+            assert!(res.ok);
+            if res.output.contains("exited") {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(stopped, "the killed job must report an exit, not run for 60s");
+    }
+
+    #[test]
+    fn process_kill_on_an_already_exited_job_is_honest() {
+        let dir = root();
+        let start = do_run_command(
+            &serde_json::json!({ "program": "node", "args": ["-e", ""], "background": true }),
+            &dir,
+        );
+        let id = bg_id(&start);
+        // Wait for the (instant) exit before killing.
+        for _ in 0..30 {
+            let res = do_process_output(&serde_json::json!({ "job": id, "wait_ms": 2000 }));
+            if res.output.contains("exited") {
+                break;
+            }
+        }
+        let kill = do_process_kill(&serde_json::json!({ "job": id }));
+        assert!(kill.ok);
+        assert!(
+            kill.output.contains("already exited"),
+            "a finished job is not a kill target: {}",
+            kill.output
+        );
+    }
+
+    #[test]
+    fn a_background_job_is_not_a_cancellable_child() {
+        // Deliberate: Stop (tool_cancel) must not sweep up a job the model chose to detach from —
+        // process_kill is the job's stop path. This pins that the background branch skips the
+        // running_children registration.
+        let dir = root();
+        let call_id = format!("bg-no-register-{}", std::process::id());
+        let start = do_run_command_with(
+            &serde_json::json!({ "program": "node", "args": ["-e", "setTimeout(()=>{},30000)"], "background": true }),
+            &dir,
+            Some(&call_id),
+        );
+        let id = bg_id(&start);
+        // Registration happens synchronously inside do_run_command_with, so by the time the
+        // start returned, THIS call id would already be in the map if the background branch
+        // had not skipped it. Other tests run their own children in parallel; only this id
+        // proves anything about the background branch.
+        assert!(
+            !running_children().lock().unwrap().contains_key(&call_id),
+            "no tool-call id may be registered for a background job"
+        );
+        let kill = do_process_kill(&serde_json::json!({ "job": id }));
+        assert!(kill.ok);
+        // Give the SIGINT a moment, then confirm the process is gone (do not leave strays).
+        for _ in 0..30 {
+            let res = do_process_output(&serde_json::json!({ "job": id, "wait_ms": 500 }));
+            if res.output.contains("exited") {
+                break;
+            }
+        }
     }
 
     // --- the gateway sends `arguments` as a JSON string, the Assistant as an object ---

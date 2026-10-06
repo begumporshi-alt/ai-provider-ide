@@ -1184,10 +1184,7 @@ mod tests {
             NormalizeOptions::default(),
         );
         let msgs = messages_of(&out);
-        assert_eq!(
-            msgs[0]["content"],
-            serde_json::json!([{ "type": "text", "text": "run ls" }])
-        );
+        assert_eq!(msgs[0]["content"], serde_json::json!([{ "type": "text", "text": "run ls" }]));
         assert_eq!(msgs[2]["content"], serde_json::json!("alpha.txt\nbeta.txt"));
     }
 
