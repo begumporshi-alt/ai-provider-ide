@@ -137,10 +137,6 @@ function formatTokens(n: number): string {
   return n.toLocaleString();
 }
 
-/**
- * Guard against the mercury-2.5 failure is answered in `lib/chat/turn/prompt.ts` — the constant
- * moved there with the system turns it belongs to.
- */
 
 /**
  * One switch row inside the run-configuration panel: setting name on the left, pill switch on
