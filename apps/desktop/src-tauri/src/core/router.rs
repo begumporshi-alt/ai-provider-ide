@@ -74,7 +74,9 @@ use crate::core::persist::{
     aliases_rows, api_keys_rows, models_cache_rows, providers_rows, setting_value, AliasRow,
     ApiKeyRow, LedgerRow, ModelRow, ProviderRow,
 };
-use crate::core::planner::{build_plan, earliest_key_retry_at, Candidate, PlanContext, PlanInput};
+use crate::core::planner::{
+    build_plan, earliest_key_retry_at, Candidate, PlanContext, PlanInput, PROVIDER_HEALTH_WINDOW_MS,
+};
 use crate::core::pricing::{estimate_cost_micros, pricing_from_cache_json, PricingMicros};
 use crate::core::store::Store;
 use crate::core::usage::UsageTokens;
@@ -538,6 +540,8 @@ struct PlanView<'a> {
     store: &'a RouterStore,
     health: &'a HealthTracker,
     cursors: &'a HashMap<String, i64>,
+    /// D96: observed outcomes, for the planner's degrading-provider demotion.
+    ledger: &'a UsageLedger,
 }
 
 impl PlanContext for PlanView<'_> {
@@ -569,6 +573,10 @@ impl PlanContext for PlanView<'_> {
 
     fn pricing_for(&self, provider_id: &str, native_id: &str) -> Option<PricingMicros> {
         self.store.pricing_for(provider_id, native_id)
+    }
+
+    fn provider_recent_health(&self, provider_id: &str) -> Option<(i64, i64)> {
+        Some(self.ledger.recent_health(provider_id, now_ms() - PROVIDER_HEALTH_WINDOW_MS))
     }
 }
 
@@ -781,7 +789,8 @@ impl<'a> ModelRouter<'a> {
         // does no I/O, so the lock is never held across an `await`. It is a named binding rather
         // than an inline temporary because `PlanView` borrows it for the length of the call.
         let cursors = self.shared.cursors();
-        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors };
+        let ledger = self.shared.ledger();
+        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors, ledger: &ledger };
         let plan = build_plan(&input, &view, now_ms());
         if self.settings.failover_enabled {
             return plan;
@@ -816,7 +825,8 @@ impl<'a> ModelRouter<'a> {
     fn cooldown_retry_at(&self, model: &str, modality: &str) -> Option<i64> {
         let input = PlanInput { model, modality, exclude_provider_ids: &[] };
         let cursors = self.shared.cursors();
-        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors };
+        let ledger = self.shared.ledger();
+        let view = PlanView { store: self.store, health: self.shared.health(), cursors: &cursors, ledger: &ledger };
         earliest_key_retry_at(&input, &view, now_ms())
     }
 

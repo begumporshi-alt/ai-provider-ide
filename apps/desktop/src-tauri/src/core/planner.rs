@@ -105,6 +105,17 @@ pub struct PlanInput<'a> {
 /// A trait rather than a struct of `&dyn Fn` fields — see the module note. Every method is
 /// required: there is no default body anywhere, so a new member breaks every implementor at
 /// compile time, which is the discipline the rest of this crate holds.
+/// How far back the planner looks for a provider's observed outcomes (D96). Short on purpose:
+/// this is "is this provider failing *right now*," not a reputation — drift's one-hour window
+/// already owns the long memory, and a provider that recovered an hour ago must not stay
+/// demoted by it.
+pub const PROVIDER_HEALTH_WINDOW_MS: i64 = 10 * 60 * 1000;
+
+/// The sample floor under which no demotion happens. Three requests prove nothing — a provider
+/// with one bad minute and three attempts would be invisible to a smaller floor anyway, and the
+/// cost of a wrong demotion is trying the healthy provider's neighbour first.
+pub const PROVIDER_HEALTH_MIN_SAMPLES: i64 = 4;
+
 pub trait PlanContext {
     fn providers(&self) -> &[ProviderRow];
     fn aliases(&self) -> &[AliasRow];
@@ -124,6 +135,13 @@ pub trait PlanContext {
     /// none. `None` is **not** a zero; see `core::pricing` for why that distinction is the whole
     /// point of the unit it returns.
     fn pricing_for(&self, provider_id: &str, native_id: &str) -> Option<PricingMicros>;
+
+    /// Observed outcomes for `provider_id` over the recent window: `(failures, total)` ledger
+    /// rows naming it. `None` means the caller cannot observe health — the planner then plans
+    /// exactly as it did before D96, so a context without a ledger loses nothing.
+    fn provider_recent_health(&self, _provider_id: &str) -> Option<(i64, i64)> {
+        None
+    }
 }
 
 /// A `(provider, model)` pair the request wants, before any of it is checked against the catalog.
@@ -145,7 +163,7 @@ struct Wanted {
 /// allowed to be empty, and an empty plan is a caller-visible "no route for model".
 pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) -> Vec<Candidate> {
     let mut plan = Vec::new();
-    for (provider, model) in servable_carriers(input, ctx) {
+    for (provider, model) in servable_carriers(input, ctx, now_ms) {
         let keys = order_keys(
             ctx.keys_for(&provider.id),
             &provider.rotation_strategy,
@@ -161,6 +179,18 @@ pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) ->
     plan
 }
 
+/// Whether the provider's recent observed outcomes are all failures, with enough of them to mean
+/// something. The exact rule D96's demotion keys on: `total` at or above
+/// [`PROVIDER_HEALTH_MIN_SAMPLES`], every one a failure, inside [`PROVIDER_HEALTH_WINDOW_MS`].
+fn currently_failing(provider_id: &str, ctx: &impl PlanContext, now_ms: i64) -> bool {
+    match ctx.provider_recent_health(provider_id) {
+        Some((failures, total)) => {
+            total >= PROVIDER_HEALTH_MIN_SAMPLES && failures >= total
+        }
+        None => false,
+    }
+}
+
 /// The `(provider, model)` pairs `input` could be served by, in failover order — **before any key
 /// is consulted.**
 ///
@@ -171,6 +201,7 @@ pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) ->
 fn servable_carriers(
     input: &PlanInput<'_>,
     ctx: &impl PlanContext,
+    now_ms: i64,
 ) -> Vec<(ProviderRow, ModelRow)> {
     let mut out = Vec::new();
     for w in order_carriers(resolve_wanted(input.model, ctx), ctx) {
@@ -195,7 +226,16 @@ fn servable_carriers(
         };
         out.push((provider.clone(), model));
     }
-    out
+    // D96: a provider every recent request failed on is demoted to the end of the failover
+    // order — behind, not out. A model this provider is the *only* carrier for must still plan
+    // (demotion that empties the plan would break the single-provider user for the sake of
+    // hygiene), and the relative order of the healthy carriers is untouched.
+    let (healthy, failing): (Vec<_>, Vec<_>) = out
+        .into_iter()
+        .partition(|(p, _)| !currently_failing(&p.id, ctx, now_ms));
+    let mut ordered = healthy;
+    ordered.extend(failing);
+    ordered
 }
 
 /// The soonest moment at which `input` would plan to something, when **every** key that could
@@ -216,7 +256,7 @@ pub fn earliest_key_retry_at(
     now_ms: i64,
 ) -> Option<i64> {
     let mut soonest: Option<i64> = None;
-    for (provider, _model) in servable_carriers(input, ctx) {
+    for (provider, _model) in servable_carriers(input, ctx, now_ms) {
         for key in ctx.keys_for(&provider.id) {
             if let Some(at) = ctx.health().key_retry_at(&key, now_ms) {
                 soonest = Some(soonest.map_or(at, |s| s.min(at)));
@@ -452,6 +492,8 @@ mod tests {
         pricing: Vec<(String, String, PricingMicros)>,
         cursor: i64,
         health: HealthTracker,
+        /// D96: `(provider_id, failures, total)` — the observed window a test plants.
+        recent: Vec<(String, i64, i64)>,
     }
 
     impl PlanContext for Fixture {
@@ -479,6 +521,12 @@ mod tests {
                 .find(|(p, n, _)| p == provider_id && n == native_id)
                 .map(|(_, _, pricing)| *pricing)
         }
+        fn provider_recent_health(&self, provider_id: &str) -> Option<(i64, i64)> {
+            self.recent
+                .iter()
+                .find(|(p, _, _)| p == provider_id)
+                .map(|(_, f, t)| (*f, *t))
+        }
     }
 
     /// Build a plan for one model at `"text"` modality with nothing excluded.
@@ -503,6 +551,60 @@ mod tests {
     }
 
     // ---- stripClientNamespace --------------------------------------------------------------
+
+    // ---- D96: a currently-failing carrier is demoted, not dropped --------------------------
+
+    #[test]
+    fn a_provider_every_recent_request_failed_on_plans_after_a_healthy_one() {
+        let f = Fixture {
+            providers: vec![provider("p-bad", "bad", "round_robin"), provider("p-good", "good", "round_robin")],
+            models: vec![model("p-bad", "m", "text"), model("p-good", "m", "text")],
+            keys: vec![key("k-bad", "p-bad"), key("k-good", "p-good")],
+            recent: vec![("p-bad".into(), 4, 4)],
+            ..Default::default()
+        };
+        // The request named the failing provider first; the demotion moves it behind healthy.
+        let plan = plan_for("m", &f);
+        assert_eq!(carrier_ids(&plan), vec!["p-good", "p-bad"], "failing plans last, not first");
+    }
+
+    #[test]
+    fn a_lone_failing_carrier_still_plans() {
+        let f = Fixture {
+            providers: vec![provider("p-bad", "bad", "round_robin")],
+            models: vec![model("p-bad", "m", "text")],
+            keys: vec![key("k-bad", "p-bad")],
+            recent: vec![("p-bad".into(), 9, 9)],
+            ..Default::default()
+        };
+        assert_eq!(plan_for("bad/m", &f).len(), 1, "demotion must not empty the plan");
+    }
+
+    #[test]
+    fn below_the_sample_floor_the_order_is_untouched() {
+        let f = Fixture {
+            providers: vec![provider("p-bad", "bad", "round_robin"), provider("p-good", "good", "round_robin")],
+            models: vec![model("p-bad", "m", "text"), model("p-good", "m", "text")],
+            keys: vec![key("k-bad", "p-bad"), key("k-good", "p-good")],
+            recent: vec![("p-bad".into(), 3, 3)],
+            ..Default::default()
+        };
+        let plan = plan_for("m", &f);
+        assert_eq!(carrier_ids(&plan), vec!["p-bad", "p-good"], "3 samples prove nothing");
+    }
+
+    #[test]
+    fn a_provider_with_a_mixed_recent_record_is_not_demoted() {
+        let f = Fixture {
+            providers: vec![provider("p-mixed", "mixed", "round_robin"), provider("p-good", "good", "round_robin")],
+            models: vec![model("p-mixed", "m", "text"), model("p-good", "m", "text")],
+            keys: vec![key("k-mixed", "p-mixed"), key("k-good", "p-good")],
+            recent: vec![("p-mixed".into(), 3, 4)],
+            ..Default::default()
+        };
+        let plan = plan_for("m", &f);
+        assert_eq!(carrier_ids(&plan), vec!["p-mixed", "p-good"]);
+    }
 
     #[test]
     fn a_client_tag_the_router_has_no_provider_for_is_dropped() {

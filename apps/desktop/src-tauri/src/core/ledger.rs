@@ -176,6 +176,26 @@ impl UsageLedger {
     /// the database, not here. Reporting the count is the point — a silently truncated result looks
     /// like "there was no traffic then", which is exactly the kind of blank the ledger exists to
     /// explain rather than produce.
+    /// Observed outcomes for `provider_id` since `since_ts`: `(failures, total)`. D96's read —
+    /// the planner demotes a provider whose recent window is all failures, behind its healthy
+    /// peers. In-memory by design: the ring holds the last [`DEFAULT_MAX_MEM_ENTRIES`] rows,
+    /// which is far more than a ten-minute window's samples, and no extra SQL touches the store
+    /// lock a request is about to take anyway.
+    pub fn recent_health(&self, provider_id: &str, since_ts: i64) -> (i64, i64) {
+        let mut total: i64 = 0;
+        let mut failures: i64 = 0;
+        for row in &self.mem {
+            if row.ts < since_ts || row.provider_id.as_deref() != Some(provider_id) {
+                continue;
+            }
+            total += 1;
+            if row.status != "ok" {
+                failures += 1;
+            }
+        }
+        (failures, total)
+    }
+
     pub fn evicted_count(&self) -> u64 {
         self.evicted
     }
