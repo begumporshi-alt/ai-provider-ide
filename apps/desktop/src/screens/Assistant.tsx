@@ -39,7 +39,6 @@ import {
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
 import { ChangeSetReview } from "../components/ChangeSetReview";
 import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
-import { toolCallName } from "../lib/tools/wire";
 import { DiffView } from "../components/DiffView";
 import {
   fileChangeFor,
@@ -62,84 +61,11 @@ import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/ag
 import {
   distilTurn, memoryBlock, recallContext, recordRecall, rememberTurn,
 } from "../lib/memory/engine";
-
-interface Msg {
-  /** Stable identity. The transcript is truncated, re-run and forked by position, so rendering
-   *  must key on something that survives an edit — an array index does not. */
-  id: string;
-  role: "user" | "assistant" | "tool";
-  content: string;
-  /**
-   * The model's own reasoning for this turn, when it produced any. Kept beside `content` rather
-   * than spliced into it: reasoning is the model's notes, not its answer, and a transcript that
-   * merged the two would quote the notes as the reply.
-   *
-   * It is kept even when the turn produced **no answer at all**, which is the case it exists for.
-   * Measured 2026-10-02 on `agentrouter.org` (`deepseek-v4-flash`): extended thinking is on by
-   * default, `max_tokens` covers reasoning *and* answer, and a turn whose reasoning outran the
-   * 8192-token budget streamed 25 000 characters of thinking, no text, and left the user staring
-   * at an empty bubble for 46 seconds. The reasoning was there the whole time; nothing was
-   * listening for it.
-   */
-  reasoning?: string;
-  /** Set on an assistant turn that requested tool calls, so the next turn can replay them. */
-  tool_calls?: unknown;
-  /** Set on a tool result turn, linking it to its originating call. */
-  tool_call_id?: string;
-  /**
-   * Images this user turn was sent with (P3). Kept on the transcript, not only on the request,
-   * because a follow-up turn has to replay them: "what about the second one?" is unanswerable if the
-   * picture vanished from history the moment it was sent. The bytes are already in memory (they came
-   * from the composer), so this costs no extra read.
-   */
-  attachments?: Attachment[];
-  /** Names of workspace files inlined into this turn, for the transcript's own labelling. */
-  inlined?: InlinedText[];
-}
-
-/** Monotonic within a session; combined with a timestamp so a resumed transcript cannot collide
- *  with ids minted in this run. */
-let msgSeq = 0;
-function newMsgId(): string {
-  msgSeq += 1;
-  return `m-${Date.now().toString(36)}-${msgSeq}`;
-}
-
-/** Assign ids to messages that arrived without them (a resumed transcript from History). */
-function withIds(msgs: ReadonlyArray<Omit<Msg, "id">>): Msg[] {
-  return msgs.map((m) => ({ ...m, id: newMsgId() }));
-}
-
-/**
- * Replay prior turns for a follow-up request — the one place both the agent and the plain-chat
- * paths build history from.
- *
- * `tool_calls` and `tool_call_id` have to survive the replay, not just `role` and `content`. A
- * tool-result message without its `tool_call_id` is rejected by every OpenAI-compatible provider
- * with HTTP 400, and the assistant turn that asked for it is meaningless without `tool_calls`.
- *
- * These were two separate mappings and only the agent's kept the tool fields, so any session that
- * had used agent mode failed on the *next plain message* with `BAD_REQUEST_SCHEMA` — the request
- * was refused for replaying a tool result the provider could not match to a call. Keeping one
- * mapping is the point: the bug was the divergence, not either version of the filter.
- *
- * The filter also drops the empty assistant bubble a stopped or failed turn leaves behind —
- * `{ role: "assistant", content: "" }` is rejected with 400 by most providers too.
- */
-function replayHistory(msgs: Msg[]): ChatMessage[] {
-  return msgs
-    // A turn carrying an image has text too (the question), so the filter's usual test still holds;
-    // an image-only turn is kept by the second clause rather than dropped as "empty".
-    .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls) || (m.attachments?.length ?? 0) > 0)
-    .map((m) => ({
-      role: m.role,
-      // Rebuilt as content parts so the image travels with its turn. `userContent` returns a plain
-      // string when there are no attachments, which is what keeps an ordinary turn a string.
-      content: userContent(m.content, (m.attachments ?? []).map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
-      ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
-      ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
-    })) as ChatMessage[];
-}
+import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
+import {
+  agentSystem, buildAgentSystem, buildPlainRequestMessages, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
+} from "../lib/chat/turn/prompt";
+import { clip, tryParseArgs, recordAgentTurn } from "../lib/chat/turn/graph-record";
 
 /**
  * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
@@ -189,74 +115,11 @@ function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<st
   };
 }
 
-/**
- * Agent-mode system prompt. Unlike the no-tools guard (which suppresses tool-call markup),
- * this one tells the model it DOES have tools and how to use them — confined to the workspace
- * root the user sets. It is deliberately terse; the sandbox, not the prompt, is the enforcement.
- */
-const AGENT_SYSTEM =
-  "You are an agent inside AI-Provider Router. You have file and shell tools confined to the " +
-  "workspace root the user specified. Complete the task by calling tools: search_files to find " +
-  "where something is, read_file (with offset/limit for large files) and list_dir to inspect, " +
-  "file_info to check a path exists, edit_file to change one exact snippet, write_file to " +
-  "create a whole file, mkdir to make a directory, run_command for allowlisted commands. " +
-  "For the public web, web_search (keyless, with fallback backends) finds pages, web_fetch reads one, " +
-  "and web_ask answers a question about a page without loading it into this conversation. " +
-  "read_document reads PDFs and Word files; read_image shows you an image if you support vision. " +
-  "For any task with several steps, maintain the task list with todo_write (the whole list, each " +
-  "task pending/in_progress/completed, one in_progress at a time) — the user watches it live. " +
-  "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +
-  "Never ask the user to run a command — call the tool. " +
-  "Stop calling tools once the task is done and give a concise final answer.";
-
-/**
- * The agent's system prompt, plus where it actually is.
- *
- * Without the root, "what is the exact path?" is a question the agent cannot answer: it has to
- * spend a tool call on `pwd`, and if that call is denied or fails it reports that it cannot tell.
- * The root is the user's own setting, so naming it costs nothing and answers the question outright.
- */
-function agentSystem(root: string, custom?: string): string {
-  const base = custom && custom.trim() ? custom.trim() : AGENT_SYSTEM;
-  const r = root.trim();
-  if (!r) return base;
-  return (
-    base +
-    `\n\nYour workspace root is: ${r}. Every relative path resolves inside it — answer questions ` +
-    `about the path from this rather than spending a tool call on \`pwd\`.`
-  );
-}
-
 interface AgentItem {
   name: string;
   args: Record<string, unknown>;
   status: "calling" | "ok" | "error" | "denied";
   result?: string;
-}
-
-/**
- * Plan mode's system prompt (Phase 5).
- *
- * The prompt is not the enforcement — the approval gate refuses every mutation itself, and would
- * refuse them even if this text were deleted. Saying it anyway is what makes the pass *useful*:
- * a model that is asked to research and is silently blocked at its first edit spends its tool
- * budget rediscovering that it cannot write, and then answers with an apology. Told up front, it
- * proposes instead.
- */
-const PLAN_MODE_SYSTEM =
-  "\n\nPLAN MODE — this pass may not modify the workspace. Every writing tool (write_file, " +
-  "edit_file, mkdir, run_command) will be refused. Use the read-only tools (read_file, list_dir, " +
-  "search_files, file_info, todo_write) to understand the task, then answer with the plan you intend to carry " +
-  "out: numbered steps, the exact files each step changes, and anything you would need to confirm. " +
-  "Do not attempt a write, and do not ask the user to apply it for you.";
-
-/** The user turn that starts the executing pass after a plan is approved. Phrased as the user's
- *  own words rather than a hidden instruction, because it is replayed in every later turn. */
-const PLAN_APPROVED_TURN = "The plan is approved — carry it out now.";
-
-/** Graph labels are identifiers, not content — a 400-character node is unreadable on canvas. */
-function clip(s: string, n: number): string {
-  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
 /**
@@ -272,82 +135,9 @@ function formatTokens(n: number): string {
 }
 
 /**
- * Record what one agent turn produced: each message after the user's, and for every tool call a
- * skill node plus the artifact its result produced.
- *
- * A tool result is recorded as an artifact because that is what it is to the model — context it
- * was handed, not something it said. That distinction is the whole reason the graph has two node
- * kinds instead of one.
- *
- * `userNode` and `produced` are both supplied by the caller, and both matter:
- *
- *   - `userNode` is the id of the node the caller already created for this turn's prompt. The
- *     caller needs that node before the run starts (recall edges anchor to it), so creating a
- *     second one here would put the same prompt in the graph twice.
- *   - `produced` is only what THIS turn added. `runAgentLoop` seeds its working copy from the
- *     replayed history and hands the whole transcript back, so passing that verbatim would
- *     re-record every earlier turn as brand-new nodes on every turn.
+ * Guard against the mercury-2.5 failure is answered in `lib/chat/turn/prompt.ts` — the constant
+ * moved there with the system turns it belongs to.
  */
-function recordAgentTurn(rec: Recorder, userNode: string, produced: ChatMessage[], model: string): string {
-  let prev: string = userNode;
-  const skillByCall = new Map<string, string>();
-
-  for (const m of produced) {
-    const content = typeof m.content === "string" ? m.content : "";
-    if (m.role === "tool") {
-      // `text` carries the full result beside the clipped label: the timeline (and therefore
-      // resume) rebuilds content from it, and an 80-character label would truncate every tool
-      // result a resumed session replays.
-      const artifact = rec.node("artifact", clip(content, 80), { tool_call_id: m.tool_call_id, text: content });
-      const skill = m.tool_call_id ? skillByCall.get(m.tool_call_id) : undefined;
-      rec.edge(skill ?? prev, artifact, "produced");
-      continue;
-    }
-    // `tool_calls` is `unknown` in the core's message type: the wire shape varies by dialect
-    // and the core does not commit to one. A stored transcript may hold either the flat internal
-    // shape or OpenAI's nested one (the agent loop writes the latter), so the name is read
-    // tolerantly rather than assuming whichever shape the current writer produces.
-    const calls = (m.tool_calls as ToolCall[] | undefined) ?? [];
-    const node = rec.node("message", clip(content, 120), {
-      role: m.role,
-      model,
-      // Full text beside the clipped label — the label is for the graph canvas, `text` is what
-      // a resume rebuilds the conversation from.
-      text: content,
-      tool_calls: calls.length ? calls : undefined,
-    });
-    rec.edge(prev, node, "follows");
-    for (const c of calls) {
-      const skill = rec.node("skill", toolCallName(c));
-      rec.edge(node, skill, "used");
-      if (c.id) skillByCall.set(c.id, skill);
-    }
-    prev = node;
-  }
-  return prev;
-}
-
-function tryParseArgs(raw?: string): Record<string, unknown> {
-  if (!raw) return {};
-  try {
-    const v = JSON.parse(raw);
-    return v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : {};
-  } catch {
-    return {};
-  }
-}
-
-/**
- * Guard against the mercury-2.5 failure: Assistant declares no tools, and a model handed a
- * toolless request will sometimes invent tool-call markup from its agentic training data.
- * Saying so outright in the system turn stops it at the source. Off = raw model behaviour,
- * which is what you want when probing a provider's own prompting.
- */
-const NO_TOOLS_SYSTEM =
-  "You are answering inside AI-Provider Router's Assistant — a plain chat console. " +
-  "You have no tools, functions, plugins, or file/shell access of any kind. " +
-  "Never emit tool-call markup (for example <tool_call>, <|tool_call_start|>, or <function=...>). " +
-  "When a request would need a tool, say so in plain prose and describe the steps instead.";
 
 interface Trace {
   ms: number;
@@ -2187,7 +1977,7 @@ function Chat({
           // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
           // a system message rather than a line in the user's text so the model can tell a constraint
           // the user set from a sentence the user wrote.
-          system: agentSystem(root, agentSystemPrompt) + skillsBlock + (memoryBlock(recalled) ? `\n\n${memoryBlock(recalled)}` : "") + (planMode ? PLAN_MODE_SYSTEM : "") + (perTurn ? `\n\n${perTurn}` : ""),
+          system: buildAgentSystem({ root, custom: agentSystemPrompt, skillsBlock, recalledMemory: memoryBlock(recalled), planMode, perTurn }),
           registry: AGENT_TOOLS,
           // Tier 2: when this request has to drop context, the dropped turns are summarized
           // rather than discarded. One summarizer per run, built against the chosen model.
@@ -2369,20 +2159,10 @@ function Chat({
       const exec = await gatewayGenerate(
         {
           model: chosen,
-          messages: [
-            ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
-            ...(recallMsg ? [{ role: "system" as const, content: recallMsg }] : []),
-            // Last, and directly above the user's turn: a per-turn constraint is the most specific
-            // instruction in the request, and its own message keeps it from reading as the user's words.
-            ...(perTurn ? [{ role: "system" as const, content: perTurn }] : []),
-            ...history,
-            // The user's own turn, as parts when it carries images — `userContent` returns a plain
-            // string otherwise, so an ordinary message is still an ordinary message.
-            {
-              role: "user" as const,
-              content: userContent(trimmed, attachments.map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
-            },
-          ],
+          messages: buildPlainRequestMessages(systemPromptText, recallMsg, perTurn, history, {
+            content: trimmed,
+            attachments,
+          }),
           onFinish: setFinishReason,
           // Rendered live, throttled. A reasoning-heavy turn is otherwise indistinguishable from a
           // hung request: the panel filling in is the only signal that the model is working.
