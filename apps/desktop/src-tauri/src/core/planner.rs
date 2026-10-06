@@ -163,7 +163,7 @@ struct Wanted {
 /// allowed to be empty, and an empty plan is a caller-visible "no route for model".
 pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) -> Vec<Candidate> {
     let mut plan = Vec::new();
-    for (provider, model) in servable_carriers(input, ctx, now_ms) {
+    for (provider, model) in servable_carriers(input, ctx) {
         let keys = order_keys(
             ctx.keys_for(&provider.id),
             &provider.rotation_strategy,
@@ -182,7 +182,9 @@ pub fn build_plan(input: &PlanInput<'_>, ctx: &impl PlanContext, now_ms: i64) ->
 /// Whether the provider's recent observed outcomes are all failures, with enough of them to mean
 /// something. The exact rule D96's demotion keys on: `total` at or above
 /// [`PROVIDER_HEALTH_MIN_SAMPLES`], every one a failure, inside [`PROVIDER_HEALTH_WINDOW_MS`].
-fn currently_failing(provider_id: &str, ctx: &impl PlanContext, now_ms: i64) -> bool {
+// The window arithmetic belongs to the context's read (the ledger knows where "now" is);
+// the planner only decides on the (failures, total) it is handed.
+fn currently_failing(provider_id: &str, ctx: &impl PlanContext) -> bool {
     match ctx.provider_recent_health(provider_id) {
         Some((failures, total)) => {
             total >= PROVIDER_HEALTH_MIN_SAMPLES && failures >= total
@@ -198,11 +200,7 @@ fn currently_failing(provider_id: &str, ctx: &impl PlanContext, now_ms: i64) -> 
 /// model.** The second asks "would this plan be non-empty if the keys were free", which is only a
 /// meaningful question against the *same* carrier resolution the first uses; a second copy of the
 /// loop would be a second spelling of one rule, free to drift from this one.
-fn servable_carriers(
-    input: &PlanInput<'_>,
-    ctx: &impl PlanContext,
-    now_ms: i64,
-) -> Vec<(ProviderRow, ModelRow)> {
+fn servable_carriers(input: &PlanInput<'_>, ctx: &impl PlanContext) -> Vec<(ProviderRow, ModelRow)> {
     let mut out = Vec::new();
     for w in order_carriers(resolve_wanted(input.model, ctx), ctx) {
         // **The provider check is `HealthTracker::is_provider_usable`, not an inline
@@ -232,7 +230,7 @@ fn servable_carriers(
     // hygiene), and the relative order of the healthy carriers is untouched.
     let (healthy, failing): (Vec<_>, Vec<_>) = out
         .into_iter()
-        .partition(|(p, _)| !currently_failing(&p.id, ctx, now_ms));
+        .partition(|(p, _)| !currently_failing(&p.id, ctx));
     let mut ordered = healthy;
     ordered.extend(failing);
     ordered
@@ -256,7 +254,7 @@ pub fn earliest_key_retry_at(
     now_ms: i64,
 ) -> Option<i64> {
     let mut soonest: Option<i64> = None;
-    for (provider, _model) in servable_carriers(input, ctx, now_ms) {
+    for (provider, _model) in servable_carriers(input, ctx) {
         for key in ctx.keys_for(&provider.id) {
             if let Some(at) = ctx.health().key_retry_at(&key, now_ms) {
                 soonest = Some(soonest.map_or(at, |s| s.min(at)));
