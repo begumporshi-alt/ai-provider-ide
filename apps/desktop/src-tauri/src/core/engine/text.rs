@@ -1,9 +1,11 @@
 //! The text loop — the hot path (D98 phase 5): plan walked to one streamed answer, with usage
-//! forwarding (A1), the mapped finish reason (D86), the reasoning knob (D87), and the failover
-//! chain. The seam comments inside `execute_text` are measurement records — do not clean them up.
+//! forwarding (A1), the mapped finish reason (D86), the reasoning knob (D87), the failover chain,
+//! and the same-key 5xx re-probe. The seam comments inside `execute_text` are measurement records —
+//! do not clean them up.
 use serde_json::Value;
 use futures_util::StreamExt;
-use std::time::Instant;
+use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::core::adapter::{
     AdapterFactory, Cancel, ReasoningEffort, StreamObservation, TextArgs, ToolCall,
@@ -15,10 +17,10 @@ use crate::core::usage::UsageTokens;
 use super::attempt::{
     attempt_budget, attempt_disposition, attempt_outcome, candidate_is_affordable, labelled,
     records_key_health, saturated_outcome, transport_outcome, AttemptDisposition, AttemptError,
-    AttemptOutcome,
+    AttemptOutcome, SERVER_ERROR_RETRY_BACKOFF,
 };
 use super::health::HealthTracker;
-use super::taxonomy::ErrorClass;
+use super::taxonomy::{COOLDOWN_FLOOR_MS, ErrorClass};
 use super::{now_ms, AllAttemptsFailed};
 
 /// What one text request is asked to do. The Rust port of `executeText`'s argument
@@ -209,7 +211,14 @@ pub async fn execute_text(
     let mut attempted_any = false;
 
     let ended = 'plan: {
-        for candidate in args.plan.into_iter().take(budget) {
+        // **The plan is a queue, not an iterator, because of the same-key re-probe.** Everything
+        // else reads exactly as the `for` it replaced: one `pop_front` per attempt, drained left to
+        // right. The flag rides *with* the candidate — being re-probed is a per-candidate fact, not
+        // a loop fact — so a re-queued candidate comes back already marked and cannot be probed
+        // twice.
+        let mut plan: VecDeque<(Candidate, bool)> =
+            args.plan.into_iter().take(budget).map(|c| (c, false)).collect();
+        while let Some((candidate, reprobed)) = plan.pop_front() {
             // `:80`, checked *before* the permit is taken — see `candidate_gate`, which states the
             // order and why: a cancelled request must not consume a slot on its way out.
             if cancel.is_cancelled() {
@@ -375,9 +384,17 @@ pub async fn execute_text(
                 let disposition =
                     attempt_disposition(emitted || tool_calls > 0, cancel.is_cancelled());
                 let outcome = labelled(attempt_outcome(&e, disposition), &candidate);
+                // Read before the push: an outcome is not `Copy`, and the `Next` arm below decides
+                // the re-probe from the class and wait it recorded.
+                let (outcome_cls, outcome_status, outcome_retry_after) =
+                    (outcome.cls, outcome.status, outcome.retry_after_ms);
                 if records_key_health(disposition) {
-                    let (cls, retry_after_ms) = (outcome.cls, outcome.retry_after_ms);
-                    health.record_result(&candidate.key.id, cls, retry_after_ms, now_ms());
+                    health.record_result(
+                        &candidate.key.id,
+                        outcome_cls,
+                        outcome_retry_after,
+                        now_ms(),
+                    );
                 }
                 attempts.push(outcome);
                 match disposition {
@@ -394,7 +411,48 @@ pub async fn execute_text(
                         break 'plan Ended::MidStream { error: e, served: candidate };
                     }
                     AttemptDisposition::Stop => break 'plan Ended::Cancelled,
-                    AttemptDisposition::Next => continue,
+                    AttemptDisposition::Next => {
+                        // **The same-key re-probe: the plan just ran out on a 5xx.** A plan with a
+                        // next candidate fails over immediately — a healthy provider beats a wait
+                        // on a wobbling one. With none, the only thing failover could do is give
+                        // up, so the wait-and-redial any competent client performs happens here
+                        // instead: once per candidate, only before anything reached the sink, and
+                        // only for `SERVER_ERROR` — the class the egress layer already treats as
+                        // "the failure is real, but what it predicts may not be" (see
+                        // `SERVER_ERROR_RETRY_BACKOFF`).
+                        //
+                        // **The wait is the provider's own `Retry-After` when it named one**,
+                        // floored like every other named wait, and 2 s otherwise. **Admission is
+                        // the plan budget's own rule**: a re-probe is a candidate start, so it is
+                        // priced by `candidate_is_affordable` with the wait added to the elapsed
+                        // time — one full `UPSTREAM_HEADER_TIMEOUT` must still fit, which is what
+                        // keeps this from becoming the 2026-09-27 overrun again. A provider that
+                        // names a wait too long to afford simply does not get a re-probe.
+                        //
+                        // The failed attempt above is already in the chain, so a ledger row shows
+                        // the re-probe as the second attempt it is.
+                        let wait = outcome_retry_after
+                            .filter(|&ms| ms > 0)
+                            .map(|ms| Duration::from_millis(ms.max(COOLDOWN_FLOOR_MS)))
+                            .unwrap_or(SERVER_ERROR_RETRY_BACKOFF);
+                        if outcome_cls == ErrorClass::ServerError
+                            && plan.is_empty()
+                            && !reprobed
+                            && !cancel.is_cancelled()
+                            && candidate_is_affordable(plan_started.elapsed() + wait, false)
+                        {
+                            tracing::info!(
+                                provider = %candidate.provider.slug,
+                                key = %candidate.key.label,
+                                status = outcome_status,
+                                wait_ms = wait.as_millis() as u64,
+                                "plan exhausted on SERVER_ERROR — re-probing the same key once",
+                            );
+                            tokio::time::sleep(wait).await;
+                            plan.push_front((candidate, true));
+                        }
+                        continue;
+                    }
                 }
             }
 

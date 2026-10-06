@@ -2368,6 +2368,128 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_final_candidate_server_error_is_reprobed_once_and_can_serve() {
+        // The measured case (2026-10-06): a provider-qualified id with one key plans exactly one
+        // candidate, so the old `Next => continue` exhausted the plan on the first 500 and a
+        // transient upstream blip became a hard failure. The re-probe is the wait-and-redial the
+        // plan had nowhere left to do.
+        let adapter = TextScripted::new(vec![refused(503), chunks_of(&["recovered"])])
+            .shared();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the re-probe serves");
+
+        assert_eq!(served.candidate.provider.id, "p1", "the same candidate serves");
+        assert_eq!(adapter.calls().len(), 2, "the same key was dialled twice");
+        assert_eq!(
+            adapter.calls(),
+            vec!["key:p1:k1|m1".to_string(), "key:p1:k1|m1".to_string()],
+        );
+        assert_eq!(served.attempts.len(), 1, "the 500 stays in the chain");
+        assert_eq!(served.attempts[0].cls, ErrorClass::ServerError);
+        assert_eq!(served.attempts[0].status, 503);
+        assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_server_error_on_the_reprobed_candidate_gets_no_third_dial() {
+        // Bounded means bounded: one re-probe per candidate, whatever it returns. The chain records
+        // both attempts, which is what the ledger's "attempt 2" line reads from.
+        let adapter = TextScripted::new(vec![refused(503), refused(500)]).shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("both dials 500'd");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                let classes: Vec<ErrorClass> = error.chain.iter().map(|a| a.cls).collect();
+                assert_eq!(classes, vec![ErrorClass::ServerError, ErrorClass::ServerError]);
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(adapter.calls().len(), 2, "exactly one re-probe, never a third");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_plan_server_error_fails_over_without_reprobing() {
+        // With a next candidate, failover is immediate: a healthy provider beats a wait on the
+        // provider that just 500'd. The re-probe exists only where failover has nothing to do.
+        let adapter = TextScripted::new(vec![refused(503), chunks_of(&["second"])]).shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1"), candidate("p2", "k2", "m2")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the second candidate serves");
+
+        assert_eq!(served.candidate.provider.id, "p2");
+        assert_eq!(
+            adapter.calls(),
+            // `key_row` hardcodes `key:p1:{label}` into the secret_ref, so the second
+            // candidate's ref spells p1 even though its provider id is p2.
+            vec!["key:p1:k1|m1".to_string(), "key:p1:k2|m2".to_string()],
+            "one dial per candidate — p1 was not re-dialled",
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn only_server_error_earns_a_reprobe_on_the_final_candidate() {
+        // 429 already has a remedy the re-probe would corrupt: the key cools, and a wait inside
+        // this request would run straight back into the named window. The re-probe is a 5xx
+        // behaviour and nothing else.
+        let adapter = TextScripted::new(vec![refused(429)]).shared();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("rate-limited is not re-probed");
+
+        match failure {
+            TextFailure::AllAttemptsFailed { error, .. } => {
+                assert_eq!(error.chain.len(), 1);
+                assert_eq!(error.chain[0].cls, ErrorClass::RateLimited);
+            }
+            other => panic!("expected AllAttemptsFailed, got {other:?}"),
+        }
+        assert_eq!(adapter.calls().len(), 1, "one dial, no re-probe");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn the_permit_comes_back_on_every_text_path() {
         // The text loop has more exits than the image one — served, exhausted, mid-stream,
         // cancelled — so the `Drop` that releases the slot has more ways to leak.

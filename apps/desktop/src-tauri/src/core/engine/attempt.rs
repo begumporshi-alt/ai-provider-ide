@@ -160,6 +160,34 @@ pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
     is_first || elapsed + crate::core::egress::UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET
 }
 
+/// How long the text loop waits before re-dialing the **same** candidate whose plan just ran out on
+/// a `SERVER_ERROR` — the same-key re-probe.
+///
+/// **The measured case (2026-10-06, `agent-router` / `deepseek-v4-flash`):** the first prompt
+/// served, the second drew a 500 "Service temporarily unavailable", and the request failed —
+/// because a provider-qualified id plans only that one provider, the provider had one key, and the
+/// loop's only response to a 500 is *fail over to the next candidate*. With a plan of length one,
+/// "next candidate" does not exist, so a transient upstream blip became a hard failure. The value
+/// of a same-key retry here is exactly the value the egress layer already states for transport
+/// errors (`UPSTREAM_TRANSPORT_RETRIES`): the failure was real, but *what it predicted* — that this
+/// host cannot serve right now — is only sometimes true, and a short wait is how you find out.
+///
+/// **2 s is the initial delay ZCode retries with** (its embedded AI-SDK layer: `maxRetries 2`,
+/// initial delay 2 s, factor 2), and it is where the parallel is deliberate: the re-probe exists so
+/// this engine behaves like a competent client when the plan has nowhere to go, and 2 s is short
+/// enough to stay inside the plan budget (below) while giving a flapping upstream a beat to
+/// recover. A provider that names its own `Retry-After` is honoured instead — floored at
+/// [`COOLDOWN_FLOOR_MS`] — for the same reason `min_retry_after_ms` honours it.
+///
+/// **Bounded, and budget-checked like everything else.** One re-probe per candidate, only when the
+/// plan is exhausted behind it (a plan with a next candidate fails over *immediately* — waiting on
+/// the provider that just 500'd when a healthy one is next is strictly worse), only before anything
+/// reached the sink, and admitted only if `elapsed + wait + UPSTREAM_HEADER_TIMEOUT` fits inside
+/// [`PLAN_BUDGET`] — a re-probe is a candidate start, so it is priced by
+/// [`candidate_is_affordable`] with the wait added to the elapsed time. A provider that names a
+/// `Retry-After` too long to afford simply does not get one.
+pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
 /// How many of a plan's candidates this request may actually try.
 ///
 /// `None` means "the caller named none" and takes [`MAX_ATTEMPTS_DEFAULT`]. `Some(0)` means
