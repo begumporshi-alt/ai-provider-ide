@@ -31,7 +31,7 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
@@ -240,21 +240,24 @@ function StepBudget({
   onChange,
   disabled,
 }: {
-  value: number;
-  onChange: (v: number) => void;
+  /** The user's budget, or `null` for no ceiling — see `AgentLoopOptions.maxIterations`. */
+  value: number | null;
+  onChange: (v: number | null) => void;
   disabled?: boolean;
 }) {
-  const [draft, setDraft] = useState(String(value));
+  // `null` renders as an empty field, which is also how the user asks for no limit: the blank
+  // state and the unbounded state are the same state, so nothing has to translate between them.
+  const [draft, setDraft] = useState(value === null ? "" : String(value));
   // Follow the value when it changes from outside this field — hydration, or a reset.
-  useEffect(() => setDraft(String(value)), [value]);
+  useEffect(() => setDraft(value === null ? "" : String(value)), [value]);
 
   const commit = () => {
-    // The raw string, not `Number(draft)`: an emptied field must read as "no answer" and fall
-    // back to the default, and `Number("")` is 0 — which would clamp to the minimum and turn a
-    // cleared box into a one-step loop that returns an empty answer and reports success.
+    // The raw string, not `Number(draft)`: an emptied field means "no limit", and `Number("")` is
+    // 0 — which would clamp to the minimum and turn a cleared box into a one-step loop that
+    // returns an empty answer and reports success.
     const next = clampIterations(draft);
     onChange(next);
-    setDraft(String(next));
+    setDraft(next === null ? "" : String(next));
   };
 
   return (
@@ -267,7 +270,7 @@ function StepBudget({
       title={
         disabled
           ? "only applies in agent mode — without tools there is nothing to step through"
-          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}); the loop also stops as soon as the model answers without calling a tool`
+          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank for no limit — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
       }
     >
       <span className="text-[11px]">Steps</span>
@@ -466,7 +469,10 @@ interface AssistantSettings {
   noTools?: boolean;
   /** Ceiling on tool-calling rounds in one turn. Stored raw; clamped on read, because a value
    *  written by a future build may sit outside today's bounds and must not crash the screen. */
-  maxIterations?: number;
+  /** `null` for no ceiling — distinct from absent for the same round-trip reason as the fields
+   *  below: a cleared budget has to overwrite the stored one, and `JSON.stringify` drops an
+   *  `undefined` key. */
+  maxIterations?: number | null;
   /** Per-request model parameters. `null` means "unset — send the provider's default", and is
    *  deliberately distinct from absent: the write below serialises with `JSON.stringify`, which
    *  DROPS an `undefined` key, so a cleared field saved as `undefined` would leave the previous
@@ -568,7 +574,9 @@ export function AssistantScreen() {
   // The tool-step ceiling. It is a setting rather than a constant because it is the one knob
   // that trades cost against thoroughness per run: a one-shot question wants 1, a real refactor
   // across a repo doesn't finish in 8.
-  const [maxIterations, setMaxIterations] = useState(DEFAULT_MAX_ITERATIONS);
+  // `null` is the default and means no ceiling: a real task is not a fixed number of rounds, and
+  // the measured failure of the alternative (2026-10-06) was a legitimate long task cut off by one.
+  const [maxIterations, setMaxIterations] = useState<number | null>(null);
   const [temperature, setTemperature] = useState<number | "">("");
   const [maxTokens, setMaxTokens] = useState<number | "">("");
   // The thinking level. `""` is "unset" — send no field and leave the provider's own default,
@@ -625,7 +633,10 @@ export function AssistantScreen() {
       if (typeof stored.agentMode === "boolean") setAgentMode(stored.agentMode);
       if (typeof stored.useMemory === "boolean") setUseMemory(stored.useMemory);
       // Clamped, not trusted: the stored JSON is ours but not written by this build.
-      if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
+      // `null` is a real stored value here ("no limit"), like `temperature`'s and `maxTokens`',
+      // so it is tested for first; anything else is parsed (and unparseable reads as no limit).
+      if (stored.maxIterations === null) setMaxIterations(null);
+      else if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
       // A stored `null` is a real value here — it is how "unset" survives the round trip — so the
       // tests are explicitly for `null` first and then for a usable number. A blank field and a
       // field holding 0 are different requests: 0 is a real temperature.
@@ -750,7 +761,7 @@ export function AssistantScreen() {
   // carries the state at a glance: accent while agent mode is on, a dot whenever anything differs
   // from its default — hiding the switches must not hide their effect.
   const runConfigDirty =
-    agentMode || planMode || !useMemory || !noTools || approvalMode !== "ask" || maxIterations !== DEFAULT_MAX_ITERATIONS;
+    agentMode || planMode || !useMemory || !noTools || approvalMode !== "ask" || maxIterations !== null;
   const runToolbar = (
     <div className="relative shrink-0">
       <button
@@ -1357,7 +1368,8 @@ function Chat({
   noTools: boolean;
   agentMode: boolean;
   useMemory: boolean;
-  maxIterations: number;
+  /** The user's step budget, or null for no ceiling (the default). */
+  maxIterations: number | null;
   /** P5: how tool calls are gated. The mode itself lives in `AssistantScreen` (it is persisted);
    *  the trust the user grants from the modal is per-session state held here. */
   approvalMode: ApprovalMode;
@@ -1483,10 +1495,11 @@ function Chat({
   // `unpricedRows`/`rows` are the honesty inputs for the cost figure: a total that silently skips
   // the requests whose model published no price is a number the user cannot tell apart from a
   // complete one, and this app treats "unknown" and "free" as different facts everywhere else.
-  const [sessionCost, setSessionCost] = useState<{ micros: number; rows: number; unpriced: number }>({
+  const [sessionCost, setSessionCost] = useState<{ micros: number; rows: number; unpriced: number; unreported: number }>({
     micros: 0,
     rows: 0,
     unpriced: 0,
+    unreported: 0,
   });
   const [sessionTokensIn, setSessionTokensIn] = useState(0);
   const [sessionTokensOut, setSessionTokensOut] = useState(0);
@@ -1555,7 +1568,7 @@ function Chat({
       const pricing = provider && model ? catalog.pricingFor(provider, model) : undefined;
       sessionUsageRef.current = chargeSessionUsage(sessionUsageRef.current, { tokensIn, tokensOut, pricing });
       const u = sessionUsageRef.current;
-      setSessionCost({ micros: u.micros, rows: u.rows, unpriced: u.unpriced });
+      setSessionCost({ micros: u.micros, rows: u.rows, unpriced: u.unpriced, unreported: u.unreported });
       setSessionTokensIn(u.tokensIn);
       setSessionTokensOut(u.tokensOut);
     },
@@ -1569,12 +1582,15 @@ function Chat({
    * partial sum is marked `≥ …` so the user knows a request is missing from it, and traffic with no
    * price at all renders as `—` (unknown) rather than `$0.00` (free).
    */
+  // A row that reported no usage is as unknown as one with no published price — both make the
+  // total a lower bound, and a total that is only unknown rows is not a number at all.
+  const unknownRows = sessionCost.unpriced + sessionCost.unreported;
   const costLabel =
     sessionCost.rows === 0
       ? formatCost(0)
-      : sessionCost.unpriced === sessionCost.rows
+      : unknownRows >= sessionCost.rows
         ? formatCost(null)
-        : `${sessionCost.unpriced > 0 ? "≥ " : ""}${formatCost(sessionCost.micros)}`;
+        : `${unknownRows > 0 ? "≥ " : ""}${formatCost(sessionCost.micros)}`;
 
   // P8: keep the palette honest about "New chat" — it is refused while a turn runs (same reason
   // `newChat` guards on `busy`: re-entering the loop mid-stream interleaves two runs into one
@@ -1888,7 +1904,9 @@ function Chat({
           temperature: typeof temperature === "number" ? temperature : undefined,
           maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
           thinking,
-          maxIterations: clampIterations(maxIterations),
+          // Already the parsed shape (`number | null`); the clamp happened when it was typed or
+          // loaded, and re-clamping here would only risk disagreeing with the field.
+          maxIterations,
           controller: ac,
           confirm: (call, args) => turn.confirm(call, args),
         },
@@ -2890,10 +2908,17 @@ function Chat({
             "Totals for the turns this screen has sent since it opened, as reported on each turn's wire usage — Activity shows every request the gateway routed, including other clients" +
             (sessionCost.unpriced > 0
               ? ` · ${sessionCost.unpriced} of ${sessionCost.rows} used a model with no published price, so the cost is a lower bound`
+              : "") +
+            (sessionCost.unreported > 0
+              ? ` · ${sessionCost.unreported} of ${sessionCost.rows} reported no usage at all, so the tokens are a partial sum`
               : "")
           }
         >
-          Σ {formatTokens(sessionTokensIn)} in · {formatTokens(sessionTokensOut)} out · {costLabel}
+          {/* Nothing reported is not zero reported: a session whose calls all came back without
+            usage says so, rather than printing a measurement it never took. */}
+          {sessionCost.rows > sessionCost.unreported
+            ? `Σ ${formatTokens(sessionTokensIn)} in · ${formatTokens(sessionTokensOut)} out · ${costLabel}`
+            : `Σ usage not reported · ${costLabel}`}
         </span>
       </div>
 

@@ -35,7 +35,7 @@ function makePorts(opts: {
   const events: AgentEvent[] = [];
   const traces: Trace[] = [];
   const patches: { id: string; patch: Record<string, unknown> }[] = [];
-  const charged: { tokensIn: number; tokensOut: number; provider?: string; model?: string }[] = [];
+  const charged: { tokensIn: number | undefined; tokensOut: number | undefined; provider?: string; model?: string }[] = [];
   const recorded: { kind: string; label?: string }[] = [];
   const runs: { started: unknown[]; ended: unknown[] } = { started: [], ended: [] };
   let nodeSeq = 0;
@@ -183,12 +183,14 @@ describe("runAgentTurn", () => {
     expect(hostRuns).toEqual([{ name: "read_file", args: { path: "a.txt" } }]);
     expect(recorded.map((r) => r.kind)).toEqual(["tool_call", "tool_result", "done"]);
     expect(runs.ended[0]).toEqual(["run-1", "ok", 2]);
-    // Charged once per completed model call: the first with its reported usage, the second with
-    // none — a row with zero tokens, exactly like the screen's own wrapper did.
+    // Charged once per completed model call. The second call reported **no usage**, and that is
+    // charged as `undefined` rather than zeros: the session accumulator counts it separately, so a
+    // provider that reports nothing cannot make the totals read as a measured `0 in · 0 out`
+    // (2026-10-06: agent-router's stream did exactly that while it was plainly billing).
     expect(charged).toEqual([
       { tokensIn: 10, tokensOut: 2, provider: "prov-1", model: "model-x" },
-      // the second call's fake never reported served ids, so it charges unpriced — honest
-      { tokensIn: 0, tokensOut: 0, provider: undefined, model: undefined },
+      // the second call's fake never reported served ids either, so it charges unpriced — honest
+      { tokensIn: undefined, tokensOut: undefined, provider: undefined, model: undefined },
     ]);
     // The transcript was replaced with the full loop transcript plus the final assistant turn.
     const transcript = vi.mocked(ports.onReplaceTranscript).mock.calls[0]![0];

@@ -149,7 +149,7 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
     // usually never reaches the usage chunk, so it adds nothing — honest, since those tokens
     // were mostly never generated, let alone billed.
     if (turnUsage) {
-      ports.chargeUsage(turnUsage.prompt_tokens ?? 0, turnUsage.completion_tokens ?? 0, turnServed?.provider, turnServed?.model);
+      ports.chargeUsage(turnUsage.prompt_tokens, turnUsage.completion_tokens, turnServed?.provider, turnServed?.model);
     }
   }
 }

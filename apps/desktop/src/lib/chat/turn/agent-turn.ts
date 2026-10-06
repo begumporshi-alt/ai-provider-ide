@@ -26,7 +26,8 @@ export interface AgentTurnRequest extends TurnRequestBase {
   temperature?: number;
   maxTokens?: number;
   thinking?: string;
-  maxIterations: number;
+  /** The user's step budget, or null for no ceiling — see `AgentLoopOptions.maxIterations`. */
+  maxIterations: number | null;
   /** The live AbortController — registered with the orchestrator so the dashboard can stop the run. */
   controller: AbortController;
   confirm: Parameters<typeof runAgentLoop>[0]["confirm"];
@@ -138,8 +139,10 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         // Code drive. The loop's own reasoning override — the NO_OUTPUT fallback's forced "off" —
         // is spread after the run-config level on purpose: it must win, or the fallback could not
         // turn thinking off.
-        let callIn = 0;
-        let callOut = 0;
+        // `undefined` until the call reports usage: a call that reports none must not be charged
+        // as a zero-token one (see `chargeSessionUsage`).
+        let callIn: number | undefined;
+        let callOut: number | undefined;
         const p = ports.generate(
           {
             ...(req.thinking ? { reasoning: req.thinking } : {}),
@@ -152,8 +155,8 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
               // Summed, not replaced: an agent turn is several model calls, and the live status
               // line shows what the whole run has spent so far.
               ports.onRunUsageAdded(u.prompt_tokens ?? 0, u.completion_tokens ?? 0);
-              callIn += u.prompt_tokens ?? 0;
-              callOut += u.completion_tokens ?? 0;
+              callIn = (callIn ?? 0) + (u.prompt_tokens ?? 0);
+              callOut = (callOut ?? 0) + (u.completion_tokens ?? 0);
             },
           } as Parameters<AgentTurnPorts["generate"]>[0],
           { signal: opts?.signal },

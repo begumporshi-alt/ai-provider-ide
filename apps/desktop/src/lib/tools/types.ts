@@ -88,8 +88,19 @@ export interface AgentLoopOptions {
   generate: GenerateFn;
   /** Injected tool executor (Tauri sandbox in prod, fake in tests). */
   host: ToolHost;
-  /** Hard ceiling on model round-trips; guards against a model that never stops calling. */
-  maxIterations?: number;
+  /**
+   * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling**.
+   *
+   * The Assistant's screen leaves this unset by default: a real task is not a fixed number of
+   * rounds, and the measured failure of the alternative (2026-10-06) was a legitimate long task cut
+   * off mid-work by a hard cap. A turn without a ceiling is paced by the loop's own reminder (see
+   * `TOOL_CALL_NUDGE_AFTER` in `agentLoop.ts`) and ended by the user's Stop. A number still bounds
+   * a turn, and reaching it is reported as `hitCeiling` rather than passed off as an answer.
+   *
+   * The gateway's loop is a different caller with the opposite default: external clients that this
+   * app cannot see must never be unbounded, so it passes `DEFAULT_MAX_ITERATIONS`.
+   */
+  maxIterations?: number | null;
   /**
    * Per-call confirmation gate. Return true to execute, false to deny (the UI shows the
    * user an allow/deny prompt). When omitted, every call executes (non-interactive use).

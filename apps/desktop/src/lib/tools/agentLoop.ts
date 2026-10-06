@@ -34,9 +34,29 @@ import type { AgentLoopOptions } from "./types";
  */
 export const DEFAULT_MAX_ITERATIONS = 8;
 
-/** Upper bound when the ceiling is user-set. Not a security control — the loop is bounded
- *  either way — but a value of 5000 would just be a slow way to burn tokens. */
+/** Upper bound when the ceiling is user-set. Not a security control — a value of 5000 would just
+ *  be a slow way to burn tokens. */
 export const MAX_ITERATIONS_CAP = 50;
+
+/**
+ * How many tool calls a turn may make before the loop starts reminding the model to wrap up — and
+ * how many reminders one turn may carry.
+ *
+ * **A long turn is paced by a nudge, not by a guillotine.** The measured incident (2026-10-06,
+ * "make the prompt library a desktop app"): a real task needed more than the configured 40 rounds,
+ * and the hard ceiling cut the turn off mid-work — the user's report was "assistant suddenly
+ * stopped". A client that paces instead of aborting is the shape a mature agent uses: ZCode runs
+ * its main turn with no step cap at all and injects at most three of these per turn ("This turn has
+ * already made N tool calls. Do not keep calling tools reflexively. Use the gathered results to
+ * choose a different next step, summarize the blocker, or ask the user for guidance if you are
+ * stuck."). The wording here is the same instruction, sized to this loop.
+ *
+ * The reminder rides the **system turn** of the next request only — never the transcript — so it
+ * steers the model without appearing as a message the person did not write, and it is capped so a
+ * model that ignores it still hears the same thing at most three times rather than every round.
+ */
+export const TOOL_CALL_NUDGE_AFTER = 25;
+export const TOOL_CALL_NUDGE_MAX = 3;
 
 /**
  * How many times a NO_OUTPUT turn — the model reasoned through its whole output budget and sent
@@ -59,10 +79,12 @@ export const NO_OUTPUT_RETRIES = 1;
  */
 export const TRUNCATION_RETRIES = 2;
 
-/** Clamp a user-supplied ceiling into `[1, MAX_ITERATIONS_CAP]`. Non-finite and non-numeric
- *  input falls back to the default rather than to 1: a corrupted setting should degrade to the
- *  value that works, not to a loop that gives up immediately. */
-export function clampIterations(value: unknown): number {
+/** Clamp a user-supplied ceiling into `[1, MAX_ITERATIONS_CAP]`, or `null` for no ceiling.
+ *
+ *  Non-finite and non-numeric input — and a blank string, which is what a cleared field holds —
+ *  fall back to no ceiling rather than to 1 or to some default: a corrupted setting should degrade
+ *  to the value that works, and an unbounded turn is the one the pacing nudge was built for. */
+export function clampIterations(value: unknown): number | null {
   // Numbers and numeric strings only. A blanket `Number(value)` would coerce `null`, `[]` and
   // `true` into 0, 0 and 1 — a JSON blob that lost its field would then read as "run one step",
   // which is indistinguishable from a broken agent rather than a missing setting.
@@ -72,7 +94,12 @@ export function clampIterations(value: unknown): number {
       : typeof value === "string" && value.trim() !== ""
         ? Number(value)
         : NaN;
-  if (!Number.isFinite(n)) return DEFAULT_MAX_ITERATIONS;
+  // **Blank, and anything unparseable, mean no ceiling** — the same reading the field's own blank
+  // state has. It used to mean the default 8, which was right while the ceiling was mandatory and
+  // is wrong now that the ceiling is the user's option: a cleared box asks for no limit, and a
+  // corrupted setting should degrade to the value that always works, which is the unbounded one
+  // the nudge paces (see `TOOL_CALL_NUDGE_AFTER`).
+  if (!Number.isFinite(n)) return null;
   return Math.max(1, Math.min(MAX_ITERATIONS_CAP, Math.floor(n)));
 }
 
@@ -112,7 +139,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     registry,
     generate,
     host,
-    maxIterations = DEFAULT_MAX_ITERATIONS,
+    // `null` — and absent — mean **no ceiling**: the turn ends when the model stops calling tools,
+    // which is what a real task needs and what the nudge above paces. A number is the user's own
+    // budget from the run configuration, and it still ends the turn with the ceiling notice.
+    // (`DEFAULT_MAX_ITERATIONS` is not the default here on purpose: it is the *gateway loop's*
+    // bound, pinned against the Rust constant `bridge_policy.rs::MAX_TOOL_ITERATIONS` — a client
+    // the app cannot see must never be left unbounded, while the Assistant's user can watch it and
+    // press Stop.)
+    maxIterations = null,
     confirm,
     onEvent,
     signal,
@@ -126,12 +160,25 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   let lastText = "";
   let truncationRetries = 0;
   let noOutputRetries = 0;
+  // The pacing counter (see `TOOL_CALL_NUDGE_AFTER`): calls made this turn, and reminders sent.
+  let toolCallsThisTurn = 0;
+  let nudgesSent = 0;
   // Set once the NO_OUTPUT fallback has fired: every attempt afterwards asks for thinking off,
   // so the knob's level never re-arms mid-turn.
   let forceNoReasoning = false;
 
-  for (let iter = 1; iter <= maxIterations; iter++) {
+  for (let iter = 1; maxIterations === null || iter <= maxIterations; iter++) {
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
+
+    // Pace a long turn: once it has made enough calls, every request carries a reminder to wrap up
+    // or ask — at most `TOOL_CALL_NUDGE_MAX` times, so a model that ignores it is not nagged
+    // forever and a model that heeds it is not told twice.
+    const dueForNudge =
+      toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) && nudgesSent < TOOL_CALL_NUDGE_MAX;
+    const systemForThisRequest = !opts.system && !dueForNudge
+      ? ""
+      : [opts.system, dueForNudge ? nudgeText(toolCallsThisTurn) : ""].filter(Boolean).join("\n\n");
+    if (dueForNudge) nudgesSent += 1;
 
     const collected: ToolCall[] = [];
     let text = "";
@@ -148,7 +195,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     const stream = await generate(
       {
         model,
-        messages: opts.system ? [{ role: "system" as const, content: opts.system }, ...messages] : messages,
+        // The pace reminder joins the system turn for this request only (see
+        // `TOOL_CALL_NUDGE_AFTER`): appended after the caller's own instructions so it is the last
+        // thing the model reads, and never written into `messages` — it is a steering note, not a
+        // turn the transcript should show or the next turn should replay.
+        messages: systemForThisRequest
+          ? [{ role: "system" as const, content: systemForThisRequest }, ...messages]
+          : messages,
         tools,
         toolChoice: tools ? "auto" : undefined,
         ...(forceNoReasoning ? { reasoning: "off" as const } : {}),
@@ -298,12 +351,20 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               }
             }
           } else {
-            // `call.id` and the run's signal travel together: the id lets the sandbox register a
-            // long `run_command` for cancellation, and the signal is what fires the cancel when
-            // the user hits Stop mid-tool. Without both, Stop could only take effect at the next
-            // tool boundary — which for a 60-second command is exactly the "stop doesn't work"
-            // complaint this path exists to answer.
-            const r = await host.run(name, args, { callId: call.id, signal });
+            // **The id that travels is `ids[i]`, not `call.id`, and the difference is a Stop that
+            // works.** `toWireToolCalls` above synthesizes an id when the provider sent none, and
+            // `ids[i]` is what the assistant turn and the tool result both name; `call.id` is
+            // `undefined` for exactly that provider (the case `wire.ts` documents as real). Handing
+            // the sandbox `undefined` meant `tool_cancel` was never invoked and the child was never
+            // registered for cancellation — so Stop reported "stopped by you" while a 60-second
+            // command ran to completion in the background. The wire id and the sandbox id are one
+            // decision or they are two ids for one call.
+            //
+            // The signal rides along with it: it is what fires the cancel when the user hits Stop
+            // mid-tool. Without both, Stop could only take effect at the next tool boundary — which
+            // for a 60-second command is exactly the "stop doesn't work" complaint this path exists
+            // to answer.
+            const r = await host.run(name, args, { callId: ids[i], signal });
             resultText = r.output;
             ok = r.ok;
             // Belt and braces: `ToolHost` is an interface, and a host that reports a failure with
@@ -342,6 +403,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
       messages.push({ role: "tool", content: resultText, tool_call_id: ids[i]! });
     }
+    toolCallsThisTurn += collected.length;
   }
 
   // Hit the iteration ceiling: hand back the last answer rather than spinning forever. The ceiling
@@ -349,8 +411,22 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // It is its own outcome, named: the model was still calling tools when the budget ran out, and
   // the last iteration's text is typically empty (that turn was pure tool_use). The caller reads
   // `hitCeiling` and says so, rather than appending an empty assistant turn that reads as a hang.
-  onEvent?.({ type: "done", text: lastText, iterations: maxIterations, hitCeiling: true });
+  // Only reachable with an explicit budget: with no ceiling the loop exits through the terminal
+  // branch above, on an answer.
+  const ceiling = maxIterations ?? 0;
+  onEvent?.({ type: "done", text: lastText, iterations: ceiling, hitCeiling: true });
   return { text: lastText, messages, truncated: false, hitCeiling: true };
+}
+
+/** What the pace reminder says. Phrased as instruction rather than scolding — the loop has no
+ *  view of whether the work is nearly done, and "you have made N calls" is the only fact it can
+ *  honestly add. Mirrors the wording a mature client uses; see `TOOL_CALL_NUDGE_AFTER`. */
+function nudgeText(calls: number): string {
+  return (
+    `This turn has already made ${calls} tool calls. Do not keep calling tools reflexively — ` +
+    "use the results you have. Finish the task if it is done, summarise what is done and what " +
+    "remains if it is not, or ask the user if you are stuck."
+  );
 }
 
 /** The marker `read_image` writes: `READ_IMAGE:<media>;base64,<payload>` then `path:`/`bytes:` lines. */

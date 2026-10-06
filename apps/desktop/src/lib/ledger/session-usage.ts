@@ -23,16 +23,29 @@ export interface SessionUsage {
   unpriced: number;
   tokensIn: number;
   tokensOut: number;
+  /**
+   * Of `rows`, how many reported no usage at all. They contribute no tokens and no micros, and
+   * their only job is to make the totals honest: a sum that silently omits a request reads as a
+   * measurement, which is exactly what it is not. `undefined` tokens — never zero — is how a
+   * caller says "this one reported nothing"; zero stays a measurement.
+   */
+  unreported: number;
 }
 
 export function emptySessionUsage(): SessionUsage {
-  return { micros: 0, rows: 0, unpriced: 0, tokensIn: 0, tokensOut: 0 };
+  return { micros: 0, rows: 0, unpriced: 0, tokensIn: 0, tokensOut: 0, unreported: 0 };
 }
 
-/** One turn's usage report. `pricing` is the served model's catalog entry, absent when unknown. */
+/**
+ * One turn's usage report. `pricing` is the served model's catalog entry, absent when unknown.
+ *
+ * `tokensIn`/`tokensOut` are `undefined` when the call reported nothing — the same distinction
+ * `UsageTokens.cached_tokens: None` vs `Some(0)` keeps on the Rust side, and for the same reason:
+ * a provider that reports nothing is not a provider that used nothing.
+ */
 export interface SessionUsageCharge {
-  tokensIn: number;
-  tokensOut: number;
+  tokensIn: number | undefined;
+  tokensOut: number | undefined;
   pricing?: PricingMicros;
 }
 
@@ -42,6 +55,12 @@ export interface SessionUsageCharge {
  * and a mixed one reads as "≥ total".
  */
 export function chargeSessionUsage(u: SessionUsage, charge: SessionUsageCharge): SessionUsage {
+  // A call that reported nothing is counted and set aside, never added as zeros: adding them would
+  // make the session read `0 in · 0 out` for a request that was billed, which is the shape the
+  // 2026-10-06 incident measured on agent-router (its stream reported cached tokens only).
+  if (charge.tokensIn === undefined || charge.tokensOut === undefined) {
+    return { ...u, rows: u.rows + 1, unreported: u.unreported + 1 };
+  }
   const cost = estimateCostMicros(charge.pricing, charge.tokensIn, charge.tokensOut);
   return {
     micros: u.micros + (cost ?? 0),
@@ -49,5 +68,6 @@ export function chargeSessionUsage(u: SessionUsage, charge: SessionUsageCharge):
     unpriced: u.unpriced + (cost === undefined ? 1 : 0),
     tokensIn: u.tokensIn + charge.tokensIn,
     tokensOut: u.tokensOut + charge.tokensOut,
+    unreported: u.unreported,
   };
 }

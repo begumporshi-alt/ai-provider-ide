@@ -43,7 +43,7 @@ interface FakeOpts {
 function makePorts(opts: FakeOpts = {}) {
   const patches: { id: string; patch: Record<string, unknown> }[] = [];
   const traces: Trace[] = [];
-  const charged: { tokensIn: number; tokensOut: number; provider?: string; model?: string }[] = [];
+  const charged: { tokensIn: number | undefined; tokensOut: number | undefined; provider?: string; model?: string }[] = [];
   const recorder = fakeRecorder();
   const ports: TurnPorts = {
     generate: async () => {

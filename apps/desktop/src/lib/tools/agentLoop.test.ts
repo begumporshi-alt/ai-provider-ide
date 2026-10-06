@@ -402,6 +402,111 @@ describe("runAgentLoop", () => {
     expect(toolTurn?.content).toBe("r");
   });
 
+  it("hands the sandbox the same id the wire carries, synthesized when the model sent none", async () => {
+    // **The Stop defect this pins.** The host call used `call.id`, which is `undefined` for a
+    // provider that omits ids — while `toWireToolCalls` had already synthesized one for the wire.
+    // With no id the host never invoked `tool_cancel` and the sandbox never registered the child,
+    // so Stop reported "stopped by you" while a 60-second command kept running. One call, one id.
+    const seen: ChatMessage[][] = [];
+    const opts: { callId?: string }[] = [];
+    const host: ToolHost = {
+      async run(_name, _args, o) {
+        if (o?.callId) opts.push({ callId: o.callId });
+        return { ok: true, output: "r" };
+      },
+    };
+    // A call with NO id, which is the shape this provider sends.
+    const model: GenerateFn = fakeModel([
+      { text: "", calls: [{ id: "", name: "read_file", arguments: "{}" }] },
+      { text: "done" },
+    ]);
+    const capturing: GenerateFn = async (req) => {
+      seen.push(JSON.parse(JSON.stringify(req.messages)));
+      return model(req);
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: capturing,
+      host,
+    });
+
+    const wireId = (seen[1]!.find((m) => m.role === "assistant")?.tool_calls as { id: string }[])[0]!.id;
+    expect(wireId, "the wire id was synthesized").toBeTruthy();
+    expect(opts.map((o) => o.callId), "the sandbox got the wire id, not undefined").toEqual([wireId]);
+  });
+
+  it("runs past the old eight-round default and ends on the model's own answer", async () => {
+    // The default is no ceiling: a real task is not a fixed number of rounds, and the measured
+    // failure of the alternative (2026-10-06) was a legitimate long task — "make the prompt library
+    // a desktop app" — cut off mid-work by one. Twelve rounds proves the eight-round default is
+    // gone; the ceiling machinery is still tested above, with an explicit budget.
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      if (calls <= 12) {
+        req.onToolCall?.({ id: `c${calls}`, name: "read_file", arguments: "{}" });
+        return streamOf("working");
+      }
+      return streamOf("finally, the answer");
+    };
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(calls, "twelve rounds ran").toBe(13);
+    expect(out.text).toBe("finally, the answer");
+    expect(out.hitCeiling, "and it ended on the answer, not a ceiling").toBe(false);
+  });
+
+  it("paces a long turn with a reminder on the system turn, three at most", async () => {
+    // 110 rounds is past all three reminder thresholds (25, 50, 75) — a model that ignores every
+    // reminder must hear the same thing at most three times rather than every round.
+    const seen: ChatMessage[][] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      seen.push(JSON.parse(JSON.stringify(req.messages)));
+      if (calls <= 110) {
+        req.onToolCall?.({ id: `c${calls}`, name: "read_file", arguments: "{}" });
+        return streamOf("working");
+      }
+      return streamOf("done");
+    };
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      system: "You are an agent.",
+    });
+
+    const askedForMore = (messages: ChatMessage[]): boolean =>
+      String(messages[0]?.content ?? "").includes("reflexively");
+    const nudgedRounds = seen.map((m, i) => (askedForMore(m) ? i + 1 : 0)).filter(Boolean);
+    // The 26th request is the first one made *after* the 25th call, so that is where the reminder
+    // rides — then every 25 calls after it, capped at three.
+    expect(nudgedRounds, "the first reminder rides the request after the 25th call").toEqual([26, 51, 76]);
+    expect(seen.filter(askedForMore)).toHaveLength(3);
+    // The reminder is a steering note, not a turn: it never enters the conversation the caller gets
+    // back, so it cannot surface in the transcript or be replayed as if the user had said it.
+    expect(
+      seen[seen.length - 1]!.filter((m) => m.role === "user").map((m) => String(m.content)),
+      "no synthetic user turn",
+    ).toEqual(["go"]);
+  });
+
   it("never hands the model an empty tool result when the tool fails", async () => {
     // The Tauri host used to return `{ ok, output }` and drop `error`. On the failure path Rust
     // sends `output: ""` with the reason in `error`, so a refused program, an unusable workspace
@@ -497,11 +602,15 @@ describe("clampIterations", () => {
     expect(clampIterations(7.9)).toBe(7);
   });
 
-  it("falls back to the default for input that is not a number at all", () => {
-    // A corrupted setting should degrade to the value that works, not to a loop that gives up
-    // immediately — 1 and "give up" look identical from the outside.
-    for (const v of [NaN, Infinity, -Infinity, undefined, null, "twelve", {}, [], true]) {
-      expect(clampIterations(v)).toBe(DEFAULT_MAX_ITERATIONS);
+  it("reads input that is not a number at all as no ceiling, which is what a blank field means", () => {
+    // The ceiling is the user's option now, and the field's blank state is how "no limit" is
+    // asked for — so unparseable input degrades to the same place. It used to fall back to the
+    // default 8, which was right while the ceiling was mandatory: back then, "no answer" and
+    // "give up immediately" had to be told apart, and now there is a third state that is the
+    // honest one. A corrupted setting should degrade to the value that works, and an unbounded
+    // turn is the one the pacing nudge exists for.
+    for (const v of [NaN, Infinity, -Infinity, undefined, null, "twelve", {}, [], true, ""]) {
+      expect(clampIterations(v)).toBeNull();
     }
   });
 
@@ -511,11 +620,13 @@ describe("clampIterations", () => {
   });
 });
 
-describe("the tool-step ceiling has one source", () => {
-  // The gateway bounds its own loop with the same number. Those were two separate `= 8`
-  // constants kept in step by a comment — the kind of duplication that survives exactly until
-  // someone edits one of them, at which point the gateway and the Assistant disagree about how
-  // much a turn may spend and nothing fails.
+describe("the gateway's tool-step ceiling has one source", () => {
+  // A number that is now the GATEWAY's alone: the Assistant's loop runs without a ceiling by
+  // default (see `AgentLoopOptions.maxIterations`), while a client this app cannot see must never
+  // be unbounded. The constant stayed because the cross-language pin is worth more than the
+  // naming: those were two separate `= 8` constants kept in step by a comment — the kind of
+  // duplication that survives exactly until someone edits one of them, at which point the gateway
+  // and the desktop app disagree about how much a turn may spend and nothing fails.
   //
   // **Retargeted in 25f.** The gateway loop used to be `gateway-bridge.ts`, which imported
   // `DEFAULT_MAX_ITERATIONS` and so could not drift. 25f moved the loop into Rust

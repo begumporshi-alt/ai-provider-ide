@@ -17,6 +17,19 @@ describe("chargeSessionUsage", () => {
     expect(u.micros).toBe(900);
   });
 
+  it("counts a call that reported no usage separately, never as zeros", () => {
+    let u = emptySessionUsage();
+    u = chargeSessionUsage(u, { tokensIn: undefined, tokensOut: undefined });
+    // The row is counted and set aside: adding zeros would make the session read as a measurement
+    // it never took, which is the shape the 2026-10-06 incident measured.
+    expect(u).toMatchObject({ micros: 0, rows: 1, unpriced: 0, unreported: 1, tokensIn: 0, tokensOut: 0 });
+
+    // A mixed session keeps the real totals and its `unreported` count tells the reader why they
+    // are a partial sum — the same shape `unpriced` gives the cost side.
+    u = chargeSessionUsage(u, { tokensIn: 300, tokensOut: 40, pricing: PRICED });
+    expect(u).toMatchObject({ rows: 2, unpriced: 0, unreported: 1, tokensIn: 300, tokensOut: 40 });
+  });
+
   it("counts an unpriced turn as a row with no micros — unknown, not free", () => {
     const u = chargeSessionUsage(emptySessionUsage(), { tokensIn: 100, tokensOut: 20 });
     expect(u).toMatchObject({ micros: 0, rows: 1, unpriced: 1, tokensIn: 100, tokensOut: 20 });

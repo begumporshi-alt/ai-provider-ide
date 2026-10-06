@@ -529,7 +529,7 @@ test("assistant: the switches and the workspace root survive a reload", async ({
   await expect(page.getByPlaceholder(/absolute\/path/)).toHaveValue("/tmp/persisted-workspace");
 });
 
-test("assistant: the tool-step budget is a setting, and a value past the cap is clamped", async ({ page }) => {
+test("assistant: the tool-step budget is a setting, blank means no limit, and a value past the cap is clamped", async ({ page }) => {
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
@@ -541,7 +541,10 @@ test("assistant: the tool-step budget is a setting, and a value past the cap is 
   // Without agent mode there is no loop to step through, so the field is not offered — a budget
   // you can set but that does nothing is worse than one that is greyed out.
   await expect(budget).toBeDisabled();
-  await expect(budget).toHaveValue("8");
+  // Blank is the default and it means **no ceiling** — the loop ends when the model stops calling
+  // tools, paced by the reminder in `agentLoop.ts`. It used to default to 8, which is the
+  // gateway's bound for clients this app cannot see, not this screen's.
+  await expect(budget).toHaveValue("");
 
   // These edits are deliberately back-to-back with no settling time. The root's write is
   // debounced, and it used to serialise the snapshot from when it was SCHEDULED rather than
@@ -563,9 +566,16 @@ test("assistant: the tool-step budget is a setting, and a value past the cap is 
   await budget.blur();
   await expect(budget).toHaveValue("12");
 
+  // Clearing the field asks for no limit again, and that has to be a real stored value rather
+  // than an omission — `JSON.stringify` drops an `undefined`, so a cleared budget saved that way
+  // would leave the old number in the row and silently restore it.
+  await budget.fill("");
+  await budget.blur();
+  await expect(budget).toHaveValue("");
+
   await page.waitForTimeout(700);
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await openRunConfig(page);
-  await expect(page.getByLabel("tool steps")).toHaveValue("12");
+  await expect(page.getByLabel("tool steps"), "no limit survives the reload").toHaveValue("");
 });

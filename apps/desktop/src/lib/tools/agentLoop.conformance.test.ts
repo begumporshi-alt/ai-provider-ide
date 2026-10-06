@@ -15,7 +15,7 @@
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { runAgentLoop } from "./agentLoop";
+import { DEFAULT_MAX_ITERATIONS, runAgentLoop } from "./agentLoop";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
 import type { ChatMessage, TextStream, ToolCall } from "@aiprovider/router-core";
 
@@ -169,6 +169,13 @@ async function runScenario(sc: Scenario): Promise<void> {
     registry: [],
     generate: scriptedModel(sc.steps, seen),
     host,
+    // **The ceiling is passed explicitly because this suite tests the BOUNDED contract** — the one
+    // shared with the Rust gateway loop, whose `bridge_policy::MAX_TOOL_ITERATIONS` is this same 8,
+    // and whose client this app cannot see must never be unbounded. The Assistant's own default is
+    // the opposite (no ceiling; see `AgentLoopOptions.maxIterations`) and has its own tests; the
+    // `repeated_tool_calls_stop_at_the_iteration_ceiling` scenario below is a statement about the
+    // bounded rule both loops implement, not about either caller's default.
+    maxIterations: DEFAULT_MAX_ITERATIONS,
     confirm: async (call: ToolCall) => !denied.has(call.name ?? ""),
     onEvent: (e) => events.push(e),
   });

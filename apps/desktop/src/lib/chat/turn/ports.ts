@@ -78,7 +78,14 @@ export interface TurnEventSink {
   onStopping(stopping: boolean): void;
   /** The screen's abortRef is cleared when the turn settles; ownership moves in phase 4. */
   clearAbort(): void;
-  chargeUsage(tokensIn: number, tokensOut: number, provider?: string, model?: string): void;
+  /** `undefined` for a call that reported no usage at all — see `SessionUsageCharge`, where that
+   *  distinction is what keeps the session totals from reading `0 in · 0 out` for a billed call. */
+  chargeUsage(
+    tokensIn: number | undefined,
+    tokensOut: number | undefined,
+    provider?: string,
+    model?: string,
+  ): void;
 }
 
 /** Everything a turn needs besides its request: its callbacks and its dependencies. */
