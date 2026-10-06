@@ -13,6 +13,13 @@ permissions:
 jobs:
   release:
     runs-on: macos-14
+    env:
+      # **`secrets` is not an allowed context in a step `if`, and using it there invalidates the
+      # whole file.** GitHub reports that as a run that fails in zero seconds with "workflow file
+      # issue" on *every* push — which is what this workflow did from the commit that made signing
+      # optional (413d08a) until this fix, while the release job itself never ran at all.
+      # env values *may* read secrets, so the fact is computed once here and tested below.
+      APPLE_CREDENTIALS_PRESENT: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -115,7 +122,7 @@ jobs:
       # An ad-hoc build (no secrets) has no stapled ticket to verify; the WebKit-link check above
       # is the meaningful gate for that state.
       - name: Verify artifacts are signed and notarized
-        if: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+        if: env.APPLE_CREDENTIALS_PRESENT == 'true'
         run: bash scripts/verify-release-signature.sh
         env:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
