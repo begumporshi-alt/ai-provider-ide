@@ -73,6 +73,13 @@ the tool loop and emits `BridgeMsg` frames) → `router.rs`/`planner.rs`/`engine
 classification) → `egress.rs` (the only credential toucher), with `persist.rs`/`store.rs` under everything
 and `retention.rs`/`drift.rs` as the off-path housekeeping.
 
+The agent protocol exists twice — the TS loop (`lib/tools/agentLoop.ts`) and the Rust loop above — and they
+are pinned to each other by construction: `apps/desktop/conformance/loop-scenarios.json` is executed by both
+(`agentLoop.conformance.test.ts` and `router_bridge/tests/conformance.rs`), so the wire shape, round-trip
+accumulation, refusal-as-result, and the iteration ceiling of `8` are shared facts enforced by tests on both
+sides, including a cross-language source parse in each direction. Expectations stay abstract where the loops
+intentionally differ (denial wording, empty-output handling, usage accounting).
+
 Arrows point downward. **One relaxation is deliberate and must not be "fixed":** L3 services call L1 components
 directly (`onboarding-orchestrator` → probe/generator/contract, `drift-monitor` → generator), because those L1
 modules are the pipeline's tools rather than a layer beneath it.

@@ -1939,4 +1939,12 @@ mod tests {
         );
         assert!(data[0].get("url").is_none());
     }
+
+    // ---------- conformance ----------
+    //
+    // The scenarios the TypeScript loop also runs, from one shared JSON file. Lives here so it
+    // reuses these doubles: a conformance harness that drifted from the unit harness would pin
+    // nothing.
+
+    mod conformance;
 }

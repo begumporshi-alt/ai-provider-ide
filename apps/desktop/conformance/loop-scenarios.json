@@ -1,0 +1,227 @@
+{
+  "comment": [
+    "Shared agent-loop conformance scenarios (2026-10-06).",
+    "",
+    "The product has two implementations of the same agent protocol: the TypeScript loop",
+    "(apps/desktop/src/lib/tools/agentLoop.ts, Assistant-side) and the Rust gateway loop",
+    "(apps/desktop/src-tauri/src/core/router_bridge.rs, gateway-side). Every scenario in this file",
+    "is executed by BOTH, so the implementations are pinned to each other by construction.",
+    "",
+    "Drivers:",
+    "  TypeScript: apps/desktop/src/lib/tools/agentLoop.conformance.test.ts",
+    "  Rust:       apps/desktop/src-tauri/src/core/router_bridge/tests/conformance.rs",
+    "",
+    "Expectations are deliberately abstract where the two loops intentionally differ:",
+    "  - denial/refusal wording (a user confirm on the client vs the gateway's mutation-off refusal)",
+    "  - empty-output handling (the client loop retries NO_OUTPUT turns; the gateway's tools report emptiness themselves)",
+    "  - usage accounting (the gateway forwards Usage; the client loop's charging happens outside the loop)",
+    "",
+    "Tool names: 'sandbox_echo' is deliberately NOT implemented by the Rust sandbox, so its result",
+    "is the deterministic 'unknown tool' string and no scenario needs a filesystem. The exception is",
+    "'write_file', which must be a real mutating tool for the gateway's refusal path to fire.",
+    "",
+    "Step fields: text (the turn's prose), calls[] with id (omit to force id synthesis), name,",
+    "args (omit to force empty-object arguments), denyInClientLoop (the client driver's confirm",
+    "gate denies it; the gateway driver relies on mutation being off). Steps repeat-last when the",
+    "loop asks for more turns than scripted — both drivers implement the same rule.",
+    "",
+    "Expectation fields: modelCalls (total generate calls), finalText (what the caller sees at the",
+    "end — earlier tool turns' prose is discarded by both loops), ceiling (graceful ceiling exit,",
+    "not a truncation), turns[i] = the conversation the model saw on call i+1, where 'rounds' pairs",
+    "each assistant tool_calls turn with the role:tool results that follow it, in order."
+  ],
+  "scenarios": [
+    {
+      "name": "plain_text_ends_after_one_model_call",
+      "steps": [{ "text": "hello there" }],
+      "expect": { "modelCalls": 1, "finalText": "hello there" }
+    },
+    {
+      "name": "tool_round_trip_feeds_the_result_back_before_the_answer",
+      "steps": [
+        { "text": "let me look.", "calls": [{ "id": "c1", "name": "sandbox_echo", "args": { "path": "." } }] },
+        { "text": "here is what I found." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "here is what I found.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": { "path": "." } }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "parallel_calls_get_one_result_each_in_the_order_they_were_called",
+      "steps": [
+        {
+          "text": "two things to check.",
+          "calls": [
+            { "id": "c1", "name": "sandbox_echo", "args": { "n": 1 } },
+            { "id": "c2", "name": "sandbox_echo", "args": { "n": 2 } }
+          ]
+        },
+        { "text": "both came back." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "both came back.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [
+                  { "name": "sandbox_echo", "arguments": { "n": 1 } },
+                  { "name": "sandbox_echo", "arguments": { "n": 2 } }
+                ],
+                "toolResults": [{ "nonEmpty": true }, { "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "an_id_less_call_is_answered_under_a_synthesized_call_id",
+      "steps": [
+        { "text": "checking.", "calls": [{ "name": "sandbox_echo", "args": { "q": 1 } }] },
+        { "text": "got it." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "got it.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": { "q": 1 } }],
+                "toolResults": [{ "idPrefix": "call_", "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "absent_arguments_reach_the_next_turn_as_an_empty_object",
+      "steps": [
+        { "text": "checking.", "calls": [{ "id": "c1", "name": "sandbox_echo" }] },
+        { "text": "got it." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "got it.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": {} }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "a_denied_tool_is_a_result_the_model_sees_not_an_error",
+      "steps": [
+        { "text": "editing.", "calls": [{ "id": "c1", "name": "write_file", "denyInClientLoop": true, "args": { "path": "a.txt" } }] },
+        { "text": "understood, I will not write." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "understood, I will not write.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "write_file", "arguments": { "path": "a.txt" } }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "an_unknown_tool_is_a_result_the_model_sees_not_an_error",
+      "steps": [
+        { "text": "trying the tool.", "calls": [{ "id": "c1", "name": "no_such_tool", "args": {} }] },
+        { "text": "okay, moving on." }
+      ],
+      "expect": {
+        "modelCalls": 2,
+        "finalText": "okay, moving on.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "no_such_tool", "arguments": {} }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_round_trips_accumulate_in_the_conversation",
+      "steps": [
+        { "text": "checking.", "calls": [{ "id": "c1", "name": "sandbox_echo", "args": { "step": 1 } }] },
+        { "text": "checking again.", "calls": [{ "id": "c2", "name": "sandbox_echo", "args": { "step": 2 } }] },
+        { "text": "all done." }
+      ],
+      "expect": {
+        "modelCalls": 3,
+        "finalText": "all done.",
+        "turns": [
+          null,
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": { "step": 1 } }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          },
+          {
+            "rounds": [
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": { "step": 1 } }],
+                "toolResults": [{ "nonEmpty": true }]
+              },
+              {
+                "assistantToolCalls": [{ "name": "sandbox_echo", "arguments": { "step": 2 } }],
+                "toolResults": [{ "nonEmpty": true }]
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "name": "repeated_tool_calls_stop_at_the_iteration_ceiling_without_an_error",
+      "steps": [
+        { "text": "still working.", "calls": [{ "id": "c", "name": "sandbox_echo", "args": {} }] }
+      ],
+      "expect": {
+        "modelCalls": 8,
+        "finalText": "still working.",
+        "ceiling": true
+      }
+    }
+  ]
+}
