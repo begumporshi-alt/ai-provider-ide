@@ -96,6 +96,41 @@ const drain = async (exec: { chunks: AsyncIterable<string> }): Promise<string> =
   return text;
 };
 
+test("served_by rides the terminal chunk wholesale — including the failover chain", async () => {
+  stubFetch();
+  const sseBody = [
+    frame({ choices: [{ delta: { content: "Hello" } }] }),
+    frame({
+      choices: [
+        {
+          index: 0,
+          delta: {},
+          finish_reason: "stop",
+          served_by: {
+            provider: "winner",
+            model: "model-x",
+            key: "key-01",
+            fallbacks: [
+              { provider: "first-try", key: "key-00", cls: "SERVER" },
+              { cls: "RATE_LIMITED", reason: "slow down" },
+            ],
+          },
+        },
+      ],
+    }),
+    "data: [DONE]\n\n",
+  ];
+  responses.push(() => sse(sseBody));
+  const exec = await gatewayGenerate({ model: "m", messages: [{ role: "user", content: "hi" }] }, {});
+  await drain(exec);
+  const served = exec.served();
+  expect(served?.provider).toBe("winner");
+  expect(served?.fallbacks).toHaveLength(2);
+  expect(served?.fallbacks?.[0]).toEqual({ provider: "first-try", key: "key-00", cls: "SERVER" });
+  // The unlabelled attempt stays unlabelled — no invented names.
+  expect(served?.fallbacks?.[1]).toEqual({ cls: "RATE_LIMITED", reason: "slow down" });
+});
+
 test("yields answer chunks and fires the callbacks the port promises", async () => {
   stubFetch();
   responses.push(() => okTurn());

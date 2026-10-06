@@ -10,6 +10,7 @@ function fakeGenerate(
   steps: Array<{ text: string; calls?: { id: string; name: string; arguments: string }[]; usage?: { prompt_tokens: number; completion_tokens: number }; served?: ServedBy }>,
   hooks: { onModelReq?: (req: Record<string, unknown>) => void } = {},
 ): AgentTurnPorts["generate"] {
+  void steps;
   let i = 0;
   return (async (req: Record<string, unknown>) => {
     hooks.onModelReq?.(req);
@@ -191,6 +192,29 @@ describe("runAgentTurn", () => {
     expect(runs.ended[0]).toEqual(["run-1", "stopped", 0]);
     expect(ports.onTrace).toHaveBeenLastCalledWith(expect.objectContaining({ error: "stopped by you" }));
     expect(patches.some((p) => String(p.patch.content).startsWith("⚠ stopped by you"))).toBe(true);
+  });
+
+  it("accumulates each model call's failover chain into the run's trace", async () => {
+    // Two model calls, each served after its own failed attempt: the trace's chain is the
+    // whole run's, in order — not the hardcoded `[]` the pre-wire trace carried.
+    const { ports, traces } = makePorts({
+      steps: [
+        {
+          text: "trying",
+          calls: [{ id: "c1", name: "list_dir", arguments: "{}" }],
+          served: { provider: "prov-1", model: "model-x", key: "k1", fallbacks: [{ provider: "first", key: "k0", cls: "SERVER" }] },
+        },
+        {
+          text: "done",
+          served: { provider: "prov-1", model: "model-x", key: "k1", fallbacks: [{ cls: "RATE_LIMITED", reason: "429" }] },
+        },
+      ],
+    });
+    await runAgentTurn(makeRequest(), ports);
+    expect(traces[traces.length - 1]!.fallbacks).toEqual([
+      { provider: "first", key: "k0", cls: "SERVER" },
+      { cls: "RATE_LIMITED", reason: "429" },
+    ]);
   });
 
   it("resets the run UI and publishes a null change set on settle", async () => {

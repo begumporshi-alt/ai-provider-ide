@@ -288,8 +288,8 @@ pub(crate) async fn chat_h(
                     BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                         usage = Some((prompt_tokens, completion_tokens));
                     }
-                    BridgeMsg::Served { provider, model, key } => {
-                        served_by = Some(json!({ "provider": provider, "model": model, "key": key }));
+                    BridgeMsg::Served { provider, model, key, fallbacks } => {
+                        served_by = Some(json!({ "provider": provider, "model": model, "key": key, "fallbacks": fallbacks }));
                     }
                 }
             }
@@ -339,8 +339,8 @@ pub(crate) async fn chat_h(
             BridgeMsg::Usage { prompt_tokens, completion_tokens } => {
                 usage = Some((prompt_tokens, completion_tokens));
             }
-            BridgeMsg::Served { provider, model, key } => {
-                served_by = Some(json!({ "provider": provider, "model": model, "key": key }));
+            BridgeMsg::Served { provider, model, key, fallbacks } => {
+                served_by = Some(json!({ "provider": provider, "model": model, "key": key, "fallbacks": fallbacks }));
             }
         }
     }

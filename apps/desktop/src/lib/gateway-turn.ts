@@ -53,6 +53,10 @@ export interface ServedBy {
   provider?: string;
   model?: string;
   key?: string;
+  /** The attempts that failed before the winner, in the order tried — the ledger chain's own
+   *  `{provider, key, cls}` shape, riding the wire since 2026-10-06. The trace panel shows the
+   *  failover instead of a hardcoded `[]`. Absent on an older gateway or a clean first serve. */
+  fallbacks?: { provider?: string; key?: string; cls: string; reason?: string }[];
 }
 
 /** The TS engine's exec shape — what `runAgentLoop` and the chat turn consume. */

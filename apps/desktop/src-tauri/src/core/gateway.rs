@@ -446,10 +446,17 @@ pub enum BridgeMsg {
     /// and key actually answered. Emitted just before `Done` so the OpenAI-shaped handlers can
     /// put `served_by` on the terminal chunk / body. The other dialects ignore it until their
     /// clients ask for attribution.
+    ///
+    /// `fallbacks` rides inside the same object (2026-10-06): every attempt that failed before
+    /// the winner, in the order tried, in the ledger chain's own `{provider, key, cls}` shape —
+    /// failover is the product's core promise, and the flagship client could not show it because
+    /// the chain stopped at the ledger row. Accumulated across a bridge request's turns, so an
+    /// agent run's chain is the whole run's.
     Served {
         provider: String,
         model: String,
         key: String,
+        fallbacks: Vec<Value>,
     },
     /// The provider's finish reason, **already mapped to the OpenAI vocabulary** by the serving
     /// dialect's `responseFinishMap` (Anthropic `max_tokens` → `length`). Not terminal: it arrives

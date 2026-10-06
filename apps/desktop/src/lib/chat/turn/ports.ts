@@ -13,13 +13,22 @@ import type { AgentEvent, ToolHost } from "../../tools";
 import type { RunChangeSet } from "../../tools/changeset";
 import type { RunStatus, StepKind } from "../../agent/orchestrator";
 
+/** One failed attempt before the winner — the ledger chain's shape, with the two names optional
+ *  exactly where the ledger omits them (an unlabelled attempt must not grow a fake name). */
+export interface FallbackAttempt {
+  provider?: string;
+  key?: string;
+  cls: string;
+  reason?: string;
+}
+
 /** The trace panel's line. Built by whichever branch served the turn; rendered by the screen. */
 export interface Trace {
   ms: number;
   provider?: string;
   key?: string;
   model?: string;
-  fallbacks: { provider: string; key: string; cls: string }[];
+  fallbacks: FallbackAttempt[];
   error?: string;
   finishReason?: string;
 }

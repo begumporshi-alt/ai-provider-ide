@@ -113,7 +113,9 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
       provider: served?.provider ? ports.providerName(served.provider) : undefined,
       key: served?.key,
       model: served?.model ?? req.model,
-      fallbacks: [],
+      // The chain the gateway rode to this answer — the same entries the ledger row carries,
+      // finally on the wire instead of a hardcoded `[]` (the old engine's one missing field).
+      fallbacks: served?.fallbacks ?? [],
       // **A stream the user stopped is not a success**, and this path reaches here without
       // throwing: the engine's loop returns on an aborted signal rather than raising, so the
       // `catch` below never sees it and the trace printed `✓ 680ms` for a cancelled request. That

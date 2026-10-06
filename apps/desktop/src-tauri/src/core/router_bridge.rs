@@ -69,7 +69,7 @@ use crate::core::bridge_policy::{
 use crate::core::engine::TextFailure;
 use crate::core::gateway::{gateway_tool_refusal, Bridge, BridgeMsg, BridgeRequest, ReplyHandle};
 use crate::core::gateway_normalizer::{detect_client, normalize_gateway_request, NormalizeOptions};
-use crate::core::router::{
+use crate::core::router::{chain_value, 
     CallOptions, ImageRequest, ModelRouter, RouterError, RouterSettings, RouterStore,
 };
 use crate::core::tool_registry::{gateway_tool_set, registry_to_openai};
@@ -302,7 +302,12 @@ impl Job {
         // Serving attribution for the turn that ends the request (A1 Phase 2): captured per
         // successful `generate_text`, emitted as `BridgeMsg::Served` before the terminal `Done`
         // so the OpenAI-shaped handlers can put `served_by` on the wire.
+        //
+        // The failover chain accumulates the same way (2026-10-06): every attempt that failed
+        // before each turn's winner, in order — for a one-turn chat it is exactly the ledger
+        // row's `fallback_chain_json`; for a multi-turn agent run it is the whole run's chain.
         let mut last_served: Option<(String, String, String)> = None;
+        let mut fallbacks: Vec<Value> = Vec::new();
 
         for _turn in 1..=MAX_TOOL_ITERATIONS {
             if cancel.is_cancelled() {
@@ -440,6 +445,7 @@ impl Job {
                         success.candidate.model.native_id.clone(),
                         success.candidate.key.label.clone(),
                     ));
+                    fallbacks.extend(chain_value(&success.attempts).as_array().cloned().unwrap_or_default());
                 }
                 // Cancellation is not a failure to report — the client asked us to stop, so there is
                 // nobody left to read a status code.
@@ -459,6 +465,7 @@ impl Job {
                             provider: provider.clone(),
                             model: model.clone(),
                             key: key.clone(),
+                            fallbacks: fallbacks.clone(),
                         },
                     );
                 }
@@ -513,6 +520,7 @@ impl Job {
                     provider: provider.clone(),
                     model: model.clone(),
                     key: key.clone(),
+                    fallbacks: fallbacks.clone(),
                 },
             );
         }

@@ -14,7 +14,7 @@ import { buildAgentSystem } from "./prompt";
 import { newMsgId, replayHistory } from "./messages";
 import { clip, recordAgentTurn } from "./graph-record";
 import type { TurnRequestBase } from "./ports";
-import type { AgentTurnPorts } from "./ports";
+import type { AgentTurnPorts, FallbackAttempt } from "./ports";
 
 export interface AgentTurnRequest extends TurnRequestBase {
   /** The workspace root; blank refuses the run (the guard is the engine's, not the UI's). */
@@ -78,6 +78,9 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     },
   ];
   let iterations = 0;
+  // The run's failover chain, gathered per model call by the generate wrapper below — the trace
+  // shows every attempt that failed before the answer, not a hardcoded `[]` (2026-10-06).
+  const chain: FallbackAttempt[] = [];
   const onEvent: Parameters<typeof runAgentLoop>[0]["onEvent"] = (ev) => {
     // P6: every event is appended to the run record as it arrives, not batched at the end, so a
     // run that is stopped or crashes is still fully inspectable from the dashboard.
@@ -160,6 +163,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
             } finally {
               const s = exec.served();
               ports.chargeUsage(callIn, callOut, s?.provider, s?.model);
+              if (s?.fallbacks) chain.push(...s.fallbacks);
             }
           })(),
         }));
@@ -209,7 +213,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations);
     ports.onTrace({
       ms: ports.now() - req.startedAt,
-      fallbacks: [],
+      fallbacks: chain,
       provider: "agent",
       ...(stopped ? { error: "stopped by you" } : {}),
     });

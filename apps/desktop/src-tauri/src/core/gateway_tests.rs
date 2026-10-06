@@ -92,6 +92,8 @@ struct SynthBridge {
     usage: AtomicBool,
     /// Emit serving attribution just before `Done` (A1 Phase 2's `BridgeMsg::Served`).
     served: AtomicBool,
+    /// Attach a failed attempt to the Served frame — the failover chain riding the wire.
+    fallbacks: AtomicBool,
     /// Prepend a reasoning message — the upstream-gated pass-through channel.
     reasoning: AtomicBool,
     /// Prepend an empty delta — the bridge's between-turns liveness probe.
@@ -125,6 +127,7 @@ impl SynthBridge {
             tool_calls: AtomicBool::new(false),
             usage: AtomicBool::new(false),
             served: AtomicBool::new(false),
+            fallbacks: AtomicBool::new(false),
             reasoning: AtomicBool::new(false),
             empty_delta: AtomicBool::new(false),
             liveness_then_pause: AtomicBool::new(false),
@@ -166,6 +169,10 @@ impl SynthBridge {
     /// Emit `Served { sysai, oracle-mini, key-01 }` before `Done`.
     fn answer_with_served(&self, on: bool) {
         self.served.store(on, Ordering::Relaxed);
+    }
+    /// Attach a failed attempt to the Served frame — the failover chain riding the wire.
+    fn answer_with_fallbacks(&self, on: bool) {
+        self.fallbacks.store(on, Ordering::Relaxed);
     }
     fn answer_with_reasoning(&self, on: bool) {
         self.reasoning.store(on, Ordering::Relaxed);
@@ -211,6 +218,7 @@ impl Bridge for SynthBridge {
         let with_tools = self.tool_calls.load(Ordering::Relaxed);
         let with_usage = self.usage.load(Ordering::Relaxed);
         let with_served = self.served.load(Ordering::Relaxed);
+        let with_fallbacks = self.fallbacks.load(Ordering::Relaxed);
         let with_reasoning = self.reasoning.load(Ordering::Relaxed);
         let with_empty = self.empty_delta.load(Ordering::Relaxed);
         let liveness_then_pause = self.liveness_then_pause.load(Ordering::Relaxed);
@@ -275,6 +283,13 @@ impl Bridge for SynthBridge {
                                 provider: "sysai".into(),
                                 model: "oracle-mini".into(),
                                 key: "key-01".into(),
+                                fallbacks: if with_fallbacks {
+                                    vec![serde_json::json!({
+                                        "provider": "first-try", "key": "key-00", "cls": "SERVER"
+                                    })]
+                                } else {
+                                    Vec::new()
+                                },
                             },
                         );
                     }
@@ -2457,6 +2472,54 @@ async fn served_by_rides_the_terminal_chunk() {
     );
     assert_eq!(chunk["choices"][0]["served_by"]["model"], "oracle-mini");
     assert_eq!(chunk["choices"][0]["served_by"]["key"], "key-01");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn the_failover_chain_rides_served_by_on_the_terminal_chunk_and_the_body() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_served(true);
+    s.bridge.answer_with_fallbacks(true);
+
+    // Stream: the terminal chunk's served_by names the winner AND the attempts that failed first.
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(true))
+        .send()
+        .await
+        .unwrap();
+    let mut stream = res.bytes_stream();
+    let mut acc = String::new();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+    }
+    let terminal =
+        acc.lines().find(|l| l.contains("finish_reason")).expect("a terminal chunk exists");
+    let chunk: Value = serde_json::from_str(terminal.trim_start_matches("data: ").trim()).unwrap();
+    let served_by = &chunk["choices"][0]["served_by"];
+    assert_eq!(served_by["provider"], "sysai");
+    assert_eq!(
+        served_by["fallbacks"][0],
+        serde_json::json!({ "provider": "first-try", "key": "key-00", "cls": "SERVER" }),
+        "the chain rides in the ledger's own shape: {served_by}"
+    );
+
+    // Non-stream: same object on the body.
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&chat_body(false))
+        .send()
+        .await
+        .unwrap();
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(
+        body["served_by"]["fallbacks"][0]["provider"], "first-try",
+        "the body carries the chain too: {body}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

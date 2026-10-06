@@ -1590,23 +1590,20 @@ fn ledger_row(ts: i64, modality: &str, source: &str) -> LedgerRow {
     }
 }
 
-/// The failed attempts of one request, as `fallback_chain_json`.
+/// The failed attempts of one request, as the chain's JSON array value — the shape the ledger's
+/// `fallback_chain_json` carries and the wire's `served_by.fallbacks` reuses (the two readers of a
+/// chain must not be able to drift: same producer, same shape, 2026-10-06).
 ///
 /// **The shape is the webview's, not this module's.** `store.ts:124-128` builds
 /// `[{provider, key, cls}]` from `provider.slug`, `key.label` and the class, and both Activity and
 /// Context parse exactly those three fields back out. So the Rust router has to produce the same
 /// JSON, and it can now: [`AttemptLabel`](crate::core::engine::AttemptLabel) is the two strings.
 ///
-/// **Always `Some`, including for an empty chain**, because the source's
-/// `e.fallbackChain ? JSON.stringify(...) : null` is a truthiness test and `[]` is truthy — an
-/// empty chain is `"[]"`, and `null` means the caller passed no chain at all. `complete` is the one
-/// such caller.
-///
 /// **An unlabelled attempt omits `provider` and `key` rather than inventing them.** Only a
 /// hand-built chain can reach that, since both engine loops label every outcome they push — but
 /// writing `""` or `"unknown"` would put a name in the column that no provider answered to, and
 /// the reader would render it as though it were real.
-fn chain_json(attempts: &[AttemptOutcome]) -> Option<String> {
+pub fn chain_value(attempts: &[AttemptOutcome]) -> Value {
     let entries: Vec<Value> = attempts
         .iter()
         .map(|a| {
@@ -1625,7 +1622,17 @@ fn chain_json(attempts: &[AttemptOutcome]) -> Option<String> {
             Value::Object(entry)
         })
         .collect();
-    Some(Value::Array(entries).to_string())
+    Value::Array(entries)
+}
+
+/// The failed attempts of one request, as `fallback_chain_json`.
+///
+/// **Always `Some`, including for an empty chain**, because the source's
+/// `e.fallbackChain ? JSON.stringify(...) : null` is a truthiness test and `[]` is truthy — an
+/// empty chain is `"[]"`, and `null` means the caller passed no chain at all. `complete` is the one
+/// such caller.
+fn chain_json(attempts: &[AttemptOutcome]) -> Option<String> {
+    Some(chain_value(attempts).to_string())
 }
 
 #[cfg(test)]

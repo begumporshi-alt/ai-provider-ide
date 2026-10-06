@@ -219,4 +219,19 @@ describe("runPlainTurn", () => {
     expect(ports.onStopping).toHaveBeenLastCalledWith(false);
     expect(ports.clearAbort).toHaveBeenCalledTimes(1);
   });
+
+  it("carries the gateway's failover chain into the trace, not a hardcoded []", async () => {
+    const { ports, traces } = makePorts({
+      chunks: ["answer"],
+      served: {
+        provider: "prov-1",
+        model: "model-x",
+        key: "k1",
+        fallbacks: [{ provider: "first-try", key: "key-00", cls: "SERVER" }],
+      },
+    });
+    await runPlainTurn(makeRequest(), ports);
+    expect(traces[0]!.fallbacks).toEqual([{ provider: "first-try", key: "key-00", cls: "SERVER" }]);
+  });
 });
+

@@ -2656,7 +2656,7 @@ function Chat({
           {showTrace && trace.fallbacks.length > 0 && (
             <ul className="mono mt-1 ml-4 text-[11px]" style={{ color: "var(--text-dim)" }}>
               {trace.fallbacks.map((f, i) => (
-                <li key={i}>attempt {i + 1}: {f.provider} · {f.key} → {f.cls}</li>
+                <li key={i}>attempt {i + 1}: {f.provider ?? "?"} · {f.key ?? "?"} → {f.cls}</li>
               ))}
             </ul>
           )}
