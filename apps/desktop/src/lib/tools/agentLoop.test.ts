@@ -191,6 +191,41 @@ describe("runAgentLoop", () => {
     expect(events).toContainEqual({ type: "no_output_retry", attempt: 1 });
   });
 
+  it("re-asks a reasoning-only answer even when the provider never reported a finish", async () => {
+    // The same NO_OUTPUT shape as the test above, minus the finish report — a manifest that
+    // declares no finish selector. Requiring the report left this shape accepted as an empty
+    // answer: no flag, no retry, nothing on screen (found while fixing the 2026-10-06 incident,
+    // where the blank bubble came from the ceiling instead). The reversal is the point: an empty
+    // answer is not an answer, and what the provider says about stopping cannot change that.
+    const events: AgentEvent[] = [];
+    const reasoningFor: string[] = [];
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      reasoningFor.push(req.reasoning ?? "(unset)");
+      if (calls === 1) {
+        req.onReasoning?.("thinking hard");
+        // No `onFinish` at all: the manifest declares no selector, so the callback never fires.
+        return streamOf("");
+      }
+      return streamOf("Here is the answer.");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(calls).toBe(2);
+    expect(reasoningFor).toEqual(["(unset)", "off"]);
+    expect(out.text).toBe("Here is the answer.");
+    expect(events).toContainEqual({ type: "no_output_retry", attempt: 1 });
+  });
+
   it("fails loudly when even the thinking-off re-ask answers nothing", async () => {
     let calls = 0;
     const model: GenerateFn = async (req) => {

@@ -187,7 +187,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     // say what happened instead of going silent.
     if (collected.length === 0) {
       const truncated = finishReported && finishReason === undefined;
-      const noAnswer = text === "" && reasoningSeen && finishReported;
+      // **The finish report is not part of the no-answer test, and that is deliberate.** A turn
+      // that reasoned and produced neither text nor a call has no answer *whatever* the provider
+      // said about how it stopped — requiring a reported finish left a silent hole: a manifest with
+      // no finish selector plus a reasoning-only round-trip fell past both guards and was accepted
+      // as an empty answer, the same blank bubble by a different road (the same shape as the
+      // 2026-10-06 ceiling incident). Re-asking with thinking off is the remedy the class has, and
+      // it is bounded by NO_OUTPUT_RETRIES either way.
+      const noAnswer = text === "" && reasoningSeen;
       if (truncated && truncationRetries < TRUNCATION_RETRIES) {
         truncationRetries += 1;
         iter -= 1; // the for's increment restores it: the retry re-runs this iteration number
