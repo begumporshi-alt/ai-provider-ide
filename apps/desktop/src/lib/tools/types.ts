@@ -67,7 +67,14 @@ export type AgentEvent =
    * thinking forced off. `attempt` counts fallbacks.
    */
   | { type: "no_output_retry"; attempt: number }
-  | { type: "done"; text: string; iterations: number; truncated?: boolean };
+  /**
+   * The loop ended. `truncated` is the provider-side cut (a declared-finish stream closed early);
+   * `hitCeiling` is the loop-side stop: the step budget ran out while the model was still calling
+   * tools, so the turn ended mid-work and its final text is often empty. The two say different
+   * things and the UI owes the reader a different sentence for each — measured 2026-10-06, where
+   * a ceiling exit appended an empty assistant turn and the transcript showed a bare bubble.
+   */
+  | { type: "done"; text: string; iterations: number; truncated?: boolean; hitCeiling?: boolean };
 
 export interface AgentLoopOptions {
   model: string;

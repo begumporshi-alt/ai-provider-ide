@@ -102,13 +102,16 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         "done",
         ev.truncated
           ? `${ev.iterations} iterations — stream truncated`
-          : ev.iterations
-            ? `${ev.iterations} iterations`
-            : "done",
+          : ev.hitCeiling
+            ? `${ev.iterations} iterations — step ceiling, the model was still calling tools`
+            : ev.iterations
+              ? `${ev.iterations} iterations`
+              : "done",
         undefined,
-        // A truncated turn is not a clean finish: the step reads as failed so the dashboard's
-        // reader asks what the stream actually carried instead of trusting the answer.
-        !ev.truncated,
+        // A truncated turn is not a clean finish, and neither is a ceiling exit: both read as
+        // failed so the dashboard's reader asks what actually happened instead of trusting an
+        // answer that may be empty.
+        !ev.truncated && !ev.hitCeiling,
       );
     } else if (ev.type === "truncation_retry") {
       // Not a recorded step: a re-ask is the loop repairing itself, and it only matters if it
@@ -117,7 +120,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     ports.onAgentEvent(ev);
   };
   try {
-    const { text: finalText, messages } = await runAgentLoop({
+    const { text: finalText, messages, hitCeiling } = await runAgentLoop({
       model: req.model,
       messages: history,
       // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
@@ -200,6 +203,18 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // the whole transcript, so slicing off the replayed prefix is what keeps an earlier turn from
     // being re-recorded — and keeps the graph linear in turns.
     ports.lastNode.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), req.model);
+    // A ceiling exit's last iteration is usually pure tool_use — the model was verifying, not
+    // answering — so `finalText` arrives empty and appending it as-is is the bare assistant bubble
+    // that read as a hang (measured 2026-10-06: a run ended ok at 20 iterations with two pending
+    // `run_command` results and nothing to show for the turn). Say what actually stopped the turn,
+    // the way the stopped and failed paths below already do.
+    if (!finalText.trim() && hitCeiling) {
+      ports.fillIfEmpty(
+        req.assistantMsgId,
+        `⚠ stopped at ${iterations} iterations — the step budget ran out while the model was still ` +
+          "calling tools. Raise “Steps” in the run configuration to let it go further.",
+      );
+    }
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
     // it is an extra model call, and a slow or failing one must not hold up the answer the
     // user is already reading.

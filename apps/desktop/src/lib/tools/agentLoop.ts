@@ -95,6 +95,12 @@ export interface AgentLoopResult {
    *  declared-finish stream without a finish reason and every re-ask truncated too. The text is
    *  the model's last partial answer, not a complete one; the UI is expected to say so. */
   truncated: boolean;
+  /** True when the loop ended on the step ceiling rather than on an answer — the model was still
+   *  calling tools when the budget ran out, so the turn ended mid-work and `text` is often empty.
+   *  The UI is expected to say that instead of appending an empty bubble (measured 2026-10-06:
+   *  a 20-iteration run ended on two `run_command` verifications, and the transcript showed an
+   *  assistant turn with nothing in it). */
+  hitCeiling: boolean;
   /** Full conversation after this turn, conversation-only (no system turn). Feed back as the
    *  next turn's `messages` to replay tool calls correctly. */
   messages: ChatMessage[];
@@ -203,7 +209,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         );
       }
       onEvent?.({ type: "done", text, iterations: iter, truncated });
-      return { text, messages, truncated };
+      return { text, messages, truncated, hitCeiling: false };
     }
 
     // Replay the assistant turn with its tool_calls so the provider accepts the results.
@@ -332,9 +338,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   }
 
   // Hit the iteration ceiling: hand back the last answer rather than spinning forever. The ceiling
-  // exit is not a truncation — every stream here declared its own finish — so the flag stays off.
-  onEvent?.({ type: "done", text: lastText, iterations: maxIterations });
-  return { text: lastText, messages, truncated: false };
+  // exit is not a truncation — every stream here declared its own finish — so that flag stays off.
+  // It is its own outcome, named: the model was still calling tools when the budget ran out, and
+  // the last iteration's text is typically empty (that turn was pure tool_use). The caller reads
+  // `hitCeiling` and says so, rather than appending an empty assistant turn that reads as a hang.
+  onEvent?.({ type: "done", text: lastText, iterations: maxIterations, hitCeiling: true });
+  return { text: lastText, messages, truncated: false, hitCeiling: true };
 }
 
 /** The marker `read_image` writes: `READ_IMAGE:<media>;base64,<payload>` then `path:`/`bytes:` lines. */
