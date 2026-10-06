@@ -469,7 +469,9 @@ test("assistant: the behaviour switches live in the run-configuration panel", as
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
 
-  const title = page.getByRole("heading", { name: "Assistant" });
+  // The screen has no heading of its own any more — its chrome is the top bar, which now carries
+  // the session controls and the tabs — so the geometry anchors on the bar.
+  const bar = page.getByTestId("app-header");
   const picker = pickerButton(page);
 
   // Closed until asked: the composer row shows one icon, not five controls.
@@ -485,11 +487,11 @@ test("assistant: the behaviour switches live in the run-configuration panel", as
   await expect(memory).toBeVisible();
   await expect(noTools).toBeVisible();
 
-  const t = await title.boundingBox();
+  const t = await bar.boundingBox();
   const d = await panel.boundingBox();
   const p = await picker.boundingBox();
-  // The panel opens upward from the composer row, so it stays below the screen's heading; the
-  // model picker (the composer's top-right corner) does too.
+  // The panel opens upward from the composer row, so it stays below the top bar; the model
+  // picker (the composer's top-right corner) does too.
   expect(d!.y).toBeGreaterThan(t!.y);
   expect(p!.y).toBeGreaterThan(t!.y);
 });

@@ -179,6 +179,14 @@ export interface ComposerProps {
    * "what this box will send with" when it overlooks the send button.
    */
   corner?: ReactNode;
+  /**
+   * The prompt enhancer: rewrites the draft into a sharper prompt and replaces the draft with the
+   * rewrite. Optional — absent, no button renders. The composer owns the round-trip's UI (busy
+   * state, the draft swap, the caret parked at the end); the caller owns *what* does the
+   * rewriting, which is a model choice the screen already made. A throw lands in the same notice
+   * channel as a refused attachment, and the draft is untouched.
+   */
+  enhance?: (draft: string) => Promise<string>;
 }
 
 export function Composer({
@@ -203,6 +211,7 @@ export function Composer({
   seed,
   toolbar,
   corner,
+  enhance,
 }: ComposerProps) {
   const [draft, setDraft] = useState("");
   const [caret, setCaret] = useState(0);
@@ -366,6 +375,45 @@ export function Composer({
     const clamped = clampInstruction(text);
     setInstruction(clamped);
     onInstructionChange?.(clamped);
+  }
+
+  // True while the enhancer's model call is in flight. State, not a ref: the button shows the
+  // wait, and the whole action row sits disabled behind it — an enhancement landing mid-typing
+  // would replace text the user was still writing.
+  const [enhancing, setEnhancing] = useState(false);
+
+  /**
+   * Run the enhancer over the draft and swap the draft for the rewrite.
+   *
+   * Reads the draft from `draftRef` (the same composed-closure hazard `appendToDraft` documents),
+   * replaces the whole draft rather than appending — the point of the feature is a better *prompt*,
+   * and a rewrite appended under the original would ask the model to answer both — and parks the
+   * caret at the end so the user can keep editing the rewrite immediately. An empty result is a
+   * refusal to act, not a blanking of the box: the draft survives, the notice says why.
+   */
+  async function enhanceDraft() {
+    const text = draftRef.current.trim();
+    if (!text || !enhance || enhancing || busy) return;
+    setEnhancing(true);
+    try {
+      const next = (await enhance(text)).trim();
+      if (!next) {
+        onNotice("The prompt enhancer returned nothing — your draft is unchanged.");
+        return;
+      }
+      writeDraft(next);
+      requestAnimationFrame(() => {
+        const el = textareaRef.current;
+        if (!el) return;
+        el.focus();
+        el.setSelectionRange(next.length, next.length);
+        setCaret(next.length);
+      });
+    } catch (e) {
+      onNotice(`Prompt enhancement failed: ${(e as Error).message} — your draft is unchanged.`);
+    } finally {
+      setEnhancing(false);
+    }
   }
 
   async function addFiles(list: FileList | File[]) {
@@ -807,6 +855,30 @@ export function Composer({
               the turn will use brackets the row's two ends with what it does. */}
           {toolbar}
           <span className="ml-auto flex items-center gap-2">
+            {/* The prompt enhancer, beside Send: the two actions act on the same box, so they share
+                its row. Disabled on an empty draft — there is nothing to enhance — and hidden while
+                the turn runs, where Stop owns the row. */}
+            {enhance && !busy && (
+              <button
+                type="button"
+                onClick={() => void enhanceDraft()}
+                disabled={!draft.trim() || attaching || enhancing}
+                aria-label="Enhance prompt"
+                data-testid="enhance-button"
+                title="Rewrite the draft into a sharper prompt"
+                className="flex items-center gap-1.5 rounded-lg border px-2.5 py-1 text-[12px] transition-colors disabled:opacity-40"
+                style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+              >
+                {enhancing ? (
+                  <span className="spinner" role="status" aria-label="Enhancing the prompt" />
+                ) : (
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5" aria-hidden="true">
+                    <path d="m12 4 1.8 4.7 4.7 1.8-4.7 1.8L12 17l-1.8-4.7L5.5 10.5l4.7-1.8L12 4Zm6.5 9.5.9 2.1 2.1.9-2.1.9-.9 2.1-.9-2.1-2.1-.9 2.1-.9.9-2.1Z" />
+                  </svg>
+                )}
+                Enhance
+              </button>
+            )}
             {busy ? (
               <Button variant="danger" onClick={onStop}>■ Stop</Button>
             ) : (

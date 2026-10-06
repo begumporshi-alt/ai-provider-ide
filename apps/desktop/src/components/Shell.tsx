@@ -12,12 +12,24 @@
  * The nav list itself lives in `lib/nav.ts` — the command palette renders the same screens, and the
  * shortcut host lives in this component's tree — so this file is only the chrome.
  */
-import { useEffect, type ReactNode } from "react";
+import { createContext, useContext, useEffect, useState, type ReactNode } from "react";
 import { useUi } from "../ui-state";
 import { bootDegradedReason, registry, router } from "../store";
 import { StatusDot } from "./atoms";
 import { ShortcutHost } from "./ShortcutHost";
 import { NAV, screenLabel } from "../lib/nav";
+
+/**
+ * The top bar's per-screen slot. A screen portals its own header content here — the Assistant
+ * puts its session controls and the Chat/Image/Root tabs — instead of spending a second title
+ * row under the chrome. `null` until the header has committed, the same shape the Assistant's
+ * own session slot uses; screens render nothing into it until it exists.
+ */
+const HeaderSlotContext = createContext<HTMLDivElement | null>(null);
+
+export function useHeaderSlot(): HTMLDivElement | null {
+  return useContext(HeaderSlotContext);
+}
 
 /** 15px stroke icons keyed by the `icon` strings in `nav.ts`. Stroke inherits currentColor. */
 const ICON_PATHS: Record<string, ReactNode> = {
@@ -165,6 +177,9 @@ export function Shell({ children }: { children: ReactNode }) {
 
   const providers = registry.listProviders();
   const live = providers.some((p) => p.status === "enabled");
+  // The header slot. State, not a ref: screens consume it through the context below, which has to
+  // re-render once the node exists — the same pattern as the Assistant's session slot.
+  const [headerSlot, setHeaderSlot] = useState<HTMLDivElement | null>(null);
 
   // ⌘B / Ctrl+B folds the rail. Guarded on modifiers and key only — a text field holding focus
   // must not swallow it, but the browser's own find-bar uses ⌘F and bold uses ⌘B *inside inputs*,
@@ -310,10 +325,15 @@ export function Shell({ children }: { children: ReactNode }) {
         )}
       </aside>
 
+      <HeaderSlotContext.Provider value={headerSlot}>
       <main className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar 48-52px: the fold toggle, then a breadcrumb — the workspace home lands on the
-            Assistant, so its crumb is a link rather than plain text. */}
+        {/* Top bar 48-52px: the fold toggle, then the screen's own header. The Assistant portals
+            its session controls and the Chat/Image/Root tabs into the slot; every other screen
+            keeps the breadcrumb. The duplication this removes was real: the Assistant used to
+            spend a second title row ("Assistant · untitled session … Chat | Image | Root") directly
+            under a bar that already said "Workspace / Assistant". */}
         <header
+          data-testid="app-header"
           className="flex h-[50px] shrink-0 items-center gap-2 border-b px-4"
           style={{ borderColor: "var(--border)" }}
         >
@@ -328,21 +348,27 @@ export function Shell({ children }: { children: ReactNode }) {
             <PanelToggleIcon />
           </button>
           <span className="mx-1 h-4 w-px" style={{ background: "var(--border)" }} aria-hidden="true" />
-          <button
-            type="button"
-            onClick={() => go("assistant")}
-            title="Workspace"
-            className="nav-icon-btn flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[13px]"
-            style={{ color: "var(--text-dim)" }}
-          >
-            <HomeIcon />
-            <span>Workspace</span>
-          </button>
-          <span style={{ color: "var(--text-faint)" }} aria-hidden="true">/</span>
-          <span className="text-[13px]">{screenLabel(screen)}</span>
+          {screen !== "assistant" && (
+            <>
+              <button
+                type="button"
+                onClick={() => go("assistant")}
+                title="Workspace"
+                className="nav-icon-btn flex items-center gap-1.5 rounded px-1.5 py-0.5 text-[13px]"
+                style={{ color: "var(--text-dim)" }}
+              >
+                <HomeIcon />
+                <span>Workspace</span>
+              </button>
+              <span style={{ color: "var(--text-faint)" }} aria-hidden="true">/</span>
+              <span className="text-[13px]">{screenLabel(screen)}</span>
+            </>
+          )}
+          <div ref={setHeaderSlot} className="flex min-w-0 flex-1 items-center gap-3" />
         </header>
         <div className="min-h-0 flex-1 overflow-y-auto px-6 py-4">{children}</div>
       </main>
+      </HeaderSlotContext.Provider>
       {/* Rendered here rather than in each screen: the palette navigates between screens, and its
           listener has to exist on all of them. `Shell` is the only component that is always
           mounted once the app is up. */}

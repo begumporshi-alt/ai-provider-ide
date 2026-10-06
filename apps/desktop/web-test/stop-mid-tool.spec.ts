@@ -55,8 +55,8 @@ test("stop cancels a command that is running, instead of waiting for it", async 
   // The live status line names the call in flight — the state the user is looking at when they
   // reach for Stop.
   await expect(page.getByTestId("agent-status")).toContainText("Running run_command", { timeout: 15_000 });
-  // The call is real: the grouped card shows it as running.
-  await expect(page.getByRole("button", { name: /1 tool call/ })).toBeVisible();
+  // The call is real: the live transcript shows it as its own row.
+  await expect(page.getByTestId("tool-call-row").first()).toContainText("run_command", { timeout: 15_000 });
 
   const t0 = Date.now();
   await page.getByRole("button", { name: /Stop$/ }).click();

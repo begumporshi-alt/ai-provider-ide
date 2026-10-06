@@ -145,6 +145,13 @@ async function oracle(req, res, path) {
     const messages = body.messages ?? [];
     const system = messages.find((m) => m.role === "system")?.content ?? "";
     const last = messages[messages.length - 1]?.content ?? "";
+    /**
+     * The user's own prompt, wherever it sits. `last` is the newest message, which on a follow-up
+     * round-trip is a tool *result* — so anything keyed on what the person asked for has to read
+     * the last turn they wrote, not the last message on the wire. (Found the hard way: the
+     * timeline spec's `think:` trigger fired in round one and silently not in round two.)
+     */
+    const userPrompt = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
     const stream = body.stream === true;
     const tools = Array.isArray(body.tools) && body.tools.length > 0;
     const sawToolResult = messages.some((m) => m.role === "tool");
@@ -169,6 +176,14 @@ async function oracle(req, res, path) {
      * request cannot portably express — the point here is the client's handling of the shape.
      */
     const reasoningOnly = /^think:/i.test(String(last));
+    /**
+     * Reasoning *before acting*: the shape the timeline spec is about — a model that deliberates
+     * and then calls a tool, round after round. Keyed on the same `think:` prefix as the
+     * reasoning-only path (which, in agent mode, never fires: the tools branch above wins), and
+     * emitted as `reasoning_content` deltas before the content/call deltas so the client sees the
+     * order the model produced. Fixed words, so a spec can assert on what reached the panel.
+     */
+    const thinksBeforeActing = /^think:/i.test(String(userPrompt)) && Boolean(tools);
     if (system.includes("Tier-2 code adapters")) {
       // The Tier-2 round: a fenced envelope the extractor can parse.
       content = "```json\n" + JSON.stringify(CODE_ENVELOPE, null, 2) + "\n```";
@@ -256,6 +271,14 @@ async function oracle(req, res, path) {
       "Cache-Control": "no-cache",
       "Access-Control-Allow-Origin": "*",
     });
+    if (thinksBeforeActing) {
+      const thought = sawToolResult
+        ? "The tool answered; the workspace is in the state the user asked for. Now I can summarise."
+        : "The user wants the readme greeting changed. I should read the file before editing it.";
+      for (const w of thought.split(" ")) {
+        res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: w + " " } }] })}\n\n`);
+      }
+    }
     if (toolCall) {
       // OpenAI streaming shape: one chunk declaring the call (id + name + empty args),
       // then a chunk with arguments delta, then finish_reason "tool_calls", then [DONE].

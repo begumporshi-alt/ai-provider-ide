@@ -23,6 +23,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
 import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
 import { useUi } from "../ui-state";
+import { useHeaderSlot } from "../components/Shell";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
 import { Composer, type Attachment, type InlinedText } from "../components/Composer";
@@ -62,6 +63,14 @@ import {
 } from "../lib/memory/engine";
 import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
 import {
+  applyAgentEvent,
+  attachReasoning,
+  toolSegments,
+  type TimelineSegment,
+  type ToolCallSegment,
+  type ToolStatus,
+} from "../lib/chat/turn/timeline";
+import {
   agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
 } from "../lib/chat/turn/prompt";
 import { tryParseArgs } from "../lib/chat/turn/graph-record";
@@ -92,9 +101,49 @@ import type { Trace } from "../lib/chat/turn/ports";
  */
 const SUMMARIZER_INPUT_CHARS = 12_000;
 const SUMMARIZER_MAX_TOKENS = 300;
+
+/**
+ * The prompt enhancer — what the composer's Enhance button hands the draft to. Same shape as the
+ * summarizer above and the same three decisions: `maxTokens` is bounded (a prompt, not an essay),
+ * the instruction forbids invention (an enhancer that adds requirements the user never gave is
+ * writing its own task, not theirs), and the answer is the rewrite and nothing else, because the
+ * result replaces the draft verbatim. Ledgered like any other call — it spends real tokens.
+ */
+const ENHANCER_MAX_TOKENS = 800;
+const ENHANCER_SYSTEM =
+  "You rewrite the user's draft prompt into one sharper prompt for an AI assistant. Keep their " +
+  "language, their goal, and every fact, file, and constraint they gave. Add only the specificity " +
+  "a good prompt has — a clear objective, the relevant context from the draft, the expected shape " +
+  "of the answer — drawn from what the draft implies; never invent requirements, names, or files " +
+  "the draft does not mention. Answer with the rewritten prompt only: no preamble, no quotes, no " +
+  "headings, no explanation.";
 const SUMMARY_PROMPT =
   "Summarise the conversation above for an assistant that must continue it. Keep decisions, " +
   "names, numbers, file paths and anything still pending. Plain prose, no preamble, no headings.";
+
+/**
+ * The composer's Enhance action: the draft in, the rewrite out. Served by the gateway with the
+ * turn's own model — the enhancer must not introduce a second model choice the screen does not
+ * show — and bound like the summarizer, because a prompt that runs past its own budget has
+ * already failed at the thing it is asking for. Surrounding quotes are stripped even though the
+ * instruction forbids them: a model that wraps the rewrite in quotation marks would otherwise put
+ * them in the draft, where the user sends them to the next turn.
+ */
+function createEnhancer(model: string): (draft: string) => Promise<string> {
+  return async (draft) => {
+    const exec = await gatewayGenerate({
+      model,
+      messages: [
+        { role: "system", content: ENHANCER_SYSTEM },
+        { role: "user", content: draft },
+      ],
+      maxTokens: ENHANCER_MAX_TOKENS,
+    });
+    let out = "";
+    for await (const chunk of exec.chunks) out += chunk;
+    return out.trim().replace(/^["“”']+|["“”']+$/g, "");
+  };
+}
 
 function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<string> {
   return async (dropped) => {
@@ -116,13 +165,6 @@ function createSummarizer(model: string): (dropped: ChatMessage[]) => Promise<st
     for await (const chunk of exec.chunks) out += chunk;
     return out.trim();
   };
-}
-
-interface AgentItem {
-  name: string;
-  args: Record<string, unknown>;
-  status: "calling" | "ok" | "error" | "denied";
-  result?: string;
 }
 
 /**
@@ -500,6 +542,9 @@ export function AssistantScreen() {
   // `Chat` subscribes to the tick itself (the skills block re-reads on it), so this shell does
   // not — and not subscribing is what keeps a store bump from tearing down the transcript.
   const [tab, setTab] = useState<"text" | "image" | "root">("text");
+  // The top bar's slot: the session features and the tabs portal into it (see the header portal
+  // in the return below). `null` until the shell's header has committed.
+  const headerSlot = useHeaderSlot();
   // The DOM node the session features portal into (see the title row). State, not a ref: Chat has
   // to re-render once the node exists, which a ref callback + setState gives us for free.
   const [sessionSlot, setSessionSlot] = useState<HTMLDivElement | null>(null);
@@ -799,41 +844,44 @@ export function AssistantScreen() {
     // the screen read as a narrow strip — the mock runs the assistant edge to edge inside the
     // shell's padding.
     <div className="flex h-full w-full flex-col" data-testid="assistant-column">
-      {/* The title row carries the session features (portal from `Chat`, which owns their state —
-          the slot here is where they render) and the three tabs. Root setup moved into its own tab
-          with a folder browser, which freed this row for the session controls. */}
-      <div className="mb-3 flex items-center gap-3">
-        <h1 className="text-[16px] font-semibold tracking-tight">Assistant</h1>
-        <div ref={setSessionSlot} className="flex min-w-0 flex-1 items-center gap-2" />
-        {agentMode && root.trim() ? (
-          // In agent mode the root is the one fact the transcript can't show, so it stays visible
-          // here as a chip that opens the Root tab — the pane is one click away either way.
-          <button
-            type="button"
-            onClick={() => setTab("root")}
-            className="nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]"
-            style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
-            title={`${root}${rootError ? ` — ${rootError}` : " — open the Root tab"}`}
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
-              <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
-            </svg>
-            <span className="max-w-[180px] truncate">{root.split("/").filter(Boolean).pop() ?? root}</span>
-          </button>
-        ) : null}
-        <div className="ml-auto flex gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-          {(["text", "image", "root"] as const).map((t) => (
+      {/* The screen's header lives in the top bar now: the session features (portal from `Chat`,
+          which owns their state) and the three tabs portal into the shell's header slot, so the
+          screen no longer spends a title row of its own under a bar that used to repeat the same
+          screen name as a breadcrumb. */}
+      {headerSlot && createPortal(
+        <>
+          <div ref={setSessionSlot} className="flex min-w-0 flex-1 items-center gap-2" />
+          {agentMode && root.trim() ? (
+            // In agent mode the root is the one fact the transcript can't show, so it stays visible
+            // here as a chip that opens the Root tab — the pane is one click away either way.
             <button
-              key={t}
-              onClick={() => setTab(t)}
-              className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
-              style={tab === t ? { background: "var(--surface-2)", color: "var(--text)" } : { color: "var(--text-dim)" }}
+              type="button"
+              onClick={() => setTab("root")}
+              className="nav-icon-btn flex shrink-0 items-center gap-1.5 rounded-full border px-2.5 py-1 text-[11px]"
+              style={{ borderColor: "var(--border)", color: "var(--text-dim)" }}
+              title={`${root}${rootError ? ` — ${rootError}` : " — open the Root tab"}`}
             >
-              {t === "text" ? "Chat" : t === "image" ? "Image" : "Root"}
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round" className="h-3 w-3" aria-hidden="true">
+                <path d="M3.5 7.5h6l2 2.5h9v8.5h-17v-11Z" />
+              </svg>
+              <span className="max-w-[180px] truncate">{root.split("/").filter(Boolean).pop() ?? root}</span>
             </button>
-          ))}
-        </div>
-      </div>
+          ) : null}
+          <div className="flex shrink-0 gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            {(["text", "image", "root"] as const).map((t) => (
+              <button
+                key={t}
+                onClick={() => setTab(t)}
+                className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
+                style={tab === t ? { background: "var(--surface-2)", color: "var(--text)" } : { color: "var(--text-dim)" }}
+              >
+                {t === "text" ? "Chat" : t === "image" ? "Image" : "Root"}
+              </button>
+            ))}
+          </div>
+        </>,
+        headerSlot,
+      )}
       {/* No `key={tick}` here. Keying on the tick remounted Chat on every store bump, which
           wiped the conversation mid-session — a settings save took the transcript with it.
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
@@ -1412,19 +1460,21 @@ function Chat({
   });
   /** P5: what the finished run changed, for `ChangeSetReview`. Null until a run touches something. */
   const [runChanges, setRunChanges] = useState<RunChangeSet | null>(null);
-  const [agentItems, setAgentItems] = useState<AgentItem[]>([]);
+  /**
+   * The agent run's timeline: thinking, prose and tool calls in the order the model produced them
+   * (see `lib/chat/turn/timeline`). It replaces three separate accumulators — a text blob, a
+   * reasoning blob and a flat item list — that between them could not express the order, so a run
+   * that thought → read → thought → edited rendered as "all the thinking, then all the tools".
+   *
+   * The ref mirrors it for writers outside a render's closure: `onReplaceTranscript` runs from the
+   * turn's async tail, where the state this closure captured is still the pre-run empty list.
+   */
+  const [timeline, setTimeline] = useState<TimelineSegment[]>([]);
+  const timelineRef = useRef<TimelineSegment[]>([]);
   /** The task list the model maintains through `todo_write`, rendered by the floating capsule.
    *  Session-scoped: a New chat clears it, a resumed one starts empty until the model writes a
    *  new list (the transcript of the old session is context, not live state). */
   const [todos, setTodos] = useState<TodoItem[]>([]);
-  const [streamedText, setStreamedText] = useState("");
-  /**
-   * The agent run's reasoning so far. Live-only, exactly like `streamedText`: it describes the run
-   * in flight, and the transcript that replaces it when the run ends is rebuilt from the loop's
-   * messages. It exists so a run that spends 40 s thinking shows *that it is thinking* rather than
-   * a still status line.
-   */
-  const [streamedReasoning, setStreamedReasoning] = useState("");
   // P7: usage capture for the context meter and token/cost readout.
   const [lastUsage, setLastUsage] = useState<UsageTokens | null>(null);
   // Tokens this agent run has spent so far — every model call in the loop reports, and the live
@@ -1627,10 +1677,10 @@ function Chat({
     setAtBottom(true);
   }, []);
 
-  // Follow new content (streamed text, tool events, appended turns) while anchored at the bottom.
+  // Follow new content (streamed prose, tool events, appended turns) while anchored at the bottom.
   useEffect(() => {
     stickToBottom();
-  }, [msgs, streamedText, agentItems, stickToBottom]);
+  }, [msgs, timeline, stickToBottom]);
 
   // P7: context window for the chosen model. Same rule as the request path
   // (`model-router.ts`): the narrowest window published by *any* carrier of this model, because
@@ -1730,25 +1780,16 @@ function Chat({
   approvalRef.current = { mode: approvalMode, planMode, trustedTools: granted.trustedTools, allowAll: granted.allowAll };
 
   const handleAgentEvent = useCallback((ev: AgentEvent) => {
-    if (ev.type === "assistant") {
-      setStreamedText((t) => t + ev.text);
-    } else if (ev.type === "truncation_retry") {
-      // The abandoned attempt's partial prose is dropped, not concatenated: the retry's text is
-      // the answer being built, and two attempts joined would read as one sentence the model
-      // never said. The notice stays as the bubble's prefix until the retry's own text appends
-      // after it; a truncated `done` records the outcome in the run's steps.
-      setStreamedText("⏳ the model's stream ended early — re-asking…\n\n");
-    } else if (ev.type === "no_output_retry") {
-      // The model reasoned through its whole output budget and never answered. Thinking off is
-      // the one lever that works even against a provider that ignores budget tokens, so the
-      // fallback forces it and the bubble says why.
-      setStreamedText("⏳ the model answered with thinking only — re-asking with thinking off…\n\n");
-    } else if (ev.type === "reasoning") {
-      // Accumulated, not replaced: an agent turn is several round-trips and the panel shows the
-      // whole run's deliberation, the same way `streamedText` shows the whole run's prose.
-      setStreamedReasoning((t) => t + ev.text);
-    } else if (ev.type === "tool_call") {
-      setAgentItems((l) => [...l, { name: ev.call.name ?? "?", args: tryParseArgs(ev.call.arguments), status: "calling" }]);
+    // One fold for the whole timeline: `applyAgentEvent` owns the ordering rules (thinking and
+    // prose accumulate into their trailing segment, a call opens a tool segment, a result fills
+    // the last one still calling), and it is unit-tested there against no DOM at all. The ref is
+    // updated alongside the state because `onReplaceTranscript` reads it from the turn's async
+    // tail, outside any render this closure could see.
+    const next = applyAgentEvent(timelineRef.current, ev);
+    timelineRef.current = next;
+    setTimeline(next);
+
+    if (ev.type === "tool_call") {
       // The progress capsule's data source: `todo_write` carries the whole list in its arguments,
       // so the panel can update the moment the call arrives rather than after the result lands.
       if ((ev.call.name ?? "") === "todo_write") {
@@ -1764,17 +1805,6 @@ function Chat({
           );
         }
       }
-    } else if (ev.type === "tool_result") {
-      setAgentItems((l) => {
-        const copy = [...l];
-        for (let i = copy.length - 1; i >= 0; i--) {
-          if (copy[i].status === "calling") {
-            copy[i] = { ...copy[i], status: /denied|refused/i.test(ev.result) ? "denied" : ev.ok ? "ok" : "error", result: ev.result };
-            break;
-          }
-        }
-        return copy;
-      });
     }
   }, []);
 
@@ -1881,22 +1911,24 @@ function Chat({
           makeBaseHost: (r) => createTauriToolHost(r),
           onAgentEvent: handleAgentEvent,
           onAgentStart: () => {
-            setStreamedText("");
-            setStreamedReasoning("");
-            setAgentItems([]);
+            timelineRef.current = [];
+            setTimeline([]);
             setRunUsage({ tokensIn: 0, tokensOut: 0 });
           },
           onRunUsageAdded: (tin, tout) =>
             setRunUsage((r) => ({ tokensIn: r.tokensIn + tin, tokensOut: r.tokensOut + tout })),
-          onReplaceTranscript: setMsgs,
+          // The loop's transcript carries one assistant message per round-trip and the tool turns
+          // that answered it; `attachReasoning` puts each round's deliberation on its own message,
+          // which is what makes the finished turn render `Thinking → tool → Thinking → tool →
+          // answer` — the order the live view just showed and the model actually worked in.
+          onReplaceTranscript: (next) => setMsgs(attachReasoning(next, timelineRef.current)),
           fillIfEmpty: (id, note) =>
             setMsgs((m) => m.map((x) => (x.id === id && !x.content.trim() ? { ...x, content: note } : x))),
           onRunChanges: setRunChanges,
           clearRunUi: () => {
             setPendingConfirm(null);
-            setAgentItems([]);
-            setStreamedText("");
-            setStreamedReasoning("");
+            timelineRef.current = [];
+            setTimeline([]);
           },
         },
       );
@@ -2141,10 +2173,9 @@ function Chat({
     setMsgs([]);
     setTrace(null);
     setFinishReason(undefined);
-    setAgentItems([]);
+    timelineRef.current = [];
+    setTimeline([]);
     setTodos([]);
-    setStreamedText("");
-    setStreamedReasoning("");
     setEditingId(null);
     setEditDraft("");
     setSessionTitle("");
@@ -2491,9 +2522,16 @@ function Chat({
           // produced the flat run of anonymous "tool result" bubbles.
           toolRuns.consumed.has(i) ? null : (
           <div key={m.id} className="group mb-3">
-            <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.role === "user" ? "var(--info)" : m.role === "tool" ? "var(--warn)" : "var(--success)" }}>
-              {m.role}
-            </div>
+            {/* No label on a step of an agent run. A multi-round turn is several messages — one per
+                round-trip, each carrying the round's calls — and labelling every one of them
+                "ASSISTANT" chopped a single continuous turn into a stack of headings. The answer
+                (a message with no calls) still gets its label, so the transcript says where the
+                model stopped working and started answering. */}
+            {!(m.role === "assistant" && Boolean(m.tool_calls)) && (
+              <div className="mb-0.5 text-[10px] font-semibold uppercase tracking-wide" style={{ color: m.role === "user" ? "var(--info)" : m.role === "tool" ? "var(--warn)" : "var(--success)" }}>
+                {m.role}
+              </div>
+            )}
             {editingId === m.id ? (
               <div>
                 <textarea
@@ -2524,9 +2562,7 @@ function Chat({
             ) : m.role === "assistant" ? (
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive
-                  raw={streamedText}
-                  reasoning={streamedReasoning}
-                  items={agentItems}
+                  segments={timeline}
                   waiting={pendingConfirm?.call.name ?? null}
                   stopping={stopping}
                   usage={runUsage}
@@ -2704,6 +2740,7 @@ function Chat({
           seed={seed}
           toolbar={toolbar}
           corner={corner}
+          enhance={chosen ? createEnhancer(chosen) : undefined}
           sendDisabled={!chosen || (agentMode && (!root.trim() || !!rootError))}
         />
       </div>
@@ -2930,7 +2967,7 @@ function MessageActions({
 }
 
 /** A step of a live run: the shared shape, plus the outcome only a run in flight knows. */
-type UIStep = ToolStep & { status?: AgentItem["status"] };
+type UIStep = ToolStep & { status?: ToolStatus };
 
 /** A call's arguments as one line — `path: src/a.ts · pattern: todo` — with long values clipped. */
 function argSummary(args: Record<string, unknown>): string {
@@ -2944,92 +2981,105 @@ function argSummary(args: Record<string, unknown>): string {
   return parts.join(" · ");
 }
 
-const STEP_GLYPH: Record<AgentItem["status"], string> = { calling: "▶", ok: "✓", denied: "✕", error: "⚠" };
-const STEP_COLOR: Record<AgentItem["status"], string> = {
-  calling: "var(--info)", ok: "var(--success)", denied: "var(--warn)", error: "var(--danger)",
+const STEP_COLOR: Record<ToolStatus, string> = {
+  // The dot's color carries the state, so the states the reader triages on get the triage colors:
+  // amber for in-flight and refused, green for done, red for failed. A replayed transcript has no
+  // status at all and stays neutral below.
+  calling: "var(--warn)", ok: "var(--success)", denied: "var(--warn)", error: "var(--danger)",
 };
 
 /**
- * A turn's tool calls, grouped into one card (one card per turn, not per call).
+ * One tool call, in the shape the coding agents' transcripts converged on (ZCode's own): the call
+ * is a single mono line led by a status dot, and what came back folds beneath it.
  *
- * The transcript used to render every call and every result as its own flat bubble: the tool's
- * *name* never appeared on a persisted result (only "tool result · …"), a 442-line file read put
- * raw HTML in the column, and a turn that made three calls read as three anonymous blocks. One
- * card per turn names every call, keeps the output behind a disclosure, and still shows a file
- * edit's diff outright — that being the part worth seeing without asking.
+ * Replaces the per-turn card ("▸ 2 tool calls"). The card grouped well but read as a modal you had
+ * to open to learn anything: the two facts a reader wants at rest — *which tool, with what* — were
+ * the one thing the collapsed header did not say, and each call's output hid behind a disclosure
+ * the user had no reason to open. The row shows the call and a result preview outright, and folds
+ * only the bulk: a click expands the full arguments and the full output. The dot, not a separate
+ * label, carries the state — amber while the call runs, green when it returned, red when it
+ * failed, dim on a replayed transcript where no status was recorded.
  */
-function ToolRunGroup({ steps, live = false }: { steps: UIStep[]; live?: boolean }) {
-  const [open, setOpen] = useState(live);
-  const failed = steps.filter((s) => s.status === "error" || s.status === "denied").length;
-  const running = steps.some((s) => s.status === "calling");
-  const known = steps.some((s) => s.status !== undefined);
-  // Neutral until something measures otherwise: a green "✓ 4 ran" on a replayed transcript would
-  // be a claim no one checked.
-  const color = !known ? "var(--border)" : failed ? "var(--danger)" : running ? "var(--info)" : "var(--success)";
-  const label = steps.length === 1 ? "1 tool call" : `${steps.length} tool calls`;
-  const outcome = !known ? "" : running ? " · running" : failed ? ` · ✕ ${failed} failed` : " · ✓ ran";
+function ToolCallRow({ step }: { step: UIStep }) {
+  const [open, setOpen] = useState(false);
+  const change = fileChangeFor(step.name, step.args);
+  const color = step.status ? STEP_COLOR[step.status] : "var(--text-faint)";
+  const summary = argSummary(step.args);
+  const preview = step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
+  const hasOutput = preview !== null && preview.length > 0;
+  // A call in flight has no result to fold yet, and its arguments are the only live evidence of
+  // what it is doing — so they show while it runs, then fold like every finished call's.
+  const showArgs = open || step.status === "calling";
   return (
-    <div className="mt-1.5 rounded border" style={{ borderColor: color, background: "var(--surface-2)" }}>
+    <div data-testid="tool-call-row">
       <button
         type="button"
-        className="mono flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[11px]"
+        className="mono flex w-full items-baseline gap-1.5 text-left text-[11px]"
         onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title={open ? "collapse the call's arguments and output" : "expand the call's arguments and output"}
       >
-        <span style={{ color: "var(--text-faint)" }}>{open ? "▾" : "▸"}</span>
-        <span style={{ color: known && !failed && !running ? "var(--success)" : "var(--text-dim)" }}>{label}{outcome}</span>
+        <span className="shrink-0" style={{ color }}>⏺</span>
+        <span className="shrink-0" style={{ color: "var(--text)" }}>{step.name}</span>
+        {summary && <span className="truncate" style={{ color: "var(--text-dim)" }}>({summary})</span>}
       </button>
-      <div className="px-2.5 pb-1.5">
-        {steps.map((s, i) => {
-          const change = fileChangeFor(s.name, s.args);
-          const glyph = s.status ? STEP_GLYPH[s.status] : "↳";
-          const stepColor = s.status ? STEP_COLOR[s.status] : "var(--text-faint)";
-          const summary = argSummary(s.args);
-          return (
-            <div key={i} className={i > 0 ? "mt-1.5 border-t pt-1.5" : ""} style={{ borderColor: "var(--border)" }}>
-              <div className="mono flex items-baseline gap-1.5 text-[11px]">
-                <span style={{ color: stepColor }}>{glyph}</span>
-                <span style={{ color: "var(--text)" }}>{s.name}</span>
-                {summary && <span className="truncate" style={{ color: "var(--text-faint)" }}>{summary}</span>}
-              </div>
-              {change ? (
-                <div className="mt-1">
-                  <DiffView change={change} />
-                  {/* The diff is what the call *would* write, which is exactly why the result line
-                      has to stay beside it: a refused `write_file` (plan mode, a denied approval)
-                      never touched the file, and a bare diff would present it as done. The old
-                      per-turn bubble showed this line; dropping it here was a regression the browser
-                      suite caught (agent-approval.spec.ts, "in PLAN MODE"). */}
-                  {s.result !== undefined && (
-                    <div className="mono mt-0.5 truncate text-[10px]" style={{ color: "var(--text-faint)" }}>
-                      {s.result.trim() ? s.result.replace(/\s+/g, " ").slice(0, 120) : "(no output)"}
-                    </div>
-                  )}
-                </div>
-              ) : open ? (
-                <>
-                  {Object.entries(s.args).map(([k, v]) => (
-                    <div key={k} className="mono mt-1 break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
-                      <span style={{ color: "var(--text-faint)" }}>{k}: </span>
-                      {typeof v === "string" ? (v.length > 600 ? `${v.slice(0, 600)}…` : v) : JSON.stringify(v)}
-                    </div>
-                  ))}
-                  {s.result !== undefined && (
-                    <pre className="mono mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{s.result}</pre>
-                  )}
-                </>
-              ) : (
-                // Collapsed still says what came back — one line, so a failure or an empty result
-                // cannot hide behind a disclosure the user has no reason to open.
-                s.result !== undefined && (
-                  <div className="mono mt-0.5 truncate text-[10px]" style={{ color: "var(--text-faint)" }}>
-                    {s.result.trim() ? s.result.replace(/\s+/g, " ").slice(0, 120) : "(no output)"}
-                  </div>
-                )
-              )}
+      {showArgs && Object.keys(step.args).length > 0 && (
+        <div className="ml-3.5">
+          {Object.entries(step.args).map(([k, v]) => (
+            <div key={k} className="mono break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
+              <span style={{ color: "var(--text-faint)" }}>{k}: </span>
+              {typeof v === "string" ? (v.length > 600 ? `${v.slice(0, 600)}…` : v) : JSON.stringify(v)}
             </div>
-          );
-        })}
-      </div>
+          ))}
+        </div>
+      )}
+      {change ? (
+        <div className="ml-3.5 mt-1">
+          <DiffView change={change} />
+          {/* The diff is what the call *would* write, which is exactly why the result line
+              has to stay beside it: a refused `write_file` (plan mode, a denied approval)
+              never touched the file, and a bare diff would present it as done. The old
+              per-turn bubble showed this line; dropping it here was a regression the browser
+              suite caught (agent-approval.spec.ts, "in PLAN MODE"). */}
+          {step.result !== undefined && (
+            <div className="mono mt-0.5 truncate text-[10px]" style={{ color: hasOutput ? "var(--text-faint)" : "var(--warn)" }}>
+              {hasOutput ? `⎿ ${preview!.slice(0, 120)}${step.result.replace(/\s+/g, " ").trim().length > 120 ? "…" : ""}` : "⎿ (no output)"}
+            </div>
+          )}
+        </div>
+      ) : step.result !== undefined ? (
+        <button
+          type="button"
+          className="mono mt-0.5 block w-full truncate text-left text-[10px]"
+          style={{ color: hasOutput ? "var(--text-faint)" : "var(--warn)" }}
+          onClick={() => setOpen((v) => !v)}
+          title={hasOutput ? step.result : undefined}
+        >
+          {/* Collapsed still says what came back — one line, so a failure or an empty result
+              cannot hide behind a disclosure the user has no reason to open. Amber, not dim,
+              when there is nothing: an empty result is a finding, not silence. */}
+          {hasOutput
+            ? `⎿ ${preview!.length > 140 ? `${preview!.slice(0, 140)}…` : preview}`
+            : "⎿ (no output — the tool returned nothing)"}
+        </button>
+      ) : null}
+      {open && hasOutput && (
+        <pre className="mono ml-3.5 mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{step.result}</pre>
+      )}
+    </div>
+  );
+}
+
+/**
+ * A turn's tool calls, one row per call — the grouping survives (which calls belong to which
+ * turn is what makes a replayed run read turn by turn), the card does not. See `ToolCallRow`.
+ */
+function ToolRunGroup({ steps }: { steps: UIStep[] }) {
+  return (
+    <div className="mt-1.5 space-y-2" data-testid="tool-run-group">
+      {steps.map((s, i) => (
+        <ToolCallRow key={i} step={s} />
+      ))}
     </div>
   );
 }
@@ -3169,7 +3219,8 @@ function AgentStatus({
   stopping,
   usage,
 }: {
-  items: AgentItem[];
+  /** The timeline's tool segments, in order — see `toolSegments`. */
+  items: ToolCallSegment[];
   waiting: string | null;
   stopping: boolean;
   usage: { tokensIn: number; tokensOut: number };
@@ -3217,40 +3268,50 @@ function formatElapsed(s: number): string {
   return m > 0 ? `${m}m ${String(r).padStart(2, "0")}s` : `${r}s`;
 }
 
-/** Live view of an in-flight agent turn: the status line, streamed text plus this turn's calls, grouped as they run. */
+/**
+ * Live view of an in-flight agent turn: the status line, then the turn's timeline in arrival
+ * order — thinking, prose and tool calls interleaved the way the model produced them, which is
+ * the shape the finished transcript will keep (`attachReasoning` puts each round-trip's
+ * deliberation on its own message). A run that thought, read a file, thought again and edited it
+ * reads as that sequence, not as "all the thinking, then all the tools".
+ */
 function AgentLive({
-  raw,
-  reasoning,
-  items,
+  segments,
   waiting,
   stopping,
   usage,
 }: {
-  raw: string;
-  reasoning: string;
-  items: AgentItem[];
+  segments: TimelineSegment[];
   waiting: string | null;
   stopping: boolean;
   usage: { tokensIn: number; tokensOut: number };
 }) {
-  // The same card the finished turn will render, so a run does not change shape the moment it
-  // ends — the live view simply knows each call's status and the transcript does not.
-  const steps: UIStep[] = items.map((it) => ({
-    name: it.name,
-    args: it.args,
-    call: { name: it.name, args: it.args },
-    ...(it.result !== undefined ? { result: it.result } : {}),
-    status: it.status,
-  }));
   return (
     <>
-      <AgentStatus items={items} waiting={waiting} stopping={stopping} usage={usage} />
-      {/* Above the prose, folded, open while it streams — the run's own record of what it is
-          working through. A reasoning-heavy round-trip is otherwise a status line that has not
-          changed for 40 seconds, which reads as a hang. */}
-      {reasoning.trim() ? <ReasoningPanel text={reasoning} streaming /> : null}
-      {raw.trim() ? <Markdown source={raw} /> : null}
-      {steps.length > 0 && <ToolRunGroup steps={steps} live />}
+      <AgentStatus items={toolSegments(segments)} waiting={waiting} stopping={stopping} usage={usage} />
+      {segments.map((seg, i) => {
+        if (seg.kind === "thinking") {
+          // Open while it streams — the run's own record of what it is working through, and the
+          // only evidence that a 40-second round-trip is progressing rather than hung — then it
+          // folds itself the moment the next segment (a call, or the answer) arrives.
+          return <ReasoningPanel key={i} text={seg.text} streaming={i === segments.length - 1} />;
+        }
+        if (seg.kind === "text") {
+          return <Markdown key={i} source={seg.text} />;
+        }
+        const step: UIStep = {
+          name: seg.name,
+          args: seg.args,
+          call: { name: seg.name, args: seg.args },
+          ...(seg.result !== undefined ? { result: seg.result } : {}),
+          status: seg.status,
+        };
+        return (
+          <div key={i} className="mt-1.5">
+            <ToolCallRow step={step} />
+          </div>
+        );
+      })}
     </>
   );
 }
