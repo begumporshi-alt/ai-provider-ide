@@ -434,3 +434,18 @@ pub fn candidate_gate(aborted: bool, saturated: bool) -> CandidateGate {
         CandidateGate::Try
     }
 }
+
+/// What the image path records when the adapter did not answer at all.
+///
+/// The TypeScript's `catch {}` arm (`execution-engine.ts:187`) names `NETWORK` and status `0`, and
+/// **keeps nothing else the error carried** — not the status, not the `Retry-After`. See
+/// [`execute_image`] for why that is faithful and what it costs.
+pub fn transport_outcome() -> AttemptOutcome {
+    AttemptOutcome {
+        cls: ErrorClass::Network,
+        status: 0,
+        retry_after_ms: None,
+        reason: None,
+        label: None,
+    }
+}
