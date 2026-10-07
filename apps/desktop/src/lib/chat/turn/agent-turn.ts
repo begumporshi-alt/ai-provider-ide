@@ -208,17 +208,16 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // it so the UI and the context graph both see the closing line.
     //
     // **A ceiling exit's closing line is written here, before the replace, and that ordering is the
-    // whole fix.** `finalText` is empty on that exit — the last iteration was pure tool_use, so the
-    // model was working rather than answering — and the first attempt at saying so filled the
-    // bubble *after* the replace, by the optimistic message id. The replace mints a fresh id for
-    // every message (`newMsgId()` in the map below), so that lookup matched nothing and the notice
-    // vanished: measured again 2026-10-06 (run-1791294635622, 40 iterations, the step label
-    // recorded and the bubble still blank). Writing the notice into the content means the
-    // transcript, the context graph and the next turn's replayed history all carry it, and no id
-    // has to survive a replace for the user to be told what happened.
-    const closedOnCeiling = !finalText.trim() && hitCeiling;
-    const closingText = closedOnCeiling
-      ? `⚠ stopped at ${iterations} iterations — the step budget ran out while the model was still ` +
+    // whole fix.** The ceiling exit's last iteration is pure tool_use, so the loop now answers with
+    // a summary of the last tool results instead of an empty string — but the user still needs the
+    // ⚠ notice with the "raise Steps" guidance, appended to whatever the loop returned (and kept
+    // here, in the content, so no message id has to survive the replace). The earlier version of
+    // this fix filled the bubble *after* the replace by the optimistic message id; the replace
+    // mints fresh ids and the notice vanished: measured 2026-10-06 (run-1791294635622, 40
+    // iterations, the step label recorded and the bubble still blank).
+    const closedOnCeiling = hitCeiling;
+    const closingText = hitCeiling
+      ? `${finalText.trim() || "The run stopped without answering."}\n\n⚠ stopped at ${iterations} iterations — the step budget ran out while the model was still ` +
         "calling tools. Raise “Steps” in the run configuration to let it go further."
       : finalText;
     const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: closingText }];

@@ -847,6 +847,35 @@ describe("runAgentLoop", () => {
     expect(out.text).toBe("loop");
   });
 
+  it("summarizes the last tool activity when the ceiling hits on a tool-only turn", async () => {
+    // The shape every real ceiling exit takes: the budget ran out mid tool_use, so the final
+    // turn has no text. That used to return an empty answer — a dispatch_agent parent saw
+    // "(the sub-agent returned an empty summary)" and could not tell where the budget went
+    // (2026-10-06: a child spent 12 iterations on fetches that kept 403-ing and said nothing).
+    const host: ToolHost = {
+      async run() {
+        return { ok: false, output: "HTTP 403 Forbidden" };
+      },
+    };
+    const model = fakeModel([
+      { text: "trying", calls: [{ id: "c1", name: "web_fetch", arguments: '{"url":"https://x.example"}' }] },
+      { text: "", calls: [{ id: "c2", name: "web_fetch", arguments: '{"url":"https://y.example"}' }] },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      maxIterations: 2,
+    });
+
+    expect(out.hitCeiling).toBe(true);
+    expect(out.text).toContain("step budget ran out during tool calls");
+    expect(out.text).toContain("- web_fetch (FAILED): HTTP 403 Forbidden");
+  });
+
   it("replays the assistant turn with tool_calls so providers accept the result", async () => {
     const seen: ChatMessage[][] = [];
     const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };

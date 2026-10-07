@@ -188,6 +188,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   const tools = registryToOpenAI(registry);
 
   let lastText = "";
+  // The most recent iteration's tool results, kept so a ceiling exit can hand back progress
+  // instead of silence: the final iteration is pure tool_use and its text is empty, so without
+  // this the caller (a dispatch_agent parent, or the UI) receives an empty answer and cannot
+  // tell where the budget went — the 2026-10-06 sub-agent incident, where a child spent its
+  // whole budget on fetches that kept 403-ing and reported nothing.
+  let lastTools: { name: string; ok: boolean; resultText: string }[] = [];
   let truncationRetries = 0;
   let noOutputRetries = 0;
   // The pacing counter (see `TOOL_CALL_NUDGE_AFTER`): calls made this turn, and reminders sent.
@@ -343,7 +349,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
 
-    const executed = await Promise.all(
+    const executed: { name: string; resultText: string; ok: boolean }[] = await Promise.all(
       parsed.map(async ({ call, args }, i) => {
         const name = call.name ?? "(unknown)";
         const { allow, denyReason } = verdicts[i]!;
@@ -593,6 +599,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         return { name, resultText, ok };
       }),
     );
+    lastTools = executed;
 
     for (let i = 0; i < executed.length; i++) {
       const r = executed[i]!;
@@ -631,9 +638,25 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // `hitCeiling` and says so, rather than appending an empty assistant turn that reads as a hang.
   // Only reachable with an explicit budget: with no ceiling the loop exits through the terminal
   // branch above, on an answer.
+  //
+  // An empty ceiling answer is worse than nothing for a dispatch_agent parent: it reads "(the
+  // sub-agent returned an empty summary)" and cannot tell what the child did with its budget.
+  // When the final turn produced no text, summarize its tool activity instead — names, ok/fail,
+  // the first line of each result — so the parent learns where the steps went.
   const ceiling = maxIterations ?? 0;
-  onEvent?.({ type: "done", text: lastText, iterations: ceiling, hitCeiling: true });
-  return { text: lastText, messages, truncated: false, hitCeiling: true, iterations: ceiling };
+  const text =
+    lastText.trim() ||
+    (lastTools.length
+      ? "No final answer — the step budget ran out during tool calls. Last tool results:\n" +
+        lastTools
+          .map((t) => {
+            const line = t.resultText.replace(/\s+/g, " ").trim().slice(0, 200);
+            return `- ${t.name} (${t.ok ? "ok" : "FAILED"}): ${line || "(no output)"}`;
+          })
+          .join("\n")
+      : "(no output — the step budget ran out before any tool ran)");
+  onEvent?.({ type: "done", text, iterations: ceiling, hitCeiling: true });
+  return { text, messages, truncated: false, hitCeiling: true, iterations: ceiling };
 }
 
 /** What the pace reminder says. Phrased as instruction rather than scolding — the loop has no
