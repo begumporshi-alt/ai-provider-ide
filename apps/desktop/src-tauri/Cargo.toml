@@ -125,6 +125,13 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12.1"
+# The browser tools (core/browser.rs) speak the Chrome DevTools Protocol, whose only transport is
+# a WebSocket to the user's own `--remote-debugging-port` Chrome. Everything else the port needs
+# (target discovery, command dispatch, event framing) is plain JSON over that socket, so a
+# general client is the whole cost. `tokio-tungstenite` rides the tokio we already run (the
+# dedicated runtime in `core::web`), and TLS is deliberately OFF: the target is 127.0.0.1 only —
+# a wss:// endpoint would mean a remote debugger, which is not a feature but an incident.
+tokio-tungstenite = "0.26"
 
 # There is deliberately no macOS-only dependency block here. `objc2` / `objc2-foundation` were
 # declared for App Nap suppression on the hidden worker webview, and both went with that webview
