@@ -491,7 +491,7 @@ mod tests {
     fn navigate_snapshot_click_fill_screenshot_round_trips_against_chrome() {
         let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let Some((mut port, mut child)) = launch_headless_chrome(&tmp) else { return };
+        let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let page = format!(
                 "data:text/html,<title>cdp-test</title><button onclick=\"document.title='clicked-{}'\">press me</button><input oninput=\"document.title=this.value\" placeholder=\"type here\">",
@@ -553,7 +553,7 @@ mod tests {
     fn click_on_a_stale_index_says_to_re_snapshot() {
         let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-2-{}", std::process::id()));
         std::fs::create_dir_all(&tmp).unwrap();
-        let Some((mut port, mut child)) = launch_headless_chrome(&tmp) else { return };
+        let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             browser_navigate(&serde_json::json!({
                 "url": "data:text/html,<title>stale-test</title><button>b</button>",

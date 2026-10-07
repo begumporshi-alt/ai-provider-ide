@@ -982,6 +982,10 @@ const BG_BUFFER_CAP: usize = 512 * 1024;
 /// buffers, so the process can never block on a full pipe while nobody is watching it.
 struct BackgroundJob {
     pid: u32,
+    /// Written on spawn, not read yet — kept because the job's identity is exactly this pair and
+    /// an inspection surface (`jobs` for the UI) is the obvious next reader. Clippy-gated until
+    /// then, so the lint gate stays clean without pretending the read exists.
+    #[allow(dead_code)]
     program: String,
     started: Instant,
     out: Arc<Mutex<Vec<u8>>>,
