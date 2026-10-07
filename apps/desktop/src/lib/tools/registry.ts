@@ -155,8 +155,119 @@ export const AGENT_TOOLS: ToolSpec[] = [
           type: "number",
           description: "Optional wall-clock timeout in ms (enforced upper bound is 60 000).",
         },
+        background: {
+          type: "boolean",
+          description:
+            "Start without waiting and return a job id (bg-N) immediately. Use for dev servers, watchers, long builds — anything you would otherwise kill at the timeout. Poll the job with process_output, stop it with process_kill. The result of a finished job stays readable until the job table (64 slots) evicts it.",
+        },
       },
       required: ["program"],
+    },
+  },
+  {
+    name: "browser_navigate",
+    effect: "mutate",
+    description:
+      "Point the connected browser tab at a URL and wait for the page to settle. Drives the user's own Chrome (or Chromium/Edge) started with --remote-debugging-port=9222 — nothing is spawned. Follow with browser_snapshot to see what the page offers.",
+    parameters: {
+      properties: {
+        url: { type: "string", description: "The page to open — an http(s) or file:// URL." },
+        port: {
+          type: "number",
+          description: "Optional debugger port. Defaults to 9222.",
+        },
+      },
+      required: ["url"],
+    },
+  },
+  {
+    name: "browser_snapshot",
+    effect: "read",
+    description:
+      "List the connected page's visible interactive elements — buttons, links, inputs — each as [N] with its label. The [N] indexes are how browser_click and browser_fill address elements, and they go stale when the page changes: re-snapshot after navigating or clicking.",
+    parameters: {
+      properties: {
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "browser_click",
+    effect: "mutate",
+    description:
+      "Click a snapshot element with real mouse events at its position — hover, focus and the page's own event path run exactly as a user's click. The index is valid only for the most recent browser_snapshot.",
+    parameters: {
+      properties: {
+        element: { type: "number", description: "The [N] index from the latest browser_snapshot." },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: ["element"],
+    },
+  },
+  {
+    name: "browser_fill",
+    effect: "mutate",
+    description:
+      "Type a value into a snapshot element — text input, textarea, select or contenteditable. Delivered the way React and other frameworks listen for (native setter + input/change events), so controlled inputs update. The index is valid only for the most recent browser_snapshot.",
+    parameters: {
+      properties: {
+        element: { type: "number", description: "The [N] index from the latest browser_snapshot." },
+        text: { type: "string", description: "The value to enter." },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: ["element", "text"],
+    },
+  },
+  {
+    name: "browser_screenshot",
+    effect: "mutate",
+    description:
+      "Capture the connected page as a PNG saved into the workspace (images/ by default) and attach it, so a vision-capable model sees the page. Pair with browser_snapshot: the screenshot shows layout, the snapshot names the elements.",
+    parameters: {
+      properties: {
+        path: {
+          type: "string",
+          description: "Optional workspace-relative save path. Defaults to images/browser-<timestamp>.png.",
+        },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "process_output",
+    effect: "read",
+    description:
+      "Report a background command job's status and the tail of what it has printed. Use wait_ms to block briefly (up to 5 000) for a result instead of polling in a tight loop. Works whether the job is still running or has finished.",
+    parameters: {
+      properties: {
+        job: {
+          type: "string",
+          description: 'The job id run_command returned, e.g. "bg-3".',
+        },
+        wait_ms: {
+          type: "number",
+          description:
+            "Optional: block up to this many ms waiting for the job to finish (capped at 5 000). Default 0 — report immediately.",
+        },
+      },
+      required: ["job"],
+    },
+  },
+  {
+    name: "process_kill",
+    effect: "mutate",
+    description:
+      "Stop a background command job: SIGINT to its process group, escalated to SIGKILL after a short grace if it is still running. Jobs are NOT stopped by the session's Stop — this tool is their stop path. Killing an already-finished job is a no-op, not an error.",
+    parameters: {
+      properties: {
+        job: {
+          type: "string",
+          description: 'The job id run_command returned, e.g. "bg-3".',
+        },
+      },
+      required: ["job"],
     },
   },
   {
@@ -298,7 +409,94 @@ export const AGENT_TOOLS: ToolSpec[] = [
       required: ["query"],
     },
   },
+  {
+    name: "dispatch_agent",
+    effect: "read",
+    description:
+      "Delegate one self-contained research task to a sub-agent that works in its own fresh context with the read-only tools and returns ONLY a final summary. Use it when a survey (many files, many pages) would flood this conversation with intermediate results. The sub-agent sees nothing of this conversation and cannot modify the workspace — the task text must carry everything it needs.",
+    parameters: {
+      properties: {
+        task: {
+          type: "string",
+          description:
+            "The complete task for the sub-agent, self-contained: what to find, where to look, and what the summary should cover.",
+        },
+      },
+      required: ["task"],
+    },
+  },
+  {
+    name: "load_skill",
+    effect: "read",
+    description:
+      "Load the full instructions of an installed skill. The system prompt lists the available skills by name with a one-line summary; when the current task matches one, load it here and follow its procedure before acting.",
+    parameters: {
+      properties: {
+        name: { type: "string", description: "The skill's name, exactly as the system prompt's skill list shows it." },
+      },
+      required: ["name"],
+    },
+  },
+  {
+    name: "generate_image",
+    effect: "mutate",
+    description:
+      "Generate an image from a text prompt through the gateway's image route and save it into the workspace (images/ by default). The saved file is also attached as an image part, so a vision-capable model can see what it made. Needs an image model configured in Router Settings → defaults.",
+    parameters: {
+      properties: {
+        prompt: { type: "string", description: "What the image should show. Be specific and concrete." },
+        path: {
+          type: "string",
+          description: "Optional workspace-relative save path. Defaults to images/generated-<timestamp>.png.",
+        },
+        model: {
+          type: "string",
+          description:
+            "Optional image model as \"provider/model\". Defaults to the configured default image model.",
+        },
+      },
+      required: ["prompt"],
+    },
+  },
+  {
+    name: "read_notebook",
+    effect: "read",
+    description:
+      "List the cells of a Jupyter notebook (.ipynb): index, type, execution count, outputs and a one-line preview of each — the map that edit_notebook targets by index.",
+    parameters: {
+      properties: {
+        path: { type: "string", description: "Workspace-relative path of the .ipynb." },
+      },
+      required: ["path"],
+    },
+  },
+  {
+    name: "edit_notebook",
+    effect: "mutate",
+    description:
+      "Edit one cell of a Jupyter notebook (.ipynb): replace its source, insert a new code/markdown cell, or delete one. Everything untouched — outputs, metadata, kernel spec — is preserved. Read the notebook first so the index matches the listing.",
+    parameters: {
+      properties: {
+        path: { type: "string", description: "Workspace-relative path of the .ipynb." },
+        action: { type: "string", description: '"replace", "insert" or "delete".' },
+        index: { type: "number", description: "0-based cell position, as read_notebook's listing shows." },
+        cell_type: { type: "string", description: 'insert only: "code" or "markdown".' },
+        source: { type: "string", description: "replace/insert only: the full new cell text." },
+      },
+      required: ["path", "action", "index"],
+    },
+  },
 ];
+
+/**
+ * The registry a `dispatch_agent` sub-agent runs with: the read-effect tools only, minus two.
+ * `dispatch_agent` itself is excluded — a sub-agent that could spawn sub-agents is recursion
+ * with no bound — and `todo_write` is excluded because the sub-agent's transcript is discarded,
+ * so a task list it writes would be a lie the model told itself.
+ */
+export const SUBAGENT_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
+  (t) => t.effect === "read" && t.name !== "dispatch_agent" && t.name !== "todo_write",
+);
 
 /** Render the OpenAI `tools` array from a registry. Empty registry yields undefined so the
  *  caller can omit `tools`/`tool_choice` entirely (some providers 400 on an empty list). */

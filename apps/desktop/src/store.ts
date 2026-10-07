@@ -1272,7 +1272,11 @@ export async function slugifySkill(name: string): Promise<string> {
 // ---------- P6: agent orchestrator ----------
 
 export interface AgentRun {
-  id: string; session_id: string | null; model: string; status: string;
+  id: string; session_id: string | null;
+  /** The run that delegated this one via dispatch_agent, or null for a top-level run — the
+   *  edge the Subagents screen's tree is drawn from. */
+  parent_run_id: string | null;
+  model: string; status: string;
   prompt: string | null; iterations: number; tool_calls: number;
   started_at: number; ended_at: number | null; error: string | null;
 }
@@ -1286,7 +1290,7 @@ export async function listAgentRuns(limit = 50): Promise<AgentRun[]> {
 }
 
 export async function agentRunStart(a: {
-  id: string; sessionId: string | null; model: string; prompt: string | null;
+  id: string; sessionId: string | null; parentRunId: string | null; model: string; prompt: string | null;
 }): Promise<void> {
   await invoke("agent_run_start", a);
 }

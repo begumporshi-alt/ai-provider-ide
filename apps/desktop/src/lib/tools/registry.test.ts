@@ -7,15 +7,31 @@
  * and a tool the host does not implement is a call that can only ever return an error. Neither
  * surfaces until a model tries to use it — so the checks live here instead.
  *
- * The mutating set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`). That
- * constant is what keeps gateway mutation opt-in; a rename here without a rename there would
- * silently un-gate a writing tool, so the names are pinned in both places.
+ * The mutating set is asserted against the Rust list in `gateway.rs` (`MUTATING_TOOLS`) plus the
+ * frontend composites the gateway never sees. That constant is what keeps gateway mutation
+ * opt-in; a rename here without a rename there would silently un-gate a writing tool, so the
+ * names are pinned in both places.
  */
 import { describe, expect, it } from "vitest";
-import { AGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
+import { AGENT_TOOLS, SUBAGENT_TOOLS, registryToOpenAI, toolEffect } from "./registry";
 
 /** Mirrors `MUTATING_TOOLS` in src-tauri/src/gateway.rs. Keep the two in step. */
-const MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+const GATEWAY_MUTATING = ["write_file", "edit_file", "mkdir", "run_command", "http_request", "apply_patch"];
+/** Assistant-only composites the gateway never sees: `edit_notebook` is read_file + write_file
+ *  assembled in the agent loop, `generate_image` writes through the base64 encoding the loop
+ *  adds to write_file, `process_kill` stops a job only this sandbox's background table knows
+ *  about, and the browser tools drive the debugger endpoint of the app's own process. Each is
+ *  approved once as `mutate`. The gateway never sees any of them. */
+const ASSISTANT_MUTATING = [
+  "browser_click",
+  "browser_fill",
+  "browser_navigate",
+  "browser_screenshot",
+  "edit_notebook",
+  "generate_image",
+  "process_kill",
+];
+const MUTATING = [...GATEWAY_MUTATING, ...ASSISTANT_MUTATING];
 
 describe("AGENT_TOOLS", () => {
   it("names are unique", () => {
@@ -54,18 +70,24 @@ describe("AGENT_TOOLS", () => {
     // it never touches the workspace — so it belongs on the read-only side.
     const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
     expect(readOnly.sort()).toEqual([
+      "browser_snapshot",
+      "dispatch_agent",
       "file_info",
       "glob",
       "list_dir",
+      "load_skill",
+      "process_output",
       "read_document",
       "read_file",
       "read_image",
+      "read_notebook",
       "search_files",
       "todo_write",
       "web_ask",
       "web_fetch",
       "web_search",
     ]);
+    expect(ASSISTANT_MUTATING.every((m) => AGENT_TOOLS.some((t) => t.name === m))).toBe(true);
   });
 
   it("editing is possible without rewriting a whole file", () => {
@@ -85,11 +107,38 @@ describe("AGENT_TOOLS", () => {
   });
 
   it("Assistant-only tools stay out of the gateway's registry", () => {
-    // `web_ask` is answered by the agent loop itself (it needs a model, which the Rust tool
-    // host does not have), so it is a frontend-registry entry with NO backend registry entry
-    // and NO sandbox handler beyond a refusal. This test pins the asymmetry: if web_ask ever
-    // appears in a backend-shaped list here, the mirror invariant below it needs rethinking.
+    // `web_ask` (answered by the loop itself — it needs a model, which the Rust tool host does
+    // not have), `dispatch_agent` (a nested run of the loop itself), `load_skill` (it needs the
+    // skill store) and the notebook composites (read_file + write_file assembled by the loop)
+    // are frontend-registry entries with NO backend registry entry and NO sandbox handler beyond
+    // a refusal. This test pins the asymmetry: if any ever appears in a backend-shaped list
+    // here, the mirror invariant needs rethinking.
     expect(AGENT_TOOLS.some((t) => t.name === "web_ask")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "dispatch_agent")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "load_skill")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "read_notebook")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "edit_notebook")).toBe(true);
+    // process_output/process_kill DO have sandbox handlers (background jobs live in the Rust
+    // process), but only the Assistant's own loop can know what a "bg-N" id means — the gateway
+    // registry keeps them out so external clients never build on the job table. Same for the
+    // browser tools: the debugger endpoint they drive belongs to this app session.
+    expect(AGENT_TOOLS.some((t) => t.name === "process_output")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "process_kill")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_navigate")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_snapshot")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_click")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_fill")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_screenshot")).toBe(true);
+  });
+
+  it("the sub-agent registry is the read-only tools minus delegation and todos", () => {
+    const names = SUBAGENT_TOOLS.map((t) => t.name);
+    expect(names).toContain("read_file");
+    expect(names).not.toContain("dispatch_agent");
+    expect(names).not.toContain("todo_write");
+    for (const t of SUBAGENT_TOOLS) {
+      expect(t.effect, t.name).toBe("read");
+    }
   });
 
   it("knows the effect of a name, and fails closed for one it does not", () => {

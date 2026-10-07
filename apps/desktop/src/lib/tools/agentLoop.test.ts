@@ -75,6 +75,482 @@ describe("runAgentLoop", () => {
     expect(result && result.type === "tool_result" && result.result).toBe("result-for-read_file");
   });
 
+  it("executes a batch of tool calls concurrently, not one at a time", async () => {
+    // The batch the model emits in one turn is independent by construction; running it one call
+    // at a time multiplies the wall clock by the batch size. This pins overlap: the second call
+    // must already have started before the first one finished.
+    const started: string[] = [];
+    let overlapped = false;
+    const host: ToolHost = {
+      async run(name) {
+        started.push(name);
+        if (name === "read_file") {
+          await Promise.resolve(); // yield once: a sequential loop has not started call 2 yet
+          overlapped = started.includes("list_dir");
+          return { ok: true, output: "slow-done" };
+        }
+        return { ok: true, output: "fast-done" };
+      },
+    };
+    const model = fakeModel([
+      {
+        text: "batching",
+        calls: [
+          { id: "c1", name: "read_file", arguments: "{}" },
+          { id: "c2", name: "list_dir", arguments: "{}" },
+        ],
+      },
+      { text: "final" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(out.text).toBe("final");
+    expect(overlapped, "the second call started before the first finished").toBe(true);
+  });
+
+  it("appends batch results in call order even when the later call finishes first", async () => {
+    // A result belongs under the tool_call it answers, so the transcript is built in call order
+    // — not in the order executions happened to complete. The first call here is held until the
+    // second has long finished; the second model call must still see c1's result before c2's.
+    let releaseFirst: () => void = () => {};
+    const firstReleased = new Promise<void>((r) => {
+      releaseFirst = r;
+    });
+    const host: ToolHost = {
+      async run(name) {
+        if (name === "read_file") {
+          await firstReleased;
+          return { ok: true, output: "first-result" };
+        }
+        queueMicrotask(releaseFirst); // the fast call finishes first, then frees the slow one
+        return { ok: true, output: "second-result" };
+      },
+    };
+    const seen: ChatMessage[][] = [];
+    const model = fakeModel([
+      {
+        text: "batching",
+        calls: [
+          { id: "c1", name: "read_file", arguments: "{}" },
+          { id: "c2", name: "list_dir", arguments: "{}" },
+        ],
+      },
+      { text: "final" },
+    ]);
+    const capturing: GenerateFn = async (req) => {
+      seen.push(JSON.parse(JSON.stringify(req.messages)));
+      return model(req);
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: capturing,
+      host,
+    });
+
+    const toolMsgs = seen[1]!.filter((m) => m.role === "tool");
+    expect(toolMsgs.map((m) => m.tool_call_id)).toEqual(["c1", "c2"]);
+    expect(toolMsgs.map((m) => m.content)).toEqual(["first-result", "second-result"]);
+  });
+
+  it("still asks for approvals one at a time even in a batch", async () => {
+    // Concurrency is for execution only. The confirm gate is the user's modal; two dialogs at
+    // once is how approvals get rubber-stamped, so the gate must never be entered twice at once.
+    let inConfirm = false;
+    let overlapped = false;
+    const confirm = async () => {
+      if (inConfirm) overlapped = true;
+      inConfirm = true;
+      await Promise.resolve();
+      inConfirm = false;
+      return true;
+    };
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      {
+        text: "batching",
+        calls: [
+          { id: "c1", name: "read_file", arguments: "{}" },
+          { id: "c2", name: "list_dir", arguments: "{}" },
+        ],
+      },
+      { text: "final" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm,
+    });
+
+    expect(overlapped, "the gate held one dialog at a time").toBe(false);
+  });
+
+  it("denies one call of a batch without blocking the others", async () => {
+    const ran: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        ran.push(name);
+        return { ok: true, output: `r-${name}` };
+      },
+    };
+    const denied: string[] = [];
+    const model = fakeModel([
+      {
+        text: "batching",
+        calls: [
+          { id: "c1", name: "write_file", arguments: '{"path":"a","content":"x"}' },
+          { id: "c2", name: "read_file", arguments: "{}" },
+        ],
+      },
+      { text: "final" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm: async (call) => {
+        if (call.name === "write_file") {
+          denied.push(call.name);
+          return false;
+        }
+        return true;
+      },
+    });
+
+    expect(denied).toEqual(["write_file"]);
+    expect(ran, "the denied call never reached the host; its sibling ran").toEqual(["read_file"]);
+  });
+
+  it("delegates to a read-only sub-agent and keeps only its summary", async () => {
+    // One shared model script serves both loops (fakeModel consumes steps in call order):
+    // outer turn calls dispatch_agent, the sub-agent reads a file and answers, the outer turn
+    // concludes on the summary. Everything the sub-agent did in between must stay out of the
+    // parent's transcript — isolation is the entire point of delegating.
+    const seenTools: (unknown[] | undefined)[] = [];
+    const host: ToolHost = {
+      async run(name, args) {
+        expect(name, "only the sub-agent's read reached the host").toBe("read_file");
+        expect(args).toEqual({ path: "a.txt" });
+        return { ok: true, output: "file body" };
+      },
+    };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"find the answer"}' }] },
+      { text: "looking", calls: [{ id: "s1", name: "read_file", arguments: '{"path":"a.txt"}' }] },
+      { text: "SUB ANSWER" },
+      { text: "final answer" },
+    ]);
+    const capturing: GenerateFn = async (req) => {
+      seenTools.push(req.tools as unknown[] | undefined);
+      return model(req);
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: capturing,
+      host,
+    });
+
+    expect(out.text).toBe("final answer");
+    const toolResult = out.messages.find((m) => m.role === "tool");
+    expect(toolResult?.content).toBe("SUB ANSWER");
+    const dump = JSON.stringify(out.messages);
+    expect(dump, "the sub-agent's intermediate turns never reached the parent").not.toContain("looking");
+    expect(dump, "its tool output never reached the parent either").not.toContain("file body");
+    // The sub-agent's registry is read-only and cannot recurse.
+    const subTools = (seenTools[1] as Array<{ function: { name: string } }>).map((t) => t.function.name);
+    expect(subTools).toContain("read_file");
+    expect(subTools, "no mutation in a sub-agent").not.toContain("write_file");
+    expect(subTools, "no run_command in a sub-agent").not.toContain("run_command");
+    expect(subTools, "a sub-agent cannot spawn sub-agents").not.toContain("dispatch_agent");
+  });
+
+  it("records a delegation as a child run under the parent's run id", async () => {
+    // The Subagents screen is drawn from the ledger, so dispatch_agent must write rows, not just
+    // run: the child's row names its parent, one tool_call step lands per sandbox call, and the
+    // row ends with the child's real outcome.
+    const started: Array<{ runId: string; parentRunId: string | null; prompt: string }> = [];
+    const ended: Array<{ runId: string; status: string; iterations: number; error?: string }> = [];
+    const steps: Array<{ runId: string; kind: string; label?: string }> = [];
+    let childSeq = 0;
+    const recorder = {
+      newRunId: () => `child-${++childSeq}`,
+      startRun: (a: { runId: string; parentRunId?: string | null; prompt?: string }) =>
+        started.push({ runId: a.runId, parentRunId: a.parentRunId ?? null, prompt: a.prompt ?? "" }),
+      recordStep: (runId: string, kind: string, label?: string) => steps.push({ runId, kind, label }),
+      endRun: (runId: string, status: string, iterations: number, error?: string) =>
+        ended.push({ runId, status, iterations, error }),
+    };
+    const host: ToolHost = { async run(name) { return { ok: true, output: `r-${name}` }; } };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"survey the files"}' }] },
+      { text: "looking", calls: [{ id: "s1", name: "read_file", arguments: "{}" }] },
+      { text: "SUB ANSWER" },
+      { text: "final" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      runId: "parent-1",
+      subagentRecorder: recorder,
+    });
+
+    expect(started).toEqual([
+      { runId: "child-1", parentRunId: "parent-1", prompt: "survey the files" },
+    ]);
+    // The child's read reached the sandbox through the recording host — one step, the tool's name.
+    expect(steps).toEqual([{ runId: "child-1", kind: "tool_call", label: "read_file" }]);
+    // Two model round-trips (the tool turn and the answer) — the row's iterations.
+    expect(ended).toEqual([{ runId: "child-1", status: "ok", iterations: 2, error: undefined }]);
+  });
+
+  it("records a failed delegation as an error row, not silence", async () => {
+    const ended: Array<{ runId: string; status: string; error?: string }> = [];
+    const recorder = {
+      newRunId: () => "child-x",
+      startRun: () => undefined,
+      recordStep: () => undefined,
+      endRun: (runId: string, status: string, _iterations: number, error?: string) =>
+        ended.push({ runId, status, error }),
+    };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: "final" },
+    ]);
+    // The sub-agent's own model call throws — the child run ends "error" and the parent still
+    // gets a tool result it can read, rather than the turn collapsing.
+    const generate: GenerateFn = async (req) => {
+      const system = req.messages.find((m) => m.role === "system");
+      if (system && /cannot modify the workspace/.test(String(system.content))) {
+        throw new Error("model exploded");
+      }
+      return model(req);
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      runId: "parent-1",
+      subagentRecorder: recorder,
+    });
+
+    expect(out.text).toBe("final");
+    expect(ended[0]?.status).toBe("error");
+    expect(ended[0]?.error, "the row names the failure").toBeTruthy();
+  });
+
+  it("delegates without a recorder exactly as before", async () => {
+    // Tests and the gateway bridge pass no recorder; the tool must not require one.
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: "SUB ANSWER" },
+      { text: "final" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(out.text).toBe("final");
+  });
+
+  it("hands the parent's confirm gate to the sub-agent's calls", async () => {
+    // In "ask every time" a sub-agent's reads must prompt exactly as the main loop's would —
+    // a nested run must not be a permission upgrade.
+    const asked: string[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: "looking", calls: [{ id: "s1", name: "read_file", arguments: "{}" }] },
+      { text: "SUB ANSWER" },
+      { text: "final" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm: async (call) => {
+        asked.push(call.name ?? "?");
+        return true;
+      },
+    });
+
+    expect(asked).toEqual(["dispatch_agent", "read_file"]);
+  });
+
+  it("rejects a dispatch_agent call with no task", async () => {
+    const ran: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        ran.push(name);
+        return { ok: true, output: "r" };
+      },
+    };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: "{}" }] },
+      { text: "final" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(ran, "nothing ran without a task").toEqual([]);
+    const toolResult = out.messages.find((m) => m.role === "tool");
+    expect(toolResult?.content).toContain('needs a "task"');
+  });
+
+  it("generates an image, saves it base64-decoded through write_file, and attaches it", async () => {
+    // The bytes the model sees must be attached as a content part (the read_image protocol), and
+    // the bytes on disk must come from the sandbox decoding base64 — the loop writes with
+    // `encoding: "base64"` and never treats the payload as text.
+    const PNG_B64 = "iVBORw==";
+    const writes: Array<{ name: string; args: Record<string, unknown> }> = [];
+    const host: ToolHost = {
+      async run(name, args) {
+        writes.push({ name, args });
+        return { ok: true, output: `wrote to ${String(args.path)}` };
+      },
+    };
+    const model = fakeModel([
+      { text: "drawing", calls: [{ id: "c1", name: "generate_image", arguments: '{"prompt":"a red circle"}' }] },
+      { text: "done" },
+    ]);
+    const events: AgentEvent[] = [];
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      onEvent: (e) => events.push(e),
+      generateImage: async () => ({ base64: PNG_B64 }),
+    });
+
+    const w = writes[0]!;
+    expect(w.name).toBe("write_file");
+    expect(w.args.encoding).toBe("base64");
+    expect(w.args.content).toBe(PNG_B64);
+    expect(String(w.args.path)).toMatch(/^images\/generated-\d+\.png$/);
+    // The transcript carries the receipt plus a real image part, not the base64 as text.
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("generated and saved");
+    const attach = out.messages.find((m) => m.role === "user" && Array.isArray(m.content));
+    expect(JSON.stringify(attach)).toContain(PNG_B64);
+    expect(JSON.stringify(out.messages)).not.toContain("READ_IMAGE:");
+  });
+
+  it("generate_image refuses with guidance when no image port exists", async () => {
+    const ran: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        ran.push(name);
+        return { ok: true, output: "r" };
+      },
+    };
+    const model = fakeModel([
+      { text: "drawing", calls: [{ id: "c1", name: "generate_image", arguments: '{"prompt":"x"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(ran, "nothing ran without an image route").toEqual([]);
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("no image route is configured");
+  });
+
+  it("load_skill fetches the body on demand and reports a miss honestly", async () => {
+    const requested: string[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const loadSkill = async (name: string) => {
+      requested.push(name);
+      return name === "review-checklist" ? "1. read the diff\n2. run the tests" : null;
+    };
+    const model = fakeModel([
+      { text: "loading", calls: [{ id: "c1", name: "load_skill", arguments: '{"name":"review-checklist"}' }] },
+      { text: "loading again", calls: [{ id: "c2", name: "load_skill", arguments: '{"name":"missing-skill"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      loadSkill,
+    });
+
+    expect(requested).toEqual(["review-checklist", "missing-skill"]);
+    const toolMsgs = out.messages.filter((m) => m.role === "tool");
+    expect(toolMsgs[0]!.content).toContain("1. read the diff");
+    expect(toolMsgs[1]!.content).toContain('no enabled skill named "missing-skill"');
+  });
+
+  it("load_skill says there are no skills rather than failing opaquely without a port", async () => {
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "loading", calls: [{ id: "c1", name: "load_skill", arguments: '{"name":"anything"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("no skills are installed");
+  });
+
   it("re-asks a truncated stream and returns the retried answer", async () => {
     // 2026-10-03, live on vice/deepseek-v4-flash: "First, let me check" arrived, the tool call
     // never did, and the old loop recorded the turn as a clean one-iteration success. A

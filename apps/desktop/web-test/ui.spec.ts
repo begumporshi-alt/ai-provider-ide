@@ -284,8 +284,10 @@ test("provider failover: the serving provider is visible in activity log", async
 
   await page.getByRole("button", { name: "Activity" }).click();
   // The Provider column names who actually served it. `systemai` seeds "System AI (mock)" —
-  // "Mock Oracle" only exists in the story that creates it through the wizard.
-  await expect(page.getByText(/System AI \(mock\)/)).toBeVisible({ timeout: 10_000 });
+  // "Mock Oracle" only exists in the story that creates it through the wizard. The cell, not a
+  // page-wide text: the mounted-but-hidden Assistant shows the same serving provider in its
+  // turn's route trace, and a page-wide getByText resolves twice.
+  await expect(page.getByRole("cell", { name: /System AI \(mock\)/ })).toBeVisible({ timeout: 10_000 });
 });
 
 // ---------------------------------------------------------------------------

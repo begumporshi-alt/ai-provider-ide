@@ -83,8 +83,11 @@ test("agent turn: a tool call lands in the graph and the run in the dashboard", 
   // --- P6: the run shows up with the tool call recorded as a step --------------------
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   await expect(page.getByText("1 runs · 0 running · 1 ok · 0 failed · 0 stopped")).toBeVisible({ timeout: 15_000 });
-  await expect(page.getByText("list files")).toBeVisible();
-  await page.getByText("list files").click();
+  // The row cell, not the transcript paragraph: the Assistant now stays mounted while hidden
+  // (see assistant-keep-mounted.spec), so its DOM still holds "list files" and a page-wide
+  // getByText resolves twice.
+  await expect(page.getByRole("cell", { name: "list files" })).toBeVisible();
+  await page.getByRole("cell", { name: "list files" }).click();
   await expect(page.getByText("3 steps")).toBeVisible({ timeout: 15_000 });
   // Steps: tool_call, tool_result, done — in order.
   for (const kind of ["tool_call", "tool_result", "done"]) {

@@ -167,6 +167,11 @@ async function oracle(req, res, path) {
 
     let content;
     let toolCall;
+    /** More than one call in one turn — what exercises the loop's parallel execution (gap 1). */
+    let toolCalls;
+    // The newest tool result, where second-round branches read what the first round's tool did.
+    const toolMsgs = messages.filter((m) => m.role === "tool");
+    const lastToolResult = String(toolMsgs[toolMsgs.length - 1]?.content ?? "");
     /**
      * Reasoning-only: the OpenAI-compatible spelling of the failure that produced the "the agent
      * is not replying" report (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`). The model
@@ -225,6 +230,72 @@ async function oracle(req, res, path) {
       // `node` is allowlisted, so the call is one the real sandbox would accept too.
       toolCall = { name: "run_command", arguments: JSON.stringify({ program: "node", args: ["-e", "setTimeout(() => {}, 60000)"] }) };
       content = "";
+    } else if (tools && !sawToolResult && /parallel/i.test(last)) {
+      // Agent mode, PARALLEL variant: two calls in ONE turn. The loop must run both (its
+      // Promise.all over the batch) and append both results before the next round.
+      toolCalls = [
+        { name: "read_file", arguments: JSON.stringify({ path: "README.md" }) },
+        { name: "list_dir", arguments: JSON.stringify({ path: "." }) },
+      ];
+      content = "";
+    } else if (tools && /notebook/i.test(userPrompt) && !sawToolResult) {
+      // Agent mode, NOTEBOOK variant: read first (the listing is what edit_notebook's index
+      // targets), then replace cell 0, then summarize. Multi-round branches key on the newest
+      // USER turn — on round two `last` is a tool result, which never mentions the notebook.
+      toolCall = { name: "read_notebook", arguments: JSON.stringify({ path: "analysis.ipynb" }) };
+      content = "";
+    } else if (tools && /notebook/i.test(userPrompt) && /nbformat/.test(lastToolResult)) {
+      toolCall = {
+        name: "edit_notebook",
+        arguments: JSON.stringify({
+          path: "analysis.ipynb",
+          action: "replace",
+          index: 0,
+          source: "print('edited by the agent')",
+        }),
+      };
+      content = "";
+    } else if (tools && /notebook/i.test(userPrompt)) {
+      content = "Notebook updated — cell 0 now reads the edited line.";
+    } else if (tools && /checklist/i.test(userPrompt) && !sawToolResult) {
+      // Agent mode, SKILL variant: the body is fetched through load_skill from the installed,
+      // enabled skill the user names (a shim builtin); it arrives as the tool result.
+      toolCall = { name: "load_skill", arguments: JSON.stringify({ name: "Code review" }) };
+      content = "";
+    } else if (tools && /checklist/i.test(userPrompt)) {
+      content = "Following the loaded checklist: " + lastToolResult.replace(/\s+/g, " ").trim();
+    } else if (tools && /draw/i.test(last) && !sawToolResult) {
+      // Agent mode, IMAGE variant: generate_image is loop-handled — the loop itself calls the
+      // gateway's image route and lands the bytes with write_file, so nothing here serves the
+      // image; the model is passed explicitly because no image default is seeded. Gated on
+      // !sawToolResult: the follow-up user turn names the written path ("images/drawn.png"),
+      // which also matches /draw/, and without the gate this branch would loop on itself.
+      toolCall = {
+        name: "generate_image",
+        arguments: JSON.stringify({ prompt: "a tiny red pixel", model: "sd-oracle-1", path: "images/drawn.png" }),
+      };
+      content = "";
+    } else if (tools && /background/i.test(userPrompt) && !sawToolResult) {
+      // Agent mode, BACKGROUND variant: start a detached job, then poll it by the id the
+      // start receipt names.
+      toolCall = {
+        name: "run_command",
+        arguments: JSON.stringify({ program: "echo", args: ["bg", "work", "done"], background: true }),
+      };
+      content = "";
+    } else if (tools && /background/i.test(userPrompt) && /bg-\d+/.test(lastToolResult) && !/\[status\]/.test(lastToolResult)) {
+      const id = /bg-\d+/.exec(lastToolResult)[0];
+      toolCall = { name: "process_output", arguments: JSON.stringify({ job: id, wait_ms: 1000 }) };
+      content = "";
+    } else if (tools && /background/i.test(userPrompt)) {
+      content = "Background job finished — its output: " + (lastToolResult.split("\n")[1]?.trim() ?? "");
+    } else if (tools && !sawToolResult && /delegat/i.test(last)) {
+      // Agent mode, DELEGATION variant: dispatch_agent — the tool that never reaches the sandbox.
+      // The nested run comes back through this same endpoint with the task as its only user turn
+      // ("list the files…" falls through to the list_dir branch), which is what gives the child a
+      // tool call of its own to record on the Subagents screen.
+      toolCall = { name: "dispatch_agent", arguments: JSON.stringify({ task: "list the files in the workspace" }) };
+      content = "";
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.
@@ -242,6 +313,8 @@ async function oracle(req, res, path) {
           : `Hello from ${body.model ?? "oracle"}`;
     }
 
+    const calls = toolCalls ?? (toolCall ? [toolCall] : []);
+
     if (!stream) {
       return json(res, 200, {
         id: "chatcmpl-mock",
@@ -253,15 +326,15 @@ async function oracle(req, res, path) {
           message: {
             role: "assistant",
             content,
-            ...(toolCall ? {
-              tool_calls: [{
-                id: "call_mock_1",
+            ...(calls.length > 0 ? {
+              tool_calls: calls.map((c, i) => ({
+                id: `call_mock_${i + 1}`,
                 type: "function",
-                function: { name: toolCall.name, arguments: toolCall.arguments },
-              }],
+                function: { name: c.name, arguments: c.arguments },
+              })),
             } : {}),
           },
-          finish_reason: toolCall ? "tool_calls" : "stop",
+          finish_reason: calls.length > 0 ? "tool_calls" : "stop",
         }],
         usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
       });
@@ -279,23 +352,25 @@ async function oracle(req, res, path) {
         res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: { reasoning_content: w + " " } }] })}\n\n`);
       }
     }
-    if (toolCall) {
-      // OpenAI streaming shape: one chunk declaring the call (id + name + empty args),
-      // then a chunk with arguments delta, then finish_reason "tool_calls", then [DONE].
-      // The interpreter's collectToolCallDeltas accumulates id/name/args by index and the
-      // pending buffer is flushed once the stream ends.
-      res.write(`data: ${JSON.stringify({
-        choices: [{ index: 0, delta: { tool_calls: [{
-          index: 0, id: "call_mock_1", type: "function",
-          function: { name: toolCall.name, arguments: "" },
-        }] } }],
-      })}\n\n`);
-      res.write(`data: ${JSON.stringify({
-        choices: [{ index: 0, delta: { tool_calls: [{
-          index: 0,
-          function: { arguments: toolCall.arguments },
-        }] } }],
-      })}\n\n`);
+    if (calls.length > 0) {
+      // OpenAI streaming shape: per call, a chunk declaring the call (id + name + empty args,
+      // each at its own index), then a chunk with its arguments delta; then finish_reason
+      // "tool_calls" and [DONE]. The interpreter's collectToolCallDeltas accumulates
+      // id/name/args by index and the pending buffer is flushed once the stream ends.
+      for (const [i, c] of calls.entries()) {
+        res.write(`data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { tool_calls: [{
+            index: i, id: `call_mock_${i + 1}`, type: "function",
+            function: { name: c.name, arguments: "" },
+          }] } }],
+        })}\n\n`);
+        res.write(`data: ${JSON.stringify({
+          choices: [{ index: 0, delta: { tool_calls: [{
+            index: i,
+            function: { arguments: c.arguments },
+          }] } }],
+        })}\n\n`);
+      }
       res.write(`data: ${JSON.stringify({
         choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
       })}\n\n`);

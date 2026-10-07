@@ -166,8 +166,10 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
       }
 
       if (!FILE_WRITERS.has(name) || !path) {
-        // `mkdir` makes a directory; `run_command` can do anything. Neither has a file body to
-        // snapshot, so the review names them instead of counting them as reverted.
+        // `mkdir` makes a directory; `run_command` can do anything; `browser_screenshot` saves a
+        // PNG the Rust side composed (never a model-chosen rewrite of existing content). None
+        // has a file body to snapshot, so the review names them instead of counting them as
+        // reverted.
         if (name === "run_command") {
           const program = typeof args.program === "string" ? args.program : "a command";
           checkpoint.noteUntracked(
@@ -175,6 +177,10 @@ export function createCheckpointingHost(inner: ToolHost, checkpoint: RunCheckpoi
           );
         } else if (name === "mkdir" && path) {
           checkpoint.noteUntracked(`created directory ${path}`);
+        } else if (name === "browser_screenshot") {
+          checkpoint.noteUntracked(
+            `saved a browser screenshot${path ? ` to ${path}` : " into images/"} — a new capture, never an overwrite of tracked content`,
+          );
         }
         return inner.run(name, args, opts);
       }

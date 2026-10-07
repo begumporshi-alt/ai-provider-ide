@@ -45,11 +45,12 @@ export function newRunId(): string {
 }
 
 export function startRun(args: {
-  runId: string; sessionId?: string | null; model: string; prompt?: string;
+  runId: string; sessionId?: string | null; parentRunId?: string | null; model: string; prompt?: string;
 }): void {
   void agentRunStart({
     id: args.runId,
     sessionId: args.sessionId ?? null,
+    parentRunId: args.parentRunId ?? null,
     model: args.model,
     prompt: args.prompt ?? null,
   }).catch((e: unknown) => {

@@ -311,9 +311,44 @@ const MAX_WEIGHT = 50;
 // not run, so the shim provides a small virtual FS just enough to let an Assistant agent turn
 // complete in tests. Path confinement mirrors tools.rs: paths containing ".." or starting "/"
 // are refused (ok:false), the same way a real escape attempt would be.
-const virtualFs = new Map<string, string>([["README.md", "hello\nworld\n"]]);
+const virtualFs = new Map<string, string>([
+  ["README.md", "hello\nworld\n"],
+  // A minimal but real notebook: outputs and metadata here are what edit_notebook must preserve.
+  [
+    "analysis.ipynb",
+    JSON.stringify({
+      cells: [
+        {
+          cell_type: "code",
+          source: "print('hello')\n",
+          metadata: {},
+          execution_count: 1,
+          outputs: [{ output_type: "stream", name: "stdout", text: ["hello\n"] }],
+          id: "cell-a",
+        },
+        { cell_type: "markdown", source: "# Analysis\n", metadata: {}, id: "cell-b" },
+      ],
+      metadata: { kernelspec: { name: "python3", display_name: "Python 3" } },
+      nbformat: 4,
+      nbformatMinor: 5,
+    }),
+  ],
+]);
 /** Directories created by `mkdir`. The virtual fs is flat, so dirs are tracked separately. */
 const virtualDirs = new Set<string>();
+
+/**
+ * Background `run_command` jobs — mirrors the observable surface of tools.rs (`bg-N` ids,
+ * "[status] …" polling text, kill-when-running/already-exited distinction) without spawning real
+ * processes, the same fidelity line the virtual FS draws: the *host* side of these tools is pinned
+ * by the Rust tests, the shim only has to be good enough for an agent turn to drive them.
+ */
+const bgJobs = new Map<
+  string,
+  { id: string; program: string; out: string; running: boolean; started: number; pid: number }
+>();
+let bgSeq = 0;
+const bgSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** What `tools_default_root` answers. There is no HOME or filesystem here, so the shim names a
  *  fixed absolute path — the same shape the host returns (`$HOME/AI-Provider-Router-Workspace`). */
@@ -1541,6 +1576,22 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         const program = String(toolArgs["program"] ?? "");
         const cmdArgs = Array.isArray(toolArgs["args"]) ? toolArgs["args"].map(String) : [];
         if (!TOOLS_POLICY.programs.includes(program)) return fail(`program '${program}' is not in the allowlist`);
+        // `background: true` outlives the tool call, exactly as tools.rs does: answer with the job
+        // id at once, let `process_output` poll it and `process_kill` stop it.
+        if (toolArgs["background"] === true) {
+          const id = `bg-${bgSeq++}`;
+          const job = { id, program, out: "", running: true, started: Date.now(), pid: 40000 + bgSeq };
+          bgJobs.set(id, job);
+          // The one real bit of work the emulation does: an `echo` job's output is its args, the
+          // same convention the foreground arm below keeps. Any other program prints nothing.
+          setTimeout(() => {
+            job.running = false;
+            if (program === "echo") job.out = cmdArgs.join(" ") + "\n";
+          }, 400);
+          return ok(
+            `started background job ${id} (${program}, pid ${job.pid}) — poll its output with process_output, stop it with process_kill`,
+          );
+        }
         if (program === "ls") {
           const target = cmdArgs[0] ?? ".";
           if (!isConfinedPath(target)) return fail("path escapes the workspace");
@@ -1557,6 +1608,28 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         if (program === "echo") return ok(cmdArgs.join(" "));
         return ok("");
       }
+      if (name === "process_output") {
+        const id = String(toolArgs["job"] ?? "");
+        const job = bgJobs.get(id);
+        if (!job) return fail(`no background job "${id}" — the id is wrong, or the app restarted since it was started`);
+        const waitMs = Math.min(Number(toolArgs["wait_ms"] ?? 0) || 0, 5_000);
+        const deadline = Date.now() + waitMs;
+        while (job.running && Date.now() < deadline) await bgSleep(100);
+        const label = job.running ? "running" : "exited (code 0)";
+        const elapsed = ((Date.now() - job.started) / 1000).toFixed(1);
+        const body = job.out || (job.running ? "(no output yet)" : "(no output)");
+        return ok(`[status] ${label} · elapsed ${elapsed}s · job ${id}\n${body}`);
+      }
+      if (name === "process_kill") {
+        const id = String(toolArgs["job"] ?? "");
+        const job = bgJobs.get(id);
+        if (!job) return fail(`no background job "${id}" — the id is wrong, or the app restarted since it was started`);
+        if (!job.running) return ok(`job ${id} has already exited — nothing to stop`);
+        job.running = false;
+        return ok(
+          `signalled job ${id} to stop (SIGINT, then SIGKILL after 500ms if still running) — poll process_output for the final status`,
+        );
+      }
       return fail(`unknown tool '${name}'`);
     }
 
@@ -1569,6 +1642,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       if (!RUN_STATUSES.includes("running")) throw new Error("running is not a valid status");
       agentRuns.push({
         id: args.id, session_id: args.session_id ?? null, model: args.model,
+        parent_run_id: args.parent_run_id ?? null,
         status: "running", prompt: args.prompt ?? null, iterations: 0, tool_calls: 0,
         started_at: Date.now(), ended_at: null, error: null,
       });

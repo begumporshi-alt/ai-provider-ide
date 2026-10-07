@@ -109,7 +109,7 @@ export interface TurnPorts extends TurnEventSink, TurnDeps {}
  *  and so the engine does not pull the host-boundary module into every importer. */
 export interface RunRecordPorts {
   newRunId(): string;
-  startRun(args: { runId: string; sessionId?: string | null; model: string; prompt?: string }): void;
+  startRun(args: { runId: string; sessionId?: string | null; parentRunId?: string | null; model: string; prompt?: string }): void;
   registerAbort(runId: string, ac: AbortController): void;
   recordStep(runId: string, kind: StepKind, label?: string, detail?: string, ok?: boolean): void;
   endRun(runId: string, status: RunStatus, iterations: number, error?: string): void;

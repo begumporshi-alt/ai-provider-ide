@@ -89,6 +89,25 @@ export interface AgentLoopOptions {
   /** Injected tool executor (Tauri sandbox in prod, fake in tests). */
   host: ToolHost;
   /**
+   * The image-generation port behind `generate_image`: the gateway's `/v1/images/generations`
+   * route, resolved to bytes by the injected implementation (a provider that answers with a URL
+   * has those bytes fetched host-side before returning). Absent means the tool refuses with that
+   * sentence rather than failing opaquely — agent mode works without an image model configured,
+   * and the model should be told the difference.
+   */
+  generateImage?: (
+    prompt: string,
+    model: string | undefined,
+    signal?: AbortSignal,
+  ) => Promise<{ base64: string }>;
+  /**
+   * The skill port behind `load_skill`: resolves an installed, enabled skill's full body by
+   * name (or slug), or null when nothing matches. The system prompt carries only the skill
+   * index — name and description — so the body is fetched on demand instead of riding every
+   * turn whether or not the task matches.
+   */
+  loadSkill?: (name: string, signal?: AbortSignal) => Promise<string | null>;
+  /**
    * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling**.
    *
    * The Assistant's screen leaves this unset by default: a real task is not a fixed number of
@@ -118,5 +137,30 @@ export interface AgentLoopOptions {
   onEvent?: (ev: AgentEvent) => void;
   /** Finish reason callback, forwarded to `generateText` on each agent round-trip. */
   onFinish?: (reason: string | undefined) => void;
+  /**
+   * The id of the agent run this loop serves, when the caller keeps a run ledger. Recorded on
+   * the runs `dispatch_agent` spawns, so the Subagents screen can draw the delegation tree.
+   */
+  runId?: string;
+  /**
+   * The recorder behind `dispatch_agent`'s nested runs: the child's row is started with
+   * `parentRunId: runId`, one `tool_call` step lands per tool the sub-agent uses, and the row
+   * is closed with the outcome. Absent (tests, the gateway bridge) the tool works exactly as
+   * before — delegation without a ledger.
+   */
+  subagentRecorder?: {
+    newRunId(): string;
+    startRun(args: {
+      runId: string;
+      sessionId?: string | null;
+      parentRunId?: string | null;
+      model: string;
+      prompt?: string;
+    }): void;
+    recordStep(runId: string, kind: string, label?: string, detail?: string, ok?: boolean): void;
+    endRun(runId: string, status: string, iterations: number, error?: string): void;
+  };
+  /** The sub-agent's step budget. Defaults to `SUBAGENT_MAX_ITERATIONS`. */
+  subagentMaxIterations?: number;
   signal?: AbortSignal;
 }

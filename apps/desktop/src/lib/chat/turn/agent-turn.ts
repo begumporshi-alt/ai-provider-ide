@@ -28,6 +28,16 @@ export interface AgentTurnRequest extends TurnRequestBase {
   thinking?: string;
   /** The user's step budget, or null for no ceiling — see `AgentLoopOptions.maxIterations`. */
   maxIterations: number | null;
+  /**
+   * The image-generation port behind `generate_image`, or absent to refuse the tool with a
+   * sentence the model can act on. The screen owns it because only it knows the default image
+   * model and can resolve provider URLs to bytes.
+   */
+  generateImage?: Parameters<typeof runAgentLoop>[0]["generateImage"];
+  /** The skill port behind `load_skill` — the screen owns the skill store, the engine does not. */
+  loadSkill?: Parameters<typeof runAgentLoop>[0]["loadSkill"];
+  /** The sub-agent's step budget, from the user's defaults; absent means the loop's built-in. */
+  subagentMaxIterations?: Parameters<typeof runAgentLoop>[0]["subagentMaxIterations"];
   /** The live AbortController — registered with the orchestrator so the dashboard can stop the run. */
   controller: AbortController;
   confirm: Parameters<typeof runAgentLoop>[0]["confirm"];
@@ -179,6 +189,13 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         }));
       },
       host,
+      generateImage: req.generateImage,
+      loadSkill: req.loadSkill,
+      subagentMaxIterations: req.subagentMaxIterations,
+      // The delegation ledger: a dispatch_agent child records its row under this run's id, so
+      // the Subagents screen can draw the tree.
+      runId,
+      subagentRecorder: ports.orchestrator,
       // Clamped by the caller: this is the number that actually bounds the spend.
       maxIterations: req.maxIterations,
       confirm: req.confirm,

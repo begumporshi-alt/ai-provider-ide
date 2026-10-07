@@ -279,7 +279,9 @@ test("memory: the core profile section lets the user add, edit, and forget L3 fa
   await page.getByRole("button", { name: "Memory", exact: true }).click();
 
   // Add: the textarea accepts a fact, "save as core" wires through captureMemory + the host.
-  const textarea = page.locator("textarea").first();
+  // `:visible` because the Assistant stays mounted while hidden (assistant-keep-mounted.spec)
+  // and its composer is earlier in document order than anything on this screen.
+  const textarea = page.locator("textarea:visible").first();
   await textarea.fill("I write Rust by day and TypeScript by night");
   await page.getByRole("button", { name: "save as core" }).click();
   await expect(page.getByText("I write Rust by day and TypeScript by night", { exact: true })).toBeVisible();
@@ -289,9 +291,9 @@ test("memory: the core profile section lets the user add, edit, and forget L3 fa
     .toBe(1);
 
   // Edit: rewriting a fact goes through memory_update, not delete+add. The row's edit textarea
-  // appears above the add textarea, so it is nth(0) in document order.
+  // appears above the add textarea, so it is the first visible one.
   await page.getByRole("button", { name: "edit", exact: true }).click();
-  const editBox = page.locator("textarea").nth(0);
+  const editBox = page.locator("textarea:visible").nth(0);
   await editBox.fill("I write Rust by day and TypeScript by night, in that order");
   await page.getByRole("button", { name: "save", exact: true }).click();
   await expect(page.getByText("I write Rust by day and TypeScript by night, in that order", { exact: true })).toBeVisible();

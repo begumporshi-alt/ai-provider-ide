@@ -16,6 +16,7 @@ import {
   historyMaxSeq,
   setSessionTitle as saveSessionTitle,
   type HistorySession,
+  type Skill,
 } from "../store";
 import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
@@ -548,6 +549,12 @@ export function AssistantScreen() {
   // `Chat` subscribes to the tick itself (the skills block re-reads on it), so this shell does
   // not — and not subscribing is what keeps a store bump from tearing down the transcript.
   const [tab, setTab] = useState<"text" | "image" | "root">("text");
+  // This screen stays mounted while other screens are shown (App.tsx hides it with CSS, the same
+  // cure the Chat/Image tabs got). "Active" is therefore a fact from the store, not from being
+  // mounted: it gates the header portal (otherwise the session bar would ride along on every
+  // screen) and Chat's keyboard bindings (otherwise Escape would stop a run from a screen the
+  // user cannot see the run on).
+  const screenActive = useUi((s) => s.screen) === "assistant";
   // The top bar's slot: the session features and the tabs portal into it (see the header portal
   // in the return below). `null` until the shell's header has committed.
   const headerSlot = useHeaderSlot();
@@ -555,8 +562,9 @@ export function AssistantScreen() {
   // to re-render once the node exists, which a ref callback + setState gives us for free.
   const [sessionSlot, setSessionSlot] = useState<HTMLDivElement | null>(null);
   // The switches live here, above `Chat`, so switching Chat/Image does not silently reset them.
-  // `Chat` unmounts on a tab switch; how the user has configured the screen outliving that is
-  // the difference between "the tab changed" and "my settings changed".
+  // `Chat` stays mounted through a tab switch (hidden with CSS); how the user has configured the
+  // screen outliving the tab change is the difference between "the tab changed" and "my settings
+  // changed".
   const [noTools, setNoTools] = useState(true);
   const [agentMode, setAgentMode] = useState(false);
   // P5: how the agent's tool calls are gated. `ask` is today's behaviour and the default, so a
@@ -859,7 +867,10 @@ export function AssistantScreen() {
           which owns their state) and the three tabs portal into the shell's header slot, so the
           screen no longer spends a title row of its own under a bar that used to repeat the same
           screen name as a breadcrumb. */}
-      {headerSlot && createPortal(
+      {/* Gated on `screenActive`, not just `headerSlot`: this screen is mounted while other
+          screens are shown, and the slot is a single shared node — an un-gated portal would paint
+          the session bar and these tabs over every other screen's header. */}
+      {screenActive && headerSlot && createPortal(
         <>
           <div ref={setSessionSlot} className="flex min-w-0 flex-1 items-center gap-2" />
           {agentMode && root.trim() ? (
@@ -930,7 +941,7 @@ export function AssistantScreen() {
           sessionSlot={sessionSlot}
           onEditPrompts={() => setEditingPrompt("system")}
           onSwitchToImageTab={() => setTab("image")}
-          active={tab === "text"}
+          active={screenActive && tab === "text"}
         />
       </div>
       <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
@@ -1532,8 +1543,11 @@ function Chat({
   const [titleDraft, setTitleDraft] = useState("");
   const [switcherOpen, setSwitcherOpen] = useState(false);
   const [sessions, setSessions] = useState<HistorySession[]>([]);
-  // P5: enabled skills are appended to the agent's instructions. Re-read on every tick so
-  // installing or revoking a skill changes the agent's behaviour without restarting the app.
+  // P5: enabled skills are listed in the agent's instructions by name and summary, and the
+  // `load_skill` tool fetches the full procedure in the turn where the model decides the task
+  // matches. The full bodies used to ride every turn whether or not they were relevant — a
+  // context tax paid on every call, growing with every install. Re-read on every tick so
+  // installing or revoking a skill changes the index without restarting the app.
   const [skillsBlock, setSkillsBlock] = useState("");
   useEffect(() => {
     listSkills()
@@ -1542,8 +1556,8 @@ function Chat({
         setSkillsBlock(
           active.length === 0
             ? ""
-            : "\n\nInstalled skills — when the task matches one, follow its procedure:\n\n"
-              + active.map((s) => `## ${s.name}\n${s.description}\n\n${s.body}`).join("\n\n"),
+            : "\n\nInstalled skills — when the task matches one, load it with the load_skill tool and follow its procedure:\n\n"
+              + active.map((s) => `- ${s.name}: ${s.description}`).join("\n"),
         );
       })
       .catch(() => undefined);
@@ -1907,8 +1921,48 @@ function Chat({
           // Already the parsed shape (`number | null`); the clamp happened when it was typed or
           // loaded, and re-clamping here would only risk disagreeing with the field.
           maxIterations,
+          // The sub-agent budget from Router Settings → defaults; a blank or broken value means
+          // the loop's built-in 12, not 1 — a corrupted setting must degrade to the value that
+          // works, the same rule the main ceiling's clamp follows.
+          subagentMaxIterations: (() => {
+            const raw = (router.settings as typeof router.settings & { defaults?: Record<string, string> })
+              .defaults?.subagentIterations;
+            const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
+            return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
+          })(),
           controller: ac,
           confirm: (call, args) => turn.confirm(call, args),
+          // The skill port for load_skill: name or slug must match an ENABLED skill — a disabled
+          // one is not available to the run, and saying so beats serving stale instructions.
+          loadSkill: async (name) => {
+            const all = await listSkills().catch(() => [] as Skill[]);
+            const hit = all.find((s) => s.enabled && (s.name === name || s.slug === name));
+            return hit ? hit.body : null;
+          },
+          // Agent-mode image generation reuses the Image tab's serving path: the gateway's
+          // `/v1/images/generations`, default model from Router Settings → defaults. A provider
+          // that answers with a link has its bytes pulled through the host's scoped fetch, so
+          // the loop always receives base64 it can hand to write_file.
+          generateImage: (prompt, model, signal) => {
+            const chosenImage =
+              model ||
+              (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.image ||
+              "";
+            if (!chosenImage) {
+              return Promise.reject(
+                new Error("no image model is configured — pick one in Router Settings → defaults"),
+              );
+            }
+            return gatewayGenerateImage({ model: chosenImage, prompt }, { signal }).then(async (res) => {
+              if (res.base64) return { base64: res.base64 };
+              if (res.url) {
+                const dataUri = await fetchImageUrl(res.url);
+                const comma = dataUri.indexOf(",");
+                return { base64: comma >= 0 ? dataUri.slice(comma + 1) : dataUri };
+              }
+              throw new Error("the provider returned neither image bytes nor a link");
+            });
+          },
         },
         {
           generate: gatewayGenerate,
@@ -2147,28 +2201,25 @@ function Chat({
   // stored turns are re-read exactly the way a resume rebuilds them. Once per mount, and only
   // when the stored session actually has turns — a brand-new session restores nothing.
   const restoredOnMount = useRef(false);
+  // Adopt a handed-over session: the recorder, the session id and the stored turns of `intent`,
+  // exactly the way a resume rebuilds them.
+  const adoptSession = useCallback((intent: string) => {
+    void (async () => {
+      try {
+        const [resumed, seq] = await Promise.all([resumeSession(intent), historyMaxSeq(intent)]);
+        const rec = startSession(intent, seq);
+        ctxRef.current = rec;
+        lastNodeRef.current = null;
+        setSessionId(rec.sessionId);
+        setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+      } catch {
+        return; // same policy as openSession: an unreadable session is not an error wall
+      }
+    })();
+  }, []);
   useEffect(() => {
     if (restoredOnMount.current) return;
     restoredOnMount.current = true;
-    // A "Continue in Assistant" handed over from History wins: adopt that session (recorder,
-    // session id, stored turns) instead of restoring the singleton's own.
-    const intent = useUi.getState().resumeSessionId;
-    useUi.getState().setResumeSessionId(undefined);
-    if (intent) {
-      void (async () => {
-        try {
-          const [resumed, seq] = await Promise.all([resumeSession(intent), historyMaxSeq(intent)]);
-          const rec = startSession(intent, seq);
-          ctxRef.current = rec;
-          lastNodeRef.current = null;
-          setSessionId(rec.sessionId);
-          setMsgs(withIds(resumed as Omit<Msg, "id">[]));
-        } catch {
-          return; // same policy as openSession: an unreadable session is not an error wall
-        }
-      })();
-      return;
-    }
     const sid = ctxRef.current!.sessionId;
     void resumeSession(sid)
       .then((resumed) => {
@@ -2177,6 +2228,17 @@ function Chat({
       .catch(() => undefined);
     // Mount only: afterwards the transcript is owned by the turn runner and the session actions.
   }, []);
+  // A "Continue in Assistant" handed over from History. This used to be read once per mount,
+  // which worked only because navigating remounted this screen — a mount that no longer happens
+  // now that the screen stays mounted across switches. Watched, not consumed: the handover wins
+  // over whatever is on screen (it is an explicit user action), and a handover arriving while a
+  // turn runs is refused the same way `openSession` refuses one.
+  const resumeIntent = useUi((s) => s.resumeSessionId);
+  useEffect(() => {
+    if (!resumeIntent || busy) return;
+    useUi.getState().setResumeSessionId(undefined);
+    adoptSession(resumeIntent);
+  }, [resumeIntent, busy, adoptSession]);
 
   /**
    * Start a fresh conversation. The recorder is replaced, not merely cleared, so the new turns are

@@ -59,6 +59,7 @@ export const NAV: readonly NavGroup[] = [
     items: [
       { id: "providers", label: "AI Providers", icon: "cloud" },
       { id: "agents", label: "Agents", icon: "agents" },
+      { id: "subagents", label: "Subagents", icon: "subagents" },
       { id: "control", label: "Control", icon: "sliders" },
       { id: "settings", label: "Router Settings", icon: "nodes" },
       { id: "gateway", label: "Local Gateway", icon: "gateway" },

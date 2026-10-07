@@ -20,8 +20,26 @@ describe("toolEffect", () => {
   it("classifies the mutating tools as mutations and the rest as reads", () => {
     const mutate = AGENT_TOOLS.filter((t) => t.effect === "mutate").map((t) => t.name).sort();
     // `http_request` sends data out and `apply_patch` rewrites files, so both are gated like
-    // the file writers even though neither name says "write".
-    expect(mutate).toEqual(["apply_patch", "edit_file", "http_request", "mkdir", "run_command", "write_file"]);
+    // the file writers even though neither name says "write". `edit_notebook` is the frontend
+    // composite that writes through read_file + write_file, `generate_image` writes through
+    // write_file's base64 encoding — one approval each for one logical edit. `process_kill`
+    // stops a process and the browser tools act on the user's real browser, both as much a
+    // mutation as starting one is.
+    expect(mutate).toEqual([
+      "apply_patch",
+      "browser_click",
+      "browser_fill",
+      "browser_navigate",
+      "browser_screenshot",
+      "edit_file",
+      "edit_notebook",
+      "generate_image",
+      "http_request",
+      "mkdir",
+      "process_kill",
+      "run_command",
+      "write_file",
+    ]);
   });
 
   it("answers `mutate` for a name the registry does not know", () => {

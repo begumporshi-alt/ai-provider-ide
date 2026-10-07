@@ -172,6 +172,26 @@ export function SettingsScreen() {
               <DefaultModelPicker modality={mod} />
             </label>
           ))}
+          <label className="block">
+            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Subagent step budget</span>
+            <input
+              className="mono w-full rounded border px-2 py-1 text-[12px]"
+              style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+              type="number"
+              min={1}
+              placeholder="12"
+              value={(router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.subagentIterations ?? ""}
+              onChange={(e) => {
+                const cast = router.settings as typeof router.settings & { defaults?: Record<string, string> };
+                cast.defaults = { ...(cast.defaults ?? {}), subagentIterations: e.target.value };
+                persistRouterSettings();
+                bump();
+              }}
+            />
+            <span className="mt-1 block text-[11px]" style={{ color: "var(--text-faint)" }}>
+              Model round-trips one dispatch_agent sub-agent gets. Blank = the built-in 12.
+            </span>
+          </label>
         </div>
       </Section>
 

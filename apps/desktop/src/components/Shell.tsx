@@ -63,6 +63,14 @@ const ICON_PATHS: Record<string, ReactNode> = {
       <path d="M3.5 20v-.5a5 5 0 0 1 5-5h1a5 5 0 0 1 5 5v.5M16 5.6a3.5 3.5 0 0 1 0 5.8M18.5 14.8a5 5 0 0 1 2 4.2" />
     </>
   ),
+  subagents: (
+    <>
+      <circle cx="7.5" cy="7.5" r="3" />
+      <circle cx="16.5" cy="16.5" r="3" />
+      <circle cx="16.5" cy="7.5" r="3" />
+      <circle cx="7.5" cy="16.5" r="3" />
+    </>
+  ),
   sliders: (
     <>
       <path d="M4 7h9m4.5 0H20M4 17h3m4.5 0H20" />

@@ -16,6 +16,7 @@ import { ContextScreen } from "./screens/Context";
 import { HistoryScreen } from "./screens/History";
 import { SkillsScreen } from "./screens/Skills";
 import { AgentsScreen } from "./screens/Agents";
+import { SubagentsScreen } from "./screens/Subagents";
 import { MemoryScreen } from "./screens/Memory";
 import { SettingsScreen } from "./screens/Settings";
 import { GatewayScreen } from "./screens/Gateway";
@@ -87,15 +88,23 @@ export default function App() {
 
   return (
     <Shell>
+      {/* The Assistant stays mounted across screen switches, hidden with CSS — the same cure its
+          own Chat/Image tabs needed (see Assistant.tsx): unmounting it orphaned an in-flight turn,
+          whose streaming updates flowed into a dead component, and the way back in re-read the
+          session's *stored* turns over the live transcript, so a turn still running read as
+          stopped-with-only-the-first-reply. Every other screen is stateless enough to remount. */}
+      <div className={screen === "assistant" ? "h-full" : "hidden"}>
+        <AssistantScreen />
+      </div>
       {screen === "providers" && <ProvidersScreen />}
       {screen === "models" && <ModelsScreen />}
-      {screen === "assistant" && <AssistantScreen />}
       {screen === "compare" && <CompareScreen />}
       {screen === "activity" && <ActivityScreen />}
       {screen === "context" && <ContextScreen />}
       {screen === "history" && <HistoryScreen />}
       {screen === "skills" && <SkillsScreen />}
       {screen === "agents" && <AgentsScreen />}
+      {screen === "subagents" && <SubagentsScreen />}
       {screen === "memory" && <MemoryScreen />}
       {screen === "settings" && <SettingsScreen />}
       {screen === "gateway" && <GatewayScreen />}
