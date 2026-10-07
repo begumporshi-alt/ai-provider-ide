@@ -9,10 +9,12 @@
 //!   answers wins (the result says which one). Today that is DuckDuckGo's "lite" page, then
 //!   DuckDuckGo's full "html" template (same provider, different markup, so one template
 //!   changing does not take out both); each parser is tolerant and pinned by a fixture test,
-//!   so a markup change degrades to the next backend instead of breaking the tool. The
-//!   chain-head slot is where an optional key-backed backend (Brave/Tavily/…) goes when a
-//!   settings field for it exists — see [`web_search`]. A self-hosted SearXNG is the permanent
-//!   keyless option and slots in at the tail — see [`parse_searxng`].
+//!   so a markup change degrades to the next backend instead of breaking the tool. A key-backed
+//!   backend (Brave/Tavily) heads the chain when a `<provider>|<key>` secret is stored in the
+//!   vault under "websearch" — see [`chain_for`]; nothing writes that account yet, so keyless
+//!   runs see the two-DDG chain. After a run where every backend failed, each one cools down
+//!   for 2 minutes rather than being re-hammered — see [`BACKEND_COOLDOWN`]. A self-hosted
+//!   SearXNG is the permanent keyless option and slots in at the tail — see [`parse_searxng`].
 //!
 //! For comparison: ZCode solves search by delegating to the model provider's server-side
 //! `web_search` (`supportsNativeWebSearch` in their handler) — the vendor hosts the search
@@ -35,7 +37,7 @@
 
 use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use regex::Regex;
 
@@ -55,7 +57,30 @@ const MAX_BODY_BYTES: usize = 512 * 1024;
 /// The text handed to the model is capped tighter — 32 KB of prose is already ~8k tokens, and
 /// the model can re-fetch with the reading it needs.
 const MAX_TEXT_BYTES: usize = 32 * 1024;
-const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) AIProviderRouter/1.2 Safari/537.36";
+/// A plain browser UA. Measured 2026-10-07 against DuckDuckGo: the app-suffixed UA and a
+/// Chrome UA get 202'd equally once requests burst, so the UA is not what trips DDG — but bare
+/// non-browser UAs are the classic trigger for site-side 403s on ordinary pages, so the fetch
+/// identifies as the browser it otherwise behaves as. No app marker: it only invites scrutiny.
+const USER_AGENT: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36";
+
+/// The headers a page GET carries beyond the UA. A request with only a UA string is the
+/// bot-shaped profile many sites 403 outright; these two make the request look like the
+/// browsers that page expects. Applied as client defaults, so a caller-supplied header
+/// (`http_request`) still overrides them.
+fn browser_default_headers() -> reqwest::header::HeaderMap {
+    let mut h = reqwest::header::HeaderMap::new();
+    h.insert(
+        reqwest::header::ACCEPT,
+        reqwest::header::HeaderValue::from_static(
+            "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        ),
+    );
+    h.insert(
+        reqwest::header::ACCEPT_LANGUAGE,
+        reqwest::header::HeaderValue::from_static("en-US,en;q=0.9"),
+    );
+    h
+}
 
 /// A dedicated multi-thread runtime, built once. The tool host is synchronous, and blocking on
 /// the ambient runtime (if any) with `tokio::block_on` would panic; a private runtime is the
@@ -189,6 +214,7 @@ pub fn check_public_http_url(raw: &str) -> Result<reqwest::Url, String> {
 pub fn http_get(url: &reqwest::Url) -> Result<Vec<u8>, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
+        .default_headers(browser_default_headers())
         .redirect(reqwest::redirect::Policy::none())
         .timeout(FETCH_TIMEOUT)
         .connect_timeout(CONNECT_TIMEOUT)
@@ -569,19 +595,16 @@ type SearchBackend = fn(&str) -> Result<Vec<WebSearchHit>, String>;
 /// closures that count calls (`fn` pointers cannot close over state).
 type DynSearchBackend<'a> = &'a (dyn Fn(&str) -> Result<Vec<WebSearchHit>, String> + 'a);
 
-// The key tier below — a vault-stored Brave/Tavily key and the plumbing that serves it — is held
-// ready, not wired: no settings field for a search key exists yet, so nothing reachable from a
-// release build uses it. The tests at the bottom of this file drive `chain_for` and the parsers
-// directly, which is what keeps the tier exercised; wiring it is one entry at the HEAD of the
-// backend list (see `web_search`'s doc comment).
-#[allow(dead_code)]
+// The key tier below is wired: `web_search` builds its chain through `chain_for`, which puts a
+// vault-stored `<brave|tavily>|<key>` secret at the HEAD and the keyless pair after it. Nothing
+// writes that vault account yet (no settings field), so keyless users run the two-DDG chain and
+// the tier activates the moment a secret is stored under "websearch".
 const SEARCH_KEY_ACCOUNT: &str = "websearch";
 
 /// The key-tier backends. These are official APIs — the stable path the keyless chain defers
 /// to whenever the user has configured a key. Each parses the provider's JSON and needs a
 /// `POST`-or-header variant of the fetch, so they carry their own thin request code instead of
 /// `http_get`.
-#[allow(dead_code)]
 fn search_brave(query: &str) -> Result<Vec<WebSearchHit>, String> {
     let secret = vault_secret()?;
     let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
@@ -599,7 +622,6 @@ fn search_brave(query: &str) -> Result<Vec<WebSearchHit>, String> {
     parse_brave_json(&body)
 }
 
-#[allow(dead_code)]
 fn search_tavily(query: &str) -> Result<Vec<WebSearchHit>, String> {
     let secret = vault_secret()?;
     let key = secret.split_once('|').map(|(_, k)| k).unwrap_or("");
@@ -615,7 +637,6 @@ fn search_tavily(query: &str) -> Result<Vec<WebSearchHit>, String> {
 }
 
 /// The stored `<provider>|<key>` secret, if one is configured and well-formed.
-#[allow(dead_code)]
 fn vault_secret() -> Result<String, String> {
     match crate::core::vault::get(SEARCH_KEY_ACCOUNT) {
         Ok(Some(secret)) if secret.contains('|') && !secret.ends_with('|') => Ok(secret),
@@ -625,7 +646,6 @@ fn vault_secret() -> Result<String, String> {
 }
 
 /// Parse Brave's web-search JSON: `web.results[]` of `{title, url, description}`.
-#[allow(dead_code)]
 fn parse_brave_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("Brave returned non-JSON: {e}"))?;
@@ -646,7 +666,6 @@ fn parse_brave_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
 }
 
 /// Parse Tavily's JSON: `results[]` of `{title, url, content}`.
-#[allow(dead_code)]
 fn parse_tavily_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
     let v: serde_json::Value =
         serde_json::from_str(body).map_err(|e| format!("Tavily returned non-JSON: {e}"))?;
@@ -666,14 +685,12 @@ fn parse_tavily_json(body: &str) -> Result<Vec<WebSearchHit>, String> {
         .collect())
 }
 
-#[allow(dead_code)]
 fn snip(s: &str) -> String {
     s.chars().take(120).collect()
 }
 
 /// GET with extra headers — the shape `http_get` cannot express (Brave authenticates by
 /// header). Same timeout and no-redirect discipline.
-#[allow(dead_code)]
 fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -699,7 +716,6 @@ fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result
 
 /// POST JSON with a bearer-free `Content-Type` body — Tavily authenticates in the body. Same
 /// timeout and no-redirect discipline as `http_get`.
-#[allow(dead_code)]
 fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
     let client = reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -727,7 +743,6 @@ fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
 
 /// The keyless backends, tried in order after any key tier. A self-hosted SearXNG slots in at
 /// the TAIL (see [`parse_searxng`]).
-#[allow(dead_code)]
 fn keyless_backends() -> Vec<(&'static str, SearchBackend)> {
     vec![("DuckDuckGo", search_ddg_lite), ("DuckDuckGo (html)", search_ddg_html)]
 }
@@ -735,7 +750,6 @@ fn keyless_backends() -> Vec<(&'static str, SearchBackend)> {
 /// The chain as a pure function of the configured secret, which is what makes the tiering
 /// testable without touching the vault. The key backend goes at the HEAD: when the user
 /// configured one, it is the answer they asked for; the keyless backends become the fallback.
-#[allow(dead_code)]
 fn chain_for(secret: Option<&str>) -> Vec<(&'static str, SearchBackend)> {
     let mut out: Vec<(&'static str, SearchBackend)> = Vec::new();
     match secret.map(str::trim).filter(|s| !s.is_empty()) {
@@ -748,7 +762,6 @@ fn chain_for(secret: Option<&str>) -> Vec<(&'static str, SearchBackend)> {
 }
 
 /// The chain as the app will run it: whatever key the user configured, then the keyless pair.
-#[allow(dead_code)]
 fn search_backends() -> Vec<(&'static str, SearchBackend)> {
     let secret = crate::core::vault::get(SEARCH_KEY_ACCOUNT).ok().flatten();
     chain_for(secret.as_deref())
@@ -807,24 +820,74 @@ fn search_ddg_html(query: &str) -> Result<Vec<WebSearchHit>, String> {
 // fn search_searxng — removed until a settings field exists for the instance URL, so the
 // build carries no unreachable code; the parser above is the tested half and stays.
 
-/// Search the public web: try every keyless backend in order, return the first answer with the
-/// name of the backend that served it. This is the whole `web_search` tool.
+// ── the post-failure cooldown ────────────────────────────────────────────────────────────
+
+/// How long a search backend that just failed sits out. Keyless engines bot-check by IP after
+/// bursts (measured 2026-10-07: DuckDuckGo answers 202 to every request for a while once a run
+/// has hammered it), and the agent's natural behaviour is to search again immediately — which
+/// re-enters the chain, hammers the flagged engine, and extends the flag. A short quiet window
+/// is what actually lifts those checks.
+const BACKEND_COOLDOWN: Duration = Duration::from_secs(120);
+
+fn search_cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, Instant>> {
+    static CELL: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, Instant>>,
+    > = OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Record that `name` just failed, starting its cooldown. `at` is explicit, like the fetch
+/// cache's insert, so the window is testable without sleeping.
+fn mark_backend_failed(name: &str, at: Instant) {
+    search_cooldowns().lock().unwrap().insert(name.to_string(), at);
+}
+
+/// Is `name` inside its post-failure cooldown as of `at`?
+fn backend_is_cooling(name: &str, at: Instant) -> bool {
+    search_cooldowns()
+        .lock()
+        .unwrap()
+        .get(name)
+        .map(|failed_at| at.duration_since(*failed_at) < BACKEND_COOLDOWN)
+        .unwrap_or(false)
+}
+
+/// The backends this call may use: everything configured, minus the ones cooling down from a
+/// recent failure. `None` means every backend is cooling — the caller refuses rather than
+/// re-hammering engines that just flagged this IP.
+fn drop_cooling(
+    all: Vec<(&'static str, SearchBackend)>,
+    at: Instant,
+) -> Option<Vec<(&'static str, SearchBackend)>> {
+    let live: Vec<(&'static str, SearchBackend)> =
+        all.into_iter().filter(|(n, _)| !backend_is_cooling(n, at)).collect();
+    if live.is_empty() { None } else { Some(live) }
+}
+
+/// Search the public web: try every configured backend in order — a vault-stored key tier at
+/// the head, the keyless pair after it — and return the first answer with the name of the
+/// backend that served it. This is the whole `web_search` tool.
 ///
-/// Where other backends go: a key-backed backend (Brave/Tavily/…) slots in at the HEAD of the
-/// list once a settings field for it exists, returning `Err` with a recognisable "no key
-/// configured" message when unset so the chain skips it without counting a failure; a
-/// self-hosted SearXNG slots in at the TAIL (see [`parse_searxng`]).
+/// After a run where every backend failed, each of them cools down for [`BACKEND_COOLDOWN`]:
+/// a `web_search` inside that window refuses instead of contacting the flagged engines again,
+/// because the request burst is what trips their bot checks. A self-hosted SearXNG slots in at
+/// the TAIL once a settings field for the instance URL exists (see [`parse_searxng`]).
 pub fn web_search(query: &str) -> Result<(&'static str, Vec<WebSearchHit>), String> {
     let query = query.trim();
     if query.is_empty() {
         return Err("a search query is required".into());
     }
     let query: String = query.chars().take(300).collect();
-    let names: [&'static str; 2] = ["DuckDuckGo", "DuckDuckGo (html)"];
-    let backends: Vec<SearchBackend> = vec![search_ddg_lite, search_ddg_html];
-    let dyn_backends: Vec<(&'static str, DynSearchBackend<'_>)> = names
+    let now = Instant::now();
+    let Some(live) = drop_cooling(search_backends(), now) else {
+        return Err(
+            "every search backend is cooling down after a recent failure — wait a couple of \
+             minutes before searching again"
+                .into(),
+        );
+    };
+    let dyn_backends: Vec<(&'static str, DynSearchBackend<'_>)> = live
         .iter()
-        .zip(backends.iter())
         .map(|(n, f)| {
             // The unsize coercion needs an annotated coercion site; a bare tuple would leave
             // `f` a fn pointer.
@@ -832,7 +895,18 @@ pub fn web_search(query: &str) -> Result<(&'static str, Vec<WebSearchHit>), Stri
             (*n, f)
         })
         .collect();
-    run_search_chain(&query, &dyn_backends)
+    match run_search_chain(&query, &dyn_backends) {
+        Ok(answer) => Ok(answer),
+        Err(e) => {
+            let now = Instant::now();
+            for (n, _) in &live {
+                mark_backend_failed(n, now);
+            }
+            Err(format!(
+                "{e} — those backends are cooling down for 2 minutes; wait before searching again"
+            ))
+        }
+    }
 }
 
 /// Send one HTTP request to a public URL and return `HTTP {status}` plus the body. This backs
@@ -1247,5 +1321,101 @@ mod tests {
         // could have answered.
         let err = web_fetch_text("http://127.0.0.1:9/x").expect_err("guard");
         assert!(err.contains("not a public address"), "{err}");
+    }
+
+    /// Like [`serve_once`], but the request bytes are captured for assertion. The capture is
+    /// written before the response is, so a completed `http_get` implies it is readable.
+    fn serve_capture(
+        response: &'static str,
+    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let cap = captured.clone();
+        std::thread::spawn(move || {
+            let (mut sock, _) = listener.accept().expect("accept");
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).unwrap_or(0);
+            *cap.lock().unwrap() = String::from_utf8_lossy(&buf[..n]).into_owned();
+            sock.write_all(response.as_bytes()).expect("write");
+        });
+        (format!("http://{addr}/page"), captured)
+    }
+
+    #[test]
+    fn http_get_identifies_as_a_browser_and_carries_accept_headers() {
+        // The 2026-10-06 incident: page fetches coming back 403 Forbidden. A UA-only request is
+        // the bot-shaped profile sites refuse; these assertions pin that the fetch now carries
+        // the browser headers and no longer advertises the app in its UA.
+        let (url, captured) = serve_capture(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 2\r\nConnection: close\r\n\r\nhi",
+        );
+        let body = http_get(&reqwest::Url::parse(&url).unwrap()).expect("body");
+        assert_eq!(body, b"hi");
+        let req = captured.lock().unwrap().to_lowercase();
+        assert!(req.contains("user-agent:"), "{req}");
+        assert!(
+            !req.contains("aiproviderrouter"),
+            "the app name must not ride the UA: {req}"
+        );
+        assert!(req.contains("chrome/"), "a browser-shaped UA: {req}");
+        assert!(req.contains("accept:"), "{req}");
+        assert!(req.contains("accept-language:"), "{req}");
+    }
+
+    // ── the post-failure search cooldown ─────────────────────────────────
+
+    #[test]
+    fn a_marked_backend_sits_out_the_cooldown_then_returns() {
+        let now = Instant::now();
+        let expired = now
+            .checked_sub(BACKEND_COOLDOWN + Duration::from_secs(1))
+            .expect("the clock reaches back past the cooldown window");
+        mark_backend_failed("cool-test", expired);
+        assert!(
+            !backend_is_cooling("cool-test", now),
+            "past the window, the backend is live again"
+        );
+
+        mark_backend_failed("cool-test", now);
+        assert!(backend_is_cooling("cool-test", now), "freshly failed: cooling");
+
+        // Do not leak the entry into other tests sharing the process-wide map.
+        search_cooldowns().lock().unwrap().remove("cool-test");
+    }
+
+    #[test]
+    fn drop_cooling_keeps_the_live_backends_and_refuses_when_all_are_cooling() {
+        let now = Instant::now();
+        mark_backend_failed("cool-test", now);
+        let all: Vec<(&'static str, SearchBackend)> =
+            vec![("cool-test", search_ddg_lite), ("live", search_ddg_html)];
+        let live = drop_cooling(all, now).expect("one backend still live");
+        assert_eq!(live.len(), 1, "only the un-cooled backend survives the filter");
+        assert_eq!(live[0].0, "live");
+
+        let all_cooling: Vec<(&'static str, SearchBackend)> =
+            vec![("cool-test", search_ddg_lite)];
+        assert!(
+            drop_cooling(all_cooling, now).is_none(),
+            "no live backends means refuse, not hammer"
+        );
+        search_cooldowns().lock().unwrap().remove("cool-test");
+    }
+
+    #[test]
+    fn web_search_refuses_instead_of_re_hammering_when_every_backend_is_cooling() {
+        // End to end through the real entry point. This assumes no search key is configured in
+        // the vault (the keyless chain is exactly the two DDG backends); a machine testing with
+        // a "websearch" vault secret would exercise the Brave/Tavily head instead.
+        let now = Instant::now();
+        for name in ["DuckDuckGo", "DuckDuckGo (html)"] {
+            mark_backend_failed(name, now);
+        }
+        let err = web_search("anything").expect_err("all cooling — refusal before any network");
+        assert!(err.contains("cooling down"), "{err}");
+        for name in ["DuckDuckGo", "DuckDuckGo (html)"] {
+            search_cooldowns().lock().unwrap().remove(name);
+        }
     }
 }
