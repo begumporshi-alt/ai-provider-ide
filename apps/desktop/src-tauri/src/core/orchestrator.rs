@@ -220,7 +220,15 @@ mod orchestrator_tests {
         // a top-level row has none.
         let (s, d) = temp_store("parent");
         start(&s, "p1".into(), None, None, "m".into(), Some("main task".into())).unwrap();
-        start(&s, "c1".into(), None, Some("p1".into()), "m".into(), Some("the delegated slice".into())).unwrap();
+        start(
+            &s,
+            "c1".into(),
+            None,
+            Some("p1".into()),
+            "m".into(),
+            Some("the delegated slice".into()),
+        )
+        .unwrap();
         let all = runs(&s, 10).unwrap();
         assert_eq!(all.len(), 2);
         let child = all.iter().find(|r| r.id == "c1").expect("child recorded");

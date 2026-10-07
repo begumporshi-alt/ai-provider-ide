@@ -63,9 +63,8 @@ fn runtime() -> &'static tokio::runtime::Runtime {
     })
 }
 
-type WsStream = tokio_tungstenite::WebSocketStream<
-    tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
->;
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct Conn {
     ws: WsStream,
@@ -168,9 +167,7 @@ async fn command(conn: &mut Conn, method: &str, params: Value) -> Result<Value, 
     use tokio_tungstenite::tungstenite::Message;
     let id = conn.next_id;
     conn.next_id += 1;
-    let text = json!({ "id": id, "method": method, "params": params })
-        .to_string()
-        .into();
+    let text = json!({ "id": id, "method": method, "params": params }).to_string().into();
     tokio::time::timeout(CMD_TIMEOUT, async {
         conn.ws.send(Message::Text(text)).await.map_err(|e| format!("connection lost: {e}"))?;
         loop {
@@ -181,8 +178,8 @@ async fn command(conn: &mut Conn, method: &str, params: Value) -> Result<Value, 
                 .ok_or_else(|| "connection lost: the debugger closed the socket".to_string())?
                 .map_err(|e| format!("connection lost: {e}"))?;
             if let Message::Text(t) = msg {
-                let v: Value = serde_json::from_str(t.as_str())
-                    .map_err(|e| format!("bad CDP frame: {e}"))?;
+                let v: Value =
+                    serde_json::from_str(t.as_str()).map_err(|e| format!("bad CDP frame: {e}"))?;
                 if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                     if let Some(err) = v.get("error") {
                         return Err(format!("{method} failed: {err}"));
@@ -205,9 +202,7 @@ async fn evaluate(conn: &mut Conn, expression: &str) -> Result<Value, String> {
         json!({ "expression": expression, "returnByValue": true, "awaitPromise": true }),
     )
     .await?;
-    let r = res
-        .get("result")
-        .ok_or_else(|| "evaluate returned no result".to_string())?;
+    let r = res.get("result").ok_or_else(|| "evaluate returned no result".to_string())?;
     if let Some(desc) = r.get("exceptionDetails") {
         return Err(format!("the page threw: {desc}"));
     }
@@ -317,7 +312,9 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
 pub fn browser_snapshot(args: &Value) -> crate::core::tools::ToolResult {
     let port = port_of(args);
     wrap_err(runtime().block_on(with_page(port, |conn| {
-        Box::pin(async move { evaluate(conn, SNAPSHOT_JS).await.map(|v| v.as_str().unwrap_or_default().to_string()) })
+        Box::pin(async move {
+            evaluate(conn, SNAPSHOT_JS).await.map(|v| v.as_str().unwrap_or_default().to_string())
+        })
     })))
 }
 
@@ -433,9 +430,7 @@ mod tests {
     /// Launch a real headless Chrome on a fresh port and profile, return the port. Skips the
     /// caller (Ok without connecting) when Chrome is not installed rather than failing a machine
     /// that cannot run the test at all.
-    fn launch_headless_chrome(
-        dir: &std::path::Path,
-    ) -> Option<(u16, std::process::Child)> {
+    fn launch_headless_chrome(dir: &std::path::Path) -> Option<(u16, std::process::Child)> {
         let chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
         if !std::path::Path::new(chrome).exists() {
             eprintln!("skipping: no Chrome at {chrome}");
@@ -510,7 +505,11 @@ mod tests {
             assert!(snap.ok, "snapshot: {:?}", snap.error);
             // The outline arrives as JSON, so quotes inside it are escaped; the needles here
             // avoid them.
-            assert!(snap.output.contains("button") && snap.output.contains("press me"), "got: {}", snap.output);
+            assert!(
+                snap.output.contains("button") && snap.output.contains("press me"),
+                "got: {}",
+                snap.output
+            );
             assert!(snap.output.contains("type here"), "got: {}", snap.output);
 
             let click = browser_click(&serde_json::json!({ "element": 0, "port": port }));
@@ -523,7 +522,9 @@ mod tests {
                 after_click.output
             );
 
-            let fill = browser_fill(&serde_json::json!({ "element": 1, "text": "typed value", "port": port }));
+            let fill = browser_fill(
+                &serde_json::json!({ "element": 1, "text": "typed value", "port": port }),
+            );
             assert!(fill.ok, "fill: {:?}", fill.error);
             let after_fill = browser_snapshot(&serde_json::json!({ "port": port }));
             assert!(after_fill.ok);
@@ -561,10 +562,7 @@ mod tests {
             let click = browser_click(&serde_json::json!({ "element": 99, "port": port }));
             assert!(!click.ok, "an absent element must not 'succeed'");
             let reason = click.error.unwrap_or_default();
-            assert!(
-                reason.contains("browser_snapshot"),
-                "the error names the recovery: {reason}"
-            );
+            assert!(reason.contains("browser_snapshot"), "the error names the recovery: {reason}");
         }));
         stop_chrome(&mut child);
         let _ = std::fs::remove_dir_all(&tmp);

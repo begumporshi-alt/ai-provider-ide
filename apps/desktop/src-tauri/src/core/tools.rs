@@ -414,7 +414,9 @@ fn do_write_file(args: &serde_json::Value, root: &Path) -> ToolResult {
                     .decode(content.trim())
                     .map_err(|e| format!("content is not valid base64: {e}"))?;
                 if decoded.len() > MAX_WRITE_BYTES_BINARY {
-                    return Err(format!("decoded content exceeds the {MAX_WRITE_BYTES_BINARY} byte cap"));
+                    return Err(format!(
+                        "decoded content exceeds the {MAX_WRITE_BYTES_BINARY} byte cap"
+                    ));
                 }
                 let n = decoded.len();
                 (decoded, n)
@@ -1056,7 +1058,14 @@ fn start_background_job(mut child: Child, pid: u32, program: &str) -> Result<Str
     let mut jobs = background_jobs().lock().map_err(|e| e.to_string())?;
     jobs.insert(
         id.clone(),
-        BackgroundJob { pid, program: program.to_string(), started: Instant::now(), out, err, status },
+        BackgroundJob {
+            pid,
+            program: program.to_string(),
+            started: Instant::now(),
+            out,
+            err,
+            status,
+        },
     );
     // Evict finished jobs oldest-first once the table is full. A RUNNING job is never evicted:
     // losing its handle would orphan the process with no way to watch or stop it.
@@ -1094,16 +1103,12 @@ fn do_process_output(args: &serde_json::Value) -> ToolResult {
             let job = jobs.get(&id).ok_or_else(|| {
                 format!("no background job \"{id}\" — the id is wrong, or the app restarted since it was started")
             })?;
-            (
-                job.out.clone(),
-                job.err.clone(),
-                job.status.clone(),
-                job.started.elapsed(),
-            )
+            (job.out.clone(), job.err.clone(), job.status.clone(), job.started.elapsed())
         };
         let deadline = Instant::now() + Duration::from_millis(wait_ms);
         loop {
-            if !matches!(*status.lock().unwrap(), JobStatus::Running) || Instant::now() >= deadline {
+            if !matches!(*status.lock().unwrap(), JobStatus::Running) || Instant::now() >= deadline
+            {
                 break;
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -1115,13 +1120,14 @@ fn do_process_output(args: &serde_json::Value) -> ToolResult {
             if b.len() <= MAX_OUTPUT_BYTES {
                 String::from_utf8_lossy(&b).into_owned()
             } else {
-                format!("…[earlier output omitted]\n{}", String::from_utf8_lossy(&b[b.len() - MAX_OUTPUT_BYTES..]))
+                format!(
+                    "…[earlier output omitted]\n{}",
+                    String::from_utf8_lossy(&b[b.len() - MAX_OUTPUT_BYTES..])
+                )
             }
         };
-        let mut text = format!(
-            "[status] {status_label} · elapsed {:.1}s · job {id}\n",
-            elapsed.as_secs_f64()
-        );
+        let mut text =
+            format!("[status] {status_label} · elapsed {:.1}s · job {id}\n", elapsed.as_secs_f64());
         text.push_str(&tail(&out));
         let stderr_tail = tail(&err);
         if !stderr_tail.is_empty() {
@@ -1131,7 +1137,9 @@ fn do_process_output(args: &serde_json::Value) -> ToolResult {
             text.push_str("[stderr]\n");
             text.push_str(&stderr_tail);
         }
-        if text.trim() == format!("[status] {status_label} · elapsed {:.1}s · job {id}", elapsed.as_secs_f64()) {
+        if text.trim()
+            == format!("[status] {status_label} · elapsed {:.1}s · job {id}", elapsed.as_secs_f64())
+        {
             text.push_str(if status_label == "running" {
                 "(no output yet)"
             } else {
@@ -1171,7 +1179,10 @@ fn do_process_kill(args: &serde_json::Value) -> ToolResult {
                 let still_running = background_jobs()
                     .lock()
                     .ok()
-                    .and_then(|jobs| jobs.get(&job_id).map(|j| matches!(*j.status.lock().unwrap(), JobStatus::Running)))
+                    .and_then(|jobs| {
+                        jobs.get(&job_id)
+                            .map(|j| matches!(*j.status.lock().unwrap(), JobStatus::Running))
+                    })
                     .unwrap_or(false);
                 if still_running {
                     signal_group(pid, libc::SIGKILL);
@@ -1755,10 +1766,13 @@ fn do_browser_screenshot(args: &serde_json::Value, root: &Path) -> ToolResult {
         }
         let rel = match args.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p.to_string(),
-            _ => format!("images/browser-{}.png", std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis())
-                .unwrap_or(0)),
+            _ => format!(
+                "images/browser-{}.png",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0)
+            ),
         };
         let path = resolve_within(root, &rel, false)?;
         if path
@@ -2754,10 +2768,7 @@ diff --git a/a.txt b/a.txt
         assert!(res.ok, "the start must succeed: {:?}", res.error);
         // The output is "started background job bg-N (node, pid M) — poll its output with ...".
         let marker = "started background job ";
-        let at = res
-            .output
-            .find(marker)
-            .unwrap_or_else(|| panic!("no job id in: {}", res.output));
+        let at = res.output.find(marker).unwrap_or_else(|| panic!("no job id in: {}", res.output));
         let rest = &res.output[at + marker.len()..];
         let end = rest.find(' ').unwrap_or(rest.len());
         rest[..end].to_string()
@@ -2787,10 +2798,7 @@ diff --git a/a.txt b/a.txt
             }
         }
         assert!(final_text.contains("bg-done"), "got: {final_text}");
-        assert!(
-            final_text.contains("exited (code 0)"),
-            "a clean exit is the status: {final_text}"
-        );
+        assert!(final_text.contains("exited (code 0)"), "a clean exit is the status: {final_text}");
         assert!(final_text.contains("[status]"), "the header line is present: {final_text}");
     }
 
