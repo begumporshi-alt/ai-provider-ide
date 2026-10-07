@@ -830,9 +830,8 @@ fn search_ddg_html(query: &str) -> Result<Vec<WebSearchHit>, String> {
 const BACKEND_COOLDOWN: Duration = Duration::from_secs(120);
 
 fn search_cooldowns() -> &'static std::sync::Mutex<std::collections::HashMap<String, Instant>> {
-    static CELL: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<String, Instant>>,
-    > = OnceLock::new();
+    static CELL: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Instant>>> =
+        OnceLock::new();
     CELL.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -861,7 +860,11 @@ fn drop_cooling(
 ) -> Option<Vec<(&'static str, SearchBackend)>> {
     let live: Vec<(&'static str, SearchBackend)> =
         all.into_iter().filter(|(n, _)| !backend_is_cooling(n, at)).collect();
-    if live.is_empty() { None } else { Some(live) }
+    if live.is_empty() {
+        None
+    } else {
+        Some(live)
+    }
 }
 
 /// Search the public web: try every configured backend in order — a vault-stored key tier at
@@ -1325,9 +1328,7 @@ mod tests {
 
     /// Like [`serve_once`], but the request bytes are captured for assertion. The capture is
     /// written before the response is, so a completed `http_get` implies it is readable.
-    fn serve_capture(
-        response: &'static str,
-    ) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
+    fn serve_capture(response: &'static str) -> (String, std::sync::Arc<std::sync::Mutex<String>>) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
         let captured = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -1354,10 +1355,7 @@ mod tests {
         assert_eq!(body, b"hi");
         let req = captured.lock().unwrap().to_lowercase();
         assert!(req.contains("user-agent:"), "{req}");
-        assert!(
-            !req.contains("aiproviderrouter"),
-            "the app name must not ride the UA: {req}"
-        );
+        assert!(!req.contains("aiproviderrouter"), "the app name must not ride the UA: {req}");
         assert!(req.contains("chrome/"), "a browser-shaped UA: {req}");
         assert!(req.contains("accept:"), "{req}");
         assert!(req.contains("accept-language:"), "{req}");
@@ -1386,21 +1384,23 @@ mod tests {
 
     #[test]
     fn drop_cooling_keeps_the_live_backends_and_refuses_when_all_are_cooling() {
+        // Unique key: the cooldown map is process-wide and tests run in parallel, so sharing a
+        // name with the expiry test let one test's cleanup delete the other's entry mid-run.
         let now = Instant::now();
-        mark_backend_failed("cool-test", now);
+        mark_backend_failed("cool-filter", now);
         let all: Vec<(&'static str, SearchBackend)> =
-            vec![("cool-test", search_ddg_lite), ("live", search_ddg_html)];
+            vec![("cool-filter", search_ddg_lite), ("live", search_ddg_html)];
         let live = drop_cooling(all, now).expect("one backend still live");
         assert_eq!(live.len(), 1, "only the un-cooled backend survives the filter");
         assert_eq!(live[0].0, "live");
 
         let all_cooling: Vec<(&'static str, SearchBackend)> =
-            vec![("cool-test", search_ddg_lite)];
+            vec![("cool-filter", search_ddg_lite)];
         assert!(
             drop_cooling(all_cooling, now).is_none(),
             "no live backends means refuse, not hammer"
         );
-        search_cooldowns().lock().unwrap().remove("cool-test");
+        search_cooldowns().lock().unwrap().remove("cool-filter");
     }
 
     #[test]
