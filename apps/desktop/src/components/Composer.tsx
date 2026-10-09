@@ -222,6 +222,9 @@ export function Composer({
   const [mentionPick, setMentionPick] = useState(0);
   const [slashPick, setSlashPick] = useState(0);
   const [dragOver, setDragOver] = useState(false);
+  // The vision note the user has closed, as its full text. Keyed on the text, not a bare boolean:
+  // picking a different model produces a different note, and that one must be visible again.
+  const [dismissedVisionNote, setDismissedVisionNote] = useState<string | null>(null);
   // Mirror of the draft for writers that run outside a render's closure: `addFiles` appends once
   // per file with an `await readAsText` between appends, and the running closure still holds the
   // gesture-time render — composing from `draft` there would overwrite every earlier file's block
@@ -902,9 +905,19 @@ export function Composer({
         />
       )}
 
-      {visionNote && (
-        <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="vision-note">
-          {visionNote}
+      {visionNote && visionNote !== dismissedVisionNote && (
+        <p className="mt-1 flex items-center gap-1.5 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="vision-note">
+          <span className="min-w-0 flex-1">{visionNote}</span>
+          <button
+            type="button"
+            onClick={() => setDismissedVisionNote(visionNote)}
+            aria-label="Dismiss model capability note"
+            title="Dismiss"
+            className="shrink-0 rounded px-1 leading-none transition-opacity hover:opacity-80"
+            style={{ color: "var(--text-faint)" }}
+          >
+            ✕
+          </button>
         </p>
       )}
       {!readFile && (

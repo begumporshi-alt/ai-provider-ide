@@ -289,6 +289,17 @@ async function oracle(req, res, path) {
       content = "";
     } else if (tools && /background/i.test(userPrompt)) {
       content = "Background job finished — its output: " + (lastToolResult.split("\n")[1]?.trim() ?? "");
+    } else if (tools && /specialist/i.test(userPrompt) && !sawToolResult) {
+      // Agent mode, SPECIALIST variant: dispatch_agent naming a user-authored agent type. The
+      // child's own request carries the definition's system prompt (marker-echoed in its final
+      // answer below), which is what proves the def reached the child loop.
+      toolCall = { name: "dispatch_agent", arguments: JSON.stringify({ task: "find the drifted docs", agent: "doc-sweeper" }) };
+      content = "";
+    } else if (tools && sawToolResult && String(system).includes("DEFMARKER-doc-sweeper")) {
+      // The doc-sweeper specialist's own final round: its system turn carries the definition's
+      // prompt, so the answer the parent receives proves the def was dispatched, not the
+      // default researcher.
+      content = "Specialist summary — the doc-sweeper prompt reached the child loop.";
     } else if (tools && !sawToolResult && /delegat/i.test(last)) {
       // Agent mode, DELEGATION variant: dispatch_agent — the tool that never reaches the sandbox.
       // The nested run comes back through this same endpoint with the task as its only user turn

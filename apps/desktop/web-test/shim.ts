@@ -99,6 +99,19 @@ const sessionTitles = new Map<string, string>();
 const skills: Row[] = [];
 const agentRuns: Row[] = [];
 const agentSteps: Row[] = [];
+/**
+ * The `agents/` definition files (core/agent_defs.rs): id -> raw JSON, exactly what the host
+ * stores on disk. Same contract as the real commands — the id is a filename-safe slug and the
+ * content must parse as a JSON object; field validation stays TypeScript-side.
+ */
+const agentDefs = new Map<string, string>();
+// The builtin specialists, seeded the way the Rust host's `ensure_builtin_defs` seeds them —
+// from the same JSON file the host compiles in, so the two cannot drift. Skip-existing: a
+// spec's edit to a seeded definition survives.
+import builtinDefsJson from "../src/lib/agents/builtin-defs.json";
+for (const def of builtinDefsJson as Array<{ id: string }>) {
+  agentDefs.set(def.id, JSON.stringify(def, null, 2));
+}
 // P7 memory. Mirrors memory.rs: same four layers, same dedupe-on-(layer,text) rule.
 const memories: Row[] = [];
 
@@ -169,13 +182,23 @@ let uiSessionKey: string | undefined = undefined;
  * waiting while the hourly distillation budget is spent (§10(2)) — and so `budget_left` can be
  * dropped to stand in for an older host that never reported it.
  */
-const queueStatus = {
+const queueStatus: {
+  queued: number;
+  processing: number;
+  done: number;
+  failed: number;
+  outstanding: number;
+  budget_left?: number;
+  /** Migration 0026: why the retired rows were retired. `undefined` stands in for an older host. */
+  failed_reasons?: { reason: string; count: number }[];
+} = {
   queued: 0,
   processing: 0,
   done: 0,
   failed: 0,
   outstanding: 0,
   budget_left: 60 as number | undefined,
+  failed_reasons: [],
 };
 
 // ---- host state with no UI input, modelled so the screens that read it can actually load ----
@@ -1378,6 +1401,30 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "skills_slugify":
       return slugifySkillName(String(args.name ?? ""));
 
+    // ---- Subagent definition files (Agent types screen; core/agent_defs.rs) ----
+    case "agent_defs_list":
+      return [...agentDefs.entries()]
+        .map(([fileName, contentJson]) => ({ fileName, contentJson }))
+        .sort((a, b) => a.fileName.localeCompare(b.fileName));
+    case "agent_def_save": {
+      const id = String(args.id ?? "");
+      if (!/^[a-z0-9][a-z0-9_-]{0,63}$/.test(id)) throw new Error(`invalid agent definition id: ${id}`);
+      JSON.parse(String(args.content_json ?? "")); // malformed content throws, like the host
+      agentDefs.set(id, String(args.content_json));
+      return null;
+    }
+    case "agent_def_set_enabled": {
+      const id = String(args.id ?? "");
+      const raw = agentDefs.get(id);
+      if (raw === undefined) throw new Error("could not read the file: no such file");
+      const parsed = JSON.parse(raw);
+      parsed.enabled = Boolean(args.enabled);
+      agentDefs.set(id, JSON.stringify(parsed, null, 2));
+      return null;
+    }
+    case "agent_def_delete":
+      return agentDefs.delete(String(args.id ?? ""));
+
     // ---- Tool sandbox (Assistant agent mode) ----
     case "tools_policy":
       return TOOLS_POLICY;
@@ -1645,6 +1692,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         parent_run_id: args.parent_run_id ?? null,
         status: "running", prompt: args.prompt ?? null, iterations: 0, tool_calls: 0,
         started_at: Date.now(), ended_at: null, error: null,
+        // Migration 0025: a run's own spend, 0 until it ends (or when no usage was reported).
+        prompt_tokens: 0, completion_tokens: 0,
       });
       return null;
     }
@@ -1672,6 +1721,8 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         run.iterations = args.iterations ?? 0;
         run.error = args.error ?? null;
         run.ended_at = Date.now();
+        run.prompt_tokens = args.prompt_tokens ?? 0;
+        run.completion_tokens = args.completion_tokens ?? 0;
       }
       return null;
     }

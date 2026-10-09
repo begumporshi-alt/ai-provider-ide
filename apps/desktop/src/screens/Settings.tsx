@@ -179,7 +179,7 @@ export function SettingsScreen() {
               style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
               type="number"
               min={1}
-              placeholder="12"
+              placeholder="no limit"
               value={(router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.subagentIterations ?? ""}
               onChange={(e) => {
                 const cast = router.settings as typeof router.settings & { defaults?: Record<string, string> };
@@ -189,7 +189,9 @@ export function SettingsScreen() {
               }}
             />
             <span className="mt-1 block text-[11px]" style={{ color: "var(--text-faint)" }}>
-              Model round-trips one dispatch_agent sub-agent gets. Blank = the built-in 12.
+              Model round-trips one dispatch_agent sub-agent gets. Blank = no limit — real
+              sub-agent work runs long (measured: median 24 tool calls, p90 55), so a low number
+              here cuts legitimate work short. Only how many run at once is capped.
             </span>
           </label>
         </div>

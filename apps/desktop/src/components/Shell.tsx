@@ -335,14 +335,14 @@ export function Shell({ children }: { children: ReactNode }) {
 
       <HeaderSlotContext.Provider value={headerSlot}>
       <main className="flex min-w-0 flex-1 flex-col">
-        {/* Top bar 48-52px: the fold toggle, then the screen's own header. The Assistant portals
+        {/* Top bar 40px: the fold toggle, then the screen's own header. The Assistant portals
             its session controls and the Chat/Image/Root tabs into the slot; every other screen
             keeps the breadcrumb. The duplication this removes was real: the Assistant used to
             spend a second title row ("Assistant · untitled session … Chat | Image | Root") directly
             under a bar that already said "Workspace / Assistant". */}
         <header
           data-testid="app-header"
-          className="flex h-[50px] shrink-0 items-center gap-2 border-b px-4"
+          className="flex h-10 shrink-0 items-center gap-2 border-b px-4"
           style={{ borderColor: "var(--border)" }}
         >
           <button

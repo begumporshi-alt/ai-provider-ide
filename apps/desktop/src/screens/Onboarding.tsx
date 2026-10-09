@@ -25,7 +25,7 @@ import {
 } from "@aiprovider/router-core";
 import {
   adapters, addKey, createPendingProvider, deleteProvider, getHttpPort,
-  recordGeneratorAudit, refreshCatalog, registry, setProviderStatus, router,
+  recordGeneratorAudit, refreshCatalog, registry, routerSettingsLabel, setProviderStatus, router,
 } from "../store";
 import { useUi } from "../ui-state";
 import { Button, Field, Spinner, StatusDot, inputCls, inputStyle } from "../components/atoms";
@@ -245,11 +245,9 @@ export function OnboardingScreen() {
   );
 
   /** Phase 4: the AI path. Best-of-N candidates, each gated schema -> lint -> free checks. */
-  function systemLabel(): string {
-    return (router.settings.systemAi
-      ? `${registry.getProvider(router.settings.systemAi.providerId)?.slug}/${router.settings.systemAi.model}`
-      : "auto") + " (system)";
-  }
+  // The system AI's label comes from the shared `routerSettingsLabel` (store.ts): this screen kept
+  // a private copy, and the copy was the one that printed `undefined/…` into the generation audit
+  // when the System AI provider no longer resolved.
 
   async function runGenerator(orch: OnboardingOrchestrator, baseUrl: string, providerId: string, secretRef: string, note?: string) {
     setGenerating(true);
@@ -265,7 +263,7 @@ export function OnboardingScreen() {
     try {
       const ranked = await generateCandidates({
         ai: gatewaySystemAiPort(() => router.settings.systemAi?.model),
-        systemLabel: systemLabel(),
+        systemLabel: routerSettingsLabel(),
         report: orch.session.probeReport!,
         baseUrl,
         secretRef,
@@ -313,7 +311,7 @@ export function OnboardingScreen() {
     try {
       const candidate = await generateCodeCandidate({
         ai: gatewaySystemAiPort(() => router.settings.systemAi?.model),
-        systemLabel: systemLabel(),
+        systemLabel: routerSettingsLabel(),
         report: orch.session.probeReport!,
         baseUrl: orch.session.input.baseUrl,
         secretRef: registry.keysOf(r.providerId)[0]?.secretRef ?? "",

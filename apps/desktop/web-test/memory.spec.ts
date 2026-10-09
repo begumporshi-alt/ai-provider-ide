@@ -117,6 +117,42 @@ test("memory: a host that does not report the budget shows no budget line", asyn
 });
 
 /**
+ * A retired turn is reported, with the reason it was retired. Before this, three turns could be
+ * quietly given up on while the queue line read "0 awaiting distillation" — work that will never
+ * be learned from, invisible. The reason is what makes it actionable: a provider outage leaves the
+ * turns re-runnable, a turn no model can distil does not.
+ */
+test("memory: turns given up on are named, with why", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.evaluate(() => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (window as any).__webTest.queueStatus({
+      failed: 3,
+      failed_reasons: [
+        { reason: "401 from provider", count: 2 },
+        { reason: "(no reason recorded)", count: 1 },
+      ],
+    });
+  });
+  await page.getByRole("button", { name: "Local Gateway", exact: true }).click();
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+
+  const failed = page.getByTestId("distill-failed");
+  await expect(failed).toBeVisible();
+  await expect(failed).toContainText("3 given up on");
+  // The commonest reason first, with its count — the shape the summary is ordered by.
+  await expect(failed).toContainText("401 from provider (×2)");
+  await expect(failed).toContainText("(no reason recorded)");
+});
+
+/** A healthy queue says nothing about failures — the line is not furniture. */
+test("memory: no failure line when nothing has been given up on", async ({ page }) => {
+  await page.goto(`${APP}?seed=systemai`);
+  await page.getByRole("button", { name: "Memory", exact: true }).click();
+  await expect(page.getByTestId("distill-failed")).toHaveCount(0);
+});
+
+/**
  * The behavioural half of the shim-gap guard (the systemic half is in smoke.spec.ts).
  *
  * This screen loads four host values in one `Promise.all(...).catch(() => undefined)`. One

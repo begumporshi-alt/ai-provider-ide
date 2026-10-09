@@ -80,6 +80,26 @@ function saveSidebarCollapsed(collapsed: boolean): void {
   }
 }
 
+/** Whether the Assistant's runs drawer is expanded. Same reasoning as `SIDEBAR_KEY`: window
+ *  chrome, not app data — restore the fold the user last chose without a gateway round-trip. */
+const RUNS_DRAWER_KEY = "aip.runsDrawerOpen";
+
+function loadRunsDrawerOpen(): boolean {
+  try {
+    return window.localStorage.getItem(RUNS_DRAWER_KEY) === "1";
+  } catch {
+    return false; // closed is the default: the drawer is a live view, not furniture
+  }
+}
+
+function saveRunsDrawerOpen(open: boolean): void {
+  try {
+    window.localStorage.setItem(RUNS_DRAWER_KEY, open ? "1" : "0");
+  } catch {
+    // fire-and-forget: a failed write just means the drawer resets next launch
+  }
+}
+
 interface UiState {
   screen: ScreenId;
   tick: number;
@@ -108,6 +128,8 @@ interface UiState {
   assistantBusy: boolean;
   /** Whether the sidebar is folded to an icon rail; see `SIDEBAR_KEY`. */
   sidebarCollapsed: boolean;
+  /** Whether the Assistant's runs drawer is expanded; see `RUNS_DRAWER_KEY`. */
+  runsDrawerOpen: boolean;
   /**
    * Requests the intent be dropped, so a stale one cannot fire on an unrelated mount later.
    * Called by the target once it has acted — or once it has decided the request is not for it.
@@ -121,6 +143,7 @@ interface UiState {
   setOverlay: (o: OverlayKind | null) => void;
   setAssistantBusy: (b: boolean) => void;
   toggleSidebar: () => void;
+  toggleRunsDrawer: () => void;
 }
 
 export const useUi = create<UiState>((set) => ({
@@ -129,6 +152,7 @@ export const useUi = create<UiState>((set) => ({
   overlay: null,
   assistantBusy: false,
   sidebarCollapsed: loadSidebarCollapsed(),
+  runsDrawerOpen: loadRunsDrawerOpen(),
   go: (screen) => set({ screen }),
   bump: () => set((s) => ({ tick: s.tick + 1 })),
   setOnboardingPrefill: (onboardingPrefill) => set({ onboardingPrefill }),
@@ -144,5 +168,10 @@ export const useUi = create<UiState>((set) => ({
     set((s) => {
       saveSidebarCollapsed(!s.sidebarCollapsed);
       return { sidebarCollapsed: !s.sidebarCollapsed };
+    }),
+  toggleRunsDrawer: () =>
+    set((s) => {
+      saveRunsDrawerOpen(!s.runsDrawerOpen);
+      return { runsDrawerOpen: !s.runsDrawerOpen };
     }),
 }));

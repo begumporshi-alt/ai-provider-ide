@@ -31,6 +31,23 @@ import { noteTrailFailure, noteUnrecordedEnd } from "../trail-health";
 
 const controllers = new Map<string, AbortController>();
 /**
+ * Fired on `window` whenever a run starts or ends. The runs ledger's *writes* all flow through
+ * this module, but its *readers* — a drawer mounted long before a turn begins — cannot learn
+ * "a run just started" from `tick` (which moves on user actions) or from an interval (a short
+ * turn can open and close entirely between two 1.5s polls, measured 2026-10-07: a delegation
+ * lived and died without any poll ever seeing it). One precise event closes that gap; readers
+ * that prefer polling can keep it.
+ */
+export const RUN_CHANGED_EVENT = "aip.agent-run-changed";
+
+function noteRunChanged(): void {
+  try {
+    window.dispatchEvent(new CustomEvent(RUN_CHANGED_EVENT));
+  } catch {
+    // no window (a test harness without a DOM): nobody is listening anyway
+  }
+}
+/**
  * Runs whose *start* did not land. Never cleared on purpose: an append from a run that has since
  * ended can still be in flight, and clearing on end would let that late failure be counted for a run
  * the channel already reported. Bounded by the runs of one session — the channel's own lifetime.
@@ -53,7 +70,9 @@ export function startRun(args: {
     parentRunId: args.parentRunId ?? null,
     model: args.model,
     prompt: args.prompt ?? null,
-  }).catch((e: unknown) => {
+  })
+    .then(() => noteRunChanged())
+    .catch((e: unknown) => {
     // The swallow stays — a run that cannot be recorded must still run. But the dashboard's list is
     // *the* record of runs, and a start that did not land means this run will never appear in it at
     // all: not as running, not as failed. Silence here is not "the run is fine", it is "there is no
@@ -91,6 +110,8 @@ export function endRun(
   status: RunStatus,
   iterations: number,
   error?: string,
+  promptTokens?: number,
+  completionTokens?: number,
 ): void {
   controllers.delete(runId);
   void agentRunFinish({
@@ -98,13 +119,19 @@ export function endRun(
     status,
     iterations,
     error: error ?? null,
-  }).catch(() => {
-    // The swallow stays — the run is over either way, and a lost record must not become a lost run.
-    // But this ending *was* observed, and the controller is already gone, so the row left behind
-    // reads exactly like one from a session closed mid-run. Keep the observation so the dashboard can
-    // report what happened instead of naming a cause it cannot know.
-    noteUnrecordedEnd(runId, status);
-  });
+    ...(promptTokens !== undefined ? { promptTokens } : {}),
+    ...(completionTokens !== undefined ? { completionTokens } : {}),
+  })
+    .then(() => noteRunChanged())
+    .catch(() => {
+      // The swallow stays — the run is over either way, and a lost record must not become a lost run.
+      // But this ending *was* observed, and the controller is already gone, so the row left behind
+      // reads exactly like one from a session closed mid-run. Keep the observation so the dashboard can
+      // report what happened instead of naming a cause it cannot know. The event still fires — a
+      // reader that cannot see the ending should at least see that the ledger moved.
+      noteUnrecordedEnd(runId, status);
+      noteRunChanged();
+    });
 }
 
 /** Attach a controller so the run can be stopped from anywhere. */

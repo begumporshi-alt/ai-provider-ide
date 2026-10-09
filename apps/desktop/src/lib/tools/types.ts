@@ -9,7 +9,7 @@
  * `createTauriToolHost` (host.ts); unit tests inject a fake. That is what makes the loop
  * deterministic and testable without a desktop shell.
  */
-import type { ChatMessage, TextRequest, TextStream } from "@aiprovider/router-core";
+import type { ChatMessage, TextRequest, TextStream, UsageTokens } from "@aiprovider/router-core";
 
 /** What a tool does to the workspace. Declared per tool so the approval policy can be a function
  *  of the declaration instead of a second hardcoded list that drifts away from this one. */
@@ -135,6 +135,17 @@ export interface AgentLoopOptions {
   ) => Promise<boolean | { allow: boolean; reason?: string }>;
   /** Streaming + lifecycle events for the UI. */
   onEvent?: (ev: AgentEvent) => void;
+  /**
+   * Token usage for the model calls **this loop** makes.
+   *
+   * The loop forwards whatever the caller's `generate` reports for each of its own round-trips,
+   * which is what lets a nested run be costed on its own: the child's dispatch passes a handler
+   * here, so a sub-agent's spend lands on its ledger row instead of only being folded into the
+   * session meter. (`generate` receives it as `TextRequest.onUsage`; a caller that already
+   * counts usage for the whole turn — `agent-turn.ts` — keeps doing so, and the two are additive
+   * because each fires for the calls the loop in question actually made.)
+   */
+  onUsage?: (usage: UsageTokens) => void;
   /** Finish reason callback, forwarded to `generateText` on each agent round-trip. */
   onFinish?: (reason: string | undefined) => void;
   /**
@@ -144,7 +155,8 @@ export interface AgentLoopOptions {
   runId?: string;
   /**
    * The recorder behind `dispatch_agent`'s nested runs: the child's row is started with
-   * `parentRunId: runId`, one `tool_call` step lands per tool the sub-agent uses, and the row
+   * `parentRunId: runId`, one `tool_call` step lands per tool the sub-agent uses and one
+   * `tool_result` step per result that comes back (denials recorded as `denied`), and the row
    * is closed with the outcome. Absent (tests, the gateway bridge) the tool works exactly as
    * before — delegation without a ledger.
    */
@@ -158,9 +170,35 @@ export interface AgentLoopOptions {
       prompt?: string;
     }): void;
     recordStep(runId: string, kind: string, label?: string, detail?: string, ok?: boolean): void;
-    endRun(runId: string, status: string, iterations: number, error?: string): void;
+    /** `promptTokens`/`completionTokens` are the run's own model calls, summed. */
+    endRun(
+      runId: string,
+      status: string,
+      iterations: number,
+      error?: string,
+      promptTokens?: number,
+      completionTokens?: number,
+    ): void;
   };
-  /** The sub-agent's step budget. Defaults to `SUBAGENT_MAX_ITERATIONS`. */
+  /**
+   * The sub-agent's step budget. **Absent means no ceiling** (see `SUBAGENT_MAX_ITERATIONS` in
+   * agentLoop.ts): the child is paced by the nudge and bounded by the concurrency cap, not by a
+   * step count, and only `SUBAGENT_HARD_BACKSTOP` ends a pathological run. A number here is the
+   * user's explicit ceiling from Router Settings → defaults.
+   */
   subagentMaxIterations?: number;
+  /**
+   * The enabled user-authored specialists `dispatch_agent` may pick from (parsed by
+   * `lib/agents/defs.ts`). Absent — tests, the gateway bridge — the tool dispatches the
+   * built-in researcher exactly as before. A type-only import: the defs module pulls the
+   * registry, and this file must stay a leaf.
+   */
+  subagentDefs?: import("../agents/defs").SubagentDef[];
+  /**
+   * How long a sub-agent may go without an event before it is treated as hung and aborted.
+   * Defaults to `SUBAGENT_INACTIVITY_TIMEOUT_MS` (10 minutes, the value ZCode ships);
+   * injectable so the watchdog is testable without waiting ten real minutes.
+   */
+  subagentInactivityTimeoutMs?: number;
   signal?: AbortSignal;
 }

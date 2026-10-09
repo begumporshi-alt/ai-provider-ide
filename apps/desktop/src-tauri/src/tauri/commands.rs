@@ -12,6 +12,7 @@ use serde::Deserialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
+use crate::core::agent_defs;
 use crate::core::context;
 use crate::core::crash_report;
 use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
@@ -325,8 +326,21 @@ pub fn agent_run_finish(
     status: String,
     iterations: i64,
     error: Option<String>,
+    prompt_tokens: Option<i64>,
+    completion_tokens: Option<i64>,
 ) -> Result<(), CommandError> {
-    orchestrator::finish(&store, &run_id, status, iterations, error).map_err(CommandError)
+    // Absent tokens are `0`, not an error: a run whose provider reported no usage block still
+    // has an honest ending, and refusing the finish would leave the row `running` forever.
+    orchestrator::finish(
+        &store,
+        &run_id,
+        status,
+        iterations,
+        error,
+        prompt_tokens.unwrap_or(0),
+        completion_tokens.unwrap_or(0),
+    )
+    .map_err(CommandError)
 }
 
 #[tauri::command]
@@ -530,8 +544,14 @@ pub fn capture_complete(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, C
 }
 
 #[tauri::command]
-pub fn capture_release(store: State<'_, Arc<Store>>, id: i64) -> Result<bool, CommandError> {
-    crate::core::capture::release(&store, id).map_err(CommandError)
+pub fn capture_release(
+    store: State<'_, Arc<Store>>,
+    id: i64,
+    error: Option<String>,
+) -> Result<bool, CommandError> {
+    // The reason is optional so an older caller keeps working, but a caller that has one — and
+    // the drain does — should send it: "3 failed" with no reason is not actionable.
+    crate::core::capture::release(&store, id, error).map_err(CommandError)
 }
 
 #[tauri::command]
@@ -637,6 +657,46 @@ pub fn crash_clear_all(store: State<'_, Arc<store::Store>>) -> Result<usize, Com
     Ok(crash_report::clear_all_crash_reports(&app_data_dir(&store)))
 }
 
+// ── subagent definition files (dispatch_agent specialists) ───────────────────
+// File CRUD only: the host validates the id and the JSON envelope; field validation is the
+// TypeScript guard's (`lib/agents/defs.ts`), which every consumer runs. See `core/agent_defs.rs`.
+
+#[tauri::command]
+pub fn agent_defs_list(
+    store: State<'_, Arc<store::Store>>,
+) -> Result<Vec<agent_defs::AgentDefFile>, CommandError> {
+    // Seeding rides the first list: the dir is created and any missing builtin is written
+    // before the read, so a fresh install sees its builtins without a restart.
+    agent_defs::ensure_builtin_defs(&app_data_dir(&store));
+    Ok(agent_defs::list_defs(&app_data_dir(&store)))
+}
+
+#[tauri::command]
+pub fn agent_def_save(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+    content_json: String,
+) -> Result<(), CommandError> {
+    agent_defs::save_def(&app_data_dir(&store), &id, &content_json).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_def_set_enabled(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+    enabled: bool,
+) -> Result<(), CommandError> {
+    agent_defs::set_def_enabled(&app_data_dir(&store), &id, enabled).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn agent_def_delete(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<bool, CommandError> {
+    agent_defs::delete_def(&app_data_dir(&store), &id).map_err(CommandError)
+}
+
 /// What this app binary was built from, to compare against whatever is serving the gateway.
 ///
 /// The app and `aiproviderd` are separate binaries from one crate, so "is the gateway I am talking
@@ -711,6 +771,10 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         agent_step_append,
         agent_run_finish,
         agent_run_steps,
+        agent_defs_list,
+        agent_def_save,
+        agent_def_set_enabled,
+        agent_def_delete,
         crate::tauri::gateway_cmds::gateway_status,
         crate::tauri::gateway_cmds::get_tools_enabled,
         crate::tauri::gateway_cmds::set_tools_enabled,

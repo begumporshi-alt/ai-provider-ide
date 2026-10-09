@@ -515,6 +515,13 @@ impl Job {
         if let Some(text) = gate.release() {
             let _ = replies.reply(id, BridgeMsg::Delta(text));
         }
+        // …and the client is *told* it was a ceiling, in the one vocabulary the protocol has for
+        // it. Without this the handler falls back to `finish_reason: "stop"`, which claims a
+        // finished answer the model never produced — the same "cannot tell 'gave up' from 'broke'"
+        // the release above exists to prevent, one level up. `length` is the OpenAI meaning of "the
+        // budget ended this, not the model", so a client that understands it continues with another
+        // request instead of treating the fragment as complete.
+        let _ = replies.reply(id, BridgeMsg::Finish("length".to_string()));
         if let Some((provider, model, key)) = &last_served {
             let _ = replies.reply(
                 id,
@@ -1800,13 +1807,20 @@ mod tests {
         assert_eq!(adapter.text_calls(), MAX_TOOL_ITERATIONS);
         assert!(matches!(msgs.last(), Some(BridgeMsg::Done)));
         assert!(
-            delta_text(&msgs).contains("turn 7"),
+            delta_text(&msgs).contains(&format!("turn {}", MAX_TOOL_ITERATIONS - 1)),
             "the last turn is released, not dropped: {:?}",
             delta_text(&msgs)
         );
         assert!(
             !msgs.iter().any(|m| matches!(m, BridgeMsg::ToolCalls(_))),
             "gateway-owned calls never go back to the client"
+        );
+        // The client is told *why* it ended. Without this the handler falls back to
+        // `finish_reason: "stop"`, which claims a finished answer the model never produced.
+        assert!(
+            msgs.iter().any(|m| matches!(m, BridgeMsg::Finish(r) if r == "length")),
+            "the ceiling reports `length`, not a silent `stop`: {:?}",
+            msgs
         );
     }
 

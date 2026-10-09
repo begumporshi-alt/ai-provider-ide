@@ -160,7 +160,7 @@ describe("runAgentTurn", () => {
     await runAgentTurn(makeRequest(), ports);
     expect(ports.orchestrator.startRun).toHaveBeenCalledWith({ runId: "run-1", sessionId: "session-1", model: "prov-1/model-x", prompt: "do the thing" });
     expect(recorded.map((r) => r.kind)).toEqual(["done"]);
-    expect(runs.ended[0]).toEqual(["run-1", "ok", 1]);
+    expect(runs.ended[0]).toEqual(["run-1", "ok", 1, undefined, 0, 0]);
     expect(ports.onTrace).toHaveBeenCalledWith(expect.objectContaining({ provider: "agent", fallbacks: [] }));
     expect(ports.memory.remember).toHaveBeenCalledWith("session-1", "do the thing", "Here is the answer.");
   });
@@ -182,7 +182,9 @@ describe("runAgentTurn", () => {
     await runAgentTurn(makeRequest(), ports);
     expect(hostRuns).toEqual([{ name: "read_file", args: { path: "a.txt" } }]);
     expect(recorded.map((r) => r.kind)).toEqual(["tool_call", "tool_result", "done"]);
-    expect(runs.ended[0]).toEqual(["run-1", "ok", 2]);
+    // The run row closes with THIS run's own spend — the number a sub-agent's cost used to
+    // vanish into the session meter. The fake reported 10 in / 2 out.
+    expect(runs.ended[0]).toEqual(["run-1", "ok", 2, undefined, 10, 2]);
     // Charged once per completed model call. The second call reported **no usage**, and that is
     // charged as `undefined` rather than zeros: the session accumulator counts it separately, so a
     // provider that reports nothing cannot make the totals read as a measured `0 in · 0 out`
@@ -208,7 +210,7 @@ describe("runAgentTurn", () => {
     // only when the wording says refused/denied — the screen's own gate words it that way.
     await runAgentTurn(makeRequest({ confirm: async () => ({ allow: false, reason: "refused: not today" }) }), ports);
     expect(recorded.map((r) => r.kind)).toEqual(["tool_call", "denied", "done"]);
-    expect(runs.ended[0]).toEqual(["run-1", "ok", 2]);
+    expect(runs.ended[0]).toEqual(["run-1", "ok", 2, undefined, 0, 0]);
   });
 
   it("ends a stopped run as stopped and fills the empty bubble", async () => {
@@ -221,7 +223,7 @@ describe("runAgentTurn", () => {
       throw new Error("aborted stream");
     }) as never;
     await runAgentTurn(makeRequest({ controller: aborted }), ports);
-    expect(runs.ended[0]).toEqual(["run-1", "stopped", 0]);
+    expect(runs.ended[0]).toEqual(["run-1", "stopped", 0, undefined, 0, 0]);
     expect(ports.onTrace).toHaveBeenLastCalledWith(expect.objectContaining({ error: "stopped by you" }));
     expect(patches.some((p) => String(p.patch.content).startsWith("⚠ stopped by you"))).toBe(true);
   });

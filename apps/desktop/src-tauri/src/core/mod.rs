@@ -28,6 +28,7 @@
 pub mod activation;
 pub mod adapter;
 pub mod adapter_runtime;
+pub mod agent_defs;
 pub mod assistant_stream;
 pub mod bridge_policy;
 pub mod browser;

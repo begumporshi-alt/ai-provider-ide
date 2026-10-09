@@ -85,13 +85,26 @@ impl BridgeKind {
 /// The ceiling on model turns in one gateway request.
 ///
 /// The reference imports this from `lib/tools/agentLoop.ts:35` rather than declaring its own
-/// `= 8`, and the comment there records why: a second copy kept in step by a comment means the
-/// gateway and the Assistant silently disagree the moment either one changes. That single source
-/// does not exist in Rust yet — the Assistant's loop is still TypeScript — so the value is declared
-/// here, and `the_iteration_ceiling_matches_the_reference` pins it so a change has to be deliberate.
+/// `DEFAULT_MAX_ITERATIONS`, and the comment there records why: a second copy kept in step by a
+/// comment means the gateway and the Assistant silently disagree the moment either one changes.
+/// That single source does not exist in Rust yet — the Assistant's loop is still TypeScript — so
+/// the value is declared here, and `the_iteration_ceiling_matches_the_reference` pins it so a
+/// change has to be deliberate.
 /// **When the Assistant's loop is ported, this constant should move to it and be imported back**,
 /// for the same reason the reference imports it.
-pub const MAX_TOOL_ITERATIONS: usize = 8;
+///
+/// **Was 8 until 2026-10-09, and 8 was a guillotine.** This loop serves external clients that do
+/// real multi-step work, and 8 turns is ~8 tool calls for a client that does not batch — while the
+/// same loop's own measured sub-agent runs need 19–37 tool calls for a single survey. Every request
+/// that outgrew 8 turns was cut off mid-work, and (until the `Finish` emission below) the client was
+/// told `finish_reason: "stop"` — a complete answer it never got. 40 is still a bound, but one sized
+/// for work rather than for a chat.
+///
+/// It stays bounded on purpose, unlike the Assistant's loop: that one has a user watching and a Stop
+/// button, while this one executes tools on behalf of a client the app cannot see. The bound that
+/// carries the real safety here is not this number anyway — it is the attempt budget, the sandbox's
+/// per-op budgets and the concurrency limiter, all of which classify their failure and report it.
+pub const MAX_TOOL_ITERATIONS: usize = 40;
 
 /// Upstream statuses that may be handed to the client unchanged.
 ///
@@ -676,9 +689,10 @@ mod tests {
 
     #[test]
     fn the_iteration_ceiling_matches_the_reference() {
-        // `lib/tools/agentLoop.ts:35` is the single source the reference imports from. If the
+        // `lib/tools/agentLoop.ts` is the single source the reference imports from. If the
         // Assistant's loop is ported, this constant should move there rather than be copied.
-        assert_eq!(MAX_TOOL_ITERATIONS, 8);
+        // Both sides are 40 since 2026-10-09 (was 8 — see the constant's own note).
+        assert_eq!(MAX_TOOL_ITERATIONS, 40);
     }
 
     #[test]
