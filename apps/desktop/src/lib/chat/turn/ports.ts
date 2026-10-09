@@ -112,7 +112,19 @@ export interface RunRecordPorts {
   startRun(args: { runId: string; sessionId?: string | null; parentRunId?: string | null; model: string; prompt?: string }): void;
   registerAbort(runId: string, ac: AbortController): void;
   recordStep(runId: string, kind: StepKind, label?: string, detail?: string, ok?: boolean): void;
-  endRun(runId: string, status: RunStatus, iterations: number, error?: string): void;
+  /**
+   * Close the run's row. `promptTokens`/`completionTokens` are this run's own model calls,
+   * summed; absent means the provider reported no usage, which the host stores as 0 rather than
+   * treating as an error. Positional because they travel straight to the host command.
+   */
+  endRun(
+    runId: string,
+    status: RunStatus,
+    iterations: number,
+    error?: string,
+    promptTokens?: number,
+    completionTokens?: number,
+  ): void;
 }
 
 /** The agent turn's extra paint events, beyond what the plain turn emits. */

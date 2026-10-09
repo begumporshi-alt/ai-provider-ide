@@ -218,7 +218,7 @@
         { "text": "still working.", "calls": [{ "id": "c", "name": "sandbox_echo", "args": {} }] }
       ],
       "expect": {
-        "modelCalls": 8,
+        "modelCalls": 40,
         "finalText": "still working.",
         "ceiling": true
       }

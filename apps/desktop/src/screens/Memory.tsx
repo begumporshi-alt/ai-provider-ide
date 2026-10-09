@@ -321,6 +321,26 @@ function MemoryLayerSection({
               : `${budget} distillations left this hour`}
           </span>
         )}
+        {/* Retired turns, named. Without this the queue line said "0 awaiting distillation" while
+            three turns had been quietly given up on — a count that reads as "nothing to do" for
+            work that will never be learned from. The reason is the actionable half: a provider
+            outage is re-runnable, an undistillable turn is not. */}
+        {queue && queue.failed > 0 && (
+          <span
+            data-testid="distill-failed"
+            style={{ color: "var(--warning)" }}
+            title={
+              queue.failed_reasons?.length
+                ? queue.failed_reasons.map((f) => `${f.count}× ${f.reason}`).join("\n")
+                : undefined
+            }
+          >
+            {queue.failed} given up on
+            {queue.failed_reasons?.length
+              ? ` — ${queue.failed_reasons.map((f) => `${f.reason}${f.count > 1 ? ` (×${f.count})` : ""}`).join(", ")}`
+              : ""}
+          </span>
+        )}
         <Button onClick={doDrain} disabled={busy}>
           {busy ? "distilling…" : "distil now"}
         </Button>

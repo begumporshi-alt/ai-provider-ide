@@ -6,7 +6,10 @@
  */
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP } from "./agentLoop";
+import {
+  runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
+  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP,
+} from "./agentLoop";
 import { AGENT_TOOLS } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
 import type { ChatMessage, TextStream, ToolCall } from "@aiprovider/router-core";
@@ -320,8 +323,13 @@ describe("runAgentLoop", () => {
     expect(started).toEqual([
       { runId: "child-1", parentRunId: "parent-1", prompt: "survey the files" },
     ]);
-    // The child's read reached the sandbox through the recording host — one step, the tool's name.
-    expect(steps).toEqual([{ runId: "child-1", kind: "tool_call", label: "read_file" }]);
+    // The child's read reached the sandbox through the recording host — one `tool_call` step,
+    // and its outcome as a `tool_result` step (both halves, so the ledger answers "what came
+    // back" and not only "what was called").
+    expect(steps).toEqual([
+      { runId: "child-1", kind: "tool_call", label: "read_file" },
+      { runId: "child-1", kind: "tool_result", label: "read_file" },
+    ]);
     // Two model round-trips (the tool turn and the answer) — the row's iterations.
     expect(ended).toEqual([{ runId: "child-1", status: "ok", iterations: 2, error: undefined }]);
   });
@@ -363,6 +371,283 @@ describe("runAgentLoop", () => {
     expect(ended[0]?.status).toBe("error");
     expect(ended[0]?.error, "the row names the failure").toBeTruthy();
   });
+
+  it("records a denied child call as a denied step, not a failed result", async () => {
+    const steps: Array<{ runId: string; kind: string; label?: string; ok?: boolean }> = [];
+    const recorder = {
+      newRunId: () => "child-1",
+      startRun: () => undefined,
+      recordStep: (runId: string, kind: string, label?: string, _detail?: string, ok?: boolean) =>
+        steps.push({ runId, kind, label, ok }),
+      endRun: () => undefined,
+    };
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: "looking", calls: [{ id: "s1", name: "read_file", arguments: "{}" }] },
+      { text: "SUB ANSWER" },
+      { text: "final" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      runId: "parent-1",
+      subagentRecorder: recorder,
+      // The gate rides into the child; a denial the child receives is recorded as `denied` —
+      // the same word the parent's own recorder uses — rather than as a failed tool result.
+      // The delegation itself is allowed, or the child would never run.
+      confirm: async (call) => call.name === "dispatch_agent",
+    });
+
+    expect(steps).toEqual([{ runId: "child-1", kind: "denied", label: "read_file", ok: false }]);
+  });
+
+  it("dispatches a named specialist with its prompt, model, and narrowed toolset", async () => {
+    // Capture what the child's round-trips asked for, then script the child to answer at once.
+    const childRequests: Array<{ model: string; system: string; toolNames: string[] }> = [];
+    const script = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t","agent":"locator"}' }] },
+      { text: "final" },
+    ]);
+    const generate: GenerateFn = async (req, opts) => {
+      if (req.model === "cheap/model") {
+        childRequests.push({
+          model: req.model,
+          system: String(req.messages.find((m) => m.role === "system")?.content ?? ""),
+          toolNames: ((req.tools ?? []) as Array<{ function: { name: string } }>).map((t) => t.function.name),
+        });
+      }
+      return script(req, opts);
+    };
+    const host: ToolHost = { async run(name) { return { ok: true, output: `r-${name}` }; } };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host,
+      subagentDefs: [
+        {
+          id: "locator",
+          name: "Locator",
+          description: "finds files fast",
+          systemPrompt: "You locate files and nothing else.",
+          tools: ["read_file"],
+          model: "cheap/model",
+          maxIterations: 3,
+          enabled: true,
+        },
+      ],
+    });
+
+    expect(childRequests).toHaveLength(1);
+    const child = childRequests[0]!;
+    // The specialist's model override is used.
+    expect(child.model).toBe("cheap/model");
+    expect(child.system).toContain("You locate files and nothing else.");
+    // The isolation half is the loop's, not the definition's to lose.
+    expect(child.system).toContain("ONLY your final message is returned");
+    // …and so is the batching instruction: a round is a turn, not a tool call, and asking for
+    // several calls per turn is what keeps a turn budget from being a tool-call budget.
+    expect(child.system).toContain("Batch independent tool calls into ONE message");
+    // The allowlist narrows the toolset.
+    expect(child.toolNames).toEqual(["read_file"]);
+  });
+
+  it("answers an unknown specialist id with the valid names instead of silently degrading", async () => {
+    const events: AgentEvent[] = [];
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t","agent":"nope"}' }] },
+      { text: "final" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      onEvent: (e) => events.push(e),
+      subagentDefs: [{ id: "locator", name: "Locator", description: "d", systemPrompt: "sp", enabled: true }],
+    });
+
+    const result = events.find((e) => e.type === "tool_result");
+    expect(result && result.type === "tool_result" && result.ok).toBe(false);
+    expect(result && result.type === "tool_result" && result.result).toContain("No sub-agent named");
+    expect(result && result.type === "tool_result" && result.result).toContain("locator");
+    expect(out.text).toBe("final");
+  });
+
+  it("lets a sub-agent run past the old twelve-round ceiling", async () => {
+    // The child's default is **no ceiling**, and this pins the regression that motivated it:
+    // every delegation reported "hit its step budget", because 12 rounds is ~12 tool calls in
+    // this loop (one call per round) while real sub-agent work measures median 24 tool calls
+    // and p90 55 across 433 recorded runs. A child that needs 16 rounds must finish.
+    let childRounds = 0;
+    const generate: GenerateFn = async (req) => {
+      const system = String(req.messages.find((m) => m.role === "system")?.content ?? "");
+      if (system.includes("ONLY your final message is returned")) {
+        childRounds += 1;
+        if (childRounds <= 15) {
+          req.onToolCall?.({ id: `k${childRounds}`, name: "read_file", arguments: "{}" });
+          return streamOf("sweeping");
+        }
+        return streamOf("SUB SUMMARY");
+      }
+      // The parent: delegate once, then answer on the round that carries the tool result.
+      if (!req.messages.some((m) => m.role === "tool")) {
+        req.onToolCall?.({ id: "c1", name: "dispatch_agent", arguments: '{"task":"sweep"}' });
+        return streamOf("delegating");
+      }
+      return streamOf("final");
+    };
+    const events: AgentEvent[] = [];
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(childRounds, "the child ran 16 rounds — past the old ceiling of 12").toBe(16);
+    expect(out.text).toBe("final");
+    const result = events.find((e) => e.type === "tool_result");
+    expect(result && result.type === "tool_result" && result.result).toContain("SUB SUMMARY");
+    expect(
+      result && result.type === "tool_result" && result.result,
+      "no budget warning — the work finished, it was not cut off",
+    ).not.toContain("step budget");
+  });
+
+  it("caps how many sub-agents run at once, and still returns every summary", async () => {
+    // The runaway that matters is *parallel* delegation, so the pool holds at most
+    // `SUBAGENT_CONCURRENCY` children in flight — the bound ZCode also enforces (its only
+    // limit-related failure in its whole run history is "user concurrency limit exceeded").
+    // Five delegations in one batch must run in waves, and every summary must still come back.
+    let inFlight = 0;
+    let peak = 0;
+    const generate: GenerateFn = async (req) => {
+      const system = String(req.messages.find((m) => m.role === "system")?.content ?? "");
+      if (system.includes("ONLY your final message is returned")) {
+        inFlight += 1;
+        peak = Math.max(peak, inFlight);
+        await new Promise((r) => setTimeout(r, 20)); // hold the slot so overlap is observable
+        inFlight -= 1;
+        return streamOf("SUB DONE");
+      }
+      if (!req.messages.some((m) => m.role === "tool")) {
+        const calls = Array.from({ length: 5 }, (_, i) => ({
+          id: `c${i}`,
+          name: "dispatch_agent",
+          arguments: JSON.stringify({ task: `survey ${i}` }),
+        }));
+        calls.forEach((c) => req.onToolCall?.(c));
+        return streamOf("delegating");
+      }
+      return streamOf("final");
+    };
+    const events: AgentEvent[] = [];
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(peak, `never more than ${SUBAGENT_CONCURRENCY} children at once`).toBe(SUBAGENT_CONCURRENCY);
+    expect(out.text).toBe("final");
+    const results = events.filter((e) => e.type === "tool_result");
+    expect(results).toHaveLength(5);
+    for (const r of results) {
+      expect(r.type === "tool_result" && r.result).toContain("SUB DONE");
+    }
+  });
+
+  it("aborts a wedged sub-agent on the inactivity watchdog, and says so distinctly", async () => {
+    // The failure a step ceiling cannot see: the child's request never returns, so no round ever
+    // completes and no iteration is ever counted. ZCode arms the same watchdog (10 min); the
+    // timeout is injected here so the test does not wait for it.
+    const events: AgentEvent[] = [];
+    const generate: GenerateFn = async (req, opts) => {
+      const system = String(req.messages.find((m) => m.role === "system")?.content ?? "");
+      if (system.includes("ONLY your final message is returned")) {
+        // The child's model call hangs — a provider stream that never ends. It produces nothing
+        // and only the abort ends it, which is what a real stream does when the signal fires
+        // (the watchdog's abort is the only thing that can free it).
+        return new Promise<never>((_, reject) => {
+          const onAbort = () => reject(new DOMException("Agent loop aborted", "AbortError"));
+          if (opts?.signal?.aborted) onAbort();
+          else opts?.signal?.addEventListener("abort", onAbort, { once: true });
+        });
+      }
+      if (!req.messages.some((m) => m.role === "tool")) {
+        req.onToolCall?.({ id: "c1", name: "dispatch_agent", arguments: '{"task":"hang"}' });
+        return streamOf("delegating");
+      }
+      return streamOf("final");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      onEvent: (e) => events.push(e),
+      subagentInactivityTimeoutMs: 60,
+    });
+
+    expect(out.text).toBe("final");
+    const result = events.find((e) => e.type === "tool_result");
+    expect(result && result.type === "tool_result" && result.ok).toBe(false);
+    expect(
+      result && result.type === "tool_result" && result.result,
+      "the model is told it was wedged, not that it failed generically",
+    ).toContain("made no progress");
+  });
+
+  it("caps a runaway sub-agent budget at the hard backstop, whatever its source", async () => {
+    // Audit 2026-10-09: the backstop was applied only to the `null` default, so a typo of 5000 in
+    // Router Settings produced a 5000-round child that nothing could bound — while the same value
+    // in a specialist definition was clamped to 50. It is a ceiling on every path now.
+    let childRounds = 0;
+    const generate: GenerateFn = async (req) => {
+      const system = String(req.messages.find((m) => m.role === "system")?.content ?? "");
+      if (system.includes("ONLY your final message is returned")) {
+        childRounds += 1;
+        req.onToolCall?.({ id: `k${childRounds}`, name: "read_file", arguments: "{}" });
+        return streamOf("working");
+      }
+      if (!req.messages.some((m) => m.role === "tool")) {
+        req.onToolCall?.({ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' });
+        return streamOf("delegating");
+      }
+      return streamOf("final");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate,
+      host: { async run() { return { ok: true, output: "r" }; } },
+      // Absurd on purpose: this is the Router Settings typo the audit describes.
+      subagentMaxIterations: 5000,
+    });
+
+    expect(out.text).toBe("final");
+    expect(childRounds, "the child stopped at the backstop, not at 5000").toBe(SUBAGENT_HARD_BACKSTOP);
+  }, 60_000);
 
   it("delegates without a recorder exactly as before", async () => {
     // Tests and the gateway bridge pass no recorder; the tool must not require one.

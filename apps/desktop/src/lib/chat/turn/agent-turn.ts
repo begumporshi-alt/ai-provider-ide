@@ -8,7 +8,7 @@
  * recorded as they arrive even though the UI is only forwarding them.
  */
 import { userContent, textOfContent, type ChatMessage } from "@aiprovider/router-core";
-import { runAgentLoop, AGENT_TOOLS } from "../../tools";
+import { runAgentLoop, withSubagentDefs } from "../../tools";
 import { fetchMcpTools } from "../../tools/mcp-client";
 import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
 import { buildAgentSystem } from "./prompt";
@@ -38,6 +38,13 @@ export interface AgentTurnRequest extends TurnRequestBase {
   loadSkill?: Parameters<typeof runAgentLoop>[0]["loadSkill"];
   /** The sub-agent's step budget, from the user's defaults; absent means the loop's built-in. */
   subagentMaxIterations?: Parameters<typeof runAgentLoop>[0]["subagentMaxIterations"];
+  /**
+   * The enabled user-authored subagent specialists, parsed and validated by the screen (the
+   * same screen-owns-the-store rule as `loadSkill`). Their ids join `dispatch_agent`'s
+   * description so the model can route deliberately; each supplies its own prompt, tool
+   * allowlist, model, and budget when dispatched.
+   */
+  subagentDefs?: Parameters<typeof runAgentLoop>[0]["subagentDefs"];
   /** The live AbortController — registered with the orchestrator so the dashboard can stop the run. */
   controller: AbortController;
   confirm: Parameters<typeof runAgentLoop>[0]["confirm"];
@@ -93,6 +100,12 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
   // The run's failover chain, gathered per model call by the generate wrapper below — the trace
   // shows every attempt that failed before the answer, not a hardcoded `[]` (2026-10-06).
   const chain: FallbackAttempt[] = [];
+  // The turn's own spend, summed here and written on the run's ledger row when it ends — the
+  // same number ZCode reports per sub-agent, and what makes "what did this turn cost" answerable
+  // per run rather than only as a session total. `onRunUsageAdded` keeps feeding the live meter;
+  // this is the durable copy.
+  let runIn = 0;
+  let runOut = 0;
   const onEvent: Parameters<typeof runAgentLoop>[0]["onEvent"] = (ev) => {
     // P6: every event is appended to the run record as it arrives, not batched at the end, so a
     // run that is stopped or crashes is still fully inspectable from the dashboard.
@@ -141,7 +154,12 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // MCP tools join the builtin registry when servers are configured and reachable; failure
       // or no configuration collapses to exactly the builtin set. The fetch is cached briefly
       // Rust-side connections stay live, so the common case is one cheap re-list per turn.
-      registry: [...AGENT_TOOLS, ...(await fetchMcpTools())],
+      // The enabled specialists ride `dispatch_agent`'s description (cloned, never mutating
+      // AGENT_TOOLS) so the model can pick one by id.
+      registry: [
+        ...withSubagentDefs(req.subagentDefs ?? []),
+        ...(await fetchMcpTools()),
+      ],
       // Tier 2: when this request has to drop context, the dropped turns are summarized rather
       // than discarded (server-side, or the caller's client-side summarizer above the engine).
       generate: (loopReq, opts) => {
@@ -165,6 +183,8 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
               // Summed, not replaced: an agent turn is several model calls, and the live status
               // line shows what the whole run has spent so far.
               ports.onRunUsageAdded(u.prompt_tokens ?? 0, u.completion_tokens ?? 0);
+              runIn += u.prompt_tokens ?? 0;
+              runOut += u.completion_tokens ?? 0;
               callIn = (callIn ?? 0) + (u.prompt_tokens ?? 0);
               callOut = (callOut ?? 0) + (u.completion_tokens ?? 0);
             },
@@ -192,6 +212,9 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       generateImage: req.generateImage,
       loadSkill: req.loadSkill,
       subagentMaxIterations: req.subagentMaxIterations,
+      // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,
+      // model, and budget at dispatch time.
+      subagentDefs: req.subagentDefs,
       // The delegation ledger: a dispatch_agent child records its row under this run's id, so
       // the Subagents screen can draw the tree.
       runId,
@@ -262,11 +285,13 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         stopped
           ? undefined
           : `step ceiling: ${iterations} iterations, the model was still calling tools`,
+        runIn,
+        runOut,
       );
     } else {
       // Arity kept at three for the clean paths, as it was: only a run that ended for a reason
       // carries one, which is also how the catch path below already calls it.
-      ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations);
+      ports.orchestrator.endRun(runId, stopped ? "stopped" : "ok", iterations, undefined, runIn, runOut);
     }
     ports.onTrace({
       ms: ports.now() - req.startedAt,
@@ -283,11 +308,11 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // assistant turn behind, which rendered as a bare "…" — indistinguishable from a model that
     // had not answered yet — with the only clue a thin red line above the composer.
     if (req.controller.signal.aborted) {
-      ports.orchestrator.endRun(runId, "stopped", iterations);
+      ports.orchestrator.endRun(runId, "stopped", iterations, undefined, runIn, runOut);
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: "stopped by you" });
       ports.fillIfEmpty(req.assistantMsgId, "⚠ stopped by you — this turn did not finish. Send again, or retry it from the message actions.");
     } else {
-      ports.orchestrator.endRun(runId, "error", iterations, (e as Error).message);
+      ports.orchestrator.endRun(runId, "error", iterations, (e as Error).message, runIn, runOut);
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: (e as Error).message });
       ports.fillIfEmpty(req.assistantMsgId, `⚠ ${(e as Error).message}`);
     }

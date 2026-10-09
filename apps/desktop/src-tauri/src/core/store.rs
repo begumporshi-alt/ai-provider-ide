@@ -344,7 +344,45 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0022_manifest_thinking_placeholder", backfill_manifest_thinking_placeholder),
     ("0023_idempotency_keys", create_idempotency_keys),
     ("0024_agent_runs_parent", add_agent_runs_parent),
+    ("0025_agent_runs_tokens", add_agent_runs_tokens),
+    ("0026_pending_last_error", add_pending_last_error),
 ];
+
+/// 0026 — why a queued turn was retired.
+///
+/// `capture.rs::release` gives a row back and, after three failed attempts, retires it as
+/// `failed` — but the reason was thrown away by the drain's `catch {}`, so the only thing the UI
+/// could ever say was "something was lost". That is the difference between a provider outage
+/// (fix the provider, the turns are re-runnable) and a turn no model can distil (nothing to
+/// fix) — and it is exactly what the person looking at "3 failed" needs to know.
+///
+/// Nullable: a row retired before this migration has no recorded reason, which is a fact about
+/// the record, not a failure.
+fn add_pending_last_error(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "memory_pending", "last_error")? {
+        tx.execute_batch("ALTER TABLE memory_pending ADD COLUMN last_error TEXT;")?;
+    }
+    Ok(())
+}
+
+/// 0025 — per-run token usage. ZCode reports `totalTokens` for every sub-agent it runs; our
+/// ledger recorded rounds and tool calls but not cost, so "what did that delegation actually
+/// spend" was unanswerable and the only visible number was the *session* meter the child's calls
+/// were folded into.
+///
+/// `DEFAULT 0` rather than nullable: a run recorded before this migration genuinely has no
+/// measurement, and `0` keeps a cost view's arithmetic total. The subtle distinction that matters
+/// elsewhere (`cached_tokens`-style "not reported" vs "reported as none") does not apply — to a
+/// spend view, "reported nothing" and "spent nothing" are the same fact.
+fn add_agent_runs_tokens(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "agent_runs", "prompt_tokens")? {
+        tx.execute_batch("ALTER TABLE agent_runs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    if !table_has_column(tx, "agent_runs", "completion_tokens")? {
+        tx.execute_batch("ALTER TABLE agent_runs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
 
 /// 0024 — the delegation tree. `dispatch_agent` spawns a nested agent run; until now the child
 /// had no column naming its parent, so "what did the main run delegate, and what came back?"
@@ -1452,11 +1490,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0023 data migrations.
-        assert_eq!(info.schema_version, 24);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0026 data migrations.
+        assert_eq!(info.schema_version, 26);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(24, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(26, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

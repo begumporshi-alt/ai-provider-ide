@@ -566,14 +566,21 @@ pub fn complete(store: &Store, id: i64) -> Result<bool, String> {
 
 /// Give a row back. A row that has failed repeatedly is retired rather than retried forever —
 /// a turn that will not distil is not going to start.
-pub fn release(store: &Store, id: i64) -> Result<bool, String> {
+///
+/// `error` is the reason the distillation attempt failed (a provider error, a malformed reply,
+/// and so on). It was previously discarded by the caller, which left "3 failed" in the UI with no
+/// answer to "failed *how*" — the difference between a provider that was down and a turn nothing
+/// can distil. Recorded on every release, not only on retirement: the last reason is what a
+/// retried row eventually carries when it gives up.
+pub fn release(store: &Store, id: i64, error: Option<String>) -> Result<bool, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let n = conn
         .execute(
             "UPDATE memory_pending
-             SET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END
+             SET status = CASE WHEN attempts >= 3 THEN 'failed' ELSE 'queued' END,
+                 last_error = COALESCE(?2, last_error)
              WHERE id = ?1 AND status='processing'",
-            params![id],
+            params![id, error],
         )
         .map_err(|e| e.to_string())?;
     Ok(n > 0)
@@ -603,7 +610,7 @@ const RETENTION_DAYS: i64 = 7;
 /// How many rows the queue currently holds in each state. The Memory screen shows `queued` as
 /// "turns awaiting distillation"; the rest is there so a stuck queue is visible rather than
 /// inferred from a growing database.
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QueueStatus {
     pub queued: usize,
     pub processing: usize,
@@ -616,6 +623,17 @@ pub struct QueueStatus {
     /// deliberately, not that anything is stuck — without it, "5 awaiting distillation" that never
     /// moves looks like a bug rather than a budget doing its job.
     pub budget_left: usize,
+    /// Why the retired rows were retired, commonest first — the answer "3 failed" cannot give.
+    /// A bare count says something was lost; the reason says whether it is worth doing anything
+    /// about (a provider outage is re-runnable, an undistillable turn is not).
+    pub failed_reasons: Vec<FailedReason>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct FailedReason {
+    /// The recorded message, trimmed for display. Rows retired before migration 0026 carry none.
+    pub reason: String,
+    pub count: usize,
 }
 
 pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
@@ -627,6 +645,7 @@ pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
         failed: 0,
         outstanding: 0,
         budget_left: 0,
+        failed_reasons: Vec::new(),
     };
     let mut stmt = conn
         .prepare("SELECT status, COUNT(*) FROM memory_pending GROUP BY status")
@@ -646,6 +665,23 @@ pub fn queue_status(store: &Store) -> Result<QueueStatus, String> {
     }
     out.outstanding = out.queued + out.processing;
     out.budget_left = budget_left(&conn);
+    // Grouped in SQL so the summary is the whole set, not a page of it. Rows with no recorded
+    // reason are grouped under a label that says so rather than being hidden.
+    let mut reasons = conn
+        .prepare(
+            "SELECT COALESCE(NULLIF(TRIM(last_error), ''), '(no reason recorded)') AS why, COUNT(*)
+             FROM memory_pending WHERE status = 'failed'
+             GROUP BY why ORDER BY COUNT(*) DESC, why ASC LIMIT 3",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = reasons
+        .query_map([], |r| {
+            Ok(FailedReason { reason: r.get(0)?, count: r.get::<_, i64>(1)? as usize })
+        })
+        .map_err(|e| e.to_string())?;
+    for r in rows {
+        out.failed_reasons.push(r.map_err(|e| e.to_string())?);
+    }
     Ok(out)
 }
 
@@ -974,7 +1010,8 @@ mod capture_tests {
         for attempt in 1..=3 {
             let batch = claim(&s).unwrap();
             assert_eq!(batch.len(), 1, "attempt {attempt}");
-            assert!(release(&s, batch[0].id).unwrap());
+            // The reason travels with the release: it is what makes "3 failed" actionable.
+            assert!(release(&s, batch[0].id, Some(format!("provider said no (try {attempt})"))).unwrap());
         }
         // Third failure retires it rather than retrying forever.
         let conn = s.conn.lock().unwrap();
@@ -982,6 +1019,38 @@ mod capture_tests {
             .query_row("SELECT status FROM memory_pending WHERE id=1", [], |r| r.get(0))
             .unwrap();
         assert_eq!(status, "failed", "a turn that will not distil is not retried indefinitely");
+        // …and the last reason is kept, so the UI can say *why* and not only *that*.
+        let recorded: Option<String> = conn
+            .query_row("SELECT last_error FROM memory_pending WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(recorded.as_deref(), Some("provider said no (try 3)"), "the last reason wins");
+        drop(conn);
+
+        // The status view groups them, so the Memory screen can show a reason, not a bare count.
+        let st = queue_status(&s).unwrap();
+        assert_eq!(st.failed, 1);
+        assert_eq!(st.failed_reasons.len(), 1);
+        assert_eq!(st.failed_reasons[0].count, 1);
+        assert!(st.failed_reasons[0].reason.contains("provider said no"));
+
+        // A row retired with no reason on record is still listed — under a label that says so,
+        // rather than hidden behind an empty string.
+        {
+            let c = s.conn.lock().unwrap();
+            c.execute(
+                "INSERT INTO memory_pending (request_id, user_text, status, attempts, created_at, last_error)
+                 VALUES ('r-legacy','legacy turn','failed',3,1,NULL)",
+                [],
+            )
+            .unwrap();
+        }
+        let st2 = queue_status(&s).unwrap();
+        assert_eq!(st2.failed, 2, "both retired rows are counted");
+        assert!(
+            st2.failed_reasons.iter().any(|f| f.reason == "(no reason recorded)"),
+            "a missing reason is named, not blank: {:?}",
+            st2.failed_reasons
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 

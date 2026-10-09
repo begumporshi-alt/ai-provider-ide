@@ -22,7 +22,7 @@ import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { registryToOpenAI, SUBAGENT_TOOLS } from "./registry";
 import { runNotebookEdit, runNotebookRead } from "./notebook";
 import { toWireToolCalls } from "./wire";
-import type { AgentLoopOptions, ToolHost } from "./types";
+import type { AgentEvent, AgentLoopOptions, ToolHost } from "./types";
 
 /**
  * Ceiling on model round-trips in one agent turn. A model that will not stop calling tools
@@ -33,7 +33,7 @@ import type { AgentLoopOptions, ToolHost } from "./types";
  * two separate `= 8` constants kept in step by a comment — the kind of duplication that survives
  * exactly until someone edits one of them.
  */
-export const DEFAULT_MAX_ITERATIONS = 8;
+export const DEFAULT_MAX_ITERATIONS = 40;
 
 /** Upper bound when the ceiling is user-set. Not a security control — a value of 5000 would just
  *  be a slow way to burn tokens. */
@@ -81,26 +81,92 @@ export const NO_OUTPUT_RETRIES = 1;
 export const TRUNCATION_RETRIES = 2;
 
 /**
- * Model round-trips one `dispatch_agent` sub-agent gets, regardless of the parent turn's own
- * budget. A sub-agent's job is bounded by construction — survey, summarise, return — and its
- * caller is a tool result the parent cannot iterate on mid-flight, so a runaway delegation must
- * end on its own, cheaply. Fixed rather than model-chosen: the caller asking for a bigger
- * sub-agent is the exact behaviour the bound exists to cap.
+ * The sub-agent's default step budget: **none** — and that is the measured answer, not a
+ * relaxation.
+ *
+ * This was a hard 12 (then briefly 30), and the evidence that any low number is wrong is
+ * recorded on this machine: across 433 completed ZCode sub-agent runs, the median is 24 tool
+ * uses, p90 is 55, and the largest is 152 — every one finishing `completed`, with **zero**
+ * budget-related failures. A 12-round ceiling guillotined ordinary work (the "sub-agent hit its
+ * step budget" complaint); a 30 would still cut off the p90 case. Our loop's own measurement
+ * agrees: the models make roughly one tool call per round, so a step cap *is* a tool-call cap.
+ *
+ * So the bound is not a step count. Four things actually bound a child here:
+ *   1. the pacing nudge (`TOOL_CALL_NUDGE_AFTER`) — it asks the child to wrap up rather than
+ *      being cut off, and a child is exactly where a long turn is legitimate;
+ *   2. the parent's abort signal — the user's Stop, checked every iteration;
+ *   3. its obligation to end with a summary (see `SUBAGENT_PROTOCOL`), which is what the
+ *      delegation is for;
+ *   4. `SUBAGENT_CONCURRENCY`, which bounds how many children run at once — the runaway that
+ *      actually matters, and the one ZCode enforces too.
+ *
+ * A user who wants a firm ceiling still sets one: Router Settings → defaults → subagent
+ * iterations, or `maxIterations` on a specialist definition. `SUBAGENT_HARD_BACKSTOP` is the
+ * only unconditional bound.
  */
-export const SUBAGENT_MAX_ITERATIONS = 12;
+export const SUBAGENT_MAX_ITERATIONS: number | null = null;
+
+/**
+ * Insurance against a pathological loop, far above any real work: the largest honest sub-agent
+ * run measured is 152 tool calls, so a child that reaches 250 is not working, it is stuck.
+ * Reaching it reports `hitCeiling` and the ceiling-exit summary — the same honest ending a
+ * user-set budget produces. This is deliberately not a budget; teams that want a real one set
+ * `subagentIterations` in Router Settings.
+ */
+export const SUBAGENT_HARD_BACKSTOP = 250;
+
+/**
+ * How many `dispatch_agent` children may run at once.
+ *
+ * The real runaway is *parallel* delegation, not a long single child: a model that emits five
+ * `dispatch_agent` calls in one batch would, with no step cap, start five unbounded runs at the
+ * same moment. ZCode bounds this the same way and reports "user concurrency limit exceeded" when
+ * it is hit (the only limit-related failure in its entire run history on this machine). Queued
+ * rather than refused, so the model's intent still executes — it just executes in waves.
+ */
+export const SUBAGENT_CONCURRENCY = 3;
 
 /** Characters of a sub-agent's summary that reach the parent transcript. The point of delegation
  *  is context isolation; a summary the size of the survey it replaced would undo it. */
 export const SUBAGENT_RESULT_CAP = 4000;
 
-/** The system turn every sub-agent runs under. The last sentence is load-bearing: only the final
- *  message survives, so a model that ends with "I looked at several files" delegates nothing. */
+/**
+ * The protocol every sub-agent runs under, appended to its role prompt (its own definition's
+ * `systemPrompt`, or `SUBAGENT_SYSTEM` below).
+ *
+ * Two halves, both load-bearing:
+ *
+ * **Isolation** — only the final message survives, so a model that ends with "I looked at
+ * several files" delegates nothing.
+ *
+ * **Batching** — a round is a *turn*, not a tool call, and independent calls in one turn run
+ * concurrently (`Promise.all` below). Measured against our own ledger: sub-agents that batch
+ * made 19–37 tool calls inside 6–12 rounds, while one that did not spent its whole budget on
+ * single calls. ZCode's sub-agents work the same way and its prompt says so outright ("Launch up
+ * to N agents IN PARALLEL (single message, multiple tool calls)"). Asking for it explicitly is
+ * the difference between a budget measured in turns and one measured in tool calls.
+ */
+const SUBAGENT_PROTOCOL =
+  "Nobody sees your intermediate steps or tool output: ONLY your final message is returned to " +
+  "the main conversation. Work the task thoroughly, then end with a self-contained summary: the " +
+  "findings, the exact file paths or URLs they came from, and anything that changes what the " +
+  "main agent should do next.\n\n" +
+  "Batch independent tool calls into ONE message — several reads or searches per turn run at " +
+  "once, and a turn is not a tool call. Do not spend a turn on a single read when you already " +
+  "know the next three things to look at.";
+
 const SUBAGENT_SYSTEM =
   "You are a research sub-agent spawned by a main agent. You have the read-only tools only — " +
-  "you cannot modify the workspace. Nobody sees your intermediate steps or tool output: ONLY " +
-  "your final message is returned to the main conversation. Work the task thoroughly, then end " +
-  "with a self-contained summary: the findings, the exact file paths or URLs they came from, " +
-  "and anything that changes what the main agent should do next.";
+  "you cannot modify the workspace. " + SUBAGENT_PROTOCOL;
+
+/**
+ * How long a sub-agent may go **without a single event** before it is treated as hung and
+ * aborted — ZCode's inactivity watchdog, at the value ZCode ships (`inactivityTimeoutMs =
+ * 600000`). This is the bound that actually protects a delegation: the failure mode is not a
+ * child working for a long time (that is the job), it is a child wedged on a provider stream
+ * that will never end. A step-count ceiling cannot see the difference; a clock can.
+ */
+export const SUBAGENT_INACTIVITY_TIMEOUT_MS = 600_000;
 
 /** Clamp a user-supplied ceiling into `[1, MAX_ITERATIONS_CAP]`, or `null` for no ceiling.
  *
@@ -180,6 +246,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     runId,
     subagentRecorder,
     subagentMaxIterations,
+    subagentDefs,
+    subagentInactivityTimeoutMs = SUBAGENT_INACTIVITY_TIMEOUT_MS,
   } = opts;
 
   // Conversation only — the system turn is prepended at each model call, never stored here.
@@ -241,6 +309,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         tools,
         toolChoice: tools ? "auto" : undefined,
         ...(forceNoReasoning ? { reasoning: "off" as const } : {}),
+        // The run's own token usage, reported to whoever owns this loop's ledger row. The
+        // parent's turn wrapper counts it for the session as it always has; a child's dispatch
+        // passes a handler here, so a sub-agent's spend lands on ITS row instead of only being
+        // folded into the session meter. Both readings are correct because this fires only for
+        // the calls THIS loop made.
+        onUsage: (u) => opts.onUsage?.(u),
         onToolCall: (call) => {
           collected.push(call);
         },
@@ -349,6 +423,31 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
 
+    // Batch execution, with the one real bound: **how many children run at once**. Everything
+    // else in a batch is a cheap tool call; a `dispatch_agent` is an unbounded nested run, so a
+    // model that emits five of them would start five at the same instant (see
+    // `SUBAGENT_CONCURRENCY`). The permits are taken in call order and released as each child
+    // settles, so the batch still finishes and the results stay in call order below.
+    const childPermits = (() => {
+      let free = SUBAGENT_CONCURRENCY;
+      const waiters: Array<() => void> = [];
+      return {
+        async take(): Promise<void> {
+          if (free > 0) {
+            free -= 1;
+            return;
+          }
+          await new Promise<void>((resolve) => waiters.push(resolve));
+        },
+        release(): void {
+          const next = waiters.shift();
+          // A waiter inherits the permit rather than the counter being bumped: whoever wakes
+          // takes the freed slot directly, so the count never transiently exceeds the cap.
+          if (next) next();
+          else free += 1;
+        },
+      };
+    })();
     const executed: { name: string; resultText: string; ok: boolean }[] = await Promise.all(
       parsed.map(async ({ call, args }, i) => {
         const name = call.name ?? "(unknown)";
@@ -362,23 +461,59 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         } else {
           try {
             // `dispatch_agent` never reaches the sandbox either: it is a nested run of THIS loop,
-            // with a fresh context (the task is all it sees), the read-only `SUBAGENT_TOOLS`, and
-            // a fixed step budget. The parent's confirm gate rides along — in "ask every time"
-            // the sub-agent's reads prompt exactly as the main loop's would, so a nested run is
-            // never a permission upgrade. Its events are deliberately not forwarded and its
-            // transcript deliberately discarded: isolation is the entire point of delegating.
+            // with a fresh context (the task is all it sees) and the read-only `SUBAGENT_TOOLS`.
+            // Its step budget is normally *none* — see `SUBAGENT_MAX_ITERATIONS` — and the only
+            // unconditional bound is `SUBAGENT_HARD_BACKSTOP`. How many children run at once is
+            // capped by the permits taken below. The parent's confirm gate rides along — in
+            // "ask every time" the sub-agent's reads prompt exactly as the main loop's would, so
+            // a nested run is never a permission upgrade. Its events are not forwarded to the UI
+            // and its transcript deliberately discarded — isolation is the entire point of
+            // delegating; only the ledger keeps a filtered half (see `childOnEvent` below).
             if (name === "dispatch_agent") {
               const task = typeof args.task === "string" ? args.task.trim() : "";
+              // A named specialist, if the model asked for one and the definitions carry it.
+              // An unknown name errors back as the tool result — naming the valid ids — rather
+              // than silently degrading: a silent fallback would read as a routing success
+              // while running the wrong prompt.
+              const requested = typeof args.agent === "string" ? args.agent.trim() : "";
+              const def = requested ? (subagentDefs ?? []).find((d) => d.id === requested) : undefined;
               if (!task) {
                 resultText =
                   'dispatch_agent needs a "task": the sub-agent sees nothing else of this conversation.';
                 ok = false;
+              } else if (requested && !def) {
+                const known = (subagentDefs ?? []).map((d) => d.id).join(", ") || "(none)";
+                resultText =
+                  `No sub-agent named "${requested}". Available specialists: ${known}. ` +
+                  'Omit "agent" for the general researcher.';
+                ok = false;
               } else {
                 // The delegation is a real run, not just a function call: with a recorder on
                 // board the child gets its own ledger row under this run's id, one tool_call
-                // step per sandbox call it makes, and an honest ending — "stopped" when it ran
-                // out of budget, "error" when it threw. Recording wraps the child's host; the
-                // child loop itself stays oblivious.
+                // step per sandbox call it makes, one tool_result step per call that came back
+                // (denials included — see `childOnEvent`), and an honest ending — "stopped"
+                // when it ran out of budget, "error" when it threw. Recording wraps the child's
+                // host and filters its events; the child loop itself stays oblivious.
+                // The specialist's overrides, resolved once: its own prompt (the isolation half
+                // stays the loop's — it is what makes delegation isolation, not a suggestion),
+                // a narrowed tool allowlist, an optional model, and its own step budget. A
+                // definition can only narrow: its allowlist is intersected with the read-effect
+                // set at parse time, so a custom agent is never a permission upgrade.
+                const childModel = def?.model || model;
+                const childSystem = def ? `${def.systemPrompt}\n\n${SUBAGENT_PROTOCOL}` : SUBAGENT_SYSTEM;
+                const childRegistry = def?.tools?.length
+                  ? SUBAGENT_TOOLS.filter((t) => def.tools!.includes(t.name))
+                  : SUBAGENT_TOOLS;
+                // Three sources, in priority order: the specialist's own budget, the user's
+                // global one (Router Settings → defaults), then the loop's default — which is
+                // **no ceiling**. The backstop is a ceiling on **every** path (`Math.min`), not
+                // only on the `null` default: it is documented as unconditional, and while it was
+                // an either/or, a typo of `5000` in Router Settings produced a 5000-round child
+                // that nothing could bound — the specialist path clamps to 50 and this one did not
+                // (audit 2026-10-09).
+                const requestedBudget = def?.maxIterations ?? subagentMaxIterations ?? SUBAGENT_MAX_ITERATIONS;
+                const childBudget =
+                  requestedBudget === null ? SUBAGENT_HARD_BACKSTOP : Math.min(requestedBudget, SUBAGENT_HARD_BACKSTOP);
                 const recorder = subagentRecorder;
                 const childRunId = recorder ? recorder.newRunId() : null;
                 if (recorder && childRunId) {
@@ -386,7 +521,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                     recorder.startRun({
                       runId: childRunId,
                       parentRunId: runId ?? null,
-                      model,
+                      model: childModel,
                       prompt: task,
                     });
                   } catch {
@@ -402,21 +537,82 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                         },
                       }
                     : host;
+                // The result half of the child's ledger. The child's events are still not
+                // forwarded to the UI — isolation is the point of delegating — but a filtered
+                // half lands in the ledger, because a steps list that shows what a sub-agent
+                // *called* without what came back answers "what is it doing" with half a
+                // sentence. Denied/refused calls are named `denied` here by the same regex the
+                // parent's own recorder applies to its results (agent-turn.ts), so both ledgers
+                // mean the same thing by the word.
+                const childOnEvent: ((ev: AgentEvent) => void) | undefined =
+                  recorder && childRunId
+                    ? (ev) => {
+                        if (ev.type !== "tool_result") return;
+                        const name = ev.call.name ?? "(unknown)";
+                        const denied = /denied|refused/i.test(ev.result);
+                        recorder.recordStep(
+                          childRunId,
+                          denied ? "denied" : "tool_result",
+                          name,
+                          ev.result.slice(0, 500),
+                          ev.ok,
+                        );
+                      }
+                    : undefined;
+                // The watchdog: a child that produces no event for `SUBAGENT_INACTIVITY_TIMEOUT_MS`
+                // is wedged, not working, and is aborted. It covers the case a step ceiling
+                // cannot see — a provider stream that never ends, where no round is ever
+                // completed and therefore no iteration is ever counted. Armed from the start,
+                // reset on every child event.
+                // The child's own spend, summed over its round-trips — the number ZCode reports
+                // as `totalTokens` and the one our ledger could not answer before.
+                let childIn = 0;
+                let childOut = 0;
+                const watchdog = new AbortController();
+                let lastActivity = Date.now();
+                let watchdogFired = false;
+                const onParentAbort = () => watchdog.abort();
+                signal?.addEventListener("abort", onParentAbort, { once: true });
+                const pollMs = Math.max(10, Math.min(30_000, Math.floor(subagentInactivityTimeoutMs / 4)));
+                const timer = setInterval(() => {
+                  if (Date.now() - lastActivity < subagentInactivityTimeoutMs) return;
+                  watchdogFired = true;
+                  watchdog.abort();
+                }, pollMs);
+                const childOnEventWatched = (ev: AgentEvent) => {
+                  lastActivity = Date.now();
+                  childOnEvent?.(ev);
+                };
                 try {
-                  const sub = await runAgentLoop({
-                    model,
-                    messages: [{ role: "user", content: task }],
-                    system: SUBAGENT_SYSTEM,
-                    registry: SUBAGENT_TOOLS,
-                    generate,
-                    host: childHost,
-                    confirm,
-                    loadSkill,
-                    runId: childRunId ?? undefined,
-                    subagentRecorder: recorder,
-                    maxIterations: subagentMaxIterations ?? SUBAGENT_MAX_ITERATIONS,
-                    signal,
-                  });
+                  // Queue behind the concurrency cap *before* the child starts, and release in
+                  // the `finally` so a throw cannot strand a permit and deadlock later children.
+                  await childPermits.take();
+                  let sub: Awaited<ReturnType<typeof runAgentLoop>>;
+                  try {
+                    sub = await runAgentLoop({
+                      model: childModel,
+                      messages: [{ role: "user", content: task }],
+                      system: childSystem,
+                      registry: childRegistry,
+                      generate,
+                      host: childHost,
+                      confirm,
+                      loadSkill,
+                      runId: childRunId ?? undefined,
+                      subagentRecorder: recorder,
+                      maxIterations: childBudget,
+                      onEvent: childOnEventWatched,
+                      onUsage: (u) => {
+                        childIn += u.prompt_tokens ?? 0;
+                        childOut += u.completion_tokens ?? 0;
+                      },
+                      signal: watchdog.signal,
+                    });
+                  } finally {
+                    childPermits.release();
+                    clearInterval(timer);
+                    signal?.removeEventListener("abort", onParentAbort);
+                  }
                   const summary = sub.text.trim();
                   const capped =
                     summary.length > SUBAGENT_RESULT_CAP
@@ -427,10 +623,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                     : capped;
                   ok = true;
                   if (recorder && childRunId) {
-                    recorder.endRun(childRunId, sub.hitCeiling ? "stopped" : "ok", sub.iterations);
+                    recorder.endRun(
+                      childRunId,
+                      sub.hitCeiling ? "stopped" : "ok",
+                      sub.iterations,
+                      undefined,
+                      childIn,
+                      childOut,
+                    );
                   }
                 } catch (e) {
-                  resultText = `Sub-agent failed: ${e instanceof Error ? e.message : String(e)}`;
+                  // A watchdog abort and a user Stop both arrive as AbortError; only the clock
+                  // knows which one this was, and the model must be told the right story — one
+                  // is "your sub-agent hung", the other is "the human stopped you".
+                  resultText = watchdogFired
+                    ? `The sub-agent made no progress for ${Math.round(subagentInactivityTimeoutMs / 60_000)} ` +
+                      "minutes and was stopped — it was wedged on a request that never returned. " +
+                      "Retry the task, or narrow it."
+                    : `Sub-agent failed: ${e instanceof Error ? e.message : String(e)}`;
                   ok = false;
                   if (recorder && childRunId) {
                     recorder.endRun(
@@ -438,6 +648,8 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                       "error",
                       0,
                       e instanceof Error ? e.message : String(e),
+                      childIn,
+                      childOut,
                     );
                   }
                 }

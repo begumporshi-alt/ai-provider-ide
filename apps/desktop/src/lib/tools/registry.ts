@@ -421,6 +421,11 @@ export const AGENT_TOOLS: ToolSpec[] = [
           description:
             "The complete task for the sub-agent, self-contained: what to find, where to look, and what the summary should cover.",
         },
+        agent: {
+          type: "string",
+          description:
+            "Optional: the specialist to run, by id, from the specialist list in this tool's description. Omit for the general researcher.",
+        },
       },
       required: ["task"],
     },
@@ -497,6 +502,29 @@ export const AGENT_TOOLS: ToolSpec[] = [
 export const SUBAGENT_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
   (t) => t.effect === "read" && t.name !== "dispatch_agent" && t.name !== "todo_write",
 );
+
+/**
+ * The parent registry with `dispatch_agent`'s description carrying the enabled specialists, so
+ * the model can route a task to one deliberately instead of guessing ids. Cloned, never
+ * mutated: `AGENT_TOOLS` is a shared const, and the specialist list is per-run state.
+ */
+export function withSubagentDefs(defs: { id: string; name: string; description: string }[]): ToolSpec[] {
+  if (defs.length === 0) return AGENT_TOOLS;
+  const list = defs
+    .map((d) => `- ${d.id} (${d.name}): ${d.description}`)
+    .join("\n");
+  return AGENT_TOOLS.map((t) =>
+    t.name !== "dispatch_agent"
+      ? t
+      : {
+          ...t,
+          description:
+            t.description +
+            "\n\nAvailable specialist sub-agents (pass one as \"agent\"; omit for the general researcher):\n" +
+            list,
+        },
+  );
+}
 
 /** Render the OpenAI `tools` array from a registry. Empty registry yields undefined so the
  *  caller can omit `tools`/`tool_choice` entirely (some providers 400 on an empty list). */

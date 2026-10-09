@@ -33,6 +33,11 @@ pub struct AgentRun {
     pub started_at: i64,
     pub ended_at: Option<i64>,
     pub error: Option<String>,
+    /// Tokens this run's own model calls spent, summed over its round-trips. `0` means either
+    /// "nothing spent" or "recorded before 0025" — the two are the same fact to a cost view, and
+    /// a sub-agent's cost is otherwise invisible (it is folded into the session meter).
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -119,14 +124,17 @@ pub fn finish(
     status: String,
     iterations: i64,
     error: Option<String>,
+    prompt_tokens: i64,
+    completion_tokens: i64,
 ) -> Result<(), String> {
     if !RUN_STATUSES.contains(&status.as_str()) {
         return Err(format!("unknown run status '{status}'"));
     }
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     conn.execute(
-        "UPDATE agent_runs SET status=?2, iterations=?3, error=?4, ended_at=?5 WHERE id=?1",
-        rusqlite::params![run_id, status, iterations, error, now_ms()],
+        "UPDATE agent_runs SET status=?2, iterations=?3, error=?4, ended_at=?5, \
+         prompt_tokens=?6, completion_tokens=?7 WHERE id=?1",
+        rusqlite::params![run_id, status, iterations, error, now_ms(), prompt_tokens, completion_tokens],
     )
     .map_err(|e| e.to_string())?;
     Ok(())
@@ -136,7 +144,8 @@ pub fn runs(store: &Store, limit: usize) -> Result<Vec<AgentRun>, String> {
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT id, session_id, parent_run_id, model, status, prompt, iterations, tool_calls, started_at, ended_at, error
+            "SELECT id, session_id, parent_run_id, model, status, prompt, iterations, tool_calls, started_at, ended_at, error, \
+             prompt_tokens, completion_tokens
              FROM agent_runs ORDER BY started_at DESC LIMIT ?1",
         )
         .map_err(|e| e.to_string())?;
@@ -154,6 +163,8 @@ pub fn runs(store: &Store, limit: usize) -> Result<Vec<AgentRun>, String> {
                 started_at: r.get(8)?,
                 ended_at: r.get(9)?,
                 error: r.get(10)?,
+                prompt_tokens: r.get(11)?,
+                completion_tokens: r.get(12)?,
             })
         })
         .map_err(|e| e.to_string())?;
@@ -257,11 +268,26 @@ mod orchestrator_tests {
     fn finishing_records_the_outcome_and_the_duration_is_derivable() {
         let (s, d) = temp_store("finish");
         start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
-        finish(&s, "r1", "ok".into(), 3, None).unwrap();
+        finish(&s, "r1", "ok".into(), 3, None, 0, 0).unwrap();
         let all = runs(&s, 10).unwrap();
         assert_eq!(all[0].status, "ok");
         assert_eq!(all[0].iterations, 3);
         assert!(all[0].ended_at.is_some());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_runs_token_usage_is_recorded_and_read_back() {
+        // The cost of a delegation was previously invisible — folded into the session meter.
+        // This is the column pair that makes "what did that sub-agent spend" answerable.
+        let (s, d) = temp_store("tokens");
+        start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
+        // A run in flight reports nothing yet: 0 is the honest reading, not a missing row.
+        assert_eq!(runs(&s, 10).unwrap()[0].prompt_tokens, 0);
+        finish(&s, "r1", "ok".into(), 2, None, 12_345, 678).unwrap();
+        let all = runs(&s, 10).unwrap();
+        assert_eq!(all[0].prompt_tokens, 12_345);
+        assert_eq!(all[0].completion_tokens, 678);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -278,7 +304,7 @@ mod orchestrator_tests {
         let (s, d) = temp_store("vocab");
         start(&s, "r1".into(), None, None, "m".into(), None).unwrap();
         assert!(step(&s, "r1", "telepathy".into(), None, None, None).is_err());
-        assert!(finish(&s, "r1", "maybe".into(), 0, None).is_err());
+        assert!(finish(&s, "r1", "maybe".into(), 0, None, 0, 0).is_err());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -9,6 +9,7 @@ import { createPortal } from "react-dom";
 import {
   catalog,
   listSkills,
+  agentDefsList,
   registry,
   router,
   loadHistorySessions,
@@ -18,6 +19,7 @@ import {
   type HistorySession,
   type Skill,
 } from "../store";
+import { parseSubagentDefs } from "../lib/agents/defs";
 import { selectableModels } from "../lib/models/selectable";
 import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
@@ -40,6 +42,7 @@ import {
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
 import { ChangeSetReview } from "../components/ChangeSetReview";
 import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
+import { SubagentsDrawer } from "../components/RunsDrawer";
 import { DiffView } from "../components/DiffView";
 import {
   fileChangeFor,
@@ -1922,8 +1925,10 @@ function Chat({
           // loaded, and re-clamping here would only risk disagreeing with the field.
           maxIterations,
           // The sub-agent budget from Router Settings → defaults; a blank or broken value means
-          // the loop's built-in 12, not 1 — a corrupted setting must degrade to the value that
-          // works, the same rule the main ceiling's clamp follows.
+          // **no ceiling** — the loop's own default, because real sub-agent work runs long
+          // (measured across 433 runs: median 24 tool calls, p90 55). A low value here cuts
+          // legitimate work short, which is exactly the "hit its step budget" complaint. The
+          // clamp keeps a corrupted setting from reading as "run one step".
           subagentMaxIterations: (() => {
             const raw = (router.settings as typeof router.settings & { defaults?: Record<string, string> })
               .defaults?.subagentIterations;
@@ -1939,6 +1944,12 @@ function Chat({
             const hit = all.find((s) => s.enabled && (s.name === name || s.slug === name));
             return hit ? hit.body : null;
           },
+          // The enabled dispatch_agent specialists, read straight from the definition files at
+          // send time — the same read-late rule as loadSkill, so a definition the user just
+          // wrote or disabled is honored by the very next turn without a restart.
+          subagentDefs: await agentDefsList()
+            .catch(() => [] as { fileName: string; contentJson: string }[])
+            .then((files) => parseSubagentDefs(files).defs.filter((d) => d.enabled)),
           // Agent-mode image generation reuses the Image tab's serving path: the gateway's
           // `/v1/images/generations`, default model from Router Settings → defaults. A provider
           // that answers with a link has its bytes pulled through the host's scoped fetch, so
@@ -2521,6 +2532,9 @@ function Chat({
           there, and this transcript starts directly under the session bar. */}
       <div className="relative min-h-0 flex-1">
         <AssistantCapsule root={root} todos={todos} busy={busy} />
+        {/* The subagents drawer: delegated runs only, live, pinned to the transcript's right
+            edge. Mounted only in the Chat tab — the Image and Root tabs have no runs to watch. */}
+        <SubagentsDrawer />
         <div
           ref={listRef}
           onScroll={onListScroll}

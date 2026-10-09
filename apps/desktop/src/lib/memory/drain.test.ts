@@ -80,7 +80,10 @@ describe("drainOnce", () => {
 
     expect(r.distilled).toBe(0);
     expect(r.released).toBe(1);
-    expect(release).toHaveBeenCalledWith(7);
+    // The reason travels with the release. It used to be swallowed here, which is exactly why
+    // the Memory screen could only ever say "3 failed" and never why — the difference between
+    // "the provider was down" (fix it, retry) and "this turn will not distil" (nothing to do).
+    expect(release).toHaveBeenCalledWith(7, "upstream 500");
     expect(complete).not.toHaveBeenCalled();
   });
 

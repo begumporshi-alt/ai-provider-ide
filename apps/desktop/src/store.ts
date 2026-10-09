@@ -330,10 +330,20 @@ export async function buildRepairPlan(evidence: DriftEvidence): Promise<RepairPl
   }
 }
 
-function routerSettingsLabel(): string {
+/**
+ * The System AI label, as the generation audit records it: `slug/model (system)`.
+ *
+ * The slug lookup can fail — the System AI provider can be deleted while the setting still names it
+ * — and the audit is a permanent trail, so a failed lookup must name the gap ("unknown-provider")
+ * rather than let a template literal print the string `undefined` into it. Exported because the
+ * onboarding wizard used to keep a private copy of this exact function, and its copy was the one
+ * without a fallback.
+ */
+export function routerSettingsLabel(): string {
   const sa = router.settings.systemAi;
-  if (sa) return `${registry.getProvider(sa.providerId)?.slug ?? "?"}/${sa.model} (system)`;
-  return "auto (system)";
+  if (!sa) return "auto (system)";
+  const slug = registry.getProvider(sa.providerId)?.slug ?? "unknown-provider";
+  return `${slug}/${sa.model} (system)`;
 }
 
 /**
@@ -571,6 +581,15 @@ async function runBootstrap(): Promise<void> {
   // `if (settingsRaw)` guard did.
   Object.assign(router.settings, routerSettings);
 
+  // Heal a System AI setting that outlived its provider (deleted while selected, before
+  // `deleteProvider` learned to clear it). Hydration is the one moment the registry and the
+  // setting are both in hand, so the dangle is repaired here and persisted — otherwise every
+  // generation audit keeps recording an unattributable "unknown-provider" label forever.
+  if (router.settings.systemAi && !registry.getProvider(router.settings.systemAi.providerId)) {
+    router.settings.systemAi = null;
+    persistRouterSettings();
+  }
+
   // Self-heal a stale catalog: a persisted cache can outlive its adapter's modality rules
   // (the 2026-09-16 rawMatch amendment is the case), and `isStale` was never called, so a
   // pre-fix cache would otherwise keep showing wrong classifications until a manual refresh.
@@ -707,6 +726,14 @@ export async function setProviderRotation(id: string, rotationStrategy: Provider
 export async function deleteProvider(id: string): Promise<void> {
   await fetchAdmin("DELETE", `/admin/providers/${id}`); // cascades; host recomputes the allowlist
   adapters.unregister(id);
+  // The System AI setting holds this provider's id, and a dangling one is silent: every later
+  // generation still runs, but the audit label lookup fails and the trail fills with rows no one
+  // can attribute. The Settings dropdown would show an empty selection, which reads as "unset",
+  // not "broken" — so the delete that causes the dangle clears the setting here.
+  if (router.settings.systemAi?.providerId === id) {
+    router.settings.systemAi = null;
+    persistRouterSettings();
+  }
   await refreshFromHost();
 }
 
@@ -1269,6 +1296,31 @@ export async function slugifySkill(name: string): Promise<string> {
   return invoke<string>("skills_slugify", { name });
 }
 
+// ---------- subagent definition files (dispatch_agent specialists) ----------
+// Thin invokes over the host's agent-def file CRUD; validation happens in
+// `lib/agents/defs.ts` on every load, so a hand-edited file is a visible skip, never a crash.
+
+export interface AgentDefFile {
+  fileName: string;
+  contentJson: string;
+}
+
+export async function agentDefsList(): Promise<AgentDefFile[]> {
+  return invoke<AgentDefFile[]>("agent_defs_list");
+}
+
+export async function agentDefSave(id: string, contentJson: string): Promise<void> {
+  await invoke("agent_def_save", { id, contentJson });
+}
+
+export async function agentDefSetEnabled(id: string, enabled: boolean): Promise<void> {
+  await invoke("agent_def_set_enabled", { id, enabled });
+}
+
+export async function agentDefDelete(id: string): Promise<boolean> {
+  return invoke<boolean>("agent_def_delete", { id });
+}
+
 // ---------- P6: agent orchestrator ----------
 
 export interface AgentRun {
@@ -1279,6 +1331,8 @@ export interface AgentRun {
   model: string; status: string;
   prompt: string | null; iterations: number; tool_calls: number;
   started_at: number; ended_at: number | null; error: string | null;
+  /** This run's own model calls, summed — `0` also means "recorded before migration 0025". */
+  prompt_tokens: number; completion_tokens: number;
 }
 export interface AgentStep {
   seq: number; kind: string; label: string | null;
@@ -1303,6 +1357,8 @@ export async function agentStepAppend(a: {
 
 export async function agentRunFinish(a: {
   runId: string; status: string; iterations: number; error: string | null;
+  /** The run's own model calls. Omitted means "no usage reported" — the host stores 0. */
+  promptTokens?: number; completionTokens?: number;
 }): Promise<void> {
   await invoke("agent_run_finish", a);
 }
@@ -1522,6 +1578,12 @@ export interface QueueStatus {
   queued: number; processing: number; done: number; failed: number; outstanding: number;
   /** §10(2): distillations still available in this rolling hour. Absent on an older host. */
   budget_left?: number;
+  /**
+   * Why the retired rows were retired, commonest first. Absent on a host older than migration
+   * 0026. A bare `failed` count says something was lost; the reason says whether it is worth
+   * acting on — a provider outage is re-runnable, an undistillable turn is not.
+   */
+  failed_reasons?: { reason: string; count: number }[];
 }
 
 /**
@@ -1540,9 +1602,13 @@ export async function captureComplete(id: number): Promise<boolean> {
 /**
  * Give a row back. The host retires it after three attempts rather than retrying forever — a turn
  * that will not distil is not going to start.
+ *
+ * `error` is why the attempt failed. It is recorded on the row and surfaced on the Memory screen,
+ * because "3 turns failed" with no reason is not something anyone can act on: a provider outage
+ * leaves the turns re-runnable, a distilled-nothing reply does not.
  */
-export async function captureRelease(id: number): Promise<boolean> {
-  return invoke<boolean>("capture_release", { id });
+export async function captureRelease(id: number, error?: string): Promise<boolean> {
+  return invoke<boolean>("capture_release", { id, ...(error ? { error } : {}) });
 }
 
 /** Put back rows whose claim went stale, i.e. the webview died mid-batch. */

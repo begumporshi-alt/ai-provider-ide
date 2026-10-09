@@ -87,10 +87,15 @@ export async function drainOnce(
         await captureComplete(row.id).catch(() => false);
         out.distilled += 1;
         out.atoms += atoms.length;
-      } catch {
+      } catch (e) {
         // Give it back. The host retires the row after three attempts, so a turn that will not
         // distil cannot wedge the queue.
-        await captureRelease(row.id).catch(() => false);
+        //
+        // The reason travels with it. This `catch` used to swallow the error entirely, which is
+        // why the Memory screen could report "3 failed" and nothing else — the reader could not
+        // tell a provider outage (retry, or fix the key, and the turns distil) from a turn no
+        // model can distil (nothing to do). The message is the whole difference.
+        await captureRelease(row.id, e instanceof Error ? e.message : String(e)).catch(() => false);
         out.released += 1;
       }
     }
