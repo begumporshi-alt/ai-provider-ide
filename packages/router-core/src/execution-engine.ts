@@ -133,6 +133,8 @@ export class ExecutionEngine {
     // The last attempt's reasoning and finish reason, reset with `observation` so all three
     // describe the same candidate the ledger row will blame.
     let reasoning = "";
+    /** Set once, so the truncation marker below is appended at most once per attempt. */
+    let reasoningTruncated = false;
     let finishReason: string | undefined;
     const SAMPLE_CHARS = 240;
     async function* stream(): AsyncGenerator<string, void, void> {
@@ -154,6 +156,7 @@ export class ExecutionEngine {
         let tally: StreamTally = emptyTally();
         observation = undefined;
         reasoning = "";
+        reasoningTruncated = false;
         finishReason = undefined;
         // **A tool call is delivered output, so it marks the candidate as `served`.** `served` is
         // what `wrapLedger` tests (`model-router.ts:429`) and what names the provider on the row,
@@ -198,7 +201,17 @@ export class ExecutionEngine {
               // the engine keeps its own bounded copy so the ledger row can say whether reasoning
               // was the reason the turn produced no answer.
               onReasoningDelta: t => {
-                if (reasoning.length < MAX_REASONING_CHARS) reasoning += t;
+                // The cap is a memory bound, but it must not be a *silent* one: this buffer is
+                // what the ledger's reasoning evidence and the agent loop's NO_OUTPUT
+                // classification read, so a record that stops mid-sentence reads as a model that
+                // stopped reasoning. The marker says what actually happened — the same convention
+                // `SUBAGENT_RESULT_CAP` follows — and it is appended once.
+                if (reasoning.length < MAX_REASONING_CHARS) {
+                  reasoning += t;
+                } else if (!reasoningTruncated) {
+                  reasoningTruncated = true;
+                  reasoning += "\n\n(reasoning truncated — the provider streamed past the engine's limit)";
+                }
                 args.onReasoning?.(t);
               },
               onFinish: r => {
