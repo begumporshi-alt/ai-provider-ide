@@ -551,9 +551,9 @@ function saveAssistantSettings(s: AssistantSettings): void {
 export function AssistantScreen() {
   // `Chat` subscribes to the tick itself (the skills block re-reads on it), so this shell does
   // not — and not subscribing is what keeps a store bump from tearing down the transcript.
-  const [tab, setTab] = useState<"text" | "image" | "root">("text");
+  const [tab, setTab] = useState<"text" | "root">("text");
   // This screen stays mounted while other screens are shown (App.tsx hides it with CSS, the same
-  // cure the Chat/Image tabs got). "Active" is therefore a fact from the store, not from being
+  // cure the Chat/Root tabs got). "Active" is therefore a fact from the store, not from being
   // mounted: it gates the header portal (otherwise the session bar would ride along on every
   // screen) and Chat's keyboard bindings (otherwise Escape would stop a run from a screen the
   // user cannot see the run on).
@@ -564,7 +564,7 @@ export function AssistantScreen() {
   // The DOM node the session features portal into (see the title row). State, not a ref: Chat has
   // to re-render once the node exists, which a ref callback + setState gives us for free.
   const [sessionSlot, setSessionSlot] = useState<HTMLDivElement | null>(null);
-  // The switches live here, above `Chat`, so switching Chat/Image does not silently reset them.
+  // The switches live here, above `Chat`, so switching Chat/Root does not silently reset them.
   // `Chat` stays mounted through a tab switch (hidden with CSS); how the user has configured the
   // screen outliving the tab change is the difference between "the tab changed" and "my settings
   // changed".
@@ -867,7 +867,7 @@ export function AssistantScreen() {
     // shell's padding.
     <div className="flex h-full w-full flex-col" data-testid="assistant-column">
       {/* The screen's header lives in the top bar now: the session features (portal from `Chat`,
-          which owns their state) and the three tabs portal into the shell's header slot, so the
+          which owns their state) and the two tabs portal into the shell's header slot, so the
           screen no longer spends a title row of its own under a bar that used to repeat the same
           screen name as a breadcrumb. */}
       {/* Gated on `screenActive`, not just `headerSlot`: this screen is mounted while other
@@ -893,14 +893,14 @@ export function AssistantScreen() {
             </button>
           ) : null}
           <div className="flex shrink-0 gap-1 rounded-lg border p-0.5" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
-            {(["text", "image", "root"] as const).map((t) => (
+            {(["text", "root"] as const).map((t) => (
               <button
                 key={t}
                 onClick={() => setTab(t)}
                 className="rounded-md px-3 py-1 text-[12px] font-medium transition-colors"
                 style={tab === t ? { background: "var(--surface-2)", color: "var(--text)" } : { color: "var(--text-dim)" }}
               >
-                {t === "text" ? "Chat" : t === "image" ? "Image" : "Root"}
+                {t === "text" ? "Chat" : "Root"}
               </button>
             ))}
           </div>
@@ -912,7 +912,7 @@ export function AssistantScreen() {
           Re-rendering is enough: the skills block re-reads on `tick` through its own effect,
           and the model list comes from the store. */}
       {/* Both panels stay mounted; the inactive one is hidden with CSS. Switching tabs used to
-          UNMOUNT `Chat`, which took the transcript with it (Chat → Image → Chat lost the whole
+          UNMOUNT `Chat`, which took the transcript with it (Chat → Root → Chat lost the whole
           visible conversation and started blank) and orphaned an in-flight turn: its
           AbortController lived in the component that had just been destroyed, so the run could not
           be cancelled and its Stop button was gone. Keeping both mounted preserves the transcript,
@@ -943,12 +943,8 @@ export function AssistantScreen() {
           corner={modelCorner}
           sessionSlot={sessionSlot}
           onEditPrompts={() => setEditingPrompt("system")}
-          onSwitchToImageTab={() => setTab("image")}
           active={screenActive && tab === "text"}
         />
-      </div>
-      <div className={tab === "image" ? "min-h-0 flex-1" : "hidden"}>
-        <ImageBox />
       </div>
       <div className={tab === "root" ? "min-h-0 flex-1" : "hidden"}>
         <RootPane
@@ -1376,7 +1372,6 @@ function Chat({
   corner,
   sessionSlot,
   onEditPrompts,
-  onSwitchToImageTab,
   active,
 }: {
   noTools: boolean;
@@ -1423,11 +1418,9 @@ function Chat({
    */
   sessionSlot: HTMLDivElement | null;
   onEditPrompts: () => void;
-  /** Switch the AssistantScreen to the Image tab (`/image`). */
-  onSwitchToImageTab: () => void;
-  /** Whether this panel is the visible tab. Keyboard actions are gated on it: the Image tab keeps
+  /** Whether this panel is the visible tab. Keyboard actions are gated on it: the Root tab keeps
    *  `Chat` mounted but `hidden`, so a shortcut bound here would otherwise fire (and focus an
-   *  invisible composer) while the user is looking at the Image tab. */
+   *  invisible composer) while the user is looking at the Root tab. */
   active: boolean;
 }) {
   const tick = useUi((s) => s.tick);
@@ -1950,10 +1943,10 @@ function Chat({
           subagentDefs: await agentDefsList()
             .catch(() => [] as { fileName: string; contentJson: string }[])
             .then((files) => parseSubagentDefs(files).defs.filter((d) => d.enabled)),
-          // Agent-mode image generation reuses the Image tab's serving path: the gateway's
-          // `/v1/images/generations`, default model from Router Settings → defaults. A provider
-          // that answers with a link has its bytes pulled through the host's scoped fetch, so
-          // the loop always receives base64 it can hand to write_file.
+          // Agent-mode image generation is served by the gateway's `/v1/images/generations`,
+          // default model from Router Settings → defaults. A provider that answers with a link
+          // has its bytes pulled through the host's scoped fetch, so the loop always receives
+          // base64 it can hand to write_file.
           generateImage: (prompt, model, signal) => {
             const chosenImage =
               model ||
@@ -2823,7 +2816,6 @@ function Chat({
           onStop={stopRun}
           onClear={newChat}
           onOpenModelPicker={onOpenModelPicker}
-          onSwitchToImageTab={onSwitchToImageTab}
           onCompact={() => void compactNow()}
           listFiles={mentionHost ? listWorkspaceFiles : null}
           readFile={mentionHost ? readWorkspaceFile : null}
@@ -3464,104 +3456,5 @@ function ApprovalPicker({
         ))}
       </select>
     </label>
-  );
-}
-
-function ImageBox() {
-  const [model, setModel] = useState("");
-  const [prompt, setPrompt] = useState("");
-  const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<{ url?: string; base64?: string; ms: number; provider?: string; key?: string } | null>(null);
-  const [shown, setShown] = useState<string | null>(null); // data: URI once the bytes are in hand
-  const [fetchNote, setFetchNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [progress, setProgress] = useState("");
-  // A generation can take tens of seconds; without this there was no way out but to wait for it.
-  const abortRef = useRef<AbortController | null>(null);
-  const def = (router.settings as typeof router.settings & { defaults?: Record<string, string> }).defaults?.image ?? "";
-  const chosen = model || def;
-
-  async function go() {
-    if (!prompt.trim() || !chosen || busy) return;
-    const ac = new AbortController();
-    abortRef.current = ac;
-    setBusy(true);
-    setError(null);
-    setResult(null);
-    setShown(null);
-    setFetchNote(null);
-    const t0 = Date.now();
-    setProgress("Queued at the router…");
-    const timer = window.setTimeout(() => setProgress("Waiting for the provider…"), 1500);
-    try {
-      // A1 Phase 2: served by the gateway's OpenAI-shaped image route, like every client.
-      const res = await gatewayGenerateImage({ model: chosen, prompt: prompt.trim() }, { signal: ac.signal });
-      setProgress("");
-      setResult({ ...res, ms: Date.now() - t0, provider: chosen.split("/")[0] });
-
-      if (res.base64) {
-        setShown(`data:image/png;base64,${res.base64}`);
-      } else if (res.url) {
-        // Provider-returned URL (e.g. a CDN link). The webview CSP blocks it directly; pull
-        // the bytes through the host's scoped fetch (invariant 3 carve-out, no secret sent).
-        setFetchNote("fetching the image through the host…");
-        try {
-          setShown(await fetchImageUrl(res.url));
-          setFetchNote(null);
-        } catch (e) {
-          setFetchNote(`could not load the image (${(e as Error).message}) — the link below still works`);
-        }
-      }
-    } catch (e) {
-      // A user-initiated stop is not a failure to report in red — it is the thing they asked for.
-      setProgress("");
-      setError(ac.signal.aborted ? "stopped by you" : (e as Error).message);
-    } finally {
-      clearTimeout(timer);
-      abortRef.current = null;
-      setBusy(false);
-    }
-  }
-
-  return (
-    <div className="rounded-md border p-4" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
-      <div className="mb-3 flex items-center gap-2">
-        <ModelPicker modality="image" value={chosen} onChange={setModel} />
-        {registry.listProviders().length === 0 && (
-          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
-            image models come from providers whose catalog tags them (dall-e / flux / sd / imagen / seedream / nano-banana patterns)
-          </span>
-        )}
-      </div>
-      <textarea
-        className={`${inputCls} mb-2 resize-none`}
-        style={inputStyle}
-        rows={3}
-        value={prompt}
-        onChange={(e) => setPrompt(e.target.value)}
-        placeholder="A tiny lighthouse on a stormy cliff, painterly…"
-      />
-      <div className="flex items-center gap-3">
-        {busy ? (
-          <Button variant="danger" onClick={() => abortRef.current?.abort()}>■ Stop</Button>
-        ) : (
-          <Button variant="primary" disabled={!chosen || !prompt.trim()} onClick={() => void go()}>Generate</Button>
-        )}
-        {progress && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{progress}</span>}
-        {fetchNote && <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>{fetchNote}</span>}
-      </div>
-      {error && <p className="mt-3 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
-      {result && (
-        <div className="mt-3">
-          <p className="mono mb-2 text-[11px]" style={{ color: "var(--text-dim)" }}>
-            ✓ {result.ms}ms · {result.provider}{result.key ? ` · ${result.key}` : ""}
-          </p>
-          {shown && <img alt="generated" src={shown} className="max-h-80 rounded border" style={{ borderColor: "var(--border)" }} />}
-          {result.url && (
-            <p className="mono mt-1 text-[11px] break-all" style={{ color: "var(--text-faint)" }}>{result.url}</p>
-          )}
-        </div>
-      )}
-    </div>
   );
 }

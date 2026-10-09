@@ -9,8 +9,9 @@
  *
  * `match` is tested against the option's label, which carries the provider slug (`slug/nativeId`).
  *
- * Both the text and image pickers are always mounted; the inactive tab is hidden with CSS, which
- * removes it from the accessibility tree — so only the visible picker's button and options match.
+ * The Assistant keeps more than one picker mounted (the composer's corner and the run
+ * configuration card); a hidden one is out of the accessibility tree, so only the visible
+ * picker's button and options match.
  */
 import { type Page } from "@playwright/test";
 

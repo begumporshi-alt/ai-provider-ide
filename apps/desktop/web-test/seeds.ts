@@ -55,8 +55,8 @@ function systemAi(): SeedInput {
   const providerId = "seed-oracle";
   // BUILTIN_TEMPLATES["openai-compat"] is the raw openaiCompat(baseUrl) builder; PROVIDER_PROFILES
   // only carries the three sketch providers (openrouter/opencode/b.ai), which pin other baseUrls.
-  // imageEndpoint:true gives the oracle the image endpoint + modality rules the Assistant's
-  // Image tab needs (the mock serves a URL, exercising the host egress carve-out).
+  // imageEndpoint:true gives the oracle the image endpoint + modality rules the agent loop's
+  // generate_image needs (the mock serves a URL, exercising the host egress carve-out).
   const manifest = BUILTIN_TEMPLATES["openai-compat"](ORACLE_BASE, { imageEndpoint: true });
   return {
     providers: [
@@ -122,8 +122,8 @@ function systemAi(): SeedInput {
         // provider published none.
         pricingJson: null, capabilitiesJson: null,
       },
-      // Image model: "sd-" matches the openai-compat modality rule, so the Assistant's
-      // Image tab lists it and the interpreter routes /images/generations.
+      // Image model: "sd-" matches the openai-compat modality rule, so the image model list
+      // includes it and the interpreter routes /images/generations.
       {
         providerId, nativeId: "sd-oracle-1", modality: "image", contextWindow: null, fetchedAt: now,
         pricingJson: null, capabilitiesJson: null,
@@ -143,8 +143,8 @@ function systemAi(): SeedInput {
  * The production bug shape, reproduced (regression fixture for the 2026-09-16 modality
  * amendment): an ENABLED OpenRouter provider whose cache holds a catalog with ZERO image
  * models — exactly what the anchored id-pattern rule produced before the fix, and what is
- * still sitting in a real user's SQLite after upgrading. The Image tab is empty here, and the
- * spec asserts that Models > Refresh fills it by classifying the provider's own metadata.
+ * still sitting in a real user's SQLite after upgrading. The image model list is empty here,
+ * and the spec asserts that Models > Refresh fills it by classifying the provider's own metadata.
  *
  * slug is deliberately "openrouter" so store.ts registers the REAL shipped profile (not a
  * template): the seed's cached rows cannot hide a regression in that profile, because the rows
@@ -182,7 +182,7 @@ function orRouter(): SeedInput {
         lastTestedAt: null,
       },
     ],
-    // The pre-fix cache: every namespaced id tagged text, so the Image tab has nothing.
+    // The pre-fix cache: every namespaced id tagged text, so the image model list has nothing.
     models: [
       {
         providerId, nativeId: "openai/gpt-5-image", modality: "text", contextWindow: null, fetchedAt: now,

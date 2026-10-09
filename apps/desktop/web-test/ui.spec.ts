@@ -155,49 +155,22 @@ test("state persists across reload mid-wizard", async ({ page }) => {
 });
 
 // ---------------------------------------------------------------------------
-// Story 4 — a provider that returns an image URL (not base64) still renders. The webview CSP
-// blocks remote images, so the bytes come back through the host's scoped egress carve-out
-// (invariant 3: the URL was returned in that provider's own response) and render as data:.
-// ---------------------------------------------------------------------------
-
-test("image URL from a provider is fetched through egress and rendered", async ({ page }) => {
-  await page.goto(`${APP}?seed=systemai`);
-  await expect(page.getByText("System AI (mock)")).toBeVisible();
-
-  await page.getByRole("button", { name: "Assistant" }).click();
-  await page.getByRole("button", { name: "Image" }).click();
-  await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
-
-  await pickModel(page, /sd-oracle-1/);
-  await page.getByRole("button", { name: "Generate" }).click();
-
-  // The provider answered with a URL on the mock's origin; the UI must have pulled its bytes
-  // through egress and rendered them — a CSP-blocked URL would leave no img at all.
-  const img = page.locator('img[alt="generated"]');
-  await expect(img).toBeVisible({ timeout: 30_000 });
-  const src = await img.getAttribute("src");
-  expect(src).toMatch(/^data:image\/png;base64,/);
-
-  // Wire-level truth: the image request hit the mock's actual bytes endpoint.
-  const seenImg = await (await page.request.get(`${MOCK_ORIGIN}/v1/e2e/img-seen`)).json();
-  expect(seenImg.path).toBe("/v1/img/tiny.png");
-});
-
-// ---------------------------------------------------------------------------
 // Story 5 — the OpenRouter regression (2026-09-16 modality amendment, DECISIONS.md).
 //
 // The seed reproduces the exact state a real user is left in after upgrading: an enabled
 // OpenRouter provider whose persisted catalog has EVERY namespaced id tagged "text", because
-// the profile's anchored id-pattern rule ("^dall-e|flux|...") matches none of them. The Image
-// tab is therefore empty. Models > Refresh must re-list the provider and classify from the
-// provider's OWN metadata — architecture.output_modalities — through map.raw -> rawMatch.
+// the profile's anchored id-pattern rule ("^dall-e|flux|...") matches none of them. The image
+// model list is therefore empty. Models > Refresh must re-list the provider and classify from
+// the provider's OWN metadata — architecture.output_modalities — through map.raw -> rawMatch.
 //
 // Asserted precisely, because a loose check would pass on the wrong behaviour:
-//   - the two image-primary models appear in the Image tab;
+//   - the two image-primary models appear in the image model list;
 //   - openrouter/auto does NOT, even though its output_modalities also names "image"
 //     (its PRIMARY output is text — the whole reason the rule reads index [0]);
-//   - generation still works: the provider's real route is /images, and it answers with
-//     base64 + media_type and no url, which the UI must render.
+//   - generation still works: driven through the agent loop (the only image path since the
+//     Image tab was removed), whose mock scripts generate_image naming gpt-5-image. The
+//     provider's real route is /images, and it answers with base64 + media_type and no url,
+//     which the loop lands in the workspace with write_file.
 // ---------------------------------------------------------------------------
 
 test("OpenRouter: image models are discovered from provider metadata, not their ids", async ({ page }) => {
@@ -220,16 +193,29 @@ test("OpenRouter: image models are discovered from provider metadata, not their 
   await expect(page.getByText("openrouter/auto")).toBeVisible();
   await expect(page.getByText("2 text models")).toBeVisible();
 
-  // And generation routes to the provider's real image API, rendering the returned base64.
+  // And generation routes to the provider's real image API — through the agent loop, the one
+  // image path the Assistant has left: the mock's chat handler scripts generate_image, the
+  // gateway's image ingress translates the model to OpenRouter's /images route, and the loop
+  // writes the returned base64 into the workspace.
   await page.getByRole("button", { name: "Assistant" }).click();
-  await page.getByRole("button", { name: "Image" }).click();
-  await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
-  await pickModel(page, /openai\/gpt-5-image/);
-  await page.getByRole("button", { name: "Generate" }).click();
+  await pickModel(page, /gpt-4o/);
+  await openRunConfig(page);
+  await page.getByLabel("agent mode").check();
+  await closeRunConfig(page);
+  await page.getByRole("button", { name: "Root", exact: true }).click();
+  await page.getByPlaceholder(/absolute\/path/).fill("/tmp");
+  await page.getByRole("button", { name: "Chat", exact: true }).click();
+  await page.getByPlaceholder(/Describe a task for the agent/).fill("draw me a pixel");
+  await page.getByRole("button", { name: "Send" }).click();
 
-  const img = page.locator('img[alt="generated"]');
-  await expect(img).toBeVisible({ timeout: 30_000 });
-  expect(await img.getAttribute("src")).toMatch(/^data:image\/png;base64,/);
+  await expect(page.getByRole("heading", { name: /Allow this (tool call|change)\?/ })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+
+  await expect(page.getByText(/generated and saved: images\/or\.png/)).toBeVisible({ timeout: 30_000 });
+  // The bytes really landed in the sandbox — a receipt alone would pass even if the write failed.
+  await expect
+    .poll(() => page.evaluate(() => Object.keys((window as unknown as { __webTest: { vfs: () => Record<string, string> } }).__webTest.vfs())))
+    .toContain("images/or.png");
 });
 
 // ---------------------------------------------------------------------------

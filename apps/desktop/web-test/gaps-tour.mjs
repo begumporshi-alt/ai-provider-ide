@@ -155,21 +155,5 @@ async function attempt(name, fn) {
   await page.close();
 }
 
-// Image tab (the Image screen the generate_image port reuses)
-{
-  const page = await browser.newPage();
-  await page.setViewportSize({ width: 1280, height: 860 });
-  await page.goto(`${APP}?seed=systemai`);
-  await page.getByRole("button", { name: "Assistant", exact: true }).click();
-  await page.getByRole("button", { name: "Image", exact: true }).click();
-  await page.getByPlaceholder(/A tiny lighthouse/).fill("a tiny red pixel");
-  await page.getByRole("button", { name: /open picker/ }).click();
-  await page.getByRole("option").filter({ hasText: /sd-oracle-1/ }).first().click();
-  await page.getByRole("button", { name: "Generate", exact: true }).click();
-  await page.locator('img[alt="generated"]').waitFor({ timeout: 30_000 });
-  await shot(page, "image-tab-generated.png");
-  await page.close();
-}
-
 await browser.close();
 console.log("screenshots written to", OUT);

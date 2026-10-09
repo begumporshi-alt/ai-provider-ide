@@ -6,7 +6,7 @@
  * output gone. App.tsx unmounted the screen on every switch; the in-flight turn kept streaming
  * into the dead component, and the way back in re-read the session's stored turns over the live
  * transcript. The cure keeps the screen mounted and hidden with CSS — the same one its own
- * Chat/Image tabs got — so these assertions pin three facts:
+ * Chat/Root tabs got — so these assertions pin three facts:
  *
  *   1. while away, the Assistant's header controls do not bleed onto the other screen;
  *   2. coming back mid-turn, the transcript is exactly as it was left, still streaming;
@@ -36,7 +36,7 @@ test("leaving mid-turn and coming back keeps the live transcript", async ({ page
   // --- leave while the turn runs --------------------------------------------------------
   await page.getByRole("button", { name: "Agents", exact: true }).click();
   // On the other screen the Assistant's header portal must be gone: the session bar and the
-  // Chat/Image/Root tabs live in one shared slot, and a screen that stays mounted must not
+  // Chat/Root tabs live in one shared slot, and a screen that stays mounted must not
   // paint them over every other screen's header.
   await expect(page.getByRole("button", { name: "Chat", exact: true })).toBeHidden();
   await expect(page.getByRole("heading", { name: "Agents" })).toBeVisible();

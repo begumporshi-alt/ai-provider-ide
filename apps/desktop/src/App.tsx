@@ -89,7 +89,7 @@ export default function App() {
   return (
     <Shell>
       {/* The Assistant stays mounted across screen switches, hidden with CSS — the same cure its
-          own Chat/Image tabs needed (see Assistant.tsx): unmounting it orphaned an in-flight turn,
+          own Chat/Root tabs needed (see Assistant.tsx): unmounting it orphaned an in-flight turn,
           whose streaming updates flowed into a dead component, and the way back in re-read the
           session's *stored* turns over the live transcript, so a turn still running read as
           stopped-with-only-the-first-reply. Every other screen is stateless enough to remount. */}

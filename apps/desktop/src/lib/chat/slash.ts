@@ -7,11 +7,11 @@
  * *type* of the draft changes meaning — "/clear" is not a message to send — so the parse lives here,
  * in a `.ts` module a test can reach (vitest runs without jsdom).
  *
- * Deliberately tiny: four commands that do something the UI already does, so this file adds a way to
- * reach them rather than new behaviour to maintain.
+ * Deliberately tiny: three commands that do something the UI already does, so this file adds a way
+ * to reach them rather than new behaviour to maintain.
  */
 
-export type SlashCommandId = "clear" | "model" | "image" | "compact";
+export type SlashCommandId = "clear" | "model" | "compact";
 
 export interface SlashCommand {
   id: SlashCommandId;
@@ -24,7 +24,6 @@ export interface SlashCommand {
 export const SLASH_COMMANDS: readonly SlashCommand[] = [
   { id: "clear", name: "clear", summary: "Start a new chat, emptying this transcript" },
   { id: "model", name: "model", summary: "Open the model picker" },
-  { id: "image", name: "image", summary: "Switch to the Image tab" },
   { id: "compact", name: "compact", summary: "Summarise older turns to free context now" },
 ];
 

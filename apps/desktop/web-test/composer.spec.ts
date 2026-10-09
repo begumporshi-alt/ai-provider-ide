@@ -179,7 +179,7 @@ test("a text file is appended to the draft rather than turned into a part", asyn
   await expect(page.getByTestId("attachment-chip")).toHaveCount(0);
 });
 
-test("the slash menu lists commands, and /image switches the tab", async ({ page }) => {
+test("the slash menu lists commands, and /model opens the picker from it", async ({ page }) => {
   await openAssistant(page, /oracle-flash/);
 
   await page.getByTestId("composer-input").type("/");
@@ -188,9 +188,9 @@ test("the slash menu lists commands, and /image switches the tab", async ({ page
   await expect(menu.getByRole("option", { name: /compact/ })).toBeVisible();
 
   // Typing the whole name and pressing Enter runs it (the menu closes once the name is complete).
-  await page.getByTestId("composer-input").type("image");
+  await page.getByTestId("composer-input").type("model");
   await page.keyboard.press("Enter");
-  await expect(page.getByRole("button", { name: "Image", exact: true })).toHaveAttribute("style", /--surface-2/);
+  await expect(page.getByRole("listbox", { name: "Pick a model" })).toBeVisible();
   // The draft is consumed by the command, not left behind to be sent as a message.
   await expect(page.getByTestId("composer-input")).toHaveValue("");
 });

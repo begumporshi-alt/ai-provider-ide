@@ -72,7 +72,9 @@ function cors(res, extra = {}) {
   res.writeHead(204, {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept,X-Requested-With",
+    // HTTP-Referer/X-Title: the OpenRouter profile's textHeaders — a preflight that does not
+    // name them refuses the profile's chat requests before the handler ever runs.
+    "Access-Control-Allow-Headers": "Authorization,Content-Type,Accept,X-Requested-With,HTTP-Referer,X-Title",
     "Access-Control-Max-Age": "86400",
     ...extra,
   });
@@ -478,7 +480,7 @@ const OR_MODELS = {
   data: [
     { id: "openai/gpt-5-image", architecture: { input_modalities: ["text"], output_modalities: ["image", "text"] } },
     { id: "google/gemini-2.5-flash-image", architecture: { input_modalities: ["text", "image"], output_modalities: ["image", "text"] } },
-    // Dual-modality router: PRIMARY output is text, so it must NOT appear in the Image tab.
+    // Dual-modality router: PRIMARY output is text, so it must NOT be tagged an image model.
     { id: "openrouter/auto", architecture: { input_modalities: ["text"], output_modalities: ["text", "image"] } },
     { id: "openai/gpt-4o", architecture: { input_modalities: ["text"], output_modalities: ["text"] } },
   ],
@@ -501,6 +503,87 @@ async function orRouter(req, res, path) {
       data: [{ b64_json: PNG_1PX.toString("base64"), media_type: "image/png" }],
       usage: { prompt_tokens: 4, completion_tokens: 0, total_tokens: 4 },
     });
+  }
+  if (path === "/chat/completions" && req.method === "POST") {
+    const auth = req.headers.authorization;
+    if (auth !== `Bearer ${RAW_OR_KEY}`) return json(res, 401, { error: { message: "No auth credentials found" } });
+    // Exists to script the IMAGE story's agent round (ui.spec Story 5): on a draw prompt the
+    // model emits one generate_image call naming an image-primary model, so the loop exercises
+    // the gateway's image ingress against OpenRouter's real /images route. Same wire shapes as
+    // the oracle's handler above — the engine's interpreter consumes both identically.
+    const body = JSON.parse((await readBody(req)) || "{}");
+    const messages = body.messages ?? [];
+    const userPrompt = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const tools = Array.isArray(body.tools) && body.tools.length > 0;
+    const sawToolResult = messages.some((m) => m.role === "tool");
+    const calls = tools && !sawToolResult && /draw/i.test(String(userPrompt))
+      ? [{
+          name: "generate_image",
+          arguments: JSON.stringify({ prompt: "a tiny red pixel", model: "openai/gpt-5-image", path: "images/or.png" }),
+        }]
+      : [];
+    const content = calls.length === 0 ? "Done. The image is saved in the workspace." : "";
+    if (body.stream !== true) {
+      return json(res, 200, {
+        id: "chatcmpl-or-mock",
+        object: "chat.completion",
+        created: Math.floor(Date.now() / 1000),
+        model: body.model ?? "openai/gpt-4o",
+        choices: [{
+          index: 0,
+          message: {
+            role: "assistant",
+            content,
+            ...(calls.length > 0 ? {
+              tool_calls: calls.map((c, i) => ({
+                id: `call_or_mock_${i + 1}`,
+                type: "function",
+                function: { name: c.name, arguments: c.arguments },
+              })),
+            } : {}),
+          },
+          finish_reason: calls.length > 0 ? "tool_calls" : "stop",
+        }],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      });
+    }
+    res.writeHead(200, {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Access-Control-Allow-Origin": "*",
+    });
+    for (const [i, c] of calls.entries()) {
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { tool_calls: [{
+          index: i, id: `call_or_mock_${i + 1}`, type: "function",
+          function: { name: c.name, arguments: "" },
+        }] } }],
+      })}\n\n`);
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: { tool_calls: [{
+          index: i,
+          function: { arguments: c.arguments },
+        }] } }],
+      })}\n\n`);
+    }
+    if (calls.length > 0) {
+      res.write(`data: ${JSON.stringify({
+        choices: [{ index: 0, delta: {}, finish_reason: "tool_calls" }],
+      })}\n\n`);
+    } else {
+      for (const w of content.split(" ")) {
+        res.write(`data: ${JSON.stringify({ choices: [{ delta: { content: w + " " } }] })}\n\n`);
+      }
+      res.write(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: "stop" }] })}\n\n`);
+    }
+    if (body.stream_options?.include_usage === true) {
+      res.write(`data: ${JSON.stringify({
+        choices: [],
+        usage: { prompt_tokens: 5, completion_tokens: 3, total_tokens: 8 },
+      })}\n\n`);
+    }
+    res.write("data: [DONE]\n\n");
+    return res.end();
   }
   return notFound(res);
 }

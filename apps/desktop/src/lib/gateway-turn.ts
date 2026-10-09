@@ -152,7 +152,8 @@ export async function gatewayGenerate(
 
 /**
  * One image generation, over the gateway's OpenAI-shaped `/v1/images/generations`. The
- * response is normalized to what the Image tab consumes: `url` (a provider/CDN link) or
+ * response is normalized to what the agent loop's generate_image port consumes: `url` (a
+ * provider/CDN link) or
  * `base64` (the bytes), exactly one of which the gateway's image path produces.
  */
 export async function gatewayGenerateImage(

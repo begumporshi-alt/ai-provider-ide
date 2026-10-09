@@ -10,6 +10,7 @@
 import { expect, test } from "@playwright/test";
 import { pickModel } from "./model-picker";
 import { closeRunConfig, openRunConfig } from "./run-config";
+import { MOCK_ORIGIN } from "./seeds";
 
 const APP = "/web-test/";
 
@@ -104,4 +105,10 @@ test("gap 4: generate_image produces bytes, saves them in the workspace, and rep
   await expect
     .poll(() => page.evaluate(() => Object.keys((window as unknown as WebTest).__webTest.vfs())))
     .toContain("images/drawn.png");
+
+  // And the bytes really came from the provider: the mock answers with a URL, so the loop had to
+  // fetch it back through the host's scoped egress carve-out (the webview CSP forbids the mock's
+  // origin directly) — this is the wire-level proof that the fetch actually dialed the provider.
+  const seenImg = await (await page.request.get(`${MOCK_ORIGIN}/v1/e2e/img-seen`)).json();
+  expect(seenImg.path).toBe("/v1/img/tiny.png");
 });

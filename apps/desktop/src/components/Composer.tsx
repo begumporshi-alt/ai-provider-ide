@@ -149,7 +149,6 @@ export interface ComposerProps {
   /** Slash commands the composer cannot run itself. */
   onClear: () => void;
   onOpenModelPicker: () => void;
-  onSwitchToImageTab: () => void;
   onCompact: () => void;
   /** Workspace listing for @-mentions and the Project files panel, or null when there is no root. */
   listFiles: (() => Promise<MentionCandidate[]>) | null;
@@ -203,7 +202,6 @@ export function Composer({
   sendDisabled = false,
   onClear,
   onOpenModelPicker,
-  onSwitchToImageTab,
   onCompact,
   listFiles,
   readFile,
@@ -536,7 +534,6 @@ export function Composer({
     switch (command.id) {
       case "clear": onClear(); break;
       case "model": onOpenModelPicker(); break;
-      case "image": onSwitchToImageTab(); break;
       case "compact": onCompact(); break;
     }
   }
