@@ -25,3 +25,9 @@ apps/desktop/src-tauri/*.db-wal
 .env.*
 *.pem
 *.key
+
+# ZCode's own workspace (design artefacts, plans) — never part of the app.
+.zcode/
+
+# Playwright failure artefacts: evidence for a debugging session, not a deliverable.
+apps/desktop/web-test/screenshots/
