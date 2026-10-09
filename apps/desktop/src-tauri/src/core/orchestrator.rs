@@ -134,7 +134,15 @@ pub fn finish(
     conn.execute(
         "UPDATE agent_runs SET status=?2, iterations=?3, error=?4, ended_at=?5, \
          prompt_tokens=?6, completion_tokens=?7 WHERE id=?1",
-        rusqlite::params![run_id, status, iterations, error, now_ms(), prompt_tokens, completion_tokens],
+        rusqlite::params![
+            run_id,
+            status,
+            iterations,
+            error,
+            now_ms(),
+            prompt_tokens,
+            completion_tokens
+        ],
     )
     .map_err(|e| e.to_string())?;
     Ok(())

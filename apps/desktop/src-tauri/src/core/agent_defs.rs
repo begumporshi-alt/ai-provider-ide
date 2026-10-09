@@ -76,9 +76,9 @@ pub fn agents_dir(app_data_dir: &Path) -> PathBuf {
 pub fn is_valid_id(id: &str) -> bool {
     let bytes = id.as_bytes();
     !(bytes.is_empty() || bytes.len() > 64)
-        && bytes.iter().all(|b| {
-            b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_'
-        })
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-' || *b == b'_')
         && !id.starts_with('-')
         && !id.starts_with('_')
 }
@@ -112,8 +112,8 @@ pub fn save_def(app_data_dir: &Path, id: &str, content_json: &str) -> Result<(),
     if !is_valid_id(id) {
         return Err(format!("invalid agent definition id: {id:?}"));
     }
-    let parsed: serde_json::Value =
-        serde_json::from_str(content_json).map_err(|e| format!("content is not valid JSON: {e}"))?;
+    let parsed: serde_json::Value = serde_json::from_str(content_json)
+        .map_err(|e| format!("content is not valid JSON: {e}"))?;
     if !parsed.is_object() {
         return Err("content must be a JSON object".to_string());
     }
@@ -122,7 +122,8 @@ pub fn save_def(app_data_dir: &Path, id: &str, content_json: &str) -> Result<(),
     // Pretty-printed: the files are user-editable by design, so diffing and hand-editing them
     // must not fight a single-line blob.
     let pretty = serde_json::to_string_pretty(&parsed).map_err(|e| e.to_string())?;
-    fs::write(dir.join(format!("{id}.json")), pretty).map_err(|e| format!("could not write the file: {e}"))
+    fs::write(dir.join(format!("{id}.json")), pretty)
+        .map_err(|e| format!("could not write the file: {e}"))
 }
 
 /// Flip the `enabled` field in place: read, patch, write. The JSON round-trip preserves any
@@ -200,14 +201,20 @@ mod tests {
         ensure_builtin_defs(&dir); // idempotent: repeat runs change nothing
         let again = list_defs(&dir);
         assert_eq!(again.len(), first.len(), "no re-seed, no duplicates");
-        let mapper = again.iter().find(|f| f.file_name == "codebase-mapper").expect("still present");
+        let mapper =
+            again.iter().find(|f| f.file_name == "codebase-mapper").expect("still present");
         let v: serde_json::Value = serde_json::from_str(&mapper.content_json).unwrap();
-        assert_eq!(v["enabled"], serde_json::Value::Bool(false), "the user's edit survived the re-seed");
+        assert_eq!(
+            v["enabled"],
+            serde_json::Value::Bool(false),
+            "the user's edit survived the re-seed"
+        );
 
         // Every seed must clear the same guard the TypeScript side applies, or a builtin would
         // land as a skip-warning row the day it ships.
         for f in &again {
-            let parsed: serde_json::Value = serde_json::from_str(&f.content_json).expect("valid JSON");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&f.content_json).expect("valid JSON");
             assert!(parsed.get("id").is_some(), "{} carries an id", f.file_name);
             assert!(parsed.get("name").is_some(), "{} carries a name", f.file_name);
             assert!(parsed.get("description").is_some(), "{} carries a description", f.file_name);
@@ -241,7 +248,8 @@ mod tests {
     #[test]
     fn an_id_is_a_filename_so_path_traversal_is_rejected() {
         let dir = temp_dir("traversal");
-        for id in ["", "../escape", "a/b", ".hidden", "-lead", "_lead", "UPPER", &( "x".repeat(65))] {
+        for id in ["", "../escape", "a/b", ".hidden", "-lead", "_lead", "UPPER", &("x".repeat(65))]
+        {
             assert!(!is_valid_id(id), "{id:?} should not be a valid id");
             assert!(save_def(&dir, id, "{}").is_err(), "{id:?} must not write");
         }
@@ -261,14 +269,22 @@ mod tests {
     #[test]
     fn set_enabled_patches_one_field_and_keeps_the_rest() {
         let dir = temp_dir("enabled");
-        save_def(&dir, "doc-sweeper", r#"{"id":"doc-sweeper","name":"Doc Sweeper","enabled":true}"#).unwrap();
+        save_def(
+            &dir,
+            "doc-sweeper",
+            r#"{"id":"doc-sweeper","name":"Doc Sweeper","enabled":true}"#,
+        )
+        .unwrap();
 
         set_def_enabled(&dir, "doc-sweeper", false).expect("disable");
         let listed = list_defs(&dir);
         let v: serde_json::Value = serde_json::from_str(&listed[0].content_json).unwrap();
         assert_eq!(v["enabled"], serde_json::Value::Bool(false));
         assert_eq!(v["name"], "Doc Sweeper", "the other fields survive the patch");
-        assert!(set_def_enabled(&dir, "missing", true).is_err(), "a missing file is an error, not a silent ok");
+        assert!(
+            set_def_enabled(&dir, "missing", true).is_err(),
+            "a missing file is an error, not a silent ok"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }

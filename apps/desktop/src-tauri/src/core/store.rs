@@ -376,10 +376,14 @@ fn add_pending_last_error(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()
 /// spend view, "reported nothing" and "spent nothing" are the same fact.
 fn add_agent_runs_tokens(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
     if !table_has_column(tx, "agent_runs", "prompt_tokens")? {
-        tx.execute_batch("ALTER TABLE agent_runs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;")?;
+        tx.execute_batch(
+            "ALTER TABLE agent_runs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     if !table_has_column(tx, "agent_runs", "completion_tokens")? {
-        tx.execute_batch("ALTER TABLE agent_runs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;")?;
+        tx.execute_batch(
+            "ALTER TABLE agent_runs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;",
+        )?;
     }
     Ok(())
 }

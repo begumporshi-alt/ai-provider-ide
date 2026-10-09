@@ -12,8 +12,8 @@ use serde::Deserialize;
 use tauri::ipc::Channel;
 use tauri::State;
 
-use crate::core::context;
 use crate::core::agent_defs;
+use crate::core::context;
 use crate::core::crash_report;
 use crate::core::egress::{self, EgressRequest, EgressState, StreamEvent};
 use crate::core::error::CommandError;
@@ -662,7 +662,9 @@ pub fn crash_clear_all(store: State<'_, Arc<store::Store>>) -> Result<usize, Com
 // TypeScript guard's (`lib/agents/defs.ts`), which every consumer runs. See `core/agent_defs.rs`.
 
 #[tauri::command]
-pub fn agent_defs_list(store: State<'_, Arc<store::Store>>) -> Result<Vec<agent_defs::AgentDefFile>, CommandError> {
+pub fn agent_defs_list(
+    store: State<'_, Arc<store::Store>>,
+) -> Result<Vec<agent_defs::AgentDefFile>, CommandError> {
     // Seeding rides the first list: the dir is created and any missing builtin is written
     // before the read, so a fresh install sees its builtins without a restart.
     agent_defs::ensure_builtin_defs(&app_data_dir(&store));
@@ -688,7 +690,10 @@ pub fn agent_def_set_enabled(
 }
 
 #[tauri::command]
-pub fn agent_def_delete(store: State<'_, Arc<store::Store>>, id: String) -> Result<bool, CommandError> {
+pub fn agent_def_delete(
+    store: State<'_, Arc<store::Store>>,
+    id: String,
+) -> Result<bool, CommandError> {
     agent_defs::delete_def(&app_data_dir(&store), &id).map_err(CommandError)
 }
 

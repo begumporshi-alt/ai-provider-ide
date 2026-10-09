@@ -1818,8 +1818,7 @@ mod tests {
         // The client is told *why* it ended. Without this the handler falls back to
         // `finish_reason: "stop"`, which claims a finished answer the model never produced.
         assert!(
-            msgs.iter()
-                .any(|m| matches!(m, BridgeMsg::Finish(r) if r == "length")),
+            msgs.iter().any(|m| matches!(m, BridgeMsg::Finish(r) if r == "length")),
             "the ceiling reports `length`, not a silent `stop`: {:?}",
             msgs
         );

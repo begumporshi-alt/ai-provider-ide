@@ -1011,7 +1011,8 @@ mod capture_tests {
             let batch = claim(&s).unwrap();
             assert_eq!(batch.len(), 1, "attempt {attempt}");
             // The reason travels with the release: it is what makes "3 failed" actionable.
-            assert!(release(&s, batch[0].id, Some(format!("provider said no (try {attempt})"))).unwrap());
+            assert!(release(&s, batch[0].id, Some(format!("provider said no (try {attempt})")))
+                .unwrap());
         }
         // Third failure retires it rather than retrying forever.
         let conn = s.conn.lock().unwrap();
