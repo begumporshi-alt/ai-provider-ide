@@ -48,10 +48,15 @@ export interface ApprovalState {
    * It outranks the mode on purpose: `yolo` + plan mode must still refuse writes, or "propose
    * before you touch anything" is a promise the yolo setting can silently break.
    *
-   * It only ever **subtracts**. Plan mode does not quietly auto-approve reads in an "ask every
-   * time" session — a switch that can grant permissions the mode above it withheld is a switch
-   * whose effect the user cannot predict from the two labels they chose. Pair it with
-   * "auto-approve reads" if the pass should be quiet; the UI says so.
+   * It **is** the read-only mode (2026-10-10): reads run, writes are refused, and that pair is the
+   * whole policy whatever mode sits underneath. It used to subtract only — plan mode never granted
+   * a read that "ask every time" withheld — on the reasoning that a switch must not grant what the
+   * labels above it withheld. That reasoning was right about *writes* and wrong about *reads*: a
+   * planning pass whose first act is a modal asking to approve the read it needs is a pass the user
+   * clicks through without reading, and the old remedy — a hint telling the user to go hand-pair
+   * "auto-approve reads" — was the design admitting a friction it could just remove. The label now
+   * promises reads; the gate keeps that promise. Mutations stay subtract-only: nothing here can
+   * allow a write, so "propose first" still cannot be switched off from below.
    */
   planMode: boolean;
 }
@@ -84,14 +89,16 @@ export function planRefusal(name: string): string {
  * The decision for one call.
  *
  * Order is the whole specification:
- *  1. plan mode refuses writes — before every mode, including `yolo`;
+ *  1. plan mode is the read-only mode — reads run, writes are refused — before every mode,
+ *     including `yolo`;
  *  2. a session-wide allow, or this tool's own allow, is already the user's answer;
  *  3. the mode decides by effect.
  */
 export function decide(state: ApprovalState, name: string | undefined | null): Verdict {
   const effect = toolEffect(name);
-  if (state.planMode && effect === "mutate") {
-    return { action: "deny", reason: planRefusal(name ?? "?") };
+  if (state.planMode) {
+    if (effect === "mutate") return { action: "deny", reason: planRefusal(name ?? "?") };
+    return { action: "allow" };
   }
   if (state.allowAll) return { action: "allow" };
   if (name && state.trustedTools.has(name)) return { action: "allow" };

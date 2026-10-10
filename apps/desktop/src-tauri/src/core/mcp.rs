@@ -25,7 +25,9 @@
 //! Effect discipline: an MCP tool's `readOnlyHint` annotation is a *hint from the server*, so it
 //! only ever relaxes the tool toward `read`; absence fails closed to `mutate`, exactly like
 //! `toolEffect` treats a name it does not know. Approval therefore asks before any MCP call the
-//! server did not mark read-only, which is the only safe default for third-party code.
+//! server did not mark read-only, which is the only safe default for third-party code. Plan mode is
+//! the one place that does not ask (2026-10-10): it is the read-only mode and classifies for
+//! itself — a `read`-marked MCP tool runs, a `mutate`-marked one is refused, both unprompted.
 
 use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;

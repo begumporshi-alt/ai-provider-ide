@@ -139,17 +139,34 @@ describe("plan mode", () => {
     expect(decide(s, "write_file").action).toBe("deny");
   });
 
-  it("does not grant reads that the mode underneath withholds", () => {
-    // Plan mode subtracts. If it also auto-approved reads, "ask every time" + plan mode would be
-    // a session whose gate the user cannot predict from the two labels they picked.
+  it("is the read-only mode: reads run even under a mode that would ask for them", () => {
+    // Changed 2026-10-10 (ZCode parity). This asserted `ask` before, on the reasoning that plan
+    // mode must only ever subtract. That held while plan mode was an overlay on a mode the user
+    // configured separately — but the cost was a planning pass whose first act is a modal asking
+    // to approve the read it needs, plus a hint telling the user to go pair "auto-approve reads"
+    // by hand to stop it. Plan mode now carries its own read policy: the label promises reads run
+    // and writes are refused, and the gate keeps both halves. The subtract-only half that matters
+    // — no write can ever be allowed — is pinned below.
     const s = state({ mode: "ask", planMode: true });
-    expect(decide(s, "read_file")).toEqual({ action: "ask" });
-  });
-
-  it("is quiet about reads when paired with auto-approve reads", () => {
-    const s = state({ mode: "auto-reads", planMode: true });
     expect(decide(s, "read_file")).toEqual({ action: "allow" });
     expect(decide(s, "search_files")).toEqual({ action: "allow" });
+  });
+
+  it("never allows a mutation, whatever runs underneath it", () => {
+    // The whole point of the mode: every escalation path is present at once, and none of them
+    // reaches a write.
+    const s = state({ mode: "yolo", planMode: true, allowAll: true });
+    for (const t of AGENT_TOOLS.filter((t) => t.effect === "mutate")) {
+      expect(decide(s, t.name).action, t.name).toBe("deny");
+    }
+    // Fail-closed covers names the registry never heard of — a third-party (MCP) tool lands as
+    // `mutate`, and plan mode must refuse it like a write rather than wave it through as a read.
+    expect(decide(s, "mcp_evil_delete").action).toBe("deny");
+  });
+
+  it("is quiet about reads whatever the mode underneath", () => {
+    const s = state({ mode: "auto-reads", planMode: true });
+    expect(decide(s, "read_file")).toEqual({ action: "allow" });
     expect(decide(s, "write_file").action).toBe("deny");
   });
 });

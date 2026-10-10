@@ -198,6 +198,118 @@ test("plan mode refuses a write without asking, then executes the approved plan"
   await expect(page.getByTestId("plan-approve")).toHaveCount(0);
 });
 
+// 2026-10-10: plan mode carries its own read policy. This is the half that used to be a hint —
+// "pair it with auto-approve reads". Under the default "ask every time", a planning pass opened a
+// modal for the very read it exists to perform: approve-the-read, approve-the-read, plan. Reads now
+// run inside plan mode; the gate keeps its other half, which is that nothing may write.
+test("plan mode is read-only: a read runs with no modal under 'ask every time'", async ({ page }) => {
+  await openAgentChat(page);
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  await closeRunConfig(page);
+
+  // The oracle's default variant is one `list_dir` call — a read, and one the default mode would
+  // otherwise stop on. Nothing may stop it here: if the gate asked, the run would park on a modal
+  // and the terminal answer would never arrive.
+  await send(page, "list files");
+  await expect(page.getByText("Done. Here is what I found in the workspace.")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("dialog")).toHaveCount(0);
+});
+
+// The panel's condition used to be `msgs.length > 0`, which is true of any transcript. So ticking
+// the switch on a conversation offered to "Approve plan & execute" a plan that did not exist yet,
+// and ticking it again after approving re-offered the plan that had just been executed. Both
+// halves are pinned here.
+test("the approve panel waits for a plan, and an approved plan is not offered again", async ({ page }) => {
+  await openAgentChat(page);
+  // An ordinary pass first, so the transcript is non-empty — the state the old condition keyed on.
+  await send(page, "list files");
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+  await expect(page.getByText("Done. Here is what I found in the workspace.")).toBeVisible({ timeout: 30_000 });
+
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  // The hint renders with the toggle itself, so it proves the re-render happened while the panel is
+  // still open — the bar's absence below is a real absence, not a frame the assertion won.
+  await expect(page.getByTestId("plan-mode-hint")).toBeVisible();
+  await closeRunConfig(page);
+  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+
+  // A plan pass does produce one: the oracle's plan document is prose with no tool call.
+  await send(page, "plan the subagent system upgrade");
+  await expect(page.getByTestId("plan-approve")).toBeVisible({ timeout: 30_000 });
+
+  // --- approve it for real -------------------------------------------------------------
+  await page.getByRole("button", { name: "Approve plan & execute" }).click();
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+  await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
+
+  // The question is answered. Turning plan mode back on means "make another plan" — it must not
+  // re-offer the plan that was just carried out.
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  await expect(page.getByTestId("plan-mode-hint")).toBeVisible();
+  await closeRunConfig(page);
+  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+});
+
+// A pass whose switch is off must not be recorded as a plan. The marking used to read the live
+// switch at the finish transition; the ref-based capture that replaced it has to be re-answered by
+// EVERY pass — plain chat included — or it reintroduces the same bug through the other door: the
+// capture left standing from an earlier plan pass cards the next plain answer as a "Plan".
+test("a plain answer after a plan pass is not carded as a plan", async ({ page }) => {
+  await openAgentChat(page);
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  await closeRunConfig(page);
+
+  // A plan pass first, so the capture has been set at least once.
+  await send(page, "plan the subagent system upgrade");
+  await expect(page.getByTestId("doc-card")).toBeVisible({ timeout: 30_000 });
+
+  // Now leave plan mode AND agent mode: the next turn is ordinary chat.
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").uncheck();
+  await page.getByLabel("agent mode").uncheck();
+  await closeRunConfig(page);
+
+  await page.getByPlaceholder(/Message your assistant/).fill("say hello");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect(page.getByText("Hello from oracle-mini")).toBeVisible({ timeout: 30_000 });
+  // The plain answer is a message, not a document. Counted as a positive first — that form is only
+  // satisfiable once the plain pass is the one being rendered, where `toHaveCount(0)` on a filter
+  // can pass in the window before the finish effect has run.
+  await expect(page.getByTestId("doc-card")).toHaveCount(1);
+  await expect(page.getByTestId("doc-card").filter({ hasText: "Hello from oracle-mini" })).toHaveCount(0);
+});
+
+// A wholesale transcript change answers or discards the plan question too. Without this, New chat
+// left the bar sitting over an empty chat, offering to approve a plan from the conversation that
+// had just been thrown away — the same `msgs.length > 0` bug through a different door.
+test("starting a new chat clears a plan that was pending", async ({ page }) => {
+  await openAgentChat(page);
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  await closeRunConfig(page);
+
+  await send(page, "plan the subagent system upgrade");
+  await expect(page.getByTestId("plan-approve")).toBeVisible({ timeout: 30_000 });
+
+  // The palette's New chat — the affordance that empties the transcript wholesale.
+  const mac = await page.evaluate(() =>
+    /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent),
+  );
+  await page.keyboard.press(`${mac ? "Meta" : "Control"}+k`);
+  const row = page.getByRole("dialog", { name: "Commands" }).getByRole("option", { name: /New chat/ });
+  await expect(row).toBeVisible({ timeout: 5_000 });
+  await row.click();
+
+  // Empty transcript, and nothing to approve.
+  await expect(page.getByText("Subagent System Upgrade — Two Phases")).toHaveCount(0);
+  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+});
+
 // The gate and Stop used to fight: while the modal was up the loop was parked on the approval
 // promise, and an abort flipped the controller's flag without resolving it. The gate now races
 // the run's abort signal and answers "stopped by you" on its behalf.

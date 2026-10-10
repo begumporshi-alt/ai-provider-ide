@@ -126,6 +126,18 @@ ChatGPT/Claude web chat surfaces.
   and never auto-approves reads the mode underneath withheld — a switch that could grant
   permissions its neighbour took away is one whose effect nobody can predict. The hint under it says
   to pair it with "auto-approve reads" for a quiet pass.
+  **Revised 2026-10-10 (ZCode parity):** plan mode now carries its own read policy — it *is* the
+  read-only mode: reads run without asking, every write is refused, whatever mode sits underneath.
+  The subtract-only reasoning above was right about *writes* and wrong about *reads*: a planning
+  pass whose first act is a modal asking to approve the read it needs is a pass the user clicks
+  through, and "pair it with auto-approve reads" was the design admitting a friction it could just
+  remove. The hint no longer says that. The approve panel also stopped keying on `msgs.length > 0`
+  (which offered to approve a plan that did not exist the instant the switch was ticked); it appears
+  only while a clean pass that *ran as* a plan pass has left an unanswered plan, and that plan is
+  cleared on approval, on every new turn, and whenever the transcript is replaced wholesale.
+  ZCode's own protocol — a plan file under `<workspace>/.zcode/plans/`, `EnterPlanMode`/`ExitPlanMode`
+  tool calls, the plan carried inside the approval request — is the target for the follow-up pass;
+  this revision is the gate + workflow half of it.
   (c) The checkpoint reads a file's previous contents **before the first write of the run**, which
   is what makes the review a true diff (a `write_file` used to render as all-additions with "any
   previous contents are not shown") and makes a file written twice revert to its pre-run state.

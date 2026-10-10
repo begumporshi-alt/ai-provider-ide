@@ -837,13 +837,13 @@ export function AssistantScreen() {
             <div className="px-2 py-1.5">
               <ApprovalPicker mode={approvalMode} onChange={setApprovalMode} disabled={!agentMode} />
               {agentMode && planMode && (
-                // The pairing is the whole reason this appears: plan mode subtracts permissions
-                // and never grants them, so a plan pass that reads without being clicked through
-                // needs the mode above it to say so. Living next to the approval select it names,
+                // Plan mode carries its own read policy (2026-10-10): the gate lets reads run and
+                // refuses every write, whatever the approval select above says. The old copy told
+                // the user to go pair "auto-approve reads" themselves — the design admitting a
+                // friction it could just remove. Living next to the approval select it overrides,
                 // not as a stray line above the transcript.
                 <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="plan-mode-hint">
-                  Plan mode refuses every write, whatever the approval mode. Pair it with “auto-approve reads”
-                  for a pass that explores without asking.
+                  Plan mode is read-only: reads and searches run without asking, every write is refused.
                 </p>
               )}
             </div>
@@ -1497,20 +1497,39 @@ function Chat({
   // the transcript replace, which mints fresh ids for every message it hands back
   // (agent-turn.ts `onReplaceTranscript`). Content is the one handle that survives that rewrite.
   const [planDocs, setPlanDocs] = useState<string[]>([]);
+  // The plan awaiting the user's call — the newest plan-mode answer, or null. Separate from
+  // `planDocs` (which is history: every plan card ever shown) because this is what the approve bar
+  // gates on, and it stops being the open question the moment it is answered: cleared on approval,
+  // and at the start of every new pass. Before this, the bar keyed on `msgs.length > 0` — true of
+  // any transcript with one message in it — so ticking the switch offered to approve a plan that
+  // did not exist, and ticking it again re-offered the same stale approval.
+  const [pendingPlan, setPendingPlan] = useState<string | null>(null);
   const wasBusyRef = useRef(false);
+  // Whether the run that just finished ran as a plan pass — captured at run start from the same
+  // ref the gate reads, never from the live switch. The live switch answers the wrong question:
+  // toggled mid-run it either stole an ordinary answer as a "plan" or lost a real plan written
+  // seconds earlier, and after Approve it would still read `true` for the executing pass, whose
+  // final message would come back as a plan card.
+  const ranInPlanModeRef = useRef(false);
   useEffect(() => {
-    if (wasBusyRef.current && !busy && planMode) {
+    // A clean finish only. A stopped, failed or ceiling-hit pass leaves its own ⚠ notice — or
+    // intermediate prose — as the last assistant text, and offering "Plan ready, nothing written
+    // yet" over a pass that ended badly would be a claim the run never earned. The trace carries
+    // the reason for exactly these endings (`agent-turn` sets `error` for stopped, failed and
+    // ceiling exits alike).
+    if (wasBusyRef.current && !busy && ranInPlanModeRef.current && !trace?.error) {
       for (let i = msgs.length - 1; i >= 0; i--) {
         const m = msgs[i];
         if (m && m.role === "assistant" && m.content.trim()) {
           const doc = m.content.trim();
           setPlanDocs((prev) => (prev.includes(doc) ? prev : [...prev, doc]));
+          setPendingPlan(doc);
           break;
         }
       }
     }
     wasBusyRef.current = busy;
-  }, [busy, planMode, msgs]);
+  }, [busy, msgs, trace]);
   // The draft itself lives in `Composer` (it also owns attachments and the two menus). This is a
   // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
   // context meter's estimate of what the next send will contain, and nothing else.
@@ -2066,6 +2085,20 @@ function Chat({
     const ac = turn.controller;
     const t0 = Date.now();
 
+    // Whether this pass runs as a plan pass — decided once, for BOTH branches, and read from the
+    // approval ref rather than the `planMode` state. `approvePlan` flips the ref synchronously (the
+    // gate reads it live) while the state value still says `true` during that call: read here, the
+    // executing pass would be marked as a plan (its answer landing back in the approve flow) and its
+    // system turn would still forbid the writes its gate permits. Every pass answers the question,
+    // plain chat included — a plain answer that left the previous capture standing would be recorded
+    // and rendered as the next "Plan" card.
+    const planPass = agentMode && approvalRef.current.planMode;
+    ranInPlanModeRef.current = planPass;
+    // A new turn supersedes the plan on screen: the bar returns only when a pass produces its own
+    // plan. An unanswered plan survives the switch being flipped off and on — it is still the open
+    // question — but not a new send.
+    setPendingPlan(null);
+
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
       if (!root.trim()) {
@@ -2074,6 +2107,9 @@ function Chat({
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
         setStopping(false);
+        // The turn never ran, so there is no pass to remember: left true, the finish effect would
+        // card whatever assistant text was already in the transcript.
+        ranInPlanModeRef.current = false;
         turn.finish();
         return;
       }
@@ -2093,7 +2129,9 @@ function Chat({
           root,
           customAgentPrompt: agentSystemPrompt,
           skillsBlock,
-          planMode,
+          // The ref's value, not the state's: see the capture above `if (agentMode)` — the state is
+          // stale for exactly the executing pass the approve button starts.
+          planMode: planPass,
           temperature: typeof temperature === "number" ? temperature : undefined,
           maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
           thinking,
@@ -2257,6 +2295,9 @@ function Chat({
    * watch the agent fail to do the thing they just approved.
    */
   function approvePlan() {
+    // Closes the open question: without this, turning plan mode back on after approving would
+    // offer the same plan a second time.
+    setPendingPlan(null);
     approvalRef.current = { ...approvalRef.current, planMode: false };
     onPlanModeChange(false);
     void runTurn(PLAN_APPROVED_TURN, msgs);
@@ -2343,6 +2384,9 @@ function Chat({
    */
   function deleteFrom(i: number) {
     setMsgs((m) => m.slice(0, i));
+    // The plan is pending only while its message is on screen: dropping the turn that carries it
+    // drops the offer to approve it.
+    setPendingPlan((cur) => (cur && msgs.slice(0, i).some((m) => m.content.trim() === cur) ? cur : null));
   }
 
   /**
@@ -2356,6 +2400,8 @@ function Chat({
     setMsgs(prefix);
     setTrace(null);
     setFinishReason(undefined);
+    // A new thread owns its own questions, including the plan one.
+    setPendingPlan(null);
   }
 
   // ---- Phase 4: session bar -------------------------------------------------------------
@@ -2401,6 +2447,8 @@ function Chat({
         lastNodeRef.current = null;
         setSessionId(rec.sessionId);
         setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+        // The adopted conversation's own plan, if any, is not this session's open question.
+        setPendingPlan(null);
       } catch {
         return; // same policy as openSession: an unreadable session is not an error wall
       }
@@ -2442,6 +2490,7 @@ function Chat({
     setMsgs([]);
     setTrace(null);
     setFinishReason(undefined);
+    setPendingPlan(null);
     timelineRef.current = [];
     setTimeline([]);
     setTodos([]);
@@ -2482,6 +2531,10 @@ function Chat({
     setMsgs(withIds(resumed as Omit<Msg, "id">[]));
     setTrace(null);
     setFinishReason(undefined);
+    // A plan answered in the conversation being left is not pending in the one being entered —
+    // and the panel used to sit over an empty transcript after a New chat, which is the same bug
+    // (`msgs.length > 0` said nothing about plans) through a different door.
+    setPendingPlan(null);
     setEditingId(null);
     // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
     // stamped so the async list refresh cannot adopt a stale value over it.
@@ -2977,17 +3030,21 @@ function Chat({
           </button>
         )}
       </div>
-      {/* P5: plan mode's approve step. Shown only once a plan pass has finished — during the run
-          there is nothing to approve yet, and the button would start a second run on top of the
-          first (which is what `busy` guards against everywhere else on this screen). */}
-      {agentMode && planMode && !busy && msgs.length > 0 && (
+      {/* P5: plan mode's approve step. Shown only while a plan is actually pending AND the switch
+          is on — `pendingPlan` is set by the finish effect of a clean pass that ran as a plan pass,
+          and cleared on approval and at the start of every new turn. It used to gate on
+          `msgs.length > 0`, which says nothing about plans: any transcript with one message in it
+          made the button appear the instant the switch was ticked, offering to run a plan that did
+          not exist. A plan stays pending until it is approved or superseded — flipping the switch
+          off and on re-offers an unanswered plan, which is the open question, not a stale one. */}
+      {agentMode && planMode && !busy && pendingPlan !== null && (
         <div
           className="mt-3 flex flex-wrap items-center gap-3 rounded-md border px-3 py-2"
           style={{ borderColor: "var(--info)", background: "var(--surface)" }}
           data-testid="plan-approve"
         >
           <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-            Plan mode — the agent could read but not write. Approving runs the plan for real.
+            Plan ready, nothing written yet. Approving runs it for real — or reply to refine it.
           </span>
           <Button variant="primary" onClick={approvePlan}>
             Approve plan &amp; execute
