@@ -173,6 +173,10 @@ export function SettingsScreen() {
             </label>
           ))}
           <label className="block">
+            <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Image-reading model</span>
+            <VisionHelperPicker />
+          </label>
+          <label className="block">
             <span className="mb-1 block text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Subagent step budget</span>
             <input
               className="mono w-full rounded border px-2 py-1 text-[12px]"
@@ -610,6 +614,51 @@ function RotationRow({ provider, onChanged }: { provider: ProviderRecord; onChan
  * pinning it to one provider here would make `failoverEnabled` inert for the whole app rather than
  * for one conversation.
  */
+/**
+ * The model that reads images for models that cannot see them (`lib/chat/vision.ts`).
+ *
+ * Listed by CAPABILITY, not modality: vision is not a modality here — the rows are text models that
+ * happen to accept image input, which is why this is a separate picker rather than a third
+ * `forModality` value. It offers every model that declares vision plus whatever id is already saved
+ * (so a deliberate choice on a model that publishes nothing is not silently dropped by the UI).
+ */
+function VisionHelperPicker() {
+  const tick = useUi((s) => s.tick);
+  const { bump } = useUi();
+  const settings = router.settings as typeof router.settings & { defaults?: Record<string, string> };
+  const value = settings.defaults?.vision ?? "";
+  const options = useMemo(() => {
+    void tick;
+    const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
+    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+    return selectableModels(
+      catalog.forModality("text").filter((m) => m.supportsVision === true),
+      catalog.aliases,
+      slugOf,
+      isEnabled,
+    );
+  }, [tick]);
+  return (
+    <select
+      className="mono w-full rounded border px-2 py-1 text-[12px]"
+      style={{ background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" }}
+      value={value}
+      onChange={(e) => {
+        settings.defaults = { ...(settings.defaults ?? {}), vision: e.target.value };
+        persistRouterSettings();
+        bump();
+      }}
+      data-testid="vision-default"
+    >
+      {/* Short on purpose: the control shares its siblings' 254px width, and a native select clips
+          a long option mid-word with no ellipsis (measured: "…that declar"). */}
+      <option value="">auto — first with vision</option>
+      {value && !options.some((o) => o.id === value) && <option value={value}>{value}</option>}
+      {options.map((o) => <option key={o.id} value={o.id}>{o.label}</option>)}
+    </select>
+  );
+}
+
 function DefaultModelPicker({ modality }: { modality: "text" | "image" }) {
   const tick = useUi((s) => s.tick);
   const { bump } = useUi();

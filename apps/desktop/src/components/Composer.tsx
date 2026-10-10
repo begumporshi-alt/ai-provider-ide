@@ -124,10 +124,7 @@ export interface ComposerProps {
   busy: boolean;
   /** Switches the placeholder's wording, which the existing specs (and users) have learned. */
   agentMode: boolean;
-  /** Whether the chosen model accepts image input: `true`, `false`, or `undefined` for "unasked". */
-  vision: boolean | undefined;
   /** The model's own name, for the notice — "GPT-4o does not accept images" beats "not allowed". */
-  modelLabel: string;
   onSend: (text: string, attachments: Attachment[], inlined: InlinedText[], instruction: string) => void;
   onStop: () => void;
   /**
@@ -192,8 +189,6 @@ export function Composer({
   textareaRef,
   busy,
   agentMode,
-  vision,
-  modelLabel,
   onSend,
   onStop,
   onDraftChange,
@@ -220,9 +215,6 @@ export function Composer({
   const [mentionPick, setMentionPick] = useState(0);
   const [slashPick, setSlashPick] = useState(0);
   const [dragOver, setDragOver] = useState(false);
-  // The vision note the user has closed, as its full text. Keyed on the text, not a bare boolean:
-  // picking a different model produces a different note, and that one must be visible again.
-  const [dismissedVisionNote, setDismissedVisionNote] = useState<string | null>(null);
   // Mirror of the draft for writers that run outside a render's closure: `addFiles` appends once
   // per file with an `await readAsText` between appends, and the running closure still holds the
   // gesture-time render — composing from `draft` there would overwrite every earlier file's block
@@ -437,16 +429,15 @@ export function Composer({
       const kind = fileKind(file.name, file.type);
 
       if (kind === "image") {
-        if (vision !== true) {
-          // The gate, said out loud. A dropped file that silently does nothing reads as a broken app
-          // rather than as a model that cannot see.
-          onNotice(
-            `${file.name} was not attached: ${modelLabel} ${
-              vision === undefined ? "does not declare image input" : "does not accept images"
-            }.`,
-          );
-          continue;
-        }
+        /*
+         * No vision gate. An image is accepted whatever the chosen model declares.
+         *
+         * The old gate refused the file and explained the MODEL's limitation — "does not declare
+         * image input" — which reads as this app being broken, and as the model being worse than it
+         * is: a vision model can read the image and the chosen model is handed that reading (see
+         * `lib/chat/vision.ts`). The size cap below is a different thing and stays — it is a limit
+         * of this app, not a claim about a model.
+         */
         if (file.size > MAX_ATTACHMENT_BYTES) {
           onNotice(`${file.name} was not attached: over the ${MAX_ATTACHMENT_BYTES / 1024 / 1024} MB limit.`);
           continue;
@@ -625,13 +616,6 @@ export function Composer({
       void send();
     }
   }
-
-  const visionNote =
-    vision === true
-      ? null
-      : vision === undefined
-        ? `${modelLabel} does not declare image input — text attachments still work.`
-        : `${modelLabel} does not accept images.`;
 
   return (
     <div
@@ -902,21 +886,6 @@ export function Composer({
         />
       )}
 
-      {visionNote && visionNote !== dismissedVisionNote && (
-        <p className="mt-1 flex items-center gap-1.5 text-[10px]" style={{ color: "var(--text-faint)" }} data-testid="vision-note">
-          <span className="min-w-0 flex-1">{visionNote}</span>
-          <button
-            type="button"
-            onClick={() => setDismissedVisionNote(visionNote)}
-            aria-label="Dismiss model capability note"
-            title="Dismiss"
-            className="shrink-0 rounded px-1 leading-none transition-opacity hover:opacity-80"
-            style={{ color: "var(--text-faint)" }}
-          >
-            ✕
-          </button>
-        </p>
-      )}
       {!readFile && (
         <p className="mt-1 text-[10px]" style={{ color: "var(--text-faint)" }}>
           Set a workspace root to reference files with @.

@@ -8,6 +8,8 @@ pnpm-debug.log*
 lerna-debug.log*
 
 node_modules
+# Staged at build time from node_modules/pdfjs-dist by scripts/copy-pdfjs-assets.mjs
+public/pdfjs
 dist
 dist-ssr
 *.local

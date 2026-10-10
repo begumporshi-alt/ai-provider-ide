@@ -935,6 +935,24 @@ export async function addManualModel(input: {
   await persistCatalog(input.providerId);
 }
 
+/**
+ * Declare whether a model accepts images (`true`), does not (`false`), or nobody has said
+ * (`undefined` — back to the provider's own silence).
+ *
+ * Persisted with the row, and now preserved across a Refresh (`ModelCatalog.refreshProvider`), so a
+ * declaration made here is not undone by the provider publishing nothing. What it changes: the
+ * picker's vision badge, and whether an attached image goes to this model directly or through a
+ * vision model's reading.
+ */
+export async function setModelVision(
+  providerId: string,
+  nativeId: string,
+  vision: boolean | undefined,
+): Promise<void> {
+  if (!catalog.setVision(providerId, nativeId, vision)) return;
+  await persistCatalog(providerId);
+}
+
 /** Remove a hand-added model. Never touches a discovered row. */
 export async function removeManualModel(providerId: string, nativeId: string): Promise<boolean> {
   const removed = catalog.removeManual(providerId, nativeId);

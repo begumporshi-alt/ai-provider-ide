@@ -775,6 +775,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         agent_def_save,
         agent_def_set_enabled,
         agent_def_delete,
+        crate::tauri::artifact_cmds::artifact_read,
         crate::tauri::gateway_cmds::gateway_status,
         crate::tauri::gateway_cmds::get_tools_enabled,
         crate::tauri::gateway_cmds::set_tools_enabled,

@@ -5,8 +5,14 @@
 import { useEffect, useMemo, useState } from "react";
 import type { Modality } from "@aiprovider/adapter-spec";
 import {
-  catalog, registry, router, persistRouterSettings, refreshCatalog,
-  workbuddyStatus, workbuddySetModels,
+  catalog,
+  persistRouterSettings,
+  refreshCatalog,
+  registry,
+  router,
+  setModelVision,
+  workbuddySetModels,
+  workbuddyStatus,
 } from "../store";
 import { useUi } from "../ui-state";
 import { bareEntry, hasFailoverCarrier } from "../lib/models/selectable";
@@ -253,11 +259,11 @@ export function ModelsScreen() {
           <thead>
             <tr className="h-[30px] text-left text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
               <th className="font-medium">Model</th>
-              <th className="w-28 font-medium">Price / 1M</th>
+              <th className="w-28 whitespace-nowrap font-medium">Price / 1M</th>
               <th className="w-20 font-medium">Context</th>
-              <th className="w-40 font-medium">Provider</th>
-              <th className="w-24 font-medium">Default</th>
-              <th className="w-20 font-medium">Client</th>
+              <th className="w-20 font-medium">Images</th>
+              <th className="w-32 font-medium">Provider</th>
+              <th className="w-24 font-medium">Status</th>
               <th className="w-24" />
               <th className="w-28" />
             </tr>
@@ -265,7 +271,7 @@ export function ModelsScreen() {
           <tbody>
             {rows.map((m) => (
               <tr key={`${m.providerId}:${m.nativeId}`} className="h-[38px] border-t" style={{ borderColor: "var(--border)" }}>
-                <td className="mono text-[12px]">
+                <td className="mono whitespace-nowrap text-[12px]">
                   {m.slug}/{m.nativeId}
                   {m.bare && (
                     <span
@@ -281,7 +287,7 @@ export function ModelsScreen() {
                     </span>
                   )}
                 </td>
-                <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
+                <td className="mono whitespace-nowrap text-[11px]" style={{ color: "var(--text-dim)" }}>
                   {m.pricing
                     ? m.pricing.prompt === 0 && m.pricing.completion === 0
                       ? "free"
@@ -291,22 +297,63 @@ export function ModelsScreen() {
                 <td className="mono text-[11px]" style={{ color: "var(--text-dim)" }}>
                   {m.contextWindow ? `${Math.round(m.contextWindow / 1000)}k` : "—"}
                 </td>
+                <td>
+                  {/*
+                   * A per-model declaration, the counterpart of ZCode's `inputFormat.supportsImage`:
+                   * a property the registry holds and the operator owns, because providers publish
+                   * capability metadata inconsistently or not at all. Three states, and the third is
+                   * not cosmetic — "auto" means nobody has said, and the app then has a vision model
+                   * read images for this one rather than assuming either answer.
+                   *
+                   * `false` reads as "no", so choosing it is a claim; leaving it on auto is not.
+                   */}
+                  <select
+                    className="mono rounded border px-1 py-0.5 text-[11px]"
+                    style={{
+                      background: "var(--bg)",
+                      borderColor: m.supportsVision === true ? "var(--info)" : "var(--border)",
+                      color: m.supportsVision === true ? "var(--info)" : "var(--text-dim)",
+                    }}
+                    value={m.supportsVision === true ? "yes" : m.supportsVision === false ? "no" : "auto"}
+                    title={
+                      m.supportsVision === true
+                        ? "Images are sent to this model directly"
+                        : "Images are read by a vision model for this one (Settings → Image-reading model)"
+                    }
+                    data-testid={`model-vision-${m.slug}-${m.nativeId}`}
+                    onChange={(e) => {
+                      const v = e.target.value;
+                      // `bump()` once the write lands, the convention every other mutation on this
+                      // screen follows: the picker's badge and this row both read the catalog
+                      // through the UI tick, so without it the change is stored and invisible.
+                      void setModelVision(
+                        m.providerId,
+                        m.nativeId,
+                        v === "yes" ? true : v === "no" ? false : undefined,
+                      ).then(() => bump());
+                    }}
+                  >
+                    <option value="auto">auto</option>
+                    <option value="yes">yes</option>
+                    <option value="no">no</option>
+                  </select>
+                </td>
                 <td className="text-[12px]" style={{ color: "var(--text-dim)" }}>{registry.getProvider(m.providerId)?.name}</td>
                 <td>
-                  {defaultFor === defaultIdFor(m) && (
-                    <span className="rounded px-1.5 py-0.5 text-[10px]" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>default</span>
-                  )}
-                </td>
-                <td>
-                  {published.includes(m.nativeId) && (
-                    <span
-                      className="rounded px-1.5 py-0.5 text-[10px]"
-                      style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
-                      title={clientPresent ? "Published to the connected client" : "Client config not found yet"}
-                    >
-                      exposed
-                    </span>
-                  )}
+                  <div className="flex items-center gap-1">
+                    {defaultFor === defaultIdFor(m) && (
+                      <span className="rounded px-1.5 py-0.5 text-[10px] whitespace-nowrap" style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}>default</span>
+                    )}
+                    {published.includes(m.nativeId) && (
+                      <span
+                        className="rounded px-1.5 py-0.5 text-[10px] whitespace-nowrap"
+                        style={{ background: "var(--surface-2)", color: "var(--text-dim)" }}
+                        title={clientPresent ? "Published to the connected client" : "Client config not found yet"}
+                      >
+                        exposed
+                      </span>
+                    )}
+                  </div>
                 </td>
                 <td className="text-right">
                   <Button onClick={() => void togglePublish(m.nativeId)}>

@@ -54,12 +54,29 @@ export interface SelectableModel {
   /** A bare native id (router default) or `slug/native` (pinned to one provider). */
   id: string;
   label: string;
+  /**
+   * Whether this entry can see images, for the badge the picker shows beside the model.
+   *
+   * Informational ONLY — nothing gates on it. An attachment is accepted whatever this says: a
+   * text-only model answers about an image via a vision model's reading of it, so refusing the
+   * attachment at the picker's door would hide a capability the app actually has.
+   *
+   * `undefined` is "the provider published nothing", which is the common case and must not be
+   * rendered as "no" — see `parseCapabilitiesJson`'s rule that unknown stays unknown.
+   */
+  vision?: boolean;
 }
 
 /** The only part of `AliasEntry` this module reads — a structural subset, so `catalog.aliases` fits. */
 export interface AliasRow {
   alias: string;
   providerId: string;
+}
+
+/** One row's declared vision support. Structural, so a `CatalogModel` fits and a test fixture need
+ *  only the one field. */
+function visionOf(row: { supportsVision?: boolean }): boolean | undefined {
+  return typeof row.supportsVision === "boolean" ? row.supportsVision : undefined;
 }
 
 /** Marks the form that lets the router choose, so the capability is visible where it is chosen. */
@@ -73,7 +90,7 @@ const ANY_PROVIDER = " · any provider (failover)";
  * order the planner would consider them.
  */
 export function bareCarriers(
-  rows: readonly Pick<CatalogModel, "providerId" | "nativeId">[],
+  rows: readonly Pick<CatalogModel, "providerId" | "nativeId" | "supportsVision">[],
   aliases: readonly AliasRow[],
   nativeId: string,
 ): string[] {
@@ -90,7 +107,7 @@ export function bareCarriers(
  * catalog carries the model twice — which is the case that a catalog-only count got wrong.
  */
 export function hasFailoverCarrier(
-  rows: readonly Pick<CatalogModel, "providerId" | "nativeId">[],
+  rows: readonly Pick<CatalogModel, "providerId" | "nativeId" | "supportsVision">[],
   aliases: readonly AliasRow[],
   nativeId: string,
   isEnabled: (providerId: string) => boolean,
@@ -108,7 +125,7 @@ export function hasFailoverCarrier(
  * is a qualified id on a provider that fails.
  */
 export function offersBareId(
-  rows: readonly Pick<CatalogModel, "providerId" | "nativeId">[],
+  rows: readonly Pick<CatalogModel, "providerId" | "nativeId" | "supportsVision">[],
   nativeId: string,
   isEnabled: (providerId: string) => boolean,
 ): boolean {
@@ -131,7 +148,7 @@ export function offersBareId(
  * offering a failover option that cannot fail over.
  */
 export function bareEntry(
-  rows: readonly Pick<CatalogModel, "providerId" | "nativeId">[],
+  rows: readonly Pick<CatalogModel, "providerId" | "nativeId" | "supportsVision">[],
   aliases: readonly AliasRow[],
   nativeId: string,
   isEnabled: (providerId: string) => boolean,
@@ -139,9 +156,16 @@ export function bareEntry(
 ): SelectableModel | null {
   if (!offersBareId(rows, nativeId, isEnabled)) return null;
   const reachable = bareCarriers(rows, aliases, nativeId).filter(isEnabled);
-  if (reachable.length > 1) return { id: nativeId, label: nativeId + ANY_PROVIDER };
+  // A bare id's badge must hold for EVERY carrier the router may choose — one that cannot see
+  // would fail the image on the turn it happens to serve. `all` over an empty set is true, hence
+  // the length guard: a bare id with no enabled carrier is not offered at all.
+  const everyCarrierSees = reachable.length > 0 && reachable.every((pid) =>
+    rows.some((row) => row.providerId === pid && row.nativeId === nativeId && visionOf(row) === true),
+  );
+  const vision = everyCarrierSees ? { vision: true } : {};
+  if (reachable.length > 1) return { id: nativeId, label: nativeId + ANY_PROVIDER, ...vision };
   if (reachable.length === 1) {
-    return { id: nativeId, label: `${nativeId} · router default (${slugOf(reachable[0]!)})` };
+    return { id: nativeId, label: `${nativeId} · router default (${slugOf(reachable[0]!)})`, ...vision };
   }
   // No enabled provider would be reached — nothing to offer.
   return null;
@@ -156,7 +180,7 @@ export function bareEntry(
  * removing options is a separate decision from adding one.
  */
 export function selectableModels(
-  rows: readonly Pick<CatalogModel, "providerId" | "nativeId">[],
+  rows: readonly Pick<CatalogModel, "providerId" | "nativeId" | "supportsVision">[],
   aliases: readonly AliasRow[],
   slugOf: (providerId: string) => string,
   isEnabled: (providerId: string) => boolean,
@@ -177,7 +201,7 @@ export function selectableModels(
     const id = `${slugOf(r.providerId)}/${r.nativeId}`;
     if (emitted.has(id)) continue;
     emitted.add(id);
-    out.push({ id, label: id });
+    out.push({ id, label: id, ...(visionOf(r) === undefined ? {} : { vision: visionOf(r) }) });
   }
   return out;
 }

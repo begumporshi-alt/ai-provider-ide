@@ -25,10 +25,23 @@ import { fetchImageUrl } from "../ipc-client";
 import { invoke } from "@tauri-apps/api/core";
 import { fetchAdmin } from "../lib/gateway-client";
 import { gatewayGenerate, gatewayGenerateImage } from "../lib/gateway-turn";
+import { userContent } from "@aiprovider/router-core";
 import { useUi } from "../ui-state";
 import { useHeaderSlot } from "../components/Shell";
 import { Button, Modal, inputCls, inputStyle } from "../components/atoms";
 import { Markdown } from "../components/Markdown";
+import { RichMarkdown } from "../components/RichMarkdown";
+import { DocCard } from "../components/DocCard";
+import { ArtifactCard } from "../components/ArtifactCard";
+import { writtenArtifactPath } from "../lib/chat/artifacts";
+import {
+  VISION_DESCRIBE_SYSTEM,
+  VISION_DESCRIBE_MAX_TOKENS,
+  imageContextBlock,
+  pickVisionModel,
+  type ImageReading,
+} from "../lib/chat/vision";
+import { artifactHistories, type ArtifactVersion } from "../lib/chat/artifact-versions";
 import { Composer, type Attachment, type InlinedText } from "../components/Composer";
 import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
@@ -1050,7 +1063,14 @@ function ModelPicker({
       </button>
       {open && (
         <>
-          <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
+          {/* The panel's own dismissal: it covers the screen, so a click anywhere outside closes it.
+              Named for the same reason the run-config overlay is — a spec has to be able to say
+              "close this" without clicking a coordinate. */}
+          <div
+            className="fixed inset-0 z-40"
+            data-testid="model-picker-overlay"
+            onClick={() => setOpen(false)}
+          />
           <div
             className="absolute left-0 top-8 z-50 w-[380px] rounded border p-2 shadow-lg"
             style={{ background: "var(--surface-2)", borderColor: "var(--border)" }}
@@ -1082,6 +1102,27 @@ function ModelPicker({
                   }}
                 >
                   {m.label}
+                  {/*
+                   * The vision badge, and the ONLY place a capability is stated about a model.
+                   *
+                   * It is informational: nothing gates on it, because an attachment is accepted
+                   * whatever the model declares — a text-only model answers about an image through a
+                   * vision model's reading of it (`lib/chat/vision.ts`). A badge that also decided
+                   * whether you could attach a file would be the refusal this replaced.
+                   *
+                   * Shown only when the catalog DECLARES it — `undefined` means the provider
+                   * published nothing, which is not the same claim as "cannot see".
+                   */}
+                  {m.vision === true && (
+                    <span
+                      className="ml-1.5 rounded px-1 py-px text-[10px]"
+                      style={{ background: "var(--accent-soft)", color: "var(--info)" }}
+                      data-testid="model-vision-badge"
+                      title="This model can be shown images directly"
+                    >
+                      vision
+                    </span>
+                  )}
                 </button>
               ))}
               {filtered.length === 0 && (
@@ -1140,7 +1181,7 @@ function AssistantContent({ raw }: { raw: string }) {
     <>
       {segs.map((s, i) =>
         s.kind === "text" ? (
-          <Markdown key={i} source={s.text} />
+          <RichMarkdown key={i} source={s.text} />
         ) : (
           <ToolCallChip key={i} seg={s} />
         ),
@@ -1450,6 +1491,26 @@ function Chat({
   const [finishReason, setFinishReason] = useState<string | undefined>(undefined);
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
+  // Plan mode's answers render as rich document cards (the ZCode-style plan card): once a
+  // plan-mode run finishes, the plan text is recorded here so the card survives approval
+  // (planMode flipping off), later turns, and — this is why it is text and not a message id —
+  // the transcript replace, which mints fresh ids for every message it hands back
+  // (agent-turn.ts `onReplaceTranscript`). Content is the one handle that survives that rewrite.
+  const [planDocs, setPlanDocs] = useState<string[]>([]);
+  const wasBusyRef = useRef(false);
+  useEffect(() => {
+    if (wasBusyRef.current && !busy && planMode) {
+      for (let i = msgs.length - 1; i >= 0; i--) {
+        const m = msgs[i];
+        if (m && m.role === "assistant" && m.content.trim()) {
+          const doc = m.content.trim();
+          setPlanDocs((prev) => (prev.includes(doc) ? prev : [...prev, doc]));
+          break;
+        }
+      }
+    }
+    wasBusyRef.current = busy;
+  }, [busy, planMode, msgs]);
   // The draft itself lives in `Composer` (it also owns attachments and the two menus). This is a
   // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
   // context meter's estimate of what the next send will contain, and nothing else.
@@ -1794,6 +1855,45 @@ function Chat({
   // consumed so they cannot *also* appear as anonymous "tool result" bubbles of their own.
   const toolRuns = useMemo(() => groupToolRuns(msgs), [msgs]);
 
+  /**
+   * Which tool steps may render an artifact preview: **the newest successful write of each file,
+   * and only once the run has finished.**
+   *
+   * Measured complaint (2026-10-10): "preview of html/docs showing after every edit". A page
+   * edited six times rendered six cards — six sandboxed iframes, six host reads, and most of them
+   * showing a half-written file. ZCode's own model is the reference here: its bundle carries
+   * `artifactId` / `artifactVersionId` / `artifactDisplayName` and an `openArtifact` affordance,
+   * i.e. ONE artifact with versions rather than a card per write.
+   *
+   * So the preview is the run's OUTPUT and the diffs are its process: while `busy`, a run that is
+   * still writing has no finished artifact to show, and the newest write is the only one whose
+   * content is not superseded. Both conditions are what make the count one-per-file rather than
+   * one-per-edit.
+   */
+  const artifacts = useMemo(() => {
+    const previews = new Map<number, Set<number>>();
+    // The newest successful write of each path, which is the one that may render a preview.
+    const newest = new Map<string, { mi: number; si: number }>();
+    msgs.forEach((m, mi) => {
+      if (m.role !== "assistant") return;
+      (toolRuns.byAssistant.get(mi) ?? []).forEach((step, si) => {
+        const path = writtenArtifactPath(step);
+        if (path) newest.set(path, { mi, si });
+      });
+    });
+    // Histories come from the same walk — a run that touched a dozen files must not replay the
+    // transcript a dozen times on every render.
+    const histories = artifactHistories(toolRuns.byAssistant);
+    if (!busy) {
+      for (const { mi, si } of newest.values()) {
+        const set = previews.get(mi) ?? new Set<number>();
+        set.add(si);
+        previews.set(mi, set);
+      }
+    }
+    return { previews, histories };
+  }, [busy, msgs, toolRuns]);
+
   // Per-call approval gate: consult the policy, and suspend the loop for a modal only when the
   // policy says the user has to decide.
   //
@@ -1854,12 +1954,95 @@ function Chat({
     const perTurn = instructionSystemText(instruction);
     // An image-only turn is a real turn: the composer allows sending one, so the guard must too.
     if ((!trimmed && attachments.length === 0) || busy || !chosen) return;
+
+    /**
+     * A model that cannot see, handed an image — read it with one that can.
+     *
+     * The turn's wire text gains an `<images read-by=…>` block and the image parts are dropped from
+     * the request, while `userMsg` below keeps them for DISPLAY: the thumbnail is part of the
+     * question, and a transcript that hid it would misrepresent what was asked. What the model
+     * actually received is stated in the block, so it cannot claim to have seen the picture itself.
+     *
+     * Nothing here is silent. A failure to read, or no vision model at all, stops the turn with a
+     * sentence in the transcript instead of sending an image upstream to be ignored or rejected.
+     */
+    const imageAttachments = attachments.filter((a) => a.mediaType.startsWith("image/"));
+    let wireText = trimmed;
+    let wireAttachments = attachments;
+    let imageReadings: { name: string; description: string }[] | undefined;
+    let imagesReadBy: string | undefined;
+    if (imageAttachments.length > 0 && chosenVision !== true) {
+      if (!visionHelper) {
+        setNotice(
+          `This model cannot see images and no vision-capable model is available to read them — ` +
+            `add a provider whose model declares vision, or pick one in Settings → defaults. The ` +
+            `turn was not sent.`,
+        );
+        return;
+      }
+      setNotice(`${visionHelper} is reading ${imageAttachments.length === 1 ? "the image" : "the images"}…`);
+      const readings: ImageReading[] = [];
+      try {
+        for (const img of imageAttachments) {
+          const cached = visionReadingsRef.current.get(img.id);
+          if (cached !== undefined) {
+            readings.push({ name: img.name, description: cached });
+            continue;
+          }
+          const exec = await gatewayGenerate(
+            {
+              model: visionHelper,
+              messages: [
+                { role: "system", content: VISION_DESCRIBE_SYSTEM },
+                {
+                  role: "user",
+                  content: userContent(
+                    trimmed
+                      ? `The other model was asked: ${trimmed}`
+                      : "Describe this image for the other model.",
+                    [{ mediaType: img.mediaType, dataBase64: img.dataBase64 }],
+                  ),
+                },
+              ],
+              maxTokens: VISION_DESCRIBE_MAX_TOKENS,
+            },
+            {},
+          );
+          let description = "";
+          for await (const chunk of exec.chunks) description += chunk;
+          if (!description.trim()) {
+            // A model that answered with nothing has not described the image, and an empty
+            // `<image>` block would read to the answering model as "a picture of nothing". Said
+            // plainly, so the answer admits it cannot tell rather than inventing a scene.
+            description = `(${visionHelper} returned no reading for this image.)`;
+          } else {
+            visionReadingsRef.current.set(img.id, description);
+          }
+          readings.push({ name: img.name, description: description.trim() });
+        }
+      } catch (e) {
+        setNotice(`${visionHelper} could not read the image: ${(e as Error).message}. The turn was not sent.`);
+        return;
+      }
+      wireText = `${trimmed}\n\n${imageContextBlock(readings, visionHelper)}`.trim();
+      wireAttachments = attachments.filter((a) => !a.mediaType.startsWith("image/"));
+      // Recorded on the MESSAGE as well as on the wire. The image stays on this turn, so every
+      // later turn re-sends it — and `replayHistory` rebuilds content from the message, which is
+      // the only thing that survives to the second turn. Without this, a follow-up would put image
+      // bytes on the wire for a model that cannot read them.
+      imageReadings = readings;
+      imagesReadBy = visionHelper;
+      setNotice(`Read by ${visionHelper}. ${chosen} will answer from that reading.`);
+    }
+
     const userMsg: Msg = {
       id: newMsgId(),
       role: "user",
       content: trimmed,
       ...(attachments.length ? { attachments } : {}),
       ...(inlined.length ? { inlined } : {}),
+      ...(imageReadings ? { imageReadings } : {}),
+      ...(imagesReadBy ? { imagesReadBy } : {}),
     };
     const assistantMsg: Msg = { id: newMsgId(), role: "assistant", content: "" };
     setMsgs([...baseMsgs, userMsg, assistantMsg]);
@@ -1898,9 +2081,9 @@ function Chat({
       // run record, checkpoint host, confirm gate, graph recording, memory, trace, change set.
       await runAgentTurn(
         {
-          text: trimmed,
+          text: wireText,
           baseMsgs,
-          attachments,
+          attachments: wireAttachments,
           model: chosen,
           perTurn,
           useMemory,
@@ -2016,9 +2199,11 @@ function Chat({
     // this is the sink of set* calls the inline code used to make, one-for-one.
     await runPlainTurn(
       {
-        text: trimmed,
+        // `wireText` / `wireAttachments`, not the raw pair: an image the chosen model cannot see was
+        // read by a vision model above, and this turn carries that reading instead of the bytes.
+        text: wireText,
         baseMsgs,
-        attachments,
+        attachments: wireAttachments,
         model: chosen,
         perTurn,
         useMemory,
@@ -2330,10 +2515,58 @@ function Chat({
    */
   const chosenVision = useMemo(() => {
     if (!chosen) return undefined;
-    const nativeId = chosen.includes("/") ? chosen.split("/")[1]! : chosen;
-    const row = catalog.all().find((m: CatalogModel) => m.nativeId === nativeId && m.modality === "text");
+    const rows = catalog.all();
+    // A QUALIFIED id resolves to its own provider's row, not to any row sharing the native id:
+    // two providers can carry the same model name with different published capabilities, and the
+    // question here is what the model that will ANSWER can see. Matching loosely would read
+    // another provider's `vision: true` and skip the reading for a model that cannot see — which
+    // is the exact failure the reading exists to prevent.
+    if (chosen.includes("/")) {
+      const cut = chosen.indexOf("/");
+      const slug = chosen.slice(0, cut);
+      const nativeId = chosen.slice(cut + 1);
+      const row = rows.find(
+        (m: CatalogModel) =>
+          m.nativeId === nativeId && (registry.getProvider(m.providerId)?.slug ?? m.providerId) === slug,
+      );
+      return row?.supportsVision;
+    }
+    const row = rows.find((m: CatalogModel) => m.nativeId === chosen && m.modality === "text");
     return row?.supportsVision;
   }, [chosen, tick]);
+
+  /**
+   * Readings already taken, keyed by attachment id.
+   *
+   * An image stays on its turn and is re-sent with every follow-up, so without this a second
+   * question about the same screenshot pays for the same description again — same image, same
+   * model, same text. The id is minted per attach (name + size + index + time), so a re-attached
+   * file is read afresh while the same attachment is not.
+   */
+  const visionReadingsRef = useRef(new Map<string, string>());
+
+  /**
+   * The model that reads images for a model that cannot see them, or null when nothing can.
+   *
+   * `settings.defaults.vision` is the explicit choice; otherwise the first enabled model that
+   * declares vision. See `lib/chat/vision.ts` for why an explicit choice outranks a declaration.
+   */
+  const visionHelper = useMemo(() => {
+    void tick;
+    const settings = router.settings as typeof router.settings & { defaults?: Record<string, string> };
+    const slugOf = (pid: string) => registry.getProvider(pid)?.slug ?? pid;
+    const isEnabled = (pid: string) => registry.getProvider(pid)?.status === "enabled";
+    return pickVisionModel({
+      preferred: settings.defaults?.vision,
+      models: catalog.all().map((m: CatalogModel) => ({
+        id: `${slugOf(m.providerId)}/${m.nativeId}`,
+        providerId: m.providerId,
+        nativeId: m.nativeId,
+        supportsVision: m.supportsVision,
+      })),
+      isEnabled,
+    });
+  }, [tick]);
 
   /**
    * The workspace tools, for `@`-mentions. `null` when there is no usable root, which is what the
@@ -2653,6 +2886,7 @@ function Chat({
                   waiting={pendingConfirm?.call.name ?? null}
                   stopping={stopping}
                   usage={runUsage}
+                  root={root}
                 />
               ) : (
                 // A turn that only requested tools has no prose of its own. Rendering the
@@ -2667,7 +2901,15 @@ function Chat({
                   {m.reasoning ? (
                     <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
                   ) : null}
-                  {m.content.trim() ? <AssistantContent raw={m.content} /> : null}
+                  {/* A plan-mode run's answer is a document, not a paragraph — the card gives it
+                      the title, truncated preview and full view ZCode renders. Everything else
+                      (including the same message before the run finished) stays the ordinary
+                      markdown path. */}
+                  {planDocs.includes(m.content.trim()) ? (
+                    <DocCard source={m.content} label="Plan" />
+                  ) : m.content.trim() ? (
+                    <AssistantContent raw={m.content} />
+                  ) : null}
                 </>
               )
             ) : (
@@ -2698,7 +2940,14 @@ function Chat({
                 )}
               </>
             )}
-            {toolRuns.byAssistant.has(i) && <ToolRunGroup steps={toolRuns.byAssistant.get(i)!} />}
+            {toolRuns.byAssistant.has(i) && (
+              <ToolRunGroup
+                steps={toolRuns.byAssistant.get(i)!}
+                root={root}
+                previewSteps={artifacts.previews.get(i)}
+                histories={artifacts.histories}
+              />
+            )}
             {editingId !== m.id && (
               <MessageActions
                 disabled={busy}
@@ -2810,8 +3059,6 @@ function Chat({
           textareaRef={inputRef}
           busy={busy}
           agentMode={agentMode}
-          vision={chosenVision}
-          modelLabel={chosen || "the current model"}
           onSend={send}
           onStop={stopRun}
           onClear={newChat}
@@ -3093,9 +3340,24 @@ const STEP_COLOR: Record<ToolStatus, string> = {
  * label, carries the state — amber while the call runs, green when it returned, red when it
  * failed, dim on a replayed transcript where no status was recorded.
  */
-function ToolCallRow({ step }: { step: UIStep }) {
+function ToolCallRow({
+  step,
+  root = "",
+  previewAllowed = false,
+  histories,
+}: {
+  step: UIStep;
+  root?: string;
+  /** Whether THIS step is the one that may render the file's preview — see `artifacts.previews`. */
+  previewAllowed?: boolean;
+  /** Version histories by path, so the card can walk what the transcript recorded. */
+  histories?: ReadonlyMap<string, { versions: ArtifactVersion[]; unresolved: number }>;
+}) {
   const [open, setOpen] = useState(false);
   const change = fileChangeFor(step.name, step.args);
+  // A card only where the step is the file's newest successful write AND the run has finished; a
+  // refused write keeps its diff either way (`writtenArtifactPath` carries that gate).
+  const previewable = previewAllowed && root ? writtenArtifactPath(step) : null;
   const color = step.status ? STEP_COLOR[step.status] : "var(--text-faint)";
   const summary = argSummary(step.args);
   const preview = step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
@@ -3139,6 +3401,14 @@ function ToolCallRow({ step }: { step: UIStep }) {
               {hasOutput ? `⎿ ${preview!.slice(0, 120)}${step.result.replace(/\s+/g, " ").trim().length > 120 ? "…" : ""}` : "⎿ (no output)"}
             </div>
           )}
+          {previewable && (
+            <ArtifactCard
+              path={previewable}
+              root={root}
+              versions={histories?.get(previewable)?.versions}
+              testId="tool-artifact"
+            />
+          )}
         </div>
       ) : step.result !== undefined ? (
         <button
@@ -3167,11 +3437,28 @@ function ToolCallRow({ step }: { step: UIStep }) {
  * A turn's tool calls, one row per call — the grouping survives (which calls belong to which
  * turn is what makes a replayed run read turn by turn), the card does not. See `ToolCallRow`.
  */
-function ToolRunGroup({ steps }: { steps: UIStep[] }) {
+function ToolRunGroup({
+  steps,
+  root = "",
+  previewSteps,
+  histories,
+}: {
+  steps: UIStep[];
+  root?: string;
+  /** Indices of the steps in THIS turn allowed to render an artifact preview. */
+  previewSteps?: Set<number>;
+  histories?: ReadonlyMap<string, { versions: ArtifactVersion[]; unresolved: number }>;
+}) {
   return (
     <div className="mt-1.5 space-y-2" data-testid="tool-run-group">
       {steps.map((s, i) => (
-        <ToolCallRow key={i} step={s} />
+        <ToolCallRow
+          key={i}
+          step={s}
+          root={root}
+          previewAllowed={previewSteps?.has(i) ?? false}
+          histories={histories}
+        />
       ))}
     </div>
   );
@@ -3373,11 +3660,14 @@ function AgentLive({
   waiting,
   stopping,
   usage,
+  root = "",
 }: {
   segments: TimelineSegment[];
   waiting: string | null;
   stopping: boolean;
   usage: { tokensIn: number; tokensOut: number };
+  /** The workspace root, so a call that already wrote a file can preview it mid-run. */
+  root?: string;
 }) {
   return (
     <>
@@ -3390,7 +3680,7 @@ function AgentLive({
           return <ReasoningPanel key={i} text={seg.text} streaming={i === segments.length - 1} />;
         }
         if (seg.kind === "text") {
-          return <Markdown key={i} source={seg.text} />;
+          return <RichMarkdown key={i} source={seg.text} />;
         }
         const step: UIStep = {
           name: seg.name,
@@ -3401,7 +3691,7 @@ function AgentLive({
         };
         return (
           <div key={i} className="mt-1.5">
-            <ToolCallRow step={step} />
+            <ToolCallRow step={step} root={root} />
           </div>
         );
       })}

@@ -14,6 +14,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import MarkdownIt from "markdown-it";
 import Prism from "prismjs";
+import { openExternal } from "../ipc-client";
 import "./markdown.css";
 
 // A single shared markdown-it instance — it is stateful (plugins, options) but not per-call.
@@ -23,6 +24,22 @@ const md = new MarkdownIt({
   typographer: true,
   breaks: false,
 });
+
+/**
+ * Intercept every link click and hand the URL to the OS browser.
+ *
+ * Without this a link is dead weight: the app's CSP refuses the navigation, and even where it
+ * were permitted, navigating would replace the application with a web page. Delegated on the
+ * container because the anchors come from `dangerouslySetInnerHTML` — there is no React handler
+ * to attach to each one.
+ */
+function handleLinkClick(e: React.MouseEvent<HTMLDivElement>) {
+  const anchor = (e.target as HTMLElement | null)?.closest?.("a");
+  const href = anchor?.getAttribute("href");
+  if (!href) return;
+  e.preventDefault();
+  if (/^https?:|^mailto:|^tel:/i.test(href)) void openExternal(href);
+}
 
 function copyToClipboard(text: string, id: string, setCopiedId: (v: string | null) => void) {
   void navigator.clipboard.writeText(text);
@@ -75,6 +92,7 @@ export function Markdown({ source }: { source: string }) {
       ref={containerRef}
       className="markdown-body whitespace-pre-wrap text-[13px]"
       style={{ color: "var(--text)" }}
+      onClick={handleLinkClick}
       dangerouslySetInnerHTML={{ __html: html }}
     />
   );

@@ -63,6 +63,24 @@ const PNG_1PX = Buffer.from(
   "base64",
 );
 
+/**
+ * A 96x48 PNG for the image-artifact variant — a visible two-tone mark, generated and verified by
+ * scripts/make-fixture-png.mjs. Deliberately NOT the 1x1 pixel the image route uses: a one-pixel
+ * bitmap renders as an invisible dot, so a screenshot of that card cannot be told apart from a
+ * broken card, and a reviewer would be judging the fixture instead of the layout.
+ */
+const TINY_PNG_B64 =
+  "iVBORw0KGgoAAAANSUhEUgAAAGAAAAAwCAIAAABhdOiYAAABBUlEQVR42u3Xuw3DMAwE0BshZWZwlU09gXdNE7hIgIiWKX6OBFioMI/Gg2BLeDxfX7Ude9dZ+AVqJhFQM32AtmP/b1ScCeeqmQZAzSQCaiYRUDOJgJpJBFScCZeeLsiEiZ5STJjuLMKEm/30TFBJIWaCYhYlE9QTyZiwKJeGCUvTCZhgMCM1E8wmJWWC8bx0THCZmogJjrNTMMH9DYIzIchODsuEUF/EgEwI+GcNxYSwJ7QgTAh+0ndnQvzbkC9TDiBHpkxALkz5gIyZsgKZMeUGMmBiAFrKxAO0iIkNSJ2JE0iRiRlIhYkf6CZTFaBpplpAE0wVgS4x1QUSMlUHGjI10IDpDZukEE2Cz2TvAAAAAElFTkSuQmCC";
+
+/**
+ * A one-page PDF for the PDF-artifact variant — built with correct xref offsets and verified
+ * parseable by the REAL pdf.js before being pasted here (`numPages: 1`, 200x100, text
+ * "Artifact preview"). A hand-waved PDF would fail inside the renderer, where the failure reads
+ * as a broken viewer rather than a bad fixture. Regenerate with scripts/make-fixture-pdf.mjs.
+ */
+const TINY_PDF_B64 =
+  "JVBERi0xLjQKMSAwIG9iago8PCAvVHlwZSAvQ2F0YWxvZyAvUGFnZXMgMiAwIFIgPj4KZW5kb2JqCjIgMCBvYmoKPDwgL1R5cGUgL1BhZ2VzIC9LaWRzIFszIDAgUl0gL0NvdW50IDEgPj4KZW5kb2JqCjMgMCBvYmoKPDwgL1R5cGUgL1BhZ2UgL1BhcmVudCAyIDAgUiAvTWVkaWFCb3ggWzAgMCAyMDAgMTAwXSAvUmVzb3VyY2VzIDw8IC9Gb250IDw8IC9GMSA0IDAgUiA+PiA+PiAvQ29udGVudHMgNSAwIFIgPj4KZW5kb2JqCjQgMCBvYmoKPDwgL1R5cGUgL0ZvbnQgL1N1YnR5cGUgL1R5cGUxIC9CYXNlRm9udCAvSGVsdmV0aWNhID4+CmVuZG9iago1IDAgb2JqCjw8IC9MZW5ndGggNDYgPj4Kc3RyZWFtCkJUIC9GMSAxNCBUZiAyMCA0NSBUZCAoQXJ0aWZhY3QgcHJldmlldykgVGogRVQKZW5kc3RyZWFtCmVuZG9iagp4cmVmCjAgNgowMDAwMDAwMDAwIDY1NTM1IGYgCjAwMDAwMDAwMDkgMDAwMDAgbiAKMDAwMDAwMDA1OCAwMDAwMCBuIAowMDAwMDAwMTE1IDAwMDAwIG4gCjAwMDAwMDAyNDEgMDAwMDAgbiAKMDAwMDAwMDMxMSAwMDAwMCBuIAp0cmFpbGVyCjw8IC9TaXplIDYgL1Jvb3QgMSAwIFIgPj4Kc3RhcnR4cmVmCjQwNwolJUVPRgo=";
+
 /** Last request that hit the image bytes endpoint — wire-level truth for the spec. */
 let imgSeen = { path: null };
 
@@ -309,6 +327,93 @@ async function oracle(req, res, path) {
       // tool call of its own to record on the Subagents screen.
       toolCall = { name: "dispatch_agent", arguments: JSON.stringify({ task: "list the files in the workspace" }) };
       content = "";
+    } else if (tools && /write page twice/i.test(userPrompt) && toolMsgs.length === 0) {
+      // THE SAME FILE TWICE variant: the transcript's artifact preview must appear ONCE, for the
+      // newest write, after the run ends — not once per edit (measured complaint 2026-10-10).
+      // Ordered before the `/write page/` branch below, which this prompt also matches.
+      toolCall = {
+        name: "write_file",
+        arguments: JSON.stringify({
+          path: "site/index.html",
+          content: "<!doctype html>\n<html><body><h1>FIRST MARK</h1></body></html>\n",
+        }),
+      };
+      content = "";
+    } else if (tools && /write page twice/i.test(userPrompt) && toolMsgs.length === 1) {
+      // The second write to the SAME path. Its content supersedes the first, so a preview of the
+      // first would be showing the user a file that no longer exists in that form.
+      toolCall = {
+        name: "write_file",
+        arguments: JSON.stringify({
+          path: "site/index.html",
+          content: "<!doctype html>\n<html><body><h1>FINAL MARK</h1></body></html>\n",
+        }),
+      };
+      content = "";
+    } else if (tools && /write page twice/i.test(userPrompt)) {
+      content = "Done. Here is what I found in the workspace.";
+    } else if (tools && !sawToolResult && /write page/i.test(userPrompt)) {
+      // Agent mode, HTML-ARTIFACT variant: a real page written to the workspace, which is what the
+      // transcript's artifact card previews. `write_file` (utf-8) is the same call the real host
+      // serves, so the diff and the card are driven by one tool result.
+      toolCall = {
+        name: "write_file",
+        arguments: JSON.stringify({
+          path: "site/index.html",
+          content:
+            "<!doctype html>\n<html>\n  <body style=\"font-family: sans-serif\">\n" +
+            "    <h1 style=\"color: rebeccapurple\">Written by the agent</h1>\n" +
+            "    <p>This file is on disk and previewed from there.</p>\n" +
+            "  </body>\n</html>\n",
+        }),
+      };
+      content = "";
+    } else if (tools && !sawToolResult && /write pdf/i.test(userPrompt)) {
+      // Agent mode, PDF-ARTIFACT variant. `encoding: "base64"` mirrors tools.rs: this is how real
+      // bytes reach the disk, and how the artifact reader hands them back.
+      toolCall = {
+        name: "write_file",
+        arguments: JSON.stringify({ path: "docs/report.pdf", content: TINY_PDF_B64, encoding: "base64" }),
+      };
+      content = "";
+    } else if (tools && !sawToolResult && /write logo/i.test(userPrompt)) {
+      // Agent mode, IMAGE-ARTIFACT variant: the 1×1 PNG the image route already serves.
+      toolCall = {
+        name: "write_file",
+        arguments: JSON.stringify({ path: "assets/logo.png", content: TINY_PNG_B64, encoding: "base64" }),
+      };
+      content = "";
+    } else if (!tools && /localhost link/i.test(last)) {
+      // Plain chat: the model names a dev-server URL. The card fetches it through the host's
+      // egress path — loopback is the one remote-ish host the policy permits.
+      content = "The preview server is up at http://127.0.0.1:18901/demo — have a look.";
+    } else if (!tools && /remote link/i.test(last)) {
+      // Plain chat: a host the egress policy does not permit, so the card must NOT try to fetch
+      // it — it offers the browser instead.
+      content = "The upstream docs live at https://example.com/guide — open that in your browser.";
+    } else if (tools && !sawToolResult && /plan the/i.test(userPrompt)) {
+      // Agent mode, PLAN-CARD variant: the plan-mode answer IS the plan document — prose, no tool
+      // call — which is what the transcript's DocCard renders. Long enough to overflow the
+      // card's clamped preview, so the "View full plan" pill is reachable in a spec.
+      content = [
+        "# Subagent System Upgrade — Two Phases",
+        "",
+        "Bring the assistant's document rendering up to what ZCode shows: a titled plan card with",
+        "a truncated, fading preview and the full document one click away. Each phase ships",
+        "independently.",
+        "",
+        "## Phase 1 — the plan card",
+        "",
+        "1. Record the plan-mode answer's message id when the run finishes.",
+        "2. Render that message through DocCard: icon header, copy button, clamped preview.",
+        "3. Expand in place; collapsing returns the faded preview.",
+        "",
+        "## Phase 2 — live HTML documents",
+        "",
+        "4. Split whole html documents out of the markdown stream.",
+        "5. Preview each one in a sandboxed iframe with a code toggle beside it.",
+        "6. Keep fragments and snippets as highlighted code — they are not pages.",
+      ].join("\n");
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.
@@ -318,6 +423,25 @@ async function oracle(req, res, path) {
       // No answer at all — the model never got past thinking. `content` must stay empty, or the
       // test would be asserting on a reply the real provider never sends.
       content = "";
+    } else if (!tools && /html page/i.test(last)) {
+      // Plain-chat variant: a whole HTML document in a fenced block — the shape the HtmlPreview
+      // card exists for. The prose around the fence proves the splitter keeps surrounding text;
+      // a fragment stays a code block (asserted in the unit suite, not here).
+      content = [
+        "Here is a small page:",
+        "",
+        "```html",
+        "<!doctype html>",
+        "<html>",
+        "  <body style=\"font-family: sans-serif; background: #f8fafc\">",
+        "    <h1 style=\"color: teal\">Rendered live</h1>",
+        "    <p>This page runs inside the chat.</p>",
+        "  </body>",
+        "</html>",
+        "```",
+        "",
+        "It renders in a sandboxed frame above.",
+      ].join("\n");
     } else {
       content = tools && sawToolResult
         ? "Done. Here is what I found in the workspace."
@@ -595,6 +719,20 @@ const server = createServer(async (req, res) => {
     if (req.method === "OPTIONS") return cors(res);
     const url = new URL(req.url, `http://127.0.0.1:${PORT}`);
     const path = url.pathname.replace(/^\/(v1|v2|v3)/, "");
+    /**
+     * A plain page for the URL-preview spec — deliberately NOT under /v1, because it is not a
+     * provider API route: it is a "dev server" the model names, and the UI fetches it through the
+     * host's `egress_request`. Serving real HTML is what makes the preview card take its page
+     * branch instead of its text branch.
+     */
+    if (url.pathname === "/demo" && req.method === "GET") {
+      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8", "Access-Control-Allow-Origin": "*" });
+      return res.end(
+        "<!doctype html><html><body style=\"font-family: sans-serif\">" +
+          "<h1 style=\"color: seagreen\">Demo server</h1>" +
+          "<p>Served by the mock, shown inside the chat.</p></body></html>",
+      );
+    }
     if (req.url.startsWith("/v1/")) return await oracle(req, res, path);
     if (req.url.startsWith("/v2/")) return await exotic(req, res, path);
     if (req.url.startsWith("/v3/")) return await orRouter(req, res, path);

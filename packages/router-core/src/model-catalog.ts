@@ -65,6 +65,35 @@ export class ModelCatalog {
     return next;
   }
 
+  /**
+   * Declare whether one model accepts images, or clear the declaration with `undefined`.
+   *
+   * The counterpart of ZCode's `inputFormat.supportsImage`, which is a per-model property the model
+   * registry holds rather than something derived from a provider's listing — because providers
+   * publish capability metadata inconsistently or not at all, and the person reading the docs knows
+   * things the catalog does not. Three states, and each means something different downstream:
+   * `true` sends images straight to the model, `false` and `undefined` both route them through a
+   * vision model's reading, and `undefined` is what "nobody has said" looks like.
+   *
+   * Returns whether anything changed, so a caller can skip a pointless persist.
+   */
+  setVision(providerId: string, nativeId: string, vision: boolean | undefined): boolean {
+    let changed = false;
+    this.models = this.models.map((m) => {
+      if (m.providerId !== providerId || m.nativeId !== nativeId) return m;
+      if (m.supportsVision === vision) return m;
+      changed = true;
+      const next = { ...m };
+      // Deleted rather than set to `undefined`: the row is persisted as JSON, and a key with an
+      // undefined value is dropped by `JSON.stringify` while `"vision": null` would read as a
+      // declaration of "no" to `parseCapabilitiesJson`.
+      if (vision === undefined) delete next.supportsVision;
+      else next.supportsVision = vision;
+      return next;
+    });
+    return changed;
+  }
+
   /** Remove a manual model. A discovered row is left alone — only a refresh may drop one. */
   removeManual(providerId: string, nativeId: string): boolean {
     const before = this.models.length;
@@ -100,6 +129,11 @@ export class ModelCatalog {
     // Manual rows are kept. They are not part of the provider's listing — clearing them here would
     // mean a Refresh, which the operator runs to pick up *new* models, also destroys the models
     // they added because the provider never listed them.
+    // What we already knew about each model, BEFORE the listing replaces it. See the preservation
+    // rule in the push below.
+    const known = new Map(
+      this.models.filter((m) => m.providerId === providerId).map((m) => [m.nativeId, m]),
+    );
     const manual = this.models.filter((m) => m.providerId === providerId && m.origin === "manual");
     const manualIds = new Set(manual.map((m) => m.nativeId));
     this.models = this.models.filter((m) => m.providerId !== providerId);
@@ -118,9 +152,14 @@ export class ModelCatalog {
         pricing: parsePricing(e.raw),
         // Same reasoning as pricing, for the other facts a client cannot guess: the prompt
         // budget and whether the model reasons. Persisted with the row (see model-meta.ts).
-        contextWindow: parseContextWindow(e.raw),
-        supportsReasoning: parseReasoningSupport(e.raw),
-        supportsVision: parseVisionSupport(e.raw),
+        // **A fetch that says nothing does not erase what is known.** `parse*` returns `undefined`
+        // for an absent field, and overwriting a `supportsVision` the operator set — or a previous
+        // listing stated — with `undefined` would silently undo it: the model drops out of the
+        // picker's vision badge and every image it is sent starts paying for a reading instead of
+        // being seen. A provider that speaks (`false`) still wins; only silence preserves.
+        contextWindow: parseContextWindow(e.raw) ?? known.get(e.nativeId)?.contextWindow,
+        supportsReasoning: parseReasoningSupport(e.raw) ?? known.get(e.nativeId)?.supportsReasoning,
+        supportsVision: parseVisionSupport(e.raw) ?? known.get(e.nativeId)?.supportsVision,
       });
     }
     this.fetchedAt.set(providerId, now);

@@ -10,16 +10,18 @@
  * reports the number of image parts it received in its own reply, which makes the same fact visible
  * in the transcript.
  *
- * The second thing worth proving is the gate: attaching to a model that does not accept images must
- * be refused *and said out loud*. A silent no-op on a dropped file is indistinguishable from a
- * broken app.
+ * The second thing worth proving is what happens when the chosen model CANNOT see the image.
+ * Nothing is refused: the image is attached, a model that declares vision reads it, and the
+ * answering turn carries that reading instead of the image. The old behaviour refused the file and
+ * explained the model's limitation, which read as this app being broken and as the model being worse
+ * than it is.
  *
  * # The three vision states
  *
  * `?seed=systemai` deliberately carries all of them: `oracle-vision` declares image input,
  * `oracle-flash` is reachable and declares nothing, and a provider that publishes no capabilities
- * at all yields the third. The UI must treat "unknown" differently from "no" — the tests below check
- * the wording, because that difference is what stops a user concluding their model is worse than it is.
+ * at all yields the third. The difference decides WHO READS an image — never whether you may attach
+ * one — and the badge in the picker shows it beside the model rather than in the composer.
  */
 import { expect, test, type Page } from "@playwright/test";
 import { pickModel } from "./model-picker";
@@ -151,20 +153,109 @@ test("an image survives the next turn, so a follow-up can refer to it", async ({
   await expect(page.getByText(/Seen 2 images in this request/)).toBeVisible({ timeout: 30_000 });
 });
 
-test("an image is refused for a model that does not declare image input, and says so", async ({ page }) => {
+/**
+ * The capability this replaced the refusal with: a model that cannot see still answers about the
+ * image, because a model that can see reads it first.
+ *
+ * Asserted on the WIRE, not only on the screen: the reading must reach the answering model as text,
+ * and the image bytes must NOT be sent to a model that cannot use them — a UI-only assertion would
+ * pass while the image went nowhere and the answer was invented.
+ */
+test("an image attached to a model that cannot see is read by one that can", async ({ page }) => {
   await openAssistant(page, /oracle-flash/);
 
   await attach(page, "pixel.png", "image/png", Buffer.from(PNG_1PX_BASE64, "base64"));
 
-  // Refused, and explained. Nothing was attached, so there is no chip.
-  await expect(page.getByTestId("attachment-chip")).toHaveCount(0);
-  await expect(page.getByTestId("composer-notice")).toContainText("does not declare image input");
+  // Attached, not refused — the chip is the visible half of that, and no notice scolds the model.
+  await expect(page.getByTestId("attachment-chip")).toBeVisible();
+  await expect(page.getByTestId("composer-notice")).toHaveCount(0);
 
-  // And the refusal is real: a text-only send carries a plain string, not an empty part array.
-  await page.getByTestId("composer-input").fill("just text then");
+  await page.getByTestId("composer-input").fill("what is this?");
   await page.getByRole("button", { name: "Send" }).click();
+
+  // Two requests: the reading, then the turn that answers from it.
+  await expect.poll(() => chatRequestCount(page), { timeout: 30_000 }).toBe(2);
+
   const body = await lastChatBody(page);
-  expect(userTurn(body).content).toBe("just text then");
+  const turn = userTurn(body);
+  expect(typeof turn.content, "the turn carries text, not image parts").toBe("string");
+  const text = String(turn.content);
+  expect(text).toContain('<images read-by="sysai/oracle-vision"');
+  // The mock's own answer to the reading request, proving it came from the model rather than from
+  // a string this app made up.
+  expect(text).toContain("Seen 1 image in this request.");
+  expect(text).toContain("what is this?");
+  expect(text).toContain("do not claim to have seen the images themselves");
+  // And the image itself never went to the blind model.
+  expect(JSON.stringify(body)).not.toContain("image_url");
+
+  // The user is told what happened, in the composer's notice line.
+  await expect(page.getByTestId("composer-notice")).toContainText("sysai/oracle-vision");
+
+  // --- a follow-up does not pay for the same reading twice --------------------------------
+  // The image stays on its turn and rides along with the next question. Re-reading it would cost a
+  // model call and return the same text, so the reading is cached per attachment: the follow-up
+  // costs ONE request, and its turn still carries the reading rather than the image.
+  const before = await chatRequestCount(page);
+  await page.getByTestId("composer-input").fill("and what colour is the button?");
+  await page.getByRole("button", { name: "Send" }).click();
+  await expect.poll(() => chatRequestCount(page), { timeout: 30_000 }).toBe(before + 1);
+
+  const followUp = await lastChatBody(page);
+  expect(String(userTurn(followUp).content)).toContain('<images read-by="sysai/oracle-vision"');
+  expect(JSON.stringify(followUp)).not.toContain("image_url");
+});
+
+/**
+ * The escape hatch for a model that can see but does not say so — ZCode's `inputFormat.supportsImage`
+ * equivalent, declared per model in the Models screen.
+ *
+ * Without it, such a model is sent images through a vision model's reading: true, but lossy, and it
+ * costs a call on every turn that carries the picture. The declaration is what turns the direct path
+ * back on, and this is the test that proves the whole chain — the stored flag, the badge, and the
+ * wire.
+ */
+test("declaring image support on a silent model sends the image straight to it", async ({ page }) => {
+  await page.setViewportSize({ width: 1280, height: 900 });
+  await page.goto(`${APP}?seed=systemai`);
+
+  // Declare it, the way the operator would: Models → the model's Images column → yes.
+  await page.getByRole("button", { name: "Model Browser", exact: true }).click();
+  await page.getByTestId("model-vision-sysai-oracle-flash").selectOption("yes");
+
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await pickModel(page, /oracle-flash/);
+
+  // The picker now badges it — the declaration is visible where the model is chosen.
+  await page.getByRole("button", { name: /open picker/ }).click();
+  await expect(page.getByRole("option").filter({ hasText: "oracle-flash" }).getByTestId("model-vision-badge")).toBeVisible();
+  // Close it by its own overlay: the panel covers the composer, so a Send click made while it is
+  // open lands on the overlay instead — which is how this test failed twice before.
+  await page.getByTestId("model-picker-overlay").click();
+  await expect(page.getByTestId("model-picker-overlay")).toHaveCount(0);
+
+  await attach(page, "pixel.png", "image/png", Buffer.from(PNG_1PX_BASE64, "base64"));
+  await page.getByTestId("composer-input").fill("what is this?");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  // Seen by the model itself: ONE request, carrying the image, and no reading step at all.
+  await expect(page.getByText(/Seen 1 image in this request/)).toBeVisible({ timeout: 30_000 });
+  expect(await chatRequestCount(page)).toBe(1);
+  expect(JSON.stringify(await lastChatBody(page))).toContain("image_url");
+});
+
+test("the reading is not attempted when the chosen model can see for itself", async ({ page }) => {
+  await openAssistant(page, /oracle-vision/);
+
+  await attach(page, "pixel.png", "image/png", Buffer.from(PNG_1PX_BASE64, "base64"));
+  await page.getByTestId("composer-input").fill("what is this?");
+  await page.getByRole("button", { name: "Send" }).click();
+
+  // ONE request: no reading step, because the answering model is the one that can see.
+  await expect(page.getByText(/Seen 1 image in this request/)).toBeVisible({ timeout: 30_000 });
+  expect(await chatRequestCount(page)).toBe(1);
+  const body = await lastChatBody(page);
+  expect(JSON.stringify(body)).toContain("image_url");
 });
 
 test("a text file is appended to the draft rather than turned into a part", async ({ page }) => {

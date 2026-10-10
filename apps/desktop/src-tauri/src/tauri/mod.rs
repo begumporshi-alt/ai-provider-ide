@@ -10,6 +10,7 @@
 //! This half may depend on `core/`; `core/` may not depend on this half.
 
 pub mod app;
+pub mod artifact_cmds;
 pub mod commands;
 pub mod gateway_cmds;
 pub mod mcp_cmds;

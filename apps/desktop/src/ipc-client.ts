@@ -4,6 +4,7 @@
  * one). UI screens import ONLY this module — nothing else crosses to core or host.
  */
 import { invoke, Channel } from "@tauri-apps/api/core";
+import { openUrl as pluginOpenUrl, revealItemInDir } from "@tauri-apps/plugin-opener";
 import type { HttpPort, KeyVaultPort, StorePort } from "@aiprovider/router-core";
 
 interface WireEgressResponse {
@@ -230,4 +231,75 @@ export async function allowProviderHost(_baseUrl: string): Promise<void> {
 }
 export async function denyProviderHost(_baseUrl: string): Promise<void> {
   // Intentionally empty: allowlisting happens in provider_delete (Rust).
+}
+
+// ---------- artifacts: previewing files the agent produced ----------
+
+export interface ArtifactBytes {
+  media_type: string;
+  /** Base64 of the raw bytes; empty when `as_text` was requested. */
+  base64: string;
+  /** UTF-8 text; only present when `as_text` was requested. */
+  text?: string;
+  bytes: number;
+}
+
+/**
+ * Read one previewable workspace file (HTML page, PDF, image) for a transcript card.
+ *
+ * The host confines the path to `root` and refuses any extension outside its allowlist
+ * (`core/artifact.rs`), so this cannot become a general file reader for the webview. `as_text`
+ * exists because the HTML card wants text for a `srcdoc` and decoding on the host side avoids
+ * re-implementing UTF-8 recovery in the UI.
+ */
+export async function artifactRead(
+  path: string,
+  root: string,
+  asText = false,
+): Promise<ArtifactBytes> {
+  return invoke<ArtifactBytes>("artifact_read", { req: { path, root, as_text: asText } });
+}
+
+/** Base64 (no data-URI header) decoded to bytes — the shape pdf.js and Blob want. */
+export function base64ToBytes(b64: string): Uint8Array {
+  const bin = atob(b64);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out;
+}
+
+/**
+ * Hand a URL to the user's default browser.
+ *
+ * The transcript's links used to be inert: markdown rendered an `<a href>`, and clicking one
+ * either did nothing (the CSP refuses the navigation) or replaced the app's own document. The
+ * opener plugin is the granted path for this (`opener:allow-default-urls` allows http/https), so
+ * the link does what the reader expects without the webview ever navigating away.
+ */
+export async function openExternal(url: string): Promise<void> {
+  await pluginOpenUrl(url);
+}
+
+/** Show a file in the OS file manager. `revealItemInDir` needs no path scope, so it is granted. */
+export async function revealPath(absolutePath: string): Promise<void> {
+  await revealItemInDir(absolutePath);
+}
+
+/**
+ * Fetch a URL's body as text through the host's egress path — no secret attached.
+ *
+ * Deliberately NOT `fetchAdmin`: that takes an admin *path* and attaches the UI session key, so
+ * pointing it at a user-supplied URL would hand this app's gateway credential to whatever is
+ * listening there. This sends `secret_ref: null`, which is the same shape the router uses for a
+ * provider with no key, and the host still enforces its own egress policy (loopback or allowlist,
+ * https-or-local-http) — so a refusal here is the policy working, not a bug to route around.
+ */
+export async function fetchUrlText(
+  url: string,
+  timeoutMs = 20_000,
+): Promise<{ status: number; body: string }> {
+  const res = await invoke<WireEgressResponse>("egress_request", {
+    req: { url, method: "GET", headers: {}, body: null, secret_ref: null, timeout_ms: timeoutMs },
+  });
+  return { status: res.status, body: res.body };
 }

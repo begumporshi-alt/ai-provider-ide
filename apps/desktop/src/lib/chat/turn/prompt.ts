@@ -2,7 +2,8 @@
  * The system turns both send paths build, extracted from the Assistant screen (turn-engine
  * phase 1) so the screen's prompt editor, context meter and send paths read one definition.
  */
-import { userContent, type ChatMessage } from "@aiprovider/router-core";
+import { type ChatMessage } from "@aiprovider/router-core";
+import { userWireContent } from "./messages";
 import type { Msg } from "./messages";
 
 /**
@@ -116,7 +117,7 @@ export function buildPlainRequestMessages(
   recallMsg: string | undefined,
   perTurn: string,
   history: ChatMessage[],
-  userTurn: Pick<Msg, "content" | "attachments">,
+  userTurn: Pick<Msg, "content" | "attachments" | "imageReadings" | "imagesReadBy">,
 ): ChatMessage[] {
   return [
     ...(systemPromptText ? [{ role: "system" as const, content: systemPromptText }] : []),
@@ -127,10 +128,9 @@ export function buildPlainRequestMessages(
     ...history,
     {
       role: "user" as const,
-      content: userContent(
-        userTurn.content,
-        (userTurn.attachments ?? []).map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 })),
-      ),
+      // `userWireContent` — the same rule the replay uses, so a turn carrying a reading sends the
+      // reading on the first send and on every replay of it.
+      content: userWireContent(userTurn),
     },
   ];
 }

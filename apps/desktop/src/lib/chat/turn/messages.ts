@@ -5,7 +5,8 @@
  * read one definition — the screen keeps transcript ownership between turns; this module owns the
  * shape and the replay rules.
  */
-import { userContent, type ChatMessage } from "@aiprovider/router-core";
+import { userContent, type ChatMessage, type ContentPart } from "@aiprovider/router-core";
+import { imageContextBlock } from "../vision";
 import type { Attachment, InlinedText } from "../../../components/Composer";
 
 export interface Msg {
@@ -38,6 +39,17 @@ export interface Msg {
    * from the composer), so this costs no extra read.
    */
   attachments?: Attachment[];
+  /**
+   * What a vision model saw in this turn's images, when the model that ANSWERED cannot see them.
+   *
+   * Stored on the message, not passed alongside it, because history replay is where it matters: an
+   * image stays on its turn, so every later turn re-sends it. A model that cannot see must receive
+   * the reading on every one of those turns — and only the message itself survives to the second
+   * turn. `attachments` still carries the thumbnails, which is what the transcript shows.
+   */
+  imageReadings?: { name: string; description: string }[];
+  /** The model that produced `imageReadings`, named for the model that reads them. */
+  imagesReadBy?: string;
   /** Names of workspace files inlined into this turn, for the transcript's own labelling. */
   inlined?: InlinedText[];
 }
@@ -71,6 +83,27 @@ export function withIds(msgs: ReadonlyArray<Omit<Msg, "id">>): Msg[] {
  * The filter also drops the empty assistant bubble a stopped or failed turn leaves behind —
  * `{ role: "assistant", content: "" }` is rejected with 400 by most providers too.
  */
+/**
+ * A user turn's content on the wire: image parts, or the reading of them.
+ *
+ * One function for every place a stored message becomes a request message (the replay here, the
+ * plain path's current turn, the agent path's), because the alternative is three copies of a rule
+ * that decides whether image bytes go out — and a copy that missed the reading would hand a blind
+ * model an image part it cannot use.
+ *
+ * The reading wins when present and the bytes are then omitted entirely: sending both would be
+ * wasteful, and sending the image to a model that cannot see it is the failure this exists to stop.
+ */
+export function userWireContent(m: Pick<Msg, "content" | "attachments" | "imageReadings" | "imagesReadBy">): string | ContentPart[] {
+  if (m.imageReadings?.length && m.imagesReadBy) {
+    const block = imageContextBlock(m.imageReadings, m.imagesReadBy);
+    return m.content.trim() ? `${m.content}\n\n${block}` : block;
+  }
+  // `userContent` returns a plain string when there are no attachments, which is what keeps an
+  // ordinary turn a string.
+  return userContent(m.content, (m.attachments ?? []).map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 })));
+}
+
 export function replayHistory(msgs: Msg[]): ChatMessage[] {
   return msgs
     // A turn carrying an image has text too (the question), so the filter's usual test still holds;
@@ -78,9 +111,7 @@ export function replayHistory(msgs: Msg[]): ChatMessage[] {
     .filter((m) => m.content.trim().length > 0 || (m.role === "assistant" && m.tool_calls) || (m.attachments?.length ?? 0) > 0)
     .map((m) => ({
       role: m.role,
-      // Rebuilt as content parts so the image travels with its turn. `userContent` returns a plain
-      // string when there are no attachments, which is what keeps an ordinary turn a string.
-      content: userContent(m.content, (m.attachments ?? []).map((a) => ({ mediaType: a.mediaType, dataBase64: a.dataBase64 }))),
+      content: userWireContent(m),
       ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
       ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
     })) as ChatMessage[];

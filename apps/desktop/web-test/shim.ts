@@ -669,6 +669,12 @@ let eventSeq = 0;
    */
   vfs: (): Record<string, string> => Object.fromEntries(virtualFs),
   /**
+   * What the UI asked the OS to open — link clicks and artifact reveals, in order. The opener is
+   * a plugin command the harness answers, so without this log a click could be asserted only by
+   * "nothing crashed"; this is the actual evidence that the URL reached the open call.
+   */
+  openerCalls: (): string[] => [...openerCalls],
+  /**
    * Set what `capture_queue_status` reports — same reason as `gatewayStatus`: the drain and its
    * budget live in the host, so the capped branch can only be arranged here.
    */
@@ -1076,6 +1082,17 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     case "egress_stream":
       // eslint-disable-next-line @typescript-eslint/no-non-null-assertion
       return egressStream(args.req as WireReq, args.on_event as string);
+    // ---- opener plugin: the granted way out of the webview ----
+    // `openExternal` (link clicks, a URL card's Open) and `revealPath` (an artifact card's
+    // Reveal). Answered rather than left to fall through: an unhandled rejection here would read
+    // as an app bug, when the real host would have opened the browser or the file manager.
+    case "plugin:opener|open_url":
+    case "plugin:opener|reveal_item_in_dir":
+      openerCalls.push(String(args.url ?? args.path ?? ""));
+      return null;
+
+    case "artifact_read":
+      return artifactRead(args.req as { path: string; root: string; as_text?: boolean });
     case "egress_fetch_image": {
       const req = args.req as { url: string; timeout_ms?: number | null };
       return fetchImage(req.url, req.timeout_ms ?? 30_000);
@@ -2844,6 +2861,60 @@ function authorize(req: WireReq): Record<string, string> {
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(req.headers)) out[k] = secret !== undefined ? v.split(SENTINEL).join(secret) : v;
   return out;
+}
+
+/**
+ * `artifact_read` — mirrors `core/artifact.rs`: workspace-root confined, extension-allowlisted,
+ * and text-or-base64 depending on `as_text`.
+ *
+ * The VFS holds strings. Text artifacts are stored as written; a BINARY artifact was written with
+ * `encoding: "base64"` (exactly as `tools.rs` writes bytes), so the stored string already IS the
+ * base64 the host hands back — this reader returns it unchanged rather than re-encoding, which is
+ * what keeps a spec's PDF bytes identical to the fixture's.
+ */
+/** Ordered log of opener-plugin calls — see `__webTest.openerCalls`. */
+const openerCalls: string[] = [];
+
+const ARTIFACT_MEDIA: Readonly<Record<string, string>> = {
+  html: "text/html",
+  htm: "text/html",
+  pdf: "application/pdf",
+  png: "image/png",
+  jpg: "image/jpeg",
+  jpeg: "image/jpeg",
+  gif: "image/gif",
+  webp: "image/webp",
+  svg: "image/svg+xml",
+};
+
+/** Extensions whose stored content is base64 bytes rather than text. */
+const BINARY_ARTIFACTS = new Set(["pdf", "png", "jpg", "jpeg", "gif", "webp"]);
+
+function artifactRead(req: { path: string; root: string; as_text?: boolean }): {
+  media_type: string;
+  base64: string;
+  text?: string;
+  bytes: number;
+} {
+  const ext = req.path.split(".").pop()?.toLowerCase() ?? "";
+  const media = ARTIFACT_MEDIA[ext];
+  // The same refusal the host gives: an unlisted extension is not previewable, webview or not.
+  if (!media) throw new Error(`no preview for this file type: ${req.path}`);
+  if (!isConfinedPath(req.path)) throw new Error("path resolves outside the workspace root");
+  const stored = virtualFs.get(req.path);
+  if (stored === undefined) throw new Error(`no such file or directory: ${req.path}`);
+  const binary = BINARY_ARTIFACTS.has(ext);
+  const bytes = binary
+    ? // Base64 length → decoded length, discounting padding.
+      Math.floor((stored.replace(/=+$/, "").length * 3) / 4)
+    : new TextEncoder().encode(stored).length;
+  if (req.as_text) {
+    // `as_text` is only meaningful for text; a binary file asked for as text is what the real
+    // host would return lossily, and no spec should rely on that.
+    return { media_type: media, base64: "", text: binary ? stored : stored, bytes };
+  }
+  const base64 = binary ? stored : Buffer.from(stored, "utf8").toString("base64");
+  return { media_type: media, base64, bytes };
 }
 
 async function egressUnary(req: WireReq): Promise<{ status: number; headers: Record<string, string>; body: string }> {

@@ -258,3 +258,83 @@ describe("alias auto-derivation across a boot", () => {
     expect(catalog.hydrateAliases(catalog.aliases.map((a) => ({ ...a })))).toBe(false);
   });
 });
+
+/**
+ * A per-model capability the operator declares, and its survival across a refresh.
+ *
+ * This is the counterpart of ZCode's `inputFormat.supportsImage`: the model registry holds the
+ * property and the operator owns it, rather than the app inferring it from a provider listing that
+ * may say nothing at all. The consequence of getting it wrong is quiet — a model that can see is
+ * sent images through a vision model's reading instead, costing a call and some fidelity — which is
+ * why both halves are pinned here: the declaration, and the fetch that must not undo it.
+ */
+describe("declared model capabilities", () => {
+  it("sets, overwrites and clears one model's image support", async () => {
+    const { catalog } = await harness(["m1"]);
+    await catalog.refreshProvider(PROVIDER_ID);
+
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBeUndefined();
+
+    expect(catalog.setVision(PROVIDER_ID, "m1", true)).toBe(true);
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBe(true);
+
+    // A second identical call changes nothing, so a caller can skip the persist.
+    expect(catalog.setVision(PROVIDER_ID, "m1", true)).toBe(false);
+
+    expect(catalog.setVision(PROVIDER_ID, "m1", false)).toBe(true);
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBe(false);
+
+    // Back to "nobody has said" — the key is REMOVED, not set to undefined: the row is persisted as
+    // JSON, where an undefined value disappears and `null` would read as a declaration of "no".
+    expect(catalog.setVision(PROVIDER_ID, "m1", undefined)).toBe(true);
+    const cleared = catalog.all().find((m) => m.nativeId === "m1");
+    expect(cleared?.supportsVision).toBeUndefined();
+    expect(Object.keys(cleared ?? {})).not.toContain("supportsVision");
+  });
+
+  it("leaves other models alone", async () => {
+    const { catalog } = await harness(["m1", "m2"]);
+    await catalog.refreshProvider(PROVIDER_ID);
+    catalog.setVision(PROVIDER_ID, "m1", true);
+    expect(catalog.all().find((m) => m.nativeId === "m2")?.supportsVision).toBeUndefined();
+  });
+
+  it("survives a refresh whose listing says nothing about capabilities", async () => {
+    const { catalog } = await harness(["m1"]);
+    await catalog.refreshProvider(PROVIDER_ID);
+    catalog.setVision(PROVIDER_ID, "m1", true);
+
+    // The provider lists the model again with no modality metadata — the case that used to erase
+    // the declaration and silently start paying for readings.
+    await catalog.refreshProvider(PROVIDER_ID);
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBe(true);
+  });
+
+  it("lets a provider that SPEAKS win over what we knew", async () => {
+    // Silence preserves; a statement replaces. Otherwise a stale declaration could outvote the
+    // provider forever, and a model that lost image support would keep receiving images.
+    const http = new FakeHttp((url) =>
+      url.includes("/models")
+        ? { status: 200, body: { data: [{ id: "m1", architecture: { input_modalities: ["text"] } }] } }
+        : undefined,
+    );
+    const registry = new ProviderRegistry(new FakeVault());
+    const adapters = new AdapterRuntime(http);
+    const catalog = new ModelCatalog(registry, adapters);
+    registry.hydrate(
+      [{
+        id: PROVIDER_ID, slug: "provider", name: "Provider", type: "manifest", baseUrl: BASE,
+        status: "enabled", rotationStrategy: "round_robin", createdAt: 0, updatedAt: 0,
+      }],
+      [],
+    );
+    await registry.addKey({ providerId: PROVIDER_ID, label: "k", secret: "sk-test-0000" });
+    adapters.register(PROVIDER_ID, BUILTIN_TEMPLATES["openai-compat"](BASE));
+
+    await catalog.refreshProvider(PROVIDER_ID);
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBe(false);
+    catalog.setVision(PROVIDER_ID, "m1", true);
+    await catalog.refreshProvider(PROVIDER_ID);
+    expect(catalog.all().find((m) => m.nativeId === "m1")?.supportsVision).toBe(false);
+  });
+});

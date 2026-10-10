@@ -234,7 +234,11 @@ pub fn tools_list_dirs(path: String) -> Result<Vec<String>, String> {
 /// Absolute paths and `..` components are rejected outright; the surviving path is then
 /// canonicalized (or its parent is, for files that do not exist yet) and re-checked against
 /// the root, which also defeats symlinks that point outside.
-fn resolve_within(root: &Path, rel: &str, create_parents: bool) -> Result<PathBuf, String> {
+pub(crate) fn resolve_within(
+    root: &Path,
+    rel: &str,
+    create_parents: bool,
+) -> Result<PathBuf, String> {
     if rel.trim().is_empty() {
         return Err("path is empty".into());
     }

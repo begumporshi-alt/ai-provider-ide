@@ -94,6 +94,31 @@
   color: var(--text);
 }
 
+/*
+ * Inside a document card the body is a DOCUMENT, not a terminal stream. The shared renderer
+ * carries `whitespace-pre-wrap`, which preserves the model's ~80-column hard wraps and left a
+ * measured third of the card empty (visual gate, 2026-10-09: a 545px text column inside an 830px
+ * card). Prose reflows to the card's full measure here; `pre` keeps its own white-space, so code
+ * blocks are untouched.
+ */
+.doc-card-body .markdown-body {
+  white-space: normal;
+}
+
+/*
+ * A document card's header action. `--text-faint` measured ≈2.4:1 against the card surface —
+ * below the 3:1 WCAG minimum for non-text UI, and the gate read the copy icon as "a faint
+ * smudge". `--text-dim` clears it while staying quieter than body text; hover reaches full text.
+ */
+.card-icon-btn {
+  color: var(--text-dim);
+  transition: color 0.15s;
+}
+
+.card-icon-btn:hover {
+  color: var(--text);
+}
+
 .markdown-body blockquote {
   margin: 0.5em 0;
   padding: 0.25em 0.75em;
