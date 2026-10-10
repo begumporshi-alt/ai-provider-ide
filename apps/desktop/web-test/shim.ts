@@ -105,6 +105,12 @@ const agentSteps: Row[] = [];
  * content must parse as a JSON object; field validation stays TypeScript-side.
  */
 const agentDefs = new Map<string, string>();
+/**
+ * Approved plan documents (core/plan_doc.rs): workspace-relative path -> markdown. Written when
+ * `exit_plan_mode` is approved — the same one-write-per-session contract the host has, so a spec
+ * can prove the plan reached "disk" without the sandbox owning it.
+ */
+const planFiles = new Map<string, string>();
 // The builtin specialists, seeded the way the Rust host's `ensure_builtin_defs` seeds them —
 // from the same JSON file the host compiles in, so the two cannot drift. Skip-existing: a
 // spec's edit to a seeded definition survives.
@@ -668,6 +674,12 @@ let eventSeq = 0;
    * is what the sandbox holds, and only the second one can falsify a revert that reported success.
    */
   vfs: (): Record<string, string> => Object.fromEntries(virtualFs),
+  /**
+   * The plan documents `plan_save` wrote (path -> markdown). Plans live OUTSIDE the sandbox — that
+   * is the point of the command — so `vfs()` cannot see them, and a spec that wants to prove the
+   * approved plan reached the workspace has to read them here.
+   */
+  plans: (): Record<string, string> => Object.fromEntries(planFiles),
   /**
    * What the UI asked the OS to open — link clicks and artifact reveals, in order. The opener is
    * a plugin command the harness answers, so without this log a click could be asserted only by
@@ -1429,6 +1441,23 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       JSON.parse(String(args.content_json ?? "")); // malformed content throws, like the host
       agentDefs.set(id, String(args.content_json));
       return null;
+    }
+    // ---- Plan documents (core/plan_doc.rs): workspace-relative path -> markdown ----
+    case "plan_save": {
+      const root = String(args.root ?? "");
+      const sessionId = String(args.session_id ?? "");
+      const markdown = String(args.markdown ?? "");
+      // A subset of the host's own validation, mirroring `plan_doc::save_plan` (which also accepts
+      // a leading `-`/`_`): a shim that accepted what the host refuses would make a green spec a
+      // lie about the workspace.
+      if (!root.trim()) throw new Error("no workspace root is set");
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) {
+        throw new Error(`invalid session id for a plan file: ${sessionId}`);
+      }
+      if (!markdown.trim()) throw new Error("refusing to write an empty plan");
+      const rel = `.zcode/plans/plan-${sessionId}.md`;
+      planFiles.set(rel, markdown);
+      return rel;
     }
     case "agent_def_set_enabled": {
       const id = String(args.id ?? "");

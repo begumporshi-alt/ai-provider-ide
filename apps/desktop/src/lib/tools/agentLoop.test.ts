@@ -789,6 +789,297 @@ describe("runAgentLoop", () => {
     expect(toolMsg?.content).toContain("no image route is configured");
   });
 
+  it("exit_plan_mode shows the plan, and approval continues the SAME run into the work", async () => {
+    // The whole point of the tool: the approval is consumed inside the running pass. There is no
+    // canned "the plan is approved" user turn and no second run — the loop's next round-trip
+    // carries the tool result, and the model implements in the same pass.
+    const reviewed: string[] = [];
+    const modes: boolean[] = [];
+    const ran: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        ran.push(name);
+        return { ok: true, output: `wrote via ${name}` };
+      },
+    };
+    const model = fakeModel([
+      {
+        text: "here is my plan",
+        calls: [
+          {
+            id: "c1",
+            name: "exit_plan_mode",
+            arguments: JSON.stringify({ plan: "# Plan\n\n1. write a.txt" }),
+          },
+        ],
+      },
+      { text: "implementing", calls: [{ id: "c2", name: "write_file", arguments: '{"path":"a.txt","content":"x"}' }] },
+      { text: "Done." },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      plan: {
+        isPlanMode: () => true,
+        setPlanMode: (on) => modes.push(on),
+        requestApproval: async (plan) => {
+          reviewed.push(plan);
+          return { approved: true };
+        },
+        requestEntry: async () => false,
+        persist: async () => ".zcode/plans/plan-s-1.md",
+      },
+    });
+
+    expect(reviewed).toEqual(["# Plan\n\n1. write a.txt"]);
+    // The mode flipped off before anything was written, and the write happened in this same run.
+    expect(modes).toEqual([false]);
+    expect(ran).toEqual(["write_file"]);
+    expect(out.text).toBe("Done.");
+    const toolMsgs = out.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(toolMsgs[0]).toContain("The user approved the plan");
+    expect(toolMsgs[0]).toContain(".zcode/plans/plan-s-1.md");
+    expect(toolMsgs[0]).toContain("implement the plan now");
+    // The plan itself never reaches the sandbox, which knows no such tool.
+    expect(ran).not.toContain("exit_plan_mode");
+  });
+
+  it("exit_plan_mode the user sends back keeps the loop planning, carrying their words", async () => {
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "plan v1", calls: [{ id: "c1", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# Plan v1" }) }] },
+      { text: "plan v2", calls: [{ id: "c2", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# Plan v2" }) }] },
+      { text: "Done." },
+    ]);
+    const plans: string[] = [];
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      plan: {
+        isPlanMode: () => true,
+        setPlanMode: () => undefined,
+        requestApproval: async (plan) => {
+          plans.push(plan);
+          // v1 comes back with a request for changes; v2 is approved.
+          return plan.includes("v1") ? { approved: false, feedback: "add a rollback step" } : { approved: true };
+        },
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(plans).toEqual(["# Plan v1", "# Plan v2"]);
+    const toolMsgs = out.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(toolMsgs[0]).toContain("did not approve the plan yet");
+    expect(toolMsgs[0]).toContain("add a rollback step");
+    expect(toolMsgs[0]).toContain("Do not modify the workspace");
+    expect(toolMsgs[1]).toContain("The user approved the plan");
+    // A plan that could not be persisted still approves: the sentence just omits the path.
+    expect(toolMsgs[1]).not.toContain("saved at");
+  });
+
+  it("enter_plan_mode asks first, and only a yes turns the mode on", async () => {
+    const modes: boolean[] = [];
+    let consents = 0;
+    let inPlan = false;
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "big change — plan first?", calls: [{ id: "c1", name: "enter_plan_mode", arguments: "{}" }] },
+      { text: "asking again", calls: [{ id: "c2", name: "enter_plan_mode", arguments: "{}" }] },
+      { text: "Done." },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      plan: {
+        isPlanMode: () => inPlan,
+        setPlanMode: (on) => {
+          inPlan = on;
+          modes.push(on);
+        },
+        requestApproval: async () => ({ approved: false }),
+        requestEntry: async () => {
+          consents += 1;
+          return consents === 1; // yes, then no thanks
+        },
+        persist: async () => null,
+      },
+    });
+
+    const toolMsgs = out.messages.filter((m) => m.role === "tool").map((m) => String(m.content));
+    expect(toolMsgs[0]).toContain("PLAN MODE IS ON");
+    expect(modes).toEqual([true]);
+    // The second call saw the mode already on — no second consent was raised.
+    expect(consents).toBe(1);
+    expect(toolMsgs[1]).toContain("already on");
+    expect(out.text).toBe("Done.");
+  });
+
+  it("exit_plan_mode outside plan mode does not raise a review", async () => {
+    let raised = 0;
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "oops", calls: [{ id: "c1", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# P" }) }] },
+      { text: "continuing" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      plan: {
+        isPlanMode: () => false,
+        setPlanMode: () => undefined,
+        requestApproval: async () => {
+          raised += 1;
+          return { approved: true };
+        },
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(raised, "no review for a call that does not apply here").toBe(0);
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("only for a pass that is in plan mode");
+  });
+
+  it("the plan pair is settled by its own interaction, not the per-call gate", async () => {
+    // Structural, not cosmetic: `decide()` cannot express these calls (as `read` a mode would
+    // auto-allow them away, as `mutate` plan mode would refuse the call that ends it), so the loop
+    // must raise their interaction without consulting `confirm` at all.
+    const confirmCalls: string[] = [];
+    const reviewed: string[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "plan", calls: [{ id: "c1", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# P" }) }] },
+      { text: "Done." },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      // A gate that would deny every call it ever sees.
+      confirm: async (call) => {
+        confirmCalls.push(call.name ?? "?");
+        return false;
+      },
+      plan: {
+        isPlanMode: () => true,
+        setPlanMode: () => undefined,
+        requestApproval: async (plan) => {
+          reviewed.push(plan);
+          return { approved: true };
+        },
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(reviewed).toEqual(["# P"]);
+    expect(confirmCalls, "the gate was never asked about a plan call").toEqual([]);
+  });
+
+  it("the plan tools refuse honestly when the run has no approval surface", async () => {
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "planning", calls: [{ id: "c1", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# P" }) }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("approval surface");
+    expect(toolMsg?.content).toContain("Present the plan in your answer");
+  });
+
+  it("keeps a plan call aligned with its neighbours in one batch, and opens the gate in time", async () => {
+    // The index alignment (`planNotes[i]` / `verdicts[i]` / `ids[i]`) is hand-maintained and every
+    // other test here emits one call per batch — so this one mixes the pair with an ordinary call,
+    // in the order that is load-bearing: the write AFTER the exit must be consulted by the gate
+    // after the plan port flipped the mode, or a just-approved run watches its first edit refused.
+    const order: string[] = [];
+    let inPlan = true;
+    // What the mode was when `persist` was called. The loop cannot observe the flip-vs-persist
+    // order from outside (both are inside one awaited call), so the port is where the claim
+    // "the gate opens before the file is written" can be pinned at all.
+    let modeAtPersist: boolean | null = null;
+    const host: ToolHost = {
+      async run(name) {
+        order.push(`host:${name}`);
+        return { ok: true, output: `ran ${name}` };
+      },
+    };
+    const model = fakeModel([
+      {
+        text: "the plan, then the work",
+        calls: [
+          { id: "c1", name: "exit_plan_mode", arguments: JSON.stringify({ plan: "# Plan" }) },
+          { id: "c2", name: "write_file", arguments: '{"path":"a.txt","content":"x"}' },
+        ],
+      },
+      { text: "Done." },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      confirm: async (call) => {
+        order.push(`confirm:${call.name}`);
+        // Allowed only once the exit has flipped the mode — the write is the same batch's next call.
+        return call.name === "write_file" ? !inPlan : true;
+      },
+      plan: {
+        isPlanMode: () => inPlan,
+        setPlanMode: (on) => {
+          inPlan = on;
+        },
+        requestApproval: async () => ({ approved: true }),
+        requestEntry: async () => false,
+        persist: async () => {
+          modeAtPersist = inPlan;
+          return null;
+        },
+      },
+    });
+
+    // The exit never reached the gate; the write did, and it ran.
+    expect(order).toEqual(["confirm:write_file", "host:write_file"]);
+    expect(inPlan).toBe(false);
+    // The mode was already open when the plan file was written.
+    expect(modeAtPersist).toBe(false);
+    const toolMsgs = out.messages.filter((m) => m.role === "tool");
+    expect(toolMsgs.map((m) => m.tool_call_id)).toEqual(["c1", "c2"]);
+    expect(String(toolMsgs[0]!.content)).toContain("The user approved the plan");
+    expect(String(toolMsgs[1]!.content)).toBe("ran write_file");
+  });
+
   it("load_skill fetches the body on demand and reports a miss honestly", async () => {
     const requested: string[] = [];
     const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };

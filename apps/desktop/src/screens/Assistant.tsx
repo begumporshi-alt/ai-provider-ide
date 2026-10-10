@@ -47,12 +47,13 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
 } from "../lib/tools";
 import { ApproveModal, type ApprovalChoice } from "../components/ApproveModal";
+import { PlanModeEntryModal, PlanReviewModal } from "../components/PlanReviewModal";
 import { ChangeSetReview } from "../components/ChangeSetReview";
 import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
 import { SubagentsDrawer } from "../components/RunsDrawer";
@@ -88,7 +89,7 @@ import {
   type ToolStatus,
 } from "../lib/chat/turn/timeline";
 import {
-  agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM, PLAN_APPROVED_TURN,
+  agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM,
 } from "../lib/chat/turn/prompt";
 import { tryParseArgs } from "../lib/chat/turn/graph-record";
 import { runPlainTurn } from "../lib/chat/turn/plain-turn";
@@ -1491,45 +1492,14 @@ function Chat({
   const [finishReason, setFinishReason] = useState<string | undefined>(undefined);
   const [showTrace, setShowTrace] = useState(false);
   const [busy, setBusy] = useState(false);
-  // Plan mode's answers render as rich document cards (the ZCode-style plan card): once a
-  // plan-mode run finishes, the plan text is recorded here so the card survives approval
-  // (planMode flipping off), later turns, and — this is why it is text and not a message id —
-  // the transcript replace, which mints fresh ids for every message it hands back
-  // (agent-turn.ts `onReplaceTranscript`). Content is the one handle that survives that rewrite.
-  const [planDocs, setPlanDocs] = useState<string[]>([]);
-  // The plan awaiting the user's call — the newest plan-mode answer, or null. Separate from
-  // `planDocs` (which is history: every plan card ever shown) because this is what the approve bar
-  // gates on, and it stops being the open question the moment it is answered: cleared on approval,
-  // and at the start of every new pass. Before this, the bar keyed on `msgs.length > 0` — true of
-  // any transcript with one message in it — so ticking the switch offered to approve a plan that
-  // did not exist, and ticking it again re-offered the same stale approval.
-  const [pendingPlan, setPendingPlan] = useState<string | null>(null);
-  const wasBusyRef = useRef(false);
-  // Whether the run that just finished ran as a plan pass — captured at run start from the same
-  // ref the gate reads, never from the live switch. The live switch answers the wrong question:
-  // toggled mid-run it either stole an ordinary answer as a "plan" or lost a real plan written
-  // seconds earlier, and after Approve it would still read `true` for the executing pass, whose
-  // final message would come back as a plan card.
-  const ranInPlanModeRef = useRef(false);
-  useEffect(() => {
-    // A clean finish only. A stopped, failed or ceiling-hit pass leaves its own ⚠ notice — or
-    // intermediate prose — as the last assistant text, and offering "Plan ready, nothing written
-    // yet" over a pass that ended badly would be a claim the run never earned. The trace carries
-    // the reason for exactly these endings (`agent-turn` sets `error` for stopped, failed and
-    // ceiling exits alike).
-    if (wasBusyRef.current && !busy && ranInPlanModeRef.current && !trace?.error) {
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        const m = msgs[i];
-        if (m && m.role === "assistant" && m.content.trim()) {
-          const doc = m.content.trim();
-          setPlanDocs((prev) => (prev.includes(doc) ? prev : [...prev, doc]));
-          setPendingPlan(doc);
-          break;
-        }
-      }
-    }
-    wasBusyRef.current = busy;
-  }, [busy, msgs, trace]);
+  // Plans are no longer inferred from an answer's text. `exit_plan_mode` carries the plan, the
+  // review modal shows it, and the transcript renders it as a card attached to that tool call (see
+  // `ToolCallRow`) — so the mark-on-finish heuristic is gone, and with it everything it needed:
+  // the busy→false effect, the live-state-versus-ref capture, and the text-membership array that
+  // guessed which messages were plans. Nothing here holds plan state at all now, which is the
+  // point: the card hangs on a tool call that is part of the transcript, and whether a resumed
+  // session can rebuild it is the host's question (`history_timeline` returning the recorded tool
+  // calls — the web-test harness does not today, so that half is pinned in-session only).
   // The draft itself lives in `Composer` (it also owns attachments and the two menus). This is a
   // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
   // context meter's estimate of what the next send will contain, and nothing else.
@@ -1546,6 +1516,19 @@ function Chat({
   /** A one-line notice: a refused attachment, a mention that matched nothing. */
   const [notice, setNotice] = useState<string | null>(null);
   const [pendingConfirm, setPendingConfirm] = useState<{ call: ToolCall; args: Record<string, unknown>; resolve: (choice: ApprovalChoice) => void } | null>(null);
+  /**
+   * The two plan-mode interactions the loop can raise, or null.
+   *
+   * `exit_plan_mode` shows the plan for review; `enter_plan_mode` asks to plan before changing
+   * anything. Both park the loop on a promise exactly the way `pendingConfirm` does, and their
+   * render sites sit beside `ApproveModal`'s — a decision is a promise the loop awaits, not a
+   * piece of state it polls.
+   */
+  const [pendingPlanReview, setPendingPlanReview] = useState<{
+    plan: string;
+    resolve: (decision: { approved: boolean; feedback?: string }) => void;
+  } | null>(null);
+  const [pendingPlanEntry, setPendingPlanEntry] = useState<{ resolve: (ok: boolean) => void } | null>(null);
   /**
    * P5: the trust the user has granted from the approval modal — this tool, or everything.
    *
@@ -1954,6 +1937,57 @@ function Chat({
   }, []);
 
   /**
+   * The plan-mode ports the loop calls into (`lib/tools/types.ts` states the contract).
+   *
+   * `setPlanMode` writes the approval ref **before** the state, and that order is load-bearing:
+   * the gate reads the ref and the loop asks it again within the same tick, so a state-only flip
+   * would land one render later — a just-approved write refused for no reason the model can see.
+   *
+   * Both interactions resolve on abort. Stop while the loop is parked on a review would otherwise
+   * leave it parked forever: the same deadlock the confirm gate already races its signal against.
+   */
+  const planPorts: PlanPorts = {
+    isPlanMode: () => approvalRef.current.planMode,
+    setPlanMode: (on) => {
+      approvalRef.current = { ...approvalRef.current, planMode: on };
+      onPlanModeChange(on);
+    },
+    requestApproval: (plan, signal) =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve({ approved: false, feedback: "the run was stopped before the plan was reviewed" });
+          return;
+        }
+        setPendingPlanReview({ plan, resolve });
+        signal?.addEventListener(
+          "abort",
+          () => {
+            setPendingPlanReview(null);
+            resolve({ approved: false, feedback: "the run was stopped before the review finished" });
+          },
+          { once: true },
+        );
+      }),
+    requestEntry: (signal) =>
+      new Promise((resolve) => {
+        if (signal?.aborted) {
+          resolve(false);
+          return;
+        }
+        setPendingPlanEntry({ resolve });
+        signal?.addEventListener(
+          "abort",
+          () => {
+            setPendingPlanEntry(null);
+            resolve(false);
+          },
+          { once: true },
+        );
+      }),
+    persist: (plan) => savePlan(root.trim(), ctxRef.current?.sessionId ?? "", plan),
+  };
+
+  /**
    * The one turn runner. A fresh send, a retry and an edit-&-resend all funnel through here, so
    * they cannot drift in how they build history, record the context graph or surface the trace.
    * `baseMsgs` is the transcript BEFORE this turn — the whole thing for a send, the truncated
@@ -2085,19 +2119,11 @@ function Chat({
     const ac = turn.controller;
     const t0 = Date.now();
 
-    // Whether this pass runs as a plan pass — decided once, for BOTH branches, and read from the
-    // approval ref rather than the `planMode` state. `approvePlan` flips the ref synchronously (the
-    // gate reads it live) while the state value still says `true` during that call: read here, the
-    // executing pass would be marked as a plan (its answer landing back in the approve flow) and its
-    // system turn would still forbid the writes its gate permits. Every pass answers the question,
-    // plain chat included — a plain answer that left the previous capture standing would be recorded
-    // and rendered as the next "Plan" card.
+    // The mode this pass runs as, read from the approval ref rather than the `planMode` state. The
+    // ref is what the gate reads live, and it is the same value the plan tools will consult when the
+    // model calls `exit_plan_mode` — ticking the switch and sending in one gesture leaves the state
+    // one render behind, which is exactly the pass that must still be told it is planning.
     const planPass = agentMode && approvalRef.current.planMode;
-    ranInPlanModeRef.current = planPass;
-    // A new turn supersedes the plan on screen: the bar returns only when a pass produces its own
-    // plan. An unanswered plan survives the switch being flipped off and on — it is still the open
-    // question — but not a new send.
-    setPendingPlan(null);
 
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
@@ -2107,9 +2133,6 @@ function Chat({
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
         setStopping(false);
-        // The turn never ran, so there is no pass to remember: left true, the finish effect would
-        // card whatever assistant text was already in the transcript.
-        ranInPlanModeRef.current = false;
         turn.finish();
         return;
       }
@@ -2129,9 +2152,11 @@ function Chat({
           root,
           customAgentPrompt: agentSystemPrompt,
           skillsBlock,
-          // The ref's value, not the state's: see the capture above `if (agentMode)` — the state is
-          // stale for exactly the executing pass the approve button starts.
+          // The ref's value, not the state's: see the capture above `if (agentMode)`.
           planMode: planPass,
+          // The plan-mode facilities: the review modal, the mode switch the gate reads, and the
+          // plan file. `exit_plan_mode` / `enter_plan_mode` are settled in the loop against these.
+          plan: planPorts,
           temperature: typeof temperature === "number" ? temperature : undefined,
           maxTokens: typeof maxTokens === "number" ? maxTokens : undefined,
           thinking,
@@ -2286,24 +2311,6 @@ function Chat({
   }
 
   /**
-   * P5: approve the plan and run it for real.
-   *
-   * The approval ref is updated **before** `send`, and that order is the whole trick: `send` starts
-   * the run synchronously, and the gate for that run reads the ref. Turning plan mode off with
-   * `setPlanMode(false)` alone would not have taken effect until the next render — after the run
-   * had already begun — so the executing pass would refuse its own first write and the user would
-   * watch the agent fail to do the thing they just approved.
-   */
-  function approvePlan() {
-    // Closes the open question: without this, turning plan mode back on after approving would
-    // offer the same plan a second time.
-    setPendingPlan(null);
-    approvalRef.current = { ...approvalRef.current, planMode: false };
-    onPlanModeChange(false);
-    void runTurn(PLAN_APPROVED_TURN, msgs);
-  }
-
-  /**
    * P5: put back the files this run touched.
    *
    * Writes go through the **plain** host, not the checkpointing one: reverting is not part of the
@@ -2384,9 +2391,6 @@ function Chat({
    */
   function deleteFrom(i: number) {
     setMsgs((m) => m.slice(0, i));
-    // The plan is pending only while its message is on screen: dropping the turn that carries it
-    // drops the offer to approve it.
-    setPendingPlan((cur) => (cur && msgs.slice(0, i).some((m) => m.content.trim() === cur) ? cur : null));
   }
 
   /**
@@ -2400,8 +2404,6 @@ function Chat({
     setMsgs(prefix);
     setTrace(null);
     setFinishReason(undefined);
-    // A new thread owns its own questions, including the plan one.
-    setPendingPlan(null);
   }
 
   // ---- Phase 4: session bar -------------------------------------------------------------
@@ -2447,8 +2449,6 @@ function Chat({
         lastNodeRef.current = null;
         setSessionId(rec.sessionId);
         setMsgs(withIds(resumed as Omit<Msg, "id">[]));
-        // The adopted conversation's own plan, if any, is not this session's open question.
-        setPendingPlan(null);
       } catch {
         return; // same policy as openSession: an unreadable session is not an error wall
       }
@@ -2490,7 +2490,6 @@ function Chat({
     setMsgs([]);
     setTrace(null);
     setFinishReason(undefined);
-    setPendingPlan(null);
     timelineRef.current = [];
     setTimeline([]);
     setTodos([]);
@@ -2531,10 +2530,6 @@ function Chat({
     setMsgs(withIds(resumed as Omit<Msg, "id">[]));
     setTrace(null);
     setFinishReason(undefined);
-    // A plan answered in the conversation being left is not pending in the one being entered —
-    // and the panel used to sit over an empty transcript after a New chat, which is the same bug
-    // (`msgs.length > 0` said nothing about plans) through a different door.
-    setPendingPlan(null);
     setEditingId(null);
     // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
     // stamped so the async list refresh cannot adopt a stale value over it.
@@ -2936,7 +2931,14 @@ function Chat({
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive
                   segments={timeline}
-                  waiting={pendingConfirm?.call.name ?? null}
+                  // The three ways a run parks on a person: the per-call gate, the plan review and
+                  // the mode consent. A status line that only knew about the first read "Running
+                  // exit_plan_mode" while a review blocked the run — the one state the line exists
+                  // to make legible.
+                  waiting={
+                    pendingConfirm?.call.name ??
+                    (pendingPlanReview ? "exit_plan_mode" : pendingPlanEntry ? "enter_plan_mode" : null)
+                  }
                   stopping={stopping}
                   usage={runUsage}
                   root={root}
@@ -2954,15 +2956,10 @@ function Chat({
                   {m.reasoning ? (
                     <ReasoningPanel text={m.reasoning} streaming={busy && i === msgs.length - 1} />
                   ) : null}
-                  {/* A plan-mode run's answer is a document, not a paragraph — the card gives it
-                      the title, truncated preview and full view ZCode renders. Everything else
-                      (including the same message before the run finished) stays the ordinary
-                      markdown path. */}
-                  {planDocs.includes(m.content.trim()) ? (
-                    <DocCard source={m.content} label="Plan" />
-                  ) : m.content.trim() ? (
-                    <AssistantContent raw={m.content} />
-                  ) : null}
+                  {/* A plan renders inside its tool call, not here (see `ToolCallRow`): the plan is
+                      what `exit_plan_mode` presented, so the card hangs on the call that carried it
+                      rather than being guessed from a message's text. */}
+                  {m.content.trim() ? <AssistantContent raw={m.content} /> : null}
                 </>
               )
             ) : (
@@ -3030,28 +3027,6 @@ function Chat({
           </button>
         )}
       </div>
-      {/* P5: plan mode's approve step. Shown only while a plan is actually pending AND the switch
-          is on — `pendingPlan` is set by the finish effect of a clean pass that ran as a plan pass,
-          and cleared on approval and at the start of every new turn. It used to gate on
-          `msgs.length > 0`, which says nothing about plans: any transcript with one message in it
-          made the button appear the instant the switch was ticked, offering to run a plan that did
-          not exist. A plan stays pending until it is approved or superseded — flipping the switch
-          off and on re-offers an unanswered plan, which is the open question, not a stale one. */}
-      {agentMode && planMode && !busy && pendingPlan !== null && (
-        <div
-          className="mt-3 flex flex-wrap items-center gap-3 rounded-md border px-3 py-2"
-          style={{ borderColor: "var(--info)", background: "var(--surface)" }}
-          data-testid="plan-approve"
-        >
-          <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-            Plan ready, nothing written yet. Approving runs it for real — or reply to refine it.
-          </span>
-          <Button variant="primary" onClick={approvePlan}>
-            Approve plan &amp; execute
-          </Button>
-        </div>
-      )}
-
       {/* P5: what this run changed. Shown after it ends, including after a stop or a failure —
           those runs have still written whatever they got to. */}
       {!busy && runChanges && (runChanges.files.length > 0 || runChanges.untracked.length > 0) && (
@@ -3304,6 +3279,25 @@ function Chat({
           }}
         />
       )}
+      {/* The plan-mode pair, raised by the loop when the model calls `exit_plan_mode` /
+          `enter_plan_mode`. Same parking contract as the gate above; a different question. */}
+      {pendingPlanReview && (
+        <PlanReviewModal
+          plan={pendingPlanReview.plan}
+          onResolve={(decision) => {
+            pendingPlanReview.resolve(decision);
+            setPendingPlanReview(null);
+          }}
+        />
+      )}
+      {pendingPlanEntry && (
+        <PlanModeEntryModal
+          onResolve={(ok) => {
+            pendingPlanEntry.resolve(ok);
+            setPendingPlanEntry(null);
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -3411,12 +3405,17 @@ function ToolCallRow({
   histories?: ReadonlyMap<string, { versions: ArtifactVersion[]; unresolved: number }>;
 }) {
   const [open, setOpen] = useState(false);
+  // `exit_plan_mode`'s argument is a document, not call detail: it renders as the plan card below
+  // instead of a clipped `plan: …` summary plus a 600-character argument dump — the same text
+  // three times in three truncations. `enter_plan_mode` carries no arguments at all.
+  const planDoc =
+    step.name === "exit_plan_mode" && typeof step.args.plan === "string" ? step.args.plan : null;
   const change = fileChangeFor(step.name, step.args);
   // A card only where the step is the file's newest successful write AND the run has finished; a
   // refused write keeps its diff either way (`writtenArtifactPath` carries that gate).
   const previewable = previewAllowed && root ? writtenArtifactPath(step) : null;
   const color = step.status ? STEP_COLOR[step.status] : "var(--text-faint)";
-  const summary = argSummary(step.args);
+  const summary = planDoc ? "" : argSummary(step.args);
   const preview = step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
   const hasOutput = preview !== null && preview.length > 0;
   // A call in flight has no result to fold yet, and its arguments are the only live evidence of
@@ -3435,7 +3434,17 @@ function ToolCallRow({
         <span className="shrink-0" style={{ color: "var(--text)" }}>{step.name}</span>
         {summary && <span className="truncate" style={{ color: "var(--text-dim)" }}>({summary})</span>}
       </button>
-      {showArgs && Object.keys(step.args).length > 0 && (
+      {planDoc && (
+        <div className="ml-3.5 mt-1">
+          {/* The same card the transcript has always used for a plan, now anchored to the call that
+              presented it. The arguments travel with the transcript, so a resumed session rebuilds
+              this card from them — where the host returns the recorded tool calls
+              (`history_timeline` → `resumeSession`). The plan file itself is for the user and other
+              tools, not for this render. */}
+          <DocCard source={planDoc} label="Plan" />
+        </div>
+      )}
+      {showArgs && !planDoc && Object.keys(step.args).length > 0 && (
         <div className="ml-3.5">
           {Object.entries(step.args).map(([k, v]) => (
             <div key={k} className="mono break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
@@ -3671,7 +3680,10 @@ function AgentStatus({
   // the one the status line names. Elapsed for it comes for free: the last "calling" item started
   // when the tool_call event arrived, and the timer above started when the run did.
   const running = items.length > 0 && items[items.length - 1]!.status === "calling" ? items[items.length - 1]! : null;
-  const summary = running ? argSummary(running.args) : "";
+  // `exit_plan_mode`'s argument is a document, and the status line is one line: naming the call is
+  // the informative half, and a 64-character slice of a plan is neither a summary nor a plan. The
+  // same suppression `ToolCallRow` applies to the full arguments.
+  const summary = running && running.name !== "exit_plan_mode" ? argSummary(running.args) : "";
   return (
     <div className="mono flex flex-wrap items-baseline gap-x-2 text-[11px]" data-testid="agent-status">
       {/* role="status" so the activity change is announced — but it sits on this span only, never

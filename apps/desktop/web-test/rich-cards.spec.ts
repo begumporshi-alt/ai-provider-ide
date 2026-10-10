@@ -24,7 +24,7 @@ async function openChat(page: import("@playwright/test").Page) {
   await pickModel(page, /oracle-mini/);
 }
 
-test("plan mode's answer renders as an expandable document card that survives approval", async ({ page }) => {
+test("plan mode's plan renders as an expandable document card on the call that presented it", async ({ page }) => {
   await openChat(page);
   await openRunConfig(page);
   await page.getByLabel("agent mode").check();
@@ -38,7 +38,9 @@ test("plan mode's answer renders as an expandable document card that survives ap
   await page.getByPlaceholder(/Describe a task for the agent/).fill("plan the subagent system upgrade");
   await page.getByRole("button", { name: "Send" }).click();
 
-  // The card, not a bare markdown message: title from the document's h1, header labelled Plan.
+  // The card, not a bare markdown message: title from the document's h1, header labelled Plan. It
+  // hangs on the `exit_plan_mode` call the model made, which is also the call that raised the
+  // review now on screen.
   const card = page.getByTestId("doc-card");
   await expect(card).toBeVisible({ timeout: 30_000 });
   await expect(page.getByTestId("doc-card-title")).toHaveText("Subagent System Upgrade — Two Phases");
@@ -46,25 +48,28 @@ test("plan mode's answer renders as an expandable document card that survives ap
 
   // The preview is clamped (scrollHeight beyond the max-height), and the last step sits below
   // the fold until the pill opens the document. Clipped-but-present text still counts as
-  // "visible" to Playwright, so the clamp is asserted by measurement, not visibility.
+  // "visible" to Playwright, so the clamp is asserted by measurement, not visibility. No clicks
+  // yet: the review modal's backdrop is up, and a click would answer the review instead.
   const lastStep = "Keep fragments and snippets as highlighted code";
   const isClamped = () =>
     page.getByTestId("doc-card-body").evaluate((el) => el.scrollHeight > el.clientHeight + 1);
   expect(await isClamped()).toBe(true);
   await expect(card.getByText(lastStep)).toBeAttached();
+
+  // --- approve, and the card stays: the plan is on the record --------------------------
+  await page.getByRole("button", { name: "Approve — implement it now" }).click();
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+  await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
+
+  // With the transcript free of modals the card expands in place, and collapsing returns the
+  // clamped preview.
   await page.getByTestId("doc-card-view").click();
   await expect(card.getByText(lastStep)).toBeVisible();
   await expect(page.getByTestId("doc-card-view")).toHaveCount(0);
   expect(await isClamped()).toBe(false);
   await page.getByTestId("doc-card-collapse").click();
   expect(await isClamped()).toBe(true);
-
-  // Approving runs the plan for real — and the card stays, because the plan is still on record.
-  await expect(page.getByTestId("plan-approve")).toBeVisible();
-  await page.getByRole("button", { name: "Approve plan & execute" }).click();
-  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Allow once", exact: true }).click();
-  await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
   await expect(card).toBeVisible();
   await expect(page.getByTestId("doc-card-title")).toHaveText("Subagent System Upgrade — Two Phases");
 });

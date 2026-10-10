@@ -112,7 +112,8 @@ ChatGPT/Claude web chat surfaces.
   `auto-approve reads` / `yolo`) driven by a declared per-tool `effect` rather than a second list of
   mutating names; a four-answer gate (`Deny` / `Always allow <tool>` / `Allow all this session` /
   `Allow once`) replacing the old allow-deny modal; plan mode (a system-prompt pass whose writes the
-  gate refuses itself, then an "Approve plan & execute" that runs it for real); and a run **change
+  gate refuses itself; the pass ends by calling `exit_plan_mode` — since 2026-10-10, see the note
+  under (b) — and an approved plan is implemented in that same pass); and a run **change
   set** with a real before/after diff and a revert that restores the pre-run bytes.
   New files: `lib/tools/approval.ts` (18 unit tests), `lib/tools/changeset.ts` (17),
   `components/ApproveModal.tsx`, `components/ChangeSetReview.tsx`, `web-test/agent-approval.spec.ts`
@@ -138,6 +139,25 @@ ChatGPT/Claude web chat surfaces.
   ZCode's own protocol — a plan file under `<workspace>/.zcode/plans/`, `EnterPlanMode`/`ExitPlanMode`
   tool calls, the plan carried inside the approval request — is the target for the follow-up pass;
   this revision is the gate + workflow half of it.
+  **Follow-up landed 2026-10-10 (same day):** the other half is in, and it *replaces* the panel the
+  paragraph above describes. `exit_plan_mode` carries the plan and raises
+  `components/PlanReviewModal.tsx` (Approve — implement it now / Request changes, whose feedback
+  returns as the tool result so the model revises and presents again); `enter_plan_mode` asks the
+  user's consent before the mode turns on; approving flips the mode and the SAME pass implements —
+  the canned "The plan is approved" turn, and the second run it started, are gone. The approved
+  plan is written to `<workspace>/.zcode/plans/plan-<session>.md` by `plan_save`
+  (`core/plan_doc.rs`), deliberately outside the sandbox: it never enters the change set and no
+  revert can take it back. The transcript's plan card now hangs on the tool call's own arguments,
+  which deleted the `planDocs` array, the finish effect and the bar with it — and the honest cost
+  is that a pass which never calls the tool produces no approval affordance at all. Both tools are
+  settled by the loop itself, before `decide()`: as `read` a mode would auto-allow them away, as
+  `mutate` plan mode would refuse the call that ends it.
+  **Known gap from that pass:** the plan card renders from a tool call's recorded arguments, so a
+  resumed session can rebuild it only where the host returns those calls on `history_timeline`
+  (the Rust side does; the web-test harness does not, so card-after-resume has no executable
+  coverage — only in-session rendering is pinned). Nothing at the web layer would catch a
+  regression in that path; a shim that returns `tool_calls` on timeline entries plus one resume
+  spec is the follow-up.
   (c) The checkpoint reads a file's previous contents **before the first write of the run**, which
   is what makes the review a true diff (a `write_file` used to render as all-additions with "any
   previous contents are not shown") and makes a file written twice revert to its pre-run state.
@@ -377,7 +397,7 @@ a run's edits are shown as a diff set that can be applied or reverted.
 |---|---|
 | Approval modes | `lib/tools/approval.ts` (`decide`), `ToolSpec.effect` in `registry.ts`, picker in `AssistantScreen` (persisted) |
 | Always allow / this session | `components/ApproveModal.tsx`; grants held in `Chat` for the session |
-| Plan mode | `PLAN_MODE_SYSTEM` + the gate's `deny` verdict; "Approve plan & execute" on the Assistant |
+| Plan mode | `PLAN_MODE_SYSTEM` + the gate's `deny` verdict; `enter_plan_mode` / `exit_plan_mode` raise the consent and the plan review (`components/PlanReviewModal.tsx`); the approved plan lands in `<workspace>/.zcode/plans/` |
 | Change review | `components/ChangeSetReview.tsx`, one `DiffView` per file, Keep / Revert |
 | Checkpoint & undo | `lib/tools/changeset.ts` (`RunCheckpoint`, `createCheckpointingHost`, `revertPlan`) |
 

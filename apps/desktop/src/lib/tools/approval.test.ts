@@ -122,6 +122,10 @@ describe("plan mode", () => {
       // the model would respond by rephrasing the same call instead of proposing a plan.
       expect(v.reason).not.toContain("denied by the user");
       expect(v.reason).toContain("plan");
+      // And it names the call that ends the pass. Without this the refusal can drift back to
+      // "reply with the plan" — which the deleted approve bar used to accept and nothing accepts
+      // now, so the pass would end with no review, no plan file and no affordance.
+      expect(v.reason).toContain("exit_plan_mode");
     }
   });
 

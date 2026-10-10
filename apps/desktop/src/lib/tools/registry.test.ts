@@ -72,6 +72,8 @@ describe("AGENT_TOOLS", () => {
     expect(readOnly.sort()).toEqual([
       "browser_snapshot",
       "dispatch_agent",
+      "enter_plan_mode",
+      "exit_plan_mode",
       "file_info",
       "glob",
       "list_dir",
@@ -109,8 +111,10 @@ describe("AGENT_TOOLS", () => {
   it("Assistant-only tools stay out of the gateway's registry", () => {
     // `web_ask` (answered by the loop itself — it needs a model, which the Rust tool host does
     // not have), `dispatch_agent` (a nested run of the loop itself), `load_skill` (it needs the
-    // skill store) and the notebook composites (read_file + write_file assembled by the loop)
-    // are frontend-registry entries with NO backend registry entry and NO sandbox handler beyond
+    // skill store), the notebook composites (read_file + write_file assembled by the loop) and
+    // the plan-mode pair (settled by the loop, against the screen's approval surface — and
+    // classified `read` so the generic gate can never auto-allow a review away) are
+    // frontend-registry entries with NO backend registry entry and NO sandbox handler beyond
     // a refusal. This test pins the asymmetry: if any ever appears in a backend-shaped list
     // here, the mirror invariant needs rethinking.
     expect(AGENT_TOOLS.some((t) => t.name === "web_ask")).toBe(true);
@@ -118,6 +122,8 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "load_skill")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "read_notebook")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "edit_notebook")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "enter_plan_mode")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "exit_plan_mode")).toBe(true);
     // process_output/process_kill DO have sandbox handlers (background jobs live in the Rust
     // process), but only the Assistant's own loop can know what a "bg-N" id means — the gateway
     // registry keeps them out so external clients never build on the job table. Same for the
@@ -131,11 +137,16 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "browser_screenshot")).toBe(true);
   });
 
-  it("the sub-agent registry is the read-only tools minus delegation and todos", () => {
+  it("the sub-agent registry is the read-only tools minus delegation, todos and the plan pair", () => {
     const names = SUBAGENT_TOOLS.map((t) => t.name);
     expect(names).toContain("read_file");
     expect(names).not.toContain("dispatch_agent");
     expect(names).not.toContain("todo_write");
+    // The mode belongs to the session, and a child's transcript is discarded: a sub-agent that
+    // could enter plan mode would gate the parent's writes, and one that could exit it would
+    // silently open them.
+    expect(names).not.toContain("enter_plan_mode");
+    expect(names).not.toContain("exit_plan_mode");
     for (const t of SUBAGENT_TOOLS) {
       expect(t.effect, t.name).toBe("read");
     }

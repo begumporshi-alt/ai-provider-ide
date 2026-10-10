@@ -44,6 +44,38 @@ const SOURCE = [
   "}",
 ].join("\n");
 
+/**
+ * The plan the PLAN-EXIT variant presents through `exit_plan_mode` — the agent's actual ending for
+ * a planning pass now, so the specs drive the same shape a real model produces. Deliberately long
+ * enough to overflow both the review modal and the transcript card, so both are asserted on real
+ * content: a titled `# h1`, two phases, and a last step that sits below the fold.
+ */
+const PLAN_MARKDOWN = [
+  "# Subagent System Upgrade — Two Phases",
+  "",
+  "Bring the assistant's document rendering up to what ZCode shows: a titled plan card with",
+  "a truncated, fading preview and the full document one click away. Each phase ships",
+  "independently.",
+  "",
+  "## Phase 1 — the plan card",
+  "",
+  "1. Record the plan-mode answer's message id when the run finishes.",
+  "2. Render that message through DocCard: icon header, copy button, clamped preview.",
+  "3. Expand in place; collapsing returns the faded preview.",
+  "",
+  "## Phase 2 — live HTML documents",
+  "",
+  "4. Split whole html documents out of the markdown stream.",
+  "5. Preview each one in a sandboxed iframe with a code toggle beside it.",
+  "6. Keep fragments and snippets as highlighted code — they are not pages.",
+].join("\n");
+
+/** The revised plan the PLAN-REVISED variant presents after a "request changes" answer. */
+const REVISED_PLAN =
+  "# Subagent System Upgrade — Two Phases (revised)\n\n" +
+  "1. Keep the plan card as reviewed.\n" +
+  "2. Add the rollback step the review asked for.";
+
 const CODE_ENVELOPE = {
   dialect: "newline-plain-v1",
   authHeader: { name: "Authorization", prefix: "Bearer" },
@@ -193,6 +225,18 @@ async function oracle(req, res, path) {
     const toolMsgs = messages.filter((m) => m.role === "tool");
     const lastToolResult = String(toolMsgs[toolMsgs.length - 1]?.content ?? "");
     /**
+     * Whether this conversation has already presented a plan. The plan variants key on this rather
+     * than on `!sawToolResult`: a planning pass is usually the second thing in a conversation (an
+     * ordinary pass came first), so "clean history" would mean "never present a plan".
+     *
+     * System turns are skipped, and that is not a detail: the plan-mode system prompt names
+     * `exit_plan_mode`, so a scan that included it would answer "a plan was already presented"
+     * before the model ever had a chance to present one.
+     */
+    const sawPlanCall = messages.some(
+      (m) => m.role !== "system" && JSON.stringify(m).includes("exit_plan_mode"),
+    );
+    /**
      * Reasoning-only: the OpenAI-compatible spelling of the failure that produced the "the agent
      * is not replying" report (2026-10-02, `agentrouter.org` / `deepseek-v4-flash`). The model
      * spends its whole output budget deliberating and never opens a text block, so a client that
@@ -222,21 +266,49 @@ async function oracle(req, res, path) {
       // so this is what proves the bridge forwards the reason instead of a blank result.
       toolCall = { name: "read_file", arguments: JSON.stringify({ path: "nope.txt" }) };
       content = "";
+    } else if (tools && /The user approved the plan/.test(lastToolResult)) {
+      // Agent mode, PLAN-APPROVED variant: the round-trip that follows an approved
+      // `exit_plan_mode`. Keyed on the tool RESULT, not on a user turn — the approval is consumed
+      // inside the same pass now, so there is no "carry it out now" message to key on (that canned
+      // turn, and the second run it started, are both gone).
+      toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "world", new: "there" }) };
+      content = "";
+    } else if (tools && /did not approve the plan yet/.test(lastToolResult)) {
+      // Agent mode, PLAN-REVISED variant: the review asked for changes, so the model revises and
+      // presents a second plan — the shape the "request changes" spec drives.
+      toolCall = { name: "exit_plan_mode", arguments: JSON.stringify({ plan: REVISED_PLAN }) };
+      content = "";
+    } else if (tools && /PLAN MODE IS ON/.test(lastToolResult)) {
+      // Agent mode, PLAN-AFTER-ENTRY variant: the `enter_plan_mode` consent was granted, so the
+      // model does what the mode is for and presents the plan. (The investigation between the two
+      // is skipped — the spec is about the consent gate and the review that follows it.)
+      toolCall = { name: "exit_plan_mode", arguments: JSON.stringify({ plan: PLAN_MARKDOWN }) };
+      content = "Planning now that the mode is on.";
+    } else if (tools && /The user declined plan mode/.test(lastToolResult)) {
+      // Agent mode, PLAN-ENTRY-DECLINED variant: the consent was refused, so the model carries on
+      // with the task instead of planning.
+      content = "Continuing without plan mode.";
+    } else if (tools && /this run is in PLAN MODE/.test(lastToolResult)) {
+      // Agent mode, PLAN-AFTER-REFUSAL variant: the pass tried to write, the gate refused it with
+      // its own wording, and the model did the thing the refusal asks for — it presents a plan.
+      toolCall = { name: "exit_plan_mode", arguments: JSON.stringify({ plan: PLAN_MARKDOWN }) };
+      content = "The write was refused as the mode says it would be. Here is the plan instead.";
     } else if (tools && /again/i.test(last)) {
       // Agent mode, SECOND-TURN variant: the same tool again, on a later turn and with a history
       // that already contains a tool result. Ungated on `sawToolResult` for that reason — the
       // "always allow this tool" spec needs a call that would be gated if the grant were not
       // recorded, and a branch that required a clean history could never produce one.
+      //
+      // The plan variants above MUST stay above this one: this test is deliberately loose, and the
+      // decline sentence tells the model to "call exit_plan_mode again" — which this branch would
+      // otherwise answer with an edit_file the plan gate then refuses, forever.
       toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "there", new: "world" }) };
       content = "";
-    } else if (tools && /approved/i.test(last)) {
-      // Agent mode, PLAN-APPROVED variant: the user turn that follows clicking "Approve plan &
-      // execute". Deliberately NOT gated on `!sawToolResult`: the plan pass before it always ends
-      // with a tool result (the refusal), so a branch that required a clean history could never
-      // fire and the executing pass would look like it did nothing — which is precisely the
-      // behaviour this variant exists to disprove.
-      toolCall = { name: "edit_file", arguments: JSON.stringify({ path: "README.md", old: "world", new: "there" }) };
-      content = "";
+    } else if (tools && !sawToolResult && /big change/i.test(last)) {
+      // Agent mode, PLAN-ENTER variant: the model asks to plan before touching anything, which is
+      // the only way an agent-initiated plan mode ever starts.
+      toolCall = { name: "enter_plan_mode", arguments: "{}" };
+      content = "This one is big enough to agree on the shape first.";
     } else if (tools && !sawToolResult && /edit/i.test(last)) {
       // Agent mode, MUTATION variant: an edit_file call against the shim's virtual FS
       // (`README.md` holds "hello\nworld\n"). The transcript must render this as a diff — the
@@ -391,29 +463,13 @@ async function oracle(req, res, path) {
       // Plain chat: a host the egress policy does not permit, so the card must NOT try to fetch
       // it — it offers the browser instead.
       content = "The upstream docs live at https://example.com/guide — open that in your browser.";
-    } else if (tools && !sawToolResult && /plan the/i.test(userPrompt)) {
-      // Agent mode, PLAN-CARD variant: the plan-mode answer IS the plan document — prose, no tool
-      // call — which is what the transcript's DocCard renders. Long enough to overflow the
-      // card's clamped preview, so the "View full plan" pill is reachable in a spec.
-      content = [
-        "# Subagent System Upgrade — Two Phases",
-        "",
-        "Bring the assistant's document rendering up to what ZCode shows: a titled plan card with",
-        "a truncated, fading preview and the full document one click away. Each phase ships",
-        "independently.",
-        "",
-        "## Phase 1 — the plan card",
-        "",
-        "1. Record the plan-mode answer's message id when the run finishes.",
-        "2. Render that message through DocCard: icon header, copy button, clamped preview.",
-        "3. Expand in place; collapsing returns the faded preview.",
-        "",
-        "## Phase 2 — live HTML documents",
-        "",
-        "4. Split whole html documents out of the markdown stream.",
-        "5. Preview each one in a sandboxed iframe with a code toggle beside it.",
-        "6. Keep fragments and snippets as highlighted code — they are not pages.",
-      ].join("\n");
+    } else if (tools && /plan the/i.test(userPrompt) && !sawPlanCall) {
+      // Agent mode, PLAN-EXIT variant: a planning pass ends the way the real contract says it must
+      // — by calling `exit_plan_mode` with the plan document, which is what raises the review.
+      // Keyed on "no plan has been presented yet", not on a clean history: a plan pass normally
+      // follows an ordinary one, so the transcript already holds tool results.
+      toolCall = { name: "exit_plan_mode", arguments: JSON.stringify({ plan: PLAN_MARKDOWN }) };
+      content = "I have read what the plan touches. Here it is for review.";
     } else if (tools && !sawToolResult) {
       // Agent-mode trigger: emit one tool call (list_dir ".") so the loop executes it once.
       // The interpreter accumulates deltas by index and emits on stream close.

@@ -15,8 +15,10 @@ import type { ChatMessage, TextRequest, TextStream, UsageTokens } from "@aiprovi
  *  of the declaration instead of a second hardcoded list that drifts away from this one. */
 export type ToolEffect = "read" | "mutate";
 
-/** A tool the agent may call. Every entry maps 1:1 to a handler in the Rust sandbox — a name
- *  the host does not implement is a call that can only ever fail. */
+/** A tool the agent may call. Most entries map 1:1 to a handler in the Rust sandbox. A handful do
+ *  not: `web_ask`, `dispatch_agent`, `generate_image`, `load_skill`, the notebook composites and
+ *  the plan-mode pair are answered by the loop itself (a model call, a nested run, the image
+ *  route, the skill store, the approval surface) and never reach the sandbox. */
 export interface ToolSpec {
   name: string;
   description: string;
@@ -76,6 +78,42 @@ export type AgentEvent =
    */
   | { type: "done"; text: string; iterations: number; truncated?: boolean; hitCeiling?: boolean };
 
+/**
+ * Everything the two plan-mode control tools need from their owner (the screen, in production).
+ *
+ * Grouped rather than five loose fields because the five are one conversation: the mode is read
+ * live (the gate reads the same ref), flipped through a port that must write through to that ref
+ * before the loop's next call, and the two interactions are what the plan tools exist to raise.
+ * `exit_plan_mode` is deliberately not routed through `confirm`: as a `read` tool the generic gate
+ * would auto-allow it under "auto-approve reads" or a remembered grant — no modal, no review — and
+ * as a `mutate` tool plan mode would refuse the very call that ends it.
+ */
+export interface PlanPorts {
+  /** Whether this run is in plan mode **right now**. Read live, like the approval gate's own state. */
+  isPlanMode: () => boolean;
+  /**
+   * Flip it for the rest of this run. The implementation must write through to whatever the gate
+   * reads — `setState` alone is not enough: the flip would land after the loop has already asked
+   * the gate about the next write, and a just-approved run would watch its first edit be refused.
+   */
+  setPlanMode: (on: boolean) => void;
+  /**
+   * Show the plan and wait for the user's decision. Must resolve when `signal` aborts (Stop while
+   * parked) rather than leaving the loop parked on a modal nobody will ever answer.
+   */
+  requestApproval: (
+    plan: string,
+    signal?: AbortSignal,
+  ) => Promise<{ approved: boolean; feedback?: string }>;
+  /** Ask the user to switch plan mode on. Resolves false when they decline or the run is stopped. */
+  requestEntry: (signal?: AbortSignal) => Promise<boolean>;
+  /**
+   * Persist the plan document where the user can find it later, returning the path. Best-effort:
+   * null means "not written", and an approval stands either way.
+   */
+  persist: (plan: string) => Promise<string | null>;
+}
+
 export interface AgentLoopOptions {
   model: string;
   /** Initial conversation (user turns). The loop appends assistant/tool turns internally. */
@@ -107,6 +145,12 @@ export interface AgentLoopOptions {
    * turn whether or not the task matches.
    */
   loadSkill?: (name: string, signal?: AbortSignal) => Promise<string | null>;
+  /**
+   * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`. Absent — tests, the
+   * gateway bridge — both tools refuse with a sentence telling the model to present the plan in
+   * its answer instead: a planning pass with no approval surface must not pretend it got one.
+   */
+  plan?: PlanPorts;
   /**
    * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling**.
    *

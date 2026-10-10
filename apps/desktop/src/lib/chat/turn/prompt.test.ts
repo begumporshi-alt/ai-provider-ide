@@ -40,6 +40,14 @@ describe("buildAgentSystem", () => {
   it("carries PLAN_MODE_SYSTEM verbatim when plan mode is on", () => {
     expect(buildAgentSystem({ root: "", skillsBlock: "", planMode: true })).toContain(PLAN_MODE_SYSTEM);
   });
+
+  it("tells the pass how it ends — the exit tool, by name", () => {
+    // The prompt plus the registry description are the model's whole contract for ending a
+    // planning pass. If the tool is ever renamed, this is the sentence that goes stale first, and
+    // the model is the one that would have found out.
+    expect(PLAN_MODE_SYSTEM).toContain("exit_plan_mode");
+    expect(PLAN_MODE_SYSTEM).toContain("same pass");
+  });
 });
 
 describe("buildPlainRequestMessages", () => {

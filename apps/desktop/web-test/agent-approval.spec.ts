@@ -20,7 +20,12 @@ const APP = "/web-test/";
 const README_BEFORE = "hello\nworld\n";
 const README_AFTER = "hello\nthere\n";
 
-type WebTest = { __webTest: { vfs: () => Record<string, string> } };
+type WebTest = {
+  __webTest: {
+    vfs: () => Record<string, string>;
+    plans: () => Record<string, string>;
+  };
+};
 
 async function openAgentChat(page: import("@playwright/test").Page) {
   await page.setViewportSize({ width: 1280, height: 860 });
@@ -165,7 +170,7 @@ test("'always allow this tool' covers the next call of the same tool", async ({ 
   expect((await vfs(page))["README.md"]).toBe(README_BEFORE);
 });
 
-test("plan mode refuses a write without asking, then executes the approved plan", async ({ page }) => {
+test("plan mode refuses a write, then presents the plan for review — no canned turn", async ({ page }) => {
   await openAgentChat(page);
   await openRunConfig(page);
   await page.getByLabel("plan mode").check();
@@ -174,28 +179,39 @@ test("plan mode refuses a write without asking, then executes the approved plan"
 
   await send(page, "edit the readme greeting");
 
-  // The refusal is the mode's, so there is nobody to ask: no modal may appear, not even for a
-  // mutation the user would have had to approve a moment earlier. Wait for the pass to end first —
-  // the approve panel is the only thing that appears when it is over, and asserting on the live
-  // view would be racing the transcript that replaces it.
-  await expect(page.getByTestId("plan-approve")).toBeVisible({ timeout: 30_000 });
-  await expect(page.getByRole("dialog")).toHaveCount(0);
+  // The refusal is the mode's, so there is nobody to ask: no approval modal may appear for a write
+  // the user would have had to approve a moment earlier. The pass ends by asking for a PLAN review
+  // instead — the mode's own exit, raised by the tool call rather than by the gate.
+  await expect(page.getByTestId("plan-review-body")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toHaveCount(0);
   // The model was told why, in the mode's own words rather than "the user denied this".
   await expect(page.getByText(/in PLAN MODE/).first()).toBeVisible();
   // And nothing was written. This is the guarantee plan mode actually makes.
   expect((await vfs(page))["README.md"]).toBe(README_BEFORE);
 
-  // --- approve ------------------------------------------------------------------------
-  await page.getByRole("button", { name: "Approve plan & execute" }).click();
+  // --- approve: the SAME run continues into the work ----------------------------------
+  await page.getByRole("button", { name: "Approve — implement it now" }).click();
 
-  // Now the same call is an ordinary mutation under the ordinary mode, so it asks.
+  // No canned "the plan is approved" turn and no second run: the approval arrives as the tool's
+  // result, and the same pass makes the write — which, under the default mode, asks.
   await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
   await page.getByRole("button", { name: "Allow once", exact: true }).click();
 
   await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
   expect((await vfs(page))["README.md"]).toBe(README_AFTER);
-  // The approve panel is gone: the run it was offering is the one that just happened.
-  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+
+  // The plan file is deliberately outside the sandbox: it must not read as a change to this run,
+  // and "revert this run" must not be able to take it back. Asserted here because routing the
+  // write through the checkpointing host would keep every other assertion in this file green.
+  expect(await page.getByTestId("change-set").innerText()).not.toContain(".zcode");
+
+  // The approved plan was written where the user can find it — outside the sandbox, so it is
+  // neither part of the change set nor revertable.
+  const plans = await page.evaluate(() => (window as unknown as WebTest).__webTest.plans());
+  const paths = Object.keys(plans);
+  expect(paths).toHaveLength(1);
+  expect(paths[0]).toMatch(/^\.zcode\/plans\/plan-.+\.md$/);
+  expect(plans[paths[0]!]).toContain("Subagent System Upgrade — Two Phases");
 });
 
 // 2026-10-10: plan mode carries its own read policy. This is the half that used to be a hint —
@@ -216,13 +232,13 @@ test("plan mode is read-only: a read runs with no modal under 'ask every time'",
   await expect(page.getByRole("dialog")).toHaveCount(0);
 });
 
-// The panel's condition used to be `msgs.length > 0`, which is true of any transcript. So ticking
-// the switch on a conversation offered to "Approve plan & execute" a plan that did not exist yet,
-// and ticking it again after approving re-offered the plan that had just been executed. Both
-// halves are pinned here.
-test("the approve panel waits for a plan, and an approved plan is not offered again", async ({ page }) => {
+// The approve panel used to appear whenever the transcript was non-empty — `msgs.length > 0` says
+// nothing about plans — so ticking the switch offered to approve a plan that did not exist, and
+// ticking it again re-offered the plan that had just been executed. The affordance is a review the
+// model asks for now (`exit_plan_mode`), and the plan renders as a card on that call.
+test("a plan review appears only when a pass presents one", async ({ page }) => {
   await openAgentChat(page);
-  // An ordinary pass first, so the transcript is non-empty — the state the old condition keyed on.
+  // An ordinary pass first, so the transcript is non-empty — the state the old panel keyed on.
   await send(page, "list files");
   await page.getByRole("button", { name: "Allow once", exact: true }).click();
   await expect(page.getByText("Done. Here is what I found in the workspace.")).toBeVisible({ timeout: 30_000 });
@@ -230,84 +246,117 @@ test("the approve panel waits for a plan, and an approved plan is not offered ag
   await openRunConfig(page);
   await page.getByLabel("plan mode").check();
   // The hint renders with the toggle itself, so it proves the re-render happened while the panel is
-  // still open — the bar's absence below is a real absence, not a frame the assertion won.
+  // still open — the absences below are real absences, not a frame the assertions won.
   await expect(page.getByTestId("plan-mode-hint")).toBeVisible();
   await closeRunConfig(page);
+  // Nothing to approve and nothing offering an approval: a switch is not a plan, and the panel that
+  // used to appear here is gone rather than merely hidden. (The count on a removed testid can never
+  // fail by itself — it is kept as the guard that the panel does not come *back*.)
+  await expect(page.getByRole("dialog")).toHaveCount(0);
   await expect(page.getByTestId("plan-approve")).toHaveCount(0);
 
-  // A plan pass does produce one: the oracle's plan document is prose with no tool call.
+  // A pass that presents a plan does produce one — through the tool call, which is also where the
+  // plan card lives.
   await send(page, "plan the subagent system upgrade");
-  await expect(page.getByTestId("plan-approve")).toBeVisible({ timeout: 30_000 });
-
-  // --- approve it for real -------------------------------------------------------------
-  await page.getByRole("button", { name: "Approve plan & execute" }).click();
+  await expect(page.getByTestId("plan-review-body")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("doc-card-title")).toHaveText("Subagent System Upgrade — Two Phases");
+  await page.getByRole("button", { name: "Approve — implement it now" }).click();
   await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
   await page.getByRole("button", { name: "Allow once", exact: true }).click();
   await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
 
-  // The question is answered. Turning plan mode back on means "make another plan" — it must not
-  // re-offer the plan that was just carried out.
+  // The question is answered. An ordinary answer afterwards must not be carded as a plan — the
+  // transcript carries exactly one document, the one the call presented.
   await openRunConfig(page);
-  await page.getByLabel("plan mode").check();
-  await expect(page.getByTestId("plan-mode-hint")).toBeVisible();
-  await closeRunConfig(page);
-  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
-});
-
-// A pass whose switch is off must not be recorded as a plan. The marking used to read the live
-// switch at the finish transition; the ref-based capture that replaced it has to be re-answered by
-// EVERY pass — plain chat included — or it reintroduces the same bug through the other door: the
-// capture left standing from an earlier plan pass cards the next plain answer as a "Plan".
-test("a plain answer after a plan pass is not carded as a plan", async ({ page }) => {
-  await openAgentChat(page);
-  await openRunConfig(page);
-  await page.getByLabel("plan mode").check();
-  await closeRunConfig(page);
-
-  // A plan pass first, so the capture has been set at least once.
-  await send(page, "plan the subagent system upgrade");
-  await expect(page.getByTestId("doc-card")).toBeVisible({ timeout: 30_000 });
-
-  // Now leave plan mode AND agent mode: the next turn is ordinary chat.
-  await openRunConfig(page);
-  await page.getByLabel("plan mode").uncheck();
   await page.getByLabel("agent mode").uncheck();
   await closeRunConfig(page);
-
   await page.getByPlaceholder(/Message your assistant/).fill("say hello");
   await page.getByRole("button", { name: "Send" }).click();
   await expect(page.getByText("Hello from oracle-mini")).toBeVisible({ timeout: 30_000 });
-  // The plain answer is a message, not a document. Counted as a positive first — that form is only
-  // satisfiable once the plain pass is the one being rendered, where `toHaveCount(0)` on a filter
-  // can pass in the window before the finish effect has run.
   await expect(page.getByTestId("doc-card")).toHaveCount(1);
   await expect(page.getByTestId("doc-card").filter({ hasText: "Hello from oracle-mini" })).toHaveCount(0);
 });
 
-// A wholesale transcript change answers or discards the plan question too. Without this, New chat
-// left the bar sitting over an empty chat, offering to approve a plan from the conversation that
-// had just been thrown away — the same `msgs.length > 0` bug through a different door.
-test("starting a new chat clears a plan that was pending", async ({ page }) => {
+// The third answer the review offers: not "no", but "not like this". The feedback travels back as
+// the tool's result and the model revises — the pass stays in plan mode until a plan is approved.
+test("requesting changes sends the review back and keeps the pass planning", async ({ page }) => {
   await openAgentChat(page);
   await openRunConfig(page);
   await page.getByLabel("plan mode").check();
   await closeRunConfig(page);
 
   await send(page, "plan the subagent system upgrade");
-  await expect(page.getByTestId("plan-approve")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("plan-review-body")).toBeVisible({ timeout: 30_000 });
+  await expect(page.getByTestId("doc-card-title").last()).toHaveText("Subagent System Upgrade — Two Phases");
 
-  // The palette's New chat — the affordance that empties the transcript wholesale.
-  const mac = await page.evaluate(() =>
-    /mac|iphone|ipad/i.test(navigator.platform || navigator.userAgent),
+  await page.getByRole("button", { name: "Request changes" }).click();
+  await page.getByTestId("plan-review-feedback").fill("add a rollback step");
+  await page.getByRole("button", { name: "Send and keep planning" }).click();
+
+  // The revised plan comes back for review — a second presentation, in the same run.
+  await expect(page.getByTestId("doc-card-title").last()).toHaveText(
+    "Subagent System Upgrade — Two Phases (revised)",
+    { timeout: 30_000 },
   );
-  await page.keyboard.press(`${mac ? "Meta" : "Control"}+k`);
-  const row = page.getByRole("dialog", { name: "Commands" }).getByRole("option", { name: /New chat/ });
-  await expect(row).toBeVisible({ timeout: 5_000 });
-  await row.click();
+  await page.getByRole("button", { name: "Approve — implement it now" }).click();
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+  await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
 
-  // Empty transcript, and nothing to approve.
-  await expect(page.getByText("Subagent System Upgrade — Two Phases")).toHaveCount(0);
-  await expect(page.getByTestId("plan-approve")).toHaveCount(0);
+  // The file holds what was actually approved — the revision, not the first draft.
+  const plans = await page.evaluate(() => (window as unknown as WebTest).__webTest.plans());
+  const body = Object.values(plans)[0] ?? "";
+  expect(body).toContain("(revised)");
+  expect(body).toContain("rollback step");
+});
+
+// The other direction: the agent asks to plan before changing anything, which is the only way an
+// agent-initiated plan mode ever starts. The consent is what turns the mode on — and the review
+// that follows is the proof, because `exit_plan_mode` raises one only inside plan mode.
+test("enter_plan_mode asks first, and consent is what turns the mode on", async ({ page }) => {
+  await openAgentChat(page);
+
+  await send(page, "this is a big change, take care");
+  await expect(page.getByRole("heading", { name: "Switch to plan mode?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Enter plan mode" }).click();
+
+  // Plan mode is on for the rest of the pass: the model presents its plan and the review appears,
+  // which can only happen in the mode.
+  await expect(page.getByTestId("plan-review-body")).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Approve — implement it now" }).click();
+  await expect(page.getByRole("heading", { name: "Allow this change?" })).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: "Allow once", exact: true }).click();
+  await expect(page.getByTestId("change-set")).toBeVisible({ timeout: 30_000 });
+  expect((await vfs(page))["README.md"]).toBe(README_AFTER);
+});
+
+// Stop while the loop is parked on a plan review: the modal must close and the run must end — the
+// same contract the confirm gate has raced its abort signal against since Phase 5. Without the
+// race the loop would stay parked on a promise nobody will ever answer.
+test("stopping a run parked on a plan review ends it", async ({ page }) => {
+  await openAgentChat(page);
+  await openRunConfig(page);
+  await page.getByLabel("plan mode").check();
+  await closeRunConfig(page);
+
+  await send(page, "plan the subagent system upgrade");
+  await expect(page.getByTestId("plan-review-body")).toBeVisible({ timeout: 30_000 });
+  // The status line names the parked state rather than claiming the run is working: the same
+  // "is it hung?" contract the confirm gate's own status line carries.
+  await expect(page.getByTestId("agent-status")).toContainText("Waiting for you — exit_plan_mode needs approval");
+
+  // The review's backdrop swallows the pointer, so reach the rail by keyboard — the same path the
+  // parked confirm gate's spec takes to the dashboard's stop.
+  await page.getByRole("button", { name: "Agents", exact: true }).focus();
+  await page.keyboard.press("Enter");
+  await page.getByRole("button", { name: "stop", exact: true }).click();
+
+  await expect(page.getByText("● running")).toHaveCount(0, { timeout: 15_000 });
+  await expect(page.getByText("stopped", { exact: true })).toBeVisible();
+
+  // Back on the Assistant: the review did not survive the stopped run, and nothing is left parked.
+  await page.getByRole("button", { name: "Assistant", exact: true }).click();
+  await expect(page.getByTestId("plan-review-body")).toHaveCount(0);
 });
 
 // The gate and Stop used to fight: while the modal was up the loop was parked on the approval

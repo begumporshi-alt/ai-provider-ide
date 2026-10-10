@@ -697,6 +697,16 @@ pub fn agent_def_delete(
     agent_defs::delete_def(&app_data_dir(&store), &id).map_err(CommandError)
 }
 
+/// Persist an approved plan under `<workspace>/.zcode/plans/`, returning the relative path written.
+///
+/// Called by the Assistant when `exit_plan_mode` is approved — the one moment the plan text is
+/// final. Outside the sandbox on purpose (see `core::plan_doc`): a plan must not enter the run's
+/// change set or be revertable, and plan mode itself would refuse the write.
+#[tauri::command]
+pub fn plan_save(root: String, session_id: String, markdown: String) -> Result<String, CommandError> {
+    crate::core::plan_doc::save_plan(&root, &session_id, &markdown).map_err(CommandError)
+}
+
 /// What this app binary was built from, to compare against whatever is serving the gateway.
 ///
 /// The app and `aiproviderd` are separate binaries from one crate, so "is the gateway I am talking
@@ -775,6 +785,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         agent_def_save,
         agent_def_set_enabled,
         agent_def_delete,
+        plan_save,
         crate::tauri::artifact_cmds::artifact_read,
         crate::tauri::gateway_cmds::gateway_status,
         crate::tauri::gateway_cmds::get_tools_enabled,

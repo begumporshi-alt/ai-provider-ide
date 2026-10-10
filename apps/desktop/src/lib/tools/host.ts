@@ -86,6 +86,32 @@ export async function fetchToolsPolicy(): Promise<ToolsPolicy> {
 }
 
 /**
+ * Persist an approved plan under the workspace's `.zcode/plans/`, returning the relative path.
+ *
+ * Deliberately not a sandbox tool: a plan is not a workspace change, so it must not enter the
+ * run's change set, be offered to "revert this run", or be refused by plan mode as a write — the
+ * plan is the one document a planning pass exists to leave behind (`core/plan_doc.rs`).
+ *
+ * Best-effort: `null` means the file could not be written, and an approval the user already gave
+ * stands either way rather than being lost to a filesystem error.
+ */
+export async function savePlan(
+  root: string,
+  sessionId: string,
+  markdown: string,
+): Promise<string | null> {
+  try {
+    return await invoke<string>("plan_save", { root, sessionId, markdown });
+  } catch (e) {
+    // Degrade, but not silently: the approval stands without the file, and a systematic failure
+    // (an old build without the command, an unwritable workspace) would otherwise be
+    // indistinguishable from success — plans would simply never reach disk and nobody would know.
+    console.warn("plan_save failed — the plan was approved but not written", e);
+    return null;
+  }
+}
+
+/**
  * The workspace agent mode starts in, or `null` when the host cannot name one.
  *
  * The agent cannot run without a root, and an empty root is what disables Send — so a fresh

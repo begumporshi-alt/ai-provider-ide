@@ -63,6 +63,7 @@ pub mod memory;
 pub mod modality;
 pub mod orchestrator;
 pub mod persist;
+pub mod plan_doc;
 pub mod planner;
 pub mod pricing;
 pub mod retention;

@@ -36,6 +36,12 @@ export interface AgentTurnRequest extends TurnRequestBase {
   generateImage?: Parameters<typeof runAgentLoop>[0]["generateImage"];
   /** The skill port behind `load_skill` — the screen owns the skill store, the engine does not. */
   loadSkill?: Parameters<typeof runAgentLoop>[0]["loadSkill"];
+  /**
+   * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`: the review modal, the
+   * mode switch the gate reads, and the plan file. The screen owns all three — it holds the
+   * approval ref, the session id and the workspace root — and the loop only forwards them.
+   */
+  plan?: Parameters<typeof runAgentLoop>[0]["plan"];
   /** The sub-agent's step budget, from the user's defaults; absent means the loop's built-in. */
   subagentMaxIterations?: Parameters<typeof runAgentLoop>[0]["subagentMaxIterations"];
   /**
@@ -211,6 +217,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       host,
       generateImage: req.generateImage,
       loadSkill: req.loadSkill,
+      plan: req.plan,
       subagentMaxIterations: req.subagentMaxIterations,
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,
       // model, and budget at dispatch time.

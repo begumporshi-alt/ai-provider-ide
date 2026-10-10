@@ -383,6 +383,38 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "enter_plan_mode",
+    effect: "read",
+    description:
+      "Ask the user to switch this pass into plan mode before anything changes: for a task big, " +
+      "risky or ambiguous enough that the shape should be agreed first. In plan mode you can read, " +
+      "list, search and inspect, but every write is refused until a plan is approved. The user " +
+      "consents or declines, and their answer arrives as this tool's result. Do not call it when " +
+      "plan mode is already on, and do not use it to ask a question — questions go in your answer.",
+    parameters: { properties: {} },
+  },
+  {
+    name: "exit_plan_mode",
+    effect: "read",
+    description:
+      "Present the plan for approval — the way a planning pass ends. Pass the complete plan as " +
+      "markdown: what we are building; the files to create; the files to modify by exact path; how " +
+      "the result will be verified; and what is explicitly out of scope. The user reviews that " +
+      "text. If they approve, plan mode ends and you implement the plan in this same pass, " +
+      "starting immediately. If they ask for changes, revise the plan and call this again. Call it " +
+      "when the plan is ready — never to ask a question, and never before you have looked at the " +
+      "code the plan is about.",
+    parameters: {
+      properties: {
+        plan: {
+          type: "string",
+          description: "The complete plan, in markdown. This exact text is what the user reviews.",
+        },
+      },
+      required: ["plan"],
+    },
+  },
+  {
     name: "web_fetch",
     effect: "read",
     description:
@@ -494,13 +526,21 @@ export const AGENT_TOOLS: ToolSpec[] = [
 ];
 
 /**
- * The registry a `dispatch_agent` sub-agent runs with: the read-effect tools only, minus two.
+ * The registry a `dispatch_agent` sub-agent runs with: the read-effect tools only, minus four.
  * `dispatch_agent` itself is excluded — a sub-agent that could spawn sub-agents is recursion
  * with no bound — and `todo_write` is excluded because the sub-agent's transcript is discarded,
- * so a task list it writes would be a lie the model told itself.
+ * so a task list it writes would be a lie the model told itself. The plan-mode pair is excluded
+ * because the mode belongs to the session, not to a child whose transcript nobody sees: a
+ * sub-agent that could enter plan mode would gate the parent's writes, and one that could exit it
+ * would silently open them.
  */
 export const SUBAGENT_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
-  (t) => t.effect === "read" && t.name !== "dispatch_agent" && t.name !== "todo_write",
+  (t) =>
+    t.effect === "read" &&
+    t.name !== "dispatch_agent" &&
+    t.name !== "todo_write" &&
+    t.name !== "enter_plan_mode" &&
+    t.name !== "exit_plan_mode",
 );
 
 /**

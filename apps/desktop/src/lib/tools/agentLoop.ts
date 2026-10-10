@@ -22,7 +22,7 @@ import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { registryToOpenAI, SUBAGENT_TOOLS } from "./registry";
 import { runNotebookEdit, runNotebookRead } from "./notebook";
 import { toWireToolCalls } from "./wire";
-import type { AgentEvent, AgentLoopOptions, ToolHost } from "./types";
+import type { AgentEvent, AgentLoopOptions, PlanPorts, ToolHost } from "./types";
 
 /**
  * Ceiling on model round-trips in one agent turn. A model that will not stop calling tools
@@ -224,6 +224,111 @@ export interface AgentLoopResult {
   iterations: number;
 }
 
+/** What a plan-mode control call settles to: the sentence the model reads as the tool's result. */
+interface PlanNote {
+  text: string;
+  ok: boolean;
+}
+
+/**
+ * Settle `enter_plan_mode` / `exit_plan_mode` — the two calls whose approval is not the generic
+ * per-call gate but their own conversation with the user.
+ *
+ * They are settled in the approval phase, one at a time with every other call, and for a reason
+ * that is structural: the generic gate cannot express them. Declared `read`, `decide()` would
+ * auto-allow them under "auto-approve reads", "yolo" or a remembered grant — the review would
+ * never appear — and declared `mutate`, plan mode would refuse the very call that ends it. So the
+ * pair is intercepted before `confirm` and their outcome rides as an already-allowed verdict.
+ *
+ * The result is a sentence, not an execution: `planNotes` is checked before every execution
+ * branch below, and `persist` is the only side effect — the plan document itself.
+ *
+ * Returns null for every other tool, leaving the ordinary path untouched.
+ */
+async function settlePlanTool(
+  name: string,
+  args: Record<string, unknown>,
+  plan: PlanPorts | undefined,
+  signal: AbortSignal | undefined,
+): Promise<PlanNote | null> {
+  if (name !== "enter_plan_mode" && name !== "exit_plan_mode") return null;
+  if (!plan) {
+    return {
+      ok: false,
+      text:
+        `"${name}" needs the plan-mode approval surface, which this run does not have. Present the ` +
+        "plan in your answer instead — the user can then ask for it to be carried out.",
+    };
+  }
+
+  if (name === "enter_plan_mode") {
+    if (plan.isPlanMode()) {
+      return {
+        ok: false,
+        text:
+          "Plan mode is already on: every write is refused until a plan is approved. Investigate " +
+          "what the plan needs, then call exit_plan_mode with it.",
+      };
+    }
+    if (!(await plan.requestEntry(signal))) {
+      return { ok: true, text: "The user declined plan mode. Continue with the task as asked." };
+    }
+    // Before the text is built, not after: the model's next iteration may already be a write, and
+    // a flip that lands late is a write refused for no reason the model can see.
+    plan.setPlanMode(true);
+    return {
+      ok: true,
+      text:
+        "PLAN MODE IS ON for the rest of this pass: reading, listing, searching and inspecting run " +
+        "without asking, and every write is refused. Investigate whatever the plan needs, then call " +
+        "exit_plan_mode with the plan. Do not attempt a write.",
+    };
+  }
+
+  if (!plan.isPlanMode()) {
+    return {
+      ok: false,
+      text:
+        "exit_plan_mode is only for a pass that is in plan mode, and nothing was approved or " +
+        "changed. Continue the task; if a plan is what this needs, call enter_plan_mode first.",
+    };
+  }
+  const planText = typeof args.plan === "string" ? args.plan.trim() : "";
+  if (!planText) {
+    return {
+      ok: false,
+      text: 'exit_plan_mode needs a "plan": the complete plan, in markdown, is what the user reviews.',
+    };
+  }
+  const decision = await plan.requestApproval(planText, signal);
+  if (!decision.approved) {
+    const asked = decision.feedback?.trim();
+    return {
+      ok: true,
+      text:
+        "The user did not approve the plan yet. " +
+        (asked
+          ? `Their requested changes: ${asked}`
+          : "They closed the review without saying what to change.") +
+        " Revise the plan accordingly and call exit_plan_mode again when it is ready. Do not " +
+        "modify the workspace.",
+    };
+  }
+  // The gate opens before the file is written. Both orders are inside this awaited call, so the
+  // loop cannot observe the difference — the reason to open it first is that a `persist` that hangs
+  // or throws must not hold the mode closed after the user has already said yes.
+  plan.setPlanMode(false);
+  const path = await plan.persist(planText).catch(() => null);
+  return {
+    ok: true,
+    text:
+      "The user approved the plan." +
+      (path ? ` It is saved at ${path}.` : "") +
+      " Plan mode is off for the rest of this pass: implement the plan now, step by step, starting " +
+      "with its first step. Do not re-plan.",
+  };
+}
+
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const {
     model,
@@ -243,6 +348,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     signal,
     generateImage,
     loadSkill,
+    plan,
     runId,
     subagentRecorder,
     subagentMaxIterations,
@@ -400,10 +506,26 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     const parsed = collected.map((call) => ({ call, args: parseArgs(call.arguments) }));
 
     const verdicts: { allow: boolean; denyReason: string }[] = [];
-    for (const { call, args } of parsed) {
+    // Sparse, positional like `verdicts`: index i holds the settled sentence for a plan-mode
+    // control call, undefined for every other call.
+    const planNotes: (PlanNote | undefined)[] = [];
+    for (let i = 0; i < parsed.length; i++) {
+      const { call, args } = parsed[i]!;
       if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
       onEvent?.({ type: "tool_call", call });
       const name = call.name ?? "(unknown)";
+
+      // The plan-mode pair first, and instead of the gate: their approval is their own interaction
+      // with the user (a plan review, a mode consent), which the effect policy cannot express —
+      // see `settlePlanTool`. Settled here, in the one-at-a-time phase, so a review never parks
+      // inside the concurrent execution below and never slips past the ordering every other
+      // approval keeps.
+      const note = await settlePlanTool(name, args, plan, signal);
+      if (note) {
+        planNotes[i] = note;
+        verdicts.push({ allow: true, denyReason: "" });
+        continue;
+      }
 
       let allow = true;
       // A refusal the gate made on its own behalf (plan mode) carries its own wording. The default
@@ -458,6 +580,11 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         if (!allow) {
           resultText = denyReason;
           ok = false;
+        } else if (planNotes[i]) {
+          // A plan-mode control call: its interaction already happened in the approval phase, so
+          // there is nothing left to execute — the sentence settled there is the result.
+          resultText = planNotes[i]!.text;
+          ok = planNotes[i]!.ok;
         } else {
           try {
             // `dispatch_agent` never reaches the sandbox either: it is a nested run of THIS loop,

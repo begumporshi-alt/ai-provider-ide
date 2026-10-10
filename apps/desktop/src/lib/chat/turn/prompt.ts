@@ -45,24 +45,25 @@ export function agentSystem(root: string, custom?: string): string {
 }
 
 /**
- * Plan mode's system prompt (Phase 5).
+ * Plan mode's system prompt (Phase 5; rewritten 2026-10-10 around `exit_plan_mode`).
  *
  * The prompt is not the enforcement — the approval gate refuses every mutation itself, and would
  * refuse them even if this text were deleted. Saying it anyway is what makes the pass *useful*:
  * a model that is asked to research and is silently blocked at its first edit spends its tool
- * budget rediscovering that it cannot write, and then answers with an apology. Told up front, it
- * proposes instead.
+ * budget rediscovering that it cannot write, and then answers with an apology. Told up front —
+ * including how the pass ends — it proposes instead.
  */
 export const PLAN_MODE_SYSTEM =
-  "\n\nPLAN MODE — this pass may not modify the workspace. Every writing tool (write_file, " +
-  "edit_file, mkdir, run_command) will be refused. Use the read-only tools (read_file, list_dir, " +
-  "search_files, file_info, todo_write) to understand the task, then answer with the plan you intend to carry " +
-  "out: numbered steps, the exact files each step changes, and anything you would need to confirm. " +
-  "Do not attempt a write, and do not ask the user to apply it for you.";
-
-/** The user turn that starts the executing pass after a plan is approved. Phrased as the user's
- *  own words rather than a hidden instruction, because it is replayed in every later turn. */
-export const PLAN_APPROVED_TURN = "The plan is approved — carry it out now.";
+  "\n\nPLAN MODE — this pass exists to agree on a plan before anything changes. Reading, listing, " +
+  "searching and inspecting run without asking; every writing tool (write_file, edit_file, mkdir, " +
+  "run_command, and the rest) is refused until a plan is approved, so do not attempt one. " +
+  "Investigate whatever the plan needs first — never propose a change to code you have not read. " +
+  "When the plan is ready, call exit_plan_mode with the complete plan in markdown: what we are " +
+  "building; the files to create; the files to modify by exact path; how the result will be " +
+  "verified; and what is explicitly out of scope. The user reviews it. If they approve, plan mode " +
+  "ends and you implement the plan in this same pass, starting immediately; if they ask for " +
+  "changes, revise the plan and call exit_plan_mode again. Anything you need to ask goes in your " +
+  "answer — not in the plan.";
 
 /**
  * Guard against the mercury-2.5 failure: Assistant declares no tools, and a model handed a

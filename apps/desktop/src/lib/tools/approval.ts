@@ -76,12 +76,15 @@ export type Verdict =
   | { action: "deny"; reason: string };
 
 /** What the model is told when plan mode refuses a write. It has to say *what to do instead* —
- *  "denied" alone teaches the model to rephrase the same call and try again. */
+ *  "denied" alone teaches the model to rephrase the same call and try again — and since
+ *  2026-10-10 "instead" means the exit tool: answering with the plan as prose ends the pass with
+ *  no review, no plan file and no affordance, so the refusal names the call that ends it. */
 export function planRefusal(name: string): string {
   return (
     `Tool call "${name}" was refused: this run is in PLAN MODE, which may not modify the workspace. ` +
-    "Inspect whatever else you need with the read-only tools, then reply with the plan you intend " +
-    "to carry out — the numbered steps and the files each one touches. The user will approve it."
+    "Use the read-only tools for whatever else the plan needs, then call exit_plan_mode with the " +
+    "plan you intend to carry out — the numbered steps and the files each one touches. The user " +
+    "reviews it, and approving it ends plan mode and lets you implement it in this same pass."
   );
 }
 
