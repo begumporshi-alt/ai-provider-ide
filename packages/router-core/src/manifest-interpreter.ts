@@ -396,9 +396,128 @@ function joinThinkingParts(v: unknown): string | undefined {
   return parts.length ? parts.join("") : undefined;
 }
 
+/**
+ * Recover the prose from a parts array that arrived **serialized inside the content string**.
+ *
+ * The Rust mirror of this is `interpreter.rs::decode_serialized_parts`, which carries the full
+ * story: one provider (vice/vyceai.com) intermittently answers with its own wire format as the
+ * answer, so `content` is the STRING `[{"text":"…","type":"text"}]` and the caller sees JSON
+ * instead of prose. 5 of that provider's 59 recorded replies, 0 of the other two of the same model
+ * family. One instance is **invalid JSON** (the model left a quote unescaped inside its own text),
+ * which is why this does not stop at `JSON.parse`.
+ *
+ * Returns `undefined` when the string is not a parts wrapper — prose, and any JSON a user actually
+ * asked for, pass through untouched. The guard is the key set: a `text` field plus anything else is
+ * somebody's data, not a wrapper.
+ *
+ * Rust side: keep the two in step. They are separate implementations because they run in different
+ * engines; a divergence shows as one engine decoding what the other leaves alone.
+ */
+export function decodeSerializedParts(s: string): string | undefined {
+  const trimmed = s.trim();
+  if (!trimmed.startsWith("[{") || !trimmed.endsWith("]")) return undefined;
+
+  // Strict first: the well-formed instances, where JSON.parse does the unescaping correctly.
+  try {
+    const parsed: unknown = JSON.parse(trimmed);
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const allParts = parsed.every((item) => {
+        if (!item || typeof item !== "object" || Array.isArray(item)) return false;
+        const o = item as Record<string, unknown>;
+        if (typeof o.text !== "string") return false;
+        if (!Object.keys(o).every((k) => k === "text" || k === "type")) return false;
+        return o.type === undefined || (typeof o.type === "string" && TEXT_BLOCK_TYPES.has(o.type));
+      });
+      if (allParts) {
+        const joined = parsed.map((item) => (item as { text: string }).text).join("");
+        return joined.length ? joined : undefined;
+      }
+    }
+    return undefined;
+  } catch {
+    // Fall through to the salvage path — the reported instance lands here.
+  }
+
+  // The malformed case: `[{"text":"…"is this…?", "type":"text"}]`. The closing quote is the LAST
+  // one before the following `"type"`, not the first: the text contains unescaped quotes, and a
+  // first-quote scan would cut it short.
+  const textKey = '"text"';
+  const keyAt = trimmed.indexOf(textKey);
+  if (keyAt < 0) return undefined;
+  const afterKey = trimmed.slice(keyAt + textKey.length);
+  const colon = afterKey.indexOf(":");
+  if (colon < 0) return undefined;
+  let rest = afterKey.slice(colon + 1).trimStart();
+  if (!rest.startsWith('"')) return undefined;
+  rest = rest.slice(1);
+
+  const typeKey = '"type"';
+  const typeAt = rest.lastIndexOf(typeKey);
+  let value: string;
+  let tail = "";
+  if (typeAt >= 0) {
+    value = rest.slice(0, typeAt);
+    tail = rest.slice(typeAt + typeKey.length);
+  } else {
+    const close = rest.lastIndexOf("]");
+    if (close < 0) return undefined;
+    value = rest.slice(0, close);
+  }
+  // Trim, then the comma, then trim again, then the closing quote — the value ends `…want?",`,
+  // and stripping the comma first would fail on the trailing space and leave the quote on.
+  value = value.trimEnd();
+  if (value.endsWith(",")) value = value.slice(0, -1).trimEnd();
+  if (!value.endsWith('"')) return undefined;
+  value = value.slice(0, -1);
+
+  if (tail) {
+    const declared = tail.trimStart().replace(/^:\s*/, "");
+    if (!declared.startsWith('"')) return undefined;
+    const type = declared.slice(1).split('"')[0];
+    if (typeof type !== "string" || !TEXT_BLOCK_TYPES.has(type)) return undefined;
+  }
+
+  const text = unescapeJsonFragment(value);
+  return text.trim().length ? text : undefined;
+}
+
+/**
+ * Undo JSON escapes in a salvaged fragment — the standard short escapes plus `\uXXXX`.
+ *
+ * Only escapes are translated: a lone unescaped quote (the thing that broke the parse) stays as the
+ * quote the model meant, which is why this is not `JSON.parse`.
+ */
+function unescapeJsonFragment(s: string): string {
+  let out = "";
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (c !== "\\") {
+      out += c;
+      continue;
+    }
+    const next = s[++i];
+    if (next === undefined) {
+      out += "\\";
+      break;
+    }
+    if (next === "n") out += "\n";
+    else if (next === "t") out += "\t";
+    else if (next === "r") out += "\r";
+    else if (next === "b") out += "\b";
+    else if (next === "f") out += "\f";
+    else if (next === "u") {
+      const hex = s.slice(i + 1, i + 5);
+      i += 4;
+      const code = Number.parseInt(hex, 16);
+      out += Number.isNaN(code) ? `\\u${hex}` : String.fromCharCode(code);
+    } else out += next;
+  }
+  return out;
+}
+
 /** Join a selected value into text — a string as-is, a mixed block array by its text parts. */
 function joinTextParts(v: unknown): string | undefined {
-  if (typeof v === "string") return v;
+  if (typeof v === "string") return decodeSerializedParts(v) ?? v;
   if (!Array.isArray(v)) return undefined;
   const parts: string[] = [];
   for (const item of v) {

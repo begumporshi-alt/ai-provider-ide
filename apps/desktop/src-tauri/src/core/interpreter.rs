@@ -678,6 +678,7 @@ impl ManifestInterpreter {
                 pending: PendingCalls::new(),
                 last_usage: None,
                 finish_reason: None,
+                hold: PartsHold::Fresh,
                 end_after_emit: false,
                 finished: false,
                 flushed: false,
@@ -1023,17 +1024,26 @@ fn attempt_error_from(e: HttpError) -> AttemptError {
 /// exists because which block leads is the provider's choice — `$.content[0].text` is `undefined`
 /// on a perfectly good reasoning-model response.
 fn select_text(json: &Value, path: &str) -> Result<Option<String>, JsonPathError> {
-    const TEXT_BLOCK_TYPES: [&str; 3] = ["text", "input_text", "output_text"];
     let v = match select_one(json, path)? {
         Some(v) => v,
         None => return Ok(None),
     };
     if let Some(s) = v.as_str() {
-        return Ok(Some(s.to_string()));
+        // A string that IS a serialized parts array — see `decode_serialized_parts`.
+        return Ok(Some(decode_serialized_parts(s).unwrap_or_else(|| s.to_string())));
     }
     let Value::Array(items) = v else {
         return Ok(None);
     };
+    Ok(join_text_blocks(items))
+}
+
+/// The text-block types this dialect family uses. A block of another type (a reasoning block, an
+/// image) is not text and must not be joined into the answer.
+const TEXT_BLOCK_TYPES: [&str; 3] = ["text", "input_text", "output_text"];
+
+/// Join a real block array — the already-decoded shape (Anthropic's `content`, Gemini's `parts`).
+fn join_text_blocks(items: &[Value]) -> Option<String> {
     let mut parts: Vec<String> = Vec::new();
     for item in items.iter() {
         if let Some(s) = item.as_str() {
@@ -1051,7 +1061,225 @@ fn select_text(json: &Value, path: &str) -> Result<Option<String>, JsonPathError
             parts.push(t.to_string());
         }
     }
-    Ok(if parts.is_empty() { None } else { Some(parts.join("")) })
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(""))
+    }
+}
+
+/// Recover the prose from a parts array that arrived **serialized inside the content string**.
+///
+/// Measured bug (2026-10-07 → 2026-10-10): the provider `vice` (vyceai.com) intermittently answers
+/// with its own wire format as the answer — `choices[0].message.content` is the STRING
+/// `[{"text":"…","type":"text"}]`, escaped newlines and all — so the transcript showed JSON
+/// instead of prose. 5 of that provider's 59 recorded replies; 0 of 463 from `agent-router` and
+/// 0 of 173 from `agnes`, the same model family behind different providers. Three facts said the
+/// string came from upstream rather than from anything here: one instance is **invalid JSON** (the
+/// model left a quote unescaped inside its own text), one is pretty-printed with raw newlines, and
+/// the key order is `text` before `type` while every array this app builds is `type` first.
+/// `serde_json`/`JSON.stringify` cannot emit any of those.
+///
+/// Strict first, then a salvage path, and the salvage is the point: the instance that prompted
+/// this fix does not parse. A `from_str`-only version would have left the reported message on
+/// screen while looking like a fix.
+///
+/// Returns `None` when the string is not a parts array — ordinary prose, and any JSON the user
+/// actually asked for, pass through untouched.
+fn decode_serialized_parts(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if !trimmed.starts_with("[{") || !trimmed.ends_with(']') {
+        return None;
+    }
+    // Strict: the well-formed instances, where serde does all the unescaping correctly.
+    if let Ok(Value::Array(items)) = serde_json::from_str::<Value>(trimmed) {
+        // Every element must be a text block with nothing else on it. This is what keeps a JSON
+        // array the USER asked for (objects with a `text` field plus anything else) out of the
+        // salvage path — the alternative is silently reflowing an answer someone requested.
+        let all_parts = !items.is_empty()
+            && items.iter().all(|it| {
+                it.as_object().is_some_and(|o| {
+                    o.get("text").is_some_and(Value::is_string)
+                        && o.keys().all(|k| k == "text" || k == "type")
+                        && o.get("type")
+                            .and_then(Value::as_str)
+                            .is_none_or(|t| TEXT_BLOCK_TYPES.contains(&t))
+                })
+            });
+        if all_parts {
+            return join_text_blocks(&items);
+        }
+        return None;
+    }
+    salvage_serialized_parts(trimmed)
+}
+
+/// The malformed case: `[{"text":"…"is this…?", "type":"text"}]`.
+///
+/// The value's closing quote is found as the LAST quote before the `"type"` key that follows it —
+/// not the first — because the text itself contains unescaped quotes. That single choice is what
+/// recovers the reported message, whose text ends `…you want?` and would be cut at
+/// `…regeneration systems` by a first-quote scan.
+///
+/// Deliberately narrow: exactly the `[{"text": … , "type": …}]` shape, one element, a known
+/// text-block type. Anything else returns `None` and stays as it arrived.
+fn salvage_serialized_parts(s: &str) -> Option<String> {
+    let after_text_key = s.find("\"text\"")? + "\"text\"".len();
+    let rest = &s[after_text_key..];
+    let colon = rest.find(':')?;
+    let after_colon = rest[colon + 1..].trim_start();
+    let body = after_colon.strip_prefix('"')?;
+
+    // Where the value's closing quote is: before the `"type"` key when there is one, else before
+    // the final `]`. `rfind` because unescaped quotes inside the text are the whole problem.
+    let type_at = body.rfind("\"type\"");
+    let (value, tail) = match type_at {
+        Some(i) => (&body[..i], &body[i + "\"type\"".len()..]),
+        None => (body.strip_suffix(']')?, ""),
+    };
+    // Order matters: the value ends `…want?",` — a comma followed by whitespace. Stripping the
+    // comma first fails on the trailing space and the closing quote then never comes off, which
+    // is exactly what left the reported message undecoded on the first attempt.
+    let value = value.trim_end();
+    let value = value.strip_suffix(',').unwrap_or(value).trim_end();
+    let value = value.strip_suffix('"')?;
+
+    // The salvaged text is only trusted when the shape's tail really is a type of a text block.
+    if !tail.is_empty() {
+        let tail = tail.trim_start().trim_start_matches(':').trim_start();
+        let declared = tail.strip_prefix('"')?.split('"').next()?;
+        if !TEXT_BLOCK_TYPES.contains(&declared) {
+            return None;
+        }
+    }
+    let text = unescape_json_fragment(value);
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+/// Undo the JSON escapes in a salvaged fragment: the standard short escapes plus `\uXXXX`.
+///
+/// Only escapes are translated — a lone unescaped `"` (the very thing that broke the parse) is
+/// kept as the quote the model meant, which is the reason this is not a `from_str` call.
+fn unescape_json_fragment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some('r') => out.push('\r'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                // An unpaired surrogate or a short run: keep it literal rather than dropping the
+                // characters — this path exists to lose nothing.
+                match u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                    Some(u) => out.push(u),
+                    None => {
+                        out.push_str("\\u");
+                        out.push_str(&hex);
+                    }
+                }
+            }
+            Some(other) => out.push(other),
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Is `s` still a possible opening of a serialized parts array?
+///
+/// The streaming hold (see `PartsHold`) calls this on the first chunk. It answers "keep holding"
+/// for `[{"text":`, `[{"type":"text` and any proper prefix, and "stream normally" the moment the
+/// text goes anywhere else — so a reply that legitimately begins with a JSON array of other objects
+/// loses at most the few characters it takes to see the key's name.
+fn opens_parts_array(s: &str) -> bool {
+    let flat: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+    ["[{\"text\":", "[{\"type\":\"text"].iter().any(|ladder| {
+        (flat.len() <= ladder.len() && ladder.starts_with(&flat)) || flat.starts_with(*ladder)
+    })
+}
+
+/// A stream's hold state — see `opens_parts_array` and `decode_serialized_parts`.
+enum PartsHold {
+    /// Nothing delivered yet: the opening chunk decides.
+    Fresh,
+    /// The opening said "serialized parts array" — buffer until it completes.
+    Holding(String),
+    /// Not a parts array. Stream every chunk straight through.
+    Open,
+}
+
+impl PartsHold {
+    /// Hand `delta` onward, or hold it back when the stream is a serialized parts array.
+    ///
+    /// Never loses text: if the buffer will not decode (a truncated stream, a shape the salvage
+    /// path does not recognise), the raw text is emitted at the end rather than dropped.
+    fn step(&mut self, delta: Option<String>, end: bool) -> LineStep {
+        let Some(text) = delta else {
+            // The stream is ending with nothing new. Flush what is held, if anything.
+            if end {
+                return match std::mem::replace(self, PartsHold::Open) {
+                    PartsHold::Holding(buf) => LineStep::Chunk {
+                        text: decode_serialized_parts(&buf).unwrap_or(buf),
+                        end: true,
+                    },
+                    _ => LineStep::End,
+                };
+            }
+            return LineStep::Continue;
+        };
+
+        match std::mem::replace(self, PartsHold::Open) {
+            PartsHold::Open => LineStep::Chunk { text, end },
+            PartsHold::Fresh => {
+                if !opens_parts_array(&text) {
+                    return LineStep::Chunk { text, end };
+                }
+                match decode_serialized_parts(&text) {
+                    // The whole array arrived in one chunk.
+                    Some(decoded) => LineStep::Chunk { text: decoded, end },
+                    // Unparseable only because it is incomplete — hold it, unless this is the end,
+                    // where the raw text is the honest answer.
+                    None if end => LineStep::Chunk { text, end },
+                    None => {
+                        *self = PartsHold::Holding(text);
+                        LineStep::Continue
+                    }
+                }
+            }
+            PartsHold::Holding(mut buf) => {
+                buf.push_str(&text);
+                match decode_serialized_parts(&buf) {
+                    Some(decoded) => LineStep::Chunk { text: decoded, end },
+                    None if end => LineStep::Chunk { text: buf, end },
+                    None => {
+                        *self = PartsHold::Holding(buf);
+                        LineStep::Continue
+                    }
+                }
+            }
+        }
+    }
+
+    /// The text still held when the line stream ends without a `[DONE]` — the caller yields it as
+    /// one last item (see `poll_next`).
+    fn take_held(&mut self) -> Option<String> {
+        match std::mem::replace(self, PartsHold::Open) {
+            PartsHold::Holding(buf) => Some(decode_serialized_parts(&buf).unwrap_or(buf)),
+            _ => None,
+        }
+    }
 }
 
 fn unary_text<'a>(
@@ -1386,6 +1614,8 @@ struct TextStream<'a> {
     /// (Anthropic's `stop_reason` is top-level unary and nested under `delta` when streaming), and
     /// both feed the same declaration.
     finish_reason: Option<String>,
+    /// Holds a reply that turns out to be a serialized parts array — see `PartsHold`.
+    hold: PartsHold,
     end_after_emit: bool,
     finished: bool,
     flushed: bool,
@@ -1463,7 +1693,12 @@ impl TextStream<'_> {
         };
         let payload = after_prefix.trim_matches(is_js_whitespace);
         if payload == "[DONE]" {
-            return LineStep::End;
+            // A held reply is emitted as the final chunk rather than dropped: `[DONE]` arrives
+            // after the text, and returning `End` here would discard it.
+            return match self.hold.take_held() {
+                Some(text) => LineStep::Chunk { text, end: true },
+                None => LineStep::End,
+            };
         }
         // Noted before the parse, on purpose: a data line that is not JSON is exactly the kind of
         // evidence this exists to keep, and it is the caller that bounds the sample.
@@ -1614,11 +1849,9 @@ impl TextStream<'_> {
         // streamed request came to report zero tokens and the spend cap stayed at 0 forever.
         let end = stop || (finished && !self.plan.wants_usage);
 
-        match delta {
-            Some(text) => LineStep::Chunk { text, end },
-            None if end => LineStep::End,
-            None => LineStep::Continue,
-        }
+        // Every text delivery goes through the hold: a stream whose answer is a serialized parts
+        // array is buffered and decoded rather than shown as JSON (see `PartsHold`).
+        self.hold.step(delta, end)
     }
 }
 
@@ -1644,6 +1877,12 @@ impl Stream for TextStream<'_> {
                 // The stream ended on its own. The source's `for await` falls out of the loop and
                 // the `finally` runs.
                 Poll::Ready(None) => {
+                    // Held text first, as one last item — `flush` ends the stream, so it has to be
+                    // handed over before the `None` that follows.
+                    if let Some(text) = this.hold.take_held() {
+                        this.end_after_emit = true;
+                        return Poll::Ready(Some(Ok(text)));
+                    }
                     this.flush();
                     return Poll::Ready(None);
                 }
@@ -4081,5 +4320,177 @@ mod tests {
             "the host variable is read last, so it overwrites the caller's model"
         );
         assert_eq!(hosted["tag"], json!("from-the-host"));
+    }
+
+    /// An SSE delta frame carrying arbitrary text.
+    ///
+    /// `delta_line` interpolates its argument into a JSON string WITHOUT escaping it, so it cannot
+    /// carry the JSON-in-a-string this bug is about — the frame it builds is not valid JSON, and
+    /// the interpreter rejects the line before any text extraction runs.
+    fn delta_line_json(content: &str) -> String {
+        format!("data: {}", serde_json::json!({ "choices": [{ "delta": { "content": content } }] }))
+    }
+
+    /// The chunks' text, joined — for the cases where the point is the whole reply rather than
+    /// which chunk carried what. Panics on an error chunk, which no test below expects.
+    fn joined(out: &[Result<String, AttemptError>]) -> String {
+        out.iter()
+            .map(|chunk| chunk.as_ref().expect("no error chunk expected").as_str())
+            .collect::<String>()
+    }
+
+    // ------------------------------------------- a parts array serialized into the content string
+    //
+    // Measured bug (2026-10-07 → 2026-10-10): the provider `vice` (vyceai.com) intermittently
+    // returns its own wire format as the answer, so `content` is the STRING
+    // `[{"text":"…","type":"text"}]` and the transcript showed JSON. 5 of that provider's 59
+    // recorded replies; 0 of 463 from `agent-router` and 0 of 173 from `agnes`. The first test
+    // below is that provider's real output, byte for byte — INCLUDING the unescaped quote that
+    // makes it invalid JSON, which is what a `from_str`-only fix would have left on screen.
+
+    #[test]
+    fn decodes_a_well_formed_parts_array_serialized_into_a_string() {
+        let raw = r#"[{"text":"Hello there","type":"text"}]"#;
+        assert_eq!(decode_serialized_parts(raw).as_deref(), Some("Hello there"));
+    }
+
+    /// The reported instance: the model left a quote inside its own text unescaped, so the string
+    /// is not valid JSON. The salvage path must still recover the prose — and must recover ALL of
+    /// it, which is why the closing quote is the last one before `"type"` rather than the first.
+    #[test]
+    fn decodes_the_malformed_parts_array_that_prompted_the_fix() {
+        let raw = r#"[{"text":"Excellent! Building a 3D world is doable. Let me outline a plan:\n\n## The Silent Earth\n\nSince we're exploring a world without humans, I'll create a post-human Earth ecosystem.\n\n- Natural growth/regeneration systems"is this direction you want?", "type":"text"}]"#;
+        let out = decode_serialized_parts(raw).expect("the salvage path must recover this");
+        assert!(out.starts_with("Excellent! Building a 3D world is doable."), "got: {out}");
+        // The text was NOT cut at the stray quote — that is the whole point of the rfind.
+        assert!(out.contains("regeneration systems\"is this direction you want?"), "got: {out}");
+        assert!(!out.contains("\"type\""), "the wrapper must not survive: {out}");
+        assert!(out.contains('\n'), "escaped newlines are unescaped, not left literal");
+        assert!(!out.contains("\\n"), "the literal backslash-n must be gone: {out}");
+    }
+
+    /// A pretty-printed variant seen in the same provider's history — raw newlines and indentation,
+    /// which no serializer in this repo emits.
+    #[test]
+    fn decodes_a_pretty_printed_parts_array() {
+        let raw = "[{\n  \"text\": \"Absolutely!\",\n  \"type\": \"text\"\n}]";
+        assert_eq!(decode_serialized_parts(raw).as_deref(), Some("Absolutely!"));
+    }
+
+    /// `type` first — the order every array in this app is built with, so the decoder cannot be
+    /// relying on the one order the leaking provider happens to use.
+    #[test]
+    fn decodes_a_parts_array_with_type_first() {
+        let raw = r#"[{"type":"text","text":"type-first works"}]"#;
+        assert_eq!(decode_serialized_parts(raw).as_deref(), Some("type-first works"));
+    }
+
+    /// Ordinary prose, and JSON the user actually asked for, must pass through untouched. The
+    /// guard is the shape's own key set: a `text` field plus anything else is somebody's data, not
+    /// a wrapper.
+    #[test]
+    fn leaves_everything_that_is_not_a_parts_wrapper_alone() {
+        for raw in [
+            "Just prose. No JSON here.",
+            "A list: [1, 2, 3]",
+            r#"[{"id":1,"text":"a user's own JSON"}]"#,
+            r#"[{"text":"no type, but an extra key","id":7}]"#,
+            r#"[{"type":"image","text":"not a text block"}]"#,
+            r#"[{"text":"unterminated""#,
+            "",
+        ] {
+            assert_eq!(decode_serialized_parts(raw), None, "must not rewrite: {raw}");
+        }
+    }
+
+    /// The unary path: a provider that wraps its answer reaches the caller as prose.
+    #[tokio::test]
+    async fn a_unary_reply_wrapped_in_a_parts_array_arrives_as_prose() {
+        let manifest = openai_manifest();
+        let body = r#"{"choices":[{"message":{"content":"[{\"text\":\"Hello there\",\"type\":\"text\"}]"}}]}"#;
+        let http = FakeHttp::new(vec![Scripted::text(200, body)]);
+        let interp = interpreter(&manifest, http);
+        // `text_args` streams by default; a `Scripted::text` body is not SSE, so this test has to
+        // ask for the unary read it is actually about.
+        let mut args = text_args("m");
+        args.stream = false;
+
+        let out = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+        assert_eq!(out, vec![Ok("Hello there".to_string())]);
+    }
+
+    /// The streaming path, which is the one the Assistant actually uses: the array arrives split
+    /// across deltas. Nothing may be emitted while it is held, and the prose must arrive whole —
+    /// a per-delta decode cannot work here, which is why the hold exists.
+    #[tokio::test]
+    async fn a_streamed_reply_wrapped_in_a_parts_array_never_shows_the_json() {
+        let mut manifest = openai_manifest();
+        manifest["endpoints"]["generateText"]["stream"]["requestUsage"] = json!(false);
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line_json("[{\"text\":\"Hello"),
+            &delta_line_json(" there\",\"type\":\"text\"}]"),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ])]);
+        let interp = interpreter(&manifest, http);
+
+        let out =
+            drain(interp.generate_text("key:k1", text_args("m"), &Cancel::new()).await.unwrap())
+                .await;
+
+        assert_eq!(out, vec![Ok("Hello there".to_string())], "held, then decoded whole");
+    }
+
+    /// A reply that legitimately begins with a JSON array of OTHER objects streams normally — the
+    /// hold releases the moment the opening stops looking like a parts wrapper.
+    #[tokio::test]
+    async fn a_reply_that_merely_starts_with_brackets_still_streams() {
+        let mut manifest = openai_manifest();
+        manifest["endpoints"]["generateText"]["stream"]["requestUsage"] = json!(false);
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line_json("[{\"id\":1,"),
+            &delta_line_json("\"name\":\"a\"}]"),
+            r#"data: {"choices":[{"delta":{},"finish_reason":"stop"}]}"#,
+        ])]);
+        let interp = interpreter(&manifest, http);
+
+        let out =
+            drain(interp.generate_text("key:k1", text_args("m"), &Cancel::new()).await.unwrap())
+                .await;
+
+        // Chunk per delta, in order, unmodified — the ordinary path.
+        assert!(out.len() >= 2, "must stream progressively, got {out:?}");
+        assert_eq!(joined(&out), "[{\"id\":1,\"name\":\"a\"}]");
+    }
+
+    /// The hold is not allowed to swallow text when a stream ends without `[DONE]` — the provider
+    /// that leaks is also the kind that hangs up. The buffer is decoded and handed over.
+    #[tokio::test]
+    async fn a_held_reply_is_still_delivered_when_the_stream_ends_without_done() {
+        let mut manifest = openai_manifest();
+        manifest["endpoints"]["generateText"]["stream"]["requestUsage"] = json!(false);
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            &delta_line("no marker"),
+            &delta_line_json("[{\"text\":\"held text\",\"type\":\"text\"}]"),
+            // No [DONE]: the line stream simply ends.
+        ])]);
+        let interp = interpreter(&manifest, http);
+
+        let out =
+            drain(interp.generate_text("key:k1", text_args("m"), &Cancel::new()).await.unwrap())
+                .await;
+
+        assert_eq!(joined(&out), "no markerheld text");
+    }
+
+    /// The guard that decides whether to hold at all: prefixes of a wrapper keep holding, and the
+    /// first character that rules it out releases immediately.
+    #[test]
+    fn the_hold_trigger_recognises_only_wrapper_openings() {
+        for opening in ["[", "[{", "[{\"te", "[{\"text\":", "[{\"text\":\"x", "[{\"type\":\"text"] {
+            assert!(opens_parts_array(opening), "should hold: {opening}");
+        }
+        for other in ["Hello", "[1, 2", "[{\"id\"", "[{\"name\":", "[]"] {
+            assert!(!opens_parts_array(other), "should stream: {other}");
+        }
     }
 }
