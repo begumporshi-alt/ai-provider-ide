@@ -84,6 +84,9 @@ export interface AgentSystemParts {
   custom?: string;
   /** The skills block the screen appends verbatim (already newline-prefixed when non-empty). */
   skillsBlock: string;
+  /** The session-references block, same convention as `skillsBlock` (see lib/chat/turn/
+   *  session-references). The conversation's source links, listed so every reply can prefer them. */
+  referencesBlock?: string;
   /** The recalled-memory text for this turn, empty when memory is off or nothing recalled. */
   recalledMemory?: string;
   planMode?: boolean;
@@ -100,6 +103,7 @@ export function buildAgentSystem(parts: AgentSystemParts): string {
   return (
     agentSystem(parts.root, parts.custom) +
     parts.skillsBlock +
+    (parts.referencesBlock ?? "") +
     (parts.recalledMemory ? `\n\n${parts.recalledMemory}` : "") +
     (parts.planMode ? PLAN_MODE_SYSTEM : "") +
     (parts.perTurn ? `\n\n${parts.perTurn}` : "")

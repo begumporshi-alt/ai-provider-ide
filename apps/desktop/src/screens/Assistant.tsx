@@ -57,6 +57,8 @@ import { PlanModeEntryModal, PlanReviewModal } from "../components/PlanReviewMod
 import { ChangeSetReview } from "../components/ChangeSetReview";
 import { AssistantCapsule, type TodoItem } from "../components/AssistantCapsule";
 import { SubagentsDrawer } from "../components/RunsDrawer";
+import { SessionSkillsDrawer } from "../components/SessionSkillsDrawer";
+import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
 import {
   fileChangeFor,
@@ -92,6 +94,20 @@ import {
   agentSystem, AGENT_SYSTEM, NO_TOOLS_SYSTEM,
 } from "../lib/chat/turn/prompt";
 import { tryParseArgs } from "../lib/chat/turn/graph-record";
+import {
+  filterSessionSkills,
+  recordSkillUse,
+  resolveSessionSkill,
+  skillsIndexBlock,
+  type SkillOverride,
+  type UsedSkill,
+} from "../lib/chat/turn/session-skills";
+import {
+  addReferences,
+  referencesBlock,
+  refsFromMessages,
+  type SessionReference,
+} from "../lib/chat/turn/session-references";
 import { runPlainTurn } from "../lib/chat/turn/plain-turn";
 import { runAgentTurn } from "../lib/chat/turn/agent-turn";
 import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
@@ -1613,19 +1629,42 @@ function Chat({
   // context tax paid on every call, growing with every install. Re-read on every tick so
   // installing or revoking a skill changes the index without restarting the app.
   const [skillsBlock, setSkillsBlock] = useState("");
+  // The session-visibility layer over the installed catalog (lib/chat/turn/session-skills): the
+  // Skills screen's flag stays global, this map is what THIS conversation sees — off a skill the
+  // rest of the app still offers, or back on one it disabled. Session-scoped like `todos`: a New
+  // chat or a resume starts from the global flags.
+  const [skillOverrides, setSkillOverrides] = useState<SkillOverride>({});
+  // The ref mirrors it for the `load_skill` port, which runs from the turn's async closure and
+  // would otherwise read the overrides of the render that sent the message (the same rule as
+  // `timelineRef`).
+  const skillOverridesRef = useRef(skillOverrides);
+  skillOverridesRef.current = skillOverrides;
+  // The skills the model actually fetched through `load_skill` in this conversation — the used
+  // log the session-skills drawer renders. First-load timestamps, one row per skill.
+  const [usedSkills, setUsedSkills] = useState<UsedSkill[]>([]);
+  // Session references (lib/chat/turn/session-references): the source links this conversation
+  // has gathered. The transcript-derived half rebuilds itself — including on resume, where the
+  // restored turns are re-scanned — so it is a fact of the conversation, not live-only state.
+  // `manualRefs` is what the user pinned by hand, and `dismissedUrls` what they removed (a scan
+  // would otherwise resurrect a dismissed link on the next transcript change).
+  const [manualRefs, setManualRefs] = useState<SessionReference[]>([]);
+  const [dismissedUrls, setDismissedUrls] = useState<ReadonlySet<string>>(new Set());
+  const autoRefs = useMemo(() => refsFromMessages(msgs), [msgs]);
+  const sessionRefs = useMemo(
+    () => addReferences(autoRefs, manualRefs).filter((r) => !dismissedUrls.has(r.url)),
+    [autoRefs, manualRefs, dismissedUrls],
+  );
+  // The block every reply's system turn carries, plain and agent paths alike: a link pasted in
+  // turn one is still the session's source in turn ten.
+  const referencesBlockText = useMemo(() => referencesBlock(sessionRefs), [sessionRefs]);
   useEffect(() => {
     listSkills()
       .then((all) => {
-        const active = all.filter((s) => s.enabled);
-        setSkillsBlock(
-          active.length === 0
-            ? ""
-            : "\n\nInstalled skills — when the task matches one, load it with the load_skill tool and follow its procedure:\n\n"
-              + active.map((s) => `- ${s.name}: ${s.description}`).join("\n"),
-        );
+        const active = filterSessionSkills(all, skillOverrides);
+        setSkillsBlock(skillsIndexBlock(active));
       })
       .catch(() => undefined);
-  }, [tick]);
+  }, [tick, skillOverrides]);
 
   // P7: aggregate session cost/tokens from the usage the turns themselves report.
   //
@@ -1806,10 +1845,10 @@ function Chat({
   const currentPromptTokens = useMemo(() => {
     if (!draftText.trim() && msgs.length === 0) return 0;
     const base = agentMode
-      ? agentSystem(root, agentSystemPrompt) + skillsBlock
+      ? agentSystem(root, agentSystemPrompt) + skillsBlock + referencesBlockText
       : noTools
-        ? (noToolsSystem || NO_TOOLS_SYSTEM)
-        : (systemPrompt ?? "");
+        ? (noToolsSystem || NO_TOOLS_SYSTEM) + referencesBlockText
+        : (systemPrompt ?? "") + referencesBlockText;
     // Counted because it is a system message of its own on both send paths; a meter that ignored a
     // constraint the user just set would be wrong at exactly the moment they are watching it.
     const perTurn = instructionSystemText(turnInstruction);
@@ -1820,7 +1859,7 @@ function Chat({
       ...(draftText.trim() ? [{ role: "user" as const, content: draftText }] : []),
     ];
     return estimateTokens(all);
-  }, [msgs, draftText, turnInstruction, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, noToolsSystem, systemPrompt]);
+  }, [msgs, draftText, turnInstruction, tick, agentMode, noTools, root, agentSystemPrompt, skillsBlock, referencesBlockText, noToolsSystem, systemPrompt]);
   // P7: context meter — fraction of the window consumed, or `null` when no carrier published a
   // window. A bar scaled to a number the catalog never claimed would be the same invention in a
   // different shape.
@@ -2106,6 +2145,10 @@ function Chat({
       ...(imagesReadBy ? { imagesReadBy } : {}),
     };
     const assistantMsg: Msg = { id: newMsgId(), role: "assistant", content: "" };
+    // This turn's own links are folded into the references here: the derived list was computed
+    // from the pre-send transcript, so the reply that introduces a source is exactly the reply
+    // that would otherwise not read it. First origin wins — a URL the user pasted stays theirs.
+    const turnReferencesBlock = referencesBlock(addReferences(sessionRefs, refsFromMessages([userMsg])));
     setMsgs([...baseMsgs, userMsg, assistantMsg]);
     // A send, retry or edit is a deliberate action: re-anchor to the bottom even if the user had
     // scrolled up, so the reply they just asked for is what they see arrive.
@@ -2166,6 +2209,7 @@ function Chat({
           root,
           customAgentPrompt: agentSystemPrompt,
           skillsBlock,
+          referencesBlock: turnReferencesBlock,
           // The ref's value, not the state's: see the capture above `if (agentMode)`.
           planMode: planPass,
           // The plan-mode facilities: the review modal, the mode switch the gate reads, and the
@@ -2190,12 +2234,16 @@ function Chat({
           })(),
           controller: ac,
           confirm: (call, args) => turn.confirm(call, args),
-          // The skill port for load_skill: name or slug must match an ENABLED skill — a disabled
-          // one is not available to the run, and saying so beats serving stale instructions.
+          // The skill port for load_skill: name or slug must resolve among the skills THIS
+          // conversation can see — the session overrides first, then the global flag (the same
+          // rule the prompt's skills block used to index them). A skill the session turned off is
+          // not available to the run, and saying so beats serving stale instructions.
           loadSkill: async (name) => {
             const all = await listSkills().catch(() => [] as Skill[]);
-            const hit = all.find((s) => s.enabled && (s.name === name || s.slug === name));
-            return hit ? hit.body : null;
+            const hit = resolveSessionSkill(all, skillOverridesRef.current, name);
+            if (!hit) return null;
+            setUsedSkills((u) => recordSkillUse(u, hit, Date.now()));
+            return hit.body;
           },
           // The enabled dispatch_agent specialists, read straight from the definition files at
           // send time — the same read-late rule as loadSkill, so a definition the user just
@@ -2284,7 +2332,14 @@ function Chat({
         model: chosen,
         perTurn,
         useMemory,
-        systemPromptText: noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt,
+        // The references block rides the system turn here too — a session's sources are not an
+        // agent-mode feature. `undefined` when both halves are empty, which keeps the blank
+        // editor's "no system turn at all" third state intact.
+        systemPromptText: (() => {
+          const base = (noTools ? (noToolsSystem || NO_TOOLS_SYSTEM) : systemPrompt) ?? "";
+          const full = base + turnReferencesBlock;
+          return full.trim() ? full : undefined;
+        })(),
         // The run-config inputs are `number | ""` (blank = provider default); the engine's
         // request type wants `undefined` for absent, so the guard moves to the call site.
         temperature: typeof temperature === "number" ? temperature : undefined,
@@ -2418,6 +2473,9 @@ function Chat({
     setMsgs(prefix);
     setTrace(null);
     setFinishReason(undefined);
+    // The fork is a new session, so the used log restarts — but the overrides stay: it is the
+    // same conversation continuing, and the user's curation of its toolset should carry.
+    setUsedSkills([]);
   }
 
   // ---- Phase 4: session bar -------------------------------------------------------------
@@ -2463,6 +2521,14 @@ function Chat({
         lastNodeRef.current = null;
         setSessionId(rec.sessionId);
         setMsgs(withIds(resumed as Omit<Msg, "id">[]));
+        // A fresh conversation view: the used log belongs to the live thread, and the overrides
+        // were a decision about the conversation that was on screen, not about this one. The
+        // references' transcript-derived half rebuilds from the restored turns on its own — only
+        // the curated halves (pinned, dismissed) are this view's state.
+        setSkillOverrides({});
+        setUsedSkills([]);
+        setManualRefs([]);
+        setDismissedUrls(new Set());
       } catch {
         return; // same policy as openSession: an unreadable session is not an error wall
       }
@@ -2511,6 +2577,14 @@ function Chat({
     setEditDraft("");
     setSessionTitle("");
     setSwitcherOpen(false);
+    // Session-scoped skill state resets with the conversation, like `todos` above: a new chat
+    // sees the global flags again and has loaded nothing.
+    setSkillOverrides({});
+    setUsedSkills([]);
+    // Same for references: the transcript-derived half empties with `msgs`; the curated halves
+    // reset here.
+    setManualRefs([]);
+    setDismissedUrls(new Set());
     useUi.getState().setResumeSessionId(undefined);
   }
 
@@ -2545,6 +2619,12 @@ function Chat({
     setTrace(null);
     setFinishReason(undefined);
     setEditingId(null);
+    // Session-scoped skill state resets with the conversation — same rule as `newChat`: the
+    // overrides were about the previous thread, the used log belongs to the live one.
+    setSkillOverrides({});
+    setUsedSkills([]);
+    setManualRefs([]);
+    setDismissedUrls(new Set());
     // The session keeps its own name — it IS that session, not a copy. `titleLoadedFor` is
     // stamped so the async list refresh cannot adopt a stale value over it.
     titleLoadedFor.current = sid;
@@ -2823,6 +2903,26 @@ function Chat({
         {/* The subagents drawer: delegated runs only, live, pinned to the transcript's right
             edge. Mounted only in the Chat tab — the Image and Root tabs have no runs to watch. */}
         <SubagentsDrawer />
+        {/* The session-skills drawer: what this conversation's turns can reach through
+            load_skill, and what they already did. Its state is session-scoped and held by this
+            component — the drawer itself is only the view, the same split as `todos`. */}
+        <SessionSkillsDrawer
+          overrides={skillOverrides}
+          used={usedSkills}
+          onToggle={(slug, next) => setSkillOverrides((o) => ({ ...o, [slug]: next }))}
+          onResetOverrides={() => setSkillOverrides({})}
+        />
+        {/* The session-references drawer: the conversation's source links, derived from the
+            transcript and curated here. Removal of a derived link is a dismissal, so the scan
+            cannot resurrect it. */}
+        <SessionReferencesDrawer
+          refs={sessionRefs}
+          onAdd={(url) => setManualRefs((m) => addReferences(m, [{ url, origin: "manual" }]))}
+          onRemove={(url) => {
+            setManualRefs((m) => m.filter((r) => r.url !== url));
+            setDismissedUrls((d) => new Set(d).add(url));
+          }}
+        />
         <div
           ref={listRef}
           onScroll={onListScroll}

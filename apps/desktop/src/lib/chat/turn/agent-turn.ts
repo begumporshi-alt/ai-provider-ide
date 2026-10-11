@@ -22,6 +22,8 @@ export interface AgentTurnRequest extends TurnRequestBase {
   root: string;
   customAgentPrompt?: string;
   skillsBlock: string;
+  /** The session's source links, newline-prefixed; empty adds nothing (see session-references). */
+  referencesBlock?: string;
   planMode: boolean;
   temperature?: number;
   maxTokens?: number;
@@ -156,7 +158,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // The per-turn instruction goes last: it is the most specific thing in the prompt, and it is
       // a system message rather than a line in the user's text so the model can tell a constraint
       // the user set from a sentence the user wrote.
-      system: buildAgentSystem({ root: req.root, custom: req.customAgentPrompt, skillsBlock: req.skillsBlock, recalledMemory: ports.memory.block(recalled), planMode: req.planMode, perTurn: req.perTurn }),
+      system: buildAgentSystem({ root: req.root, custom: req.customAgentPrompt, skillsBlock: req.skillsBlock, referencesBlock: req.referencesBlock, recalledMemory: ports.memory.block(recalled), planMode: req.planMode, perTurn: req.perTurn }),
       // MCP tools join the builtin registry when servers are configured and reachable; failure
       // or no configuration collapses to exactly the builtin set. The fetch is cached briefly
       // Rust-side connections stay live, so the common case is one cheap re-list per turn.

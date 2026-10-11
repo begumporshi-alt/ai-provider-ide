@@ -48,6 +48,25 @@ describe("buildAgentSystem", () => {
     expect(PLAN_MODE_SYSTEM).toContain("exit_plan_mode");
     expect(PLAN_MODE_SYSTEM).toContain("same pass");
   });
+
+  it("appends the session-references block after skills and before memory", () => {
+    const out = buildAgentSystem({
+      root: "",
+      skillsBlock: "\n\n## skill one",
+      referencesBlock: "\n\nReferences gathered in this session",
+      recalledMemory: "remembered fact",
+    });
+    expect(out).toContain("References gathered in this session");
+    expect(out.indexOf("## skill one")).toBeLessThan(out.indexOf("References gathered"));
+    expect(out.indexOf("References gathered")).toBeLessThan(out.indexOf("remembered fact"));
+  });
+
+  it("adds nothing for the references block when it is absent or empty", () => {
+    const without = buildAgentSystem({ root: "", skillsBlock: "" });
+    expect(without).not.toContain("References gathered");
+    const empty = buildAgentSystem({ root: "", skillsBlock: "", referencesBlock: "" });
+    expect(empty).toBe(without);
+  });
 });
 
 describe("buildPlainRequestMessages", () => {
