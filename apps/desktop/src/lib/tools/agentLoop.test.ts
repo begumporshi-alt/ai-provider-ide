@@ -1123,6 +1123,75 @@ describe("runAgentLoop", () => {
     expect(systems.join("\n")).not.toContain("PLAN MODE IS NOW OFF");
   });
 
+  it("tells the model when the mode was switched ON mid-pass", async () => {
+    // The mirror of the reported bug: a pass that started OUTSIDE plan mode and whose user then
+    // switched it on. The system turn never had plan framing, so without this the model only
+    // discovers the mode when a write is refused — it spends an iteration learning what the
+    // request could have said.
+    const systems: string[] = [];
+    const model: GenerateFn = async (req) => {
+      const first = req.messages?.[0];
+      systems.push(first && first.role === "system" ? String(first.content) : "");
+      return streamOf("ok");
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "ok" }; } },
+      system: "BASE",
+      plan: {
+        isPlanMode: () => true,
+        startedInPlanMode: () => false,
+        setPlanMode: () => undefined,
+        requestApproval: async () => ({ approved: false }),
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(systems.join("\n")).toContain("PLAN MODE IS NOW ON");
+    expect(systems.join("\n")).toContain("every write is refused");
+    // Not the approval note: nothing was approved, and a model told "implement the plan" here
+    // would implement a plan that does not exist.
+    expect(systems.join("\n")).not.toContain("approved the plan this pass presented");
+  });
+
+  it("does not tell the model a plan was approved when the user only switched the mode off", async () => {
+    // Reachable: the switch is a control the user owns, and flipping it off mid-pass takes the
+    // gate off without any review. Claiming an approval there would send the model off to
+    // implement something that was never agreed.
+    const systems: string[] = [];
+    const model: GenerateFn = async (req) => {
+      const first = req.messages?.[0];
+      systems.push(first && first.role === "system" ? String(first.content) : "");
+      return streamOf("ok");
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "ok" }; } },
+      system: "BASE\n\nPLAN MODE — do not attempt a write.",
+      plan: {
+        isPlanMode: () => false,
+        startedInPlanMode: () => true,
+        setPlanMode: () => undefined,
+        requestApproval: async () => ({ approved: true }),
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(systems.join("\n")).toContain("PLAN MODE IS NOW OFF");
+    expect(systems.join("\n")).toContain("the user switched it off");
+    expect(systems.join("\n")).not.toContain("approved the plan this pass presented");
+  });
+
   it("keeps a plan call aligned with its neighbours in one batch, and opens the gate in time", async () => {
     // The index alignment (`planNotes[i]` / `verdicts[i]` / `ids[i]`) is hand-maintained and every
     // other test here emits one call per batch — so this one mixes the pair with an ordinary call,

@@ -228,6 +228,8 @@ export interface AgentLoopResult {
 interface PlanNote {
   text: string;
   ok: boolean;
+  /** The plan was approved by this call: plan mode is now off, and the user said yes. */
+  planApproved?: boolean;
 }
 
 /**
@@ -321,6 +323,7 @@ async function settlePlanTool(
   const path = await plan.persist(planText).catch(() => null);
   return {
     ok: true,
+    planApproved: true,
     text:
       "The user approved the plan." +
       (path ? ` It is saved at ${path}.` : "") +
@@ -330,22 +333,38 @@ async function settlePlanTool(
 }
 
 /**
- * What the model is told, per request, once this pass's plan-mode framing has gone stale — the
- * plan was approved, or the user switched the mode off mid-run.
+ * What the model is told, per request, when the live plan mode no longer matches the framing the
+ * pass started with.
  *
- * Appended rather than substituted, because the system turn is composed by the caller and the loop
- * cannot know which paragraph of it was the plan framing. It says what it supersedes, because the
- * alternative is a model holding two contradictory instructions and picking the wrong one — which
- * is exactly the failure measured on 2026-10-10: after an approved `exit_plan_mode`, every
- * remaining iteration of the pass still carried "PLAN MODE — do not attempt a write", so a
- * compliant model answered that it could not implement the plan the user had just approved. The
- * browser suite could never have caught it: the test oracle never reads the system turn.
+ * The system turn is composed once by the caller and cannot be rebuilt mid-run, so a mode change
+ * inside a pass has to be stated in the request instead. Appended rather than substituted — the
+ * loop cannot know which paragraph of a caller-composed system turn was the plan framing — so each
+ * note names what it supersedes. The alternative is a model holding two contradictory instructions
+ * and picking the wrong one, which is the failure measured on 2026-10-10: after an approved
+ * `exit_plan_mode`, every remaining iteration still carried "PLAN MODE — do not attempt a write",
+ * so a compliant model answered that it could not implement the plan the user had just approved.
+ * The browser suite could never have caught it: the test oracle never reads the system turn.
+ *
+ * Three notes, because the exits mean different things and one sentence cannot be true for all of
+ * them: a plan the user approved is a mandate to implement, a mode the user switched off is
+ * permission to continue, and a mode switched ON mid-pass is a constraint to respect.
  */
-const PLAN_MODE_OFF_NOTE =
+const PLAN_MODE_APPROVED_NOTE =
   "PLAN MODE IS NOW OFF — the user reviewed and approved the plan this pass presented, so any " +
   "instruction above telling you not to write, or that every writing tool is refused, is " +
   "superseded: the writing tools are available now. Implement the plan in this same pass, starting " +
   "with its first step, and do not re-plan.";
+
+const PLAN_MODE_OFF_NOTE =
+  "PLAN MODE IS NOW OFF — the user switched it off during this pass, so any instruction above " +
+  "telling you not to write, or that every writing tool is refused, is superseded: the writing " +
+  "tools are available now. Continue the task.";
+
+const PLAN_MODE_ON_NOTE =
+  "PLAN MODE IS NOW ON — the user switched it on during this pass, after it had started. It means " +
+  "what it always means: reading, listing, searching and inspecting run without asking, and every " +
+  "write is refused until a plan is approved. Investigate whatever the plan needs, then call " +
+  "exit_plan_mode with the plan; do not attempt a write.";
 
 /**
  * The workspace-relative path of the plan a settled `exit_plan_mode` saved, or null.
@@ -413,6 +432,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // Set once the NO_OUTPUT fallback has fired: every attempt afterwards asks for thinking off,
   // so the knob's level never re-arms mid-turn.
   let forceNoReasoning = false;
+  // Whether the user approved the plan this pass presented. Decides WHICH correction the system
+  // turn carries once the mode is off — "the user approved it, implement it" is a different
+  // instruction from "the user switched the mode off, carry on".
+  let planApprovedThisPass = false;
 
   for (let iter = 1; maxIterations === null || iter <= maxIterations; iter++) {
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
@@ -424,12 +447,24 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) && nudgesSent < TOOL_CALL_NUDGE_MAX;
     // The pass's system turn is frozen, so its plan framing has to be corrected in the request
     // rather than rebuilt — see `PLAN_MODE_OFF_NOTE`. Read live: the mode can go off mid-iteration.
-    const supersedePlanFraming = Boolean(plan && plan.startedInPlanMode() && !plan.isPlanMode());
-    const systemForThisRequest = !opts.system && !dueForNudge && !supersedePlanFraming
+    // The pass's system turn is frozen, so a mode change inside the pass has to be corrected in the
+    // request rather than rebuilt — see the PLAN_MODE_*_NOTE constants. Read live, per iteration:
+    // the mode can change between any two round-trips, and it does so in both directions.
+    const startedInPlan = Boolean(plan?.startedInPlanMode());
+    const inPlanNow = Boolean(plan?.isPlanMode());
+    const planFramingNote =
+      inPlanNow === startedInPlan
+        ? ""
+        : inPlanNow
+          ? PLAN_MODE_ON_NOTE
+          : planApprovedThisPass
+            ? PLAN_MODE_APPROVED_NOTE
+            : PLAN_MODE_OFF_NOTE;
+    const systemForThisRequest = !opts.system && !dueForNudge && !planFramingNote
       ? ""
       : [
           opts.system,
-          supersedePlanFraming ? PLAN_MODE_OFF_NOTE : "",
+          planFramingNote,
           dueForNudge ? nudgeText(toolCallsThisTurn) : "",
         ]
           .filter(Boolean)
@@ -569,6 +604,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       const note = await settlePlanTool(name, args, plan, signal);
       if (note) {
         planNotes[i] = note;
+        // Remembered for the rest of the pass: the system-turn correction distinguishes an approved
+        // plan ("implement it") from a mode the user simply switched off ("carry on").
+        if (note.planApproved) planApprovedThisPass = true;
         verdicts.push({ allow: true, denyReason: "" });
         continue;
       }

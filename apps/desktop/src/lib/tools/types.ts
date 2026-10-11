@@ -94,12 +94,12 @@ export interface PlanPorts {
   /**
    * Whether this run STARTED with plan-mode framing in its system turn (the screen's `planPass`).
    *
-   * The system turn is built once per pass and cannot be rebuilt mid-run, so once the mode goes
-   * off the original framing is stale — and it outranks everything: a model told "PLAN MODE — do
-   * not attempt a write" obeys that even when the tool result says the plan was approved. The loop
-   * pairs this with `isPlanMode()` to append the correction that supersedes it (see
-   * `PLAN_MODE_OFF_NOTE` in agentLoop.ts). It covers both exits — an approved `exit_plan_mode` and
-   * the user switching the mode off mid-run.
+   * The system turn is built once per pass and cannot be rebuilt mid-run, so the loop compares this
+   * with the live `isPlanMode()` and states the difference in every request it sends — a mode that
+   * changed inside a pass is otherwise invisible to the model, or worse, contradicted by a stale
+   * paragraph. It covers both directions: an approved `exit_plan_mode` or the user switching the
+   * mode off (the framing must be superseded), and the user switching it on mid-pass (the framing
+   * was never there and must be supplied). See the `PLAN_MODE_*_NOTE` constants in agentLoop.ts.
    */
   startedInPlanMode: () => boolean;
   /**
