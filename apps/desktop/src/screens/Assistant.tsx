@@ -1530,6 +1530,11 @@ function Chat({
   } | null>(null);
   const [pendingPlanEntry, setPendingPlanEntry] = useState<{ resolve: (ok: boolean) => void } | null>(null);
   /**
+   * Whether the pass in flight started in plan mode. A ref, not state: the loop's correction for a
+   * stale plan framing is computed per request inside the run, and the state value lags the flip.
+   */
+  const passStartedInPlanModeRef = useRef(false);
+  /**
    * P5: the trust the user has granted from the approval modal — this tool, or everything.
    *
    * Session-scoped and held here rather than in `AssistantScreen`: it is a decision about *this*
@@ -1948,6 +1953,9 @@ function Chat({
    */
   const planPorts: PlanPorts = {
     isPlanMode: () => approvalRef.current.planMode,
+    // The pass's own starting mode, captured in `runTurn` — the loop needs it to know whether the
+    // system turn it was handed contains plan framing that may now be stale.
+    startedInPlanMode: () => passStartedInPlanModeRef.current,
     setPlanMode: (on) => {
       approvalRef.current = { ...approvalRef.current, planMode: on };
       onPlanModeChange(on);
@@ -2124,6 +2132,10 @@ function Chat({
     // model calls `exit_plan_mode` — ticking the switch and sending in one gesture leaves the state
     // one render behind, which is exactly the pass that must still be told it is planning.
     const planPass = agentMode && approvalRef.current.planMode;
+    // Remembered for the whole pass: the loop appends its plan-framing correction only when a pass
+    // that STARTED in plan mode no longer is (`startedInPlanMode`/`isPlanMode`), and the state it
+    // would otherwise read is one render behind the flip it is correcting.
+    passStartedInPlanModeRef.current = planPass;
 
     // ---- Agent mode: run the loop, execute tools through the sandbox, confirm each call. ----
     if (agentMode) {
@@ -2133,6 +2145,8 @@ function Chat({
         setTrace({ ms: 0, fallbacks: [], error: "set a workspace root before using agent mode" });
         setBusy(false);
         setStopping(false);
+        // The turn never ran, so there is no pass whose framing could go stale.
+        passStartedInPlanModeRef.current = false;
         turn.finish();
         return;
       }

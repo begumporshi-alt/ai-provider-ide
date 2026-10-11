@@ -212,6 +212,13 @@ test("plan mode refuses a write, then presents the plan for review — no canned
   expect(paths).toHaveLength(1);
   expect(paths[0]).toMatch(/^\.zcode\/plans\/plan-.+\.md$/);
   expect(plans[paths[0]!]).toContain("Subagent System Upgrade — Two Phases");
+
+  // And approving switched plan mode off in the UI, not only in the gate. Both halves matter: the
+  // gate is what enforces, the switch is what the user sees — and a user who still saw the mode on
+  // reported this as "plan mode does not switch off after approval".
+  await openRunConfig(page);
+  await expect(page.getByLabel("plan mode")).not.toBeChecked();
+  await closeRunConfig(page);
 });
 
 // 2026-10-10: plan mode carries its own read policy. This is the half that used to be a hint —

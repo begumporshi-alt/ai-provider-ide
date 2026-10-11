@@ -796,6 +796,7 @@ describe("runAgentLoop", () => {
     const reviewed: string[] = [];
     const modes: boolean[] = [];
     const ran: string[] = [];
+    let inPlan = true;
     const host: ToolHost = {
       async run(name) {
         ran.push(name);
@@ -824,8 +825,12 @@ describe("runAgentLoop", () => {
       generate: model,
       host,
       plan: {
-        isPlanMode: () => true,
-        setPlanMode: (on) => modes.push(on),
+        isPlanMode: () => inPlan,
+        startedInPlanMode: () => true,
+        setPlanMode: (on) => {
+          inPlan = on;
+          modes.push(on);
+        },
         requestApproval: async (plan) => {
           reviewed.push(plan);
           return { approved: true };
@@ -868,6 +873,7 @@ describe("runAgentLoop", () => {
       host,
       plan: {
         isPlanMode: () => true,
+        startedInPlanMode: () => true,
         setPlanMode: () => undefined,
         requestApproval: async (plan) => {
           plans.push(plan);
@@ -910,6 +916,7 @@ describe("runAgentLoop", () => {
       host,
       plan: {
         isPlanMode: () => inPlan,
+        startedInPlanMode: () => false,
         setPlanMode: (on) => {
           inPlan = on;
           modes.push(on);
@@ -948,6 +955,7 @@ describe("runAgentLoop", () => {
       host,
       plan: {
         isPlanMode: () => false,
+        startedInPlanMode: () => false,
         setPlanMode: () => undefined,
         requestApproval: async () => {
           raised += 1;
@@ -988,6 +996,7 @@ describe("runAgentLoop", () => {
       },
       plan: {
         isPlanMode: () => true,
+        startedInPlanMode: () => true,
         setPlanMode: () => undefined,
         requestApproval: async (plan) => {
           reviewed.push(plan);
@@ -1020,6 +1029,98 @@ describe("runAgentLoop", () => {
     const toolMsg = out.messages.find((m) => m.role === "tool");
     expect(toolMsg?.content).toContain("approval surface");
     expect(toolMsg?.content).toContain("Present the plan in your answer");
+  });
+
+  it("supersedes the pass's stale plan framing once the mode is off", async () => {
+    // Measured 2026-10-10, from a bug report: after approving a plan, plan mode looked like it had
+    // not switched off — because the pass's system turn is composed once and still said "PLAN MODE
+    // — do not attempt a write" for every remaining request, and a compliant model obeys the
+    // system turn over the tool result. The browser suite could not catch it: the test oracle
+    // never reads the system turn. This asserts the request the model actually receives.
+    const systems: string[] = [];
+    let i = 0;
+    const steps: Array<{ text: string; calls?: ToolCall[] }> = [
+      { text: "planning", calls: [{ id: "c1", name: "exit_plan_mode", arguments: '{"plan":"# P"}' }] },
+      { text: "implementing", calls: [{ id: "c2", name: "write_file", arguments: '{"path":"a.txt","content":"x"}' }] },
+      { text: "Done." },
+    ];
+    const model: GenerateFn = async (req) => {
+      const first = req.messages?.[0];
+      systems.push(first && first.role === "system" ? String(first.content) : "");
+      const step = steps[Math.min(i, steps.length - 1)]!;
+      i += 1;
+      step.calls?.forEach((c) => req.onToolCall?.(c));
+      return streamOf(step.text);
+    };
+    const host: ToolHost = { async run() { return { ok: true, output: "ok" }; } };
+    let inPlan = true;
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      // The caller's system turn, exactly as the screen builds it while the mode is on.
+      system: "BASE\n\nPLAN MODE — this pass may not modify the workspace. Do not attempt a write.",
+      plan: {
+        isPlanMode: () => inPlan,
+        startedInPlanMode: () => true,
+        setPlanMode: (on) => {
+          inPlan = on;
+        },
+        requestApproval: async () => ({ approved: true }),
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(systems).toHaveLength(3);
+    // Before the approval the framing is accurate and uncorrected.
+    expect(systems[0]).not.toContain("PLAN MODE IS NOW OFF");
+    // After it, every remaining request says so — and says it supersedes what came before, because
+    // the loop cannot cut the stale paragraph out of a system turn the caller composed.
+    expect(systems[1]).toContain("PLAN MODE IS NOW OFF");
+    expect(systems[1]).toContain("superseded");
+    expect(systems[2]).toContain("PLAN MODE IS NOW OFF");
+  });
+
+  it("leaves a pass alone that was never in plan mode", async () => {
+    // The correction must not appear for an ordinary pass that happens to call the tool wrongly
+    // (the corrective sentence for that case is the tool result, not a system note).
+    const systems: string[] = [];
+    let requests = 0;
+    const model: GenerateFn = async (req) => {
+      const first = req.messages?.[0];
+      systems.push(first && first.role === "system" ? String(first.content) : "");
+      requests += 1;
+      // Only the FIRST request calls the tool. A model that called it on every iteration would
+      // spin the loop — there is no step ceiling in a loop driven this way — and hang the suite
+      // for real, which is how this test was written the first time.
+      if (requests === 1) {
+        req.onToolCall?.({ id: "c1", name: "exit_plan_mode", arguments: '{"plan":"# P"}' });
+      }
+      return streamOf("ok");
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "ok" }; } },
+      system: "BASE",
+      plan: {
+        isPlanMode: () => false,
+        startedInPlanMode: () => false,
+        setPlanMode: () => undefined,
+        requestApproval: async () => ({ approved: true }),
+        requestEntry: async () => false,
+        persist: async () => null,
+      },
+    });
+
+    expect(systems.join("\n")).not.toContain("PLAN MODE IS NOW OFF");
   });
 
   it("keeps a plan call aligned with its neighbours in one batch, and opens the gate in time", async () => {
@@ -1063,6 +1164,7 @@ describe("runAgentLoop", () => {
       },
       plan: {
         isPlanMode: () => inPlan,
+        startedInPlanMode: () => true,
         setPlanMode: (on) => {
           inPlan = on;
         },

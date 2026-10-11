@@ -330,6 +330,24 @@ async function settlePlanTool(
 }
 
 /**
+ * What the model is told, per request, once this pass's plan-mode framing has gone stale — the
+ * plan was approved, or the user switched the mode off mid-run.
+ *
+ * Appended rather than substituted, because the system turn is composed by the caller and the loop
+ * cannot know which paragraph of it was the plan framing. It says what it supersedes, because the
+ * alternative is a model holding two contradictory instructions and picking the wrong one — which
+ * is exactly the failure measured on 2026-10-10: after an approved `exit_plan_mode`, every
+ * remaining iteration of the pass still carried "PLAN MODE — do not attempt a write", so a
+ * compliant model answered that it could not implement the plan the user had just approved. The
+ * browser suite could never have caught it: the test oracle never reads the system turn.
+ */
+const PLAN_MODE_OFF_NOTE =
+  "PLAN MODE IS NOW OFF — the user reviewed and approved the plan this pass presented, so any " +
+  "instruction above telling you not to write, or that every writing tool is refused, is " +
+  "superseded: the writing tools are available now. Implement the plan in this same pass, starting " +
+  "with its first step, and do not re-plan.";
+
+/**
  * The workspace-relative path of the plan a settled `exit_plan_mode` saved, or null.
  *
  * The sentence and its parser live in one module on purpose: the path exists only inside the tool
@@ -404,9 +422,18 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     // forever and a model that heeds it is not told twice.
     const dueForNudge =
       toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) && nudgesSent < TOOL_CALL_NUDGE_MAX;
-    const systemForThisRequest = !opts.system && !dueForNudge
+    // The pass's system turn is frozen, so its plan framing has to be corrected in the request
+    // rather than rebuilt — see `PLAN_MODE_OFF_NOTE`. Read live: the mode can go off mid-iteration.
+    const supersedePlanFraming = Boolean(plan && plan.startedInPlanMode() && !plan.isPlanMode());
+    const systemForThisRequest = !opts.system && !dueForNudge && !supersedePlanFraming
       ? ""
-      : [opts.system, dueForNudge ? nudgeText(toolCallsThisTurn) : ""].filter(Boolean).join("\n\n");
+      : [
+          opts.system,
+          supersedePlanFraming ? PLAN_MODE_OFF_NOTE : "",
+          dueForNudge ? nudgeText(toolCallsThisTurn) : "",
+        ]
+          .filter(Boolean)
+          .join("\n\n");
     if (dueForNudge) nudgesSent += 1;
 
     const collected: ToolCall[] = [];

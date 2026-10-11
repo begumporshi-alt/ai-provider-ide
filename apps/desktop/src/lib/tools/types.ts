@@ -92,6 +92,17 @@ export interface PlanPorts {
   /** Whether this run is in plan mode **right now**. Read live, like the approval gate's own state. */
   isPlanMode: () => boolean;
   /**
+   * Whether this run STARTED with plan-mode framing in its system turn (the screen's `planPass`).
+   *
+   * The system turn is built once per pass and cannot be rebuilt mid-run, so once the mode goes
+   * off the original framing is stale — and it outranks everything: a model told "PLAN MODE — do
+   * not attempt a write" obeys that even when the tool result says the plan was approved. The loop
+   * pairs this with `isPlanMode()` to append the correction that supersedes it (see
+   * `PLAN_MODE_OFF_NOTE` in agentLoop.ts). It covers both exits — an approved `exit_plan_mode` and
+   * the user switching the mode off mid-run.
+   */
+  startedInPlanMode: () => boolean;
+  /**
    * Flip it for the rest of this run. The implementation must write through to whatever the gate
    * reads — `setState` alone is not enough: the flip would land after the loop has already asked
    * the gate about the next write, and a just-approved run would watch its first edit be refused.
