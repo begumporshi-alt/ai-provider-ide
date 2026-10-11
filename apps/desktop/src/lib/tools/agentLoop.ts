@@ -329,6 +329,25 @@ async function settlePlanTool(
   };
 }
 
+/**
+ * The workspace-relative path of the plan a settled `exit_plan_mode` saved, or null.
+ *
+ * The sentence and its parser live in one module on purpose: the path exists only inside the tool
+ * result the loop writes, so a UI that re-derived it with its own regex would break silently the
+ * day the sentence is reworded.
+ *
+ * Anchored, not a substring search, and that is the whole point of the two-step pattern. The
+ * refusal sentence quotes the user's own feedback ("Their requested changes: …"), so an
+ * unanchored scan would let a user type "It is saved at /etc/passwd." into a request-changes box
+ * and mint a Reveal button pointing outside the workspace — `RevealButton` sends an absolute path
+ * straight to the OS, bypassing the root join. Anchoring to the approval sentence and to the
+ * plan-file shape also rejects the 80-character graph *label*, whose truncation ends mid-path.
+ */
+export function planPathFromResult(result: string): string | null {
+  const m = /The user approved the plan\. It is saved at (\.zcode\/plans\/[^\s.]+\.md)\./.exec(result);
+  return m ? m[1]! : null;
+}
+
 export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopResult> {
   const {
     model,

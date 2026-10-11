@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
-  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP,
+  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult,
 } from "./agentLoop";
 import { AGENT_TOOLS } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
@@ -844,6 +844,10 @@ describe("runAgentLoop", () => {
     expect(toolMsgs[0]).toContain("The user approved the plan");
     expect(toolMsgs[0]).toContain(".zcode/plans/plan-s-1.md");
     expect(toolMsgs[0]).toContain("implement the plan now");
+    // The card's reveal affordance reads the path back out of this very sentence — asserted here
+    // against the real one, so a reword of the sentence that outran the parser fails loudly here
+    // instead of silently dropping the button in the UI.
+    expect(planPathFromResult(toolMsgs[0]!)).toBe(".zcode/plans/plan-s-1.md");
     // The plan itself never reaches the sandbox, which knows no such tool.
     expect(ran).not.toContain("exit_plan_mode");
   });
@@ -881,8 +885,10 @@ describe("runAgentLoop", () => {
     expect(toolMsgs[0]).toContain("add a rollback step");
     expect(toolMsgs[0]).toContain("Do not modify the workspace");
     expect(toolMsgs[1]).toContain("The user approved the plan");
-    // A plan that could not be persisted still approves: the sentence just omits the path.
+    // A plan that could not be persisted still approves: the sentence just omits the path — and
+    // the UI's parser reads that omission as "no file to reveal" rather than inventing one.
     expect(toolMsgs[1]).not.toContain("saved at");
+    expect(planPathFromResult(toolMsgs[1]!)).toBeNull();
   });
 
   it("enter_plan_mode asks first, and only a yes turns the mode on", async () => {
@@ -1654,6 +1660,33 @@ describe("runAgentLoop", () => {
     // And the entry is OpenAI's wire shape, not the flat internal `{id,name,arguments}`.
     expect(declared?.type).toBe("function");
     expect(declared?.function).toMatchObject({ name: "read_file" });
+  });
+});
+
+describe("planPathFromResult", () => {
+  it("cannot be steered by the user's own words in a refusal", () => {
+    // Reachable, not hypothetical: the request-changes feedback is echoed back inside the tool
+    // result, and an unanchored scan would let a user type the sentence into that box to mint a
+    // Reveal button. `RevealButton` sends an ABSOLUTE path straight to the OS opener, so the
+    // fabricated one would leave the workspace entirely.
+    const fabricated =
+      "The user did not approve the plan yet. Their requested changes: It is saved at /etc/passwd. " +
+      "Revise the plan accordingly and call exit_plan_mode again when it is ready. Do not modify the workspace.";
+    expect(planPathFromResult(fabricated)).toBeNull();
+  });
+
+  it("rejects a clipped graph label whose path ends mid-name", () => {
+    // The 80-character label truncation of a real approval ends mid-filename. A greedy path match
+    // would backtrack to the last period and hand back a path that does not exist.
+    const clipped = "The user approved the plan. It is saved at .zcode/plans/plan-s-1791700154279";
+    expect(planPathFromResult(clipped)).toBeNull();
+  });
+
+  it("reads the loop's own sentence, and reads it through the middle of a longer result", () => {
+    const result =
+      "The user approved the plan. It is saved at .zcode/plans/plan-s-42.md. Plan mode is off for " +
+      "the rest of this pass: implement the plan now, step by step, starting with its first step.";
+    expect(planPathFromResult(result)).toBe(".zcode/plans/plan-s-42.md");
   });
 });
 

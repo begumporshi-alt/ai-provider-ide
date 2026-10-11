@@ -158,6 +158,14 @@ ChatGPT/Claude web chat surfaces.
   coverage — only in-session rendering is pinned). Nothing at the web layer would catch a
   regression in that path; a shim that returns `tool_calls` on timeline entries plus one resume
   spec is the follow-up.
+  **Closed 2026-10-10:** the shim now mirrors the host's timeline (`tool_calls` on assistant
+  entries, `tool_call_id` on tool entries — `web-test/shim.ts`), the Rust round trip is pinned by
+  `context.rs`'s `a_replayed_assistant_turn_keeps_the_calls_it_made`, and card-after-resume is
+  asserted by `rich-cards.spec.ts`'s "the plan card and its tool row come back when the session is
+  resumed". The approved plan also gained a Reveal button (the same opener affordance the artifact
+  cards use) whose path is parsed from the loop's own sentence by `planPathFromResult` — anchored
+  to the approval sentence and the plan-file shape, because the unanchored form let a user's
+  request-changes feedback name a file outside the workspace.
   (c) The checkpoint reads a file's previous contents **before the first write of the run**, which
   is what makes the review a true diff (a `write_file` used to render as all-additions with "any
   previous contents are not shown") and makes a file written twice revert to its pre-run state.

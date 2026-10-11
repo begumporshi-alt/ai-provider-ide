@@ -3,7 +3,8 @@
  *
  * Modeled on what ZCode shows for a plan: a titled card with an icon-labelled header, a copy
  * button, a truncated preview that fades out, and a centered "View full plan →" pill that
- * expands the whole document in place. Before this component a plan-mode answer rendered as one
+ * expands the whole document in place. A document that was saved to disk also offers Reveal
+ * (`reveal` prop). Before this component a plan-mode answer rendered as one
  * long markdown message — correct, but indistinguishable from every other paragraph, which is
  * exactly the "where does the plan end and the prose begin" reading problem the card solves.
  *
@@ -12,6 +13,7 @@
  */
 import { useEffect, useMemo, useRef, useState } from "react";
 import { Markdown } from "./Markdown";
+import { RevealButton } from "./ArtifactCard";
 
 /** The preview's ceiling. About four content lines — enough to read the shape, short enough that
  *  the fade reads as "there is more" rather than "this is all". */
@@ -75,11 +77,18 @@ export function DocCard({
   source,
   label = "Plan",
   testId = "doc-card",
+  reveal,
 }: {
   source: string;
   /** What the document is — the header's icon label and the pill's noun ("View full plan"). */
   label?: string;
   testId?: string;
+  /**
+   * Where this document was saved, when it was: `path` is workspace-relative. Present renders the
+   * reveal affordance beside copy — the same action the artifact cards offer, and a real pointer to
+   * the file rather than the tool result's sentence about it.
+   */
+  reveal?: { path: string; root: string };
 }) {
   const [expanded, setExpanded] = useState(false);
   const [copied, setCopied] = useState(false);
@@ -118,16 +127,19 @@ export function DocCard({
       <div className="flex items-center gap-2 px-4 pt-3 text-[12px]" style={{ color: "var(--text-dim)" }}>
         <ClipboardIcon />
         <span className="font-medium">{label}</span>
-        <button
-          type="button"
-          className="card-icon-btn ml-auto rounded p-1"
-          style={copied ? { color: "var(--success)" } : undefined}
-          onClick={copy}
-          title={copied ? "Copied" : `Copy the full ${label.toLowerCase()}`}
-          data-testid="doc-card-copy"
-        >
-          {copied ? "✓" : <CopyIcon />}
-        </button>
+        <div className="ml-auto flex items-center gap-1">
+          {reveal && <RevealButton path={reveal.path} root={reveal.root} testId="doc-card-reveal" />}
+          <button
+            type="button"
+            className="card-icon-btn rounded p-1"
+            style={copied ? { color: "var(--success)" } : undefined}
+            onClick={copy}
+            title={copied ? "Copied" : `Copy the full ${label.toLowerCase()}`}
+            data-testid="doc-card-copy"
+          >
+            {copied ? "✓" : <CopyIcon />}
+          </button>
+        </div>
       </div>
 
       {title && (

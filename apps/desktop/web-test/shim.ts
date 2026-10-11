@@ -1099,9 +1099,18 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
     // Reveal). Answered rather than left to fall through: an unhandled rejection here would read
     // as an app bug, when the real host would have opened the browser or the file manager.
     case "plugin:opener|open_url":
-    case "plugin:opener|reveal_item_in_dir":
-      openerCalls.push(String(args.url ?? args.path ?? ""));
+      openerCalls.push(String(args.url ?? ""));
       return null;
+    case "plugin:opener|reveal_item_in_dir": {
+      // The plugin sends `paths` — an array, because `revealItemInDir` accepts several — not
+      // `path`. This case used to read `args.path` and log an empty string, which nothing noticed
+      // because no spec clicked a Reveal button until the plan card grew one: a harness bug that
+      // would have made any reveal assertion vacuous.
+      const paths = args.paths;
+      const first = Array.isArray(paths) ? paths[0] : paths;
+      openerCalls.push(String(first ?? ""));
+      return null;
+    }
 
     case "artifact_read":
       return artifactRead(args.req as { path: string; root: string; as_text?: boolean });
@@ -1299,8 +1308,25 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         });
       const byId = new Map(nodes.map((n) => [String(n.id), n]));
       const edges = contextEdges.filter((e) => byId.has(String(e.from_id)));
+      /** A node's meta object, or {} — every read here tolerates a missing or malformed blob. */
+      const metaOf = (id: string): Record<string, unknown> => {
+        try {
+          return JSON.parse(String(byId.get(id)?.meta_json ?? "{}")) as Record<string, unknown>;
+        } catch {
+          return {};
+        }
+      };
       const toolsOf = new Map<string, string[]>();
       const resultsOf = new Map<string, string[]>();
+      /**
+       * The wire id the REQUEST declared for a call, keyed by the skill node that made it — the
+       * artifact that answered the call is where the recorder puts it, so this is read off the
+       * `produced` edges exactly as `context.rs` does (first id wins). Without it a resumed
+       * transcript rebuilds rows with no id to pair a result against: `groupToolRuns` keeps the
+       * call's row and appends an extra unnamed row for the orphan, and with no calls recorded at
+       * all every result degrades to a bare bubble.
+       */
+      const resultCallIds = new Map<string, string>();
       const recalled = new Map<string, number>();
       for (const e of edges) {
         const from = String(e.from_id);
@@ -1312,15 +1338,15 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         } else if (e.kind === "produced") {
           const target = byId.get(to);
           if (target) {
-            let targetMeta: Record<string, unknown> = {};
-            try {
-              targetMeta = JSON.parse(String(target.meta_json ?? "{}")) as Record<string, unknown>;
-            } catch {
-              targetMeta = {};
-            }
+            const targetMeta = metaOf(to);
             const arr = resultsOf.get(from) ?? [];
             arr.push(typeof targetMeta.text === "string" ? targetMeta.text : String(target.label ?? ""));
             resultsOf.set(from, arr);
+            // An empty string is treated as absent, unlike the host's `meta_text` — an id that
+            // cannot pair a result is the same as no id downstream.
+            if (!resultCallIds.has(from) && typeof targetMeta.tool_call_id === "string" && targetMeta.tool_call_id) {
+              resultCallIds.set(from, targetMeta.tool_call_id);
+            }
           }
         } else if (e.kind === "recalled") {
           recalled.set(from, (recalled.get(from) ?? 0) + 1);
@@ -1345,6 +1371,14 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
           detail: null,
           model: typeof meta.model === "string" ? meta.model : null,
           memories: recalled.get(id) ?? 0,
+          tool_call_id: null,
+          // The recorded calls, re-serialized to a string the way the host's `meta_json` helper
+          // does (`context.rs`): absent reads as null, present as compact JSON. Parse-equivalent
+          // rather than byte-identical — the host emits serde's key order — and every consumer
+          // `JSON.parse`s it anyway. This is the half a resumed session needs to rebuild the
+          // transcript's tool rows at all: the assistant turn is the only place the calls are
+          // written down.
+          tool_calls: typeof meta.tool_calls === "undefined" ? null : JSON.stringify(meta.tool_calls),
         });
         const calls = (toolsOf.get(id) ?? []).sort(
           (x, y) =>
@@ -1363,6 +1397,13 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
             detail: detail === "" ? null : detail,
             model: null,
             memories: 0,
+            // The host's fallback order: the artifact that answered the call, then the call node's
+            // own metadata (an older writer put the id there).
+            tool_call_id: ((): string | null => {
+              const declared = metaOf(call).tool_call_id;
+              return resultCallIds.get(call) ?? (typeof declared === "string" && declared ? declared : null);
+            })(),
+            tool_calls: null,
           });
         }
       }

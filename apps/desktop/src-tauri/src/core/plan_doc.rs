@@ -30,9 +30,7 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
     !id.is_empty()
         && id.len() <= 64
         && !id.starts_with('.')
-        && id
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
 }
 
 /// Write `markdown` as the plan for `session_id`. Returns the workspace-relative path written.
@@ -41,9 +39,7 @@ pub(crate) fn save_plan(root: &str, session_id: &str, markdown: &str) -> Result<
         return Err("no workspace root is set".into());
     }
     if !is_valid_session_id(session_id) {
-        return Err(format!(
-            "invalid session id for a plan file: {session_id:?}"
-        ));
+        return Err(format!("invalid session id for a plan file: {session_id:?}"));
     }
     if markdown.trim().is_empty() {
         return Err("refusing to write an empty plan".into());

@@ -966,6 +966,96 @@ mod context_graph_tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// The calls an assistant turn made survive the round trip.
+    ///
+    /// The id test above covers the *result* half of a replayed tool exchange; this covers the
+    /// *call* half. Both are load-bearing for a resumed session: with the calls lost, a transcript
+    /// rebuilds no tool rows at all — every result degrades to a bare bubble — and a plan's text
+    /// (an argument of `exit_plan_mode`) is gone with them, so the card cannot come back.
+    #[test]
+    fn a_replayed_assistant_turn_keeps_the_calls_it_made() {
+        let (s, d) = temp_store("calls");
+        // `r##` not `r#`: the plan text inside the arguments contains `"#`, which would close a
+        // single-hash raw string mid-literal.
+        let calls = r##"[{"id":"c1","type":"function","function":{"name":"exit_plan_mode","arguments":"{\"plan\":\"# Plan\"}"}}]"##;
+        let meta = |m: &str| Some(m.to_string());
+        let assistant_meta =
+            format!(r#"{{"role":"assistant","model":"a/b","tool_calls":{calls}}}"#);
+        record(
+            &s,
+            &[
+                ContextNode {
+                    id: "m1".into(),
+                    kind: "message".into(),
+                    label: "plan it".into(),
+                    source: "ui".into(),
+                    session_id: Some("s-1".into()),
+                    ts: 1000,
+                    meta_json: meta(r#"{"role":"user","text":"plan it"}"#),
+                },
+                ContextNode {
+                    id: "m2".into(),
+                    kind: "message".into(),
+                    label: "".into(),
+                    source: "ui".into(),
+                    session_id: Some("s-1".into()),
+                    ts: 1001,
+                    meta_json: Some(assistant_meta),
+                },
+                ContextNode {
+                    id: "k1".into(),
+                    kind: "skill".into(),
+                    label: "exit_plan_mode".into(),
+                    source: "ui".into(),
+                    session_id: Some("s-1".into()),
+                    ts: 1002,
+                    meta_json: None,
+                },
+                ContextNode {
+                    id: "a1".into(),
+                    kind: "artifact".into(),
+                    label: "the plan".into(),
+                    source: "ui".into(),
+                    session_id: Some("s-1".into()),
+                    ts: 1003,
+                    meta_json: meta(r#"{"tool_call_id":"c1","text":"the plan"}"#),
+                },
+            ],
+            &[
+                ContextEdge {
+                    id: "e1".into(),
+                    from_id: "m2".into(),
+                    to_id: "k1".into(),
+                    kind: "used".into(),
+                    weight: 1.0,
+                    ts: 1002,
+                    meta_json: None,
+                },
+                ContextEdge {
+                    id: "e2".into(),
+                    from_id: "k1".into(),
+                    to_id: "a1".into(),
+                    kind: "produced".into(),
+                    weight: 1.0,
+                    ts: 1003,
+                    meta_json: None,
+                },
+            ],
+        )
+        .unwrap();
+        let t = timeline(&s, "s-1").unwrap();
+        // The user turn made no calls and says so rather than omitting the field.
+        assert_eq!(t.entries[0].tool_calls, None);
+        let raw = t.entries[1].tool_calls.as_deref().expect("the calls are replayed");
+        let parsed: serde_json::Value = serde_json::from_str(raw).expect("compact JSON");
+        assert_eq!(parsed[0]["id"], "c1");
+        assert_eq!(parsed[0]["function"]["name"], "exit_plan_mode");
+        assert_eq!(parsed[0]["function"]["arguments"], r##"{"plan":"# Plan"}"##);
+        // And the call still pairs with its result by id, which is what rebuilding a row needs.
+        assert_eq!(t.entries[2].tool_call_id.as_deref(), Some("c1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn an_unknown_session_reads_as_an_empty_timeline() {
         let (s, d) = temp_store("empty");

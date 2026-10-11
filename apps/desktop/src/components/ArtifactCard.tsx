@@ -150,8 +150,17 @@ function VersionBar({
   );
 }
 
-/** The reveal affordance, shared by both card shapes. */
-function RevealButton({ path, root }: { path: string; root: string }) {
+/** The reveal affordance, shared by the card shapes that stand for a file on disk — the HTML/image
+ *  artifacts here and the plan document in `DocCard`. */
+export function RevealButton({
+  path,
+  root,
+  testId = "artifact-reveal",
+}: {
+  path: string;
+  root: string;
+  testId?: string;
+}) {
   return (
     <button
       type="button"
@@ -161,7 +170,7 @@ function RevealButton({ path, root }: { path: string; root: string }) {
       // seeing the page is what the preview is for, finding the file is what comes next.
       onClick={() => void revealPath(path.startsWith("/") ? path : `${root.replace(/\/+$/, "")}/${path}`)}
       title="Show this file in the file manager"
-      data-testid="artifact-reveal"
+      data-testid={testId}
     >
       Reveal
     </button>

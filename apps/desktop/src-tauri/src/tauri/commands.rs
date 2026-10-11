@@ -703,7 +703,11 @@ pub fn agent_def_delete(
 /// final. Outside the sandbox on purpose (see `core::plan_doc`): a plan must not enter the run's
 /// change set or be revertable, and plan mode itself would refuse the write.
 #[tauri::command]
-pub fn plan_save(root: String, session_id: String, markdown: String) -> Result<String, CommandError> {
+pub fn plan_save(
+    root: String,
+    session_id: String,
+    markdown: String,
+) -> Result<String, CommandError> {
     crate::core::plan_doc::save_plan(&root, &session_id, &markdown).map_err(CommandError)
 }
 

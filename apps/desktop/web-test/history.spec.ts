@@ -119,6 +119,61 @@ test("history: the timeline shows the turn, the calls and each call's own result
   await expect(readFile).toContainText("main.rs");
 });
 
+test("history: the wire calls a turn made are recorded and read back with their ids", async ({ page }) => {
+  // The harness's own mirror of the host's timeline (`context.rs`) — asserted directly, because
+  // the two fields this checks are what a resumed Assistant transcript rebuilds its tool rows
+  // FROM, and every other assertion about them goes through the UI. A shim that quietly dropped
+  // either would keep those UI tests green while the real host did the right thing.
+  await page.goto(`${APP}?seed=or-router`);
+  const session = "s-calls";
+  const id = (k: string, n: number) => `${k}:${session}:${n}`;
+  const calls = [
+    { id: "c1", type: "function", function: { name: "exit_plan_mode", arguments: '{"plan":"# Plan"}' } },
+  ];
+  await page.evaluate(
+    async ({ nodes, edges }) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      await (window as any).__webTest.invoke("context_record", { nodes, edges });
+    },
+    {
+      nodes: [
+        { id: id("message", 1), kind: "message", label: "plan it", source: "ui", session_id: session, ts: 1000,
+          meta_json: '{"role":"user","text":"plan it"}' },
+        { id: id("message", 2), kind: "message", label: "", source: "ui", session_id: session, ts: 1001,
+          meta_json: JSON.stringify({ role: "assistant", model: "mock/oracle-1", tool_calls: calls }) },
+        // No id on the artifact — it lives on the call node instead, which is the host's fallback
+        // order (`artifact_id.or_else(meta_text(target, "tool_call_id"))`).
+        { id: id("skill", 3), kind: "skill", label: "exit_plan_mode", source: "ui", session_id: session, ts: 1002,
+          meta_json: '{"tool_call_id":"c1"}' },
+        { id: id("artifact", 4), kind: "artifact", label: "the plan", source: "ui", session_id: session, ts: 1003,
+          meta_json: '{"text":"the plan"}' },
+      ],
+      edges: [
+        { id: "e1", from_id: id("message", 2), to_id: id("skill", 3), kind: "used", weight: 1, ts: 1002, meta_json: null },
+        { id: "e2", from_id: id("skill", 3), to_id: id("artifact", 4), kind: "produced", weight: 1, ts: 1003, meta_json: null },
+      ],
+    },
+  );
+
+  const timeline = await page.evaluate(
+    async (sid) => {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return (await (window as any).__webTest.invoke("history_timeline", { sessionId: sid })) as {
+        entries: Array<{ kind: string; tool_calls?: string | null; tool_call_id?: string | null }>;
+      };
+    },
+    session,
+  );
+  const assistant = timeline.entries.find((e) => e.kind === "assistant");
+  expect(assistant?.tool_calls, "the calls come back as parseable JSON").toBeTruthy();
+  expect(JSON.parse(assistant!.tool_calls!)[0].function.name).toBe("exit_plan_mode");
+  // The user turn made no calls and says so, rather than the field being invented.
+  expect(timeline.entries.find((e) => e.kind === "user")?.tool_calls).toBeFalsy();
+  // And the result still pairs with the call it answers — via the call node's own metadata, since
+  // this artifact carries none (the host's `artifact_id.or_else(...)` order).
+  expect(timeline.entries.find((e) => e.kind === "tool")?.tool_call_id).toBe("c1");
+});
+
 test("history: turns keep their order when every node shares one timestamp", async ({ page }) => {
   await page.goto(`${APP}?seed=or-router`);
   // One `ts` for the whole run — the batching that makes time useless as a tiebreak.

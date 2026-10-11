@@ -47,7 +47,7 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
@@ -1497,9 +1497,9 @@ function Chat({
   // `ToolCallRow`) — so the mark-on-finish heuristic is gone, and with it everything it needed:
   // the busy→false effect, the live-state-versus-ref capture, and the text-membership array that
   // guessed which messages were plans. Nothing here holds plan state at all now, which is the
-  // point: the card hangs on a tool call that is part of the transcript, and whether a resumed
-  // session can rebuild it is the host's question (`history_timeline` returning the recorded tool
-  // calls — the web-test harness does not today, so that half is pinned in-session only).
+  // point: the card hangs on a tool call that is part of the transcript, so a resumed session
+  // rebuilds it from the recorded calls — pinned end to end by rich-cards.spec.ts's
+  // "the plan card and its tool row come back when the session is resumed".
   // The draft itself lives in `Composer` (it also owns attachments and the two menus). This is a
   // read-only mirror, reported on each keystroke, for the two things the parent needs it for: the
   // context meter's estimate of what the next send will contain, and nothing else.
@@ -3410,6 +3410,9 @@ function ToolCallRow({
   // three times in three truncations. `enter_plan_mode` carries no arguments at all.
   const planDoc =
     step.name === "exit_plan_mode" && typeof step.args.plan === "string" ? step.args.plan : null;
+  // Where the approved plan landed, when the result says it did. Parsed by the sentence's owner
+  // (`planPathFromResult`), never by a regex of this component's own — see that function.
+  const planPath = planDoc && step.result ? planPathFromResult(step.result) : null;
   const change = fileChangeFor(step.name, step.args);
   // A card only where the step is the file's newest successful write AND the run has finished; a
   // refused write keeps its diff either way (`writtenArtifactPath` carries that gate).
@@ -3441,7 +3444,11 @@ function ToolCallRow({
               this card from them — where the host returns the recorded tool calls
               (`history_timeline` → `resumeSession`). The plan file itself is for the user and other
               tools, not for this render. */}
-          <DocCard source={planDoc} label="Plan" />
+          <DocCard
+            source={planDoc}
+            label="Plan"
+            reveal={planPath && root ? { path: planPath, root } : undefined}
+          />
         </div>
       )}
       {showArgs && !planDoc && Object.keys(step.args).length > 0 && (
