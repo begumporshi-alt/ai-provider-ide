@@ -411,22 +411,130 @@ function flattenPreview(label: string): string {
   return flat.length <= 120 ? flat : `${flat.slice(0, 120)}…`;
 }
 
+/**
+ * The builtin catalog, mirroring `skills.rs` — same slugs, names and descriptions, bodies
+ * abbreviated to the opening line and the steps a spec asserts on. Kept in the catalog's order so
+ * the two lists can be diffed by eye.
+ */
 const BUILTIN_SKILLS: { slug: string; name: string; description: string; body: string }[] = [
-  { slug: "code-review", name: "Code review", description: "Review a change for correctness, security and clarity before it lands.", body: "Review the change the user points at.\n\n1. Read the changed files.\n2. Look for correctness bugs, unhandled errors, security problems, then clarity.\n3. Report as a short list: file, line, what is wrong, why it matters." },
-  { slug: "commit-message", name: "Commit message", description: "Write a conventional commit message from what actually changed.", body: "Write a commit message for the pending change.\n\n1. Inspect the change; do not guess from the branch name.\n2. First line: type(scope): summary, imperative, under 72 characters.\n3. Body: why the change was needed, not what it did." },
-  { slug: "explain-code", name: "Explain code", description: "Explain a file, module or symbol to someone seeing it for the first time.", body: "Explain the code the user names.\n\n1. Read it before explaining it.\n2. Lead with the one thing it is for.\n3. Then the shape: entry points, main data flow, dependencies." },
-  { slug: "test-writer", name: "Write tests", description: "Write focused tests for a module, covering behaviour rather than implementation.", body: "Write tests for the module the user names.\n\n1. Read the module and any existing tests.\n2. Cover behaviour: normal path, edge cases, error cases.\n3. Match the conventions already there." },
+  {
+    slug: "byte-slice-panic",
+    name: "Byte slice panic",
+    description: "Diagnose a Rust crash from slicing a string at a byte index inside a character.",
+    body: "A Rust process dies instead of reporting an error.\n\n1. Read the panic literally: the cut was at byte N, inside a multi-byte character.\n2. Audit the family: s[..n], s[a..b], truncate, split_at, and byte slices cast back to str.\n3. Walk the cut back to a character boundary before slicing. Never catch the panic or move the cap.",
+  },
+  {
+    slug: "code-review",
+    name: "Code review",
+    description: "Review a change for correctness, security and clarity before it lands.",
+    body: "Review the change the user points at.\n\n1. Read the changed files.\n2. Look for correctness bugs, unhandled errors, security problems, then clarity.\n3. Report as a short list: file, line, what is wrong, why it matters.",
+  },
+  {
+    slug: "commit-message",
+    name: "Commit message",
+    description: "Write a conventional commit message from what actually changed.",
+    body: "Write a commit message for the pending change.\n\n1. Inspect the change; do not guess from the branch name.\n2. First line: type(scope): summary, imperative, under 72 characters.\n3. Body: why the change was needed, not what it did.",
+  },
+  {
+    slug: "error-notes",
+    name: "Error notes",
+    description: "Record a diagnosed error and its fix, so no session diagnoses the same thing twice.",
+    body: "Record an error once it is fixed, in one notes file kept with the project.\n\n1. Write the entry at resolution time, not mid-diagnosis.\n2. Search the notes for the same symptom first; add a recurrence line instead of a second entry.\n3. Root cause as why it happened, the fix as what was applied, plus how it was verified.",
+  },
+  {
+    slug: "explain-code",
+    name: "Explain code",
+    description: "Explain a file, module or symbol to someone seeing it for the first time.",
+    body: "Explain the code the user names.\n\n1. Read it before explaining it.\n2. Lead with the one thing it is for.\n3. Then the shape: entry points, main data flow, dependencies.",
+  },
+  {
+    slug: "fix-to-skill",
+    name: "Capture the fix",
+    description: "Turn a fix that just worked into a skill draft the operator can install.",
+    body: "Turn a fix that just worked into a skill the operator can install.\n\nThis app cannot install a skill into itself. The deliverable is a complete draft, ready to paste into the skills screen.\n\n1. Offer this only for a confirmed, non-trivial fix that could recur.\n2. Reconstruct the symptom, root cause, fix and verification from this conversation.\n3. Generalize it, then present the whole draft and say it still needs installing.",
+  },
+  {
+    slug: "grill-plan",
+    name: "Grill the plan",
+    description: "Interview the user in rounds until a plan or design is settled, before any work starts.",
+    body: "Interview the user until the plan is settled. Do not start work before that.\n\n1. Map the work as a tree of decisions, then ask the whole frontier at once.\n2. One decision per question, with options and your recommendation.\n3. Facts are yours to find; decisions belong to the user. Ask, then wait.",
+  },
+  {
+    slug: "lean-reading",
+    name: "Lean reading",
+    description: "Keep context lean while exploring code and running commands, without losing information.",
+    body: "Keep the context lean while reading code and running commands.\n\n1. Read a file whole only when it is short; otherwise map it and read the range you need.\n2. Never read again what is already in this conversation.\n3. Verify your own edits with a diff, and keep command output to the lines that matter.",
+  },
+  {
+    slug: "protocol-leak-triage",
+    name: "Protocol leak triage",
+    description: "Diagnose raw protocol syntax leaking into visible model output, and fix it at the seam.",
+    body: "Model output renders raw protocol syntax instead of prose.\n\n1. Prove whose string it is: pull the stored text and try to parse it as the shape it claims to be.\n2. Group the offenders by model and provider; almost-parsing points upstream.\n3. Fix at the seam where provider text becomes a message, strictly, and never per stream chunk.",
+  },
+  {
+    slug: "screen-design-brief",
+    name: "Screen design brief",
+    description: "Settle a screen's layout pattern, primary interaction and visible chrome before building it.",
+    body: "Build or restructure a screen or component.\n\n1. Before markup, note the layout pattern, the primary interaction and what is visible unscrolled.\n2. Keep one title, one primary action and one status indicator above the fold.\n3. Reuse the existing components and colour tokens; never hardcode a colour.",
+  },
+  {
+    slug: "subagent-dispatch",
+    name: "Dispatch sub-agents",
+    description: "Decide when to delegate to a sub-agent, and brief it so it can work from nothing.",
+    body: "Delegate to a sub-agent only where it genuinely helps, and brief it fully.\n\n1. Do it yourself when it is a question, a lookup or a single-file edit.\n2. A sub-agent sees none of this conversation: give it the task, the paths and what to return.\n3. Issue independent sub-agents in one batch; never two that edit the same files.",
+  },
+  {
+    slug: "test-writer",
+    name: "Write tests",
+    description: "Write focused tests for a module, covering behaviour rather than implementation.",
+    body: "Write tests for the module the user names.\n\n1. Read the module and any existing tests.\n2. Cover behaviour: normal path, edge cases, error cases.\n3. Match the conventions already there.",
+  },
+  {
+    slug: "verify-before-done",
+    name: "Verify before done",
+    description: "Prove the work before calling it complete, and report the check that proved it.",
+    body: "Before reporting any task complete.\n\n1. Name the check that would prove this works, and run it after the last edit.\n2. Read the output, not the exit code alone; a suite reporting '0 tests' passed nothing.\n3. Report what was verified and by what, then what remains unverified.",
+  },
 ];
 
-/** Builtins seed once, exactly as skills.rs does — otherwise a revoked one would come back. */
-function seedSkillsOnce(): void {
-  if (settings.get("skills_seeded") === "1") return;
+/** The catalog as it shipped before it grew: what a store carrying only the old flag holds. */
+const ORIGINAL_BUILTIN_SLUGS = ["code-review", "commit-message", "explain-code", "test-writer"];
+
+/** Builtin slugs this store has already been given — the mirror of `skills.rs`'s settings row. */
+function seededBuiltinSlugs(): string[] {
+  const raw = settings.get("skills_seeded_builtins");
+  if (raw !== undefined) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (Array.isArray(parsed)) return parsed.map(String);
+    } catch {
+      // An unreadable record is treated as absent; the flag below still protects a revoke.
+    }
+  }
+  return settings.get("skills_seeded") === "1" ? [...ORIGINAL_BUILTIN_SLUGS] : [];
+}
+
+/**
+ * Seed the builtins this store has not been given yet.
+ *
+ * Mirrors `skills.rs`, including the part that matters: the seeding is recorded per slug, so a
+ * revoked builtin stays revoked (it is recorded) while a builtin added in a later release still
+ * lands. One boolean over the whole catalog would make the revoke button a lie.
+ */
+function seedMissingBuiltins(): void {
+  const known = seededBuiltinSlugs();
   const now = Date.now();
+  let planted = false;
   for (const b of BUILTIN_SKILLS) {
+    if (known.includes(b.slug)) continue;
+    known.push(b.slug);
+    planted = true;
     if (!skills.some((s) => s.slug === b.slug)) {
       skills.push({ id: `builtin-${b.slug}`, slug: b.slug, name: b.name, description: b.description, version: "1.0.0", source: "builtin", body: b.body, enabled: true, installed_at: now });
     }
   }
+  if (!planted) return;
+  settings.set("skills_seeded_builtins", JSON.stringify(known));
   settings.set("skills_seeded", "1");
 }
 
@@ -1412,7 +1520,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 
     // ---- P5: skills ----
     case "skills_list":
-      seedSkillsOnce();
+      seedMissingBuiltins();
       return [...skills].sort((a, b) => String(a.name).localeCompare(String(b.name)));
     case "skills_catalog":
       return BUILTIN_SKILLS.map((b) => ({

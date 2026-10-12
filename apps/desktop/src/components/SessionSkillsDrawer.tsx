@@ -9,8 +9,8 @@
  *
  * Pinned to the transcript's right edge, the same mount point as the SubagentsDrawer. Unlike that
  * drawer — which renders nothing before the first delegation — the rail here stays visible once
- * any skill is installed: there is always something true to say ("4 on · 1 used"), and a control
- * that exists to be found must be findable.
+ * any skill is installed: there is always something true to say (the "N on · M used" counts), and
+ * a control that exists to be found must be findable.
  */
 import { useEffect, useState } from "react";
 import { listSkills, type Skill } from "../store";

@@ -13,6 +13,9 @@ import { closeRunConfig, openRunConfig } from "./run-config";
 
 const APP = "/web-test/";
 
+/** The shipped builtin catalog, which the shim mirrors from `skills.rs` — see shim.ts. */
+const BUILTINS = 13;
+
 async function openAgentChat(page: import("@playwright/test").Page) {
   await page.setViewportSize({ width: 1280, height: 860 });
   await page.goto(`${APP}?seed=systemai`);
@@ -39,15 +42,15 @@ async function allowOnce(page: import("@playwright/test").Page) {
 test("the drawer lists the installed skills, tracks a loaded one, and a new session starts clean", async ({ page }) => {
   await openAgentChat(page);
 
-  // The shim seeds the four builtins, so there is always something true for the rail to say.
+  // The shim seeds the whole builtin catalog, so there is always something true for the rail to say.
   const rail = page.getByTestId("session-skills-rail");
   await expect(rail).toBeVisible({ timeout: 15_000 });
-  await expect(rail).toContainText("4 on");
+  await expect(rail).toContainText(`${BUILTINS} on`);
 
   await rail.click();
   const drawer = page.getByTestId("session-skills-drawer");
   await expect(drawer).toBeVisible();
-  await expect(drawer.getByTestId("session-skills-row")).toHaveCount(4);
+  await expect(drawer.getByTestId("session-skills-row")).toHaveCount(BUILTINS);
   // Nothing has been loaded in this conversation yet — the used section says so in words.
   await expect(drawer.getByTestId("session-skills-empty-used")).toBeVisible();
   await page.getByRole("button", { name: "Close session skills drawer" }).click();

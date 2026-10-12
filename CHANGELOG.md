@@ -73,7 +73,50 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   `sk-aip-PASTE-KEY-HERE` slot to paste over. The model-id field defaults to the configured
   System AI model, so the smoke test references a model the router is known to serve.
 
+- **The builtin skill catalog grew from four procedures to thirteen**, taking the procedures that
+  were earned rather than invented: the original four (code review, commit message, explain code,
+  write tests) plus `lean-reading` (map a large file instead of reading it whole, never re-read what
+  is already in context, keep command output to the lines that matter), `verify-before-done` (name
+  the check that would prove the work, run it after the last edit, report what stayed unverified),
+  `grill-plan` (settle a plan in rounds of one decision each before starting), `subagent-dispatch`
+  (when delegation pays for its overhead, and how to brief an agent that cannot see this
+  conversation), `protocol-leak-triage` (raw protocol syntax in model output — whose string it is,
+  and the strict-decode-then-salvage rule at the extraction seam), `byte-slice-panic` (the Rust
+  crash from slicing at a byte index inside a character, plus the audit that finds the rest of the
+  family), `error-notes` (record a fixed error so no session diagnoses it twice),
+  `screen-design-brief` (settle the layout pattern, the primary interaction and the above-the-fold
+  chrome before writing markup), and `fix-to-skill` (turn a confirmed fix into a paste-ready draft
+  the operator can install).
+
+  Each is still a procedure and not a capability: a skill cannot widen the tool surface, and one
+  costs a line in the system prompt until the model loads its body on demand. All thirteen can be
+  switched off globally on the Skills screen or per conversation in the session drawer, so the
+  prompt index stays a decision rather than a tax.
+
 ### Changed
+
+- **The Skills screen is a list you can manage in place, modelled on the host app's skills panel.**
+  It used to be three stacked sections of cards — Installed, Catalog, and a paste box — with a
+  `revoke` link and an `active` checkbox on every row. It is now one screen of two grouped panels:
+  a title with a **search field** (name, slug or description), **Status** and **Source** filters, an
+  icon-only **Refresh**, and a **+ New** button that opens the SKILL.md composer in a dialog instead
+  of parking a textarea under the list. Every installed row carries a **switch** and a **delete**,
+  the delete asks first, and a footer counts `N skills · M enabled`. Rows are rows in a panel
+  separated by hairlines rather than individual cards, so thirteen skills read as a list, and a row
+  expands to show its instructions with a caret that says so.
+
+  Two things are deliberately not ported from that panel, and both would need machinery this app
+  does not have. It can **import skills from external agents** by copying or symlinking their
+  directories and **sync a skill to a remote host** — our skills are database rows, not folders, and
+  reading a directory outside the workspace root is a widening of host file access that should be a
+  decision, not a side effect of a redesign. Its **scope selector** (per agent/workspace) has no
+  equivalent here either: the Source filter covers builtin-versus-yours, and per-conversation reach
+  is already the session drawer in the transcript.
+
+  The two honesty notes stayed and were compressed to a line each. The instruction text is shown
+  before installing and after, and the consequence of a delete is stated per source — a builtin can
+  be installed again from the catalog, an operator's own skill cannot — because a confirmation that
+  says the same thing either way is a confirmation about nothing.
 
 - **The gateway no longer advertises tools it will refuse.** Four of the eight agent tools
   (`write_file`, `edit_file`, `mkdir`, `run_command`) are refused at call time while gateway
@@ -101,6 +144,20 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   form *absent*.
 
 ### Fixed
+
+- **A builtin skill added to the catalog could never reach an install that already had skills.**
+  Seeding stamped one boolean (`skills_seeded`) and returned early forever after, so `BUILTINS` was
+  read by a fresh database and by nothing else: the catalog could grow, and every existing install
+  kept the four it started with until the operator noticed the Catalog section and installed the
+  rest by hand. The record is now per slug — a `settings` row naming the builtins already placed —
+  so a builtin from a later release lands on a database seeded long ago, while a revoked one stays
+  revoked and a disabled one stays disabled. The old flag is still read, and read as the *smaller*
+  claim: a database carrying it holds the original four and not the current catalog, because
+  recording more slugs than it holds is exactly what would resurrect a builtin the operator removed.
+  One limit is worth stating: an already-placed row is never updated, so a release that *edits* a
+  builtin's text still does not reach an install that already has it — revoke it and reinstall from
+  the catalog to pick up a changed body. Newly added builtins reach every install; edited ones do
+  not.
 
 - **A reasoning model's answer was silently dropped on the non-streaming Anthropic path, because the
   template read block 0.** `content` is a mixed block array and the *provider* decides the order:

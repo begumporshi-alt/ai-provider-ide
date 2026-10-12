@@ -13,6 +13,28 @@ import { expect, test, type Page } from "@playwright/test";
 const APP = "/web-test/";
 
 /**
+ * The shipped builtin catalog, which the shim mirrors from `skills.rs`. Named rather than written
+ * into the assertions so that adding an entry to the catalog is one edit here instead of a hunt
+ * through the count strings — the catalog is expected to grow.
+ */
+const BUILTINS = 13;
+const BUILTIN_SLUGS = [
+  "byte-slice-panic",
+  "code-review",
+  "commit-message",
+  "error-notes",
+  "explain-code",
+  "fix-to-skill",
+  "grill-plan",
+  "lean-reading",
+  "protocol-leak-triage",
+  "screen-design-brief",
+  "subagent-dispatch",
+  "test-writer",
+  "verify-before-done",
+];
+
+/**
  * Seed through the host, for state the UI has no way to produce on its own — an agent run needs
  * a real model round-trip, and there is no reason to spend one to verify a table renders.
  */
@@ -43,31 +65,38 @@ test("skills: revoke a builtin, then reinstall it from the catalog", async ({ pa
   await page.goto(`${APP}?seed=or-router`);
   await page.getByRole("button", { name: "Skills", exact: true }).click();
 
-  // The four builtins seed once, on first read.
-  await expect(page.getByText("4 installed · 4 active")).toBeVisible({ timeout: 15_000 });
+  // The builtin catalog seeds on first read, and the footer counts what is in play.
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible({ timeout: 15_000 });
 
-  // Revoke one. `.last()` because every ancestor div also matches the filter.
-  const row = page.locator("div.rounded.border").filter({ hasText: "Code review" }).last();
-  await row.getByText("revoke").click();
-  await expect(page.getByText("3 installed · 3 active")).toBeVisible();
+  // Delete one. It asks first — a delete with no confirmation is a click away from losing the
+  // operator's own writing — so the row's trash opens a dialog and the dialog does the work.
+  const row = page.getByTestId("skill-row").filter({ hasText: "Code review" });
+  await row.getByLabel("Delete Code review").click();
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  await expect(page.getByText(`${BUILTINS - 1} skills · ${BUILTINS - 1} enabled`)).toBeVisible();
 
-  // A revoked builtin is not gone for good — the catalog is how it comes back.
-  await expect(page.getByText("Code review", { exact: true })).toHaveCount(1); // catalog entry only
-  await page.getByRole("button", { name: "install", exact: true }).click();
-  await expect(page.getByText("4 installed · 4 active")).toBeVisible();
+  // A deleted builtin is not gone for good — the catalog is how it comes back.
+  await expect(page.getByText("Code review", { exact: true })).toHaveCount(1); // the Available row only
+  await page.getByLabel("Install Code review").click();
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible();
 
-  // And it stays revoked if we merely re-read: seeding happens once, not on every list.
+  // The catalog is back to whole, and re-reading the list neither duplicated nor resurrected
+  // anything: the shim seeds per slug and records what it placed.
   const slugs = await page.evaluate(() =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     ((window as any).__webTest.store.skills() as { slug: string }[]).map((s) => s.slug).sort(),
   );
-  expect(slugs).toEqual(["code-review", "commit-message", "explain-code", "test-writer"]);
+  expect(slugs).toEqual(BUILTIN_SLUGS);
 });
 
 test("skills: a pasted SKILL.md is parsed before it is installed", async ({ page }) => {
   await page.goto(`${APP}?seed=or-router`);
   await page.getByRole("button", { name: "Skills", exact: true }).click();
-  await expect(page.getByText("4 installed · 4 active")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible({ timeout: 15_000 });
+
+  // The composer lives behind the toolbar's New button, the way the reference screen keeps its
+  // list and its editor separate instead of stacking a textarea under the rows.
+  await page.getByRole("button", { name: "New skill" }).click();
 
   const box = page.getByPlaceholder(/name: My Skill/);
   await box.fill("---\nname: Release Notes\ndescription: summarise a release\n---\n1. Read the tags.\n2. Summarise.\n");
@@ -79,20 +108,72 @@ test("skills: a pasted SKILL.md is parsed before it is installed", async ({ page
   await expect(page.getByText(/characters of instructions/)).toBeVisible();
 
   await page.getByRole("button", { name: "install skill" }).click();
-  await expect(page.getByText("5 installed · 5 active")).toBeVisible();
+  await expect(page.getByText(`${BUILTINS + 1} skills · ${BUILTINS + 1} enabled`)).toBeVisible();
+});
+
+test("skills: search and the status filter narrow the panel, and the switch drives the filter", async ({ page }) => {
+  await page.goto(`${APP}?seed=or-router`);
+  await page.getByRole("button", { name: "Skills", exact: true }).click();
+  const panel = page.getByTestId("skills-installed");
+  const footer = page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`);
+  await expect(footer).toBeVisible({ timeout: 15_000 });
+  await expect(panel.getByTestId("skill-row")).toHaveCount(BUILTINS);
+
+  // Search narrows the panel and leaves the footer alone: the footer is a statement about the
+  // whole installed set, so a filter must not move it.
+  await page.getByLabel("Search skills").fill("lean reading");
+  await expect(panel.getByTestId("skill-row")).toHaveCount(1);
+  await expect(panel.getByText("Lean reading")).toBeVisible();
+  await expect(footer).toBeVisible();
+
+  await page.getByLabel("Search skills").fill("zzz-nothing-matches");
+  await expect(page.getByText("No skills found").first()).toBeVisible();
+  await page.getByLabel("Search skills").fill("");
+
+  // Every seeded builtin is enabled, so a Disabled filter finds nothing until a switch is flipped.
+  await page.getByLabel("Status filter").selectOption("Disabled");
+  await expect(panel.getByTestId("skill-row")).toHaveCount(0);
+  await page.getByLabel("Status filter").selectOption("Enabled");
+  await expect(panel.getByTestId("skill-row")).toHaveCount(BUILTINS);
+
+  // The switch is what that filter is asking about.
+  await page.getByLabel("Status filter").selectOption("all");
+  await panel.getByLabel("Disable Lean reading").click();
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS - 1} enabled`)).toBeVisible();
+  await page.getByLabel("Status filter").selectOption("Disabled");
+  await expect(panel.getByTestId("skill-row")).toHaveCount(1);
+});
+
+test("skills: the delete dialog can be declined, and it says what the delete costs", async ({ page }) => {
+  await page.goto(`${APP}?seed=or-router`);
+  await page.getByRole("button", { name: "Skills", exact: true }).click();
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible({ timeout: 15_000 });
+
+  await page.getByTestId("skill-row").filter({ hasText: "Lean reading" }).getByLabel("Delete Lean reading").click();
+  const dialog = page.getByRole("dialog", { name: "Delete skill" });
+  await expect(dialog).toBeVisible();
+  // The consequence is stated per source, because it differs: a builtin is recoverable, the
+  // operator's own skill is not.
+  await expect(dialog.getByText(/stays in the catalog and can be installed again/)).toBeVisible();
+
+  await dialog.getByRole("button", { name: "Cancel" }).click();
+  await expect(dialog).toHaveCount(0);
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible();
+  await expect(page.getByTestId("skills-installed").getByTestId("skill-row")).toHaveCount(BUILTINS);
 });
 
 test("context: conversation mode draws what the skills screen recorded", async ({ page }) => {
   await page.goto(`${APP}?seed=or-router`);
   await page.getByRole("button", { name: "Skills", exact: true }).click();
-  await expect(page.getByText("4 installed · 4 active")).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible({ timeout: 15_000 });
 
-  // Reinstalling a revoked builtin is a context event, so it lands in the graph.
-  const row = page.locator("div.rounded.border").filter({ hasText: "Commit message" }).last();
-  await row.getByText("revoke").click();
-  await expect(page.getByText("3 installed · 3 active")).toBeVisible();
-  await page.getByRole("button", { name: "install", exact: true }).click();
-  await expect(page.getByText("4 installed · 4 active")).toBeVisible();
+  // Reinstalling a deleted builtin is a context event, so it lands in the graph.
+  const row = page.getByTestId("skill-row").filter({ hasText: "Commit message" });
+  await row.getByLabel("Delete Commit message").click();
+  await page.getByRole("button", { name: "Confirm delete" }).click();
+  await expect(page.getByText(`${BUILTINS - 1} skills · ${BUILTINS - 1} enabled`)).toBeVisible();
+  await page.getByLabel("Install Commit message").click();
+  await expect(page.getByText(`${BUILTINS} skills · ${BUILTINS} enabled`)).toBeVisible();
 
   await page.getByRole("button", { name: "Context", exact: true }).click();
   // One recorded skill node, and a canvas rather than the empty state.
