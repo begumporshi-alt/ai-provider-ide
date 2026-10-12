@@ -2397,13 +2397,9 @@ mod tests {
         // time is what lets the three 2 s waits sleep for free while the plan budget's real
         // `Instant` stays near zero, so every round is affordable and the count — not the clock —
         // is what stops the loop.
-        let adapter = TextScripted::new(vec![
-            refused(503),
-            refused(503),
-            refused(503),
-            refused(503),
-        ])
-        .shared();
+        let adapter =
+            TextScripted::new(vec![refused(503), refused(503), refused(503), refused(503)])
+                .shared();
         let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
 
@@ -2425,11 +2421,194 @@ mod tests {
             }
             other => panic!("expected AllAttemptsFailed, got {other:?}"),
         }
-        assert_eq!(
-            adapter.calls().len(),
-            4,
-            "first dial + three re-probes, never a fifth"
-        );
+        assert_eq!(adapter.calls().len(), 4, "first dial + three re-probes, never a fifth");
+    }
+
+    /// An adapter whose text stream never yields and never ends — the keep-alive-only stall of
+    /// ledger rows 3949/3968, with the selector-unmatched delta folded into the silence (the
+    /// interpreter sees nothing either way).
+    struct Silent;
+
+    impl AdapterInstance for Silent {
+        fn generate_image<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            Box::pin(async { Err(AttemptError::Transport) })
+        }
+
+        fn generate_text<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async {
+                Ok(Box::pin(futures_util::stream::pending())
+                    as BoxStream<'a, Result<String, AttemptError>>)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_silent_upstream_is_cut_at_the_pre_output_budget_not_cancelled_by_the_gateway() {
+        // The measured case (2026-10-12, rows 3949/3968 — same signature back to 2026-10-09): the
+        // upstream answered headers and one selector-unmatched SSE event, then went silent. The
+        // egress's idle budget is 120s, the gateway's first-message bound is 30s, so the gateway
+        // won and the request was filed as a client cancel at 30 001ms with the failure
+        // "abandoned; retry". The pre-first-output deadline hands the ending back to the engine:
+        // the attempt drains into the NO_OUTPUT arm at 20s, the same chain entry the cancellation
+        // produced, minus the cancellation. Paused time fires the 20s deadline for free against a
+        // stream that would otherwise hang the test — which is exactly what the pre-fix code did.
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let served = execute_text(
+            &Always(Arc::new(Silent)),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("a cut attempt is a served-with-nothing, not a cancel");
+
+        assert_eq!(served.candidate.provider.id, "p1");
+        assert!(seen.lock().unwrap().is_empty(), "nothing reached the sink — that is the incident");
+        assert_eq!(served.attempts.len(), 1, "the drained attempt is recorded");
+        assert_eq!(served.attempts[0].cls, ErrorClass::NoOutput);
+        assert_eq!(served.attempts[0].status, 200);
+    }
+
+    /// A stream whose first poll fires a tool call and then stalls — output that arrives during
+    /// the pre-first-output window, so the deadline must stand down rather than cut the wait.
+    struct ToolThenStall(ToolCall);
+
+    impl AdapterInstance for ToolThenStall {
+        fn generate_image<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _args: ImageArgs,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
+            Box::pin(async { Err(AttemptError::Transport) })
+        }
+
+        fn generate_text<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            mut args: TextArgs<'a>,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
+        {
+            Box::pin(async move {
+                let tc = self.0.clone();
+                let mut on_tool_call = args.on_tool_call.take();
+                let mut polled = 0usize;
+                let stream = futures_util::stream::poll_fn(move |_cx| {
+                    polled += 1;
+                    match polled {
+                        1 => {
+                            if let Some(cb) = on_tool_call.as_deref_mut() {
+                                cb(tc.clone());
+                            }
+                            std::task::Poll::Pending
+                        }
+                        _ => std::task::Poll::Ready(None),
+                    }
+                });
+                Ok(Box::pin(stream) as BoxStream<'a, Result<String, AttemptError>>)
+            })
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities { text: true, image: false }
+        }
+
+        fn tag_modality(&self, _entry: &ModelEntry) -> &'static str {
+            "text"
+        }
+
+        fn list_models<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, Result<Vec<ModelEntry>, AttemptError>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn ping_key<'a>(
+            &'a self,
+            _secret_ref: &'a str,
+            _cancel: &'a Cancel,
+        ) -> BoxFuture<'a, PingResult> {
+            Box::pin(async {
+                PingResult { ok: false, status: 0, rate_limited: false, message: None }
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn output_that_arrives_stands_the_pre_output_budget_down() {
+        // The disarm rule is the gateway's own, mirrored: any bridge message — here a tool call —
+        // disarms the first-message bound, so it disarms this deadline. A model that delivered its
+        // tool call just inside the window must not have its remaining wait (finish, usage) cut
+        // by a deadline aimed at silence.
+        let (calls, mut on_tool) = tool_sink();
+        let health = HealthTracker::new();
+        let (_seen, mut on_chunk) = sink();
+        let mut args = text_args(vec![candidate("p1", "k1", "m1")]);
+        args.on_tool_call = Some(&mut on_tool);
+
+        let served = execute_text(
+            &Always(Arc::new(ToolThenStall(ToolCall {
+                id: Some("c1".to_string()),
+                name: Some("read_file".to_string()),
+                arguments: Some("{}".to_string()),
+                raw: None,
+            }))),
+            &health,
+            None,
+            args,
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect("the tool call stands the deadline down and the stream ends served");
+
+        assert_eq!(calls.lock().unwrap().len(), 1, "the tool call was delivered");
+        assert!(served.attempts.is_empty(), "nothing failed — the deadline never fired as a cut");
+        assert_eq!(served.candidate.provider.id, "p1");
     }
 
     #[tokio::test(flavor = "multi_thread")]

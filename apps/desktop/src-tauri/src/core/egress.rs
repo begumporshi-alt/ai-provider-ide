@@ -583,6 +583,43 @@ pub const UPSTREAM_HEADER_TIMEOUT: Duration = Duration::from_secs(20);
 /// path could not previously reach because the gateway had already taken the request away.
 pub const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long the upstream may take to produce its **first output** — the first text chunk, the
+/// first reasoning delta, or the first tool call — measured from the moment the attempt begins.
+/// Enforced in `engine::text`'s attempt loop, not here: the egress speaks raw bytes and cannot
+/// tell a content event from a keep-alive, while the interpreter's stream is where "the model
+/// said something" is actually knowable.
+///
+/// **The stall this bounds is the one the 2026-09-27 entry predicted and left unfixed.** An
+/// upstream can pass every bound above — headers arrive, the first body byte arrives — and then
+/// send only events the manifest's delta selector does not match (an OpenAI-shaped stream's
+/// role-only first delta is the common one) before going silent. The interpreter then has no
+/// output, the egress waits out [`UPSTREAM_IDLE_TIMEOUT`] (120s) for an event that never comes,
+/// and the gateway's `FIRST_MSG_TIMEOUT` (30s) wins the race it was always going to win: the
+/// request dies as `CANCELLED` with *"the router produced no response within 30000ms — the
+/// request was abandoned; retry"*, a message that describes our own bound while reading like an
+/// upstream's.
+///
+/// Measured 2026-10-12, ledger rows **3949/3968** (and the same signature at 3557/3632/3653/3855
+/// back to 2026-10-09): `CANCELLED` at ~30s, chain `[NO_OUTPUT]` on the only candidate,
+/// `failure_detail` reading *"stream carried 1 SSE event(s), none matched the manifest's delta
+/// selector"*, and the log showing `first_byte_ms ≈ 1000` followed by 29s of nothing. The
+/// 09-27 entry's revisit condition — *"a keep-alive-only stall is observed, which would justify a
+/// first-content bound"* — is met.
+///
+/// **What counts as output is the gateway's own rule, mirrored.** Any bridge message disarms
+/// `FIRST_MSG_TIMEOUT` — a `Delta`, a `Reasoning`, a tool call — so those disarm this deadline
+/// too. A reasoning-only stream (a thinking model with a long pre-answer silence between *events*)
+/// is therefore never cut here; what it is subject to is the egress idle bound, as before. A
+/// stream cut by this deadline ends the attempt as a drained `NO_OUTPUT` — the exact chain entry
+/// the 30s cancellation produced, minus the cancellation — so the caller gets the legible
+/// "every delta was X, no text was sent" failure while the plan budget can still act on it.
+///
+/// **Sized at the same 20s, from the same calibration** as [`UPSTREAM_FIRST_BYTE_TIMEOUT`]:
+/// `first_msg_ms` p99 18.6s over the 09-27 measurement, 0/54 past 20s. Ordered below
+/// `PLAN_BUDGET < FIRST_MSG_TIMEOUT` so the engine's failure always beats the gateway's —
+/// pinned by `the_pre_first_byte_budget_encloses_the_header_budget`.
+pub const UPSTREAM_FIRST_OUTPUT_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// How many *extra* attempts a **transport error** gets — and, deliberately, how many a header
 /// timeout gets: **none**.
 ///
@@ -2002,8 +2039,10 @@ mod stall_tests {
     /// proof that a second `stream` call had begun with no budget left.
     ///
     /// ```text
-    /// UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= PLAN_BUDGET < FIRST_MSG_TIMEOUT
-    ///          20s                          20s                    26s              30s
+    /// UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= UPSTREAM_FIRST_OUTPUT_TIMEOUT
+    ///          20s                          20s                         20s
+    ///   <= PLAN_BUDGET < FIRST_MSG_TIMEOUT
+    ///       26s              30s
     /// ```
     ///
     /// **The leftmost term was added hours after the two beside it, because this ordering was
@@ -2016,6 +2055,12 @@ mod stall_tests {
     /// overrun, and the `header <= per_attempt` clause keeps the sub-bound from silently
     /// swallowing it.
     ///
+    /// **`UPSTREAM_FIRST_OUTPUT_TIMEOUT` is the same correction, one phase later.** The first
+    /// *byte* is not the first *output*: an upstream that sends only selector-unmatched events
+    /// (rows 3949/3968, 2026-10-12) passes the byte bound, stalls inside the 120s idle budget, and
+    /// the gateway cancels at 30s. The output bound is enforced in `engine::text`, where content is
+    /// knowable, and it must stay inside the plan budget for the same reason the byte bound does.
+    ///
     /// The left inequality is what makes `PLAN_BUDGET` a real bound rather than a hope: the engine
     /// admits a candidate only when it can fund a full attempt, so no admitted candidate can run
     /// past the plan. The right inequality is the original one, kept. A deliberate retune of all
@@ -2027,6 +2072,9 @@ mod stall_tests {
         // the header wait inside it: an attempt that gets headers and then no body costs the full
         // `first_byte` budget, so that is the term the plan has to fund.
         let per_attempt = UPSTREAM_FIRST_BYTE_TIMEOUT;
+        // The pre-first-OUTPUT phase encloses the byte phase: an attempt that gets bytes but no
+        // output the interpreter recognizes costs this budget.
+        let first_output = UPSTREAM_FIRST_OUTPUT_TIMEOUT;
         let plan = crate::core::engine::PLAN_BUDGET;
         let gateway_bound = crate::core::gateway::FIRST_MSG_TIMEOUT;
         assert!(
@@ -2037,10 +2085,16 @@ mod stall_tests {
              including a genuine pre-headers one — would be reported as a missing body."
         );
         assert!(
-            per_attempt <= plan,
-            "one attempt may cost {per_attempt:?}, but the whole plan is budgeted {plan:?} — a \
+            per_attempt <= first_output,
+            "the first byte may cost {per_attempt:?} but the phase containing it — up to the first \
+             recognized output — is only {first_output:?}. A byte bound larger than the output \
+             phase can never fire, and the keep-alive-only stall of rows 3949/3968 returns."
+        );
+        assert!(
+            first_output <= plan,
+            "one attempt may cost {first_output:?}, but the whole plan is budgeted {plan:?} — a \
              candidate admitted for a full attempt could then overrun the plan. Raise PLAN_BUDGET \
-             or lower UPSTREAM_HEADER_TIMEOUT."
+             or lower UPSTREAM_FIRST_OUTPUT_TIMEOUT."
         );
         assert!(
             plan < gateway_bound,

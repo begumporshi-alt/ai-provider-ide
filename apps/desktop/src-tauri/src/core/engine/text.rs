@@ -5,6 +5,8 @@
 use futures_util::StreamExt;
 use serde_json::Value;
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::core::adapter::{
@@ -22,6 +24,7 @@ use super::attempt::{
 use super::health::HealthTracker;
 use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
 use super::{now_ms, AllAttemptsFailed};
+use crate::core::egress::UPSTREAM_FIRST_OUTPUT_TIMEOUT;
 
 /// What one text request is asked to do. The Rust port of `executeText`'s argument
 /// (`execution-engine.ts:23-39`).
@@ -300,8 +303,13 @@ pub async fn execute_text(
                 // same four errors either way, and a single `'a` compiles the moment this closure
                 // exists. So the seam did not need changing and the call site did.
                 let mut caller_on_tool_call = args.on_tool_call.as_deref_mut();
+                // **The deadline's output flag.** Declared here so both output forwards — tool
+                // calls and reasoning — set it; see the reasoning closure below for why.
+                let output_flowed = Arc::new(AtomicBool::new(false));
+                let tool_flag = Arc::clone(&output_flowed);
                 let mut forward_tool = |tc: ToolCall| {
                     tool_calls += 1;
+                    tool_flag.store(true, Ordering::Relaxed);
                     if let Some(cb) = caller_on_tool_call.as_deref_mut() {
                         cb(tc);
                     }
@@ -314,13 +322,18 @@ pub async fn execute_text(
                         cb(reason);
                     }
                 };
-                // The same shape again, and deliberately NOTHING beside the forward: no counter, no
-                // `emitted`, no disposition. Reasoning is not delivered output — a stream that only
-                // reasoned is still a drained stream (`NO_OUTPUT` when the observation says it
-                // reasoned), and the pass-through consumer renders what it receives without that
-                // changing what the turn was.
+                // The same local-closure shape again — and one shared flag beside the forwards,
+                // which the old comment forbade. The flag feeds the pre-first-output deadline in
+                // the stream loop: a reasoning delta or a tool call is output the gateway would
+                // disarm its first-message bound on, so it disarms this deadline too. It is shared
+                // (`Arc<AtomicBool>`) rather than a captured local because the closures live as
+                // long as the stream borrow, and the loop must read the flag while they do.
+                // Still nothing beside the forwards for *disposition* — reasoning is not delivered
+                // output, and a stream that only reasoned is still a drained stream.
                 let mut caller_on_reasoning = args.on_reasoning.as_deref_mut();
+                let reasoned_flag = Arc::clone(&output_flowed);
                 let mut forward_reasoning = |text: &str| {
+                    reasoned_flag.store(true, Ordering::Relaxed);
                     if let Some(cb) = caller_on_reasoning.as_deref_mut() {
                         cb(text);
                     }
@@ -350,30 +363,69 @@ pub async fn execute_text(
                 // not live long enough", with the compiler pointing at the whole `match`. Binding the
                 // result first drops the temporary at the end of this statement, which is before the
                 // locals and after the stream has been drained.
-                let refusal =
-                    match adapter.generate_text(&candidate.key.secret_ref, text_args, cancel).await
-                    {
-                        // The response phase refused: nothing reached the sink, so this attempt is
-                        // retryable and the loop classifies it below.
-                        Err(e) => Some(e),
-                        Ok(mut stream) => {
-                            while let Some(item) = stream.next().await {
-                                match item {
-                                    Ok(chunk) => {
-                                        // `:100-103`. Only the flag is needed: the candidate is the loop
-                                        // variable, so `served` is carried out rather than cloned.
-                                        emitted = true;
-                                        on_chunk(&chunk);
-                                    }
-                                    Err(e) => {
-                                        broke = Some(e);
+                let refusal = match adapter
+                    .generate_text(&candidate.key.secret_ref, text_args, cancel)
+                    .await
+                {
+                    // The response phase refused: nothing reached the sink, so this attempt is
+                    // retryable and the loop classifies it below.
+                    Err(e) => Some(e),
+                    Ok(mut stream) => {
+                        // **The pre-first-output deadline** — see
+                        // `egress::UPSTREAM_FIRST_OUTPUT_TIMEOUT` for the measured incident it
+                        // closes. An upstream can pass every egress bound and then stream only
+                        // events the manifest does not select before going silent; here nothing
+                        // has reached the sink, so this loop waits on the egress's 120s idle
+                        // budget while the gateway's 30s bound wins the race and files the
+                        // request as a client cancel. The deadline hands the ending back to the
+                        // engine: a cut attempt drains into the `NO_OUTPUT` arm below, the
+                        // same chain entry the cancellation produced, minus the cancellation.
+                        //
+                        // Disarmed by anything the gateway would count: a chunk, a tool call,
+                        // or a reasoning delta (`reasoned`, set in `forward_reasoning`). Once
+                        // output has flowed the gateway is no longer about to cancel, and the
+                        // stream's own idle bound is the right budget again.
+                        let mut armed =
+                            Some(Box::pin(tokio::time::sleep(UPSTREAM_FIRST_OUTPUT_TIMEOUT)));
+                        loop {
+                            let item = match armed.as_mut() {
+                                Some(sleep) => tokio::select! {
+                                    item = stream.next() => item,
+                                    _ = sleep => {
+                                        armed = None;
+                                        if output_flowed.load(Ordering::Relaxed) {
+                                            continue;
+                                        }
+                                        tracing::warn!(
+                                            silent_ms =
+                                                UPSTREAM_FIRST_OUTPUT_TIMEOUT.as_millis() as u64,
+                                            "upstream produced no output — ending the attempt \
+                                             before the gateway's first-message bound does",
+                                        );
                                         break;
                                     }
+                                },
+                                None => stream.next().await,
+                            };
+                            match item {
+                                Some(Ok(chunk)) => {
+                                    // `:100-103`. Only the flag is needed: the candidate is the
+                                    // loop variable, so `served` is carried out rather than
+                                    // cloned.
+                                    emitted = true;
+                                    armed = None;
+                                    on_chunk(&chunk);
                                 }
+                                Some(Err(e)) => {
+                                    broke = Some(e);
+                                    break;
+                                }
+                                None => break,
                             }
-                            None
                         }
-                    };
+                        None
+                    }
+                };
                 refusal
             };
 

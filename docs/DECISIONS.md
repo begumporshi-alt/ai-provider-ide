@@ -1727,3 +1727,40 @@ that is not drift (then the rethrown path needs its own health record).
 - **Revisit if:** a client needs stream replays (reserve the terminal SSE frame), or
   canonicalisation becomes necessary (very large bodies, header-dependent semantics) — at which
   point the fingerprint grows into a hash and the stored scope gains a normalized-body column.
+
+## 2026-10-12 — The keep-alive-only stall gets the first-output bound the 09-27 entry deferred
+
+- **The observed residual, arriving on schedule.** The 2026-09-27 entry ended: *"Revisit if: a
+  keep-alive-only stall is observed, which would justify a first-content bound."* Ledger rows
+  3557/3632/3653/3855 (2026-10-09 → 10-12) and **3949/3968** (2026-10-12, 21:52 and 21:55 local)
+  are that stall, seven times: `CANCELLED` at ~30s, chain `[NO_OUTPUT]`, `failure_detail` reading
+  *"stream carried 1 SSE event(s), none matched the manifest's delta selector"*, and the log showing
+  `first_byte_ms ≈ 1000` followed by 29s of silence. The upstream (vice, the same host family as the
+  flap fixed the same day) answered headers, sent one OpenAI role-only delta the manifest does not
+  select, and stopped talking. Every egress bound had been passed; the 120s idle budget outlived the
+  gateway's 30s `FIRST_MSG_TIMEOUT` exactly as the entry predicted, and the client read *"the router
+  produced no response within 30000ms — the request was abandoned; retry"* — our own literal, reading
+  like an upstream's.
+- **Decision:** bound the pre-first-**output** phase at 20s (`UPSTREAM_FIRST_OUTPUT_TIMEOUT`, same
+  number and same `first_msg_ms` calibration as the byte bound), enforced in `engine::text`'s attempt
+  loop rather than the egress — the egress speaks bytes and cannot tell content from keep-alive; the
+  interpreter's stream is where "the model said something" is knowable. The disarm rule is the
+  gateway's own, mirrored: any bridge message (chunk, reasoning delta, tool call) stands the deadline
+  down, so a thinking model's reasoning stream and a slow tool-call stream are never cut. A cut
+  attempt drains into the existing `NO_OUTPUT` arm — the same chain entry the 30s cancellation
+  produced, minus the cancellation — so the failure is legible and the plan budget can still act.
+- **The mechanism, precisely:** the attempt's first wait on the stream is `select`ed against a 20s
+  sleep; expiry with the shared `output_flowed` flag unset logs
+  `upstream produced no output` and breaks, dropping the stream (and the egress connection with it).
+  Output flowing disarms permanently for the attempt; mid-stream silence after that remains the
+  egress idle bound's job, as before.
+- **Falsification:** with the deadline disabled (armed = None), the new
+  `a_silent_upstream_is_cut_at_the_pre_output_budget_not_cancelled_by_the_gateway` test — paused
+  time, a forever-pending stream — hangs, which is precisely the production wait it names. Restored,
+  it passes. `output_that_arrives_stands_the_pre_output_budget_down` pins the disarm branch;
+  `the_plan_budget_fits_inside_the_gateway_bound` gains the
+  `first_byte <= first_output <= PLAN_BUDGET` clauses. Gates: `cargo test --lib` 1596/0,
+  `cargo fmt --check` clean, `cargo clippy --all-targets` 0 warnings.
+- **Revisit if:** `first_msg_ms` accumulates past 20s at the p99 (raise this with
+  `UPSTREAM_FIRST_BYTE_TIMEOUT`, `PLAN_BUDGET` and `FIRST_MSG_TIMEOUT` together); or an output-that-
+  then-silences stall is observed, which would justify tightening the post-output idle budget too.
