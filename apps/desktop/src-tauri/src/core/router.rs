@@ -518,7 +518,13 @@ impl RouterError {
                 }
             }
             RouterError::Text(failure) => match failure.as_ref() {
-                TextFailure::MidStream { error, .. } => format!("mid-stream failure: {error:?}"),
+                TextFailure::MidStream { error, .. } => match error.message() {
+                    // The failure's own words, not a Debug render: "mid-stream failure:
+                    // Transport" told the client nothing that "upstream went silent for 120s"
+                    // would have. The fallback keeps the phrase for the wordless shapes.
+                    Some(m) => format!("mid-stream failure: {m}"),
+                    None => "mid-stream failure".to_string(),
+                },
                 TextFailure::Cancelled { .. } => "request cancelled".to_string(),
                 TextFailure::AllAttemptsFailed { error, .. } => error.describe(),
             },
@@ -1186,14 +1192,17 @@ impl<'a> ModelRouter<'a> {
                     None,
                     None,
                 ),
-                Err(TextFailure::MidStream { served, attempts, usage, .. }) => (
+                Err(TextFailure::MidStream { served, attempts, usage, error }) => (
                     ledger_row(now, TEXT, &source),
                     *usage,
                     attempts,
                     Some(served),
                     "NETWORK",
                     None,
-                    None,
+                    // The class token cannot explain a 122s hang; the egress's own words can
+                    // ("upstream went silent for 120s"). Row 4047 reached the ledger with this
+                    // column empty and took a log cross-reference to diagnose.
+                    error.message().map(str::to_string),
                 ),
                 Err(TextFailure::AllAttemptsFailed { error, usage }) => {
                     let last = error.chain.last();
@@ -2040,7 +2049,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
             self.calls.lock().unwrap().push(format!("image:{secret_ref}|{}", args.model));
             let next = self.image.lock().unwrap().pop_front();
-            Box::pin(async move { next.unwrap_or(Err(AttemptError::Transport)) })
+            Box::pin(async move { next.unwrap_or(Err(AttemptError::Transport { message: None })) })
         }
 
         fn generate_text<'a>(
@@ -2059,7 +2068,7 @@ mod tests {
             let reasoning = self.reasoning.lock().unwrap().pop_front().unwrap_or_default();
             Box::pin(async move {
                 match next {
-                    None => Err(AttemptError::Transport),
+                    None => Err(AttemptError::Transport { message: None }),
                     Some(Err(e)) => Err(e),
                     Some(Ok(chunks)) => {
                         // Reasoning first — the order the model produces it in — and through its
@@ -2653,8 +2662,10 @@ mod tests {
         assert_eq!(adapter.calls().len(), 1, "only one candidate was contacted");
 
         // The ledger row names the provider that served, and the class is `NETWORK` — the Rust
-        // router's `MidStream` arm hardcodes it (`router.rs:1076`), which is the analogue of the
-        // TS engine's `NETWORK` for a non-`ManifestHttpError` throw. Skipping key health is safe
+        // router's `MidStream` arm fixes the class (`router.rs:1189`), which is the analogue of the
+        // TS engine's `NETWORK` for a non-`ManifestHttpError` throw. This break carries no words
+        // (`body: None`), so the detail column stays empty; the transport break that does carry
+        // them is the next test. Skipping key health is safe
         // because the invariant `a_rethrown_failure_is_always_a_drift_class` covers it: a mid-stream
         // break after a tool call classifies the same way as one after a chunk.
         let row = &rows(&router.ledger())[0];
@@ -2669,6 +2680,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_stream_transport_break_writes_its_words_into_the_ledger_row() {
+        // The measured case (2026-10-12, ledger row 4047): 122s of mid-stream silence filed as a
+        // bare `NETWORK` with an empty `failure_detail` — a hang explainable only by
+        // cross-referencing the log. The egress's diagnosis now rides the error into the row's
+        // detail column, the same slot a drained stream's observation uses.
+        let store = one_provider();
+        let adapter = Scripted::new(vec![chunks(&["half"])]).with_breaks(vec![Some(
+            AttemptError::Transport {
+                message: Some("upstream went silent for 120s — abandoning the stream".to_string()),
+            },
+        )]);
+        let mut router = ModelRouter::new(&store, factory(adapter.clone()));
+        let (_seen, mut on_chunk) = sink();
+
+        let error = router
+            .generate_text(text_req("m1"), &opts("gateway"), &Cancel::new(), &mut on_chunk)
+            .await
+            .expect_err("a mid-stream break rethrows");
+
+        let failure = text_failure(&error);
+        assert!(matches!(failure, TextFailure::MidStream { .. }), "got {failure:?}");
+
+        let row = &rows(&router.ledger())[0];
+        assert_eq!(row.status, "error");
+        assert_eq!(row.error_class.as_deref(), Some("NETWORK"));
+        assert_eq!(
+            row.failure_detail.as_deref(),
+            Some("upstream went silent for 120s — abandoning the stream"),
+            "the row explains the 122s the class token cannot"
+        );
+        let chain = row.fallback_chain_json.as_deref().unwrap_or("[]");
+        assert!(
+            chain.contains("upstream went silent for 120s"),
+            "the chain entry carries the reason: {chain}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn a_whole_plan_of_refusals_records_the_last_class_and_the_chain() {
         // Three candidates means three keys; give the provider three.
         let store = RouterStore::hydrate(
@@ -2677,8 +2726,11 @@ mod tests {
             vec![model("p1", "m1", TEXT)],
             vec![],
         );
-        let adapter =
-            Scripted::new(vec![Err(refusal(404)), Err(refusal(429)), Err(AttemptError::Transport)]);
+        let adapter = Scripted::new(vec![
+            Err(refusal(404)),
+            Err(refusal(429)),
+            Err(AttemptError::Transport { message: None }),
+        ]);
         let mut router = ModelRouter::new(&store, factory(adapter.clone()));
         let (_seen, mut on_chunk) = sink();
 
@@ -3520,7 +3572,7 @@ mod tests {
             _args: ImageArgs,
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn generate_text<'a>(
@@ -3536,7 +3588,7 @@ mod tests {
                 while !cancel.is_cancelled() {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
-                Err(AttemptError::Transport)
+                Err(AttemptError::Transport { message: None })
             })
         }
 

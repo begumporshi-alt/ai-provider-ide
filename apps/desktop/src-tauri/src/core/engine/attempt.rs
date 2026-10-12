@@ -268,7 +268,16 @@ pub enum AttemptError {
         body: Option<String>,
     },
     /// No HTTP answer: a transport failure, a timeout, or an adapter fault.
-    Transport,
+    ///
+    /// `message` carries the words the failure was produced with, when there were any — the
+    /// egress's own diagnosis ("upstream went silent for 120s — abandoning the stream") rather
+    /// than the bare class. **It was a unit variant until ledger row 4047 argued otherwise**
+    /// (2026-10-12, agnes-3.0-flash): a mid-stream silence reached the ledger as `NETWORK` with
+    /// an empty `failure_detail`, 122s of client-visible hang explainable only by cross-referencing
+    /// the log. The interpreter's old note claimed "nothing downstream reads it"; the ledger's
+    /// mid-stream detail column and the chain's `reason` read it now, and a transport break
+    /// without words simply passes `None`.
+    Transport { message: Option<String> },
     /// **No HTTP answer because this process refused to ask.** The egress allowlist does not contain
     /// the destination host, or a `secret_ref` was pointed at a host it is not paired with.
     ///
@@ -293,7 +302,7 @@ impl AttemptError {
     pub fn status_or_zero(&self) -> u16 {
         match self {
             AttemptError::Http { status, .. } => *status,
-            AttemptError::Transport | AttemptError::Blocked { .. } => 0,
+            AttemptError::Transport { .. } | AttemptError::Blocked { .. } => 0,
         }
     }
 
@@ -301,7 +310,18 @@ impl AttemptError {
     pub fn retry_after_ms(&self) -> Option<u64> {
         match self {
             AttemptError::Http { retry_after_ms, .. } => *retry_after_ms,
-            AttemptError::Transport | AttemptError::Blocked { .. } => None,
+            AttemptError::Transport { .. } | AttemptError::Blocked { .. } => None,
+        }
+    }
+
+    /// The failure's own words, when it was produced with any: a mid-stream break's egress
+    /// diagnosis, a refusal body, an egress denial. The ledger's mid-stream detail column and
+    /// [`RouterError::message`] render this; a class token alone cannot explain 122s of silence.
+    pub fn message(&self) -> Option<&str> {
+        match self {
+            AttemptError::Http { body, .. } => body.as_deref(),
+            AttemptError::Transport { message } => message.as_deref(),
+            AttemptError::Blocked { reason } => Some(reason),
         }
     }
 }
@@ -329,7 +349,7 @@ impl AttemptError {
 /// `429` would classify as `RateLimited` and then never cool its key. See D19.
 pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
     match e {
-        AttemptError::Transport => ErrorClass::Network,
+        AttemptError::Transport { .. } => ErrorClass::Network,
         // The third case, and the one the TypeScript cannot have: a refusal by our own egress. It is
         // not `Network` — nothing was dialled — and it is not any status class, because there was no
         // status. See `AttemptError::Blocked`.
@@ -413,7 +433,11 @@ pub fn attempt_outcome(e: &AttemptError, disposition: AttemptDisposition) -> Att
         },
         reason: match e {
             AttemptError::Http { body, .. } => reason_from_body(body.as_deref()),
-            _ => None,
+            // A transport break's own words — "went silent for 120s", "no body within 20s" — are
+            // the only explanation the chain will ever carry for it, so they ride the same slot a
+            // refusal's reason does. Row 4047 is the row that argued for this.
+            AttemptError::Transport { message } => message.clone(),
+            AttemptError::Blocked { .. } => None,
         },
         // Attached by the loop, which is the only place that holds the candidate.
         label: None,

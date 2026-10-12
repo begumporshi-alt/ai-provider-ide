@@ -903,7 +903,7 @@ mod tests {
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
             // A text double. The image half has its own double in `engine.rs`.
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn generate_text<'a>(

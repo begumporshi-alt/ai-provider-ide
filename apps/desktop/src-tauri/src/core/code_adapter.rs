@@ -691,7 +691,7 @@ mod tests {
             .list_models("key-1", &Cancel::new())
             .await
             .expect_err("a disposed adapter has no actor to answer");
-        assert_eq!(error, AttemptError::Transport);
+        assert_eq!(error, AttemptError::Transport { message: None });
     }
 
     /// An absent `size` leaves the key **out**, rather than sending `"size": null`.

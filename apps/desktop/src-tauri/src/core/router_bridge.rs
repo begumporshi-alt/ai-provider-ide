@@ -1017,7 +1017,7 @@ mod tests {
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
             let next = self.images.lock().unwrap().pop_front();
-            Box::pin(async move { next.unwrap_or(Err(AttemptError::Transport)) })
+            Box::pin(async move { next.unwrap_or(Err(AttemptError::Transport { message: None })) })
         }
 
         fn generate_text<'a>(
@@ -1044,7 +1044,9 @@ mod tests {
                 // Nothing scripted: a transport failure, which is what a real adapter reports when
                 // it cannot reach the provider. A test that under-scripts its turns sees the
                 // request fail rather than silently finishing.
-                let Some(turn) = next else { return Err(AttemptError::Transport) };
+                let Some(turn) = next else {
+                    return Err(AttemptError::Transport { message: None });
+                };
                 let ScriptedTurn { chunks, refusal, then_error, tool_calls, usage, reasoning } =
                     turn;
                 if let Some(err) = refusal {

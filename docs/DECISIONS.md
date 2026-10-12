@@ -1764,3 +1764,44 @@ that is not drift (then the rethrown path needs its own health record).
 - **Revisit if:** `first_msg_ms` accumulates past 20s at the p99 (raise this with
   `UPSTREAM_FIRST_BYTE_TIMEOUT`, `PLAN_BUDGET` and `FIRST_MSG_TIMEOUT` together); or an output-that-
   then-silences stall is observed, which would justify tightening the post-output idle budget too.
+
+## 2026-10-13 — A mid-stream silence keeps its words: `Transport` learns to carry a message
+
+- **The observed residual, the other half of the 10-12 entry's revisit clause.** Ledger row 4047
+  (2026-10-13 01:47 local, agnes-3.0-flash, turn 16 of a healthy 75k-token agent run): the upstream
+  delivered its first byte in 1.3s, the bridge produced its first message 4ms later, and then not
+  one further byte for 120s — the egress idle budget abandoned the stream at exactly 122.182s with
+  *"upstream went silent mid-stream"*. The row that recorded it: `NETWORK`, no HTTP status, **an
+  empty `failure_detail`**, and a client message that was the Debug render of the error —
+  *"mid-stream failure: Transport"*. The diagnosis took a log cross-reference; the ledger alone
+  could not have told a dead connection from a wrong route.
+- **The root cause was a documented loss whose justification had expired.** The interpreter's
+  divergence note read *"a broken line stream loses its message … nothing downstream reads it"* —
+  true when written, false since this entry: the ledger's mid-stream detail column and the chain's
+  `reason` read it now. `AttemptError::Transport` was a unit variant, so the egress's own diagnosis
+  ("went silent for 120s", "sent headers but no body") was destroyed at the seam. Discussed and
+  rejected: converting the break to the TS's `ManifestHttpError(200, mid-stream)` shape — taxonomy
+  rule 2 classifies any mid-stream kind as `PARSE_ERROR`, which would misfile a pre-output
+  connection death that is honestly `NETWORK`.
+- **Decision:** `Transport { message: Option<String> }`. The interpreter's stream-break site and
+  the unary `attempt_error_from` mapping populate it from the `HttpError` they were already
+  holding; classification is untouched (`Transport` stays `NETWORK`, status stays 0), so failover,
+  key health and re-probe behaviour are bit-identical. The words flow three ways:
+  `attempt_outcome` puts them in the chain entry's `reason` (the slot a refusal body uses);
+  the router's `MidStream` ledger arm writes them into `failure_detail` — the column the ledger
+  schema already reserves for *"the one failure shape the chain cannot describe"*; and
+  `RouterError::message` renders them instead of the Debug blob, so the client reads
+  *"mid-stream failure: upstream went silent for 120s — abandoning the stream"*.
+- **Deliberately not done:** tightening the post-output idle budget. The 10-12 entry named this
+  stall as its revisit trigger, and row 4047 is the first observation — one data point, against a
+  budget sized at 4× the gateway bound for thinking gaps that stream no bytes. A second instance
+  calibrates a tighter number; cutting it now would trade an opaque 122s for a self-inflicted
+  `NETWORK` on a legitimately slow provider, the exact failure mode the 09-27 entry exists over.
+- **Falsification:** `a_broken_line_stream_flushes_before_the_failure` now asserts the message
+  crosses the seam verbatim; `a_mid_stream_transport_break_carries_the_egress_words` pins the
+  chain reason; `a_mid_stream_transport_break_writes_its_words_into_the_ledger_row` fails on the
+  old code's empty detail column. Gates: `cargo test --lib` 1598/0, `cargo fmt --check` clean,
+  `cargo clippy --all-targets` 0 warnings.
+- **Revisit if:** the post-output silence recurs (tighten `UPSTREAM_IDLE_TIMEOUT` against the
+  accumulated idle-gap distribution, the way `first_msg_ms` calibrated the byte bound); or a
+  client surfaces `failure_detail` and needs it structured rather than prose.

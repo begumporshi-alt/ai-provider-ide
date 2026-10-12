@@ -1020,9 +1020,12 @@ mod tests {
 
     #[test]
     fn a_transport_failure_is_network_because_there_is_no_status_to_classify() {
-        assert_eq!(classify_attempt_error(&AttemptError::Transport), ErrorClass::Network);
-        assert_eq!(AttemptError::Transport.status_or_zero(), 0);
-        assert_eq!(AttemptError::Transport.retry_after_ms(), None);
+        assert_eq!(
+            classify_attempt_error(&AttemptError::Transport { message: None }),
+            ErrorClass::Network
+        );
+        assert_eq!(AttemptError::Transport { message: None }.status_or_zero(), 0);
+        assert_eq!(AttemptError::Transport { message: None }.retry_after_ms(), None);
     }
 
     #[test]
@@ -1185,7 +1188,7 @@ mod tests {
 
         // No answer at all: status 0 is the sentinel, not a status.
         assert_eq!(
-            attempt_outcome(&AttemptError::Transport, AttemptDisposition::Next),
+            attempt_outcome(&AttemptError::Transport { message: None }, AttemptDisposition::Next),
             outcome(ErrorClass::Network, 0, None)
         );
     }
@@ -1283,8 +1286,12 @@ mod tests {
             self.calls.lock().unwrap().push(format!("{secret_ref}|{}", args.model));
             // A script that runs out answers as a transport failure, so an under-scripted test
             // fails loudly instead of passing on a silent default.
-            let next =
-                self.replies.lock().unwrap().pop_front().unwrap_or(Err(AttemptError::Transport));
+            let next = self
+                .replies
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(AttemptError::Transport { message: None }));
             Box::pin(async move { next })
         }
 
@@ -1300,7 +1307,7 @@ mod tests {
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError>>
         {
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn capabilities(&self) -> Capabilities {
@@ -1840,7 +1847,7 @@ mod tests {
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
             // The mirror of `Scripted`'s text half: failing loudly beats answering a question this
             // double was never built to answer.
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn generate_text<'a>(
@@ -1859,7 +1866,7 @@ mod tests {
                     .lock()
                     .unwrap()
                     .pop_front()
-                    .unwrap_or(Err(AttemptError::Transport));
+                    .unwrap_or(Err(AttemptError::Transport { message: None }));
                 let items = match next {
                     Err(e) => return Err(e),
                     Ok(items) => items,
@@ -2132,6 +2139,58 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn a_mid_stream_transport_break_carries_the_egress_words() {
+        // The measured case (2026-10-12, ledger row 4047): an upstream that streamed output and
+        // then went silent for 120s was abandoned by the egress with its own diagnosis — which the
+        // interpreter's unit `Transport` then dropped, so the ledger filed a bare NETWORK with an
+        // empty detail and the client read "mid-stream failure: Transport". The words ride the
+        // error now: into the chain entry's reason, and from there to the ledger and the client.
+        let adapter = TextScripted::new(vec![Ok(vec![
+            Ok("half".to_string()),
+            Err(AttemptError::Transport {
+                message: Some("upstream went silent for 120s — abandoning the stream".to_string()),
+            }),
+        ])])
+        .shared();
+        let health = HealthTracker::new();
+        let (seen, mut on_chunk) = sink();
+
+        let failure = execute_text(
+            &Always(adapter.clone()),
+            &health,
+            None,
+            text_args(vec![candidate("p1", "k1", "m1")]),
+            &Cancel::new(),
+            &mut on_chunk,
+        )
+        .await
+        .expect_err("the break is not retryable");
+
+        match failure {
+            TextFailure::MidStream { error, attempts, .. } => {
+                assert_eq!(
+                    error,
+                    AttemptError::Transport {
+                        message: Some(
+                            "upstream went silent for 120s — abandoning the stream".to_string()
+                        )
+                    },
+                    "the egress's own words travel"
+                );
+                assert_eq!(attempts.len(), 1, "the break is still in the chain");
+                assert_eq!(attempts[0].cls, ErrorClass::Network, "no status to classify");
+                assert_eq!(
+                    attempts[0].reason.as_deref(),
+                    Some("upstream went silent for 120s — abandoning the stream"),
+                    "the chain entry explains itself"
+                );
+            }
+            other => panic!("expected MidStream, got {other:?}"),
+        }
+        assert_eq!(*seen.lock().unwrap(), vec!["half".to_string()]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn the_same_status_is_a_refusal_or_a_break_depending_on_which_phase_threw() {
         // The seam's two phases (`AdapterInstance::generate_text`), seen from the loop: two
         // identical `AttemptError` values, opposite handling. A port that classified by status alone
@@ -2310,7 +2369,7 @@ mod tests {
     async fn exhausting_the_plan_reports_every_attempt_in_order() {
         let adapter = TextScripted::new(vec![
             refused(404),
-            Err(AttemptError::Transport),
+            Err(AttemptError::Transport { message: None }),
             Err(AttemptError::Http {
                 status: 429,
                 kind: FailureKind::Response,
@@ -2436,7 +2495,7 @@ mod tests {
             _args: ImageArgs,
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn generate_text<'a>(
@@ -2521,7 +2580,7 @@ mod tests {
             _args: ImageArgs,
             _cancel: &'a Cancel,
         ) -> BoxFuture<'a, Result<ImageReply, AttemptError>> {
-            Box::pin(async { Err(AttemptError::Transport) })
+            Box::pin(async { Err(AttemptError::Transport { message: None }) })
         }
 
         fn generate_text<'a>(
@@ -2692,7 +2751,8 @@ mod tests {
         .expect("served");
         assert_eq!(limiter.in_flight_count("p1"), 0, "the served path released");
 
-        let exhausted = TextScripted::new(vec![Err(AttemptError::Transport)]).shared();
+        let exhausted =
+            TextScripted::new(vec![Err(AttemptError::Transport { message: None })]).shared();
         execute_text(
             &Always(exhausted),
             &health,

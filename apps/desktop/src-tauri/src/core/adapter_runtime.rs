@@ -495,7 +495,7 @@ mod tests {
         );
         assert_eq!(
             superseded.list_models("k", &Cancel::new()).await.unwrap_err(),
-            AttemptError::Transport,
+            AttemptError::Transport { message: None },
             "the superseded adapter's sandbox must be gone"
         );
     }
@@ -554,7 +554,7 @@ mod tests {
         assert!(rt.registered().is_empty());
         assert_eq!(
             held.list_models("k", &Cancel::new()).await.unwrap_err(),
-            AttemptError::Transport,
+            AttemptError::Transport { message: None },
             "an unregistered adapter's sandbox must be gone"
         );
     }

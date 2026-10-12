@@ -34,10 +34,10 @@
 //!   breaks on an error item, and an error item is flushed before it is produced, so no engine path
 //!   reaches this. A future consumer that stops early would see the source's tool calls and usage
 //!   and not this one's.
-//! - **A broken line stream loses its message.** [`HttpError`] carries the host's text; the engine's
-//!   `AttemptError::Transport` has no field for it, so it is dropped here. Nothing downstream reads
-//!   it — `classify_attempt_error` classifies on the type, and `AttemptOutcome` has no message — but
-//!   the source's thrown `Error` does carry it into a log.
+//! - **A broken line stream keeps its message since 2026-10-12.** [`HttpError`] carries the host's
+//!   text, and `AttemptError::Transport { message }` now holds it — ledger row 4047 (a 122s
+//!   mid-stream silence filed as bare `NETWORK` with no detail) was the evidence that "nothing
+//!   downstream reads it" had stopped being true. Sites with no words behind them pass `None`.
 //! - **A mid-stream error's body is not built at all.** The source throws
 //!   `ManifestHttpError(200, JSON.stringify(err), "mid-stream")`; the body reaches the same
 //!   unread message, so building it would be work with no reader. The status and kind are exact.
@@ -160,7 +160,7 @@ impl From<&InterpreterError> for AttemptError {
     fn from(e: &InterpreterError) -> Self {
         match e {
             InterpreterError::Http(http) => http.into(),
-            InterpreterError::Failed(_) => AttemptError::Transport,
+            InterpreterError::Failed(_) => AttemptError::Transport { message: None },
         }
     }
 }
@@ -345,11 +345,11 @@ impl ManifestInterpreter {
         // `throw new Error("manifest has no generateImage endpoint")` — a non-`ManifestHttpError`,
         // so the engine classifies it as a transport failure, which `AttemptError::Transport` is.
         let Some(ep) = self.view.endpoints.generate_image.as_ref() else {
-            return Err(AttemptError::Transport);
+            return Err(AttemptError::Transport { message: None });
         };
 
         let body = render_template(&ep.request_template, &image_values(&args, &self.ctx.vars))
-            .map_err(|_| AttemptError::Transport)?;
+            .map_err(|_| AttemptError::Transport { message: None })?;
 
         let res = self
             .ctx
@@ -384,7 +384,8 @@ impl ManifestInterpreter {
             });
         }
 
-        let json = serde_json::from_str::<Value>(&res.body).map_err(|_| AttemptError::Transport)?;
+        let json = serde_json::from_str::<Value>(&res.body)
+            .map_err(|_| AttemptError::Transport { message: None })?;
         Ok(ImageReply {
             ok: true,
             status: res.status,
@@ -424,7 +425,7 @@ impl ManifestInterpreter {
             } = args;
 
             let Some(ep) = self.view.endpoints.generate_text.as_ref() else {
-                return Err(AttemptError::Transport);
+                return Err(AttemptError::Transport { message: None });
             };
             let spec = ep.stream.as_ref();
             // `args.stream && ep.stream` — the reference's own guard (`manifest-interpreter.ts:306`),
@@ -451,7 +452,7 @@ impl ManifestInterpreter {
                 parts.and_then(|p| p.get("toolCall")).and_then(Value::as_object),
                 parts.and_then(|p| p.get("toolResult")).and_then(Value::as_object),
             )
-            .map_err(|_| AttemptError::Transport)?;
+            .map_err(|_| AttemptError::Transport { message: None })?;
             let (normalized, system_content) = dialect_shaping::normalize_dialect_messages(
                 &shaped_messages,
                 ep.messages_role_map.as_ref(),
@@ -462,13 +463,13 @@ impl ManifestInterpreter {
                 parts,
                 ep.content_field.as_deref(),
             )
-            .map_err(|_| AttemptError::Transport)?;
+            .map_err(|_| AttemptError::Transport { message: None })?;
             let shaped_tools = dialect_shaping::shape_tool_declarations(
                 tools,
                 ep.tool_declaration_templates.as_ref(),
                 ep.tool_declaration_wrapper.as_ref(),
             )
-            .map_err(|_| AttemptError::Transport)?;
+            .map_err(|_| AttemptError::Transport { message: None })?;
 
             let mut values = Map::new();
             // A dialect may put the model in the PATH (`{{model}}`), so the segment survives the
@@ -548,7 +549,7 @@ impl ManifestInterpreter {
             }
 
             let mut body = render_template(&ep.request_template, &values)
-                .map_err(|_| AttemptError::Transport)?;
+                .map_err(|_| AttemptError::Transport { message: None })?;
 
             // **`args.stream`, not `streaming`.** The source tests the caller's request, so a
             // manifest with no stream block still gets the field when the caller asked to stream.
@@ -660,10 +661,10 @@ impl ManifestInterpreter {
                 // Unreachable: `streaming` implies a spec. Written as a match rather than an
                 // `expect` so a future change to that implication fails as a transport error
                 // instead of a panic in a request path.
-                return Err(AttemptError::Transport);
+                return Err(AttemptError::Transport { message: None });
             };
             let Some(lines) = res.lines else {
-                return Err(AttemptError::Transport);
+                return Err(AttemptError::Transport { message: None });
             };
 
             Ok(Box::pin(TextStream {
@@ -901,7 +902,7 @@ fn parse_body(body: &str) -> Result<Value, InterpreterError> {
 fn select_string(json: &Value, path: Option<&str>) -> Result<Option<String>, AttemptError> {
     let Some(path) = path else { return Ok(None) };
     Ok(select_one(json, path)
-        .map_err(|_| AttemptError::Transport)?
+        .map_err(|_| AttemptError::Transport { message: None })?
         .and_then(Value::as_str)
         .map(str::to_string))
 }
@@ -1014,7 +1015,7 @@ fn attempt_error_from(e: HttpError) -> AttemptError {
     if e.is_denied() {
         AttemptError::Blocked { reason: e.message }
     } else {
-        AttemptError::Transport
+        AttemptError::Transport { message: Some(e.message) }
     }
 }
 
@@ -1290,11 +1291,13 @@ fn unary_text<'a>(
     on_finish: Option<&'a mut (dyn FnMut(Option<String>) + Send)>,
     on_reasoning: Option<&'a mut (dyn FnMut(&str) + Send)>,
 ) -> Result<BoxStream<'a, Result<String, AttemptError>>, AttemptError> {
-    let json: Value = serde_json::from_str(body).map_err(|_| AttemptError::Transport)?;
+    let json: Value =
+        serde_json::from_str(body).map_err(|_| AttemptError::Transport { message: None })?;
 
     // `if (typeof text === "string") yield text;` — a miss yields nothing, and an empty string *is*
     // yielded, because the guard is on the type and not on truthiness.
-    let chunk = select_text(&json, &ep.response_map.text).map_err(|_| AttemptError::Transport)?;
+    let chunk = select_text(&json, &ep.response_map.text)
+        .map_err(|_| AttemptError::Transport { message: None })?;
 
     // The reasoning, when the reply was mostly reasoning: the **thinking** blocks of the same mixed
     // array `select_text` reads past (`thinking_text`). Fired on the stream's first poll — the
@@ -1302,7 +1305,7 @@ fn unary_text<'a>(
     let reasoning = match on_reasoning.is_some() {
         true => {
             let joined = select_one(&json, &ep.response_map.text)
-                .map_err(|_| AttemptError::Transport)?
+                .map_err(|_| AttemptError::Transport { message: None })?
                 .map(thinking_text)
                 .unwrap_or_default();
             (!joined.is_empty()).then_some(joined)
@@ -1315,7 +1318,7 @@ fn unary_text<'a>(
     let tool_calls = match &ep.response_map.tool_calls {
         Some(path) => Some(
             select_one(&json, path)
-                .map_err(|_| AttemptError::Transport)?
+                .map_err(|_| AttemptError::Transport { message: None })?
                 .cloned()
                 .unwrap_or(Value::Null),
         ),
@@ -1325,10 +1328,12 @@ fn unary_text<'a>(
     // The usage path is guarded by the callback *first*, which short-circuits the selector — the
     // source's `if (args.onUsage && ep.responseMap.usage)`.
     let usage = match (&ep.response_map.usage, on_usage.is_some()) {
-        (Some(path), true) => match select_one(&json, path).map_err(|_| AttemptError::Transport)? {
-            Some(Value::Object(map)) => read_usage(map, ep.response_map.usage_keys.as_ref()),
-            _ => None,
-        },
+        (Some(path), true) => {
+            match select_one(&json, path).map_err(|_| AttemptError::Transport { message: None })? {
+                Some(Value::Object(map)) => read_usage(map, ep.response_map.usage_keys.as_ref()),
+                _ => None,
+            }
+        }
         _ => None,
     };
 
@@ -1336,7 +1341,7 @@ fn unary_text<'a>(
     // OpenAI vocabulary at the single point it is read.
     let finish_reason = match (&ep.response_finish, on_finish.is_some()) {
         (Some(path), true) => select_one(&json, path)
-            .map_err(|_| AttemptError::Transport)?
+            .map_err(|_| AttemptError::Transport { message: None })?
             .and_then(Value::as_str)
             .filter(|s| !s.is_empty() && *s != "null")
             .map(|s| {
@@ -1889,9 +1894,11 @@ impl Stream for TextStream<'_> {
                 // A transport break in the line stream. The source throws from inside the
                 // generator, so the flush runs *before* the consumer sees the failure — which is
                 // why the flush is here and not after the item is produced.
-                Poll::Ready(Some(Err(_))) => {
+                Poll::Ready(Some(Err(e))) => {
                     this.flush();
-                    return Poll::Ready(Some(Err(AttemptError::Transport)));
+                    return Poll::Ready(Some(Err(AttemptError::Transport {
+                        message: Some(e.message),
+                    })));
                 }
                 Poll::Ready(Some(Ok(line))) => match this.handle_line(&line) {
                     LineStep::Chunk { text, end } => {
@@ -3208,7 +3215,7 @@ mod tests {
             Ok(_) => panic!("a missing required field must not produce a stream"),
             Err(e) => e,
         };
-        assert_eq!(err, AttemptError::Transport);
+        assert_eq!(err, AttemptError::Transport { message: None });
         assert!(http.requests().is_empty(), "nothing may reach the network");
     }
 
@@ -3511,7 +3518,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_eq!(err, AttemptError::Transport);
+        assert_eq!(err, AttemptError::Transport { message: None });
         assert!(http.requests().is_empty());
     }
 
@@ -3597,7 +3604,7 @@ mod tests {
             Ok(_) => panic!("an unreadable body must not produce a stream"),
             Err(e) => e,
         };
-        assert_eq!(err, AttemptError::Transport);
+        assert_eq!(err, AttemptError::Transport { message: None });
     }
 
     /* ---------------------------------------------------------- text: stream */
@@ -3974,7 +3981,7 @@ mod tests {
     }
 
     /// **A broken line stream flushes first and then fails**, for the same reason: the host's
-    /// message is dropped (`AttemptError::Transport` has no field for it) but the report is not.
+    /// message rides the error now (`Transport { message }`) but the report is not dropped.
     #[tokio::test]
     async fn a_broken_line_stream_flushes_before_the_failure() {
         let http = FakeHttp::new(vec![Scripted::sse_then_break(
@@ -4000,7 +4007,11 @@ mod tests {
         }
 
         assert_eq!(observed.len(), 1);
-        assert_eq!(observed[0].0, Err(AttemptError::Transport));
+        assert_eq!(
+            observed[0].0,
+            Err(AttemptError::Transport { message: Some("upstream went silent for 120s".into()) }),
+            "the egress's own words survive the crossing"
+        );
         assert_eq!(observed[0].1, 1, "the flush preceded the failure");
     }
 
@@ -4162,10 +4173,10 @@ mod tests {
             err
         }
 
-        // A genuine host failure: no answer, and a message naming nothing in particular.
+        // A genuine host failure: no answer, but the egress's words travel with it now.
         assert_eq!(
             failure_from(HttpError::new("connection reset by peer")).await,
-            AttemptError::Transport
+            AttemptError::Transport { message: Some("connection reset by peer".into()) }
         );
 
         // **The discriminating input.** This message is the exact string the previous spelling of
@@ -4174,7 +4185,7 @@ mod tests {
         // at the text, this is the assertion that reddens.
         assert_eq!(
             failure_from(HttpError::new("host not allowlisted")).await,
-            AttemptError::Transport
+            AttemptError::Transport { message: Some("host not allowlisted".into()) }
         );
 
         // The refusal — and the reason travels with it rather than being flattened into the class.

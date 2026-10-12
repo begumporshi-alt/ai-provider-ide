@@ -204,13 +204,13 @@ impl SandboxError {
 /// **The loss is the reference's behaviour, not a shortcut here.**
 /// `execution-engine.ts:114` reads `e instanceof ManifestHttpError ? e.status : 0`, so anything
 /// that is *not* a `ManifestHttpError` — a `SandboxError` included — is recorded with status `0`
-/// and nothing else. `AttemptError` has nowhere to carry a message, so the faithful mapping is the
-/// one that discards it. A variant added to preserve the reason would be a second spelling of "the
-/// call did not complete", and the reason itself is still where a caller can read it: every
-/// producer hands the [`SandboxError`] back before it crosses this conversion.
+/// and nothing else. A sandbox fault has no egress words worth carrying (`message: None`), and a
+/// variant to preserve the reason would be a second spelling of "the call did not complete"; the
+/// reason itself is still where a caller can read it: every producer hands the [`SandboxError`]
+/// back before it crosses this conversion.
 impl From<&SandboxError> for AttemptError {
     fn from(_: &SandboxError) -> Self {
-        AttemptError::Transport
+        AttemptError::Transport { message: None }
     }
 }
 
