@@ -9,8 +9,11 @@
  * ceiling are shared facts, not conventions kept in step by comments.
  *
  * Expectations are deliberately abstract where the loops intentionally differ: denial wording
- * (a user `confirm` here vs the gateway's mutation-off refusal), empty-output handling, and
- * usage accounting. Anything the scenarios assert, both loops must satisfy identically.
+ * (a user `confirm` here vs the gateway's mutation-off refusal), empty-output handling,
+ * usage accounting, and the ceiling wrap-up (this loop makes one extra, unscripted, tool-less
+ * model call after a tool-only final round and returns its answer; the gateway loop ends at the
+ * ceiling — declared per scenario as `wrapUpCalls`, which only this driver counts). Anything
+ * the scenarios assert, both loops must satisfy identically.
  */
 import { describe, expect, it } from "vitest";
 import { readFileSync } from "node:fs";
@@ -47,6 +50,10 @@ interface Scenario {
     modelCalls: number;
     finalText: string;
     ceiling?: boolean;
+    /** Extra unscripted calls a loop that implements the wrap-up pass makes after a tool-only
+     *  final round (see the header: the client loop wraps up; the gateway loop ends at the
+     *  ceiling). This driver adds it to the count; the Rust driver does not. */
+    wrapUpCalls?: number;
     /** Entry i describes the conversation the model saw on call i+1; `null` skips a call. */
     turns?: Array<null | { rounds: RoundExpectation[] }>;
   };
@@ -170,8 +177,9 @@ async function runScenario(sc: Scenario): Promise<void> {
     generate: scriptedModel(sc.steps, seen),
     host,
     // **The ceiling is passed explicitly because this suite tests the BOUNDED contract** — the one
-    // shared with the Rust gateway loop, whose `bridge_policy::MAX_TOOL_ITERATIONS` is this same 8,
-    // and whose client this app cannot see must never be unbounded. The Assistant's own default is
+    // shared with the Rust gateway loop, whose `bridge_policy::MAX_TOOL_ITERATIONS` is this same
+    // 40 (pinned in both directions by the conformance suites), and whose client this app cannot
+    // see must never be unbounded. The Assistant's own default is
     // the opposite (no ceiling; see `AgentLoopOptions.maxIterations`) and has its own tests; the
     // `repeated_tool_calls_stop_at_the_iteration_ceiling` scenario below is a statement about the
     // bounded rule both loops implement, not about either caller's default.
@@ -180,10 +188,14 @@ async function runScenario(sc: Scenario): Promise<void> {
     onEvent: (e) => events.push(e),
   });
 
-  expect(seen.length, `${sc.name}: model calls`).toBe(sc.expect.modelCalls);
+  // `modelCalls` counts the ceiling rounds; `wrapUpCalls` is this loop's extra wrap-up call on
+  // top of them (the Rust driver asserts `modelCalls` alone — a declared divergence, see header).
+  expect(seen.length, `${sc.name}: model calls`)
+    .toBe(sc.expect.modelCalls + (sc.expect.wrapUpCalls ?? 0));
   expect(out.text, `${sc.name}: final text`).toBe(sc.expect.finalText);
   if (sc.expect.ceiling) {
     expect(out.truncated, `${sc.name}: the ceiling exit is not a truncation`).toBe(false);
+    // The wrap-up ends the turn on the final round itself, so `iterations` is still the ceiling.
     const done = [...events].reverse().find((e) => e.type === "done");
     expect(done && "iterations" in done ? done.iterations : undefined, `${sc.name}: iterations at the ceiling`)
       .toBe(sc.expect.modelCalls);

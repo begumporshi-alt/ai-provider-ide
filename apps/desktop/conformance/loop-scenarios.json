@@ -15,6 +15,11 @@
     "  - denial/refusal wording (a user confirm on the client vs the gateway's mutation-off refusal)",
     "  - empty-output handling (the client loop retries NO_OUTPUT turns; the gateway's tools report emptiness themselves)",
     "  - usage accounting (the gateway forwards Usage; the client loop's charging happens outside the loop)",
+    "  - the wrap-up pass (the client loop, on a tool-only final round, makes ONE extra unscripted",
+    "    model call with no tools and returns its answer; the gateway loop ends at the ceiling,",
+    "    returning the last turn's text). Scenario fields declare it rather than hide it:",
+    "    `modelCalls` counts the ceiling rounds themselves, and `wrapUpCalls` is the extra call a",
+    "    loop adds when it implements the wrap-up.",
     "",
     "Tool names: 'sandbox_echo' is deliberately NOT implemented by the Rust sandbox, so its result",
     "is the deterministic 'unknown tool' string and no scenario needs a filesystem. The exception is",
@@ -219,6 +224,7 @@
       ],
       "expect": {
         "modelCalls": 40,
+        "wrapUpCalls": 1,
         "finalText": "still working.",
         "ceiling": true
       }

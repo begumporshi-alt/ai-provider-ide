@@ -10,7 +10,11 @@
 //!
 //! Expectations are deliberately abstract where the loops intentionally differ: denial wording
 //! (a user confirm on the client vs this loop's mutation-off refusal), empty-output handling,
-//! and usage accounting. Everything the scenarios assert, both loops must satisfy identically.
+//! usage accounting, and the ceiling wrap-up (the client loop makes one extra, unscripted,
+//! tool-less model call after a tool-only final round; this loop ends at the ceiling and returns
+//! the last turn's text — scenarios declare it as `wrapUpCalls`, which only the client driver
+//! counts, so this driver keeps asserting `modelCalls` alone). Everything else the scenarios
+//! assert, both loops must satisfy identically.
 
 use serde_json::{json, Value};
 

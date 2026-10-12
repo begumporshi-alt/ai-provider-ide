@@ -13,7 +13,10 @@
  *   4. otherwise append the assistant turn WITH its `tool_calls` (providers reject a dangling
  *      tool result without the originating call), execute each call through the host — pausing
  *      for `confirm` per call — and append the results as `tool` role messages;
- *   5. repeat until the model stops calling or `maxIterations` is hit.
+ *   5. repeat until the model stops calling or `maxIterations` is hit — and when the budget is
+ *      hit, the turn is *wrapped up*, not cut: the final round is told in advance, and a round
+ *      that still ends in tool calls is followed by one no-tools round that produces the answer
+ *      (see `FINAL_ROUND_NOTE` / `WRAP_UP_NOTE`).
  *
  * The returned `messages` is the conversation only (the system turn is NOT included, so the
  * caller can persist it and feed it back next turn without duplicating the system prompt).
@@ -58,6 +61,42 @@ export const MAX_ITERATIONS_CAP = 50;
  */
 export const TOOL_CALL_NUDGE_AFTER = 25;
 export const TOOL_CALL_NUDGE_MAX = 3;
+
+/**
+ * What the **final allowed round** is told before it starts, when the turn runs under an explicit
+ * step budget.
+ *
+ * The pacing nudge above asks a long turn to consider wrapping up; it cannot say *when*. The one
+ * fact the loop holds that the model does not is the round number, so the last round under budget
+ * says it: after this round, no further tool calls run. Told in advance rather than after, because
+ * the measured failure (2026-10-12, "stopped at 40 iterations — the step budget ran out while the
+ * model was still calling tools") is a model that spent its last round on tool_use and was then
+ * cut — everything it had gathered was in the transcript and none of it reached the user.
+ *
+ * It rides the system turn of that one request only, like the nudge — steering, never transcript.
+ * A model that heeds it ends the turn through the ordinary terminal branch and the ceiling is
+ * never felt; one that does not is caught by `WRAP_UP_NOTE` below.
+ */
+export const FINAL_ROUND_NOTE =
+  "THIS IS THE FINAL ROUND of this turn's step budget: after it, no further tool calls run. " +
+  "Do not call tools now — use everything you have gathered and give your final answer. If the " +
+  "work is not finished, say exactly what is done, what it produced, and what remains.";
+
+/**
+ * What the wrap-up round is told, when the final round ended in tool calls anyway.
+ *
+ * **One extra model round-trip outside the budget, and that is the point.** Executing the final
+ * round's calls is correct — the results land in the transcript, the approvals gate them exactly
+ * as any round's — and then the honest ending is not the tool-dump fallback, it is the model's own
+ * summary of them. The wrap-up call carries **no tools**, so a call cannot be attempted, and its
+ * instruction names that rather than hoping the model infers it. If it answers nothing or errors,
+ * the ceiling exit below answers with the last tool activity instead — the fallback is the
+ * backstop, not the plan.
+ */
+export const WRAP_UP_NOTE =
+  "The step budget is exhausted and the tool loop has ended: this request has NO tools, and any " +
+  "tool call will not run. Using everything gathered above, give the final answer now: what was " +
+  "done, what it produced, and what remains.";
 
 /**
  * How many times a NO_OUTPUT turn — the model reasoned through its whole output budget and sent
@@ -442,9 +481,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
     // Pace a long turn: once it has made enough calls, every request carries a reminder to wrap up
     // or ask — at most `TOOL_CALL_NUDGE_MAX` times, so a model that ignores it is not nagged
-    // forever and a model that heeds it is not told twice.
+    // forever and a model that heeds it is not told twice. The final round under budget does not
+    // get the nudge — it gets something stronger (see `FINAL_ROUND_NOTE`), and the two would only
+    // repeat each other.
+    const isFinalRound = maxIterations !== null && iter === maxIterations;
     const dueForNudge =
-      toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) && nudgesSent < TOOL_CALL_NUDGE_MAX;
+      !isFinalRound &&
+      toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) &&
+      nudgesSent < TOOL_CALL_NUDGE_MAX;
     // The pass's system turn is frozen, so its plan framing has to be corrected in the request
     // rather than rebuilt — see `PLAN_MODE_OFF_NOTE`. Read live: the mode can go off mid-iteration.
     // The pass's system turn is frozen, so a mode change inside the pass has to be corrected in the
@@ -460,12 +504,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           : planApprovedThisPass
             ? PLAN_MODE_APPROVED_NOTE
             : PLAN_MODE_OFF_NOTE;
-    const systemForThisRequest = !opts.system && !dueForNudge && !planFramingNote
+    const systemForThisRequest = !opts.system && !dueForNudge && !planFramingNote && !isFinalRound
       ? ""
       : [
           opts.system,
           planFramingNote,
           dueForNudge ? nudgeText(toolCallsThisTurn) : "",
+          isFinalRound ? FINAL_ROUND_NOTE : "",
         ]
           .filter(Boolean)
           .join("\n\n");
@@ -1052,15 +1097,56 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       messages.push({ role: "tool", content: r.resultText, tool_call_id: ids[i]! });
     }
     toolCallsThisTurn += collected.length;
+
+    // **The wrap-up round: the budget ran out mid tool_use, so end with an answer, not a dump.**
+    // The final round was told in advance (`FINAL_ROUND_NOTE`); a model that called tools anyway
+    // has had those calls executed and their results appended — a complete, replayable state — so
+    // one extra round with the tools *absent* asks for the model's own summary of them. It is an
+    // extra round-trip outside the budget on purpose: the alternative is the ceiling exit below,
+    // whose fallback text tells the user where the steps went but not what they mean. A model that
+    // answers nothing here (or errors, or the user pressed Stop) falls through to that fallback —
+    // it is the backstop, not the plan. The reasoning knob rides along so a model already asked to
+    // think silent keeps doing so.
+    if (isFinalRound && !signal?.aborted) {
+      const wrapSystem = [opts.system, WRAP_UP_NOTE].filter(Boolean).join("\n\n");
+      try {
+        const wrap = await generate(
+          {
+            model,
+            messages: wrapSystem
+              ? [{ role: "system" as const, content: wrapSystem }, ...messages]
+              : messages,
+            ...(forceNoReasoning ? { reasoning: "off" as const } : {}),
+            onUsage: (u) => opts.onUsage?.(u),
+            onReasoning: (t) => onEvent?.({ type: "reasoning", text: t }),
+          },
+          { signal },
+        );
+        let wrapText = "";
+        for await (const chunk of wrap.chunks) {
+          if (signal?.aborted) break;
+          wrapText += chunk;
+          onEvent?.({ type: "assistant", text: chunk });
+        }
+        if (wrapText.trim()) {
+          onEvent?.({ type: "done", text: wrapText, iterations: iter, hitCeiling: true });
+          return { text: wrapText, messages, truncated: false, hitCeiling: true, iterations: iter };
+        }
+      } catch {
+        /* the ceiling exit below answers with the last tool activity instead */
+      }
+    }
   }
 
-  // Hit the iteration ceiling: hand back the last answer rather than spinning forever. The ceiling
-  // exit is not a truncation — every stream here declared its own finish — so that flag stays off.
-  // It is its own outcome, named: the model was still calling tools when the budget ran out, and
-  // the last iteration's text is typically empty (that turn was pure tool_use). The caller reads
-  // `hitCeiling` and says so, rather than appending an empty assistant turn that reads as a hang.
-  // Only reachable with an explicit budget: with no ceiling the loop exits through the terminal
-  // branch above, on an answer.
+  // Hit the iteration ceiling: hand back the last answer rather than spinning forever. This is the
+  // wrap-up's backstop, not the plan — the wrap-up round above normally ends the turn with the
+  // model's own summary, and this runs only when that answered nothing, errored, or was aborted.
+  // The ceiling exit is not a truncation — every stream here declared its own finish — so that
+  // flag stays off. It is its own outcome, named: the model was still calling tools when the
+  // budget ran out, and the last iteration's text is typically empty (that turn was pure
+  // tool_use). The caller reads `hitCeiling` and says so, rather than appending an empty assistant
+  // turn that reads as a hang. Only reachable with an explicit budget: with no ceiling the loop
+  // exits through the terminal branch above, on an answer.
   //
   // An empty ceiling answer is worse than nothing for a dispatch_agent parent: it reads "(the
   // sub-agent returned an empty summary)" and cannot tell what the child did with its budget.

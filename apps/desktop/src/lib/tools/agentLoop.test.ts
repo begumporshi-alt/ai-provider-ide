@@ -9,10 +9,11 @@ import { readFileSync } from "node:fs";
 import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
   SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult,
+  FINAL_ROUND_NOTE,
 } from "./agentLoop";
 import { AGENT_TOOLS } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
-import type { ChatMessage, TextStream, ToolCall } from "@aiprovider/router-core";
+import type { ChatMessage, TextRequest, TextStream, ToolCall } from "@aiprovider/router-core";
 
 function streamOf(...chunks: string[]): TextStream {
   return {
@@ -646,7 +647,9 @@ describe("runAgentLoop", () => {
     });
 
     expect(out.text).toBe("final");
-    expect(childRounds, "the child stopped at the backstop, not at 5000").toBe(SUBAGENT_HARD_BACKSTOP);
+    // The backstop rounds themselves, plus the wrap-up call that ends the child's last tool-only
+    // round with an answer — the same extra call the parent's loop makes at its own ceiling.
+    expect(childRounds, "the child stopped at the backstop, not at 5000").toBe(SUBAGENT_HARD_BACKSTOP + 1);
   }, 60_000);
 
   it("delegates without a recorder exactly as before", async () => {
@@ -1614,6 +1617,100 @@ describe("runAgentLoop", () => {
       { text: "trying", calls: [{ id: "c1", name: "web_fetch", arguments: '{"url":"https://x.example"}' }] },
       { text: "", calls: [{ id: "c2", name: "web_fetch", arguments: '{"url":"https://y.example"}' }] },
     ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      maxIterations: 2,
+    });
+
+    expect(out.hitCeiling).toBe(true);
+    expect(out.text).toContain("step budget ran out during tool calls");
+    expect(out.text).toContain("- web_fetch (FAILED): HTTP 403 Forbidden");
+  });
+
+  it("tells the final round under budget that it is final, in that request's system turn only", async () => {
+    const reqs: TextRequest[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "working", calls: [{ id: "c1", name: "read_file", arguments: '{"path":"a"}' }] },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: async (req) => {
+        reqs.push(req);
+        return model(req);
+      },
+      host,
+      maxIterations: 3,
+    });
+
+    // Rounds 1 and 2 carry no note; round 3 (the final one) does — so the model that heeds it
+    // never spends the last round on yet another call it will not get to run.
+    expect(reqs.length).toBe(4); // 3 rounds + the wrap-up
+    for (const i of [0, 1]) {
+      const system = reqs[i].messages.find((m) => m.role === "system");
+      expect(system, `round ${i + 1} has no system turn`).toBeUndefined();
+    }
+    const finalSystem = reqs[2].messages.find((m) => m.role === "system");
+    expect(finalSystem && "content" in finalSystem ? String(finalSystem.content) : "")
+      .toContain(FINAL_ROUND_NOTE);
+  });
+
+  it("wraps up a tool-only budget exhaustion into a final answer, offered no tools", async () => {
+    const reqs: TextRequest[] = [];
+    const host: ToolHost = { async run() { return { ok: true, output: "file contents" }; } };
+    let call = 0;
+    const model: GenerateFn = async (req) => {
+      call += 1;
+      reqs.push(req);
+      if (call <= 2) {
+        req.onToolCall?.({ id: `c${call}`, name: "read_file", arguments: '{"path":"a"}' });
+        return streamOf("");
+      }
+      return streamOf("Here is what I found.");
+    };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      maxIterations: 2,
+    });
+
+    // The answer is the wrap-up's, not the tool-summary fallback, and the wrap-up request
+    // carries the gathered tool results but no tools to call.
+    expect(out.hitCeiling).toBe(true);
+    expect(out.text).toBe("Here is what I found.");
+    const wrapUp = reqs[2];
+    expect(wrapUp.tools ?? []).toHaveLength(0);
+    const toolTurn = wrapUp.messages.find((m) => m.role === "tool");
+    expect(toolTurn?.content).toBe("file contents");
+  });
+
+  it("answers with the last tool summary when the wrap-up call itself fails", async () => {
+    const host: ToolHost = {
+      async run() {
+        return { ok: false, output: "HTTP 403 Forbidden" };
+      },
+    };
+    let call = 0;
+    const model: GenerateFn = async (req) => {
+      call += 1;
+      if (call <= 2) {
+        req.onToolCall?.({ id: `c${call}`, name: "web_fetch", arguments: '{"url":"https://x.example"}' });
+        return streamOf("");
+      }
+      throw new Error("wrap-up model exploded");
+    };
 
     const out = await runAgentLoop({
       model: "m",
