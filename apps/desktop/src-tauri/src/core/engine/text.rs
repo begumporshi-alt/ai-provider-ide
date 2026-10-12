@@ -17,7 +17,7 @@ use crate::core::usage::UsageTokens;
 use super::attempt::{
     attempt_budget, attempt_disposition, attempt_outcome, candidate_is_affordable, labelled,
     records_key_health, saturated_outcome, transport_outcome, AttemptDisposition, AttemptError,
-    AttemptOutcome, SERVER_ERROR_RETRY_BACKOFF,
+    AttemptOutcome, SERVER_ERROR_REPROBES_MAX, SERVER_ERROR_RETRY_BACKOFF,
 };
 use super::health::HealthTracker;
 use super::taxonomy::{ErrorClass, COOLDOWN_FLOOR_MS};
@@ -213,12 +213,12 @@ pub async fn execute_text(
     let ended = 'plan: {
         // **The plan is a queue, not an iterator, because of the same-key re-probe.** Everything
         // else reads exactly as the `for` it replaced: one `pop_front` per attempt, drained left to
-        // right. The flag rides *with* the candidate — being re-probed is a per-candidate fact, not
-        // a loop fact — so a re-queued candidate comes back already marked and cannot be probed
-        // twice.
-        let mut plan: VecDeque<(Candidate, bool)> =
-            args.plan.into_iter().take(budget).map(|c| (c, false)).collect();
-        while let Some((candidate, reprobed)) = plan.pop_front() {
+        // right. The round count rides *with* the candidate — being re-probed is a per-candidate
+        // fact, not a loop fact — so a re-queued candidate comes back carrying the round it is on
+        // and cannot spend more than the re-probe budget allows.
+        let mut plan: VecDeque<(Candidate, usize)> =
+            args.plan.into_iter().take(budget).map(|c| (c, 0)).collect();
+        while let Some((candidate, reprobes)) = plan.pop_front() {
             // `:80`, checked *before* the permit is taken — see `candidate_gate`, which states the
             // order and why: a cancelled request must not consume a slot on its way out.
             if cancel.is_cancelled() {
@@ -416,13 +416,17 @@ pub async fn execute_text(
                         // next candidate fails over immediately — a healthy provider beats a wait
                         // on a wobbling one. With none, the only thing failover could do is give
                         // up, so the wait-and-redial any competent client performs happens here
-                        // instead: once per candidate, only before anything reached the sink, and
-                        // only for `SERVER_ERROR` — the class the egress layer already treats as
-                        // "the failure is real, but what it predicts may not be" (see
-                        // `SERVER_ERROR_RETRY_BACKOFF`).
+                        // instead: at most [`SERVER_ERROR_REPROBES_MAX`] rounds per candidate, only
+                        // before anything reached the sink, and only for `SERVER_ERROR` — the class
+                        // the egress layer already treats as "the failure is real, but what it
+                        // predicts may not be" (see `SERVER_ERROR_RETRY_BACKOFF`).
                         //
                         // **The wait is the provider's own `Retry-After` when it named one**,
-                        // floored like every other named wait, and 2 s otherwise. **Admission is
+                        // floored like every other named wait, and the flat backoff otherwise.
+                        // Flat, not growing, and that is measured: the admission rule below
+                        // reserves a full `UPSTREAM_HEADER_TIMEOUT` behind every wait, so an 8 s
+                        // third round never fits under `PLAN_BUDGET` while a flat 2 s keeps every
+                        // round affordable (see `SERVER_ERROR_RETRY_BACKOFF`). **Admission is
                         // the plan budget's own rule**: a re-probe is a candidate start, so it is
                         // priced by `candidate_is_affordable` with the wait added to the elapsed
                         // time — one full `UPSTREAM_HEADER_TIMEOUT` must still fit, which is what
@@ -437,7 +441,7 @@ pub async fn execute_text(
                             .unwrap_or(SERVER_ERROR_RETRY_BACKOFF);
                         if outcome_cls == ErrorClass::ServerError
                             && plan.is_empty()
-                            && !reprobed
+                            && reprobes < SERVER_ERROR_REPROBES_MAX
                             && !cancel.is_cancelled()
                             && candidate_is_affordable(plan_started.elapsed() + wait, false)
                         {
@@ -446,10 +450,12 @@ pub async fn execute_text(
                                 key = %candidate.key.label,
                                 status = outcome_status,
                                 wait_ms = wait.as_millis() as u64,
-                                "plan exhausted on SERVER_ERROR — re-probing the same key once",
+                                round = reprobes + 1,
+                                max = SERVER_ERROR_REPROBES_MAX,
+                                "plan exhausted on SERVER_ERROR — re-probing the same key",
                             );
                             tokio::time::sleep(wait).await;
-                            plan.push_front((candidate, true));
+                            plan.push_front((candidate, reprobes + 1));
                         }
                         continue;
                     }

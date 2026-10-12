@@ -2359,11 +2359,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_final_candidate_server_error_is_reprobed_once_and_can_serve() {
+    async fn a_final_candidate_server_error_is_reprobed_and_can_serve() {
         // The measured case (2026-10-06): a provider-qualified id with one key plans exactly one
         // candidate, so the old `Next => continue` exhausted the plan on the first 500 and a
         // transient upstream blip became a hard failure. The re-probe is the wait-and-redial the
-        // plan had nowhere left to do.
+        // plan had nowhere left to do — the first of up to `SERVER_ERROR_REPROBES_MAX` rounds.
         let adapter = TextScripted::new(vec![refused(503), chunks_of(&["recovered"])]).shared();
         let health = HealthTracker::new();
         let (seen, mut on_chunk) = sink();
@@ -2388,11 +2388,22 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), vec!["recovered".to_string()]);
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn a_second_server_error_on_the_reprobed_candidate_gets_no_third_dial() {
-        // Bounded means bounded: one re-probe per candidate, whatever it returns. The chain records
-        // both attempts, which is what the ledger's "attempt 2" line reads from.
-        let adapter = TextScripted::new(vec![refused(503), refused(500)]).shared();
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn the_reprobe_budget_is_three_rounds_and_no_fourth_redial() {
+        // The measured case (2026-10-12): the 2026-10-06 flap recurred, this time lasting ~37 s,
+        // and one re-probe was not enough — rows 3773/3775/3779 each exhausted the plan and
+        // surfaced a hard error. Bounded still means bounded: `SERVER_ERROR_REPROBES_MAX` rounds
+        // on the final candidate, then the request fails with every round in the chain. Paused
+        // time is what lets the three 2 s waits sleep for free while the plan budget's real
+        // `Instant` stays near zero, so every round is affordable and the count — not the clock —
+        // is what stops the loop.
+        let adapter = TextScripted::new(vec![
+            refused(503),
+            refused(503),
+            refused(503),
+            refused(503),
+        ])
+        .shared();
         let health = HealthTracker::new();
         let (_seen, mut on_chunk) = sink();
 
@@ -2405,16 +2416,20 @@ mod tests {
             &mut on_chunk,
         )
         .await
-        .expect_err("both dials 500'd");
+        .expect_err("every round 500'd");
 
         match failure {
             TextFailure::AllAttemptsFailed { error, .. } => {
                 let classes: Vec<ErrorClass> = error.chain.iter().map(|a| a.cls).collect();
-                assert_eq!(classes, vec![ErrorClass::ServerError, ErrorClass::ServerError]);
+                assert_eq!(classes, vec![ErrorClass::ServerError; 4]);
             }
             other => panic!("expected AllAttemptsFailed, got {other:?}"),
         }
-        assert_eq!(adapter.calls().len(), 2, "exactly one re-probe, never a third");
+        assert_eq!(
+            adapter.calls().len(),
+            4,
+            "first dial + three re-probes, never a fifth"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

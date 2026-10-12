@@ -148,6 +148,12 @@ tokio-tungstenite = "0.26"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Dev-only: `#[tokio::test(start_paused = true)]`, which lets an engine test sleep through the
+# re-probe backoff (2 s + 4 s + 8 s) without the wall clock moving. Features here union with the
+# runtime tokio above only inside `cargo test`; the shipped binary does not compile them.
+[dev-dependencies]
+tokio = { version = "1.53.1", features = ["test-util"] }
+
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
 [profile.release]
 codegen-units = 1

@@ -319,3 +319,31 @@ and Gemini says `MAX_TOKENS`. Both engines now translate the dialect's word into
 at the point it is read, via a declared `responseFinishMap`, and the mapped reason reaches every egress
 path (OpenAI `finish_reason`, Anthropic `stop_reason`, Gemini `finishReason`, Responses
 `status: incomplete`). A reason the map does not name passes through raw.
+
+---
+
+## Addendum (2026-10-12): the 500 flap, and the re-probe budget it exhausted
+
+The same carrier flapped again — `500 {"error":{"message":"Upstream rejected the request as invalid",
+"type":"invalid_request_error"}}` from 19:31:58 to 19:32:35 local, a ~37 s window. Five gateway
+requests hit it; two recovered mid-execution (ledger rows 3774/3777: the **identical rendered body**
+500'd on `key-01` and 200'd on `key-02` seconds later — the proof that the rejection is
+nondeterministic upstream, not a request-shape defect), and three (rows 3773/3775/3779) exhausted
+their attempts and surfaced `all attempts failed`.
+
+Two causes compounded, and both are now closed:
+
+1. **One re-probe was measured too short.** The 2026-10-06 re-probe (one redial after the plan ran
+   out) died inside a flap twice that length. `SERVER_ERROR_REPROBES_MAX = 3` now allows up to four
+   dials on a plan-exhausted candidate — flat 2 s waits, not doubling, because the budget's
+   admission rule (a full 20 s header timeout behind every wait) never funds a third doubling
+   round; measured, not styled (`engine/attempt.rs`, `engine/text.rs`).
+2. **The Assistant was pinned to the qualified id.** `assistant.model` was
+   `agent-router/deepseek-v4-flash`, so the plan had one provider and `failoverEnabled` was inert
+   for it — §5's own guidance, unapplied. The setting now holds the bare `deepseek-v4-flash`, which
+   resolves to agent-router (alias priority 102) with vice (103) as the live failover.
+
+Residual: no in-request policy can ride out a flap longer than `PLAN_BUDGET` (26 s, pinned below
+the gateway's 30 s). For an outage that long the honest remedies remain the client's own retry and
+the bare id's second carrier — which is why the id's form, not the retry count, is the load-bearing
+fix.

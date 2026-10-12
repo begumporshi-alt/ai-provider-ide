@@ -177,14 +177,39 @@ pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
 /// recover. A provider that names its own `Retry-After` is honoured instead — floored at
 /// [`COOLDOWN_FLOOR_MS`] — for the same reason `min_retry_after_ms` honours it.
 ///
-/// **Bounded, and budget-checked like everything else.** One re-probe per candidate, only when the
-/// plan is exhausted behind it (a plan with a next candidate fails over *immediately* — waiting on
-/// the provider that just 500'd when a healthy one is next is strictly worse), only before anything
-/// reached the sink, and admitted only if `elapsed + wait + UPSTREAM_HEADER_TIMEOUT` fits inside
-/// [`PLAN_BUDGET`] — a re-probe is a candidate start, so it is priced by
-/// [`candidate_is_affordable`] with the wait added to the elapsed time. A provider that names a
-/// `Retry-After` too long to afford simply does not get one.
+/// **Bounded, and budget-checked like everything else.** A plan-exhausted candidate may be
+/// re-dialled at most [`SERVER_ERROR_REPROBES_MAX`] times, only when the plan is exhausted behind
+/// it (a plan with a next candidate fails over *immediately* — waiting on the provider that just
+/// 500'd when a healthy one is next is strictly worse), only before anything reached the sink, and
+/// admitted only if `elapsed + wait + UPSTREAM_HEADER_TIMEOUT` fits inside [`PLAN_BUDGET`] — a
+/// re-probe is a candidate start, so it is priced by [`candidate_is_affordable`] with the wait
+/// added to the elapsed time. A provider that names a `Retry-After` too long to afford simply does
+/// not get a re-probe.
+///
+/// **The wait is flat, not growing, and that is measured, not lazy.** The budget's admission rule
+/// (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) reserves a full 20 s header timeout
+/// behind every wait, so a *growing* cadence loses its last round to the budget exactly when it
+/// matters — the 8 s third round never fits under 26 s, while a flat 2 s keeps every round
+/// affordable and puts four dials inside the request. The cadence that fits the budget beats the
+/// one that reads better.
 pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
+
+/// How many times the text loop may re-dial the **same** final candidate whose plan ran out on a
+/// `SERVER_ERROR`, on top of its first dial.
+///
+/// **The measured case (2026-10-12, `agent-router` / `deepseek-v4-flash`):** the 2026-10-06 flap
+/// recurred, this time lasting ~37 s, and one re-probe was not enough — ledger rows 3773/3775/3779
+/// each exhausted the plan and surfaced a hard error while the plan budget (26 s) still had dials
+/// to spend. Three rounds put four dials inside the request, spanning ~8 s of real attempt-and-
+/// wait time; no in-request policy can ride out a flap longer than the request budget itself,
+/// which is what client retries and failover to a second provider are for.
+///
+/// **Why three, not one or unbounded.** One is the 2026-10-06 value, measured too short tonight.
+/// Unbounded is what [`PLAN_BUDGET`] exists to prevent — the re-probe would spend the whole budget
+/// redialling a host that may be down for minutes, when a *client* retry (the caller's own
+/// backoff, or a fresh request) is the honest remedy for an outage that long. Three keeps the
+/// engine a competent client through a flap without pretending it can outlast an outage.
+pub const SERVER_ERROR_REPROBES_MAX: usize = 3;
 
 /// How many of a plan's candidates this request may actually try.
 ///
