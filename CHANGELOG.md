@@ -13,6 +13,125 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Added
 
+- **The Assistant can fan out: several independent sub-agent tasks in one round, with structured
+  results.** `dispatch_agent` runs one child per call, so a set of independent items — survey these
+  twelve files, check these eight endpoints — was either serialised across rounds or run as a batch
+  whose summaries came back as N prose blocks the model had to keep straight itself. `fan_out` takes a
+  list of tasks and returns **JSON keyed by the caller's own label**: one object per task carrying its
+  summary, iteration count and tokens spent, under a one-line header with the counts. A bad item fails
+  **only** that item — an unknown specialist names the valid ids, and the other children's completed
+  work is not discarded — and the per-call cap of 12 is refused before any child starts, because each
+  item is a full sub-agent run. A batch larger than the concurrency cap still works; it runs in waves.
+
+  It is the **same child** as `dispatch_agent`, not a second kind. The child-run path is now one
+  function both tools call, so the granted tool set, the definition narrowing it, the step budget and
+  its hard backstop, the parent's approval gate riding along, the ledger row per child and the
+  inactivity watchdog are one implementation. That is the point rather than tidiness: a second copy is
+  how a fan-out child ends up at a different privilege level from a dispatched one, and the probe
+  shows the sharing holds — breaking the grant reddens **every** test that pins it, `dispatch_agent`'s
+  included, where a duplicate would have reddened only its own.
+
+  `fan_out` is read-effect for the same reason `dispatch_agent` is: whatever a child writes is gated
+  by the parent's approval, not by this call. It is also excluded from a child's own tool set, so
+  delegation cannot recurse — the newest route to unbounded nesting, closed in the exclusion list
+  rather than only left unsaid.
+
+- **The manifest interpreter's two implementations are now pinned to each other by a shared corpus.**
+  `apps/desktop/conformance/dialect-scenarios.json` holds 15 shaping scenarios executed by **both**
+  the TypeScript reference and the Rust port (`core/dialect_shaping.rs`), so a divergence between
+  what the wizard validates and what the gateway serves fails a test instead of surfacing later as a
+  provider "behaving oddly". Drivers: `src/lib/dialect-conformance.test.ts` on the reference side and
+  a `#[cfg(test)]` module in `dialect_shaping.rs` on the port side. The corpus header states the
+  null-normalisation rule both drivers apply — Rust serialises `Option::None` as an explicit `null`
+  where TypeScript omits the key, and absence is not what these scenarios test.
+
+  The scope of this first slice is a real seam rather than an oversight: it covers the functions
+  whose inputs are identical on both sides — role mapping, tool-call reading, text extraction, dotted
+  field lookup, finish-reason mapping. `shapeToolDeclarations`, `attachToolParts` and
+  `shapeMessageContent` are next: their TypeScript signatures take the template renderer as an
+  **injected callback** (the interpreter owns rendering) while the Rust signatures render internally,
+  so those drivers must pass `renderTemplate` explicitly or the comparison would partly be a
+  comparison of the two drivers.
+
+  *(Updated the same day: `shapeToolDeclarations`, `shapeMessageContent` and `attachToolParts` are now
+  covered too, with the reference driver passing the package's own `renderTemplate` — the corpus is 22
+  scenarios and covers **every** shaping function. `attachToolParts` was written last and from its
+  semantics rather than its signature, because its output depends on relations between messages: a tool
+  result's name is resolved by looking back at the assistant turn that declared the call, and a run of
+  consecutive results collapses into one message. Both implementations agreed with the authored
+  expectations on the first run.)*
+
+- **A resumed session is now restored rather than reconstructed.** Until this change the only durable
+  copy of a conversation was the context graph, which is built for edges rather than for replay: a
+  message node's text is clipped for the force layout, its order comes from the sequence number
+  embedded in its id, and the assistant turn a tool result belongs to has to be recovered by walking
+  a `produced` edge. So `resumeSession` handed back a shortened conversation, and a resumed agent
+  session could come back with tool calls whose results no longer lined up. Migration **0027** adds
+  `session_messages` — the message as it was sent, with `tool_calls` on the assistant turn and
+  `tool_call_id` on each result, which is the pair a provider validates on replay. Both turn paths
+  append their turn, and `resumeSession` prefers rows, falling back to the graph for sessions
+  recorded before 0027: a backfill could only invent the text the graph never stored.
+
+  Three details worth knowing. A failed or stopped turn is recorded as **what the bubble says**
+  (`⚠ boom`, or the partial text), not as the empty stream — a durable copy that disagreed with the
+  conversation would be worse than none. Attachment **metadata** is stored and the image bytes are
+  not: base64 is megabytes the user already has on disk, and a resume re-reads it from the turn that
+  owns it. And a resumed session continues at `transcript_max_seq`, so its next turn cannot upsert
+  over the session's own earlier rows — the same rule the graph recorder's sequence follows.
+
+  The History screen's timeline **view** is deliberately unchanged: that is a rendering of the graph,
+  which is what the graph is for. The transcript is what a *resume* reads, and `session_messages`
+  goes with its session when one is deleted.
+
+- **A sub-agent can be allowed to modify the workspace, and how much of its summary comes back is
+  now a setting.** A `dispatch_agent` child was read-only by construction — its whole granted set
+  was the read-effect tools — so delegation bought parallel *research* and never parallel *work*. A
+  new switch in the Assistant's run panel (**Sub-agent writes**, off by default) grants the full
+  tool set instead, and a second field sets how many characters of the child's summary reach the
+  conversation (default 4000, clamped 500–16000).
+
+  Three things keep this a delegation rather than a permission bypass. The switch is the **user's**
+  and the only thing that widens anything: a specialist definition's `tools` list is applied as a
+  filter *over* the granted set, so a definition naming `write_file` while writes are off gets
+  nothing — asserted, not assumed. A write-capable child runs the **parent's own approval gate**,
+  so its mutations ask exactly as the parent's would, and a denial reaches it as a refusal rather
+  than a silent success. And the never-list is unchanged at every privilege level: `dispatch_agent`
+  (unbounded recursion), `todo_write` (its transcript is discarded, so the list would be a lie the
+  model told itself) and the plan-mode pair (a child cannot approve the plan the parent executes).
+
+  The `dispatch_agent` description now changes with the setting. The read-only text states outright
+  that the sub-agent "cannot modify the workspace", so a model running with writes enabled would
+  have been told its own capability did not exist and would have spent the delegation asking the
+  parent to make the change.
+
+  One behaviour tightened on the way: an **empty** `tools` list on a definition now means *no*
+  tools, where `.length` read it as "unset" and granted everything. That was harmless while every
+  tool was read-only; with writes enabled it was the difference between no access and full access.
+
+- **The `run_command` sandbox's program list can be extended from Settings, without weakening what
+  the list guarantees.** The allowlist was thirty-eight hardcoded programs, so whole task classes
+  were unreachable by construction: `cargo` could not be invoked directly, `rm` and `mv` could not
+  tidy anything up, and `curl`, `sqlite3`, `docker` and `jq` were not there at all. A user may now
+  add programs in **Settings → Agent tool sandbox**. The additions live in the `tools` settings row,
+  are read at boot by the app *and* the daemon, and are applied by the one `core::tools` gate both
+  serving paths already share — a policy only the app applied would mean one workspace with two
+  sandboxes.
+
+  Three properties keep the extension from being a hole. **The baseline is unchanged and still the
+  default** — configured with nothing, the refusal path is the behaviour it had, which the existing
+  golden test still asserts. **A name must be a bare executable** (`[A-Za-z0-9._+-]{1,64}`, no path
+  separator, no `..`, at most 32 entries), because a path would be an escape the argument gate cannot
+  close: the program itself would sit outside the workspace. And a ten-entry **never-allowed** list —
+  `sudo`, `su`, `dd`, `shutdown`, `reboot`, `halt`, `diskutil`, `launchctl`, `csrutil`, `kextload` —
+  outranks the configuration, refused at the setter so the user learns immediately *and* at the gate
+  so a list persisted by an older store cannot slip one through. `rm` and `mv` are deliberately not
+  on it: destructive but confinable, and refusing them forever is what made "tidy up the build
+  output" impossible in the first place.
+
+  The policy the screen renders reports the baseline, the additions and the refused list as three
+  sets rather than one merged list, so the boundary is visible instead of inferred; the Settings
+  section renders the policy the **host returned**, never the list that was typed.
+
 - **A provider can be set up with its models, and each model can be tested before you commit to
   it.** Adding a provider by hand previously recorded a name, a URL and an auth scheme and nothing
   else — no model was ever entered, so a provider whose `/models` endpoint is missing, incomplete or
@@ -144,6 +263,67 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   form *absent*.
 
 ### Fixed
+
+- **A manifest that cannot read a stream no longer asks for one (drift D47).** A dialect with no
+  `stream` block has no `chunkMap` to read SSE with, so the answer was already read as unary — but the
+  request body still carried `"stream": true` from the caller's flag. A provider that honoured it
+  replied with SSE, the unary branch parsed that as JSON, failed, and reported a transport error that
+  the engine classifies as `NETWORK`: a `502` blaming a provider that had answered correctly. It was
+  the third route to the misleading `502` the register already tracks and the second involving no
+  allowlist at all, and it fired for a hand-written, imported or generated manifest — every manifest
+  on the installed database declares the block, which is why no gate could see it.
+
+  The fix is the repair the register named and had deliberately not taken: `{{stream}}` is now bound to
+  **one** decision — "the caller asked to stream AND this manifest can read a stream" — and that same
+  decision also governs whether `stream_options` is requested, which endpoint is dialled, and which
+  branch reads the answer. Four things that used to disagree now cannot. It is a **both-sides** change
+  (the reference and the Rust port), which is why it waited for a way to hold them together: each side
+  now carries the same pair of tests, and the corpus added in this release is what makes a one-sided
+  edit visible.
+
+- **The same `null`-versus-`undefined` divergence, at a second site — found the same way, on the same
+  day.** `shapeMessageContent` tested `contentField !== undefined`, and `"contentField": null` made it
+  rename the content field to a key literally called `"null"`, while the Rust port's `Option<&str>`
+  read the same manifest as having no rename. Both fields are `z.string().optional()` in the grammar,
+  so neither case is reachable through a *validated* manifest — they arrive through the bypass the
+  drift register already tracks for other fields (a hand-edited row, an imported config, a manifest
+  stored by an older build). Both are fixed anyway: a differential corpus carrying an "except when the
+  input is null" caveat is a corpus people learn to ignore.
+
+- **`"systemField": null` in a manifest did nothing on one serving path and something on the other.**
+  The reference tested `systemField === undefined`, but this value is parsed from a manifest file,
+  where an absent-or-explicitly-null field is `null` at runtime. So a hand-written manifest carrying
+  `"systemField": null` hoisted its system prompt into a path literally named `"null"`, while the
+  Rust port's `Option<&str>` read the same manifest as having no system channel at all and dropped
+  that content. Identical manifests, two behaviours, decided by which path served the request. The
+  reference now tests `== null`. **Found by the new conformance corpus on its first run**, which is
+  the case for having built it.
+
+- **Two lazily-built runtimes could end the gateway process instead of answering the model.** The
+  browser tools and the web search/fetch tools each build a private tokio runtime on their **first
+  call** — that is the request path, not startup — and both reached for
+  `.expect("the … runtime must start")`. Release builds use `panic = "abort"`, so a thread pool that
+  could not be created (resource exhaustion, a restricted environment) killed the process and every
+  in-flight client with it, rather than reporting a failed tool call. Both are now fallible, cached
+  with their failure so a broken environment is not re-tried per call, and the tools return the
+  reason to the model.
+
+  Four more request-path panic expressions went with them, each one provably infallible *today* and
+  one edit from not being: `browser.rs`'s `.expect("list_pages refuses empty")` (the refusal lives in
+  another function), its `.expect("just connected")`, its `unreachable!` at the end of the retry loop,
+  and `mcp.rs`'s `.expect("checked above")` — the last re-fetching `inputSchema` after testing it four
+  lines earlier, on a **third-party server's** payload. The MCP one is now a single lookup and a
+  match, so there is no invariant to hold.
+
+- **`scripts/panic-census.py` — the panic-source count is now reproducible rather than quoted.**
+  `docs/dev-book/06-conventions.md` says the census "goes stale the moment code lands, so re-derive it
+  rather than quoting it", and the figure it quoted had drifted. The script masks comments and string
+  literals before counting braces (the first version brace-counted raw text, so a test fixture
+  containing `"{"` unbalanced the skip and reported four test-only `.unwrap()`s as production),
+  preserves line numbers, and separates lock unwraps — unreachable under `panic = "abort"` — from the
+  ones that can actually end the process. Re-derived 2026-10-13: **130 `.unwrap()`, all of them lock
+  calls; 24 `.expect()`, of which 20 are literal regex/URL/serialization constants; zero
+  `panic!`/`todo!`/`unimplemented!`/`unreachable!`.**
 
 - **A builtin skill added to the catalog could never reach an install that already had skills.**
   Seeding stamped one boolean (`skills_seeded`) and returned early forever after, so `BUILTINS` was

@@ -47,9 +47,21 @@ opposite directions from where intuition goes:
 2026-09-20 figure was "3 production `expect()`, every production `.unwrap()` is a lock call, there is not one
 non-lock `.unwrap()` in the shipped code" — accurate for *that* tree, and falsified four days later when the
 router-core port landed `sandbox.rs`, `gateway_normalizer.rs` and `ledger.rs`. The 2026-09-27 re-run found
-**eleven**. Nothing was wrong with the original count; what was missing was a trigger to repeat it, which is why the
-corrected figure lives in [`../SECURITY_AUDIT_2026-09-20.md`](../SECURITY_AUDIT_2026-09-20.md) H3 with the
-instrument that produced it.
+**eleven**. Nothing was wrong with the original count; what was missing was a trigger to repeat it — so the
+trigger is now a script and the finding is a sample, not a fact:
+
+```bash
+python3 scripts/panic-census.py            # production code only, test modules blanked
+```
+
+Re-derived 2026-10-13: **130 `.unwrap()`, every one of them a lock call; 24 `.expect()`, 20 of which are
+literal `Regex::new`/`Url::parse`/`serde_json` constants; zero `panic!`/`todo!`/`unimplemented!`/
+`unreachable!`.** The script is also the record of what a naive count gets wrong — it masks comments and
+strings before counting braces (a test fixture containing `"{"` had unbalanced the skip and reported
+test-only code as production) and preserves line numbers, because a stripper that deletes lines reports
+findings against unrelated code. The 2026-10-13 pass is what removed the last `unreachable!`, converted
+both lazily-built runtimes (`core/browser.rs`, `core/web.rs`) to fallible accessors, and folded
+`reason_from_body`'s `is_none`-then-`unwrap` into one expression.
 
 **Parallel tests must not derive a temp directory from `pid + timestamp`.** Two tests in the same millisecond
 collide and one fails with `DatabaseBusy`, which looks like a locking bug in the code under test. Use a
