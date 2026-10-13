@@ -558,3 +558,42 @@ describe("the caller's thinking knob (`reasoningValues`)", () => {
     expect(g.lastBody()!.generationConfig as Record<string, unknown>).not.toHaveProperty("thinkingConfig");
   });
 });
+
+/**
+ * **D47, closed 2026-10-13: a manifest that cannot read a stream does not ask for one.**
+ *
+ * The reference's half of the pair (the Rust port has the same two tests in
+ * `core/interpreter.rs`). A dialect with no `stream` block has no `chunkMap` to read SSE with, so the
+ * read path is unary — and the request body has to agree, or a provider answers with SSE, the unary
+ * branch parses it as JSON, and the failure surfaces as a transport error the engine classifies as
+ * `NETWORK`: a `502` blaming a provider that answered correctly. The request body is asserted rather
+ * than the branch, because the branch was already right and the body was the half nothing could see.
+ */
+describe("streaming is one decision: what is asked for matches how the answer is read", () => {
+  /** The openai-compat manifest with its `stream` block removed — a dialect that cannot stream. */
+  function withoutStreamBlock() {
+    const manifest = BUILTIN_TEMPLATES["openai-compat"]("https://api.test/v1");
+    const ep = (manifest.endpoints as Record<string, Record<string, unknown>>).generateText;
+    if (!ep) throw new Error("the builtin manifest has a generateText endpoint");
+    delete ep.stream;
+    return manifest;
+  }
+
+  it("asks for a unary answer when the manifest declares no stream block, even if the caller streams", async () => {
+    const manifest = withoutStreamBlock();
+    let body: Record<string, unknown> | undefined;
+    const http = new FakeHttp((_url, init) => {
+      if (init.body) body = JSON.parse(init.body);
+      return { status: 200, body: { choices: [{ message: { content: "ok" } }] } };
+    });
+    const interp = new ManifestInterpreter(manifest, { http, vars: {} });
+    await drain(interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: true });
+    expect(body!.stream, "the caller's wish cannot make the response readable").toBe(false);
+  });
+
+  it("still asks to stream when the manifest declares the block", async () => {
+    const { interp, lastBody } = capture("openai-compat", { choices: [{ message: { content: "ok" } }] });
+    await drain(interp, { model: "gpt-4o", messages: [{ role: "user", content: "hi" }], stream: true });
+    expect(lastBody()!.stream).toBe(true);
+  });
+});

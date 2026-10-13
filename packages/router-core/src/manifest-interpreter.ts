@@ -563,7 +563,7 @@ function renderPath(path: string, model: string): string {
  * zero branches. A new dialect adds a row to the map and a `systemField` declaration (or omits
  * them for pass-through) and needs no interpreter change.
  */
-function normalizeDialectMessages(
+export function normalizeDialectMessages(
   messages: unknown[],
   roleMap: Record<string, string | null> | undefined,
   systemField: string | undefined,
@@ -609,7 +609,14 @@ function normalizeDialectMessages(
   const systemContent = systemParts.length ? systemParts.join("\n\n") : undefined;
   // When the dialect declares neither a map nor a system field, it has no system channel —
   // and hoisted content would be silently lost. Drop it with nothing to receive it.
-  if (systemField === undefined) {
+  //
+  // `== null`, not `=== undefined`: the type says `string | undefined`, but this is parsed from a
+  // manifest file, where an absent-or-explicitly-null field is `null` at runtime. The strict check
+  // let `"systemField": null` through as a *field name*, so a hand-written manifest hoisted its
+  // system prompt into a path literally called "null" instead of dropping it — while the Rust port,
+  // whose `Option<&str>` maps null to `None`, dropped it. Found by the dialect conformance corpus
+  // (`conformance/dialect-scenarios.json`) on its first run, which is what that corpus is for.
+  if (systemField == null) {
     return { messages: out, systemContent: undefined };
   }
   return { messages: out, systemContent };
@@ -672,7 +679,7 @@ function translateToolChoice(
  * more useful to a caller than `undefined`. When the manifest declares no map the value is untouched
  * — the OpenAI dialect, whose words already are the target.
  */
-function translateFinishReason(reason: string, map: Record<string, unknown> | undefined): string {
+export function translateFinishReason(reason: string, map: Record<string, unknown> | undefined): string {
   if (!map) return reason;
   const mapped = map[reason];
   return typeof mapped === "string" && mapped ? mapped : reason;
@@ -889,10 +896,24 @@ export class ManifestInterpreter implements AdapterInstance {
       ep.contentField,
       renderTemplate,
     );
+    // **The one decision.** "The caller asked to stream AND this manifest can read a stream" governs
+    // the `{{stream}}` value below, the `stream_options` request, which endpoint is dialled, and
+    // which branch reads the answer.
+    //
+    // Until 2026-10-13 the first, second and third used `args.stream` alone, so a manifest declaring
+    // no `stream` block still sent `"stream": true`; a server that honoured it answered with SSE, and
+    // the unary branch parsed that as JSON and threw — surfacing as a transport failure the engine
+    // classifies as `NETWORK`, i.e. a misleading `502` blaming the provider. Drift **D47**, closed
+    // 2026-10-13 in both implementations: what you ask for and how you read it are one decision.
+    // Bound to the spec itself so the streaming branch below keeps its narrowing: branching on
+    // `spec` is what tells the compiler the chunk map exists, and `streaming` collapses the two
+    // conditions the request body and the reader must agree on.
+    const spec = ep.stream;
+    const streaming = Boolean(args.stream && spec);
     const templateValues: Record<string, unknown> = {
       model: args.model,
       messages: dialectMessages,
-      stream: args.stream,
+      stream: streaming,
       maxTokens: args.maxTokens ?? this.m.limits?.maxOutputTokens,
       // The caller's thinking knob, rendered into whatever field(s) this dialect's template
       // declares. `reasoningValues` returns only the keys the caller asked for, so a request with
@@ -934,12 +955,12 @@ export class ManifestInterpreter implements AdapterInstance {
     // field can be opted out by setting `requestUsage: false` on its manifest.
     const wantsUsage =
       ep.stream?.requestUsage ?? (this.m.dialect === "openai-chat-v1" && Boolean(ep.responseMap.usage));
-    if (args.stream && wantsUsage) {
+    if (streaming && wantsUsage) {
       body["stream_options"] = { include_usage: true };
     }
     // A dialect may stream at a different endpoint than it dials unarily (Gemini:
     // `:generateContent` vs `:streamGenerateContent?alt=sse`).
-    const dialedPath = args.stream && ep.streamPath ? ep.streamPath : ep.path;
+    const dialedPath = streaming && ep.streamPath ? ep.streamPath : ep.path;
     const url = joinUrl(this.m.provider.baseUrl, renderPath(dialedPath, args.model));
     const res = await this.ctx.http.request({
       url,
@@ -951,7 +972,7 @@ export class ManifestInterpreter implements AdapterInstance {
     });
     if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
 
-    if (!args.stream || !ep.stream) {
+    if (!streaming || !spec) {
       const json: unknown = jsonBody(await res.text(), url);
       const text = selectText(json, ep.responseMap.text);
       if (typeof text === "string") yield text;
@@ -993,11 +1014,11 @@ export class ManifestInterpreter implements AdapterInstance {
 
     // Reassembled here, flushed once the stream ends: `arguments` is delivered in fragments.
     const pending = new Map<number, PendingCall>();
-    const tcs = args.onToolCall ? ep.stream.toolCallStream : undefined;
+    const tcs = args.onToolCall ? spec.toolCallStream : undefined;
     // v1.1 amendment (2026-10-01): the dialect's declared block shape, which the streamed branch
     // below needs to tell "fragments to concatenate" from "a whole call per event".
     const toolShape = ep.responseMap.toolCallShape;
-    const wantToolCalls = Boolean(args.onToolCall && (ep.stream.chunkMap.toolCalls || tcs));
+    const wantToolCalls = Boolean(args.onToolCall && (spec.chunkMap.toolCalls || tcs));
     // Last-seen usage block from the stream. Set by the Rust-side parser or by the provider's
     // own usage chunk (e.g. OpenAI puts it on the final choice; Anthropic puts it on message_delta).
     let lastUsage: Partial<UsageTokens> | undefined;
@@ -1041,8 +1062,8 @@ export class ManifestInterpreter implements AdapterInstance {
         } catch {
           continue;
         }
-        if (ep.stream.errorMap) {
-          for (const errPath of Object.keys(ep.stream.errorMap)) {
+        if (spec.errorMap) {
+          for (const errPath of Object.keys(spec.errorMap)) {
             const err = selectOne(json, errPath);
             if (err) throw new ManifestHttpError(200, JSON.stringify(err), "mid-stream");
           }
@@ -1066,8 +1087,8 @@ export class ManifestInterpreter implements AdapterInstance {
               if (typeof partial === "string") cur.args += partial;
               pending.set(idx, cur);
             }
-          } else if (ep.stream.chunkMap.toolCalls) {
-            const blocks = selectOne(json, ep.stream.chunkMap.toolCalls);
+          } else if (spec.chunkMap.toolCalls) {
+            const blocks = selectOne(json, spec.chunkMap.toolCalls);
             if (toolShape?.streamedAs === "whole") {
               // Whole calls, one per event (v1.1 amendment 2026-10-01 — Gemini). This must NOT go
               // through the fragment accumulator: that one reads `function.arguments`, finds
@@ -1089,7 +1110,7 @@ export class ManifestInterpreter implements AdapterInstance {
         }
         // A chunk delta may be a block ARRAY, not a string (Gemini's parts): join it the same
         // way the unary path does, or a dialect whose delta is structured yields nothing.
-        const delta = joinTextParts(selectOne(json, ep.stream.chunkMap.delta));
+        const delta = joinTextParts(selectOne(json, spec.chunkMap.delta));
         if (delta) yield delta;
         // Collect usage whenever present on any chunk (OpenAI: on final choice; Anthropic: on message_delta).
         if (ep.responseMap.usage) {
@@ -1117,8 +1138,8 @@ export class ManifestInterpreter implements AdapterInstance {
           const fr = selectOne(json, ep.responseFinish);
           if (typeof fr === "string" && fr && fr !== "null") finishReason = fr;
         }
-        if (ep.stream.stopWhen && selectOne(json, ep.stream.stopWhen.path) === ep.stream.stopWhen.equals) return;
-        const finish = ep.stream.finish ? selectOne(json, ep.stream.finish) : undefined;
+        if (spec.stopWhen && selectOne(json, spec.stopWhen.path) === spec.stopWhen.equals) return;
+        const finish = spec.finish ? selectOne(json, spec.finish) : undefined;
         // The `stream.finish` selector doubles as a finish-reason source: it may point at a
         // different path than `responseFinish` (Anthropic nests `stop_reason` under `delta`
         // in streaming, vs top-level in the non-stream body), so capture it here too.
@@ -1159,7 +1180,7 @@ export class ManifestInterpreter implements AdapterInstance {
       if (
         args.onFinish &&
         !signal?.aborted &&
-        (ep.stream.finish !== undefined ||
+        (spec.finish !== undefined ||
           ep.responseFinish !== undefined ||
           finishReason !== undefined)
       ) {

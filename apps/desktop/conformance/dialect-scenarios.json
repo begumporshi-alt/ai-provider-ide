@@ -1,0 +1,406 @@
+{
+  "comment": [
+    "Shared dialect-shaping conformance scenarios (2026-10-13).",
+    "",
+    "The product has two implementations of the same manifest interpreter: the TypeScript reference",
+    "(packages/router-core/src/manifest-interpreter.ts and its siblings) and the Rust port",
+    "(apps/desktop/src-tauri/src/core/dialect_shaping.rs). Every scenario in this file is executed by",
+    "BOTH, so the shaping rules are pinned to each other by construction rather than by comments.",
+    "",
+    "Drivers:",
+    "  TypeScript: packages/router-core/test/dialect-conformance.test.ts",
+    "  Rust:       apps/desktop/src-tauri/src/core/dialect_shaping.rs (a #[cfg(test)] module)",
+    "",
+    "Scope: every shaping function, and it is now complete — `normalizeDialectMessages`,",
+    "`shapeToolDeclarations`, `shapeMessageContent`, `attachToolParts`, `readToolCalls`,",
+    "`textOfContent`, `blockField` and `translateFinishReason`. `attachToolParts` was the last one in",
+    "and waited longest, for a reason worth keeping: its output depends on *relations between",
+    "messages* (a tool result's name is resolved by looking back at the assistant turn that declared",
+    "the call, and a run of consecutive tool results collapses into one message), so its scenarios had",
+    "to be written from the semantics rather than from the signature — and both implementations agreed",
+    "with the authored expectations on the first run, which is the evidence that readings on both",
+    "sides were the same reading.",
+    "",
+    "The two `shape*` kinds are the renderer seam: the TypeScript signatures take the template",
+    "renderer as an INJECTED callback (the interpreter owns rendering) while the Rust signatures",
+    "render internally. The reference driver therefore passes `renderTemplate` from `template.ts`",
+    "explicitly, and the Rust driver relies on `render_object`/`render_template`. Both template",
+    "engines are themselves a reference/port pair, so a divergence there could belong to either —",
+    "which is why the scenarios keep their templates to plain `{{placeholder}}` substitution and",
+    "nested objects, the part both engines implement identically by construction.",
+    "",
+    "Comparison rule, applied identically by both drivers: parse the actual output as JSON, drop",
+    "every object key whose value is null (recursively), and compare to the expectation with the",
+    "same normalization applied. Rust serialises `Option::None` as an explicit null where TypeScript",
+    "omits an absent optional key; without the rule the two would disagree about absence, which is",
+    "not what these scenarios are testing.",
+    "",
+    "Scenario kinds:",
+    "  normalizeMessages — {messages, roleMap, systemField} -> {messages, systemContent}",
+    "  shapeContent      — {messages, templates, contentField} -> [messages]",
+    "  readToolCalls     — {blocks, shape} -> [{id?, name?, arguments?}]",
+    "  textOfContent     — {content} -> string",
+    "  blockField        — {block, path} -> value | null",
+    "  finishReason      — {reason, map} -> string",
+    "  shapeToolDeclarations — {tools, templates, wrapper?} -> tools",
+    "  shapeMessageContent   — {messages, templates, contentField} -> [messages]",
+    "",
+    "The last two are the renderer seam: the TypeScript signatures take the template renderer as an",
+    "INJECTED callback (the interpreter owns rendering) while the Rust signatures render internally.",
+    "The reference driver therefore passes `renderTemplate` from `template.ts` explicitly, and the",
+    "Rust driver relies on `render_object`/`render_template`. Both template engines are themselves a",
+    "reference/port pair, so a divergence here can be a divergence in either — which is why the",
+    "scenarios keep their templates to plain `{{placeholder}}` substitution and nested objects, the",
+    "part both engines implement identically by construction."
+  ],
+  "scenarios": [
+    {
+      "name": "roles: system is hoisted into systemField, tool becomes user, tool_call_id is dropped",
+      "kind": "normalizeMessages",
+      "roleMap": { "system": null, "tool": "user", "assistant": "assistant" },
+      "systemField": "system",
+      "messages": [
+        { "role": "system", "content": "be terse" },
+        { "role": "user", "content": "hi" },
+        { "role": "assistant", "content": "hello" },
+        { "role": "tool", "content": "result", "tool_call_id": "call_1" }
+      ],
+      "expect": {
+        "messages": [
+          { "role": "user", "content": "hi" },
+          { "role": "assistant", "content": "hello" },
+          { "role": "user", "content": "result" }
+        ],
+        "systemContent": "be terse"
+      }
+    },
+    {
+      "name": "roles: two system messages join with a blank line, and a role not in the map passes through verbatim",
+      "kind": "normalizeMessages",
+      "roleMap": { "system": null },
+      "systemField": "system",
+      "messages": [
+        { "role": "system", "content": "first" },
+        { "role": "system", "content": "second" },
+        { "role": "developer", "content": "verbatim" }
+      ],
+      "expect": {
+        "messages": [{ "role": "developer", "content": "verbatim" }],
+        "systemContent": "first\n\nsecond"
+      }
+    },
+    {
+      "name": "roles: with no systemField the hoisted content is dropped, never written where nothing reads it",
+      "kind": "normalizeMessages",
+      "roleMap": { "system": null },
+      "systemField": null,
+      "messages": [
+        { "role": "system", "content": "nowhere to go" },
+        { "role": "user", "content": "hi" }
+      ],
+      "expect": {
+        "messages": [{ "role": "user", "content": "hi" }],
+        "systemContent": null
+      }
+    },
+    {
+      "name": "roles: no map at all is a pass-through, so a manifest predating the field is unchanged",
+      "kind": "normalizeMessages",
+      "roleMap": null,
+      "systemField": "system",
+      "messages": [
+        { "role": "system", "content": "s" },
+        { "role": "user", "content": "u" }
+      ],
+      "expect": {
+        "messages": [
+          { "role": "system", "content": "s" },
+          { "role": "user", "content": "u" }
+        ],
+        "systemContent": null
+      }
+    },
+    {
+      "name": "tool calls: the OpenAI shape, json-string arguments carried through as text",
+      "kind": "readToolCalls",
+      "shape": {
+        "discriminator": { "path": "type", "equals": "function" },
+        "id": "id",
+        "name": "function.name",
+        "arguments": "function.arguments"
+      },
+      "blocks": [
+        {
+          "id": "call_1",
+          "type": "function",
+          "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" }
+        },
+        { "type": "text", "text": "not a call" }
+      ],
+      "expect": [
+        {
+          "id": "call_1",
+          "name": "read_file",
+          "arguments": "{\"path\":\"a\"}",
+          "raw": {
+            "id": "call_1",
+            "type": "function",
+            "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" }
+          }
+        }
+      ]
+    },
+    {
+      "name": "tool calls: the Gemini shape — no discriminator value, object arguments serialized on the way in",
+      "kind": "readToolCalls",
+      "shape": {
+        "discriminator": { "path": "functionCall", "present": true },
+        "name": "functionCall.name",
+        "arguments": "functionCall.args",
+        "argumentsFormat": "object"
+      },
+      "blocks": [
+        { "functionCall": { "name": "read_file", "args": { "path": "a" } } },
+        { "text": "not a call" }
+      ],
+      "expect": [
+        {
+          "name": "read_file",
+          "arguments": "{\"path\":\"a\"}",
+          "raw": { "functionCall": { "name": "read_file", "args": { "path": "a" } } }
+        }
+      ]
+    },
+    {
+      "name": "tool calls: a block matching the discriminator but carrying no name is not a call",
+      "kind": "readToolCalls",
+      "shape": {
+        "discriminator": { "path": "type", "equals": "function" },
+        "id": "id",
+        "name": "function.name",
+        "arguments": "function.arguments"
+      },
+      "blocks": [{ "id": "call_1", "type": "function", "function": {} }],
+      "expect": []
+    },
+    {
+      "name": "text: a string, a null, and an unknown shape",
+      "kind": "textOfContent",
+      "content": "plain",
+      "expect": "plain"
+    },
+    {
+      "name": "text: an array of parts joins with single spaces, and an image becomes the placeholder",
+      "kind": "textOfContent",
+      "content": [
+        { "type": "text", "text": "one" },
+        { "type": "text", "text": "two" },
+        { "type": "image", "dataBase64": "AAAA" }
+      ],
+      "expect": "one two <image>"
+    },
+    {
+      "name": "block field: a dotted path resolves through nested objects",
+      "kind": "blockField",
+      "block": { "function": { "name": "read_file" } },
+      "path": "function.name",
+      "expect": "read_file"
+    },
+    {
+      "name": "block field: a path that is not there is absent, not an error",
+      "kind": "blockField",
+      "block": { "function": {} },
+      "path": "function.name",
+      "expect": null
+    },
+    {
+      "name": "finish reason: a declared mapping wins",
+      "kind": "finishReason",
+      "reason": "max_tokens",
+      "map": { "max_tokens": "length", "end_turn": "stop" },
+      "expect": "length"
+    },
+    {
+      "name": "finish reason: an unmapped value passes through rather than becoming a default",
+      "kind": "finishReason",
+      "reason": "something_new",
+      "map": { "max_tokens": "length" },
+      "expect": "something_new"
+    },
+    {
+      "name": "finish reason: no map is a pass-through",
+      "kind": "finishReason",
+      "reason": "max_tokens",
+      "map": null,
+      "expect": "max_tokens"
+    },
+    {
+      "name": "tool declarations: each function renders through its own type's template, and an undeclared type passes through",
+      "kind": "shapeToolDeclarations",
+      "templates": { "function": { "name": "{{name}}", "description": "{{description}}" } },
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "read_file",
+            "description": "reads a file",
+            "parameters": { "type": "object", "properties": {} }
+          }
+        },
+        { "type": "other", "function": { "name": "untouched" } }
+      ],
+      "expect": [
+        { "name": "read_file", "description": "reads a file" },
+        { "type": "other", "function": { "name": "untouched" } }
+      ]
+    },
+    {
+      "name": "tool declarations: a wrapper receives the rendered declarations under {{declarations}}",
+      "kind": "shapeToolDeclarations",
+      "templates": { "function": { "name": "{{name}}" } },
+      "wrapper": { "functionDeclarations": "{{declarations}}" },
+      "tools": [{ "type": "function", "function": { "name": "read_file" } }],
+      "expect": [{ "functionDeclarations": [{ "name": "read_file" }] }]
+    },
+    {
+      "name": "content: a text part renders through its template and the field is renamed to the dialect's own",
+      "kind": "shapeMessageContent",
+      "templates": { "text": { "type": "text", "text": "{{text}}" } },
+      "contentField": "parts",
+      "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }],
+      "expect": [{ "role": "user", "parts": [{ "type": "text", "text": "hi" }] }]
+    },
+    {
+      "name": "content: an image part is offered both the bare bytes and a data URI",
+      "kind": "shapeMessageContent",
+      "templates": {
+        "image": {
+          "inline_data": { "mime_type": "{{mediaType}}", "data": "{{dataBase64}}" },
+          "uri": "{{dataUri}}"
+        }
+      },
+      "contentField": null,
+      "messages": [
+        { "role": "user", "content": [{ "type": "image", "mediaType": "image/png", "dataBase64": "AAAA" }] }
+      ],
+      "expect": [
+        {
+          "role": "user",
+          "content": [
+            {
+              "inline_data": { "mime_type": "image/png", "data": "AAAA" },
+              "uri": "data:image/png;base64,AAAA"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "content: a part type with no template is left exactly as it was",
+      "kind": "shapeMessageContent",
+      "templates": { "text": { "type": "text", "text": "{{text}}" } },
+      "contentField": null,
+      "messages": [
+        { "role": "user", "content": [{ "type": "text", "text": "shaped" }, { "type": "unknown", "keep": "me" }] }
+      ],
+      "expect": [
+        { "role": "user", "content": [{ "type": "text", "text": "shaped" }, { "type": "unknown", "keep": "me" }] }
+      ]
+    },
+    {
+      "name": "tool parts: an assistant call becomes a content part and its result answers it",
+      "kind": "attachToolParts",
+      "templates": {
+        "toolCall": { "type": "tool_use", "id": "{{id}}", "name": "{{name}}", "input": "{{argumentsObject}}" },
+        "toolResult": { "type": "tool_result", "tool_use_id": "{{id}}", "content": "{{text}}" }
+      },
+      "messages": [
+        { "role": "user", "content": "read it" },
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            { "id": "call_1", "type": "function", "function": { "name": "read_file", "arguments": "{\"path\":\"a\"}" } }
+          ]
+        },
+        { "role": "tool", "content": "file body", "tool_call_id": "call_1" }
+      ],
+      "expect": [
+        { "role": "user", "content": "read it" },
+        {
+          "role": "assistant",
+          "content": [
+            { "type": "tool_use", "id": "call_1", "name": "read_file", "input": { "path": "a" } }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": [{ "type": "tool_result", "tool_use_id": "call_1", "content": "file body" }]
+        }
+      ]
+    },
+    {
+      "name": "tool parts: consecutive results collapse into one message, and each resolves its own tool name by looking back",
+      "kind": "attachToolParts",
+      "templates": {
+        "toolCall": { "type": "tool_use", "name": "{{name}}", "id": "{{id}}" },
+        "toolResult": { "type": "tool_result", "name": "{{name}}", "content": "{{text}}" }
+      },
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            { "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } },
+            { "id": "c2", "type": "function", "function": { "name": "list_dir", "arguments": "{}" } }
+          ]
+        },
+        { "role": "tool", "content": "A", "tool_call_id": "c1" },
+        { "role": "tool", "content": "B", "tool_call_id": "c2" }
+      ],
+      "expect": [
+        {
+          "role": "assistant",
+          "content": [
+            { "type": "tool_use", "name": "read_file", "id": "c1" },
+            { "type": "tool_use", "name": "list_dir", "id": "c2" }
+          ]
+        },
+        {
+          "role": "tool",
+          "content": [
+            { "type": "tool_result", "name": "read_file", "content": "A" },
+            { "type": "tool_result", "name": "list_dir", "content": "B" }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "tool parts: a result whose content arrived as parts still carries its text",
+      "kind": "attachToolParts",
+      "templates": { "toolResult": { "type": "tool_result", "content": "{{text}}" } },
+      "messages": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [{ "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }]
+        },
+        {
+          "role": "tool",
+          "content": [{ "type": "text", "text": "file body" }],
+          "tool_call_id": "c1"
+        }
+      ],
+      "expect": [
+        {
+          "role": "assistant",
+          "content": "",
+          "tool_calls": [
+            { "id": "c1", "type": "function", "function": { "name": "read_file", "arguments": "{}" } }
+          ]
+        },
+        { "role": "tool", "content": [{ "type": "tool_result", "content": "file body" }] }
+      ]
+    }
+  ]
+}

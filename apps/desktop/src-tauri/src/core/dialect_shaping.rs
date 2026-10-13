@@ -981,4 +981,154 @@ mod tests {
         let odd = obj(json!({ "weird": 7 }));
         assert_eq!(translate_finish_reason("weird", Some(&odd)), "weird");
     }
+
+    // ── the shared differential corpus ───────────────────────────────────────────────────────
+    //
+    // The scenarios live in ONE file (`apps/desktop/conformance/dialect-scenarios.json`) and are
+    // executed by BOTH the TypeScript reference
+    // (`packages/router-core/test/dialect-conformance.test.ts`) and this test, so the shaping rules
+    // are pinned to each other by construction. A divergence means a manifest the wizard validated
+    // behaves differently once the gateway serves it — the failure mode this corpus exists to make
+    // impossible rather than merely unlikely.
+    //
+    // It found one on its first run: the reference tested `systemField === undefined` where a
+    // manifest file carries `null`, so `"systemField": null` hoisted the system prompt into a path
+    // named "null", while this port's `Option<&str>` read the same manifest as having no field.
+
+    const DIALECT_SCENARIOS: &str = include_str!("../../../conformance/dialect-scenarios.json");
+
+    /// Drop null-valued object keys, recursively — the corpus's stated comparison rule.
+    ///
+    /// This port serialises `Option::None` as an explicit `null` where the TypeScript reference omits
+    /// an absent optional key (a `ToolCall` with no id). Absence is what these scenarios are *not*
+    /// testing, so both drivers normalize it away before comparing.
+    fn normalize(v: &Value) -> Value {
+        match v {
+            Value::Object(m) => Value::Object(
+                m.iter()
+                    .filter(|(_, val)| !val.is_null())
+                    .map(|(k, val)| (k.clone(), normalize(val)))
+                    .collect(),
+            ),
+            Value::Array(items) => Value::Array(items.iter().map(normalize).collect()),
+            other => other.clone(),
+        }
+    }
+
+    fn dialect_scenarios() -> Vec<Value> {
+        let parsed: Value = serde_json::from_str(DIALECT_SCENARIOS).expect("the corpus parses");
+        parsed
+            .get("scenarios")
+            .and_then(Value::as_array)
+            .cloned()
+            .expect("the corpus declares scenarios")
+    }
+
+    /// Run one scenario through this port. Mirrors the reference driver's dispatch exactly.
+    fn run_dialect_scenario(s: &Value) -> Value {
+        let kind = s.get("kind").and_then(Value::as_str).unwrap_or_default();
+        match kind {
+            "normalizeMessages" => {
+                let messages =
+                    s.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+                let role_map = s.get("roleMap").and_then(Value::as_object).cloned();
+                let system_field = s.get("systemField").and_then(Value::as_str);
+                let (messages, system_content) =
+                    normalize_dialect_messages(&messages, role_map.as_ref(), system_field);
+                json!({ "messages": messages, "systemContent": system_content })
+            }
+            "readToolCalls" => {
+                let shape: ToolCallShape =
+                    serde_json::from_value(s.get("shape").cloned().unwrap_or(Value::Null))
+                        .expect("the scenario declares a tool-call shape");
+                let blocks = s.get("blocks").cloned().unwrap_or(Value::Null);
+                // Projected explicitly rather than by deriving `Serialize` on an internal type for
+                // a test's convenience. The projection is also the statement of what the two
+                // implementations are compared *on*: the id, the name, the arguments text, and the
+                // provider's own block.
+                let calls: Vec<Value> = read_tool_calls(&blocks, &shape)
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "name": c.name,
+                            "arguments": c.arguments,
+                            "raw": c.raw,
+                        })
+                    })
+                    .collect();
+                json!(calls)
+            }
+            "textOfContent" => {
+                let content = s.get("content").cloned().unwrap_or(Value::Null);
+                json!(text_of_content(&content))
+            }
+            "blockField" => {
+                let block = s.get("block").cloned().unwrap_or(Value::Null);
+                let path = s.get("path").and_then(Value::as_str).unwrap_or_default();
+                block_field(&block, path).cloned().unwrap_or(Value::Null)
+            }
+            "finishReason" => {
+                let reason = s.get("reason").and_then(Value::as_str).unwrap_or_default();
+                let map = s.get("map").and_then(Value::as_object);
+                json!(translate_finish_reason(reason, map))
+            }
+            // The renderer seam. The reference's signatures take the template renderer as an
+            // injected callback while these render internally with `render_object` /
+            // `render_template` — the port of the same engine. The corpus header states that, since
+            // a divergence here could belong to either implementation's renderer.
+            "shapeToolDeclarations" => {
+                let tools = s.get("tools").cloned().unwrap_or(Value::Null);
+                let templates = s.get("templates").and_then(Value::as_object);
+                let wrapper = s.get("wrapper").and_then(Value::as_object);
+                let rendered = shape_tool_declarations(
+                    if tools.is_null() { None } else { Some(&tools) },
+                    templates,
+                    wrapper,
+                )
+                .expect("the scenario's templates render");
+                rendered.unwrap_or(Value::Null)
+            }
+            "shapeMessageContent" => {
+                let messages =
+                    s.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+                let templates = s.get("templates").and_then(Value::as_object);
+                let content_field = s.get("contentField").and_then(Value::as_str);
+                let shaped = shape_message_content(&messages, templates, content_field)
+                    .expect("the scenario's templates render");
+                json!(shaped)
+            }
+            "attachToolParts" => {
+                let messages =
+                    s.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+                // This port takes the two templates as separate arguments where the reference takes
+                // one object with two keys — the same values, reached differently.
+                let templates = s.get("templates").and_then(Value::as_object);
+                let tool_call =
+                    templates.and_then(|t| t.get("toolCall")).and_then(Value::as_object);
+                let tool_result =
+                    templates.and_then(|t| t.get("toolResult")).and_then(Value::as_object);
+                let shaped = attach_tool_parts(&messages, tool_call, tool_result)
+                    .expect("the scenario's templates render");
+                json!(shaped)
+            }
+            other => panic!("unknown scenario kind: {other}"),
+        }
+    }
+
+    #[test]
+    fn every_shared_dialect_scenario_holds_on_this_port() {
+        let scenarios = dialect_scenarios();
+        assert!(!scenarios.is_empty(), "the corpus is not empty");
+        for s in &scenarios {
+            let name = s.get("name").and_then(Value::as_str).unwrap_or("(unnamed)");
+            let expect = s.get("expect").cloned().unwrap_or(Value::Null);
+            let actual = normalize(&run_dialect_scenario(s));
+            assert_eq!(
+                actual,
+                normalize(&expect),
+                "scenario \"{name}\" diverged from the shared corpus"
+            );
+        }
+    }
 }

@@ -106,7 +106,14 @@ export function shapeMessageContent(
   contentField: string | undefined,
   render: (template: Record<string, unknown>, values: Record<string, unknown>) => Record<string, unknown>,
 ): unknown[] {
-  const renames = contentField !== undefined && contentField !== "content";
+  // `!= null`, not `!== undefined`: the grammar declares `contentField: z.string().optional()`, so
+  // `null` is not reachable through a *validated* manifest — but these values are also read from
+  // rows a hand-edit or an import wrote, which is the bypass the drift register already tracks for
+  // other fields. With the strict check, `"contentField": null` renamed the field to a key literally
+  // called `"null"`, while the Rust port's `Option<&str>` read the same manifest as having no rename
+  // at all. Found by `conformance/dialect-scenarios.json`, the same way and on the same day as the
+  // identical defect in `normalizeDialectMessages`'s `systemField`.
+  const renames = contentField != null && contentField !== "content";
   if (!templates && !renames) return [...messages];
   return messages.map((m) => {
     if (!m || typeof m !== "object") return m;

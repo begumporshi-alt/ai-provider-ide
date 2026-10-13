@@ -304,6 +304,13 @@ export const GENERATE_TEXT_ENDPOINT = z.object({
       // chunkMap yields nothing on non-chunk events, so:
       //   stopWhen   — events that END the stream (e.g. anthropic message_stop)
       //   ignoreWhen — events whose mismatched chunkMap must not classify as PARSE_ERROR
+      //
+      // **`ignoreWhen` is declared and read by NOTHING.** Measured 2026-10-13: no occurrence in
+      // `packages/router-core/src/` or `apps/desktop/src-tauri/src/`, while `stopWhen` is honoured
+      // in both. A manifest may declare it, validate, be stored and served, and behave exactly as if
+      // the declaration were absent. Registered as drift **D103** with the evidence and the two
+      // candidate resolutions (implement it in both engines, or remove it in a version bump) —
+      // pointed at here so the next reader meets the register rather than this comment alone.
       stopWhen: StreamCondition.optional(),
       ignoreWhen: StreamCondition.optional(),
       // Multi-event tool-call framing (anthropic-compat). Mutually exclusive in practice

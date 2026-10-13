@@ -1,5 +1,5 @@
 export type { AdapterManifest } from "@aiprovider/adapter-spec";
-export { ManifestInterpreter, ManifestHttpError, type HttpPortLike, type AdapterContext, type ModelEntry, type TextArgs } from "./manifest-interpreter.js";
+export { ManifestInterpreter, ManifestHttpError, normalizeDialectMessages, translateFinishReason, type HttpPortLike, type AdapterContext, type ModelEntry, type TextArgs } from "./manifest-interpreter.js";
 export { type AdapterInstance } from "./adapter-instance.js";
 export { CodeAdapterInstance, SandboxError, lintCodeSource, type CodeAdapterOptions } from "./code-adapter.js";
 export {

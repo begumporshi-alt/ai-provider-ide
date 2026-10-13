@@ -428,16 +428,19 @@ impl ManifestInterpreter {
                 return Err(AttemptError::Transport { message: None });
             };
             let spec = ep.stream.as_ref();
-            // `args.stream && ep.stream` — the reference's own guard (`manifest-interpreter.ts:306`),
-            // and it decides only how the *response* is **read**. It does not decide what is *asked
-            // for*: `values.stream` below is the caller's flag, exactly as the reference's `stream:
-            // args.stream` (`:273`) is, so a manifest that declares no `stream` block still sends
-            // `"stream": true` upstream, and a server that honours it answers with SSE — which
-            // `unary_text` then parses as JSON, fails, and reports as `AttemptError::Transport`,
-            // which the engine classifies as `NETWORK`. Measured 2026-09-24; this is the third route
-            // to the misleading 502 of D45 and D46, and the second with no allowlist involved. Latent
-            // on the installed database — all **3** manifest rows declare the block — so it fires for
-            // a hand-written or imported manifest. Recorded as **D47**.
+            // **One decision, and everything that depends on it reads THIS.** `streaming` means "the
+            // caller asked to stream AND the manifest can read a stream", and it now governs the four
+            // things that used to disagree: the `{{stream}}` value the body carries, whether
+            // `stream_options` is asked for, which endpoint is dialled, and which branch reads the
+            // answer.
+            //
+            // Until 2026-10-13 the first two used the caller's flag alone, so a manifest declaring no
+            // `stream` block still sent `"stream": true`; a server that honoured it answered with SSE,
+            // `unary_text` parsed that as JSON, failed, and reported `AttemptError::Transport` —
+            // classified `NETWORK`, surfacing to the client as a misleading `502`. That was the third
+            // route to D45's 502 and the second with no allowlist involved. **D47, closed
+            // 2026-10-13**: what you ask for and how you read it are one decision, which is why the
+            // value is bound here rather than left to the caller's flag at the template.
             let streaming = stream && spec.is_some();
             let wants_usage = wants_usage(&self.view, ep);
 
@@ -477,7 +480,7 @@ impl ManifestInterpreter {
             let model_for_path = model.clone();
             values.insert("model".to_string(), Value::String(model));
             values.insert("messages".to_string(), Value::Array(dialect_messages));
-            values.insert("stream".to_string(), Value::Bool(stream));
+            values.insert("stream".to_string(), Value::Bool(streaming));
             // Hoisted system content lands in the dialect's declared system field; `{{system?}}` in
             // the template omits the field when the dialect has no system channel.
             if let Some(system) = system_content {
@@ -551,11 +554,9 @@ impl ManifestInterpreter {
             let mut body = render_template(&ep.request_template, &values)
                 .map_err(|_| AttemptError::Transport { message: None })?;
 
-            // **`args.stream`, not `streaming`.** The source tests the caller's request, so a
-            // manifest with no stream block still gets the field when the caller asked to stream.
-            // Faithful rather than tidy: the two differ only for a manifest the grammar would have
-            // rejected anyway, and a port that "fixed" it would be changing a request body.
-            if stream && wants_usage {
+            // `streaming`, not `args.stream`: asking for a usage block on a request that will be read
+            // as unary is the same disagreement D47 was. See `streaming`'s binding above.
+            if streaming && wants_usage {
                 body.insert(
                     "stream_options".to_string(),
                     serde_json::json!({ "include_usage": true }),
@@ -3083,6 +3084,61 @@ mod tests {
         assert_eq!(req.headers["content-type"], "application/json");
         assert_eq!(req.secret_ref.as_deref(), Some("key:k1"));
         assert!(!req.stream, "a unary call must not ask the port to stream");
+    }
+
+    /// **D47, closed 2026-10-13: a manifest that cannot read a stream does not ask for one.**
+    ///
+    /// The reproduction the drift register recorded, as an assertion. With no `stream` block, the
+    /// question "can this dialect stream?" is answered by the manifest, not by the caller — and the
+    /// answer has to reach the *request body*, because asking for a stream the reader cannot parse is
+    /// what produced a `502 … [NETWORK]` blaming a provider that had answered correctly.
+    ///
+    /// This is the half the register could not test before: `streaming` was a local on the read path
+    /// only, so no assertion could see the request the trap produced.
+    #[tokio::test]
+    async fn a_manifest_with_no_stream_block_asks_for_a_unary_answer_even_when_the_caller_streams()
+    {
+        let mut manifest = openai_manifest();
+        // The one edit: the dialect declares no way to read a stream.
+        manifest["endpoints"]["generateText"].as_object_mut().expect("an object").remove("stream");
+        let http = FakeHttp::new(vec![Scripted::text(
+            200,
+            r#"{"choices":[{"message":{"content":"x"}}]}"#,
+        )]);
+        let interp = interpreter(&manifest, http.clone());
+
+        let messages = vec![json!({ "role": "user", "content": "hey" })];
+        let mut args = text_args("gpt-4o");
+        args.stream = true; // the caller asks for a stream the manifest cannot read
+        args.messages = &messages;
+        let _ = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        let body: Value =
+            serde_json::from_str(http.only_request().body.as_deref().unwrap()).expect("valid json");
+        assert_eq!(
+            body["stream"],
+            json!(false),
+            "a manifest with no stream block must be asked for a unary answer — the caller's wish \
+             cannot make the response readable"
+        );
+    }
+
+    /// The other side of the same decision: a manifest that *can* stream still gets the caller's
+    /// request, so closing D47 changed nothing for every manifest in the wild.
+    #[tokio::test]
+    async fn a_manifest_with_a_stream_block_still_asks_to_stream_when_the_caller_does() {
+        let http = FakeHttp::new(vec![Scripted::sse(&["data: {\"x\":1}\n\n", "data: [DONE]\n\n"])]);
+        let interp = interpreter(&openai_manifest(), http.clone());
+
+        let messages = vec![json!({ "role": "user", "content": "hey" })];
+        let mut args = text_args("gpt-4o");
+        args.stream = true;
+        args.messages = &messages;
+        let _ = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        let body: Value =
+            serde_json::from_str(http.only_request().body.as_deref().unwrap()).expect("valid json");
+        assert_eq!(body["stream"], json!(true));
     }
 
     /// The rendered body carries the caller's model, the conversation, and `stream: false` — and
