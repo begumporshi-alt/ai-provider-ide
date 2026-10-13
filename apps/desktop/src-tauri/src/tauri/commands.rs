@@ -230,6 +230,39 @@ pub fn history_delete_session(
     context::delete_session(&store, &session_id).map_err(CommandError)
 }
 
+// ---------- the transcript (0027) ----------
+// The durable copy of what the Assistant's transcript rendered. Until this existed a resumed
+// session was *reconstructed* from the context graph, which clips a message's text and derives its
+// order from the id — fine for a graph, lossy for a conversation.
+
+/// Append one turn's messages. Batched on purpose: a turn is a unit, and a half-written turn
+/// replays a `tool_calls` array with no results, which every provider rejects.
+#[tauri::command]
+pub fn transcript_append(
+    store: State<'_, Arc<Store>>,
+    rows: Vec<context::SessionMessageRow>,
+) -> Result<(), CommandError> {
+    context::append_session_messages(&store, &rows).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn transcript_list(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+) -> Result<Vec<context::SessionMessageRow>, CommandError> {
+    context::session_messages(&store, &session_id).map_err(CommandError)
+}
+
+/// Highest message sequence already stored, so a resumed session continues past its own turns
+/// instead of upserting over them — the transcript's sibling of `history_max_seq`.
+#[tauri::command]
+pub fn transcript_max_seq(
+    store: State<'_, Arc<Store>>,
+    session_id: String,
+) -> Result<i64, CommandError> {
+    context::max_message_seq(&store, &session_id).map_err(CommandError)
+}
+
 // ---------- skills (P5) ----------
 // Skills are procedures, not capabilities: nothing here can widen the agent's tool surface.
 
@@ -773,6 +806,9 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         history_rename_session,
         history_max_seq,
         history_delete_session,
+        transcript_append,
+        transcript_list,
+        transcript_max_seq,
         skills_list,
         skills_catalog,
         skills_install,
@@ -838,6 +874,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         crate::core::persist::config_import,
         crate::core::persist::diagnostics_bundle,
         crate::tauri::tools_cmds::tools_policy,
+        crate::tauri::tools_cmds::tools_set_extra_programs,
         crate::tauri::tools_cmds::tools_check_root,
         crate::tauri::tools_cmds::tools_default_root,
         crate::tauri::tools_cmds::tools_list_dirs,

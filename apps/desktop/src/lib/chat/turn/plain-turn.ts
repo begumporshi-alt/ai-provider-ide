@@ -7,6 +7,7 @@ import { buildPlainRequestMessages } from "./prompt";
 import { replayHistory } from "./messages";
 import { clip } from "./graph-record";
 import type { TurnPorts, TurnRequestBase } from "./ports";
+import { attachmentMeta } from "./ports";
 import type { ServedBy } from "../../gateway-turn";
 
 /** The model's reasoning paints at most every 80 ms. Time-based rather than count-based: a fixed
@@ -33,6 +34,10 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   if (recalled.length > 0) ports.memory.recordRecall(userNode, recalled);
   let streamed = "";
   let reasoned = "";
+  /** What the transcript will record for the assistant turn. Tracks the *bubble*, not the stream:
+   *  a failed turn shows a `⚠ …` line, and a transcript row that said instead would make the
+   *  durable copy disagree with the conversation the user can see. */
+  let recordedText = "";
   let lastReasoningPaint = 0;
   // Charged to the session totals in the `finally`, once per turn. No initializer: `onUsage`
   // (a closure TS cannot see run) is what assigns it, and an `= null` start would narrow the
@@ -100,6 +105,7 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
     // this path does not.
     const served = exec.served();
     turnServed = served;
+    recordedText = streamed;
     const assistantNode = rec.node("message", clip(streamed, 120) || "(empty)", {
       role: "assistant",
       model: served?.model ?? req.model,
@@ -126,14 +132,29 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   } catch (e) {
     if (req.signal.aborted) {
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: "stopped by you" });
+      // A stopped turn keeps whatever it had said — the same partial turn the graph records.
+      recordedText = streamed;
     } else {
       ports.onTrace({ ms: ports.now() - req.startedAt, fallbacks: [], error: (e as Error).message });
-      ports.patchMsg(req.assistantMsgId, { content: streamed || `⚠ ${(e as Error).message}` });
+      recordedText = streamed || `⚠ ${(e as Error).message}`;
+      ports.patchMsg(req.assistantMsgId, { content: recordedText });
     }
   } finally {
     // Flush even on error or stop: a partial turn is still a turn, and the graph is a record
     // of what happened, not of what succeeded.
     void rec.flush();
+    // The durable transcript (0027), written on the same rule as the graph flush above: a failed
+    // or stopped turn is still part of the conversation, and the `finally` is the one place both
+    // outcomes reach. `recordedText`, not `streamed` — the row must say what the bubble says.
+    ports.transcript.append([
+      { role: "user", content: req.text, attachments: attachmentMeta(req.attachments) },
+      {
+        role: "assistant",
+        content: recordedText,
+        reasoning: reasoned || null,
+        model: turnServed?.model ?? req.model,
+      },
+    ]);
     // P7: remember whatever was actually said, including a failed or stopped turn — an
     // exchange the user abandoned is still part of the record. Distillation is not awaited.
     if (req.useMemory) {

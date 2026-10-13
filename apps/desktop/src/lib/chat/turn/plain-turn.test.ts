@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { runPlainTurn, REASONING_PAINT_MS, type PlainTurnRequest } from "./plain-turn";
-import type { Trace, TurnPorts } from "./ports";
+import type { Trace, TranscriptEntry, TurnPorts } from "./ports";
 import type { ServedBy } from "../../gateway-turn";
 import type { Memory } from "../../../store";
 
@@ -44,6 +44,8 @@ function makePorts(opts: FakeOpts = {}) {
   const patches: { id: string; patch: Record<string, unknown> }[] = [];
   const traces: Trace[] = [];
   const charged: { tokensIn: number | undefined; tokensOut: number | undefined; provider?: string; model?: string }[] = [];
+  /** Every transcript append, in call order — the durable copy the turn produced (0027). */
+  const appended: TranscriptEntry[][] = [];
   const recorder = fakeRecorder();
   const ports: TurnPorts = {
     generate: async () => {
@@ -73,6 +75,7 @@ function makePorts(opts: FakeOpts = {}) {
       remember: vi.fn().mockResolvedValue(undefined),
       distil: vi.fn().mockResolvedValue(undefined),
     },
+    transcript: { append: (entries: TranscriptEntry[]) => appended.push(entries) },
     providerName: (id) => (id === "prov-1" ? "Provider One" : undefined),
     patchMsg: (id, patch) => patches.push({ id, patch: patch as Record<string, unknown> }),
     onTrace: (t) => traces.push(t),
@@ -94,7 +97,7 @@ function makePorts(opts: FakeOpts = {}) {
     if (opts.usage) (req.onUsage as (u: FakeOpts["usage"]) => void)(opts.usage);
     return inner(req, o);
   };
-  return { ports, patches, traces, charged, recorder, lastReq: () => lastReq };
+  return { ports, patches, traces, charged, recorder, appended, lastReq: () => lastReq };
 }
 
 function makeRequest(over: Partial<PlainTurnRequest> = {}): PlainTurnRequest {
@@ -232,6 +235,61 @@ describe("runPlainTurn", () => {
     });
     await runPlainTurn(makeRequest(), ports);
     expect(traces[0]!.fallbacks).toEqual([{ provider: "first-try", key: "key-00", cls: "SERVER" }]);
+  });
+
+  /**
+   * The durable transcript (0027). This path used to leave nothing behind but the graph, whose
+   * message nodes are clipped — which is why a resumed plain chat came back shortened.
+   */
+  it("records both turns in the durable transcript, with the answer as streamed", async () => {
+    const { ports, appended } = makePorts({ chunks: ["a", "b"] });
+    await runPlainTurn(makeRequest({ text: "hi there" }), ports);
+
+    expect(appended, "one append per turn").toHaveLength(1);
+    expect(appended[0]).toEqual([
+      { role: "user", content: "hi there", attachments: null },
+      { role: "assistant", content: "ab", reasoning: null, model: "prov-1/model-x" },
+    ]);
+  });
+
+  /**
+   * The row records that something was attached and never *what* it was: an image's base64 is
+   * megabytes of payload that already lives where the user put it, and duplicating it into the
+   * database on every turn is both a size problem and a needless copy of user content.
+   */
+  it("stores attachment metadata without the image bytes", async () => {
+    const { ports, appended } = makePorts({ chunks: ["ok"] });
+    await runPlainTurn(
+      makeRequest({
+        text: "what is this",
+        attachments: [
+          { id: "a1", name: "shot.png", mediaType: "image/png", dataBase64: "BASE64PAYLOAD", bytes: 12 },
+        ],
+      }),
+      ports,
+    );
+
+    const stored = appended[0]![0]!.attachments ?? "";
+    expect(stored).toContain("shot.png");
+    expect(stored).toContain("image/png");
+    expect(stored, "the bytes must not be in the row").not.toContain("BASE64PAYLOAD");
+  });
+
+  /**
+   * A failed turn is still a turn, and the row must say what the bubble says. Recording `streamed`
+   * here would store an empty assistant message while the user reads `⚠ boom` — the durable copy
+   * disagreeing with the conversation, which is worse than not storing it.
+   */
+  it("records a failed turn as the text the bubble shows, not as the empty stream", async () => {
+    const { ports, appended } = makePorts({ failWith: new Error("boom") });
+    await runPlainTurn(makeRequest({ text: "hi" }), ports);
+
+    expect(appended[0]![1]).toEqual({
+      role: "assistant",
+      content: "⚠ boom",
+      reasoning: null,
+      model: "prov-1/model-x",
+    });
   });
 });
 

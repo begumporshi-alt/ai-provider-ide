@@ -346,7 +346,47 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0024_agent_runs_parent", add_agent_runs_parent),
     ("0025_agent_runs_tokens", add_agent_runs_tokens),
     ("0026_pending_last_error", add_pending_last_error),
+    ("0027_session_messages", create_session_messages),
 ];
+
+/// 0027 — the transcript as rows, so a resumed session is restored rather than reconstructed.
+///
+/// Until now the only durable copy of a conversation was the **context graph**, which is built for
+/// edges rather than for replay: a message node's text is clipped for the force layout, its
+/// ordering comes from the sequence number embedded in its id, and the assistant turn a tool result
+/// belongs to has to be recovered by walking a `produced` edge. History rebuilt a transcript from
+/// that, which is why resume could not be lossless — the graph never held the whole message.
+///
+/// These rows are the message, in the shape the wire needs: `tool_calls` on an assistant turn and
+/// `tool_call_id` on its results, preserved exactly, because a provider rejects a dangling call or
+/// an orphan result and the pair must survive a restart. The graph stays append-only and becomes
+/// the derived view; this table becomes the record.
+///
+/// `(session_id, seq)` is the primary key, so re-appending a turn is idempotent rather than
+/// duplicating it. A data migration rather than a `MIGRATIONS` entry for the reason
+/// `backfill_live_context` records: appending to `MIGRATIONS` would shift every computed
+/// data-migration version under an existing database.
+fn create_session_messages(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE TABLE IF NOT EXISTS session_messages (
+  session_id   TEXT NOT NULL,
+  seq          INTEGER NOT NULL,
+  role         TEXT NOT NULL CHECK (role IN ('user','assistant','tool')),
+  content      TEXT NOT NULL DEFAULT '',
+  tool_calls   TEXT,
+  tool_call_id TEXT,
+  reasoning    TEXT,
+  attachments  TEXT,
+  model        TEXT,
+  ts           INTEGER NOT NULL,
+  PRIMARY KEY (session_id, seq)
+);
+CREATE INDEX IF NOT EXISTS idx_session_messages_session ON session_messages(session_id, seq);
+"#,
+    )?;
+    Ok(())
+}
 
 /// 0026 — why a queued turn was retired.
 ///
@@ -1494,11 +1534,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0026 data migrations.
-        assert_eq!(info.schema_version, 26);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0027 data migrations.
+        assert_eq!(info.schema_version, 27);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(26, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(27, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1528,6 +1568,7 @@ mod tests {
             "session_turns",
             "session_state",
             "session_titles",
+            "session_messages",
             "memory_pending",
             "memory_principal_policy",
             "router_model_context",

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from "vitest";
 import { runAgentTurn, type AgentTurnRequest } from "./agent-turn";
-import type { AgentTurnPorts, Trace } from "./ports";
+import type { AgentTurnPorts, Trace, TranscriptEntry } from "./ports";
 import type { AgentEvent, ToolHost } from "../../tools";
 import type { ServedBy } from "../../gateway-turn";
 
@@ -37,6 +37,8 @@ function makePorts(opts: {
   const patches: { id: string; patch: Record<string, unknown> }[] = [];
   const charged: { tokensIn: number | undefined; tokensOut: number | undefined; provider?: string; model?: string }[] = [];
   const recorded: { kind: string; label?: string }[] = [];
+  /** Every transcript append, in call order — the durable copy the turn produced (0027). */
+  const appended: TranscriptEntry[][] = [];
   const runs: { started: unknown[]; ended: unknown[] } = { started: [], ended: [] };
   let nodeSeq = 0;
   const controller = new AbortController();
@@ -63,6 +65,7 @@ function makePorts(opts: {
       remember: vi.fn().mockResolvedValue(undefined),
       distil: vi.fn().mockResolvedValue(undefined),
     },
+    transcript: { append: (entries: TranscriptEntry[]) => appended.push(entries) },
     providerName: () => undefined,
     patchMsg: (id, patch) => patches.push({ id, patch: patch as Record<string, unknown> }),
     onTrace: vi.fn((t: Trace) => traces.push(t)),
@@ -89,7 +92,7 @@ function makePorts(opts: {
     onRunChanges: vi.fn(),
     clearRunUi: vi.fn(),
   };
-  return { ports, events, traces, patches, charged, recorded, runs, controller };
+  return { ports, events, traces, patches, charged, recorded, runs, controller, appended };
 }
 
 function makeRequest(over: Partial<AgentTurnRequest> = {}): AgentTurnRequest {
@@ -115,6 +118,32 @@ function makeRequest(over: Partial<AgentTurnRequest> = {}): AgentTurnRequest {
 }
 
 describe("runAgentTurn", () => {
+  /**
+   * The durable transcript (0027) gets this turn's messages with the tool pair intact: the
+   * `tool_calls` array on the assistant turn that declared the call, and the matching
+   * `tool_call_id` on the result that answers it. That pair is what a provider validates on
+   * replay, and it is the one thing the graph-derived timeline could not carry losslessly.
+   */
+  it("records the turn's tool round-trip in the durable transcript, ids intact", async () => {
+    const { ports, appended } = makePorts({
+      steps: [
+        { text: "", calls: [{ id: "call_9", name: "read_file", arguments: '{"path":"a.txt"}' }] },
+        { text: "done" },
+      ],
+    });
+    await runAgentTurn(makeRequest({ useMemory: false }), ports);
+
+    expect(appended, "one append per turn").toHaveLength(1);
+    const entries = appended[0]!;
+    const assistant = entries.find((e) => e.toolCalls);
+    const result = entries.find((e) => e.role === "tool");
+    expect(assistant?.toolCalls, "the declared call survives verbatim").toContain("call_9");
+    expect(result?.toolCallId, "and the result names the same id").toBe("call_9");
+    // Only THIS turn's messages: a re-recorded prefix would replay the conversation's own history
+    // into the provider on the next resume.
+    expect(entries.some((e) => e.role === "user" && e.content === "do the thing")).toBe(true);
+  });
+
   /**
    * The seam that hid this is the replace, not the fill. `onReplaceTranscript` mints a fresh id for
    * every message, so a notice filled *after* the replace by the optimistic message's id matches

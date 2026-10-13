@@ -48,6 +48,61 @@ export interface MemoryPorts {
   distil(sessionId: string, model: string): Promise<unknown>;
 }
 
+/**
+ * One message of the turn, in the shape the durable transcript stores (0027).
+ *
+ * The engine decides *what the turn was*; the screen decides *where it is stored* — so this carries
+ * no session id, no sequence number and no timestamp. `toolCalls` and `toolCallId` are serialized
+ * strings rather than objects because that is what the row holds and what the wire replays: a
+ * provider validates the pair, and re-serializing an object on the way out risks a shape the model
+ * never declared.
+ */
+export interface TranscriptEntry {
+  role: "user" | "assistant" | "tool";
+  content: string;
+  /** Serialized OpenAI `tool_calls` array, on an assistant turn that declared calls. */
+  toolCalls?: string | null;
+  /** The call this result answers, on a `tool` entry. */
+  toolCallId?: string | null;
+  reasoning?: string | null;
+  /** Serialized attachment metadata — never bytes. */
+  attachments?: string | null;
+  model?: string | null;
+}
+
+/**
+ * The durable transcript, as the turn engine sees it.
+ *
+ * A port rather than an import for the same reason the run record is one: node tests record into an
+ * array, and the engine must not pull the host boundary into every importer. Fire-and-forget by
+ * contract — a transcript write that fails must not fail the turn; the context graph already
+ * records what happened for the readers that need durability, and this table is what a *resume*
+ * reads.
+ */
+export interface TranscriptPorts {
+  append(entries: TranscriptEntry[]): void;
+}
+
+/**
+ * Attachment metadata for a transcript row — **never the bytes**.
+ *
+ * An image's base64 is the largest thing in the request and it is already stored wherever the user
+ * put it, so writing it into the database would duplicate megabytes per turn for a payload a resume
+ * re-reads from the turn that owns it. What the row needs is that something *was* attached, and
+ * enough to name it.
+ *
+ * Structurally typed rather than importing the composer's `Attachment`, so this module stays a leaf
+ * — the turn engine's ports must not pull a React component in.
+ */
+export function attachmentMeta(
+  attachments: readonly { name: string; mediaType: string; bytes: number }[],
+): string | null {
+  if (attachments.length === 0) return null;
+  return JSON.stringify(
+    attachments.map((a) => ({ name: a.name, mediaType: a.mediaType, bytes: a.bytes })),
+  );
+}
+
 /** Inputs shared by both turn branches. `startedAt` feeds the trace's ms; the clock is injectable. */
 export interface TurnRequestBase {
   text: string;
@@ -97,6 +152,11 @@ export interface TurnDeps {
   /** Where the graph's "follows" chain currently ends; the engine appends the assistant node. */
   lastNode: { current: string | null };
   memory: MemoryPorts;
+  /**
+   * Where this turn's messages are written so a later resume is a restore rather than a
+   * reconstruction. Both branches append exactly once, at the point they already record the turn.
+   */
+  transcript: TranscriptPorts;
   /** Provider display name for the trace, from the registry. */
   providerName(providerId: string): string | undefined;
   /** Injectable clock for the throttle and the trace's duration. */

@@ -96,6 +96,12 @@ const contextEdges: Row[] = [];
  * renaming worked in the app and silently did nothing here.
  */
 const sessionTitles = new Map<string, string>();
+/**
+ * The `session_messages` transcript (migration 0027 in the Rust host), keyed by session id.
+ * Emulated rather than stubbed because the resume path reads it back — a shim returning `[]` would
+ * let "resume restored the transcript" pass while restoring nothing.
+ */
+const transcriptRows = new Map<string, Row[]>();
 const skills: Row[] = [];
 const agentRuns: Row[] = [];
 const agentSteps: Row[] = [];
@@ -389,6 +395,22 @@ const TOOLS_POLICY = {
   max_command_ms: 60_000,
   max_output_bytes: 64 * 1024,
 };
+
+/** Programs the host refuses unconditionally, so a spec can prove the screen says so too. */
+const NEVER_ALLOWED_PROGRAMS = ["sudo", "su", "dd", "shutdown", "reboot", "halt", "diskutil", "launchctl", "csrutil", "kextload"];
+
+/** The sandbox's user-added programs. Stateful because the screen under test reads the policy back
+ *  after writing it — a constant here would let a screen that ignored the response pass. */
+let toolsExtraPrograms: string[] = [];
+
+/** The policy as the host would answer it now: baseline, additions and denylist reported apart. */
+function toolsPolicyNow() {
+  return {
+    ...TOOLS_POLICY,
+    extra_programs: [...toolsExtraPrograms].sort(),
+    never_allowed: [...NEVER_ALLOWED_PROGRAMS],
+  };
+}
 
 /** Confinement: real tools.rs refuses paths containing ".." or starting with "/" (the root is
  *  stripped before resolution). Mirror it so tests catch escape attempts that production would. */
@@ -1403,7 +1425,43 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         const e = contextEdges[i]!;
         if (!live.has(String(e.from_id)) || !live.has(String(e.to_id))) contextEdges.splice(i, 1);
       }
+      transcriptRows.delete(sid);
       return null;
+    }
+    // ---- the transcript (0027) ----
+    // The durable copy of the conversation. Emulated rather than stubbed because the resume path
+    // reads it back: a shim that returned [] would make "resume restored the transcript" pass
+    // against nothing.
+    case "transcript_append": {
+      const rows = Array.isArray(args.rows) ? (args.rows as Array<Record<string, unknown>>) : [];
+      for (const r of rows) {
+        const role = String(r.role ?? "");
+        // The host refuses an unknown role (and its CHECK refuses it again); the emulation mirrors
+        // that, so a screen cannot pass here while the host would refuse the same write.
+        if (role !== "user" && role !== "assistant" && role !== "tool") {
+          throw new Error(`session_messages: unknown role "${role}" (expected user, assistant or tool)`);
+        }
+        const sid = String(r.sessionId ?? "");
+        if (!sid) throw new Error("session_messages: session_id is required");
+        const list = transcriptRows.get(sid) ?? [];
+        const seq = Number(r.seq ?? 0);
+        const at = list.findIndex((x) => Number(x.seq) === seq);
+        const row = { ...r, sessionId: sid, seq, role };
+        if (at >= 0) list[at] = row;
+        else list.push(row);
+        transcriptRows.set(sid, list);
+      }
+      return null;
+    }
+    case "transcript_list": {
+      const sid = String(args.session_id ?? "");
+      const list = [...(transcriptRows.get(sid) ?? [])].sort((a, b) => Number(a.seq) - Number(b.seq));
+      return list;
+    }
+    case "transcript_max_seq": {
+      const sid = String(args.session_id ?? "");
+      const list = transcriptRows.get(sid) ?? [];
+      return list.reduce((m, r) => Math.max(m, Number(r.seq ?? 0)), 0);
     }
     case "history_timeline": {
       const sessionId = String(args.session_id ?? "");
@@ -1622,7 +1680,26 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
 
     // ---- Tool sandbox (Assistant agent mode) ----
     case "tools_policy":
-      return TOOLS_POLICY;
+      return toolsPolicyNow();
+    case "tools_set_extra_programs": {
+      // Mirrors `core::tools::normalize_extra_programs`, and the mirroring is the point: a shim
+      // that accepted anything would let a screen pass a spec while the host refuses the same
+      // input, which is the failure mode the shim exists to prevent rather than create.
+      const raw = Array.isArray(args.programs) ? (args.programs as unknown[]).map(String) : [];
+      const next: string[] = [];
+      for (const p of raw) {
+        const name = p.trim();
+        if (name.length === 0) continue;
+        if (NEVER_ALLOWED_PROGRAMS.includes(name)) throw new Error(`program "${name}" is never allowed`);
+        if (name.startsWith("-") || !/^[A-Za-z0-9._+-]+$/.test(name)) {
+          throw new Error(`program name "${name}" must be a bare executable name — no path separators or shell characters`);
+        }
+        if (!next.includes(name)) next.push(name);
+      }
+      if (next.length > 32) throw new Error(`at most 32 additional programs, got ${next.length}`);
+      toolsExtraPrograms = next.sort();
+      return toolsPolicyNow();
+    }
     case "tools_default_root":
       return DEFAULT_WORKSPACE_ROOT;
     // ---- MCP (Settings section) ----
@@ -1817,7 +1894,9 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       if (name === "run_command") {
         const program = String(toolArgs["program"] ?? "");
         const cmdArgs = Array.isArray(toolArgs["args"]) ? toolArgs["args"].map(String) : [];
-        if (!TOOLS_POLICY.programs.includes(program)) return fail(`program '${program}' is not in the allowlist`);
+        if (!TOOLS_POLICY.programs.includes(program) && !toolsExtraPrograms.includes(program)) {
+          return fail(`program '${program}' is not in the allowlist`);
+        }
         // `background: true` outlives the tool call, exactly as tools.rs does: answer with the job
         // id at once, let `process_output` poll it and `process_kill` stop it.
         if (toolArgs["background"] === true) {

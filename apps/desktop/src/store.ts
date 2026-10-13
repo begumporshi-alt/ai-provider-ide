@@ -1247,8 +1247,83 @@ export async function historyMaxSeq(sessionId: string): Promise<number> {
   return invoke<number>("history_max_seq", { sessionId });
 }
 
-/** Reconstruct a transcript from a session's timeline, preserving tool calls. */
+/**
+ * One persisted transcript message (migration 0027).
+ *
+ * Shaped like the **wire**, not like the UI, because that is what a resumed session has to replay:
+ * `toolCalls` and `toolCallId` ride verbatim, since a provider validates the pair and rejects a
+ * dangling call or an orphan result. Every optional field is nullable rather than absent — `null`
+ * means "this turn had none of it", which is not the same as an empty string.
+ */
+export interface SessionMessageRow {
+  sessionId: string;
+  seq: number;
+  role: "user" | "assistant" | "tool";
+  content: string;
+  toolCalls?: string | null;
+  toolCallId?: string | null;
+  reasoning?: string | null;
+  /** Serialized attachment metadata — never bytes. */
+  attachments?: string | null;
+  model?: string | null;
+  ts: number;
+}
+
+/**
+ * Append one turn's messages. Batched deliberately: a turn is a unit, and a half-written turn
+ * replays a `tool_calls` array with no results, which every provider rejects.
+ */
+export async function transcriptAppend(rows: SessionMessageRow[]): Promise<void> {
+  return invoke("transcript_append", { rows });
+}
+
+/** A session's transcript, in stored order. Empty for a session recorded before 0027. */
+export async function transcriptList(sessionId: string): Promise<SessionMessageRow[]> {
+  return invoke<SessionMessageRow[]>("transcript_list", { sessionId });
+}
+
+/** Highest message sequence stored, so a resume continues past its own turns. */
+export async function transcriptMaxSeq(sessionId: string): Promise<number> {
+  return invoke<number>("transcript_max_seq", { sessionId });
+}
+
+/**
+ * Restore a session's transcript.
+ *
+ * **Rows first, graph second.** A session recorded since 0027 is restored from `session_messages`,
+ * which is the message as it was sent — including the `tool_calls` / `tool_call_id` pair a provider
+ * validates on replay. A session recorded before 0027 has no rows, and falls back to the
+ * graph-derived timeline: that reconstruction clips every message to the node's preview length and
+ * has to recover the assistant turn a tool result belongs to by walking a `produced` edge, which is
+ * exactly why it was never lossless. The fallback is kept rather than migrated, because a backfill
+ * could only invent the text the graph never stored.
+ */
 export async function resumeSession(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
+  const rows = await transcriptList(sessionId).catch(() => [] as SessionMessageRow[]);
+  if (rows.length > 0) {
+    return rows.map((r) => {
+      const msg: import("./ui-state").ResumeMsg = {
+        role: r.role,
+        content: r.content,
+        ...(r.toolCallId ? { tool_call_id: r.toolCallId } : {}),
+      };
+      if (r.toolCalls) {
+        try {
+          msg.tool_calls = JSON.parse(r.toolCalls);
+        } catch {
+          // A row whose tool_calls is not JSON is a row this build cannot replay. Keeping the
+          // message without the calls is honest; inventing an empty array would tell the provider
+          // the assistant made no call, which is a different claim.
+        }
+      }
+      return msg;
+    });
+  }
+  return resumeFromTimeline(sessionId);
+}
+
+/** The pre-0027 reconstruction: a transcript rebuilt from the context graph's timeline. */
+async function resumeFromTimeline(sessionId: string): Promise<import("./ui-state").ResumeMsg[]> {
   const timeline = await loadHistoryTimeline(sessionId);
   const out: import("./ui-state").ResumeMsg[] = [];
   for (const e of timeline.entries) {

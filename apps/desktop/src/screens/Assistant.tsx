@@ -15,6 +15,8 @@ import {
   loadHistorySessions,
   resumeSession,
   historyMaxSeq,
+  transcriptAppend,
+  transcriptMaxSeq,
   setSessionTitle as saveSessionTitle,
   type HistorySession,
   type Skill,
@@ -47,7 +49,7 @@ import { parseListing, type MentionCandidate } from "../lib/chat/mentions";
 import { parseAssistantStream, type ToolSegment } from "../lib/assistant-stream";
 import { editPoint, retryPoint } from "../lib/chat/actions";
 import { instructionSystemText } from "../lib/chat/context-blocks";
-import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, MAX_ITERATIONS_CAP, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
+import { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan, planPathFromResult, clampIterations, MAX_ITERATIONS_CAP, resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MAX, SUBAGENT_RESULT_CAP_MIN, type ToolsPolicy, type AgentEvent, type PlanPorts } from "../lib/tools";
 import {
   APPROVAL_MODES, INITIAL_APPROVAL, revertPlan,
   type ApprovalMode, type ApprovalState, type RunChangeSet,
@@ -112,6 +114,7 @@ import { runPlainTurn } from "../lib/chat/turn/plain-turn";
 import { runAgentTurn } from "../lib/chat/turn/agent-turn";
 import { beginTurn, currentTurn } from "../lib/chat/turn/controller";
 import type { Trace } from "../lib/chat/turn/ports";
+import type { TranscriptEntry } from "../lib/chat/turn/ports";
 
 /**
  * Tier 2 summarizer — what the assistant hands to `generateText` so dropped context becomes a
@@ -327,6 +330,62 @@ function StepBudget({
   );
 }
 
+/**
+ * How much of a sub-agent's summary reaches the parent transcript.
+ *
+ * Same draft-then-commit shape as `StepBudget`, and for the same reason: clamping per keystroke
+ * fights the user, and an emptied field means "the loop's default" — passing the raw string into
+ * the clamp is what keeps a blank box from becoming `0` characters of summary.
+ */
+function SubagentSummaryCap({
+  value,
+  onChange,
+  disabled,
+}: {
+  /** The user's cap, or `null` for the loop's default — see `AgentLoopOptions.subagentSummaryCap`. */
+  value: number | null;
+  onChange: (v: number | null) => void;
+  disabled?: boolean;
+}) {
+  const [draft, setDraft] = useState(value === null ? "" : String(value));
+  useEffect(() => setDraft(value === null ? "" : String(value)), [value]);
+
+  const commit = () => {
+    // The raw string into the clamp, never `Number(draft)` first: `Number("")` is 0.
+    const next = draft.trim() === "" ? null : resolveSubagentResultCap(Number(draft));
+    onChange(next);
+    setDraft(next === null ? "" : String(next));
+  };
+
+  return (
+    <label
+      className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
+      style={{ color: "var(--text-dim)" }}
+      title={
+        disabled
+          ? "only applies in agent mode — without tools there is nothing to delegate"
+          : `characters of a sub-agent's summary kept for this conversation (${SUBAGENT_RESULT_CAP_MIN}–${SUBAGENT_RESULT_CAP_MAX}), or blank for the default (${SUBAGENT_RESULT_CAP}) — the point of delegating is that the survey does not land here`
+      }
+    >
+      <span className="text-[11px]">Sub-agent summary</span>
+      <input
+        type="number"
+        min={SUBAGENT_RESULT_CAP_MIN}
+        max={SUBAGENT_RESULT_CAP_MAX}
+        value={draft}
+        disabled={disabled}
+        onChange={(e) => setDraft(e.target.value)}
+        onBlur={commit}
+        onKeyDown={(e) => {
+          if (e.key === "Enter") commit();
+        }}
+        aria-label="sub-agent summary characters"
+        className="no-spin w-16 rounded-full border px-2 py-0.5 text-center text-[11px]"
+        style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
+      />
+    </label>
+  );
+}
 /**
  * The system-prompt editor.
  *
@@ -545,6 +604,18 @@ interface AssistantSettings {
   searchProvider?: "brave" | "tavily" | null;
   /** The chosen text model as a qualified id (`slug/native`). Empty/absent = the store default. */
   model?: string;
+  /**
+   * Whether a `dispatch_agent` child may modify the workspace.
+   *
+   * Persisted, and **false when absent** — the shipped posture is read-only sub-agents, and an
+   * option nobody set must not be the thing that grants writes. Turning it on does not bypass the
+   * approval gate: a child's mutation asks exactly as the parent's would, because the child runs
+   * the parent's own `confirm`.
+   */
+  subagentsCanWrite?: boolean;
+  /** Characters of a child's summary kept for the parent. `null` = the loop's default (4000).
+   *  Stored as `null` rather than absent for the same round-trip reason as `maxIterations`. */
+  subagentsSummaryCap?: number | null;
 }
 
 const ASSISTANT_SETTINGS_KEY = "assistant";
@@ -618,6 +689,11 @@ export function AssistantScreen() {
   // `null` is the default and means no ceiling: a real task is not a fixed number of rounds, and
   // the measured failure of the alternative (2026-10-06) was a legitimate long task cut off by one.
   const [maxIterations, setMaxIterations] = useState<number | null>(null);
+  // Sub-agent privilege and context budget. Writes default **off**: a child that could modify the
+  // workspace without the user asking for it would be a capability the screen granted by omission.
+  // The summary cap defaults to `null` = the loop's own 4000 characters.
+  const [subagentsCanWrite, setSubagentsCanWrite] = useState(false);
+  const [subagentsSummaryCap, setSubagentsSummaryCap] = useState<number | null>(null);
   const [temperature, setTemperature] = useState<number | "">("");
   const [maxTokens, setMaxTokens] = useState<number | "">("");
   // The thinking level. `""` is "unset" — send no field and leave the provider's own default,
@@ -678,6 +754,12 @@ export function AssistantScreen() {
       // so it is tested for first; anything else is parsed (and unparseable reads as no limit).
       if (stored.maxIterations === null) setMaxIterations(null);
       else if (stored.maxIterations != null) setMaxIterations(clampIterations(stored.maxIterations));
+      // Absent or not a boolean leaves writes **off** — the one direction this may fail in.
+      if (typeof stored.subagentsCanWrite === "boolean") setSubagentsCanWrite(stored.subagentsCanWrite);
+      if (stored.subagentsSummaryCap === null) setSubagentsSummaryCap(null);
+      else if (stored.subagentsSummaryCap != null) {
+        setSubagentsSummaryCap(resolveSubagentResultCap(stored.subagentsSummaryCap));
+      }
       // A stored `null` is a real value here — it is how "unset" survives the round trip — so the
       // tests are explicitly for `null` first and then for a usable number. A blank field and a
       // field holding 0 are different requests: 0 is a real temperature.
@@ -720,6 +802,9 @@ export function AssistantScreen() {
   const saveAll = useCallback(
     () => saveAssistantSettings({
       root, agentMode, useMemory, noTools, maxIterations, approvalMode,
+      subagentsCanWrite,
+      // `null` for "the loop's default", never `undefined`, for the round-trip reason below.
+      subagentsSummaryCap,
       // Always written, empty string included: a model the picker cleared has to overwrite the
       // stored one, not vanish from the row.
       model,
@@ -738,7 +823,8 @@ export function AssistantScreen() {
       searchProvider: searchProvider === "none" ? null : searchProvider,
     }),
     [root, agentMode, useMemory, noTools, maxIterations, approvalMode, model, temperature, maxTokens, thinking,
-      customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider],
+      customSystemPrompt, customNoToolsSystem, customAgentSystem, searchProvider,
+      subagentsCanWrite, subagentsSummaryCap],
   );
 
   // The debounced write below must serialise the state as it is WHEN IT FIRES, not as it was
@@ -879,8 +965,26 @@ export function AssistantScreen() {
               disabled={agentMode}
               note={agentMode ? "agent mode provides the tools" : undefined}
             />
-            <div className="mt-1 border-t px-2 pt-2" style={{ borderColor: "var(--border)" }}>
+            <RunSwitchRow
+              label="Sub-agent writes"
+              checked={subagentsCanWrite}
+              onChange={setSubagentsCanWrite}
+              disabled={!agentMode}
+              note={
+                !agentMode
+                  ? "agent mode only"
+                  : subagentsCanWrite
+                    ? "a delegated sub-agent may modify the workspace; every write still asks your approval"
+                    : "sub-agents are read-only researchers"
+              }
+            />
+            <div className="mt-1 flex flex-wrap items-center gap-3 border-t px-2 pt-2" style={{ borderColor: "var(--border)" }}>
               <StepBudget value={maxIterations} onChange={setMaxIterations} disabled={!agentMode} />
+              <SubagentSummaryCap
+                value={subagentsSummaryCap}
+                onChange={setSubagentsSummaryCap}
+                disabled={!agentMode}
+              />
             </div>
           </div>
         </>
@@ -953,6 +1057,8 @@ export function AssistantScreen() {
           agentMode={agentMode}
           useMemory={useMemory}
           maxIterations={maxIterations}
+          subagentsCanWrite={subagentsCanWrite}
+          subagentsSummaryCap={subagentsSummaryCap}
           approvalMode={approvalMode}
           planMode={planMode}
           onPlanModeChange={setPlanMode}
@@ -1328,7 +1434,7 @@ function RootPane({
         <p className="-mt-2 text-[11px]" style={{ color: "var(--danger)" }} data-testid="root-pane-error">{rootError}</p>
       ) : (
         <p className="-mt-2 text-[11px]" style={{ color: "var(--text-faint)" }}>
-          An absolute path. Agent tools — reading, writing, shell — are confined to this folder; {sandboxPolicy ? `the sandbox allows ${sandboxPolicy.programs.length} programs, capped at ${Math.round(sandboxPolicy.max_command_ms / 100) / 10}s per command.` : "the sandbox allowlist applies inside it."}
+          An absolute path. Agent tools — reading, writing, shell — are confined to this folder; {sandboxPolicy ? `the sandbox allows ${sandboxPolicy.programs.length + sandboxPolicy.extra_programs.length} programs${sandboxPolicy.extra_programs.length ? ` (${sandboxPolicy.extra_programs.length} you added)` : ""}, capped at ${Math.round(sandboxPolicy.max_command_ms / 100) / 10}s per command.` : "the sandbox allowlist applies inside it."}
         </p>
       )}
       <div className="rounded-xl border" style={{ background: "var(--surface)", borderColor: "var(--border)" }}>
@@ -1410,6 +1516,8 @@ function Chat({
   agentMode,
   useMemory,
   maxIterations,
+  subagentsCanWrite,
+  subagentsSummaryCap,
   approvalMode,
   planMode,
   onPlanModeChange,
@@ -1437,6 +1545,11 @@ function Chat({
   useMemory: boolean;
   /** The user's step budget, or null for no ceiling (the default). */
   maxIterations: number | null;
+  /** Whether a delegated sub-agent may modify the workspace. Owned by `AssistantScreen` (it is
+   *  persisted) and read only when a `dispatch_agent` child is built. */
+  subagentsCanWrite: boolean;
+  /** Characters of a child's summary kept for the parent, or null for the loop's default. */
+  subagentsSummaryCap: number | null;
   /** P5: how tool calls are gated. The mode itself lives in `AssistantScreen` (it is persisted);
    *  the trust the user grants from the modal is per-session state held here. */
   approvalMode: ApprovalMode;
@@ -1615,6 +1728,15 @@ function Chat({
   const ctxRef = useRef<Recorder | null>(null);
   if (!ctxRef.current) ctxRef.current = activeSession();
   const lastNodeRef = useRef<string | null>(null);
+  /**
+   * The durable transcript's next sequence number (0027).
+   *
+   * A ref, not state: a turn appends from a callback that must not re-render the screen. Seeded
+   * past what a resumed session already stores (`transcript_max_seq`), because continuing from 1
+   * would upsert over the session's own earlier turns and silently rewrite its history — the same
+   * rule the graph recorder's sequence follows.
+   */
+  const transcriptSeqRef = useRef(0);
   // Phase 4 — the session bar. `sessionId` has to be state, not read once: a New chat and a resume
   // both swap the recorder underneath, and the title is keyed by whichever session is current.
   const [sessionId, setSessionId] = useState(() => ctxRef.current!.sessionId);
@@ -2035,6 +2157,39 @@ function Chat({
   };
 
   /**
+   * Write one turn's messages to the durable transcript (0027).
+   *
+   * **Fire-and-forget, deliberately.** The context graph and the memory record already carry what
+   * every in-app reader needs, so a transcript write that fails must not fail the turn the user is
+   * watching — this table exists so a *resume* is a restore rather than a reconstruction, and a
+   * failed resume is recoverable in a way a failed answer is not.
+   *
+   * The sequence number is assigned here rather than by the engine: the engine knows what the turn
+   * was, the screen knows which session it belongs to and where that session's transcript ends.
+   */
+  const appendTranscript = useCallback(
+    (entries: TranscriptEntry[]) => {
+      const session = ctxRef.current?.sessionId;
+      if (!session || entries.length === 0) return;
+      const ts = Date.now();
+      const rows = entries.map((e) => ({
+        sessionId: session,
+        seq: ++transcriptSeqRef.current,
+        role: e.role,
+        content: e.content,
+        toolCalls: e.toolCalls ?? null,
+        toolCallId: e.toolCallId ?? null,
+        reasoning: e.reasoning ?? null,
+        attachments: e.attachments ?? null,
+        model: e.model ?? null,
+        ts,
+      }));
+      void transcriptAppend(rows).catch(() => undefined);
+    },
+    [],
+  );
+
+  /**
    * The one turn runner. A fresh send, a retry and an edit-&-resend all funnel through here, so
    * they cannot drift in how they build history, record the context graph or surface the trace.
    * `baseMsgs` is the transcript BEFORE this turn — the whole thing for a send, the truncated
@@ -2232,6 +2387,12 @@ function Chat({
             const n = typeof raw === "string" && raw.trim() !== "" ? Number(raw) : NaN;
             return Number.isFinite(n) && n >= 1 ? Math.floor(n) : undefined;
           })(),
+          // Whether a delegated child may modify the workspace, and how much of its summary comes
+          // back. `=== true` rather than a truthy read: this is the value that decides whether a
+          // child can write, so nothing partially set may grant it. `null` (the stored "default")
+          // becomes `undefined` — the loop's own cap — because the option means "unset", not zero.
+          subagentCanWrite: subagentsCanWrite === true,
+          subagentSummaryCap: subagentsSummaryCap ?? undefined,
           controller: ac,
           confirm: (call, args) => turn.confirm(call, args),
           // The skill port for load_skill: name or slug must resolve among the skills THIS
@@ -2281,6 +2442,7 @@ function Chat({
           recorder: ctxRef.current!,
           lastNode: lastNodeRef,
           memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+          transcript: { append: appendTranscript },
           providerName: (id) => registry.getProvider(id)?.name,
           patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
           onTrace: setTrace,
@@ -2354,6 +2516,7 @@ function Chat({
         recorder: ctxRef.current!,
         lastNode: lastNodeRef,
         memory: { recall: recallContext, block: memoryBlock, recordRecall, remember: rememberTurn, distil: distilTurn },
+        transcript: { append: appendTranscript },
         providerName: (id) => registry.getProvider(id)?.name,
         patchMsg: (id, patch) => setMsgs((m) => m.map((x) => (x.id === id ? { ...x, ...patch } : x))),
         onTrace: setTrace,
@@ -2470,6 +2633,10 @@ function Chat({
     const prefix = msgs.slice(0, i + 1).map((m) => ({ ...m }));
     ctxRef.current = startSession();
     lastNodeRef.current = null;
+    // A forked thread has its own transcript, so its sequence starts at 1 — inheriting the parent's
+    // counter would leave a gap and, worse, would write the branch's first turn at the parent's
+    // sequence in a session id that already has rows.
+    transcriptSeqRef.current = 0;
     setMsgs(prefix);
     setTrace(null);
     setFinishReason(undefined);
@@ -2515,10 +2682,15 @@ function Chat({
   const adoptSession = useCallback((intent: string) => {
     void (async () => {
       try {
-        const [resumed, seq] = await Promise.all([resumeSession(intent), historyMaxSeq(intent)]);
+        const [resumed, seq, tseq] = await Promise.all([
+          resumeSession(intent),
+          historyMaxSeq(intent),
+          transcriptMaxSeq(intent),
+        ]);
         const rec = startSession(intent, seq);
         ctxRef.current = rec;
         lastNodeRef.current = null;
+        transcriptSeqRef.current = tseq;
         setSessionId(rec.sessionId);
         setMsgs(withIds(resumed as Omit<Msg, "id">[]));
         // A fresh conversation view: the used log belongs to the live thread, and the overrides
@@ -2538,6 +2710,14 @@ function Chat({
     if (restoredOnMount.current) return;
     restoredOnMount.current = true;
     const sid = ctxRef.current!.sessionId;
+    // Seed the transcript sequence from what this session already stores. The screen can remount
+    // into a session that has turns (switching tabs and back), and a counter starting at 1 would
+    // write the next turn over the session's first row.
+    void transcriptMaxSeq(sid)
+      .then((tseq) => {
+        transcriptSeqRef.current = tseq;
+      })
+      .catch(() => undefined);
     void resumeSession(sid)
       .then((resumed) => {
         if (resumed.length > 0) setMsgs(withIds(resumed as Omit<Msg, "id">[]));
@@ -2566,6 +2746,8 @@ function Chat({
     const rec = startSession();
     ctxRef.current = rec;
     lastNodeRef.current = null;
+    // A new session has no transcript, so its sequence starts at 1.
+    transcriptSeqRef.current = 0;
     setSessionId(rec.sessionId);
     setMsgs([]);
     setTrace(null);
@@ -2605,15 +2787,20 @@ function Chat({
     if (sid === sessionId) return;
     let resumed: Awaited<ReturnType<typeof resumeSession>>;
     let seq = 0;
+    let tseq = 0;
     try {
       resumed = await resumeSession(sid);
       seq = await historyMaxSeq(sid);
+      // The transcript's own sequence, seeded for the same reason the graph's is: continuing from
+      // 1 would upsert over this session's earlier turns.
+      tseq = await transcriptMaxSeq(sid);
     } catch {
       return; // an unreadable session is not worth an error wall; leave the transcript as it was
     }
     const rec = startSession(sid, seq);
     ctxRef.current = rec;
     lastNodeRef.current = null;
+    transcriptSeqRef.current = tseq;
     setSessionId(sid);
     setMsgs(withIds(resumed as Omit<Msg, "id">[]));
     setTrace(null);

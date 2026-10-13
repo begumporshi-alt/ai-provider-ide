@@ -14,6 +14,7 @@ import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
 import { buildAgentSystem } from "./prompt";
 import { newMsgId, replayHistory } from "./messages";
 import { clip, recordAgentTurn } from "./graph-record";
+import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
 import type { AgentTurnPorts, FallbackAttempt } from "./ports";
 
@@ -53,6 +54,15 @@ export interface AgentTurnRequest extends TurnRequestBase {
    * allowlist, model, and budget when dispatched.
    */
   subagentDefs?: Parameters<typeof runAgentLoop>[0]["subagentDefs"];
+  /**
+   * Whether a dispatched child may modify the workspace, from the user's screen setting. Absent is
+   * read-only. It travels with the turn rather than being read inside the loop because the loop has
+   * no settings store — and because the `dispatch_agent` description the parent model sees has to
+   * change with it, which happens here where the registry is built.
+   */
+  subagentCanWrite?: Parameters<typeof runAgentLoop>[0]["subagentCanWrite"];
+  /** Characters of a child's summary kept for the parent; absent means the loop's default. */
+  subagentSummaryCap?: Parameters<typeof runAgentLoop>[0]["subagentSummaryCap"];
   /** The live AbortController — registered with the orchestrator so the dashboard can stop the run. */
   controller: AbortController;
   confirm: Parameters<typeof runAgentLoop>[0]["confirm"];
@@ -165,7 +175,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // The enabled specialists ride `dispatch_agent`'s description (cloned, never mutating
       // AGENT_TOOLS) so the model can pick one by id.
       registry: [
-        ...withSubagentDefs(req.subagentDefs ?? []),
+        ...withSubagentDefs(req.subagentDefs ?? [], { canWrite: req.subagentCanWrite === true }),
         ...(await fetchMcpTools()),
       ],
       // Tier 2: when this request has to drop context, the dropped turns are summarized rather
@@ -224,6 +234,10 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,
       // model, and budget at dispatch time.
       subagentDefs: req.subagentDefs,
+      // Privilege and context budget for a delegated child. Both travel unchanged: the loop decides
+      // nothing about either, it only applies them.
+      subagentCanWrite: req.subagentCanWrite,
+      subagentSummaryCap: req.subagentSummaryCap,
       // The delegation ledger: a dispatch_agent child records its row under this run's id, so
       // the Subagents screen can draw the tree.
       runId,
@@ -269,6 +283,30 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // the whole transcript, so slicing off the replayed prefix is what keeps an earlier turn from
     // being re-recorded — and keeps the graph linear in turns.
     ports.lastNode.current = recordAgentTurn(rec, userNode, fullMessages.slice(history.length), req.model);
+    // The durable transcript (0027), from the same slice the graph just recorded — only this
+    // turn's messages, so a resumed conversation does not re-record its own prefix. The tool pair
+    // is carried verbatim: `tool_calls` on the assistant turn and `tool_call_id` on each result,
+    // because a provider rejects a dangling call or an orphan result, and this is the copy a
+    // resume replays. The graph cannot stand in for it — a message node's text is clipped.
+    ports.transcript.append([
+      // The user's own turn is prepended explicitly. `history` already contains it (it is built
+      // above, so the loop can send it), which means the slice below starts *after* it — the graph
+      // gets away with that because it records the user node separately, and a transcript that did
+      // the same would resume a conversation with no questions in it.
+      {
+        role: "user",
+        content: req.text,
+        attachments: attachmentMeta(req.attachments),
+        model: null,
+      },
+      ...fullMessages.slice(history.length).map((m) => ({
+        role: m.role as "user" | "assistant" | "tool",
+        content: textOfContent(m.content),
+        toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
+        toolCallId: m.tool_call_id ?? null,
+        model: m.role === "assistant" ? req.model : null,
+      })),
+    ]);
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
     // it is an extra model call, and a slow or failing one must not hold up the answer the
     // user is already reading.

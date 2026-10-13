@@ -595,8 +595,160 @@ pub fn delete_session(store: &Store, session_id: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())?;
     tx.execute("DELETE FROM memories WHERE session_id = ?1", params![session_id])
         .map_err(|e| e.to_string())?;
+    // The transcript goes with the session. Leaving these rows would leak a deleted conversation
+    // into the database forever — and, worse, a later session that happened to reuse the id would
+    // resume someone else's turns.
+    tx.execute("DELETE FROM session_messages WHERE session_id = ?1", params![session_id])
+        .map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())?;
     Ok(())
+}
+
+/// One persisted transcript message — the durable copy of what the transcript rendered.
+///
+/// Deliberately shaped like the wire rather than like the UI: `tool_calls` and `tool_call_id` are
+/// carried verbatim so a resumed session replays a tool round-trip that a provider will accept.
+/// Everything optional is `Option`, and a `NULL` means "this turn had none of it" rather than an
+/// empty value — `reasoning` on a model that does not think, `model` on a row written before the
+/// column existed.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionMessageRow {
+    #[serde(default)]
+    pub session_id: String,
+    #[serde(default)]
+    pub seq: i64,
+    /// `user` | `assistant` | `tool`. Checked, not trusted: an unknown role reaches a provider and
+    /// comes back as a `400`, so the refusal belongs here rather than in the wire log.
+    pub role: String,
+    #[serde(default)]
+    pub content: String,
+    /// Serialized OpenAI `tool_calls` array, exactly as the assistant turn declared it.
+    #[serde(default)]
+    pub tool_calls: Option<String>,
+    /// The `tool_call_id` this result answers. Present only on `tool` rows.
+    #[serde(default)]
+    pub tool_call_id: Option<String>,
+    #[serde(default)]
+    pub reasoning: Option<String>,
+    /// Serialized attachment metadata (never bytes: an image's base64 has no business in the
+    /// database, and the transcript's own attachment list is what the UI re-renders).
+    #[serde(default)]
+    pub attachments: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub ts: i64,
+}
+
+fn valid_role(role: &str) -> bool {
+    matches!(role, "user" | "assistant" | "tool")
+}
+
+/// Append messages to a session's transcript, in one transaction.
+///
+/// Batched rather than one call per message for the reason the graph recorder is batched: a turn
+/// is a unit, and a half-written turn is a transcript that replays a `tool_calls` array with no
+/// results — the exact shape a provider rejects. `(session_id, seq)` is the primary key, so
+/// appending a turn twice updates those rows instead of duplicating the conversation.
+pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Result<(), String> {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    for r in rows {
+        if r.session_id.trim().is_empty() {
+            return Err("session_messages: session_id is required".into());
+        }
+        if !valid_role(&r.role) {
+            return Err(format!(
+                "session_messages: unknown role {:?} (expected user, assistant or tool)",
+                r.role
+            ));
+        }
+    }
+    let mut conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    {
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO session_messages
+                   (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT(session_id, seq) DO UPDATE SET
+                   role=excluded.role, content=excluded.content, tool_calls=excluded.tool_calls,
+                   tool_call_id=excluded.tool_call_id, reasoning=excluded.reasoning,
+                   attachments=excluded.attachments, model=excluded.model, ts=excluded.ts",
+            )
+            .map_err(|e| e.to_string())?;
+        for r in rows {
+            stmt.execute(params![
+                r.session_id,
+                r.seq,
+                r.role,
+                r.content,
+                r.tool_calls,
+                r.tool_call_id,
+                r.reasoning,
+                r.attachments,
+                r.model,
+                r.ts,
+            ])
+            .map_err(|e| e.to_string())?;
+        }
+    }
+    tx.commit().map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// A session's transcript, in stored order.
+///
+/// Ordered by `seq` and never by `ts`: an agent turn's assistant message, its tool results and its
+/// closing message can share a millisecond, so a timestamp is not an order. The same rule the
+/// timeline follows, for the same reason.
+pub fn session_messages(store: &Store, session_id: &str) -> Result<Vec<SessionMessageRow>, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, ts
+               FROM session_messages WHERE session_id = ?1 ORDER BY seq ASC",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![session_id], |row| {
+            Ok(SessionMessageRow {
+                session_id: row.get(0)?,
+                seq: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_calls: row.get(4)?,
+                tool_call_id: row.get(5)?,
+                reasoning: row.get(6)?,
+                attachments: row.get(7)?,
+                model: row.get(8)?,
+                ts: row.get(9)?,
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
+/// The highest `seq` already stored for this session, or 0 when there is no transcript.
+///
+/// Resuming continues in place, so the next append must start past what is stored — restarting at
+/// 1 would upsert over the session's own earlier turns and silently rewrite its history. This is
+/// the transcript's sibling of [`max_node_seq`], and it exists for the same reason.
+pub fn max_message_seq(store: &Store, session_id: &str) -> Result<i64, String> {
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let max: Option<i64> = conn
+        .query_row(
+            "SELECT MAX(seq) FROM session_messages WHERE session_id = ?1",
+            params![session_id],
+            |r| r.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(max.unwrap_or(0))
 }
 
 /// The highest sequence number already used by this session's generated node ids.
@@ -1085,6 +1237,139 @@ mod context_graph_tests {
         clear(&s).unwrap();
         let g = graph(&s, 100).unwrap();
         assert!(g.nodes.is_empty() && g.edges.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // --- the transcript (0027) ---
+
+    fn msg(session: &str, seq: i64, role: &str, content: &str) -> SessionMessageRow {
+        SessionMessageRow {
+            session_id: session.into(),
+            seq,
+            role: role.into(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+            reasoning: None,
+            attachments: None,
+            model: None,
+            ts: 1_000 + seq,
+        }
+    }
+
+    #[test]
+    fn a_transcript_comes_back_in_seq_order_whatever_order_it_was_written() {
+        let (s, d) = temp_store("tx-order");
+        // Deliberately out of order: an agent turn can finish its tool results after the closing
+        // message is buffered, and the ordering authority is `seq`, not arrival.
+        append_session_messages(
+            &s,
+            &[
+                msg("s1", 2, "assistant", "third"),
+                msg("s1", 0, "user", "first"),
+                msg("s1", 1, "tool", "second"),
+            ],
+        )
+        .unwrap();
+        let rows = session_messages(&s, "s1").unwrap();
+        let content: Vec<&str> = rows.iter().map(|r| r.content.as_str()).collect();
+        assert_eq!(content, vec!["first", "second", "third"]);
+        assert_eq!(max_message_seq(&s, "s1").unwrap(), 2);
+        // Another session's rows are not this session's transcript.
+        assert!(session_messages(&s, "s2").unwrap().is_empty());
+        assert_eq!(max_message_seq(&s, "s2").unwrap(), 0);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn re_appending_a_turn_updates_it_instead_of_duplicating_the_conversation() {
+        let (s, d) = temp_store("tx-upsert");
+        append_session_messages(&s, &[msg("s1", 0, "user", "hi")]).unwrap();
+        // The same turn, re-sent — a retry, or a resume that re-flushes what it already wrote.
+        append_session_messages(&s, &[msg("s1", 0, "user", "hi again")]).unwrap();
+        let rows = session_messages(&s, "s1").unwrap();
+        assert_eq!(rows.len(), 1, "the row is updated, not duplicated");
+        assert_eq!(rows[0].content, "hi again");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_tool_round_trip_survives_the_round_trip_exactly() {
+        let (s, d) = temp_store("tx-tools");
+        let calls = r#"[{"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a.txt\"}"}}]"#;
+        let mut assistant = msg("s1", 0, "assistant", "");
+        assistant.tool_calls = Some(calls.into());
+        assistant.model = Some("openrouter/gpt-4o".into());
+        assistant.reasoning = Some("let me look".into());
+        let mut result = msg("s1", 1, "tool", "file body");
+        result.tool_call_id = Some("call_1".into());
+        append_session_messages(&s, &[assistant, result]).unwrap();
+
+        let rows = session_messages(&s, "s1").unwrap();
+        // Verbatim, because the pair is what a provider validates: an id that changes between the
+        // call and its result is a `400`, and that is the whole reason these columns exist.
+        assert_eq!(rows[0].tool_calls.as_deref(), Some(calls));
+        assert_eq!(rows[0].model.as_deref(), Some("openrouter/gpt-4o"));
+        assert_eq!(rows[0].reasoning.as_deref(), Some("let me look"));
+        assert_eq!(rows[1].tool_call_id.as_deref(), Some("call_1"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_unknown_role_is_refused_and_the_batch_is_all_or_nothing() {
+        let (s, d) = temp_store("tx-role");
+        let bad = append_session_messages(
+            &s,
+            &[msg("s1", 0, "user", "ok"), msg("s1", 1, "system", "not a transcript role")],
+        );
+        assert!(bad.is_err(), "a role the wire cannot carry must be refused");
+        assert!(bad.unwrap_err().contains("unknown role"));
+        // Nothing at all: a half-written turn replays a `tool_calls` array with no results, which
+        // is worse than not writing the turn.
+        assert!(session_messages(&s, "s1").unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn an_empty_session_id_is_refused() {
+        let (s, d) = temp_store("tx-sid");
+        let bad = append_session_messages(&s, &[msg("", 0, "user", "hi")]);
+        assert!(bad.is_err());
+        assert!(bad.unwrap_err().contains("session_id is required"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The API refuses a bad role, and the **schema** does too. Both matter: the CHECK is what
+    /// holds when a row arrives from anywhere but this function.
+    #[test]
+    fn the_schema_itself_refuses_an_unknown_role() {
+        let (s, d) = temp_store("tx-check");
+        {
+            let conn = s.conn.lock().unwrap();
+            let res = conn.execute(
+                "INSERT INTO session_messages (session_id, seq, role, content, ts) VALUES ('s1', 0, 'system', '', 1)",
+                [],
+            );
+            assert!(res.is_err(), "the CHECK must refuse a role outside user/assistant/tool");
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn deleting_a_session_takes_its_transcript_with_it() {
+        let (s, d) = temp_store("tx-delete");
+        append_session_messages(&s, &[msg("s1", 0, "user", "hi"), msg("s2", 0, "user", "other")])
+            .unwrap();
+        delete_session(&s, "s1").unwrap();
+        assert!(
+            session_messages(&s, "s1").unwrap().is_empty(),
+            "a deleted session must not leave its turns behind"
+        );
+        assert_eq!(
+            session_messages(&s, "s2").unwrap().len(),
+            1,
+            "and must not touch another session's"
+        );
         let _ = std::fs::remove_dir_all(&d);
     }
 }
