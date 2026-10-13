@@ -5,7 +5,7 @@
  * Tests import `runAgentLoop` + `AGENT_TOOLS` and inject a fake `ToolHost` (host.ts not imported).
  */
 export { AGENT_TOOLS, registryToOpenAI, toolEffect, registerToolEffects, withSubagentDefs } from "./registry";
-export { createTauriToolHost, fetchToolsPolicy, fetchDefaultRoot, savePlan } from "./host";
+export { createTauriToolHost, fetchToolsPolicy, setToolsExtraPrograms, fetchDefaultRoot, savePlan } from "./host";
 export type { ToolsPolicy } from "./host";
 export { mcpName, mcpToolToSpec, mcpTargetOf } from "./mcp";
 export type { McpServerConfig, McpToolInfo, McpRefreshOutcome } from "./mcp";

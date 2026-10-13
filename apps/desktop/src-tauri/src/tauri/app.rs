@@ -164,6 +164,9 @@ pub fn run() {
                 store::Store::open(&data_dir).map_err(|e| format!("store init failed: {e}"))?,
             );
             crate::tauri::gateway_cmds::log_to_file(app.handle(), "startup: store opened");
+            // The tool sandbox's configured additions, applied before any window exists. Same
+            // settings row the daemon reads, so the two serving paths enforce one policy.
+            crate::core::persist::tools_extra_programs_load(&store);
             // Deferred off the startup path deliberately. This probes provider key refs and can
             // trigger egress allowlist recomputation — work that should not block `setup()`
             // before a window exists. Off the startup path the app is up when it runs.

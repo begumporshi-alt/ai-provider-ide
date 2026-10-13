@@ -34,28 +34,148 @@ use std::path::{Component, Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 
-/// Executables that may start. Everything else is refused, including anything destructive
-/// (`rm`, `mv` to `rm`-like effect is bounded by confinement) or network-facing.
-fn allowed_programs() -> &'static HashSet<&'static str> {
-    // Leaked once on purpose: a `const` HashSet is not constructible pre-1.80 in const fn.
-    static CELL: std::sync::OnceLock<HashSet<&'static str>> = std::sync::OnceLock::new();
-    CELL.get_or_init(|| {
-        [
-            "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "printf",
-            "date", "which", "basename", "dirname", "stat", "du", "diff", "sort", "uniq", "tr",
-            "cut", "sed", "awk", "tar", "unzip", "mkdir", "touch", "cp", "git", "gh", "node",
-            "npm", "npx", "pnpm", "python3", "pip3", "make",
-        ]
-        .into_iter()
-        .collect()
-    })
+/// Executables that may start with no configuration at all. Everything else is refused, including
+/// anything destructive (`rm`, `mv` to `rm`-like effect is bounded by confinement) or
+/// network-facing.
+///
+/// **This is the baseline, not the whole allowlist.** A user extends it through Settings → Tools
+/// (see [`set_extra_programs`]) for the task classes the baseline cannot reach at all — `cargo`,
+/// `curl`, `sqlite3`, `rm`, `mv`. Their additions are validated as bare executable names and are
+/// checked against [`NEVER_ALLOWED`], so an addition cannot be a path or a privilege escalator.
+const BUILTIN_PROGRAMS: &[&str] = &[
+    "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "printf", "date",
+    "which", "basename", "dirname", "stat", "du", "diff", "sort", "uniq", "tr", "cut", "sed",
+    "awk", "tar", "unzip", "mkdir", "touch", "cp", "git", "gh", "node", "npm", "npx", "pnpm",
+    "python3", "pip3", "make",
+];
+
+/// Programs that never start — baseline, user-configured, or otherwise.
+///
+/// Each escalates privilege or acts on the machine *outside* any workspace root, which is exactly
+/// what `run_command`'s containment cannot answer for: a scrubbed `PATH`, a workspace
+/// `current_dir`, relative paths only, and an argument pass that refuses absolute paths. `rm` and
+/// `mv` are deliberately **not** here — they are destructive but confinable, and refusing them
+/// forever is what made "tidy up the build output" impossible.
+///
+/// Refused twice on purpose. The setter refuses them so the user learns immediately; the gate
+/// refuses them so a list persisted by an older or edited store cannot slip one through.
+const NEVER_ALLOWED: &[&str] = &[
+    "sudo",
+    "su",
+    "dd",
+    "shutdown",
+    "reboot",
+    "halt",
+    "diskutil",
+    "launchctl",
+    "csrutil",
+    "kextload",
+];
+
+/// Ceiling on user-added programs, and on the length of one name.
+const MAX_EXTRA_PROGRAMS: usize = 32;
+const MAX_PROGRAM_NAME: usize = 64;
+
+/// The user's additions, process-wide because the gate is reached from three call sites that share
+/// no state — the Assistant's tool host, the gateway's tool path, and their tests.
+///
+/// Set at boot from the `tools` settings row, and replaced by `tools_set_extra_programs`. **The
+/// mutation site calls the setter**, so there is no cache that can go stale — which is the rule
+/// this would otherwise break.
+static EXTRA_PROGRAMS: OnceLock<RwLock<HashSet<String>>> = OnceLock::new();
+
+fn extra_programs_cell() -> &'static RwLock<HashSet<String>> {
+    EXTRA_PROGRAMS.get_or_init(|| RwLock::new(HashSet::new()))
+}
+
+/// A user-supplied program is a bare executable name: no path, no shell metacharacter, no `..`.
+/// Anything else would reintroduce an escape the argument gate exists to close.
+fn check_program_name(name: &str) -> Result<(), String> {
+    if name.is_empty() {
+        return Err("a program name cannot be empty".into());
+    }
+    if name.len() > MAX_PROGRAM_NAME {
+        return Err(format!(
+            "program name \"{name}\" is longer than {MAX_PROGRAM_NAME} characters"
+        ));
+    }
+    if name.starts_with('-') {
+        return Err(format!("program name \"{name}\" cannot start with '-'"));
+    }
+    if !name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-')) {
+        return Err(format!(
+            "program name \"{name}\" must be a bare executable name — no path separators or shell characters"
+        ));
+    }
+    if NEVER_ALLOWED.contains(&name) {
+        return Err(format!("program \"{name}\" is never allowed"));
+    }
+    Ok(())
+}
+
+/// Validate and normalise a configured list: trimmed, de-duplicated, sorted, bounded.
+///
+/// Separate from [`set_extra_programs`] so a caller can refuse a bad list **before** persisting it.
+/// A list that is stored and then refused by the gate is the worst outcome available: the setting
+/// looks saved and does nothing.
+pub fn normalize_extra_programs(programs: Vec<String>) -> Result<Vec<String>, String> {
+    let mut out: Vec<String> = Vec::new();
+    for p in programs {
+        let name = p.trim().to_string();
+        if name.is_empty() {
+            continue;
+        }
+        check_program_name(&name)?;
+        if !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    if out.len() > MAX_EXTRA_PROGRAMS {
+        return Err(format!("at most {MAX_EXTRA_PROGRAMS} additional programs, got {}", out.len()));
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// Replace the configured additions, returning the normalised list that is now in force.
+pub fn set_extra_programs(programs: Vec<String>) -> Result<Vec<String>, String> {
+    let clean = normalize_extra_programs(programs)?;
+    let mut cell = extra_programs_cell().write().unwrap();
+    *cell = clean.iter().cloned().collect();
+    Ok(clean)
+}
+
+/// The configured additions, sorted.
+pub fn extra_programs() -> Vec<String> {
+    let mut v: Vec<String> = extra_programs_cell().read().unwrap().iter().cloned().collect();
+    v.sort();
+    v
+}
+
+/// Baselines, as a set. Leaked once on purpose: a `const` HashSet is not constructible pre-1.80 in
+/// const fn.
+fn builtin_programs() -> &'static HashSet<&'static str> {
+    static CELL: OnceLock<HashSet<&'static str>> = OnceLock::new();
+    CELL.get_or_init(|| BUILTIN_PROGRAMS.iter().copied().collect())
+}
+
+/// May `program` start, given the additions in force? The one place the three sets meet, so the
+/// denylist cannot be forgotten on a path that remembers the baseline.
+fn program_allowed(program: &str, extra: &HashSet<String>) -> Result<(), String> {
+    if NEVER_ALLOWED.contains(&program) {
+        return Err(format!("program \"{program}\" is never allowed"));
+    }
+    if builtin_programs().contains(program) || extra.contains(program) {
+        return Ok(());
+    }
+    Err(format!("program \"{program}\" is not on the allowlist"))
 }
 
 /// `git` is allowed for the subcommands working on a repository needs, including the network
@@ -160,6 +280,12 @@ impl ToolResult {
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolAllowlist {
     pub programs: Vec<&'static str>,
+    /// The user's additions, kept separate from `programs` so the UI can say which list a program
+    /// came from rather than showing one merged set it cannot explain.
+    pub extra_programs: Vec<String>,
+    /// Published for the same reason as `programs`: the screen shows what is refused, not only
+    /// what is permitted.
+    pub never_allowed: Vec<&'static str>,
     pub git_subcommands: Vec<&'static str>,
     pub max_command_ms: u64,
     pub max_output_bytes: usize,
@@ -168,10 +294,12 @@ pub struct ToolAllowlist {
 /// Announce the sandbox to the UI so it can show the user what is actually permitted,
 /// rather than making them trust a checkbox.
 pub fn tools_policy() -> ToolAllowlist {
-    let mut programs: Vec<&'static str> = allowed_programs().iter().copied().collect();
+    let mut programs: Vec<&'static str> = builtin_programs().iter().copied().collect();
     programs.sort_unstable();
     ToolAllowlist {
         programs,
+        extra_programs: extra_programs(),
+        never_allowed: NEVER_ALLOWED.to_vec(),
         git_subcommands: GIT_SUBCOMMANDS.to_vec(),
         max_command_ms: MAX_COMMAND_MS,
         max_output_bytes: MAX_OUTPUT_BYTES,
@@ -797,11 +925,23 @@ fn do_run_command(args: &serde_json::Value, root: &Path) -> ToolResult {
 /// gateway and direct calls do not). With an id, the child is registered for cancellation; without
 /// one it simply runs to completion or timeout, exactly as before.
 fn do_run_command_with(args: &serde_json::Value, root: &Path, call_id: Option<&str>) -> ToolResult {
+    // Cloned rather than held: the read guard must be gone before the child runs, or a concurrent
+    // `set_extra_programs` would block for as long as the command takes.
+    let extra = extra_programs_cell().read().unwrap().clone();
+    do_run_command_gated(args, root, call_id, &extra)
+}
+
+/// The gate with an explicit additions set, so a test can exercise the decision without mutating
+/// process-wide state — two parallel tests sharing one global is the collision this avoids.
+fn do_run_command_gated(
+    args: &serde_json::Value,
+    root: &Path,
+    call_id: Option<&str>,
+    extra: &HashSet<String>,
+) -> ToolResult {
     match (|| -> Result<String, String> {
         let program = arg_str(args, "program")?;
-        if !allowed_programs().contains(program.as_str()) {
-            return Err(format!("program \"{program}\" is not on the allowlist"));
-        }
+        program_allowed(&program, extra)?;
         let argv: Vec<String> = match args.get("args") {
             Some(serde_json::Value::Array(items)) => items
                 .iter()
@@ -2262,6 +2402,104 @@ mod tests {
         );
         assert!(!res.ok);
         assert!(res.error.unwrap().contains("not on the allowlist"));
+    }
+
+    // --- the configurable extension (Settings → Tools) ---
+    //
+    // The property under test is not "a user can add a program" but "adding one cannot weaken the
+    // two things the baseline guarantees": default-deny for everything unlisted, and a denylist
+    // that a configuration cannot override.
+
+    /// A program the baseline cannot reach is refused with no configuration — the default stays
+    /// deny, which is the property the extension must not touch.
+    #[test]
+    fn a_program_off_the_baseline_is_refused_while_unconfigured() {
+        let none: HashSet<String> = HashSet::new();
+        let res = do_run_command_gated(
+            &obj(&[("program", serde_json::json!("sleep")), ("args", serde_json::json!(["0"]))]),
+            &root(),
+            None,
+            &none,
+        );
+        assert!(!res.ok, "sleep must not run unconfigured");
+        assert!(res.error.unwrap().contains("not on the allowlist"));
+    }
+
+    /// …and the same program passes once configured. `sleep` because it is on the child's fixed
+    /// `PATH`, is absent from the baseline, and cannot fail for any reason except the gate.
+    #[test]
+    fn a_configured_program_passes_the_gate() {
+        let extra: HashSet<String> = ["sleep".to_string()].into_iter().collect();
+        let res = do_run_command_gated(
+            &obj(&[("program", serde_json::json!("sleep")), ("args", serde_json::json!(["0"]))]),
+            &root(),
+            None,
+            &extra,
+        );
+        assert!(res.ok, "sleep should run once configured: {:?}", res.error);
+    }
+
+    /// The denylist outranks the configuration, and is checked at the **gate** as well as the
+    /// setter — this is the shape a list persisted by an older store would produce.
+    #[test]
+    fn a_never_allowed_program_is_refused_even_when_configured() {
+        let extra: HashSet<String> = ["sudo".to_string()].into_iter().collect();
+        let res = do_run_command_gated(
+            &obj(&[("program", serde_json::json!("sudo")), ("args", serde_json::json!(["true"]))]),
+            &root(),
+            None,
+            &extra,
+        );
+        assert!(!res.ok);
+        assert!(res.error.unwrap().contains("never allowed"));
+    }
+
+    #[test]
+    fn a_never_allowed_program_cannot_be_configured_at_all() {
+        let err = normalize_extra_programs(vec!["sudo".to_string()]).unwrap_err();
+        assert!(err.contains("never allowed"), "got: {err}");
+    }
+
+    /// An addition is a name, never a path. A path would be an escape the argument gate cannot
+    /// close, because the program itself would sit outside the workspace.
+    #[test]
+    fn configured_program_names_may_not_be_paths_or_flags() {
+        for bad in ["/bin/sh", "../bin/sh", "bin/sh", "sh;rm", "sh -c", "--force", ""] {
+            match normalize_extra_programs(vec![bad.to_string()]) {
+                // An empty name is skipped rather than refused, so a blank row in the editor is
+                // not an error; every other shape above must be refused.
+                Ok(v) if bad.is_empty() => assert!(v.is_empty(), "empty input should add nothing"),
+                Ok(v) => panic!("{bad:?} should be refused, got {v:?}"),
+                Err(e) => assert!(!e.is_empty()),
+            }
+        }
+    }
+
+    #[test]
+    fn configured_programs_are_deduplicated_sorted_and_bounded() {
+        let got = normalize_extra_programs(vec!["sleep".into(), " sleep ".into(), "cargo".into()])
+            .unwrap();
+        assert_eq!(got, vec!["cargo".to_string(), "sleep".to_string()]);
+
+        let too_many: Vec<String> =
+            (0..MAX_EXTRA_PROGRAMS + 1).map(|i| format!("prog{i}")).collect();
+        assert!(normalize_extra_programs(too_many).is_err());
+    }
+
+    /// The policy the UI renders reports provenance — three sets, not one merged list it cannot
+    /// explain. The only test here that touches process-wide state; it restores before asserting,
+    /// so a failing assertion cannot leave a half-configured allowlist for a parallel test.
+    #[test]
+    fn the_policy_reports_baseline_additions_and_the_denylist() {
+        let before = extra_programs();
+        let policy = set_extra_programs(vec!["cargo".into()]).map(|_| tools_policy()).unwrap();
+        set_extra_programs(before).unwrap();
+
+        assert!(policy.extra_programs.contains(&"cargo".to_string()));
+        assert!(!policy.programs.contains(&"cargo"), "an addition is not a baseline program");
+        assert!(policy.programs.contains(&"cat"), "the baseline must still be reported");
+        assert!(policy.never_allowed.contains(&"sudo"));
+        assert!(!policy.never_allowed.contains(&"rm"), "rm must stay addable");
     }
 
     #[test]

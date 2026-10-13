@@ -358,6 +358,11 @@ async fn main() {
         }
     };
 
+    // The tool sandbox's configured additions, applied before the listener exists. The gateway
+    // path executes tools too, so a policy that only the app applied would mean one workspace with
+    // two sandboxes — the failure the shared `core::tools` host exists to prevent.
+    persist::tools_extra_programs_load(&store);
+
     // §4 retention, on boot and daily. The app ran this at startup since it existed; the daemon
     // — which can run for months without the app ever starting — never did, so the rollup table
     // stayed empty and agent runs accumulated forever. Errors are non-fatal by the same rule as

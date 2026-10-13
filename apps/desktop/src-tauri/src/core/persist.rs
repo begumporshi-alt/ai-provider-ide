@@ -1534,6 +1534,68 @@ pub fn spend_cap_set(store: &Store, cap_micros: i64) -> Result<(), CommandError>
     Ok(())
 }
 
+// ---------- tool sandbox policy ----------
+
+/// The `run_command` additions the user configured, from the `tools` settings row.
+///
+/// Read at boot by both binaries and applied with `tools::set_extra_programs`. Absent, `NULL` and
+/// unparseable all read as "no additions" rather than an error — the deny-by-default posture is
+/// the safe reading of an unreadable settings row, the same rule [`setting_value`] documents.
+pub fn tools_extra_programs(store: &Store) -> Vec<String> {
+    setting_value(store, "tools")
+        .and_then(|v| {
+            v.get("extraPrograms")?.as_array().map(|a| {
+                a.iter().filter_map(|p| p.as_str().map(str::to_string)).collect::<Vec<String>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Persist the additions. The caller validates first ([`crate::core::tools::normalize_extra_programs`]),
+/// so a list the gate would then refuse is never stored — a saved setting that does nothing is the
+/// outcome this ordering exists to prevent.
+pub fn tools_extra_programs_set(store: &Store, programs: &[String]) -> Result<(), CommandError> {
+    let conn = store.conn.lock().unwrap();
+    conn.execute(
+        "INSERT INTO settings (key, value_json) VALUES ('tools', ?1)
+         ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+        params![serde_json::json!({ "extraPrograms": programs }).to_string()],
+    )?;
+    Ok(())
+}
+
+/// Validate, persist and apply the additions as one operation, returning what is now in force.
+///
+/// The three are one thing, not three: a store write without the in-process set leaves the setting
+/// looking saved while the gate keeps refusing, and the in-process set without the store loses it
+/// at the next boot. This is the single sequenced entry point so no caller can do half of it.
+pub fn tools_extra_programs_apply(
+    store: &Store,
+    programs: Vec<String>,
+) -> Result<Vec<String>, String> {
+    // Validate first: a list the gate would refuse must never reach the store.
+    let clean = crate::core::tools::normalize_extra_programs(programs)?;
+    tools_extra_programs_set(store, &clean).map_err(|e| e.to_string())?;
+    // Cannot fail on the same already-validated input; if it ever does, the store and the gate
+    // disagree until the next boot, which `tools_extra_programs_load` resolves.
+    crate::core::tools::set_extra_programs(clean)
+}
+
+/// Apply the stored additions at boot — called by the app **and** the daemon, so a persisted
+/// setting governs both serving paths rather than only the one that happened to run the setter.
+///
+/// A stored list that no longer validates is refused with a line on stderr and the baseline is
+/// kept: the safe reading of an unreadable policy is the one that permits less.
+pub fn tools_extra_programs_load(store: &Store) {
+    let stored = tools_extra_programs(store);
+    if stored.is_empty() {
+        return;
+    }
+    if let Err(e) = crate::core::tools::set_extra_programs(stored) {
+        eprintln!("tools: stored program list refused ({e}); keeping the baseline allowlist");
+    }
+}
+
 // Four tests below carry `#[cfg(feature = "app")]` because the readers they exercise are
 // app-gated; the others compile without the feature, which is the point of
 // `cargo check --no-default-features --all-targets` — see D17.

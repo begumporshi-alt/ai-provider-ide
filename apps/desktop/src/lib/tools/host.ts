@@ -19,7 +19,18 @@ interface WireToolResult {
 }
 
 export interface ToolsPolicy {
+  /** The programs that start with no configuration. */
   programs: string[];
+  /**
+   * The user's additions, kept separate from `programs` so the screen can say which list a program
+   * came from rather than rendering one merged set it cannot explain.
+   */
+  extra_programs: string[];
+  /**
+   * Programs refused unconditionally — these stay refused even if added, so the screen shows them
+   * for the same reason it shows `programs`: the user should see the boundary, not infer it.
+   */
+  never_allowed: string[];
   git_subcommands: string[];
   max_command_ms: number;
   max_output_bytes: number;
@@ -83,6 +94,17 @@ export function createTauriToolHost(root: string): ToolHost {
 /** Surface the sandbox allowlist to the UI so the user sees what agent mode can actually do. */
 export async function fetchToolsPolicy(): Promise<ToolsPolicy> {
   return invoke<ToolsPolicy>("tools_policy");
+}
+
+/**
+ * Replace the sandbox's user-added programs (Settings → Tools), returning the policy now in force.
+ *
+ * The returned policy — not the requested list — is what the screen must render: the host
+ * normalises (trims, de-duplicates, sorts) and refuses a never-allowed or path-shaped name, so a
+ * screen that echoed its own input would claim a program runs that does not.
+ */
+export async function setToolsExtraPrograms(programs: string[]): Promise<ToolsPolicy> {
+  return invoke<ToolsPolicy>("tools_set_extra_programs", { programs });
 }
 
 /**

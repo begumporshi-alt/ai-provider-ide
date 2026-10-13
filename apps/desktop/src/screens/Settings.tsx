@@ -15,6 +15,8 @@ import type { CrashReport } from "../store";
 import { selectableModels } from "../lib/models/selectable";
 import { fetchMcpServers, refreshMcp, saveMcpServers } from "../lib/tools/mcp-client";
 import type { McpServerConfig } from "../lib/tools/mcp";
+import { fetchToolsPolicy, setToolsExtraPrograms } from "../lib/tools";
+import type { ToolsPolicy } from "../lib/tools";
 import { useUi } from "../ui-state";
 import { StatusDot } from "../components/atoms";
 
@@ -264,10 +266,126 @@ export function SettingsScreen() {
         </div>
       </Section>
 
+      <ToolSandboxSection />
+
       <McpSection />
 
       <ConfigDiagnosticsSection />
     </div>
+  );
+}
+
+/**
+ * The `run_command` sandbox's user-extensible program list (2026-10-13).
+ *
+ * What is editable here is only the *additions*. The baseline is the shipped posture, and the
+ * never-allowed list is published rather than hidden — a user who cannot see the boundary adds past
+ * it and reads the refusal as a bug. The section renders the policy the **host returned**, never
+ * the list that was typed: the host trims, de-duplicates, sorts and may refuse, so echoing the
+ * input would claim a program runs that does not.
+ */
+function ToolSandboxSection() {
+  const [policy, setPolicy] = useState<ToolsPolicy | null>(null);
+  const [draft, setDraft] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const input = "rounded border px-2 py-1 text-[12px]";
+  const inputStyle = { background: "var(--bg)", borderColor: "var(--border)", color: "var(--text)" };
+
+  useEffect(() => {
+    void fetchToolsPolicy().then(setPolicy).catch(() => undefined);
+  }, []);
+
+  /** Write the whole list, then render what the host says is now true. */
+  async function save(next: string[]): Promise<void> {
+    setBusy(true);
+    setError(null);
+    try {
+      setPolicy(await setToolsExtraPrograms(next));
+      setDraft("");
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const extras = policy?.extra_programs ?? [];
+
+  return (
+    <Section
+      title="Agent tool sandbox"
+      hint="Programs agent mode may start with run_command. The baseline is fixed; additions widen it on this machine only, and never past the refused list."
+    >
+      <div className="flex flex-col gap-3">
+        <div className="flex items-center gap-2">
+          <input
+            aria-label="Additional program"
+            className={`${input} mono w-56`}
+            style={inputStyle}
+            placeholder="cargo"
+            value={draft}
+            disabled={busy || !policy}
+            onChange={(e) => setDraft(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" && draft.trim() && !busy) void save([...extras, draft]);
+            }}
+          />
+          <button
+            className={`${input} disabled:opacity-50`}
+            style={inputStyle}
+            disabled={busy || !policy || !draft.trim()}
+            onClick={() => void save([...extras, draft])}
+          >
+            Add program
+          </button>
+        </div>
+
+        {error && (
+          <span className="text-[11px]" style={{ color: "var(--danger)" }} role="alert">
+            {error}
+          </span>
+        )}
+
+        {extras.length > 0 ? (
+          <ul className="flex flex-col gap-1">
+            {extras.map((p) => (
+              <li key={p} className="flex items-center gap-2 text-[12px]">
+                <code className="mono">{p}</code>
+                <button
+                  aria-label={`Remove ${p}`}
+                  className="text-[11px] disabled:opacity-50"
+                  style={{ color: "var(--text-faint)" }}
+                  disabled={busy}
+                  onClick={() => void save(extras.filter((x) => x !== p))}
+                >
+                  Remove
+                </button>
+              </li>
+            ))}
+          </ul>
+        ) : (
+          <span className="text-[11px]" style={{ color: "var(--text-faint)" }}>
+            No additions — only the baseline programs start.
+          </span>
+        )}
+
+        {policy && (
+          <details>
+            <summary className="cursor-pointer text-[11px]" style={{ color: "var(--text-dim)" }}>
+              {policy.programs.length} baseline programs · {policy.never_allowed.length} refused
+            </summary>
+            <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              Baseline: {policy.programs.join(", ")}
+            </p>
+            <p className="mt-1 text-[11px]" style={{ color: "var(--text-faint)" }}>
+              Refused even when added: {policy.never_allowed.join(", ")}
+            </p>
+          </details>
+        )}
+      </div>
+    </Section>
   );
 }
 

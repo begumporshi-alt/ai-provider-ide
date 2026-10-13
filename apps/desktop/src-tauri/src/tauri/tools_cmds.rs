@@ -17,7 +17,11 @@
 //! prevent.
 
 use std::path::Path;
+use std::sync::Arc;
 
+use tauri::State;
+
+use crate::core::store::Store;
 use crate::core::tools::{ToolAllowlist, ToolResult, ToolRunRequest};
 
 /// Announce the sandbox to the UI so it can show the user what is actually permitted, rather than
@@ -25,6 +29,21 @@ use crate::core::tools::{ToolAllowlist, ToolResult, ToolRunRequest};
 #[tauri::command]
 pub fn tools_policy() -> ToolAllowlist {
     crate::core::tools::tools_policy()
+}
+
+/// Replace the `run_command` program additions (Settings → Tools).
+///
+/// Returns the refreshed policy rather than an acknowledgement, so the screen renders what is now
+/// true instead of what it asked for. The validate → persist → apply sequence lives in
+/// `core::persist`, where the daemon can reach the same behaviour; this wrapper sequences nothing
+/// of its own.
+#[tauri::command]
+pub fn tools_set_extra_programs(
+    store: State<'_, Arc<Store>>,
+    programs: Vec<String>,
+) -> Result<ToolAllowlist, String> {
+    crate::core::persist::tools_extra_programs_apply(&store, programs)?;
+    Ok(crate::core::tools::tools_policy())
 }
 
 /// Is `root` usable as a workspace root? The UI asks this before the first tool call.
