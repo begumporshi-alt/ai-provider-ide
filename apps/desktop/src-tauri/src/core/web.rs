@@ -85,15 +85,22 @@ fn browser_default_headers() -> reqwest::header::HeaderMap {
 /// A dedicated multi-thread runtime, built once. The tool host is synchronous, and blocking on
 /// the ambient runtime (if any) with `tokio::block_on` would panic; a private runtime is the
 /// safe bridge between the two worlds.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static CELL: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+///
+/// **Fallible, like `core::browser`'s.** The build is lazy, so it happens on the first search or
+/// fetch — the request path, not startup — and a thread pool that cannot be created would end the
+/// process (`panic = "abort"`) instead of answering the model. Cached with the failure, so a broken
+/// environment is not re-tried per call.
+fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static CELL: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     CELL.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("the web runtime must start")
+            .map_err(|e| format!("the web runtime could not start: {e}"))
     })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 // ── the fetch cache ──────────────────────────────────────────────────────────────────────
@@ -220,7 +227,7 @@ pub fn http_get(url: &reqwest::Url) -> Result<Vec<u8>, String> {
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
-    runtime().block_on(async {
+    runtime()?.block_on(async {
         let resp = client.get(url.clone()).send().await.map_err(|e| {
             if e.is_timeout() {
                 "the request timed out".to_string()
@@ -699,7 +706,7 @@ fn http_get_with_headers(url: &reqwest::Url, headers: &[(&str, &str)]) -> Result
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
-    runtime().block_on(async {
+    runtime()?.block_on(async {
         let mut req = client.get(url.clone());
         for (name, value) in headers {
             req = req.header(*name, *value);
@@ -724,7 +731,7 @@ fn http_post_json(url: &str, _key: &str, json: &str) -> Result<String, String> {
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
-    runtime().block_on(async {
+    runtime()?.block_on(async {
         let resp = client
             .post(url)
             .header("Content-Type", "application/json")
@@ -937,7 +944,7 @@ pub fn http_request(
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .map_err(|e| format!("cannot build HTTP client: {e}"))?;
-    runtime().block_on(async {
+    runtime()?.block_on(async {
         let m: reqwest::Method = method.parse().map_err(|e| format!("bad method: {e}"))?;
         let mut req = client.request(m, url.clone());
         for (name, value) in headers {

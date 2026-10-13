@@ -363,17 +363,20 @@ fn tool_info(server: &str, entry: &Value) -> Option<McpToolInfo> {
         entry.pointer("/annotations/readOnlyHint").and_then(Value::as_bool).unwrap_or(false);
     // Only an object schema passes through; anything else the server declares becomes an empty
     // object schema, which the model reads as "no arguments" rather than as an uncallable tool.
-    let schema_is_object =
-        entry.get("inputSchema").and_then(|s| s.get("type")).and_then(Value::as_str)
-            == Some("object");
-    let parameters = if schema_is_object {
-        let s = entry.get("inputSchema").expect("checked above");
-        json!({
+    //
+    // Looked up **once** and matched, rather than testing `inputSchema.type` and then re-fetching
+    // the same field behind an `expect("checked above")`. That shape is what makes the panic
+    // possible: the second lookup is infallible only because of the first one four lines up, and
+    // the payload here is a third-party server's. One lookup has no invariant to hold.
+    let parameters = match entry
+        .get("inputSchema")
+        .filter(|s| s.get("type").and_then(Value::as_str) == Some("object"))
+    {
+        Some(s) => json!({
             "properties": s.get("properties").cloned().unwrap_or(json!({})),
             "required": s.get("required").cloned().unwrap_or(json!([])),
-        })
-    } else {
-        json!({ "properties": {}, "required": [] })
+        }),
+        None => json!({ "properties": {}, "required": [] }),
     };
     Some(McpToolInfo {
         server: server.to_string(),
@@ -628,6 +631,39 @@ for line in sys.stdin:
                 .unwrap();
         }
         assert!(servers_config(&store).is_empty(), "garbage collapses to empty");
+    }
+
+    /// The tool-list shapes a third-party server actually sends. A schema the model cannot use must
+    /// become an **empty** object schema — "no arguments" — never a panic and never an uncallable
+    /// tool. This is the branch that used to re-fetch `inputSchema` behind an
+    /// `expect("checked above")`.
+    #[test]
+    fn a_schema_that_is_not_an_object_becomes_no_arguments_rather_than_a_panic() {
+        for entry in [
+            // No schema at all.
+            json!({ "name": "bare" }),
+            // A schema that is not an object (a server bug, or a different spec revision).
+            json!({ "name": "odd", "inputSchema": { "type": "array" } }),
+            json!({ "name": "stringy", "inputSchema": "not a schema" }),
+            // `type` missing entirely.
+            json!({ "name": "typeless", "inputSchema": { "properties": { "q": {} } } }),
+        ] {
+            let info = tool_info("srv", &entry).expect("a named entry is still a tool");
+            assert_eq!(
+                info.parameters,
+                json!({ "properties": {}, "required": [] }),
+                "entry {entry} must degrade to no arguments"
+            );
+        }
+        // The positive control: an object schema still carries its properties and required list,
+        // so the assertions above cannot pass by the branch being dead.
+        let info = tool_info(
+            "srv",
+            &json!({ "name": "ok", "inputSchema": { "type": "object", "properties": { "q": { "type": "string" } }, "required": ["q"] } }),
+        )
+        .expect("a named entry is a tool");
+        assert_eq!(info.parameters["required"], json!(["q"]));
+        assert!(info.parameters["properties"].get("q").is_some());
     }
 
     #[test]

@@ -50,17 +50,38 @@ fn conn_cell() -> &'static tokio::sync::Mutex<Option<Conn>> {
     CONN.get_or_init(|| tokio::sync::Mutex::new(None))
 }
 
+/// The browser runtime, or an early `ToolResult` refusal.
+///
+/// A macro rather than `?`: these four tools answer a `ToolResult`, not a `Result`, so `?` has
+/// nothing to propagate into. A macro rather than a `match` at each call site because that repeated
+/// block is exactly what made the original `expect` look like the cheaper option.
+macro_rules! rt {
+    () => {
+        match runtime() {
+            Ok(rt) => rt,
+            Err(e) => return crate::core::tools::ToolResult::err(e),
+        }
+    };
+}
+
 /// The dedicated multi-thread runtime, the same bridge `core::web` uses: the tool host is
 /// synchronous, and blocking on the ambient runtime would panic.
-fn runtime() -> &'static tokio::runtime::Runtime {
-    static CELL: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+///
+/// **Fallible rather than an `expect`.** The init is lazy, so it runs on the *first* browser tool
+/// call — that is the request path, not startup — and a panic there would end the process (release
+/// builds are `panic = "abort"`) instead of telling the model a thread pool could not be built. The
+/// failure is cached alongside the result, so a broken environment is not re-tried per call.
+fn runtime() -> Result<&'static tokio::runtime::Runtime, String> {
+    static CELL: OnceLock<Result<tokio::runtime::Runtime, String>> = OnceLock::new();
     CELL.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
             .build()
-            .expect("the browser runtime must start")
+            .map_err(|e| format!("the browser runtime could not start: {e}"))
     })
+    .as_ref()
+    .map_err(|e| e.clone())
 }
 
 type WsStream =
@@ -129,7 +150,12 @@ fn forget_conn() {
 
 async fn connect(port: u16) -> Result<Conn, String> {
     let pages = list_pages(port).await?;
-    let (_, title, ws_url) = pages.first().cloned().expect("list_pages refuses empty");
+    // Not `.expect("list_pages refuses empty")`: that refusal lives in another function, and a
+    // cross-function invariant is one refactor away from being a panic on the request path. The
+    // wording matches `list_pages`' own, so the model reads the same instruction either way.
+    let (_, title, ws_url) = pages.first().cloned().ok_or_else(|| {
+        format!("the browser on port {port} has no open page — open a tab and call again")
+    })?;
     let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .map_err(|e| format!("connection lost: cannot attach to \"{title}\": {e}"))?;
@@ -147,7 +173,8 @@ async fn with_page<T>(
         if guard.as_ref().map(|c| c.port) != Some(port) {
             *guard = Some(connect(port).await?);
         }
-        let conn = guard.as_mut().expect("just connected");
+        let conn =
+            guard.as_mut().ok_or("the browser connection dropped before the call — call again")?;
         match f(conn).await {
             Ok(v) => return Ok(v),
             // The cached socket died (tab closed, Chrome restarted). Reconnect and retry once;
@@ -158,7 +185,11 @@ async fn with_page<T>(
             Err(e) => return Err(e),
         }
     }
-    unreachable!("the loop returns on both branches")
+    // Written as a return rather than `unreachable!`: the arms above do all return, so this is
+    // dead — but "dead" is a property of the loop body, and an edit that adds a third attempt
+    // would turn a promise into a process-ending panic on the request path.
+    Err("the browser connection could not be established after reconnecting — call again"
+        .to_string())
 }
 
 /// One request/response round trip. Events that arrive first (a live page talks constantly) are
@@ -285,7 +316,7 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
         _ => return crate::core::tools::ToolResult::err("navigate needs a \"url\""),
     };
     let port = port_of(args);
-    wrap_err(runtime().block_on(with_page(port, move |conn| {
+    wrap_err(rt!().block_on(with_page(port, move |conn| {
         let url = url.clone();
         Box::pin(async move {
             command(conn, "Page.navigate", json!({ "url": url })).await?;
@@ -311,7 +342,7 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
 /// and say to re-snapshot.
 pub fn browser_snapshot(args: &Value) -> crate::core::tools::ToolResult {
     let port = port_of(args);
-    wrap_err(runtime().block_on(with_page(port, |conn| {
+    wrap_err(rt!().block_on(with_page(port, |conn| {
         Box::pin(async move {
             evaluate(conn, SNAPSHOT_JS).await.map(|v| v.as_str().unwrap_or_default().to_string())
         })
@@ -330,7 +361,7 @@ pub fn browser_click(args: &Value) -> crate::core::tools::ToolResult {
         }
     };
     let port = port_of(args);
-    wrap_err(runtime().block_on(with_page(port, |conn| {
+    wrap_err(rt!().block_on(with_page(port, |conn| {
         Box::pin(async move {
             // The JS stringifies its answer, so `evaluate` hands back a JSON string *inside* a
             // JSON string — the inner one is the coordinates.
@@ -375,7 +406,7 @@ pub fn browser_fill(args: &Value) -> crate::core::tools::ToolResult {
     // serde_json's string encoder is the quoting boundary: whatever the model sent arrives in
     // the expression as a JSON string literal, not as JS source.
     let quoted = serde_json::to_string(text).expect("String always serializes");
-    wrap_err(runtime().block_on(with_page(port, move |conn| {
+    wrap_err(rt!().block_on(with_page(port, move |conn| {
         let quoted = quoted.clone();
         Box::pin(async move {
             let raw = evaluate(conn, &format!("{FILL_JS}({idx}, {quoted})")).await?;
@@ -392,7 +423,7 @@ pub fn browser_fill(args: &Value) -> crate::core::tools::ToolResult {
 /// Capture the connected page as a base64 PNG for `browser_screenshot` to save.
 pub fn capture_screenshot(args: &Value) -> Result<String, String> {
     let port = port_of(args);
-    let out: Result<String, String> = runtime().block_on(with_page(port, |conn| {
+    let out: Result<String, String> = runtime()?.block_on(with_page(port, |conn| {
         Box::pin(async move {
             let res = command(conn, "Page.captureScreenshot", json!({ "format": "png" })).await?;
             res.get("data")
@@ -423,7 +454,7 @@ mod tests {
     fn a_dead_debugger_port_is_an_instruction_not_a_stacktrace() {
         // A port nothing listens on. The error is what the model sees when it forgets that the
         // browser must be started first — it has to name the fix.
-        let err = runtime().block_on(list_pages(59999)).unwrap_err();
+        let err = runtime().expect("the test runtime").block_on(list_pages(59999)).unwrap_err();
         assert!(err.contains("--remote-debugging-port"), "got: {err}");
     }
 

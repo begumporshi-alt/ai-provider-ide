@@ -146,12 +146,22 @@ fn destructive_and_network_programs_are_absent() {
         ("curl", vec!["https://example.com"]),
         ("wget", vec!["https://example.com"]),
         ("sh", vec!["-c", "echo hi"]),
-        ("sudo", vec!["echo", "hi"]),
     ] {
         let r = call(&root, "run_command", serde_json::json!({ "program": prog, "args": argv }));
         assert!(!r.ok, "{prog} must be refused");
         assert!(r.error.unwrap().contains("not on the allowlist"));
     }
+    // `sudo` is refused for a different reason, and the difference is load-bearing: it is on the
+    // never-allowed list, so it stays refused even after the user extends the sandbox with
+    // Settings → Tools. An unlisted program becomes reachable by configuration; this one does not,
+    // and the wording is how a reader of the tool result tells the two apart.
+    let r = call(
+        &root,
+        "run_command",
+        serde_json::json!({ "program": "sudo", "args": ["echo", "hi"] }),
+    );
+    assert!(!r.ok, "sudo must be refused");
+    assert!(r.error.unwrap().contains("never allowed"));
     // git is allowed, but only the listed subcommands; an unlisted one is refused even though
     // the network-facing ones (clone/fetch/pull/push) are all in the list now.
     for sub in ["remote", "rebase"] {

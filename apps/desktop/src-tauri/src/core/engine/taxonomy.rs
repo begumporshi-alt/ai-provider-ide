@@ -227,7 +227,7 @@ pub const MAX_REASON_CHARS: usize = 400;
 /// *our* request shape, for a refusal that was about the provider's content policy.
 pub fn reason_from_body(body: Option<&str>) -> Option<String> {
     let body = body?;
-    let mut reason = match serde_json::from_str::<serde_json::Value>(body) {
+    let reason = match serde_json::from_str::<serde_json::Value>(body) {
         Ok(v) => v.get("error").and_then(|e| {
             let code = e.get("code").and_then(|c| c.as_str());
             let message = e.get("message").and_then(|m| m.as_str());
@@ -240,10 +240,12 @@ pub fn reason_from_body(body: Option<&str>) -> Option<String> {
         }),
         Err(_) => None,
     };
-    if reason.is_none() {
-        reason = Some(body.to_string());
-    }
-    let reason = reason.unwrap();
+    // The provider's own words, or the body verbatim: a 400 whose error object carries neither a
+    // code nor a message still has to reach the ledger as *something* an operator can read. One
+    // expression rather than `if reason.is_none() { … }` plus an `unwrap()` — that unwrap was
+    // provably infallible, and "provably" was a property of the four lines above it, which a later
+    // edit could remove without the compiler objecting.
+    let reason = reason.unwrap_or_else(|| body.to_string());
     // char-counted, not byte-counted: a CJK error message (the measurement saw 无效的令牌) would
     // panic on a byte slice that splits a code point.
     Some(if reason.chars().count() > MAX_REASON_CHARS {
@@ -265,4 +267,41 @@ pub fn is_retryable_with_next_key(cls: ErrorClass) -> bool {
             | ErrorClass::ServerError
             | ErrorClass::Network
     )
+}
+
+#[cfg(test)]
+mod reason_tests {
+    use super::*;
+
+    /// The branch that used to be an `unwrap()`: a well-formed body whose `error` object carries
+    /// neither a code nor a message. The reason must fall back to the **raw body**, because the
+    /// alternative — `None` — loses the one piece of evidence the provider sent.
+    #[test]
+    fn a_body_without_a_code_or_message_falls_back_to_the_body_itself() {
+        let body = r#"{"error":{"type":"invalid_request_error"}}"#;
+        assert_eq!(reason_from_body(Some(body)), Some(body.to_string()));
+    }
+
+    #[test]
+    fn a_code_and_a_message_are_both_kept() {
+        let got =
+            reason_from_body(Some(r#"{"error":{"code":"content-blocked","message":"nope"}}"#));
+        assert_eq!(got.as_deref(), Some("content-blocked: nope"));
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_is_still_the_reason() {
+        assert_eq!(reason_from_body(Some("upstream said no")), Some("upstream said no".into()));
+        assert_eq!(reason_from_body(None), None);
+    }
+
+    /// The cap is a character count, not a byte slice: a CJK message (measured live: 无效的令牌)
+    /// would panic on a byte index that splits a code point.
+    #[test]
+    fn the_cap_counts_characters_so_a_multibyte_message_does_not_panic() {
+        let long = "无".repeat(MAX_REASON_CHARS + 50);
+        let got = reason_from_body(Some(&long)).expect("a reason");
+        assert_eq!(got.chars().count(), MAX_REASON_CHARS + 1, "capped, plus the ellipsis");
+        assert!(got.ends_with('…'));
+    }
 }
