@@ -30,7 +30,15 @@ export interface SubagentDef {
   description: string;
   /** The system turn the sub-agent runs under. The isolation suffix is appended by the loop. */
   systemPrompt: string;
-  /** Optional allowlist of tool names. Absent/empty = the built-in read-only set. */
+  /**
+   * Optional allowlist of **read-effect** tool names — the loop applies it as a filter over whatever
+   * the run grants, so it can only narrow.
+   *
+   * `absent` = the run's whole granted set (the read-only tools, plus writes when the user has
+   * enabled sub-agent writes). `[]` = **no tools at all**: an explicitly empty allowlist is a
+   * narrowing like any other, and reading it as "unset" would hand a write-capable child every tool
+   * the moment scope was narrowed to nothing.
+   */
   tools?: string[];
   /** Optional model override (`provider/model`), else the parent's model. */
   model?: string | null;

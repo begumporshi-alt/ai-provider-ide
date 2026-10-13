@@ -74,6 +74,10 @@ describe("AGENT_TOOLS", () => {
       "dispatch_agent",
       "enter_plan_mode",
       "exit_plan_mode",
+      // Read-only, like `dispatch_agent`: it delegates, and whatever a child writes is gated by the
+      // parent's approval rather than by this call. A `mutate` effect here would ask the user to
+      // approve "run twelve sub-agents" and then ask again, per write, inside each of them.
+      "fan_out",
       "file_info",
       "glob",
       "list_dir",

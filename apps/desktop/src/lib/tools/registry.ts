@@ -18,6 +18,18 @@
  */
 import type { ToolEffect, ToolSpec } from "./types";
 
+/**
+ * How many items one `fan_out` call may carry.
+ *
+ * A **fan-out is not free**: every item is a full sub-agent run with its own step budget, so the
+ * caller's spend is roughly the item count times one child. The cap is what keeps one model call from
+ * committing to an unbounded number of runs, and the concurrency cap then decides how many of them
+ * are actually in flight at once — a batch bigger than the cap still works, it just executes in waves.
+ * The number is deliberately modest and declared here beside the tool's schema, where the model reads
+ * it, rather than only enforced in the loop.
+ */
+export const FAN_OUT_MAX = 12;
+
 export const AGENT_TOOLS: ToolSpec[] = [
   {
     name: "read_file",
@@ -463,6 +475,42 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "fan_out",
+    effect: "read",
+    description:
+      "Run several independent delegated tasks at once and get one STRUCTURED result per task. Use it when the work is a set of similar, independent items — survey these twelve files, check these eight endpoints, read these six specs — where one `dispatch_agent` per round would serialise work that can run in parallel. Each task gets its own fresh context and its own summary, and the results come back as JSON, one object per task, so items can be compared and acted on individually. Use `dispatch_agent` instead when ONE survey needs several rounds of its own; use this when the items do not depend on each other. Each task is a full sub-agent run, so N tasks cost roughly N times one — and they still run under the same concurrency cap, so a batch larger than the cap simply executes in waves.",
+    parameters: {
+      properties: {
+        tasks: {
+          type: "array",
+          description: `The tasks, at most ${FAN_OUT_MAX}. Each entry is one delegated run.`,
+          items: {
+            type: "object",
+            properties: {
+              label: {
+                type: "string",
+                description:
+                  "Short name for this item, echoed back in its result so you can tell which is which. Defaults to its position (task-1, task-2…).",
+              },
+              task: {
+                type: "string",
+                description:
+                  "The complete task for this item, self-contained: the sub-agent sees nothing else of this conversation.",
+              },
+              agent: {
+                type: "string",
+                description:
+                  "Optional: the specialist to run this item, by id. Omit for the general researcher. An unknown id fails THIS item only, naming the valid ids.",
+              },
+            },
+            required: ["task"],
+          },
+        },
+      },
+      required: ["tasks"],
+    },
+  },
+  {
     name: "load_skill",
     effect: "read",
     description:
@@ -526,44 +574,95 @@ export const AGENT_TOOLS: ToolSpec[] = [
 ];
 
 /**
- * The registry a `dispatch_agent` sub-agent runs with: the read-effect tools only, minus four.
- * `dispatch_agent` itself is excluded — a sub-agent that could spawn sub-agents is recursion
- * with no bound — and `todo_write` is excluded because the sub-agent's transcript is discarded,
- * so a task list it writes would be a lie the model told itself. The plan-mode pair is excluded
- * because the mode belongs to the session, not to a child whose transcript nobody sees: a
- * sub-agent that could enter plan mode would gate the parent's writes, and one that could exit it
- * would silently open them.
+ * Tools a `dispatch_agent` sub-agent may never have, at any privilege level.
+ *
+ * `dispatch_agent` itself is excluded because a sub-agent that could spawn sub-agents is recursion
+ * with no bound. `todo_write` is excluded because the sub-agent's transcript is discarded, so a
+ * task list it writes would be a lie the model told itself. The plan-mode pair is excluded because
+ * the mode belongs to the session, not to a child whose transcript nobody sees: a sub-agent that
+ * could enter plan mode would gate the parent's writes, one that could exit it would silently open
+ * them, and a child cannot be the thing that approves the plan the parent is executing.
+ */
+const SUBAGENT_NEVER = new Set([
+  "dispatch_agent",
+  "fan_out",
+  "todo_write",
+  "enter_plan_mode",
+  "exit_plan_mode",
+]);
+
+/**
+ * The registry a `dispatch_agent` sub-agent runs with by default: the read-effect tools only.
+ *
+ * This is the shipped posture, and it is what every call site gets unless the user has turned
+ * sub-agent writes on — see [`subagentTools`].
  */
 export const SUBAGENT_TOOLS: ToolSpec[] = AGENT_TOOLS.filter(
-  (t) =>
-    t.effect === "read" &&
-    t.name !== "dispatch_agent" &&
-    t.name !== "todo_write" &&
-    t.name !== "enter_plan_mode" &&
-    t.name !== "exit_plan_mode",
+  (t) => t.effect === "read" && !SUBAGENT_NEVER.has(t.name),
 );
 
 /**
- * The parent registry with `dispatch_agent`'s description carrying the enabled specialists, so
- * the model can route a task to one deliberately instead of guessing ids. Cloned, never
- * mutated: `AGENT_TOOLS` is a shared const, and the specialist list is per-run state.
+ * The registry a sub-agent runs with when the user has enabled sub-agent writes: everything except
+ * [`SUBAGENT_NEVER`] — writes, edits and commands are available; recursion, self-narration and plan
+ * mode are not.
  */
-export function withSubagentDefs(defs: { id: string; name: string; description: string }[]): ToolSpec[] {
-  if (defs.length === 0) return AGENT_TOOLS;
-  const list = defs
-    .map((d) => `- ${d.id} (${d.name}): ${d.description}`)
-    .join("\n");
-  return AGENT_TOOLS.map((t) =>
-    t.name !== "dispatch_agent"
-      ? t
-      : {
-          ...t,
-          description:
-            t.description +
-            "\n\nAvailable specialist sub-agents (pass one as \"agent\"; omit for the general researcher):\n" +
-            list,
-        },
-  );
+export const SUBAGENT_WRITE_TOOLS: ToolSpec[] = AGENT_TOOLS.filter((t) => !SUBAGENT_NEVER.has(t.name));
+
+/**
+ * Which set a sub-agent gets.
+ *
+ * **The user's setting is the only thing that can widen this.** That is worth stating plainly,
+ * because it is one line away from being broken: a `SubagentDef.tools` list is applied by the loop
+ * as a **filter over the granted set**, so a definition can only ever narrow — a definition naming
+ * `write_file` while sub-agent writes are off gets nothing, not a permission. Nothing in a
+ * definition file, and nothing a model can say, reaches [`SUBAGENT_WRITE_TOOLS`] on its own.
+ */
+export function subagentTools(canWrite: boolean): ToolSpec[] {
+  return canWrite ? SUBAGENT_WRITE_TOOLS : SUBAGENT_TOOLS;
+}
+
+/**
+ * The `dispatch_agent` description as shipped — the read-only one — read out of the registry rather
+ * than repeated here, so the read-only path keeps exactly one copy of that text.
+ */
+const DISPATCH_READ_ONLY_DESCRIPTION =
+  AGENT_TOOLS.find((t) => t.name === "dispatch_agent")?.description ?? "";
+
+/**
+ * The same description when sub-agent writes are on.
+ *
+ * It has to change with the setting and not merely alongside it: the read-only text says outright
+ * that the sub-agent "cannot modify the workspace", so a model running with writes enabled would be
+ * told its own capability does not exist — and would spend the delegation asking the parent to make
+ * the change instead. The approval-gate sentence is the load-bearing half: it is what makes a
+ * write-capable child a delegation rather than a permission bypass.
+ */
+const DISPATCH_WRITE_DESCRIPTION =
+  "Delegate one self-contained task to a sub-agent that works in its own fresh context with the " +
+  "FULL tool set — file writes, edits and commands included — and returns ONLY a final summary. " +
+  "Use it when a survey, or a self-contained piece of work, would flood this conversation with " +
+  "intermediate results. The sub-agent sees nothing of this conversation; it works in the same " +
+  "workspace you do, and every mutation it attempts passes through YOUR approval gate — a denial " +
+  "reaches it as a refusal, never as a silent success. The task text must carry everything it needs.";
+
+/**
+ * The parent registry with `dispatch_agent`'s description carrying the enabled specialists and the
+ * privilege level the child will actually run at, so the model can route a task deliberately
+ * instead of guessing ids. Cloned, never mutated: `AGENT_TOOLS` is a shared const, and both the
+ * specialist list and the write setting are per-run state.
+ */
+export function withSubagentDefs(
+  defs: { id: string; name: string; description: string }[],
+  opts: { canWrite?: boolean } = {},
+): ToolSpec[] {
+  const list = defs.map((d) => `- ${d.id} (${d.name}): ${d.description}`).join("\n");
+  const description =
+    (opts.canWrite === true ? DISPATCH_WRITE_DESCRIPTION : DISPATCH_READ_ONLY_DESCRIPTION) +
+    (list
+      ? "\n\nAvailable specialist sub-agents (pass one as \"agent\"; omit for the general researcher):\n" +
+        list
+      : "");
+  return AGENT_TOOLS.map((t) => (t.name === "dispatch_agent" ? { ...t, description } : t));
 }
 
 /** Render the OpenAI `tools` array from a registry. Empty registry yields undefined so the

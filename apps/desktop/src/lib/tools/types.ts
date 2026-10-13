@@ -243,6 +243,23 @@ export interface AgentLoopOptions {
    */
   subagentMaxIterations?: number;
   /**
+   * Whether a `dispatch_agent` child may modify the workspace. **Absent means read-only**, which is
+   * the shipped posture and the safe reading of an option nobody set.
+   *
+   * This is the user's decision and the only thing that widens a child's tool set: a specialist
+   * definition's `tools` list is applied as a filter *over* whatever this grants, so a definition —
+   * or a model — can never reach the write tools on its own. A write-capable child inherits the
+   * parent's `confirm` gate, so its mutations ask exactly as the parent's would.
+   */
+  subagentCanWrite?: boolean;
+  /**
+   * Characters of a child's summary that reach the parent transcript. Defaults to
+   * `SUBAGENT_RESULT_CAP` (4000); clamped to `[SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX]`
+   * by `resolveSubagentResultCap`, because a child's whole survey landing in the parent's context is
+   * the one thing delegation exists to prevent.
+   */
+  subagentSummaryCap?: number;
+  /**
    * The enabled user-authored specialists `dispatch_agent` may pick from (parsed by
    * `lib/agents/defs.ts`). Absent — tests, the gateway bridge — the tool dispatches the
    * built-in researcher exactly as before. A type-only import: the defs module pulls the

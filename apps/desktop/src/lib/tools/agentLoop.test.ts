@@ -10,9 +10,11 @@ import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
   SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult,
   FINAL_ROUND_NOTE,
+  resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
 } from "./agentLoop";
-import { AGENT_TOOLS } from "./registry";
+import { AGENT_TOOLS, FAN_OUT_MAX } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
+import type { SubagentDef } from "../agents/defs";
 import type { ChatMessage, TextRequest, TextStream, ToolCall } from "@aiprovider/router-core";
 
 function streamOf(...chunks: string[]): TextStream {
@@ -39,6 +41,58 @@ function fakeModel(
     else if (step.finish !== undefined) req.onFinish?.(step.finish);
     return streamOf(step.text);
   };
+}
+
+/** A minimal specialist definition, for the tests that exercise narrowing. */
+function def(over: Partial<SubagentDef> = {}): SubagentDef {
+  return {
+    id: "specialist",
+    name: "Specialist",
+    description: "a specialist",
+    systemPrompt: "you are a specialist",
+    enabled: true,
+    ...over,
+  };
+}
+
+/**
+ * The tool names a `dispatch_agent` child is actually offered.
+ *
+ * Runs one delegation — the parent asks, the child answers, the parent concludes — and reads the
+ * **child's** model call (index 1), which is where the granted set is decided. An empty registry
+ * reaches the wire as no `tools` field at all, so it reads back as `[]` rather than as "everything".
+ */
+async function childToolsFor(opts: {
+  subagentCanWrite?: boolean;
+  subagentDefs?: SubagentDef[];
+  args?: string;
+}): Promise<string[]> {
+  const seen: (unknown[] | undefined)[] = [];
+  const model = fakeModel([
+    {
+      text: "delegating",
+      calls: [{ id: "c1", name: "dispatch_agent", arguments: opts.args ?? '{"task":"t"}' }],
+    },
+    { text: "CHILD ANSWER" },
+    { text: "final" },
+  ]);
+  const capturing: GenerateFn = async (req) => {
+    seen.push(req.tools as unknown[] | undefined);
+    return model(req);
+  };
+  await runAgentLoop({
+    model: "m",
+    messages: [{ role: "user", content: "go" }],
+    registry: AGENT_TOOLS,
+    generate: capturing,
+    host: { async run() { return { ok: true, output: "read" }; } },
+    ...(opts.subagentCanWrite === undefined ? {} : { subagentCanWrite: opts.subagentCanWrite }),
+    ...(opts.subagentDefs ? { subagentDefs: opts.subagentDefs } : {}),
+  });
+  const child = seen[1];
+  return Array.isArray(child)
+    ? (child as Array<{ function: { name: string } }>).map((t) => t.function.name)
+    : [];
 }
 
 describe("runAgentLoop", () => {
@@ -285,6 +339,100 @@ describe("runAgentLoop", () => {
     expect(subTools, "no mutation in a sub-agent").not.toContain("write_file");
     expect(subTools, "no run_command in a sub-agent").not.toContain("run_command");
     expect(subTools, "a sub-agent cannot spawn sub-agents").not.toContain("dispatch_agent");
+  });
+
+  // --- sub-agent privilege (2026-10-13) ---
+  //
+  // The property is not "writes can be turned on" but "nothing but the user's setting turns them
+  // on": the default, the definition filter, and the never-list are each tested on their own,
+  // because a single passing test over the enabled path would not distinguish them.
+
+  it("a sub-agent is read-only unless the user enabled writes", async () => {
+    const seen = await childToolsFor({});
+    expect(seen).toContain("read_file");
+    expect(seen, "no mutation by default").not.toContain("write_file");
+    expect(seen, "no commands by default").not.toContain("run_command");
+  });
+
+  it("sub-agent writes, once enabled, reach the mutation and command tools", async () => {
+    const seen = await childToolsFor({ subagentCanWrite: true });
+    expect(seen).toContain("write_file");
+    expect(seen).toContain("edit_file");
+    expect(seen).toContain("run_command");
+  });
+
+  it("neither privilege level lets a child recurse, narrate, or touch plan mode", async () => {
+    for (const canWrite of [false, true]) {
+      const seen = await childToolsFor({ subagentCanWrite: canWrite });
+      for (const banned of ["dispatch_agent", "todo_write", "enter_plan_mode", "exit_plan_mode"]) {
+        expect(seen, `${banned} must be absent (canWrite=${canWrite})`).not.toContain(banned);
+      }
+    }
+  });
+
+  it("a specialist's tool list narrows the granted set and can never widen it", async () => {
+    // Writes ON, definition naming one tool: the child gets exactly that. The definition is a
+    // filter, not a grant.
+    const narrowed = await childToolsFor({
+      subagentCanWrite: true,
+      subagentDefs: [def({ tools: ["write_file"] })],
+      args: '{"task":"t","agent":"specialist"}',
+    });
+    expect(narrowed).toEqual(["write_file"]);
+
+    // Writes OFF, definition naming a write tool: nothing at all. This is the invariant stated
+    // where the registry is built — a definition cannot reach past the user's grant.
+    const denied = await childToolsFor({
+      subagentDefs: [def({ tools: ["write_file"] })],
+      args: '{"task":"t","agent":"specialist"}',
+    });
+    expect(denied).toEqual([]);
+  });
+
+  it("an empty specialist allowlist narrows to no tools instead of granting everything", async () => {
+    // `.length` read an empty list as "unset" and handed the child the whole set — which, once
+    // writes were enabled, was the difference between no access and full access.
+    const seen = await childToolsFor({
+      subagentCanWrite: true,
+      subagentDefs: [def({ tools: [] })],
+      args: '{"task":"t","agent":"specialist"}',
+    });
+    expect(seen).toEqual([]);
+  });
+
+  it("a configured summary cap truncates the child's summary and says what it did", async () => {
+    const long = "x".repeat(900);
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: long },
+      { text: "final" },
+    ]);
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      subagentSummaryCap: 600,
+    });
+    const toolResult = out.messages.find((m) => m.role === "tool");
+    // The summary is text, and the assertion says so rather than casting: `content` is
+    // `string | ContentPart[]`, and "it passed at runtime" is not a type.
+    expect(typeof toolResult?.content).toBe("string");
+    const text = typeof toolResult?.content === "string" ? toolResult.content : "";
+    expect(text.startsWith("x".repeat(600))).toBe(true);
+    expect(text).toContain("summary truncated at 600 characters");
+    expect(text.length).toBeLessThan(long.length);
+  });
+
+  it("the summary cap is clamped into its bounds, and a nonsense value falls back", () => {
+    expect(resolveSubagentResultCap(undefined)).toBe(SUBAGENT_RESULT_CAP);
+    expect(resolveSubagentResultCap(Number.NaN)).toBe(SUBAGENT_RESULT_CAP);
+    expect(resolveSubagentResultCap(10)).toBe(SUBAGENT_RESULT_CAP_MIN);
+    expect(resolveSubagentResultCap(999_999)).toBe(SUBAGENT_RESULT_CAP_MAX);
+    // Floored, not rounded: a cap is a ceiling, and rounding up would keep one character more than
+    // the number the user typed.
+    expect(resolveSubagentResultCap(2500.7)).toBe(2500);
   });
 
   it("records a delegation as a child run under the parent's run id", async () => {
@@ -2026,5 +2174,204 @@ describe("the gateway's tool-step ceiling has one source", () => {
     ].map((m) => Number(m[1]));
     expect(declared).toHaveLength(1);
     expect(declared[0]).toBe(DEFAULT_MAX_ITERATIONS);
+  });
+});
+
+/**
+ * `fan_out` — several independent children in one round, one structured result each.
+ *
+ * The properties worth pinning are the ones that make it different from calling `dispatch_agent`
+ * several times, plus the ones the *shared* child machinery has to keep true now that two tools reach
+ * it:
+ *
+ *  - the result is JSON keyed by the caller's own label, so items can be compared one by one;
+ *  - a bad ITEM fails that item only — the other children ran to completion and their results are
+ *    not the caller's mistake;
+ *  - the cap is enforced before any child starts, because each item is a full sub-agent run;
+ *  - a fan-out child has **the same** granted tool set and the same exclusions as a dispatched one,
+ *    which is the property the shared `runChild` exists to guarantee.
+ */
+describe("fan_out", () => {
+  /** A model that asks for `fan_out` once, echoes its own task as a child, then concludes. */
+  function fanOutModel(callArgs: string): GenerateFn {
+    let step = 0;
+    return async (req) => {
+      step += 1;
+      if (step === 1) {
+        req.onToolCall?.({ id: "c1", name: "fan_out", arguments: callArgs });
+        return streamOf("");
+      }
+      const last = req.messages[req.messages.length - 1] as { role?: string; content?: unknown };
+      // A child's only message is its task, so an echo proves which task produced which summary —
+      // and does it without depending on the order two concurrent children happen to interleave in.
+      if (last?.role === "user" && typeof last.content === "string") {
+        return streamOf(`echo:${last.content}`);
+      }
+      return streamOf("final");
+    };
+  }
+
+  /** The structured payload of the tool result: the header line, then the JSON. */
+  function payloadOf(messages: ChatMessage[]): { tasks: Array<Record<string, unknown>> } {
+    const tool = messages.find((m) => m.role === "tool");
+    expect(tool, "the fan-out produced a tool result").toBeTruthy();
+    const content = typeof tool!.content === "string" ? tool!.content : "";
+    const json = content.slice(content.indexOf("\n\n") + 2);
+    return JSON.parse(json) as { tasks: Array<Record<string, unknown>> };
+  }
+
+  it("returns one structured result per task, paired with its own label", async () => {
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: fanOutModel(
+        JSON.stringify({
+          tasks: [
+            { label: "a", task: "read A" },
+            { label: "b", task: "read B" },
+          ],
+        }),
+      ),
+      host: { async run() { return { ok: true, output: "x" }; } },
+    });
+
+    const { tasks } = payloadOf(out.messages);
+    expect(tasks).toHaveLength(2);
+    // Order-preserving and paired: the label came from the caller, the summary from THAT child.
+    expect(tasks.map((t) => [t.label, t.summary])).toEqual([
+      ["a", "echo:read A"],
+      ["b", "echo:read B"],
+    ]);
+    expect(tasks[0]!.ok).toBe(true);
+    expect(tasks[0]!.iterations).toBe(1);
+    expect(tasks[0]).toHaveProperty("tokensIn");
+  });
+
+  it("defaults a missing label to the item's position", async () => {
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: fanOutModel(JSON.stringify({ tasks: [{ task: "read A" }, { task: "read B" }] })),
+      host: { async run() { return { ok: true, output: "x" }; } },
+    });
+    expect(payloadOf(out.messages).tasks.map((t) => t.label)).toEqual(["task-1", "task-2"]);
+  });
+
+  it("fails only the item whose specialist does not exist, and names the ones that do", async () => {
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: fanOutModel(
+        JSON.stringify({
+          tasks: [
+            { label: "fine", task: "read A" },
+            { label: "bad", task: "read B", agent: "nope" },
+          ],
+        }),
+      ),
+      host: { async run() { return { ok: true, output: "x" }; } },
+      subagentDefs: [def({ id: "locator", name: "Locator", description: "finds things" })],
+    });
+
+    const { tasks } = payloadOf(out.messages);
+    expect(tasks[0]).toMatchObject({ label: "fine", ok: true, summary: "echo:read A" });
+    // The good item still ran: a batch is not failed by one malformed entry.
+    expect(tasks[1]).toMatchObject({ label: "bad", ok: false });
+    expect(String(tasks[1]!.error)).toContain('no sub-agent named "nope"');
+    expect(String(tasks[1]!.error), "the error names what is available").toContain("locator");
+  });
+
+  it("refuses more tasks than the cap, before any child starts", async () => {
+    let generateCalls = 0;
+    const inner = fanOutModel(
+      JSON.stringify({ tasks: Array.from({ length: FAN_OUT_MAX + 1 }, (_, i) => ({ task: `t${i}` })) }),
+    );
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: async (req, o) => {
+        generateCalls += 1;
+        return inner(req, o);
+      },
+      host: { async run() { return { ok: true, output: "x" }; } },
+    });
+
+    const tool = out.messages.find((m) => m.role === "tool");
+    expect(String(tool?.content)).toContain(`at most ${FAN_OUT_MAX} tasks`);
+    // Two calls: the parent's request, and its turn after the refusal. No child ever ran.
+    expect(generateCalls).toBe(2);
+  });
+
+  it("refuses an empty list, pointing at the tool for a single task", async () => {
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: fanOutModel(JSON.stringify({ tasks: [] })),
+      host: { async run() { return { ok: true, output: "x" }; } },
+    });
+    expect(String(out.messages.find((m) => m.role === "tool")?.content)).toContain(
+      "`dispatch_agent` for a single task",
+    );
+  });
+
+  /**
+   * The property the shared `runChild` exists for: a fan-out child is granted exactly what a
+   * dispatched one is — the user's `subagentCanWrite` decision, narrowed by the definition, and
+   * never the delegation tools themselves.
+   */
+  it("gives a fan-out child the same granted set, and never the delegation tools", async () => {
+    async function childToolsFor(canWrite: boolean): Promise<string[][]> {
+      // A child's request is the only one whose last message is the user turn *after* the first
+      // call, so this captures children and not the parent's own two calls.
+      const seen: { tools: unknown[] | undefined; isChild: boolean }[] = [];
+      let calls = 0;
+      const inner = fanOutModel(
+        JSON.stringify({ tasks: [{ task: "read A" }, { task: "read B" }] }),
+      );
+      await runAgentLoop({
+        model: "m",
+        messages: [{ role: "user", content: "go" }],
+        registry: AGENT_TOOLS,
+        generate: async (req, o) => {
+          calls += 1;
+          const last = req.messages[req.messages.length - 1] as { role?: string };
+          seen.push({
+            tools: (req as { tools?: unknown }).tools as unknown[] | undefined,
+            isChild: calls > 1 && last?.role === "user",
+          });
+          return inner(req, o);
+        },
+        host: { async run() { return { ok: true, output: "x" }; } },
+        subagentCanWrite: canWrite,
+      });
+      return seen
+        .filter((s) => s.isChild)
+        .map((s) =>
+          Array.isArray(s.tools)
+            ? (s.tools as Array<{ function: { name: string } }>).map((t) => t.function.name)
+            : [],
+        );
+    }
+
+    const readOnly = await childToolsFor(false);
+    expect(readOnly).toHaveLength(2);
+    for (const tools of readOnly) {
+      expect(tools).toContain("read_file");
+      expect(tools, "no mutation unless the user enabled it").not.toContain("write_file");
+    }
+
+    const writing = await childToolsFor(true);
+    for (const tools of writing) {
+      expect(tools).toContain("write_file");
+      // A child that could delegate is recursion with no bound, and `fan_out` is the newest route
+      // to it — hence its place in the exclusion set rather than only in the description.
+      expect(tools).not.toContain("fan_out");
+      expect(tools).not.toContain("dispatch_agent");
+    }
   });
 });

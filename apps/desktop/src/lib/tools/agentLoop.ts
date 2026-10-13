@@ -22,7 +22,7 @@
  * caller can persist it and feed it back next turn without duplicating the system prompt).
  */
 import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
-import { registryToOpenAI, SUBAGENT_TOOLS } from "./registry";
+import { FAN_OUT_MAX, registryToOpenAI, subagentTools } from "./registry";
 import { runNotebookEdit, runNotebookRead } from "./notebook";
 import { toWireToolCalls } from "./wire";
 import type { AgentEvent, AgentLoopOptions, PlanPorts, ToolHost } from "./types";
@@ -169,6 +169,20 @@ export const SUBAGENT_CONCURRENCY = 3;
  *  is context isolation; a summary the size of the survey it replaced would undo it. */
 export const SUBAGENT_RESULT_CAP = 4000;
 
+/** The largest summary cap a setting may ask for, and the smallest that still carries a finding.
+ *  Raised caps are a real trade — a child's whole survey can land in the parent's context — so the
+ *  ceiling is explicit rather than whatever the field happens to contain. */
+export const SUBAGENT_RESULT_CAP_MAX = 16_000;
+export const SUBAGENT_RESULT_CAP_MIN = 500;
+
+/** A configured summary cap, clamped. Absent, non-finite or non-numeric means the default; the
+ *  clamp runs on the number, never on a pre-parsed string (`Number("")` is `0`, which would floor
+ *  every summary to nothing). */
+export function resolveSubagentResultCap(configured?: number): number {
+  if (typeof configured !== "number" || !Number.isFinite(configured)) return SUBAGENT_RESULT_CAP;
+  return Math.min(Math.max(Math.floor(configured), SUBAGENT_RESULT_CAP_MIN), SUBAGENT_RESULT_CAP_MAX);
+}
+
 /**
  * The protocol every sub-agent runs under, appended to its role prompt (its own definition's
  * `systemPrompt`, or `SUBAGENT_SYSTEM` below).
@@ -197,6 +211,28 @@ const SUBAGENT_PROTOCOL =
 const SUBAGENT_SYSTEM =
   "You are a research sub-agent spawned by a main agent. You have the read-only tools only — " +
   "you cannot modify the workspace. " + SUBAGENT_PROTOCOL;
+
+/**
+ * The same role prompt when the user has enabled sub-agent writes.
+ *
+ * It states the gate explicitly, because the child cannot see the parent's approval UI and would
+ * otherwise read a refusal as its own failure — or worse, keep retrying it. The change set is
+ * mentioned for the same reason: a child's writes are the *parent run's* writes, so they are
+ * revertible together.
+ */
+const SUBAGENT_SYSTEM_WRITE =
+  "You are a task sub-agent spawned by a main agent. You have the full tool set, including file " +
+  "writes, edits and commands, and you work in the same workspace the main agent does. Every " +
+  "mutation you attempt passes through the main agent's approval gate: a refusal comes back to you " +
+  "as a refusal, and the right response is to report it, not to retry it. Your changes belong to " +
+  "the main agent's run and are reverted with it. " + SUBAGENT_PROTOCOL;
+
+/** Appended to a specialist's own prompt when sub-agent writes are on, so a definition does not have
+ *  to know about the setting to behave correctly under it. */
+const SUBAGENT_WRITE_NOTE =
+  "\n\nSub-agent writes are enabled for this run: you may modify the workspace, and each mutation " +
+  "passes through the main agent's approval gate. A refusal is reported back to you as a refusal — " +
+  "report it in your summary rather than retrying it.";
 
 /**
  * How long a sub-agent may go **without a single event** before it is treated as hung and
@@ -448,8 +484,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     subagentRecorder,
     subagentMaxIterations,
     subagentDefs,
+    subagentCanWrite = false,
+    subagentSummaryCap,
     subagentInactivityTimeoutMs = SUBAGENT_INACTIVITY_TIMEOUT_MS,
   } = opts;
+
+  // Resolved once per run: the cap is a property of this loop, and re-reading the option at each
+  // truncation would let a caller change it mid-run into a transcript half of one size.
+  const summaryCap = resolveSubagentResultCap(subagentSummaryCap);
 
   // Conversation only — the system turn is prepended at each model call, never stored here.
   const messages: ChatMessage[] = [...opts.messages];
@@ -699,6 +741,208 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         },
       };
     })();
+    /**
+     * Run one delegated child to completion, and return what the parent model reads.
+     *
+     * **One implementation, two callers.** `dispatch_agent` runs one child; `fan_out` runs many.
+     * The rules that must not drift between them live here rather than in each caller: the granted
+     * tool set (the user's setting) with the definition narrowing it, the child's system prompt, its
+     * step budget and hard backstop, the parent's approval gate riding along, one ledger row per
+     * child, and the inactivity watchdog. A second copy is how a fan-out child ends up at a
+     * different privilege level from a dispatched one.
+     */
+    async function runChild(
+      task: string,
+      def: import("../agents/defs").SubagentDef | undefined,
+    ): Promise<{
+      resultText: string;
+      ok: boolean;
+      iterations: number;
+      tokensIn: number;
+      tokensOut: number;
+    }> {
+      let resultText = "";
+      let ok = false;
+      let iterations = 0;
+      let childIn = 0;
+      let childOut = 0;
+        // The delegation is a real run, not just a function call: with a recorder on
+        // board the child gets its own ledger row under this run's id, one tool_call
+        // step per sandbox call it makes, one tool_result step per call that came back
+        // (denials included — see `childOnEvent`), and an honest ending — "stopped"
+        // when it ran out of budget, "error" when it threw. Recording wraps the child's
+        // host and filters its events; the child loop itself stays oblivious.
+        // The specialist's overrides, resolved once: its own prompt (the isolation half
+        // stays the loop's — it is what makes delegation isolation, not a suggestion),
+        // a narrowed tool allowlist, an optional model, and its own step budget. A
+        // definition can only narrow: its allowlist is intersected with the read-effect
+        // set at parse time, so a custom agent is never a permission upgrade.
+        const childModel = def?.model || model;
+        // The granted set is the **user's** setting; a definition only ever narrows it.
+        // An empty `tools` list narrows to nothing rather than falling back to everything:
+        // `.length` read an empty allowlist as "unset", which quietly handed a
+        // write-capable child every tool the moment writes were switched on.
+        const granted = subagentTools(subagentCanWrite);
+        const childRegistry = Array.isArray(def?.tools)
+          ? granted.filter((t) => def.tools!.includes(t.name))
+          : granted;
+        const childSystem = def
+          ? `${def.systemPrompt}\n\n${SUBAGENT_PROTOCOL}${subagentCanWrite ? SUBAGENT_WRITE_NOTE : ""}`
+          : subagentCanWrite
+            ? SUBAGENT_SYSTEM_WRITE
+            : SUBAGENT_SYSTEM;
+        // Three sources, in priority order: the specialist's own budget, the user's
+        // global one (Router Settings → defaults), then the loop's default — which is
+        // **no ceiling**. The backstop is a ceiling on **every** path (`Math.min`), not
+        // only on the `null` default: it is documented as unconditional, and while it was
+        // an either/or, a typo of `5000` in Router Settings produced a 5000-round child
+        // that nothing could bound — the specialist path clamps to 50 and this one did not
+        // (audit 2026-10-09).
+        const requestedBudget = def?.maxIterations ?? subagentMaxIterations ?? SUBAGENT_MAX_ITERATIONS;
+        const childBudget =
+          requestedBudget === null ? SUBAGENT_HARD_BACKSTOP : Math.min(requestedBudget, SUBAGENT_HARD_BACKSTOP);
+        const recorder = subagentRecorder;
+        const childRunId = recorder ? recorder.newRunId() : null;
+        if (recorder && childRunId) {
+          try {
+            recorder.startRun({
+              runId: childRunId,
+              parentRunId: runId ?? null,
+              model: childModel,
+              prompt: task,
+            });
+          } catch {
+            /* a lost record must not become a lost run */
+          }
+        }
+        const childHost: ToolHost =
+          recorder && childRunId
+            ? {
+                run: (n, a, o) => {
+                  recorder.recordStep(childRunId, "tool_call", n);
+                  return host.run(n, a, o);
+                },
+              }
+            : host;
+        // The result half of the child's ledger. The child's events are still not
+        // forwarded to the UI — isolation is the point of delegating — but a filtered
+        // half lands in the ledger, because a steps list that shows what a sub-agent
+        // *called* without what came back answers "what is it doing" with half a
+        // sentence. Denied/refused calls are named `denied` here by the same regex the
+        // parent's own recorder applies to its results (agent-turn.ts), so both ledgers
+        // mean the same thing by the word.
+        const childOnEvent: ((ev: AgentEvent) => void) | undefined =
+          recorder && childRunId
+            ? (ev) => {
+                if (ev.type !== "tool_result") return;
+                const name = ev.call.name ?? "(unknown)";
+                const denied = /denied|refused/i.test(ev.result);
+                recorder.recordStep(
+                  childRunId,
+                  denied ? "denied" : "tool_result",
+                  name,
+                  ev.result.slice(0, 500),
+                  ev.ok,
+                );
+              }
+            : undefined;
+        // The watchdog: a child that produces no event for `SUBAGENT_INACTIVITY_TIMEOUT_MS`
+        // is wedged, not working, and is aborted. It covers the case a step ceiling
+        // cannot see — a provider stream that never ends, where no round is ever
+        // completed and therefore no iteration is ever counted. Armed from the start,
+        // reset on every child event.
+        // The child's own spend, summed over its round-trips — the number ZCode reports
+        // as `totalTokens` and the one our ledger could not answer before.
+        const watchdog = new AbortController();
+        let lastActivity = Date.now();
+        let watchdogFired = false;
+        const onParentAbort = () => watchdog.abort();
+        signal?.addEventListener("abort", onParentAbort, { once: true });
+        const pollMs = Math.max(10, Math.min(30_000, Math.floor(subagentInactivityTimeoutMs / 4)));
+        const timer = setInterval(() => {
+          if (Date.now() - lastActivity < subagentInactivityTimeoutMs) return;
+          watchdogFired = true;
+          watchdog.abort();
+        }, pollMs);
+        const childOnEventWatched = (ev: AgentEvent) => {
+          lastActivity = Date.now();
+          childOnEvent?.(ev);
+        };
+        try {
+          // Queue behind the concurrency cap *before* the child starts, and release in
+          // the `finally` so a throw cannot strand a permit and deadlock later children.
+          await childPermits.take();
+          let sub: Awaited<ReturnType<typeof runAgentLoop>>;
+          try {
+            sub = await runAgentLoop({
+              model: childModel,
+              messages: [{ role: "user", content: task }],
+              system: childSystem,
+              registry: childRegistry,
+              generate,
+              host: childHost,
+              confirm,
+              loadSkill,
+              runId: childRunId ?? undefined,
+              subagentRecorder: recorder,
+              maxIterations: childBudget,
+              onEvent: childOnEventWatched,
+              onUsage: (u) => {
+                childIn += u.prompt_tokens ?? 0;
+                childOut += u.completion_tokens ?? 0;
+              },
+              signal: watchdog.signal,
+            });
+          } finally {
+            childPermits.release();
+            clearInterval(timer);
+            signal?.removeEventListener("abort", onParentAbort);
+          }
+        iterations = sub.iterations;
+          const summary = sub.text.trim();
+          const capped =
+            summary.length > summaryCap
+              ? summary.slice(0, summaryCap) +
+                `\n\n(summary truncated at ${summaryCap} characters)`
+              : summary || "(the sub-agent returned an empty summary)";
+          resultText = sub.hitCeiling
+            ? "The sub-agent hit its step budget with work possibly unfinished.\n\n" + capped
+            : capped;
+          ok = true;
+          if (recorder && childRunId) {
+            recorder.endRun(
+              childRunId,
+              sub.hitCeiling ? "stopped" : "ok",
+              sub.iterations,
+              undefined,
+              childIn,
+              childOut,
+            );
+          }
+        } catch (e) {
+          // A watchdog abort and a user Stop both arrive as AbortError; only the clock
+          // knows which one this was, and the model must be told the right story — one
+          // is "your sub-agent hung", the other is "the human stopped you".
+          resultText = watchdogFired
+            ? `The sub-agent made no progress for ${Math.round(subagentInactivityTimeoutMs / 60_000)} ` +
+              "minutes and was stopped — it was wedged on a request that never returned. " +
+              "Retry the task, or narrow it."
+            : `Sub-agent failed: ${e instanceof Error ? e.message : String(e)}`;
+          ok = false;
+          if (recorder && childRunId) {
+            recorder.endRun(
+              childRunId,
+              "error",
+              0,
+              e instanceof Error ? e.message : String(e),
+              childIn,
+              childOut,
+            );
+          }
+        }
+      return { resultText, ok, iterations, tokensIn: childIn, tokensOut: childOut };
+    }
+
     const executed: { name: string; resultText: string; ok: boolean }[] = await Promise.all(
       parsed.map(async ({ call, args }, i) => {
         const name = call.name ?? "(unknown)";
@@ -744,171 +988,83 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                   'Omit "agent" for the general researcher.';
                 ok = false;
               } else {
-                // The delegation is a real run, not just a function call: with a recorder on
-                // board the child gets its own ledger row under this run's id, one tool_call
-                // step per sandbox call it makes, one tool_result step per call that came back
-                // (denials included — see `childOnEvent`), and an honest ending — "stopped"
-                // when it ran out of budget, "error" when it threw. Recording wraps the child's
-                // host and filters its events; the child loop itself stays oblivious.
-                // The specialist's overrides, resolved once: its own prompt (the isolation half
-                // stays the loop's — it is what makes delegation isolation, not a suggestion),
-                // a narrowed tool allowlist, an optional model, and its own step budget. A
-                // definition can only narrow: its allowlist is intersected with the read-effect
-                // set at parse time, so a custom agent is never a permission upgrade.
-                const childModel = def?.model || model;
-                const childSystem = def ? `${def.systemPrompt}\n\n${SUBAGENT_PROTOCOL}` : SUBAGENT_SYSTEM;
-                const childRegistry = def?.tools?.length
-                  ? SUBAGENT_TOOLS.filter((t) => def.tools!.includes(t.name))
-                  : SUBAGENT_TOOLS;
-                // Three sources, in priority order: the specialist's own budget, the user's
-                // global one (Router Settings → defaults), then the loop's default — which is
-                // **no ceiling**. The backstop is a ceiling on **every** path (`Math.min`), not
-                // only on the `null` default: it is documented as unconditional, and while it was
-                // an either/or, a typo of `5000` in Router Settings produced a 5000-round child
-                // that nothing could bound — the specialist path clamps to 50 and this one did not
-                // (audit 2026-10-09).
-                const requestedBudget = def?.maxIterations ?? subagentMaxIterations ?? SUBAGENT_MAX_ITERATIONS;
-                const childBudget =
-                  requestedBudget === null ? SUBAGENT_HARD_BACKSTOP : Math.min(requestedBudget, SUBAGENT_HARD_BACKSTOP);
-                const recorder = subagentRecorder;
-                const childRunId = recorder ? recorder.newRunId() : null;
-                if (recorder && childRunId) {
-                  try {
-                    recorder.startRun({
-                      runId: childRunId,
-                      parentRunId: runId ?? null,
-                      model: childModel,
-                      prompt: task,
-                    });
-                  } catch {
-                    /* a lost record must not become a lost run */
-                  }
-                }
-                const childHost: ToolHost =
-                  recorder && childRunId
-                    ? {
-                        run: (n, a, o) => {
-                          recorder.recordStep(childRunId, "tool_call", n);
-                          return host.run(n, a, o);
-                        },
-                      }
-                    : host;
-                // The result half of the child's ledger. The child's events are still not
-                // forwarded to the UI — isolation is the point of delegating — but a filtered
-                // half lands in the ledger, because a steps list that shows what a sub-agent
-                // *called* without what came back answers "what is it doing" with half a
-                // sentence. Denied/refused calls are named `denied` here by the same regex the
-                // parent's own recorder applies to its results (agent-turn.ts), so both ledgers
-                // mean the same thing by the word.
-                const childOnEvent: ((ev: AgentEvent) => void) | undefined =
-                  recorder && childRunId
-                    ? (ev) => {
-                        if (ev.type !== "tool_result") return;
-                        const name = ev.call.name ?? "(unknown)";
-                        const denied = /denied|refused/i.test(ev.result);
-                        recorder.recordStep(
-                          childRunId,
-                          denied ? "denied" : "tool_result",
-                          name,
-                          ev.result.slice(0, 500),
-                          ev.ok,
-                        );
-                      }
-                    : undefined;
-                // The watchdog: a child that produces no event for `SUBAGENT_INACTIVITY_TIMEOUT_MS`
-                // is wedged, not working, and is aborted. It covers the case a step ceiling
-                // cannot see — a provider stream that never ends, where no round is ever
-                // completed and therefore no iteration is ever counted. Armed from the start,
-                // reset on every child event.
-                // The child's own spend, summed over its round-trips — the number ZCode reports
-                // as `totalTokens` and the one our ledger could not answer before.
-                let childIn = 0;
-                let childOut = 0;
-                const watchdog = new AbortController();
-                let lastActivity = Date.now();
-                let watchdogFired = false;
-                const onParentAbort = () => watchdog.abort();
-                signal?.addEventListener("abort", onParentAbort, { once: true });
-                const pollMs = Math.max(10, Math.min(30_000, Math.floor(subagentInactivityTimeoutMs / 4)));
-                const timer = setInterval(() => {
-                  if (Date.now() - lastActivity < subagentInactivityTimeoutMs) return;
-                  watchdogFired = true;
-                  watchdog.abort();
-                }, pollMs);
-                const childOnEventWatched = (ev: AgentEvent) => {
-                  lastActivity = Date.now();
-                  childOnEvent?.(ev);
-                };
-                try {
-                  // Queue behind the concurrency cap *before* the child starts, and release in
-                  // the `finally` so a throw cannot strand a permit and deadlock later children.
-                  await childPermits.take();
-                  let sub: Awaited<ReturnType<typeof runAgentLoop>>;
-                  try {
-                    sub = await runAgentLoop({
-                      model: childModel,
-                      messages: [{ role: "user", content: task }],
-                      system: childSystem,
-                      registry: childRegistry,
-                      generate,
-                      host: childHost,
-                      confirm,
-                      loadSkill,
-                      runId: childRunId ?? undefined,
-                      subagentRecorder: recorder,
-                      maxIterations: childBudget,
-                      onEvent: childOnEventWatched,
-                      onUsage: (u) => {
-                        childIn += u.prompt_tokens ?? 0;
-                        childOut += u.completion_tokens ?? 0;
-                      },
-                      signal: watchdog.signal,
-                    });
-                  } finally {
-                    childPermits.release();
-                    clearInterval(timer);
-                    signal?.removeEventListener("abort", onParentAbort);
-                  }
-                  const summary = sub.text.trim();
-                  const capped =
-                    summary.length > SUBAGENT_RESULT_CAP
-                      ? summary.slice(0, SUBAGENT_RESULT_CAP) + "\n\n(summary truncated)"
-                      : summary || "(the sub-agent returned an empty summary)";
-                  resultText = sub.hitCeiling
-                    ? "The sub-agent hit its step budget with work possibly unfinished.\n\n" + capped
-                    : capped;
-                  ok = true;
-                  if (recorder && childRunId) {
-                    recorder.endRun(
-                      childRunId,
-                      sub.hitCeiling ? "stopped" : "ok",
-                      sub.iterations,
-                      undefined,
-                      childIn,
-                      childOut,
-                    );
-                  }
-                } catch (e) {
-                  // A watchdog abort and a user Stop both arrive as AbortError; only the clock
-                  // knows which one this was, and the model must be told the right story — one
-                  // is "your sub-agent hung", the other is "the human stopped you".
-                  resultText = watchdogFired
-                    ? `The sub-agent made no progress for ${Math.round(subagentInactivityTimeoutMs / 60_000)} ` +
-                      "minutes and was stopped — it was wedged on a request that never returned. " +
-                      "Retry the task, or narrow it."
-                    : `Sub-agent failed: ${e instanceof Error ? e.message : String(e)}`;
-                  ok = false;
-                  if (recorder && childRunId) {
-                    recorder.endRun(
-                      childRunId,
-                      "error",
-                      0,
-                      e instanceof Error ? e.message : String(e),
-                      childIn,
-                      childOut,
-                    );
-                  }
-                }
+                const child = await runChild(task, def);
+                resultText = child.resultText;
+                ok = child.ok;
+              }
+            } else if (name === "fan_out") {
+              // **N independent children in one round, one structured result each.** The point is
+              // the shape of the answer: a `dispatch_agent` batch returns N prose summaries in call
+              // order, which the model has to keep straight itself, while this returns JSON keyed by
+              // the caller's own label — so "which of the twelve failed, and what did it say" is a
+              // question the model can answer without re-reading the batch.
+              //
+              // Everything expensive is `runChild`'s: the granted tool set and the definition
+              // narrowing it, the system prompt, the step budget and hard backstop, the parent's
+              // confirm gate, one ledger row per child, and the inactivity watchdog. They cannot
+              // drift from `dispatch_agent`'s because they are the same code — and the concurrency
+              // cap applies here for free, since each child takes its permit inside `runChild`. A
+              // batch larger than the cap runs in waves rather than being refused, the same bargain
+              // `dispatch_agent` makes.
+              const raw = Array.isArray(args.tasks) ? args.tasks : [];
+              if (raw.length === 0) {
+                resultText =
+                  'fan_out needs "tasks": an array of { task, label?, agent? } — at least one. Use ' +
+                  "`dispatch_agent` for a single task.";
+                ok = false;
+              } else if (raw.length > FAN_OUT_MAX) {
+                resultText =
+                  `fan_out accepts at most ${FAN_OUT_MAX} tasks, got ${raw.length}. Split the set ` +
+                  "across rounds — the cap exists because each task is a full sub-agent run.";
+                ok = false;
+              } else {
+                const knownIds = (subagentDefs ?? []).map((d) => d.id);
+                const results = await Promise.all(
+                  raw.map(async (entry, i) => {
+                    const e = (entry ?? {}) as Record<string, unknown>;
+                    const label =
+                      typeof e.label === "string" && e.label.trim()
+                        ? e.label.trim()
+                        : `task-${i + 1}`;
+                    const task = typeof e.task === "string" ? e.task.trim() : "";
+                    const agentId = typeof e.agent === "string" ? e.agent.trim() : "";
+                    // A bad ITEM fails that item, not the batch: the others ran to completion, and
+                    // their results are not the caller's mistake. An unknown id names the valid ones
+                    // for the same reason `dispatch_agent` does — a silent fallback would read as a
+                    // routing success while running the wrong prompt.
+                    if (!task) {
+                      return { label, ok: false, error: 'this task has no "task" text' };
+                    }
+                    const def = agentId
+                      ? (subagentDefs ?? []).find((d) => d.id === agentId)
+                      : undefined;
+                    if (agentId && !def) {
+                      return {
+                        label,
+                        ok: false,
+                        error:
+                          `no sub-agent named "${agentId}". Available: ` +
+                          `${knownIds.join(", ") || "(none)"}. Omit "agent" for the general researcher.`,
+                      };
+                    }
+                    const child = await runChild(task, def);
+                    return {
+                      label,
+                      ok: child.ok,
+                      summary: child.resultText,
+                      iterations: child.iterations,
+                      tokensIn: child.tokensIn,
+                      tokensOut: child.tokensOut,
+                    };
+                  }),
+                );
+                const failed = results.filter((r) => !r.ok).length;
+                // A one-line header, then the structure: the model reads both, and the counts are
+                // what it needs before deciding whether anything is worth retrying.
+                resultText =
+                  `fan_out ran ${results.length} task(s)${failed ? `, ${failed} failed` : ""}.\n\n` +
+                  JSON.stringify({ tasks: results }, null, 2);
+                ok = failed < results.length;
               }
             } else if (name === "web_ask") {
               // `web_ask` never reaches the sandbox: it is answered HERE, by the same model, in a
