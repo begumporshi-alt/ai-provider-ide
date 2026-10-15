@@ -8,12 +8,19 @@
 //!   1. NO SHELL. Commands are executed as `Command::new(prog).args(argv)`. There is no
 //!      `sh -c`, so `;`, `&&`, `|`, backticks and `$(...)` are inert text, not syntax. This
 //!      single choice removes the entire injection class.
-//!   2. ALLOWLIST. Only a fixed set of executables can start. `rm`, `sudo`, `sh`, `curl`,
-//!      `wget`, `ssh`, `nc` and friends are simply absent, so they cannot run at any
-//!      argument. `git` may reach the network in both directions (the user points the
-//!      assistant at repos and asks it to publish branches); `gh` is the GitHub surface,
-//!      gated to the subcommands that are neither interactive nor machine-credential-touching
-//!      nor destructive to a remote.
+//!   2. ALLOWLIST. A fixed set of executables may start *by name*. `rm`, `sudo`, `sh`, `curl`,
+//!      `wget`, `ssh`, `nc` and friends are absent, so a model cannot ask for one. **This bounds
+//!      naming, not capability** — the baseline includes interpreters (`python3`, `node`, `make`),
+//!      so any of those can start a program that is not on the list. That is deliberate: they are
+//!      what makes the tool useful, and what the list is really for is keeping the *obvious*
+//!      destructive and network-facing programs out of a model's reach while a human confirms each
+//!      call. The containment that does hold is rule 3, which is why the entries needing care are
+//!      the ones that write **outside** the workspace. Register **D113**, pinned by
+//!      `the_baseline_already_runs_a_program_that_is_not_on_it`. `git` may reach the network in
+//!      both directions (the user points the assistant at repos and asks it to publish branches);
+//!      `gh` is the GitHub surface, gated to the subcommands that are neither interactive nor
+//!      machine-credential-touching nor destructive to a remote, and `cargo` is gated the same way
+//!      ([`CARGO_DENIED`]).
 //!   3. ROOT CONFINEMENT. Every file path is resolved and must land inside the workspace
 //!      root after canonicalization, so `..` and symlinks pointing outward both fail.
 //!   4. BOUNDED. Wall-clock timeout, output caps, and a scrubbed environment (no ambient
@@ -46,9 +53,25 @@ use serde::{Deserialize, Serialize};
 /// network-facing.
 ///
 /// **This is the baseline, not the whole allowlist.** A user extends it through Settings → Tools
-/// (see [`set_extra_programs`]) for the task classes the baseline cannot reach at all — `cargo`,
-/// `curl`, `sqlite3`, `rm`, `mv`. Their additions are validated as bare executable names and are
+/// (see [`set_extra_programs`]) for the task classes the baseline cannot reach at all — `curl`,
+/// `sqlite3`, `rm`, `mv`. Their additions are validated as bare executable names and are
 /// checked against [`NEVER_ALLOWED`], so an addition cannot be a path or a privilege escalator.
+///
+/// **`cargo` is here because the assistant could not build or test Rust at all** — while `make`,
+/// `python3`, `node`, `npm`, `npx` and `pnpm` were all already reachable. That is a gap for any
+/// Rust repository and it was measurably a gap for *this* one: half of this product is Rust
+/// (`apps/desktop/src-tauri`), so the agent could edit that tree and had no way to compile it,
+/// run its tests, or check a lint — it could only assert that a change was correct. Found
+/// 2026-10-15, the same audit that found `sips` missing.
+///
+/// **It is not an escalation, and the reason is register D113 rather than a judgement.** This
+/// list does not bound code execution and never did: `make` is a shell (one `/bin/sh -c` per
+/// recipe line), and `python3`/`node`/`npm` can each start any program, so `rm` — refused by name
+/// — already ran through `python3` before this entry existed (pinned by
+/// `the_baseline_already_runs_a_program_that_is_not_on_it`). What the list bounds is what a model
+/// reaches *by naming it*, so the entries that need care are the ones that write **outside** the
+/// workspace, which root confinement cannot reach. `cargo` does not: every subcommand that would
+/// is refused by [`CARGO_DENIED`], which is the same two classes `gh` is gated against.
 ///
 /// **`sips` is here because image work had no local tool at all.** Measured 2026-10-15 in a real
 /// build (`green-energy-site`): the assistant needed a hero at 1920 and 1100 px and three cards at
@@ -69,7 +92,7 @@ const BUILTIN_PROGRAMS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "printf", "date",
     "which", "basename", "dirname", "stat", "du", "diff", "sort", "uniq", "tr", "cut", "sed",
     "awk", "tar", "unzip", "sips", "mkdir", "touch", "cp", "git", "gh", "node", "npm", "npx",
-    "pnpm", "python3", "pip3", "make",
+    "pnpm", "python3", "pip3", "make", "cargo",
 ];
 
 /// Programs that never start — baseline, user-configured, or otherwise.
@@ -239,6 +262,53 @@ fn gh_denial(argv: &[String]) -> Option<String> {
         if GH_DENIED_PAIRS.contains(&(sub.as_str(), action.as_str())) {
             return Some(format!("gh {sub} {action} is not allowed"));
         }
+    }
+    None
+}
+
+/// `cargo` subcommands refused outright. The list is short and each entry is the same two classes
+/// `gh` is gated against, not a judgement about what is "safe to compute":
+///
+/// - **Writes outside the workspace** — `install`, `uninstall`. Rule 3 confines *paths the host
+///   resolves*; it cannot confine a program that decides for itself to write `~/.cargo/bin`. This
+///   is the one class the allowlist genuinely has to carry, because root confinement does not
+///   reach it.
+/// - **Irreversible remote or credential mutation** — `publish`, `yank`, `owner` (a registry
+///   action that cannot be taken back, the `gh repo delete` analogue) and `login`, `logout`,
+///   `credential`, `credentials` (machine-level credential edits, the `gh auth` analogue).
+///
+/// Everything else stays reachable, deliberately: `build`, `check`, `test`, `run`, `clippy`,
+/// `fmt`, `doc`, `bench`, `update`, `add`, `remove`, `tree`, `metadata`, `clean`, `new`, `init`,
+/// `vendor`, `fetch`, `search`. **`build`, `test` and `run` execute arbitrary code** — a `build.rs`
+/// or a test body — and that is allowed on purpose, because it is not a capability this list is
+/// holding back: `python3`, `node`, `npm`, `npx`, `pnpm` and `make` are all on the baseline and
+/// each can start an arbitrary program (see `the_baseline_already_runs_a_program_that_is_not_on_it`
+/// and register D113). Refusing `cargo test` while allowing `make test` would be a rule about
+/// names rather than about reach.
+const CARGO_DENIED: &[&str] = &[
+    "install",
+    "uninstall",
+    "publish",
+    "yank",
+    "owner",
+    "login",
+    "logout",
+    "credential",
+    "credentials",
+];
+
+/// Why this `cargo` invocation is refused, if it is. Split from `do_run_command_gated` so the gate
+/// is unit-testable without spawning `cargo` — the same shape as [`gh_denial`].
+///
+/// `argv[0]` is the subcommand. Global flags (`--version`, `--list`, `-V`, `--help`) precede it in
+/// `cargo`'s grammar and are not subcommands, so a leading `-` is never a denial: those do no work.
+fn cargo_denial(argv: &[String]) -> Option<String> {
+    let sub = argv.first()?;
+    if sub.starts_with('-') {
+        return None;
+    }
+    if CARGO_DENIED.contains(&sub.as_str()) {
+        return Some(format!("cargo subcommand \"{sub}\" is not allowed"));
     }
     None
 }
@@ -989,6 +1059,15 @@ fn do_run_command_gated(
                 return Err(reason);
             }
         }
+        // Sub-gate `cargo`: the build/test/check surface, minus the two classes gh is gated
+        // against — subcommands that write outside the workspace, and ones that mutate a remote
+        // or a machine credential. Absent argv is `cargo` with no arguments, which prints help
+        // and does no work, so it is not an error here the way bare `git`/`gh` are.
+        if program == "cargo" {
+            if let Some(reason) = cargo_denial(&argv) {
+                return Err(reason);
+            }
+        }
         // Audit H1: the program is allowlisted, but the ARGUMENTS were never inspected. Refuse
         // path-like arguments that would leave the workspace, for every program alike.
         for a in &argv {
@@ -1014,7 +1093,7 @@ fn do_run_command_gated(
             // Scrubbed environment: nothing ambient (tokens, keys, shell vars) can leak into
             // output the model reads back.
             .env_clear()
-            .env("PATH", CHILD_PATH)
+            .env("PATH", child_path())
             .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
             .env("TMPDIR", std::env::var("TMPDIR").unwrap_or_else(|_| "/tmp".into()))
             .env("LANG", "C.UTF-8");
@@ -1480,7 +1559,52 @@ fn do_todo_write(args: &serde_json::Value) -> ToolResult {
 
 /// The fixed PATH every spawned child gets — homebrew first, then the system dirs. A scrubbed
 /// environment still has to find the allowlisted executables.
+///
+/// **This is the system half only; [`child_path`] appends the user's own bin directories.**
 const CHILD_PATH: &str = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// The directories that belong to the *user* rather than the system, and that hold programs this
+/// crate's allowlist grants. Each is a documented install location, resolved against `HOME` so
+/// nothing is pinned to one machine.
+///
+/// **Why a fixed list and not the parent's `PATH`:** inheriting the ambient value would make what
+/// the child can reach depend on *how the app was launched* — a GUI (launchd) launch and a terminal
+/// `pnpm dev` carry different `PATH`s — which is precisely the "works in dev, not in the app" class
+/// of bug. The system half stays first, so a user directory can only ever **add** a program, never
+/// shadow one the system provides.
+///
+/// **`$HOME/.cargo/bin` is here because register D114 measured the gap it closes:** `cargo` and
+/// `rustc` live there (rustup's documented location, not `/usr/bin`), so with the system half alone
+/// they were unreachable — and the failure blamed the program, not the PATH:
+/// `cannot start "cargo": No such file or directory (os error 2)`. That mattered twice over: `cargo`
+/// is on the baseline because half this product is Rust (see [`BUILTIN_PROGRAMS`]), **and**
+/// Settings → Tools offered `cargo` as the worked example of a program a user may add by hand — so
+/// the product advertised a capability that could not have worked when taken up. `pnpm` has the
+/// same shape on a pnpm-managed install, which is why `$HOME/Library/pnpm` is here (pnpm's
+/// documented macOS global bin directory).
+///
+/// **Residual, stated rather than hidden:** a *version-managed* directory cannot be a fixed
+/// constant — this machine's `pnpm` is under `~/.nvm/versions/node/v20.19.0/bin`, and any path
+/// naming `v20.19.0` would be wrong at the next upgrade. So nvm-managed global bins stay
+/// unreachable by name. `npm` and `npx` **are** on the system half, so `npx pnpm …` reaches them
+/// anyway; what is missing is the direct spelling, not the capability.
+const CHILD_USER_BIN_DIRS: &[&str] = &[".cargo/bin", ".local/bin", "Library/pnpm", ".bun/bin"];
+
+/// The full PATH for a spawned child: the fixed system half, then the user's own bin directories.
+///
+/// A directory that does not exist is still appended — `PATH` tolerates that, and filtering would
+/// add a filesystem stat to every spawn for no gain.
+fn child_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let mut path = String::from(CHILD_PATH);
+    for dir in CHILD_USER_BIN_DIRS {
+        path.push(':');
+        path.push_str(&home);
+        path.push('/');
+        path.push_str(dir);
+    }
+    path
+}
 
 /// One changed file as the git capsule shows it: the workspace-relative path and the short
 /// status letter (`M`odified, `A`dded, `D`eleted, `R`enamed, `?`ntracked…).
@@ -1514,7 +1638,7 @@ fn git_at(root: &Path, args: &[&str]) -> (bool, String, String) {
         .current_dir(root)
         .stdin(Stdio::null())
         .env_clear()
-        .env("PATH", CHILD_PATH)
+        .env("PATH", child_path())
         .env("HOME", std::env::var("HOME").unwrap_or_else(|_| "/tmp".into()))
         .env("LANG", "C.UTF-8")
         .output();
@@ -2480,6 +2604,178 @@ mod tests {
         assert_eq!((w, h), (4, 4), "8x8 resized to a 4x4 max dimension");
     }
 
+    /// **The allowlist is not a code-execution boundary, and this module's threat model says it is.**
+    ///
+    /// Rule 2 above claims: *"Only a fixed set of executables can start. `rm`, `sudo`, `sh`, `curl`
+    /// and friends are simply absent, so they cannot run at any argument."* The second sentence is
+    /// false for the set as configured, and this test is the falsification: `rm` is absent from
+    /// [`BUILTIN_PROGRAMS`] and refused by name, yet it runs, because `python3` **is** on the
+    /// baseline and is Turing-complete.
+    ///
+    /// This is not a defect introduced by any one entry — it is what the baseline *is*. `python3`,
+    /// `node`, `npm`, `npx`, `pnpm`, `make` and `git` (hooks, aliases) can each start an arbitrary
+    /// program, and `make` is literally a shell (`/bin/sh -c` per recipe line). So the allowlist
+    /// bounds *convenience*, not *capability*: it decides what a model reaches by naming it
+    /// directly, and nothing more. The real boundary is rule 3 (root confinement) plus the
+    /// approval prompt, which is why the entries that matter are the ones that write **outside**
+    /// the workspace, not the ones that can compute.
+    ///
+    /// Recorded because it is load-bearing for what follows: it is the reason adding `cargo` is
+    /// not an escalation, since `cargo` can do nothing here that `make` and `python3` cannot
+    /// already do. Register **D113**.
+    #[test]
+    fn the_baseline_already_runs_a_program_that_is_not_on_it() {
+        let dir = root();
+        fs::write(dir.join("marker.txt"), b"still here").unwrap();
+
+        let none: HashSet<String> = HashSet::new();
+        // `rm` is refused by name — asserted first, so a change to that refusal cannot silently
+        // turn this test into one that proves nothing.
+        let direct = do_run_command_gated(
+            &obj(&[
+                ("program", serde_json::json!("rm")),
+                ("args", serde_json::json!(["marker.txt"])),
+            ]),
+            &dir,
+            None,
+            &none,
+        );
+        assert!(!direct.ok, "rm must be refused by name");
+        assert!(direct.error.unwrap().contains("not on the allowlist"));
+
+        // …and the same `rm`, reached through a program that IS on the baseline.
+        let res = do_run_command_gated(
+            &obj(&[
+                ("program", serde_json::json!("python3")),
+                (
+                    "args",
+                    serde_json::json!([
+                        "-c",
+                        "import subprocess; subprocess.run(['rm', 'marker.txt'], check=True)"
+                    ]),
+                ),
+            ]),
+            &dir,
+            None,
+            &none,
+        );
+        assert!(res.ok, "python3 is on the baseline: {:?}", res.error);
+        assert!(
+            !dir.join("marker.txt").exists(),
+            "the file was deleted by a program the allowlist refuses by name"
+        );
+    }
+
+    /// The shape of the composed child `PATH`, asserted without spawning anything.
+    ///
+    /// Two properties, and the second is the one that matters: the **system half comes first**, so
+    /// a user directory can only add a program and never shadow one the system provides — a
+    /// `~/bin/git` must not become the `git` this host runs. The user half is then present, which
+    /// is what register D114 measured missing (`~/.cargo/bin`).
+    #[test]
+    fn the_child_path_adds_user_bins_after_the_system_half() {
+        let path = child_path();
+        assert!(
+            path.starts_with(CHILD_PATH),
+            "the system half must lead, so nothing user-owned can shadow it: {path}"
+        );
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+        // Spelled out rather than looped over `CHILD_USER_BIN_DIRS`: iterating the very list the
+        // function reads makes this tautological — deleting an entry would delete the expectation
+        // with it, and the test would stay green while the directory it was written for went
+        // missing. (Caught by falsifying exactly that: with `.cargo/bin` removed from the list, a
+        // loop-based version of this test still passed.) These are the measured homes of programs
+        // the baseline grants: rustup's `cargo`/`rustc`, `pipx`/user installs, and pnpm's
+        // documented macOS global bin directory.
+        for dir in [".cargo/bin", ".local/bin", "Library/pnpm"] {
+            let want = format!("{home}/{dir}");
+            assert!(path.split(':').any(|p| p == want), "{want} must be on the child PATH: {path}");
+        }
+        // The user half is *appended*, never interleaved into the system half.
+        assert_eq!(&path[..CHILD_PATH.len()], CHILD_PATH);
+        assert_eq!(path.as_bytes()[CHILD_PATH.len()], b':');
+    }
+
+    /// **`cargo` reaches the gate on the baseline**, which is the whole of the change: before this
+    /// entry the assistant could edit `apps/desktop/src-tauri` and not compile it. Same discipline
+    /// as the `sips` test — it runs the capability through the gated path with **no extra programs
+    /// configured**, so it proves the baseline rather than addability, and a list entry the gate
+    /// would then refuse cannot pass it.
+    ///
+    /// `cargo --version` rather than `cargo build`: it is a real invocation of the real binary, it
+    /// cannot fail for any reason except the gate (no manifest, no network, no toolchain
+    /// resolution), and it stays inside the suite's wall clock. `--version` is also the case
+    /// `cargo_denial` has to get right — a leading `-` is a global flag, never a subcommand.
+    ///
+    /// The closure below also pins that this is the *baseline*: `extra` is empty, so if `cargo`
+    /// were reachable only through Settings the assertion fails.
+    #[test]
+    fn cargo_reaches_the_gate_on_the_baseline() {
+        let none: HashSet<String> = HashSet::new();
+        let res = do_run_command_gated(
+            &obj(&[
+                ("program", serde_json::json!("cargo")),
+                ("args", serde_json::json!(["--version"])),
+            ]),
+            &root(),
+            None,
+            &none,
+        );
+        assert!(res.ok, "cargo should run unconfigured: {:?}", res.error);
+        assert!(res.output.contains("cargo"), "got: {}", res.output);
+    }
+
+    /// The sub-gate, both directions, without spawning `cargo`. The denial list is about reach —
+    /// writing outside the workspace, or mutating a remote/credential — so the allowed half is
+    /// asserted beside the refused half: a gate that refused everything would satisfy the refusals
+    /// alone and would be exactly the bug this change exists to fix.
+    #[test]
+    fn cargo_denial_refuses_only_the_subcommands_that_leave_or_mutate() {
+        for denied in CARGO_DENIED {
+            let argv = vec![denied.to_string()];
+            let reason = cargo_denial(&argv);
+            assert!(reason.is_some(), "cargo {denied} must be refused");
+            assert!(reason.unwrap().contains("is not allowed"), "the refusal must be legible");
+        }
+        // The work a Rust repository needs, including the three that execute code on purpose.
+        for allowed in [
+            "build", "check", "test", "run", "clippy", "fmt", "doc", "clean", "update", "add",
+            "remove", "tree", "metadata", "bench", "new", "init", "fetch",
+        ] {
+            assert!(
+                cargo_denial(&[allowed.to_string()]).is_none(),
+                "cargo {allowed} must stay reachable"
+            );
+        }
+        // Global flags precede the subcommand in cargo's grammar and do no work; treating a
+        // leading `-` as a subcommand would refuse `cargo --version`.
+        for flag in ["--version", "-V", "--list", "--help"] {
+            assert!(cargo_denial(&[flag.to_string()]).is_none(), "{flag} is a flag");
+        }
+        assert!(cargo_denial(&[]).is_none(), "bare cargo prints help and does no work");
+    }
+
+    /// **The denial is enforced at the gate, not only in the helper** — the same two-layer shape
+    /// the `gh` tests pin, because a sub-gate that is never called is a rule with no reader.
+    #[test]
+    fn the_gate_refuses_cargo_install_and_publish() {
+        let none: HashSet<String> = HashSet::new();
+        for denied in ["install", "publish", "login"] {
+            let res = do_run_command_gated(
+                &obj(&[
+                    ("program", serde_json::json!("cargo")),
+                    ("args", serde_json::json!([denied])),
+                ]),
+                &root(),
+                None,
+                &none,
+            );
+            assert!(!res.ok, "cargo {denied} must be refused by the gate");
+            let err = res.error.unwrap();
+            assert!(err.contains("is not allowed"), "got: {err}");
+        }
+    }
+
     /// …and the same program passes once configured. `sleep` because it is on the child's fixed
     /// `PATH`, is absent from the baseline, and cannot fail for any reason except the gate.
     #[test]
@@ -2544,17 +2840,33 @@ mod tests {
     /// The policy the UI renders reports provenance — three sets, not one merged list it cannot
     /// explain. The only test here that touches process-wide state; it restores before asserting,
     /// so a failing assertion cannot leave a half-configured allowlist for a parallel test.
+    ///
+    /// **Its example of "not a baseline program" was `cargo` until 2026-10-15, which is now
+    /// false** — this test failing is how the change to [`BUILTIN_PROGRAMS`] announced itself, and
+    /// it was right to: the assertion was specifically *"an addition is not a baseline program"*,
+    /// and `cargo` is no longer an addition. `sleep` takes the role (it is the same program the
+    /// surrounding gate tests use, for the same reasons: on the child `PATH`, absent from the
+    /// baseline, and it cannot fail for any reason except the gate). `cargo` is now asserted from
+    /// the other side, so the new truth is pinned rather than merely un-asserted.
     #[test]
     fn the_policy_reports_baseline_additions_and_the_denylist() {
         let before = extra_programs();
-        let policy = set_extra_programs(vec!["cargo".into()]).map(|_| tools_policy()).unwrap();
+        let policy = set_extra_programs(vec!["sleep".into()]).map(|_| tools_policy()).unwrap();
         set_extra_programs(before).unwrap();
 
-        assert!(policy.extra_programs.contains(&"cargo".to_string()));
-        assert!(!policy.programs.contains(&"cargo"), "an addition is not a baseline program");
+        assert!(policy.extra_programs.contains(&"sleep".to_string()));
+        assert!(!policy.programs.contains(&"sleep"), "an addition is not a baseline program");
         assert!(policy.programs.contains(&"cat"), "the baseline must still be reported");
+        // The Rust half of the toolchain is baseline as of 2026-10-15 (D114); a Rust repository is
+        // half of this product, and the agent could not compile it before this.
+        assert!(policy.programs.contains(&"cargo"), "cargo is baseline, not an addition");
+        assert!(
+            !policy.extra_programs.contains(&"cargo".to_string()),
+            "cargo is not a user addition"
+        );
         assert!(policy.never_allowed.contains(&"sudo"));
         assert!(!policy.never_allowed.contains(&"rm"), "rm must stay addable");
+        assert!(!policy.never_allowed.contains(&"cargo"), "cargo must stay addable");
     }
 
     #[test]

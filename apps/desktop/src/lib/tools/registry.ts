@@ -89,7 +89,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "search_files",
     effect: "read",
     description:
-      "Search the workspace for a literal string and return matching lines as path:line: text. Case-insensitive by default. Use this to find where something is defined instead of reading files one at a time.",
+      "Search the workspace for a LITERAL string (no regex) and return matching lines as path:line: text. Case-insensitive by default. Good for a name you already know. For a PATTERN — a regex, alternative spellings, a whole-word match, or finding definitions by shape — use run_command with rg instead (rg -n \"fn handle_(request|response)\" src; rg -nw MyType). This tool cannot express those.",
     parameters: {
       properties: {
         pattern: { type: "string", description: "Literal text to find. Not a regex." },
@@ -156,7 +156,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
         program: {
           type: "string",
           description:
-            "Executable from the allowlist: ls, cat, grep, rg, find, git, gh, node, npm, npx, pnpm, python3, make, tar, sed, awk, sips (image work: resize, crop, convert, and report real pixel dimensions), …",
+            "Executable from the allowlist: ls, cat, grep, rg, find, git, gh, node, npm, npx, pnpm, python3, make, cargo (Rust: cargo build, cargo test, cargo clippy, cargo fmt — cargo install and cargo publish are refused), tar, sed, awk, sips (image work: resize, crop, convert, and report real pixel dimensions), …",
         },
         args: {
           type: "array",
@@ -526,7 +526,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
     name: "generate_image",
     effect: "mutate",
     description:
-      "Generate an image from a text prompt through the gateway's image route and save it into the workspace (images/ by default). The saved file is also attached as an image part, so a vision-capable model can see what it made. Needs an image model configured in Router Settings → defaults.",
+      "Generate an image from a text prompt through the gateway's image route and save it into the workspace (images/ by default). The saved file is also attached as an image part, so a vision-capable model can see what it made. REQUIRES a provider that serves image generations (OpenRouter, OpenAI, Replicate…): none of the providers configured by default does, so this call fails with NO_ROUTE until one is added in Settings → Providers. Check that before promising an image; sips through run_command can resize or convert an existing file, but cannot create one.",
     parameters: {
       properties: {
         prompt: { type: "string", description: "What the image should show. Be specific and concrete." },

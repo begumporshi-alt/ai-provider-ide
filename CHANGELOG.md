@@ -243,6 +243,84 @@ it, and `pnpm check-version-sync` fails the build when one does not.
 
 ### Changed
 
+- **The assistant can build, test and lint Rust — and `pnpm` works too.** Two independent defects
+  sat behind one symptom, and the second was invisible until the first was fixed.
+
+  **`cargo` was not on the command baseline, though the interpreters were.** `make`, `python3`,
+  `node`, `npm`, `npx` and `pnpm` were all reachable; `cargo` was not. For a Rust repository that is
+  a hard stop, and half of this product is Rust (`apps/desktop/src-tauri`) — the agent could edit
+  that tree and had no way to compile it, run its tests, or check a lint. It could only assert that
+  a change was correct. `cargo` now reaches the build/test/check surface, with the subcommands that
+  write **outside** the workspace (`install`, `uninstall`) or mutate a remote or a credential
+  (`publish`, `yank`, `owner`, `login`, `logout`, `credential`, `credentials`) refused by
+  [`CARGO_DENIED`] — the same two classes `gh` is already gated against.
+
+  **Adding it was not enough, because the child's `PATH` could not find it.** `CHILD_PATH` was
+  system directories only, with no per-user bin directory, so `cargo` and `rustc` (rustup installs
+  to `~/.cargo/bin`) were unreachable *no matter what the allowlist said* — and the error blamed
+  the program: `cannot start "cargo": No such file or directory (os error 2)`. The same was already
+  true of **`pnpm`**, which had been on the baseline all along and is this repository's own package
+  manager. `child_path()` now appends `~/.cargo/bin`, `~/.local/bin`, `~/Library/pnpm` and
+  `~/.bun/bin` **after** the fixed system directories, so a user directory can only add a program
+  and never shadow a system one. It derives from `$HOME` rather than inheriting the parent's `PATH`
+  on purpose: the ambient value differs between a launchd launch and a terminal `pnpm dev`, which is
+  the "works in dev, not in the app" failure mode.
+
+  **This also made the product's own advice false, which is why it was a defect and not a setup
+  note.** The baseline docstring offered `cargo` as the worked example of a program a user may add
+  by hand through Settings → Tools — a capability that could not have worked for anyone who took
+  that advice. The two facts are one fact, and the error text pointed at the wrong half of it.
+
+  **Falsified both halves.** Removing `cargo` from the baseline reddens with
+  `program "cargo" is not on the allowlist`; restoring it and dropping `~/.cargo/bin` reddens with
+  the original `cannot start "cargo"` — the bug reproduced on demand. A pre-existing test failed on
+  this change and was right to: `the_policy_reports_baseline_additions_and_the_denylist` used
+  `cargo` as its example of *"an addition is not a baseline program"*, which is now false; `sleep`
+  takes that role and `cargo` is asserted from the baseline side instead. Writing the `PATH` test
+  caught a tautology in the first version of it — it looped over the very list it was testing, so
+  deleting `.cargo/bin` deleted the expectation with it and the test stayed green; the directories
+  are now spelled out.
+
+  **Residual, open.** A version-managed directory cannot be a fixed constant: this machine's `pnpm`
+  is under an nvm version path, and any constant naming `v20.19.0` would be wrong at the next
+  upgrade. So nvm-managed global bins are still unreachable by name — `npm` and `npx` are on the
+  system half, so `npx pnpm …` reaches them; what is missing is the direct spelling, not the
+  capability.
+
+  **And one claim that had to be corrected rather than fixed.** The module's threat model said
+  absent programs *"cannot run at any argument"*. They can, and always could: the baseline includes
+  interpreters, so `rm` — refused by name — runs through `python3`. Measured, not argued:
+  `the_baseline_already_runs_a_program_that_is_not_on_it` asserts the refusal and then deletes the
+  same file through `python3 -c`. Rule 2 now says what is true — the allowlist bounds *naming*, not
+  *capability*, and root confinement is the containment that actually holds. This is not a call to
+  remove the interpreters; it is the reason adding `cargo` is not an escalation, since `cargo` can
+  do nothing the baseline could not already do.
+
+  **`generate_image` is still dead, and it is configuration, not code.** All 17 image-modality
+  ledger rows have failed `NO_ROUTE` (2026-09-20 → 2026-10-14) because none of the six configured
+  providers declares an image endpoint, and `models_cache` holds no image model at all. No commit
+  closes that — it needs a provider that serves image generations added in Settings → Providers.
+  Its description now says so, so the dead end is legible instead of silent. See D112, D113 and
+  D114.
+
+- **Search patterns are now something the agent knows it can do.** The surface has no symbol
+  navigation and no codebase index — nothing type-aware — so following a definition means composing
+  a pattern and reading around the hit. The tools allowed that; the instructions did not say so.
+  `search_files` is a **literal** substring match, yet its description told the model to *"use this
+  to find where something is defined"*, and the agent prompt never mentioned `rg` at all — so the
+  model reached for the weaker tool on the job that needs the stronger one. `rg` is on the command
+  baseline and takes full regex, so both now point at it (`rg -n "fn handle_(request|response)" src`
+  to find definitions by shape, `rg -nw Name` for whole words), and the prompt states outright that
+  there is no type-aware navigation rather than leaving the model to look for one.
+
+  **This is the cheap half of D115, and the expensive half is named rather than implied.** An LSP
+  client is a project of its own — per-language server discovery, JSON-RPC framing, capability
+  negotiation, document sync, position↔offset conversion, a Settings surface — comparable in size to
+  the MCP client and useful only for languages whose server is installed. It is not built here. The
+  extension path already exists and needs no code: the MCP client registers whatever tools a
+  configured server declares, so an LSP-backed MCP server supplies real navigation to anyone who
+  points at one.
+
 - **`sips` is on the command baseline, so the assistant can finally process an image instead of
   working around not being able to.** The tool surface had two image tools and neither processed
   anything: `read_image` lets a vision model *see* a file, and `generate_image` *creates* one — but

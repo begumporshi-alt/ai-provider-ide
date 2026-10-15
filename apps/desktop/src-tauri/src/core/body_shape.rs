@@ -73,16 +73,14 @@ pub fn describe_request(body: &Map<String, Value>, bytes: usize) -> String {
     // rule to an OpenAI body would accuse every turn it has, which is worse than saying nothing —
     // a diagnostic that cries wolf is one nobody reads.
     let array_shape = messages.iter().any(|m| {
-        m.get("content")
-            .and_then(Value::as_array)
-            .map_or(false, |a| {
-                a.iter().any(|p| {
-                    matches!(
-                        p.get("type").and_then(Value::as_str),
-                        Some("tool_use") | Some("tool_result")
-                    )
-                })
+        m.get("content").and_then(Value::as_array).is_some_and(|a| {
+            a.iter().any(|p| {
+                matches!(
+                    p.get("type").and_then(Value::as_str),
+                    Some("tool_use") | Some("tool_result")
+                )
             })
+        })
     });
 
     let declared: Vec<String> = body

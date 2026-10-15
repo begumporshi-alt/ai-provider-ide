@@ -201,7 +201,10 @@ mod tests {
     fn detect_invalid_request_leaves_a_plain_upstream_flap_alone() {
         // A 5xx that says nothing about the request must stay `SERVER_ERROR`, because that class is
         // what retries: a false positive here would stop retrying a genuine outage.
-        assert_eq!(detect_invalid_request(503, Some(r#"{"error":{"message":"overloaded"}}"#)), None);
+        assert_eq!(
+            detect_invalid_request(503, Some(r#"{"error":{"message":"overloaded"}}"#)),
+            None
+        );
         assert_eq!(detect_invalid_request(500, Some("internal server error")), None);
     }
 }
