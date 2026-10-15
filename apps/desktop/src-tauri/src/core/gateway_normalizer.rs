@@ -828,9 +828,17 @@ fn ensure_array_content(messages: &mut [Value]) {
         if msg.get("role").and_then(Value::as_str) == Some("tool") {
             continue;
         }
+        // **An empty string is not a content part, so none is made from it.** `as_parts`
+        // (`dialect_shaping`) refuses to build a text part out of an empty string, but it sees this
+        // message only after this pass has already spelled the empty content as
+        // `[{type:"text",text:""}]` — so the guard was defeated by the spell, and the assistant
+        // turn of a tool call (always `content: ""`) went out carrying a content part the caller
+        // never sent. Measured 2026-10-14 (D107): `agent-router` answered those requests
+        // `500 … "invalid_request_error"` with `tokens_in = 0`. Leaving the string alone is what
+        // the OpenAI dialect wants too — it passes messages through verbatim.
         let text = match msg.get("content").and_then(Value::as_str) {
-            Some(s) => s.to_string(),
-            None => continue,
+            Some(s) if !s.is_empty() => s.to_string(),
+            _ => continue,
         };
         if let Some(obj) = msg.as_object_mut() {
             obj.insert("content".into(), json!([{ "type": "text", "text": text }]));
@@ -1186,6 +1194,11 @@ mod tests {
         let msgs = messages_of(&out);
         assert_eq!(msgs[0]["content"], serde_json::json!([{ "type": "text", "text": "run ls" }]));
         assert_eq!(msgs[2]["content"], serde_json::json!("alpha.txt\nbeta.txt"));
+        // **The middle message is the one this test did not look at, and it was the broken one.** A
+        // tool-calling assistant turn carries `content: ""`, and arraying that empty string
+        // fabricated a `text` part the caller never sent — which the assistant branch of
+        // `attach_tool_parts` then rendered beside the `tool_use`. Measured 2026-10-14 (D107).
+        assert_eq!(msgs[1]["content"], serde_json::json!(""), "empty content is not a part");
     }
 
     // ── detect_client ─────────────────────────────────────────────────────

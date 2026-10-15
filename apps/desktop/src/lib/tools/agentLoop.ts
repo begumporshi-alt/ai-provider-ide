@@ -120,6 +120,39 @@ export const NO_OUTPUT_RETRIES = 1;
 export const TRUNCATION_RETRIES = 2;
 
 /**
+ * How many times a turn the provider cut at the **output cap** (`finish_reason: "length"`) while
+ * carrying tool calls is re-asked before its calls are allowed through.
+ *
+ * **Why this is neither `TRUNCATION_RETRIES` nor zero.** A length cut with a call in flight is the
+ * one truncation whose damage lands in the *arguments*: the call the model was composing is the
+ * thing that ran out of budget, so its arguments stop mid-JSON. Measured 2026-10-13 from this
+ * machine's own `session_messages`: four consecutive `write_file` calls at 24 444 / 31 480 / 31 213
+ * / 30 854 characters, every one invalid JSON ending mid-string or mid-tag, each answered
+ * `missing argument "path"` — while the 327-character call in the same turn parsed and wrote
+ * 258 bytes. Re-asking is cheap and it lands, **but only because the re-ask says what went wrong**:
+ * the same loop re-asked blind four times and produced four identical failures. One guided retry,
+ * not two, for exactly that reason.
+ *
+ * It is also deliberately not a hard failure: a second truncation falls through to
+ * `argumentProblem`, which refuses the call with the reason and lets the model adapt inside the
+ * turn rather than killing work that has already succeeded.
+ */
+export const TRUNCATED_TOOL_CALL_RETRIES = 1;
+
+/**
+ * What a re-ask after a length cut carrying tool calls is told.
+ *
+ * It names the cut, the consequence (the call did not run) and the remedy the measured case
+ * actually needed — which the model found for itself by experiment: *"Short writes work — the long
+ * one was too big. I'll build the file in chunks."* The loop should not make it rediscover that
+ * over four failed round-trips.
+ */
+export const TRUNCATED_TOOL_CALL_NOTE =
+  "Your LAST tool call was cut off by the model's output limit before its arguments finished, so " +
+  "it did not run. Do not resend the same payload. Send smaller calls: write a short file first " +
+  "and grow it with edit_file, or split the content across several calls.";
+
+/**
  * The sub-agent's default step budget: **none** — and that is the measured answer, not a
  * relaxation.
  *
@@ -278,6 +311,62 @@ function parseArgs(raw?: string): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+/**
+ * Why a call's arguments cannot be run — or `null` when they are usable.
+ *
+ * **The distinction `parseArgs` alone destroys.** `parseArgs` returns `{}` for anything it cannot
+ * parse, which is right for the *executor* (it always needs an object) and wrong for the
+ * *transcript*: an absent or empty `arguments` is a legitimate no-argument call, while an
+ * `arguments` that is present, non-empty and unparseable is a call that never finished arriving.
+ * Collapsing the two sent `{}` to the sandbox, which answered `missing argument "path"` — a message
+ * naming a missing key while the real cause was a truncated payload, so the model had to find the
+ * difference by failing four times.
+ */
+export function argumentProblem(raw: string | undefined): "truncated" | "not-an-object" | null {
+  // Absent and empty are the same finding, and it is not a defect: `undefined` is what a dialect
+  // with no `arguments` field sends, `""` is what OpenAI-shaped servers send for a call that takes
+  // none. Treating these as truncation would refuse every legitimately argument-free call.
+  if (raw === undefined) return null;
+  const trimmed = raw.trim();
+  if (trimmed === "") return null;
+  let value: unknown;
+  try {
+    value = JSON.parse(trimmed);
+  } catch {
+    return "truncated";
+  }
+  // Valid JSON, wrong shape — a provider that sent `[]` or a bare scalar. Not a truncation, so the
+  // message must not call it one; equally unusable as an argument object.
+  if (value === null || typeof value !== "object" || Array.isArray(value)) return "not-an-object";
+  return null;
+}
+
+/**
+ * The sentence a call with unusable arguments is answered with, in place of a blind `{}`.
+ *
+ * It is phrased for the model, which is the reader that can still act on it: name the call, say it
+ * did not run, give the cause, and give the remedy. The remedy is the measured one — a `write_file`
+ * whose content does not fit in a single response is the shape that produced the 24-31 KB truncated
+ * arguments above, and chunking is what worked.
+ */
+export function argumentProblemMessage(
+  name: string,
+  problem: "truncated" | "not-an-object",
+): string {
+  if (problem === "not-an-object") {
+    return (
+      `Tool "${name}" was not run: its arguments parsed as JSON but were not an object. ` +
+      "Send this tool's arguments as a JSON object."
+    );
+  }
+  return (
+    `Tool "${name}" was not run: its arguments were cut off before they were valid JSON, so the ` +
+    "call never finished arriving — almost always the model's output limit reached mid-call, which " +
+    "is what a write whose content does not fit in one response looks like. Send a smaller call: " +
+    "write a short file first and grow it with edit_file, or split the content across several calls."
+  );
 }
 
 export interface AgentLoopResult {
@@ -506,6 +595,10 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // whole budget on fetches that kept 403-ing and reported nothing.
   let lastTools: { name: string; ok: boolean; resultText: string }[] = [];
   let truncationRetries = 0;
+  // The same counter for the *other* truncation class: a length cut that arrived carrying tool
+  // calls (see `TRUNCATED_TOOL_CALL_RETRIES`). Kept apart from `truncationRetries` so neither
+  // class can spend the other's retry.
+  let truncatedToolCallRetries = 0;
   let noOutputRetries = 0;
   // The pacing counter (see `TOOL_CALL_NUDGE_AFTER`): calls made this turn, and reminders sent.
   let toolCallsThisTurn = 0;
@@ -513,6 +606,9 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // Set once the NO_OUTPUT fallback has fired: every attempt afterwards asks for thinking off,
   // so the knob's level never re-arms mid-turn.
   let forceNoReasoning = false;
+  // Set once a length-cut turn has been re-asked: that retry carries the chunking note, because a
+  // blind re-ask is what produced four identical failures in the measured case.
+  let forceChunkedCalls = false;
   // Whether the user approved the plan this pass presented. Decides WHICH correction the system
   // turn carries once the mode is off — "the user approved it, implement it" is a different
   // instruction from "the user switched the mode off, carry on".
@@ -546,16 +642,20 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           : planApprovedThisPass
             ? PLAN_MODE_APPROVED_NOTE
             : PLAN_MODE_OFF_NOTE;
-    const systemForThisRequest = !opts.system && !dueForNudge && !planFramingNote && !isFinalRound
-      ? ""
-      : [
-          opts.system,
-          planFramingNote,
-          dueForNudge ? nudgeText(toolCallsThisTurn) : "",
-          isFinalRound ? FINAL_ROUND_NOTE : "",
-        ]
-          .filter(Boolean)
-          .join("\n\n");
+    const systemForThisRequest =
+      !opts.system && !dueForNudge && !planFramingNote && !isFinalRound && !forceChunkedCalls
+        ? ""
+        : [
+            opts.system,
+            planFramingNote,
+            dueForNudge ? nudgeText(toolCallsThisTurn) : "",
+            isFinalRound ? FINAL_ROUND_NOTE : "",
+            // The chunking note rides the system turn of the retry only — steering, never
+            // transcript, exactly like the nudge and the plan framing above.
+            forceChunkedCalls ? TRUNCATED_TOOL_CALL_NOTE : "",
+          ]
+            .filter(Boolean)
+            .join("\n\n");
     if (dueForNudge) nudgesSent += 1;
 
     const collected: ToolCall[] = [];
@@ -656,6 +756,28 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       return { text, messages, truncated, hitCeiling: false, iterations: iter };
     }
 
+    // A turn the provider cut at the output cap is **not** a turn whose tool calls can be trusted:
+    // the call in flight is the thing that ran out of budget, so its arguments stop mid-JSON. Re-ask
+    // once with the remedy attached (see `TRUNCATED_TOOL_CALL_NOTE`) rather than executing a call
+    // whose payload never finished arriving. This is the guard the terminal-branch check above
+    // cannot reach: that one is gated on `collected.length === 0`, so a length cut carrying tool
+    // calls fell straight through to execution — the measured 2026-10-13 defect. Whatever a re-ask
+    // still cannot deliver is caught by `argumentProblem` below, which refuses it and says why.
+    if (
+      finishReported &&
+      finishReason === "length" &&
+      collected.length > 0 &&
+      truncatedToolCallRetries < TRUNCATED_TOOL_CALL_RETRIES
+    ) {
+      truncatedToolCallRetries += 1;
+      iter -= 1; // the for's increment restores it: the retry re-runs this iteration number
+      forceChunkedCalls = true;
+      // The same event the other truncation class reports: the stream did end early — at the cap
+      // rather than without a finish — and the loop is re-asking the same iteration either way.
+      onEvent?.({ type: "truncation_retry", attempt: truncatedToolCallRetries });
+      continue;
+    }
+
     // Replay the assistant turn with its tool_calls so the provider accepts the results.
     // The wire entries and the ids come from ONE decision (`toWireToolCalls`), so the results
     // appended below are guaranteed to name a call this turn actually declared — the pairing
@@ -671,17 +793,38 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     // dialog at all and are the common case. The transcript appends stay in call order in the
     // third loop, so a result always lands under the tool_call it answers regardless of which
     // execution finished first.
-    const parsed = collected.map((call) => ({ call, args: parseArgs(call.arguments) }));
+    // `args` is what the executor gets (always an object, `{}` when there is nothing to parse) and
+    // `problem` is what the *transcript* needs: the reason this call cannot run at all. Keeping both
+    // is what lets a payload that never finished arriving be refused with its cause, instead of
+    // being executed as an empty object and reported as a missing key.
+    const parsed = collected.map((call) => ({
+      call,
+      args: parseArgs(call.arguments),
+      problem: argumentProblem(call.arguments),
+    }));
 
     const verdicts: { allow: boolean; denyReason: string }[] = [];
     // Sparse, positional like `verdicts`: index i holds the settled sentence for a plan-mode
     // control call, undefined for every other call.
     const planNotes: (PlanNote | undefined)[] = [];
     for (let i = 0; i < parsed.length; i++) {
-      const { call, args } = parsed[i]!;
+      const { call, args, problem } = parsed[i]!;
       if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
+      // The segment is opened for **every** call, malformed ones included: the timeline's
+      // `tool_result` fills the last segment still `calling`, so a call whose result is an error
+      // must still have opened one or its explanation would render nowhere.
       onEvent?.({ type: "tool_call", call });
       const name = call.name ?? "(unknown)";
+
+      // What is skipped is the *approval*, not the result. A call whose arguments never finished
+      // arriving cannot run, so there is nothing for the user to approve and no dialog is owed; the
+      // reason lands as this call's result in the execution phase below. The verdict is still pushed
+      // — one per call, in order — because the execution map indexes `verdicts` and `parsed` by the
+      // same `i`.
+      if (problem) {
+        verdicts.push({ allow: true, denyReason: "" });
+        continue;
+      }
 
       // The plan-mode pair first, and instead of the gate: their approval is their own interaction
       // with the user (a plan review, a mode consent), which the effect policy cannot express —
@@ -944,13 +1087,20 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     }
 
     const executed: { name: string; resultText: string; ok: boolean }[] = await Promise.all(
-      parsed.map(async ({ call, args }, i) => {
+      parsed.map(async ({ call, args, problem }, i) => {
         const name = call.name ?? "(unknown)";
         const { allow, denyReason } = verdicts[i]!;
         let resultText: string;
         let ok = true;
 
-        if (!allow) {
+        if (problem) {
+          // Refused here rather than sent as `{}`. An empty object is what turned a truncated
+          // `write_file` into `missing argument "path"` — a message naming a missing key while the
+          // real cause was a payload that never finished arriving. This sentence is the result the
+          // model reads on the next round-trip, which is where the remedy can still be acted on.
+          resultText = argumentProblemMessage(name, problem);
+          ok = false;
+        } else if (!allow) {
           resultText = denyReason;
           ok = false;
         } else if (planNotes[i]) {
@@ -1225,6 +1375,25 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     );
     lastTools = executed;
 
+    // **Every tool result of this turn goes out before any image does, and that ordering is the
+    // whole fix.** The image rides on its own `user` message (see below), so building it inline put
+    // a `user` message *between* two `tool_result`s whenever the turn called `read_image` alongside
+    // any other tool. Anthropic requires each `tool_use` to be answered by a `tool_result` in the
+    // message **immediately** after it, and rejects the entire request otherwise — measured
+    // 2026-10-15 against `agentrouter.org`, on the exact shape this loop produced:
+    //
+    //   messages.1:`tool_use` ids were found without `tool_result` blocks immediately after:
+    //   call_2. Each `tool_use` block must have a corresponding `tool_result` block in the next
+    //   message.
+    //
+    // The run that exposed it called `read_image` and `run_command` in one turn (agent_steps 9/10):
+    // the image message split the two results and every attempt for that request failed — 6 tool
+    // calls in, 224k prompt tokens, `iterations = 0`, the whole turn lost. Deferring the image
+    // messages until the run is complete keeps the results consecutive, and the image still arrives
+    // with its note, one message later: proven by the same experiment, which answers `200` when the
+    // two `tool_result`s are together and the image follows. See docs/dev-book/07-drift-register.md
+    // D109.
+    const imageMessages: ChatMessage[] = [];
     for (let i = 0; i < executed.length; i++) {
       const r = executed[i]!;
       // `read_image` (and `generate_image`, which lands its result in the same marker format)
@@ -1240,7 +1409,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
         const verb = r.name === "generate_image" ? "generated and saved" : "loaded";
         const receipt = `image ${verb}: ${imageData.path} (${Math.round(imageData.bytes / 1024)} KB) — attached as an image part below`;
         messages.push({ role: "tool", content: receipt, tool_call_id: ids[i]! });
-        messages.push({
+        imageMessages.push({
           role: "user",
           content: [
             { type: "text", text: `[image you just loaded with read_image: ${imageData.path}]` },
@@ -1252,6 +1421,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
 
       messages.push({ role: "tool", content: r.resultText, tool_call_id: ids[i]! });
     }
+    messages.push(...imageMessages);
     toolCallsThisTurn += collected.length;
 
     // **The wrap-up round: the budget ran out mid tool_use, so end with an answer, not a dump.**

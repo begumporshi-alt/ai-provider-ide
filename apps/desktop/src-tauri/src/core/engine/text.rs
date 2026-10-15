@@ -7,7 +7,8 @@ use serde_json::Value;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 use crate::core::adapter::{
     AdapterFactory, Cancel, ReasoningEffort, StreamObservation, TextArgs, ToolCall,
@@ -210,6 +211,16 @@ pub async fn execute_text(
     // The plan's own clock, and the flag that keeps the *first attempted* candidate exempt from the
     // budget. Stamped here rather than in the caller because this is the layer that knows how many
     // candidates there are — see `PLAN_BUDGET`.
+    //
+    // **`tokio::time::Instant`, not `std::time::Instant`, and the difference is a test that could
+    // not fail (fixed 2026-10-13).** The budget is enforced against this clock, but every wait the
+    // loop performs — the 2 s re-probe backoff — is a `tokio::time::sleep`. Under
+    // `#[tokio::test(start_paused = true)]` the paused clock advances sleeps for free while a `std`
+    // `Instant` does not move at all, so the admission rule read an elapsed time of ~0 across the
+    // whole run: *every* re-probe was affordable and the test exercised only the count, never the
+    // budget. That is why `SERVER_ERROR_REPROBES_MAX = 3` passed for a day while production capped
+    // at one re-probe. Reading the clock from the same source the waits use makes the two agree,
+    // and in production (unpaused) this is identical to `std::time::Instant`.
     let plan_started = Instant::now();
     let mut attempted_any = false;
 

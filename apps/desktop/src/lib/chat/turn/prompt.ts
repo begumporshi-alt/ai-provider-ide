@@ -20,6 +20,9 @@ export const AGENT_SYSTEM =
   "For the public web, web_search (keyless, with fallback backends) finds pages, web_fetch reads one, " +
   "and web_ask answers a question about a page without loading it into this conversation. " +
   "read_document reads PDFs and Word files; read_image shows you an image if you support vision. " +
+  "For image work beyond reading one — resize, crop, convert, optimise, or measure its real pixel " +
+  "size — call sips through run_command (sips -Z 1600 in.jpg --out out.jpg; sips -g pixelWidth " +
+  "-g pixelHeight img.jpg). " +
   "For any task with several steps, maintain the task list with todo_write (the whole list, each " +
   "task pending/in_progress/completed, one in_progress at a time) — the user watches it live. " +
   "Prefer inspecting before editing, and prefer edit_file over rewriting a whole file. " +

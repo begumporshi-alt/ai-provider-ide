@@ -373,10 +373,33 @@ pub fn shape_tool_declarations(
 /// Our internal content as an array of parts — the neutral side, before the rename.
 fn as_parts(content: &Value) -> Vec<Value> {
     match content {
-        Value::Array(items) => items.clone(),
+        // **Empty text parts are dropped, in both spellings.** A `text` part carrying no text is
+        // not content in any dialect — Anthropic-shaped upstreams reject the block outright — and
+        // one arrives here whenever an assistant turn carries `content: ""` beside its
+        // `tool_calls`, because Phase F (`gateway_normalizer::ensure_array_content`) turns that
+        // empty string into `[{type:"text",text:""}]` before this runs. The string arm below
+        // already refused to *make* such a part; the array arm passed one through, so whether the
+        // guard held depended on which layer had normalised the message. Measured 2026-10-14
+        // (D107): the rendered body carried the empty block ahead of the `tool_use`, and
+        // `agent-router` answered those requests `500 … "invalid_request_error"` with
+        // `tokens_in = 0`.
+        Value::Array(items) => items.iter().filter(|p| !is_empty_text_part(p)).cloned().collect(),
         Value::String(s) if !s.is_empty() => vec![json!({ "type": "text", "text": s })],
         _ => Vec::new(),
     }
+}
+
+/// Whether a content part is a `text` block carrying no text.
+///
+/// **Only `text` is judged.** An `image`, `tool_use` or `tool_result` part legitimately has no
+/// `text` field, and a part type this router does not recognise is left alone rather than silently
+/// dropped — this function removes the one thing that is provably empty, not everything it cannot
+/// classify.
+fn is_empty_text_part(part: &Value) -> bool {
+    if part.get("type").and_then(Value::as_str) != Some("text") {
+        return false;
+    }
+    part.get("text").and_then(Value::as_str).unwrap_or_default().is_empty()
 }
 
 fn non_null(v: Option<&Value>) -> Option<&Value> {
@@ -795,6 +818,50 @@ mod tests {
                 { "type": "tool_result", "tool_use_id": "c2", "content": "file b" }
             ])
         );
+    }
+
+    /// **The empty turn, in both spellings.** An assistant turn that is nothing but tool calls —
+    /// which is every tool-calling turn in every agent transcript — carries `content: ""`. It must
+    /// contribute no text block, and for a long time it did: `as_parts` refuses to *make* a text
+    /// part out of an empty string, but Phase F (`ensure_array_content`) converts `content: ""` to
+    /// `[{type:"text",text:""}]` one layer earlier, so the guard was defeated by the spelling.
+    ///
+    /// Measured 2026-10-14 (D107). Every tool-calling turn in the gateway's own `session_messages`
+    /// has the content empty — `s-1791964428639` seq 2 is `clen = 0` with two calls — and
+    /// `agent-router` answered the requests carrying them `500 … "invalid_request_error"` with
+    /// `tokens_in = 0` (ledger 4280/4283/4340). The empty block is the only part in those bodies
+    /// that the caller never sent.
+    #[test]
+    fn an_empty_assistant_turn_contributes_no_text_block_however_it_is_spelled() {
+        let parts = anthropic_parts();
+        for spelling in [json!(""), json!([{ "type": "text", "text": "" }])] {
+            let messages = vec![
+                json!({ "role": "user", "content": "hi" }),
+                json!({
+                    "role": "assistant",
+                    "content": spelling,
+                    "tool_calls": [
+                        { "id": "call_1", "type": "function",
+                          "function": { "name": "list_dir", "arguments": "{\"path\": \".\"}" } }
+                    ]
+                }),
+                json!({ "role": "tool", "content": "a.txt", "tool_call_id": "call_1" }),
+            ];
+            let out = attach_tool_parts(
+                &messages,
+                parts.get("toolCall").and_then(Value::as_object),
+                parts.get("toolResult").and_then(Value::as_object),
+            )
+            .unwrap();
+            let content = out[1]["content"].as_array().expect("the assistant content is parts");
+            assert_eq!(
+                content.len(),
+                1,
+                "the tool_use is the whole turn — an empty text block is a part the caller never \
+                 sent (spelled {spelling}): {content:?}"
+            );
+            assert_eq!(content[0]["type"], "tool_use");
+        }
     }
 
     #[test]

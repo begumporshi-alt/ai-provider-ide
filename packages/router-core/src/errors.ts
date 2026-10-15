@@ -2,7 +2,7 @@
  * error-taxonomy (§2.10): the ONLY classification the execution engine uses to decide
  * rotate / failover / drift. Maps an HTTP status (+ optional body signal) to a class.
  */
-import { detectClientGate, detectNotFound } from "./client-gate.js";
+import { detectClientGate, detectInvalidRequest, detectNotFound } from "./client-gate.js";
 
 export type ErrorClass =
   | "AUTH_FAILED"
@@ -74,6 +74,9 @@ export function classifyHttp(status: number, body: string | undefined | null): E
   const gate = detectClientGate(status, body);
   if (gate) return classify(status, "client_gate");
   if (detectNotFound(status, body)) return classify(status, "not_found");
+  // A 5xx whose body names an invalid request: the status blames the provider for a body its own
+  // upstream refused without reading (measured 2026-10-14 — see client-gate.ts).
+  if (detectInvalidRequest(status, body)) return classify(status, "schema");
   return classify(status);
 }
 
@@ -90,7 +93,11 @@ export function classify(status: number, bodyHint?: "schema" | "not_found" | "cl
   // Billing: the provider answered, so nothing about the transport or the credential is wrong.
   // Not drift (the manifest is fine), not key-retryable (the pool does not refill per key).
   if (status === 402) return "BILLING";
-  if (status >= 500) return "SERVER_ERROR";
+  // The one arm where a hint overrides its own status. An aggregator wraps its upstream's rejection
+  // of *our request* in a server-class status, so `SERVER_ERROR` would retry a body the provider had
+  // already refused to read. Measured 2026-10-14 (ledger 4280/4283): 3–4 dials, ~19 s, `tokens_in =
+  // 0`, and the identical refusal on every dial.
+  if (status >= 500) return bodyHint === "schema" ? "BAD_REQUEST_SCHEMA" : "SERVER_ERROR";
   return "NETWORK";
 }
 

@@ -7,6 +7,7 @@ export {
   type CodeGenerationDeps, type CodeReviewContext,
 } from "./code-candidate.js";
 export { selectAll, selectOne, parsePath } from "./jsonpath.js";
+export { describeRequest, isShapeRefusal, refusalShape } from "./request-shape.js";
 export { renderTemplate } from "./template.js";
 export {
   BUILTIN_TEMPLATES, PROVIDER_PROFILES, PROVIDER_PROFILE_LABELS, profileForBaseUrl,

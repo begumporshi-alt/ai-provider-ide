@@ -9,7 +9,7 @@ import { readFileSync } from "node:fs";
 import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
   SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult,
-  FINAL_ROUND_NOTE,
+  FINAL_ROUND_NOTE, TRUNCATED_TOOL_CALL_NOTE, argumentProblem,
   resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
 } from "./agentLoop";
 import { AGENT_TOOLS, FAN_OUT_MAX } from "./registry";
@@ -914,6 +914,69 @@ describe("runAgentLoop", () => {
     expect(JSON.stringify(out.messages)).not.toContain("READ_IMAGE:");
   });
 
+  it("keeps every tool result of a turn together when one of them carries an image", async () => {
+    // **The failure this pins cost a whole agent run.** `read_image`'s payload rides on its own
+    // `user` message, so building that message while walking the results put a `user` message
+    // *between* two `tool_result`s as soon as the turn called `read_image` alongside any other
+    // tool. Anthropic requires each `tool_use` to be answered in the message immediately after it
+    // and rejects the whole request otherwise — measured 2026-10-15 against `agentrouter.org`:
+    //
+    //   messages.1:`tool_use` ids were found without `tool_result` blocks immediately after:
+    //   call_2. Each `tool_use` block must have a corresponding `tool_result` block in the next
+    //   message.
+    //
+    // Falsified both ways before being trusted: the split order (image between the results) still
+    // reproduces `400 invalid_request_error`, and moving the image after both results answers
+    // `200`. See docs/dev-book/07-drift-register.md D109.
+    const PNG_B64 = "iVBORw==";
+    const host: ToolHost = {
+      async run(name, args) {
+        if (name === "read_image") {
+          return { ok: true, output: `READ_IMAGE:image/png;base64,${PNG_B64}\npath: hero.png\nbytes: 5` };
+        }
+        return { ok: true, output: `ran ${name} ${JSON.stringify(args)}` };
+      },
+    };
+    // One assistant turn, two calls — the exact shape that split: an image-reading tool and a
+    // plain one, image first.
+    const model = fakeModel([
+      {
+        text: "loading and running",
+        calls: [
+          { id: "c1", name: "read_image", arguments: '{"path":"hero.png"}' },
+          { id: "c2", name: "run_command", arguments: '{"program":"python3"}' },
+        ],
+      },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    const toolIdx = out.messages.map((m, i) => (m.role === "tool" ? i : -1)).filter((i) => i >= 0);
+    expect(toolIdx.length, "both results are recorded").toBe(2);
+    // Contiguity is the property, not just the count: nothing may sit between the results.
+    expect(
+      toolIdx[1]! - toolIdx[0]!,
+      "the two tool results are adjacent — no user message may split them",
+    ).toBe(1);
+
+    const attachIdx = out.messages.findIndex(
+      (m) => m.role === "user" && Array.isArray(m.content) && JSON.stringify(m.content).includes(PNG_B64),
+    );
+    expect(attachIdx, "the image is still attached").toBeGreaterThan(-1);
+    expect(
+      attachIdx,
+      "and it arrives after every tool result, not between them",
+    ).toBeGreaterThan(toolIdx[1]!);
+    expect(JSON.stringify(out.messages)).not.toContain("READ_IMAGE:");
+  });
+
   it("generate_image refuses with guidance when no image port exists", async () => {
     const ran: string[] = [];
     const host: ToolHost = {
@@ -1678,6 +1741,143 @@ describe("runAgentLoop", () => {
     const result = events.find((e) => e.type === "tool_result");
     expect(result && result.type === "tool_result" && result.ok).toBe(false);
     expect(result && result.type === "tool_result" && result.result).toContain("denied");
+  });
+
+  it("separates empty arguments from arguments that never finished", () => {
+    // The distinction this fix rests on. Absent and empty are one finding — the model called a tool
+    // that takes no arguments — while a present, non-empty payload that will not parse is a call
+    // that never finished arriving. Valid-but-wrong-shape is a third thing, and the message the
+    // model reads has to name the right cause in each case.
+    expect(argumentProblem(undefined)).toBeNull();
+    expect(argumentProblem("")).toBeNull();
+    expect(argumentProblem("   ")).toBeNull();
+    expect(argumentProblem("{}")).toBeNull();
+    expect(argumentProblem('{"path":"a"}')).toBeNull();
+    expect(argumentProblem('{"path":"a","content":"unterminated')).toBe("truncated");
+    expect(argumentProblem("[]")).toBe("not-an-object");
+    expect(argumentProblem("42")).toBe("not-an-object");
+    expect(argumentProblem("null")).toBe("not-an-object");
+  });
+
+  it("re-asks a turn the output cap cut mid-call instead of running the truncated call", async () => {
+    // Measured 2026-10-13 from this machine's `session_messages`: four consecutive `write_file`
+    // calls at 24 444 / 31 480 / 31 213 / 30 854 characters, every one invalid JSON ending
+    // mid-string or mid-tag, each answered `missing argument "path"` — while the 327-character call
+    // in the same turn parsed and wrote 258 bytes. The guard that should have caught it was gated on
+    // `collected.length === 0`, so a length cut carrying tool calls fell straight through and
+    // executed. Pinned here: the truncated call never runs, and the re-ask carries the remedy.
+    const ran: Array<Record<string, unknown>> = [];
+    const systemTurns: string[] = [];
+    const host: ToolHost = {
+      async run(_name, args) {
+        ran.push(args);
+        return { ok: true, output: "wrote 2 bytes" };
+      },
+    };
+    const events: AgentEvent[] = [];
+    const truncated = '{"path":"big.html","content":"' + "x".repeat(4000);
+    let calls = 0;
+    const model: GenerateFn = async (req) => {
+      calls += 1;
+      const system = req.messages.find((m) => m.role === "system");
+      systemTurns.push(typeof system?.content === "string" ? system.content : "");
+      if (calls === 1) {
+        req.onToolCall?.({ id: "c1", name: "write_file", arguments: truncated });
+        req.onFinish?.("length");
+        return streamOf("building the file");
+      }
+      if (calls === 2) {
+        req.onToolCall?.({
+          id: "c2",
+          name: "write_file",
+          arguments: '{"path":"small.html","content":"hi"}',
+        });
+        req.onFinish?.("stop");
+        return streamOf("chunking instead");
+      }
+      return streamOf("done");
+    };
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(events).toContainEqual({ type: "truncation_retry", attempt: 1 });
+    // The truncated payload never reached the sandbox; only the re-ask's small call did.
+    expect(ran).toEqual([{ path: "small.html", content: "hi" }]);
+    expect(systemTurns[0]).not.toContain(TRUNCATED_TOOL_CALL_NOTE);
+    expect(systemTurns[1]).toContain(TRUNCATED_TOOL_CALL_NOTE);
+  });
+
+  it("refuses a call whose arguments never finished, naming the cause not a missing key", async () => {
+    // The same payload with no finish report at all (a manifest declaring no finish selector), so
+    // the local half has to stand on its own. Before this, `parseArgs` returned `{}`, the sandbox
+    // was handed an empty object, and it answered `missing argument "path"` — naming a missing key
+    // while the real cause was a payload that never finished arriving.
+    const ran: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        ran.push(name);
+        return { ok: true, output: "r" };
+      },
+    };
+    const events: AgentEvent[] = [];
+    const model = fakeModel([
+      {
+        text: "building",
+        calls: [{ id: "c1", name: "write_file", arguments: '{"path":"a.html","content":"' }],
+      },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      onEvent: (e) => events.push(e),
+    });
+
+    expect(ran, "a payload that never finished must not be sent as an empty object").toEqual([]);
+    const toolMessage = out.messages.find((m) => m.role === "tool");
+    expect(String(toolMessage?.content)).toContain("were cut off before they were valid JSON");
+    expect(String(toolMessage?.content)).not.toContain("missing argument");
+    // The call still opens a timeline segment, or its explanation would render nowhere: the
+    // reducer's `tool_result` fills the last segment still `calling`.
+    expect(events.some((e) => e.type === "tool_call")).toBe(true);
+  });
+
+  it("still runs a call with empty arguments, which are not a truncation", async () => {
+    // The control that keeps the refusal honest. `""` is what OpenAI-shaped servers send for a tool
+    // that takes none, and folding it into the truncation class would refuse every legitimately
+    // argument-free call.
+    const ran: Array<Record<string, unknown>> = [];
+    const host: ToolHost = {
+      async run(_name, args) {
+        ran.push(args);
+        return { ok: true, output: "listed" };
+      },
+    };
+    const model = fakeModel([
+      { text: "listing", calls: [{ id: "c1", name: "list_dir", arguments: "" }] },
+      { text: "done" },
+    ]);
+
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    expect(ran).toEqual([{}]);
   });
 
   it("uses the gate's own reason when the refusal was not the user's doing", async () => {

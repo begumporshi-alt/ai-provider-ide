@@ -13,6 +13,7 @@ import type { AdapterInstance } from "./adapter-instance.js";
 import type { ToolCall, UsageTokens } from "./ports.js";
 import { shapeMessageContent, textOfContent } from "./content-parts.js";
 import { reasoningDeltaOf } from "./stream-shape.js";
+import { refusalShape } from "./request-shape.js";
 import {
   attachToolParts, readToolCalls, shapeToolDeclarations, type ToolCallShape, type ToolPartTemplates,
 } from "./tool-shaping.js";
@@ -799,8 +800,17 @@ export class ManifestHttpError extends Error {
     readonly kind: "response" | "mid-stream" = "response",
     /** What the provider asked us to wait before coming back, when it said. */
     readonly retryAfterMs?: number,
+    /**
+     * What the *outgoing request* looked like, when the status says the body is what was refused
+     * ([`refusalShape`]). Carried on the error rather than logged, because this twin has no logger:
+     * the caller that shows or records the failure is the one that can print it.
+     */
+    readonly requestShape?: string,
   ) {
-    super(`provider HTTP ${status} (${kind}): ${body.slice(0, 400)}`);
+    super(
+      `provider HTTP ${status} (${kind}): ${body.slice(0, 400)}` +
+        (requestShape ? ` | ${requestShape}` : ""),
+    );
   }
 }
 
@@ -962,15 +972,36 @@ export class ManifestInterpreter implements AdapterInstance {
     // `:generateContent` vs `:streamGenerateContent?alt=sse`).
     const dialedPath = streaming && ep.streamPath ? ep.streamPath : ep.path;
     const url = joinUrl(this.m.provider.baseUrl, renderPath(dialedPath, args.model));
+    // Serialized once, and its length kept: the refusal branch below reports the body's size, and
+    // re-serializing a multi-megabyte request there would double the cost of a failure for a number
+    // already in hand. Rust twin: `interpreter.rs`, which made the same change for the same reason.
+    const payload = JSON.stringify(body);
     const res = await this.ctx.http.request({
       url,
       method: "POST",
       headers: { ...authHeaders(this.m), "content-type": "application/json", ...renderHeaders(ep.headers, this.ctx.vars) },
-      body: JSON.stringify(body),
+      body: payload,
       secretRef,
       signal,
     });
-    if (res.status >= 400) throw new ManifestHttpError(res.status, await res.text(), "response", retryAfterFrom(res.headers));
+    if (res.status >= 400) {
+      // **The only moment the outgoing body is still in hand, so the only moment a refusal can be
+      // made to describe its own cause.** Four refusals in a row (D107, D108, D109, D110) reached
+      // the ledger as `500 … "invalid_request_error"` and nothing else — nothing about the *request*
+      // survives a failure, so each was diagnosed by archaeology and D110 is still unexplained
+      // because its request was never written down at all. `refusalShape` renders the structure that
+      // decides validity (unanswered `tool_use`, duplicate ids, undeclared tools, parts no dialect
+      // can name) as one line, structural only — ids and counts, never message text — so it is safe
+      // to carry on the error. It is `undefined` for the statuses that are about the key, the
+      // balance, the route or the pace, where the shape is not in question.
+      throw new ManifestHttpError(
+        res.status,
+        await res.text(),
+        "response",
+        retryAfterFrom(res.headers),
+        refusalShape(res.status, body, payload.length),
+      );
+    }
 
     if (!streaming || !spec) {
       const json: unknown = jsonBody(await res.text(), url);

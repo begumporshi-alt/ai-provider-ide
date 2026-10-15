@@ -24,6 +24,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use axum::body::Body;
+use axum::extract::DefaultBodyLimit;
 use axum::http::{header, HeaderMap, HeaderValue, Method, Request, StatusCode};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -43,6 +44,35 @@ pub const MAX_CONCURRENT: usize = 8;
 pub const MAX_QUEUED: usize = 32;
 /// Admission ceiling. Not a concurrency limit — see `dispatch`.
 const MAX_TOTAL: usize = MAX_CONCURRENT + MAX_QUEUED;
+
+/// The largest request body the gateway will buffer, in bytes.
+///
+/// **Why this exists at all: axum's default is 2 MB and nothing in this repo declared it.** The
+/// ingress handlers take their body as a buffering extractor (`gateway_handlers.rs::chat_h`'s
+/// `body: String`), so `DefaultBodyLimit`'s default applied to every route. Measured 2026-10-13
+/// from a client's report — `413 Failed to buffer the request body: length limit exceeded`, which
+/// is axum's own `LengthLimitError` wording — while **neither `aiproviderd.log` nor `gateway.log`
+/// held a single line about it**: the rejection happens in the extractor, before the handler and
+/// therefore before this module logs anything. An operator saw a 413 with no row anywhere.
+///
+/// **64 MB, from the measurement rather than from taste.** The ledger's own largest recorded
+/// request is **238 823** input tokens (`SELECT max(tokens_in) FROM ledger`), on the order of 1 MB
+/// of JSON — so ordinary traffic already ran near half the old cap, and one long agent session
+/// carrying tool results is enough to cross it. The headroom above that is for images: clients
+/// carry attachments as base64 content parts, and a single binary write is already allowed to be
+/// `MAX_WRITE_BYTES_BINARY` (8 MB, `tools.rs`) — ~10.7 MB once base64-inflated — so a transcript
+/// with a handful of images is tens of megabytes by construction.
+///
+/// **It stays bounded, and the reason it can be generous is the binding.** `spawn` listens on
+/// `Ipv4Addr::LOCALHOST` only, so this is a loopback surface, not a public one; the constant bounds
+/// memory per request for local clients rather than defending a network boundary.
+///
+/// **Residual, stated rather than hidden:** extraction happens before `dispatch` takes its
+/// admission permit, so bodies are buffered for connections that will only later queue or be
+/// refused. The worst case is therefore a multiple of accepted connections rather than
+/// `MAX_TOTAL x` this value. Streaming the body into the parser is what would remove that, and it
+/// is the follow-up if it ever matters.
+pub const MAX_REQUEST_BODY_BYTES: usize = 64 * 1024 * 1024;
 
 /// Pluggable master-key lookup so the HTTP surface is testable without touching the real
 /// OS vault. Production passes the vault-backed closure.
@@ -1373,7 +1403,16 @@ impl GatewayCore {
 ///
 /// Only the FIRST message is bounded. Once the bridge is demonstrably working on the request, a
 /// slow stream is a slow stream, and cutting it off would break long answers.
-pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// **40s, raised from 30s on 2026-10-13 to keep this strictly above the engine's plan budget.** The
+/// two are one ordering — `PLAN_BUDGET (36s) < FIRST_MSG_TIMEOUT (40s)` — and it is load-bearing in
+/// one direction only: the engine must give up *first*, so the request carries the real error class
+/// from the attempt chain instead of being cancelled here and filed `CANCELLED`. The plan budget had
+/// to grow to make the re-probe rounds reachable (see `engine::SERVER_ERROR_REPROBES_MAX`), so this
+/// grew with it. The cost is honest and bounded: a bridge that never speaks at all now fails after
+/// 40s rather than 30s. It does not lengthen a normal request — this bounds the wait for the *first*
+/// message, and a provider that answers starts the stream long before it.
+pub const FIRST_MSG_TIMEOUT: Duration = Duration::from_secs(40);
 
 /// RAII slot: permit + registration + receiver, all released on drop — including on client
 /// disconnect mid-stream, which is what makes §3.5 cancellation work.
@@ -2408,6 +2447,10 @@ pub async fn spawn(core: Arc<GatewayCore>, port: u16) -> Result<ServerHandle, St
         .fallback(unknown_route)
         .layer(middleware::from_fn(ensure_retry_after))
         .layer(middleware::from_fn(cors_headers))
+        // Buffering extractors (`body: String`, `Json<_>`) read this extension, so it has to sit in
+        // the stack above every route that takes one. Without it axum's 2 MB default applied to the
+        // whole surface and nothing declared that it did — see `MAX_REQUEST_BODY_BYTES`.
+        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(core);
     let (tx, rx) = oneshot::channel::<()>();
     tokio::spawn(async move {

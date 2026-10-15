@@ -228,6 +228,43 @@ mod tests {
     }
 
     #[test]
+    fn a_500_that_names_an_invalid_request_is_a_request_fault_not_a_server_flap() {
+        // The aggregator's own words, measured live 2026-10-14 on agent-router (ledger 4280/4283),
+        // where **every dial** of a four-dial chain returned exactly this with `tokens_in = 0`.
+        let body = r#"{"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"},"type":"error"}"#;
+        let err = AttemptError::Http {
+            status: 500,
+            kind: FailureKind::Response,
+            retry_after_ms: None,
+            body: Some(body.to_string()),
+        };
+        let cls = classify_attempt_error(&err);
+        assert_eq!(cls, ErrorClass::BadRequestSchema);
+        // The consequences are the reason the class matters, so they are pinned beside it rather
+        // than left to the reader: the request is what was wrong, so the key is not burned...
+        assert!(cls.is_drift(), "a request fault says nothing about the key");
+        // ...and because asking again cannot change that, nothing may rotate a key or re-probe.
+        assert!(!is_retryable_with_next_key(cls), "a refused request is not rescued by retrying");
+        // The words the operator sees must blame the request, not the provider.
+        assert_eq!(cls.as_str(), "BAD_REQUEST_SCHEMA");
+    }
+
+    #[test]
+    fn a_500_that_says_nothing_about_the_request_still_retries() {
+        // The other half of the rule, and the one that keeps it safe: a 5xx that never mentions the
+        // request is an upstream flap, and the retry that follows it is the correct behaviour.
+        let err = AttemptError::Http {
+            status: 503,
+            kind: FailureKind::Response,
+            retry_after_ms: None,
+            body: Some(r#"{"error":{"message":"overloaded"}}"#.to_string()),
+        };
+        let cls = classify_attempt_error(&err);
+        assert_eq!(cls, ErrorClass::ServerError);
+        assert!(is_retryable_with_next_key(cls), "an upstream flap must still rotate");
+    }
+
+    #[test]
     fn an_unnamed_status_is_a_transport_failure_rather_than_a_guess() {
         // Pinned because it is a decision, not an accident: a 3xx redirect is "not named by this
         // taxonomy", and the TypeScript falls through to NETWORK for it. 402 left that bucket on
@@ -2453,9 +2490,11 @@ mod tests {
         // and one re-probe was not enough — rows 3773/3775/3779 each exhausted the plan and
         // surfaced a hard error. Bounded still means bounded: `SERVER_ERROR_REPROBES_MAX` rounds
         // on the final candidate, then the request fails with every round in the chain. Paused
-        // time is what lets the three 2 s waits sleep for free while the plan budget's real
-        // `Instant` stays near zero, so every round is affordable and the count — not the clock —
-        // is what stops the loop.
+        // time is what lets the three 2 s waits sleep without a nine-second test, and — since
+        // `text.rs` reads `tokio::time::Instant` — the same paused clock the budget is measured
+        // against, so the admission rule sees the waits it is meant to see rather than a frozen
+        // zero. See `the_reprobe_budget_is_reachable_at_the_measured_cadence` for the arithmetic
+        // that ties this count to `PLAN_BUDGET`.
         let adapter =
             TextScripted::new(vec![refused(503), refused(503), refused(503), refused(503)])
                 .shared();
@@ -2481,6 +2520,68 @@ mod tests {
             other => panic!("expected AllAttemptsFailed, got {other:?}"),
         }
         assert_eq!(adapter.calls().len(), 4, "first dial + three re-probes, never a fifth");
+    }
+
+    /// The count above is only meaningful if the *budget* can fund it — and for a day it could not.
+    ///
+    /// `the_reprobe_budget_is_three_rounds_and_no_fourth_redial` runs on a paused clock, so its
+    /// attempts cost nothing and every round is affordable by construction. Production is the
+    /// opposite: the two keys of one provider spend real time failing before the first re-probe can
+    /// even be decided, and the admission rule (`candidate_is_affordable(elapsed + wait, false)`)
+    /// prices each round at a full `UPSTREAM_HEADER_TIMEOUT` behind its wait. Against the 26 s
+    /// budget this constant was written under, that left a 4 s window — measured 3.66 s to decide
+    /// round one (ledger row 4083), so round two was refused and round three was unreachable
+    /// whatever the timing. The engine then behaved as `SERVER_ERROR_REPROBES_MAX = 1`, and rows
+    /// 4075/4079/4083 failed at three dials with the count claiming four were available.
+    ///
+    /// This pins the arithmetic rather than the intent: at the cadence measured from those rows
+    /// (a refused dial costing ~1.8 s), every one of the three rounds must be affordable, and the
+    /// first round must be refused if the plan budget ever drops back toward the old value.
+    #[test]
+    fn the_reprobe_budget_is_reachable_at_the_measured_cadence() {
+        use crate::core::egress::UPSTREAM_HEADER_TIMEOUT as ATTEMPT;
+
+        // Ledger 4083, 2026-10-13: dispatched at 11:41:18.023, round one decided at 11:41:21.687
+        // once both of the provider's keys had 500'd — so a refused dial costs ~1.83 s here — and
+        // the request dead at 11:41:25.326.
+        let dial = Duration::from_millis(1_830);
+        let wait = SERVER_ERROR_RETRY_BACKOFF;
+
+        // The k-th re-probe is decided after the provider's two initial dials, then after each
+        // preceding wait plus its redial. `u32` because `Duration` multiplies by `u32`.
+        let rounds = SERVER_ERROR_REPROBES_MAX as u32;
+        let decide = |round: u32| dial * 2 + (wait + dial) * (round - 1);
+
+        // A re-probe is admitted by the same rule as any later candidate, with its wait added.
+        for round in 1..=rounds {
+            assert!(
+                candidate_is_affordable(decide(round) + wait, false),
+                "re-probe {round} of {SERVER_ERROR_REPROBES_MAX} is decided at {:?}, and the \
+                 admission rule reserves a full {ATTEMPT:?} behind a {wait:?} wait inside a \
+                 {PLAN_BUDGET:?} plan. When this fails the constant is decorative again: \
+                 production gets fewer rounds than it claims, which is the 2026-10-13 defect.",
+                decide(round)
+            );
+        }
+
+        // The budget is still a bound, not a formality — at this cadence the would-be fourth
+        // round is past it, so the *count* is what stops the loop rather than an accident.
+        assert!(
+            !candidate_is_affordable(decide(rounds + 1) + wait, false),
+            "a fourth round must not be affordable at the measured cadence"
+        );
+
+        // And the regression, stated as the numbers: the window is what `PLAN_BUDGET` leaves after
+        // one wait plus one full attempt. Round one was decided at 3.66 s; the old 26 s budget left
+        // a 4 s window, so round two (decided at 7.49 s) could never fit — which is why raising the
+        // count alone changed nothing.
+        let window = PLAN_BUDGET - (wait + ATTEMPT);
+        assert_eq!(window, Duration::from_secs(14), "the window the current budget leaves");
+        assert!(
+            decide(1) < Duration::from_secs(4) && decide(2) > Duration::from_secs(4),
+            "round one fits the old 4 s window and round two does not; if this stops holding the \
+             measured cadence has moved and the constants want re-deriving"
+        );
     }
 
     /// An adapter whose text stream never yields and never ends — the keep-alive-only stall of

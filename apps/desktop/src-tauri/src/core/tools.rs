@@ -49,11 +49,27 @@ use serde::{Deserialize, Serialize};
 /// (see [`set_extra_programs`]) for the task classes the baseline cannot reach at all — `cargo`,
 /// `curl`, `sqlite3`, `rm`, `mv`. Their additions are validated as bare executable names and are
 /// checked against [`NEVER_ALLOWED`], so an addition cannot be a path or a privilege escalator.
+///
+/// **`sips` is here because image work had no local tool at all.** Measured 2026-10-15 in a real
+/// build (`green-energy-site`): the assistant needed a hero at 1920 and 1100 px and three cards at
+/// 900, had no way to resize anything, and wrote the workaround into a script in the user's own
+/// project — *"no local image tooling is required (sips is not allowlisted here and PIL is
+/// absent)"* — then re-requested every image from Wikimedia's thumbnail API at the width the
+/// layout wanted. That reaches only images a remote service happens to host: it cannot touch a
+/// local file, convert a format, crop, or report the real dimensions of what it just downloaded.
+/// `read_image` lets a vision model *see* an image and `generate_image` *makes* one, so processing
+/// was the entire gap. `sips` is macOS's own image processor, which makes one baseline entry cover
+/// resize, crop, convert, rotate and re-encode with no network, no install and no configuration.
+///
+/// It is not an escalation of the kind [`NEVER_ALLOWED`] exists for: it acts only on the paths it
+/// is given, under the same relative-path argument gate as `cp` and `tar`, and it is neither
+/// destructive outside its own output nor network-facing. The flags it needs (`-Z`, `--out`, `-g`,
+/// `-s`) pass that gate, which refuses absolute paths and `..` rather than flags.
 const BUILTIN_PROGRAMS: &[&str] = &[
     "ls", "cat", "head", "tail", "wc", "grep", "rg", "find", "pwd", "echo", "printf", "date",
     "which", "basename", "dirname", "stat", "du", "diff", "sort", "uniq", "tr", "cut", "sed",
-    "awk", "tar", "unzip", "mkdir", "touch", "cp", "git", "gh", "node", "npm", "npx", "pnpm",
-    "python3", "pip3", "make",
+    "awk", "tar", "unzip", "sips", "mkdir", "touch", "cp", "git", "gh", "node", "npm", "npx",
+    "pnpm", "python3", "pip3", "make",
 ];
 
 /// Programs that never start — baseline, user-configured, or otherwise.
@@ -2423,6 +2439,45 @@ mod tests {
         );
         assert!(!res.ok, "sleep must not run unconfigured");
         assert!(res.error.unwrap().contains("not on the allowlist"));
+    }
+
+    /// **`sips` is on the baseline because image work had no local tool at all** — the full reason
+    /// is on [`BUILTIN_PROGRAMS`]. This test runs the *capability* rather than reading the list,
+    /// because a list entry the gate would then refuse is not a capability: it writes a real 8×8
+    /// PNG, resizes it to 4×4 through the gated path with no extra programs configured (so it
+    /// proves the **baseline**, not merely addability), and reads the result's own `IHDR` to
+    /// confirm the pixels actually changed. macOS-only, because `sips` is.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sips_resizes_a_real_png_through_the_gate() {
+        // A real PNG rather than the 12-byte signature other fixtures use: `sips` parses the file,
+        // so a truncated header would fail for a reason that has nothing to do with the gate.
+        const PNG_8X8: &str = "iVBORw0KGgoAAAANSUhEUgAAAAgAAAAICAIAAABLbSncAAAAEUlEQVR4nGM4EaCBFTEMLQkAaplQAc/OcKAAAAAASUVORK5CYII=";
+        let dir = root();
+        let bytes = base64::engine::general_purpose::STANDARD.decode(PNG_8X8).unwrap();
+        fs::write(dir.join("src.png"), &bytes).unwrap();
+
+        let none: HashSet<String> = HashSet::new();
+        let res = do_run_command_gated(
+            &obj(&[
+                ("program", serde_json::json!("sips")),
+                ("args", serde_json::json!(["-Z", "4", "src.png", "--out", "small.png"])),
+            ]),
+            &dir,
+            None,
+            &none,
+        );
+        assert!(res.ok, "{:?}", res.error);
+
+        // The PNG's own IHDR is the authority — width at byte 16, height at 20, big-endian — so the
+        // assertion does not depend on `sips -g`'s output format. This is also the fact the
+        // green-energy-site build had to *guess*: `wire_photos.py` hardcoded `height="1087"` from
+        // the width it requested, because nothing could report what it had actually downloaded.
+        let out = fs::read(dir.join("small.png")).unwrap();
+        assert_eq!(&out[12..16], b"IHDR", "the output is a PNG");
+        let w = u32::from_be_bytes(out[16..20].try_into().unwrap());
+        let h = u32::from_be_bytes(out[20..24].try_into().unwrap());
+        assert_eq!((w, h), (4, 4), "8x8 resized to a 4x4 max dimension");
     }
 
     /// …and the same program passes once configured. `sleep` because it is on the child's fixed

@@ -89,6 +89,12 @@ pub enum ErrorClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BodyHint {
     /// The body says the request does not match the schema.
+    ///
+    /// **The one hint that overrides a status it agrees with on paper**, and the only producer is
+    /// `client_gate::detect_invalid_request`. A `400` reaches [`ErrorClass::BadRequestSchema`]
+    /// without it; a `5xx` needs it, because an aggregator wraps its upstream's rejection of *our
+    /// request* in a server-class status — the status blames the provider for a body the provider
+    /// never read.
     Schema,
     /// The body says the model or endpoint is not there.
     NotFound,
@@ -199,6 +205,14 @@ pub fn classify(status: u16, body_hint: Option<BodyHint>) -> ErrorClass {
         return ErrorClass::Billing;
     }
     if status >= 500 {
+        // **The one arm where a hint overrides its own status.** Measured 2026-10-14: agent-router
+        // answered `500 … "type":"invalid_request_error"` with `tokens_in = 0` on every dial of
+        // ledger 4280 and 4283, and the engine spent 3–4 dials and 15–19 s re-probing a body its
+        // upstream had already refused without reading. Asking again cannot rescue a request the
+        // server called invalid, so this must not carry `SERVER_ERROR`'s retryability.
+        if body_hint == Some(BodyHint::Schema) {
+            return ErrorClass::BadRequestSchema;
+        }
         return ErrorClass::ServerError;
     }
     ErrorClass::Network

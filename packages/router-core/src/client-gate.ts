@@ -101,6 +101,42 @@ export function detectNotFound(status: number, body: string | undefined | null):
 }
 
 /**
+ * Markers in a **5xx** body that name *our request* as the thing that was refused.
+ *
+ * Measured 2026-10-14 on `agent-router`, which answered every dial of ledger 4280 and 4283 with
+ *
+ *   `500 {"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"},"type":"error"}`
+ *
+ * and `tokens_in = 0`. The zero is the load-bearing half: the upstream refused before reading the
+ * request, so the verdict is about the body's *shape* and not about the moment. An aggregator
+ * reports that as 5xx because it failed past its own edge — which is precisely why the status
+ * cannot be trusted here and the body has to be.
+ *
+ * Narrow on purpose, in the manner of the lists above. A missed marker falls back to
+ * `SERVER_ERROR` — the status quo, which retries — while a false positive would stop retrying a
+ * genuine upstream flap. Both entries are in a body this system actually received:
+ * `invalid_request_error` is the OpenAI-standard `type`, and the prose is agent-router's own.
+ */
+const INVALID_REQUEST_MARKERS = [
+  "invalid_request_error",
+  "rejected the request as invalid",
+] as const;
+
+/**
+ * Whether a 5xx response body says the **request** was invalid rather than the server unwell.
+ *
+ * A non-5xx status returns `undefined`: below 500 the taxonomy already reads the body for its own
+ * reasons (`detectNotFound` at 400, `detectClientGate` at 401/403), and a 4xx that names an invalid
+ * request is already classified as one. This exists for the one case where the status lies upward.
+ */
+export function detectInvalidRequest(status: number, body: string | undefined | null): string | undefined {
+  if (status < 500) return undefined;
+  if (!body) return undefined;
+  const hay = body.toLowerCase();
+  return INVALID_REQUEST_MARKERS.find((m) => hay.includes(m));
+}
+
+/**
  * What the operator should be told, given a detected gate.
  *
  * Phrased around what was *proved*: the provider refused the client, and by implication did not

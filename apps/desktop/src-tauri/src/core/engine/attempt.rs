@@ -124,23 +124,35 @@ pub const MAX_ATTEMPTS_DEFAULT: usize = 6;
 /// **This is the term that was missing, and its absence is the 2026-09-27 defect.** The egress
 /// layer bounds one attempt (`egress::UPSTREAM_HEADER_TIMEOUT`) and one candidate's retries, but
 /// nothing bounded the *plan* — and `execute_text` walks every candidate the plan offers. With two
-/// candidates that was `2 x 20s = 40s` of worst case against a gateway that abandons the request at
-/// `gateway::FIRST_MSG_TIMEOUT` (30s), so the last candidate was **always** cut off mid-attempt.
-/// The old invariant test pinned only one candidate's budget and so could not see it.
+/// candidates that was `2 x 20s = 40s` of worst case against a gateway that then abandoned the
+/// request at 30s, so the last candidate was **always** cut off mid-attempt. The old invariant test
+/// pinned only one candidate's budget and so could not see it.
 ///
-/// **26s is chosen so the plan is a real bound, not a hope.** Every admitted candidate is funded
-/// for a full `egress::UPSTREAM_HEADER_TIMEOUT` (20s) inside this budget, so nothing admitted can
-/// run past it; and `26s < 30s` leaves 4s for the pre-dispatch work this clock starts after
-/// (memory prepend, routing) plus scheduling slack. The three constants form one ordering —
-/// `20s <= 26s < 30s` — pinned by
+/// **36s is chosen so the plan is a real bound *and* the re-probe budget is reachable.** Every
+/// admitted candidate is funded for a full `egress::UPSTREAM_HEADER_TIMEOUT` (20s) inside this
+/// budget, so nothing admitted can run past it; and `36s < 40s` (`gateway::FIRST_MSG_TIMEOUT`)
+/// leaves room for the pre-dispatch work this clock starts after (memory prepend, routing) plus
+/// scheduling slack. The constants form one ordering — `20s <= 36s < 40s` — pinned by
 /// `egress::tests::the_plan_budget_fits_inside_the_gateway_bound`.
+///
+/// **Why 36s and not the 26s this used to be (found 2026-10-13).** A same-key re-probe is admitted
+/// only when `elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`, so a re-probe must be
+/// *decided* within `PLAN_BUDGET - 22s`. At 26s that window was **4 s** — and the two keys of a
+/// single provider had already spent ~3.7 s failing before the first re-probe was even decided, so
+/// the second round was refused at ~7.5 s and the third was unreachable *by construction*, whatever
+/// the timing. Ledger rows 4079/4083 show that ceiling exactly: three dials, then
+/// `all attempts failed` — and no row in the ledger's whole history has ever carried four.
+/// 36s widens the window to 14 s, and since the k-th re-probe is decided at `ka + 2(k-1)` seconds,
+/// three rounds now fit whenever a refused dial costs up to ~2.5 s — which is what
+/// [`SERVER_ERROR_REPROBES_MAX`] has always claimed. See that constant, and
+/// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence`.
 ///
 /// **Being below the gateway bound is also what makes the failure legible.** When this budget
 /// refuses a candidate the loop ends in [`Ended::Spent`], so the router records the real class
 /// from the attempt chain. Above the gateway bound the request is instead cancelled, and the
 /// router files it as `CANCELLED` — which is how four failed requests on 2026-09-27
 /// (rows 1652/1655/1656/1658, 30 010–30 025 ms) came to look like client aborts.
-pub const PLAN_BUDGET: Duration = Duration::from_secs(26);
+pub const PLAN_BUDGET: Duration = Duration::from_secs(36);
 
 /// Whether a candidate may be started, given how long the plan has already run.
 ///
@@ -188,10 +200,19 @@ pub fn candidate_is_affordable(elapsed: Duration, is_first: bool) -> bool {
 ///
 /// **The wait is flat, not growing, and that is measured, not lazy.** The budget's admission rule
 /// (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) reserves a full 20 s header timeout
-/// behind every wait, so a *growing* cadence loses its last round to the budget exactly when it
-/// matters — the 8 s third round never fits under 26 s, while a flat 2 s keeps every round
-/// affordable and puts four dials inside the request. The cadence that fits the budget beats the
-/// one that reads better.
+/// behind every wait, so the number of affordable rounds is set by the room left after that reserve
+/// — a flat 2 s buys three rounds there, while a doubling cadence (2 s, 4 s, 8 s) spends 14 s on
+/// waits alone and loses the third. The cadence that fits the budget beats the one that reads
+/// better.
+///
+/// **This paragraph used to claim more than the arithmetic allowed, and the correction is the
+/// point.** It said a flat 2 s "keeps every round affordable and puts four dials inside the
+/// request". That is true only once [`PLAN_BUDGET`] was widened to 36 s. Under the 26 s it was
+/// written against, the window was 4 s, so round two was refused and round three was unreachable —
+/// the flat cadence was necessary and nowhere near sufficient. The budget, not the cadence, is what
+/// funds the rounds. See
+/// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence`, which pins the
+/// arithmetic instead of the intent.
 pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 
 /// How many times the text loop may re-dial the **same** final candidate whose plan ran out on a
@@ -199,12 +220,25 @@ pub const SERVER_ERROR_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 ///
 /// **The measured case (2026-10-12, `agent-router` / `deepseek-v4-flash`):** the 2026-10-06 flap
 /// recurred, this time lasting ~37 s, and one re-probe was not enough — ledger rows 3773/3775/3779
-/// each exhausted the plan and surfaced a hard error while the plan budget (26 s) still had dials
-/// to spend. Three rounds put four dials inside the request, spanning ~8 s of real attempt-and-
-/// wait time; no in-request policy can ride out a flap longer than the request budget itself,
-/// which is what client retries and failover to a second provider are for.
+/// each exhausted the plan and surfaced a hard error. Three rounds put four dials inside the
+/// request, spanning ~8 s of real attempt-and-wait time; no in-request policy can ride out a flap
+/// longer than the request budget itself, which is what client retries and failover to a second
+/// provider are for.
 ///
-/// **Why three, not one or unbounded.** One is the 2026-10-06 value, measured too short tonight.
+/// **This value was right and inert for a day — found 2026-10-13, and the reason the budget moved
+/// with it.** Raising the count to three does not by itself buy three rounds. The admission rule
+/// prices each round at a full `UPSTREAM_HEADER_TIMEOUT` behind its wait, so a round is admitted
+/// only when it is *decided* inside `PLAN_BUDGET - 22 s`; against the 26 s budget this constant was
+/// written under, that window was 4 s — less than the two dials of a single provider cost before
+/// the first re-probe is even decided. In production the constant therefore behaved as **one**.
+/// Ledger rows 4079/4083 (2026-10-13) are that ceiling: three dials total, then
+/// `all attempts failed`, with the upstream's own `500 Upstream rejected the request as invalid`
+/// preserved in the chain. [`PLAN_BUDGET`] is now 36 s, which is what makes this number reachable;
+/// the two constants have to move together, and
+/// `engine::tests::the_reprobe_budget_is_reachable_at_the_measured_cadence` goes red if either
+/// drifts.
+///
+/// **Why three, not one or unbounded.** One is the 2026-10-06 value, measured too short.
 /// Unbounded is what [`PLAN_BUDGET`] exists to prevent — the re-probe would spend the whole budget
 /// redialling a host that may be down for minutes, when a *client* retry (the caller's own
 /// backoff, or a fresh request) is the honest remedy for an outage that long. Three keeps the
@@ -359,12 +393,19 @@ pub fn classify_attempt_error(e: &AttemptError) -> ErrorClass {
                 return ErrorClass::ParseError;
             }
             // The body can contradict the status: a gated 401 is `ClientGate`, not `AuthFailed`,
-            // and a 400 that says "model not found" is `NotFound`, not `BadRequestSchema`.
+            // a 400 that says "model not found" is `NotFound`, not `BadRequestSchema`, and a 5xx
+            // that names an invalid request is `BadRequestSchema`, not `ServerError`. The three
+            // detectors are status-gated and disjoint, so the order only decides which is asked
+            // first rather than which wins.
             let hint = crate::core::client_gate::detect_client_gate(*status, body.as_deref())
                 .map(|_| BodyHint::ClientGate)
                 .or_else(|| {
                     crate::core::client_gate::detect_not_found(*status, body.as_deref())
                         .map(|_| BodyHint::NotFound)
+                })
+                .or_else(|| {
+                    crate::core::client_gate::detect_invalid_request(*status, body.as_deref())
+                        .map(|_| BodyHint::Schema)
                 });
             match classify(*status, hint) {
                 ErrorClass::Ok => ErrorClass::ParseError,

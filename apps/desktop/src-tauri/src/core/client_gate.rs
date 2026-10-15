@@ -57,6 +57,39 @@ pub fn detect_not_found(status: u16, body: Option<&str>) -> Option<&'static str>
     MODEL_NOT_FOUND_MARKERS.iter().find(|m| hay.contains(**m)).copied()
 }
 
+/// Markers in a **5xx** body that name *our request* as the thing that was refused.
+///
+/// Measured 2026-10-14 on `agent-router`, which answered every dial of ledger 4280 and 4283 with
+///
+///   `500 {"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"},"type":"error"}`
+///
+/// and `tokens_in = 0`. Zero input tokens is the load-bearing half: the upstream refused before
+/// reading the request, so the verdict is about the body's *shape* and not about the moment. An
+/// aggregator reports that as 5xx because the failure happened past its own edge, which is exactly
+/// why the status cannot be trusted and the body has to be.
+///
+/// **Narrow on purpose, in the manner of the lists above.** A missed marker falls back to
+/// `SERVER_ERROR` — the status quo, which retries — while a false positive would stop retrying a
+/// genuine upstream flap. Both entries are in a body this system actually received:
+/// `invalid_request_error` is the OpenAI-standard type, and the prose is agent-router's own.
+const INVALID_REQUEST_MARKERS: [&str; 2] =
+    ["invalid_request_error", "rejected the request as invalid"];
+
+/// Whether a 5xx response body says the **request** was invalid rather than the server unwell.
+///
+/// A non-5xx status returns `None`: below 500 the taxonomy already reads the body for its own
+/// reasons (`detect_not_found` at 400, `detect_client_gate` at 401/403), and a 4xx that names an
+/// invalid request is already classified as one. This exists for the one case where the status
+/// lies upward.
+pub fn detect_invalid_request(status: u16, body: Option<&str>) -> Option<&'static str> {
+    if status < 500 {
+        return None;
+    }
+    let body = body?;
+    let hay = body.to_lowercase();
+    INVALID_REQUEST_MARKERS.iter().find(|m| hay.contains(**m)).copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -133,5 +166,42 @@ mod tests {
         assert_eq!(detect_not_found(400, Some("model field is required")), None);
         assert_eq!(detect_not_found(400, Some("invalid api key")), None);
         assert_eq!(detect_not_found(400, Some("content-blocked")), None);
+    }
+
+    #[test]
+    fn detect_invalid_request_reads_the_measured_500() {
+        // quoted verbatim from ledger 4280/4283 (2026-10-14, agent-router)
+        let body = r#"{"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"},"type":"error"}"#;
+        assert_eq!(detect_invalid_request(500, Some(body)), Some("invalid_request_error"));
+        // the prose alone, for a body that carries it without the standard `type`
+        assert_eq!(
+            detect_invalid_request(502, Some("Upstream rejected the request as invalid")),
+            Some("rejected the request as invalid")
+        );
+        // case-insensitive, like every other detector here
+        assert_eq!(
+            detect_invalid_request(500, Some(r#"{"error":{"type":"INVALID_REQUEST_ERROR"}}"#)),
+            Some("invalid_request_error")
+        );
+    }
+
+    #[test]
+    fn detect_invalid_request_is_gated_to_5xx() {
+        let body = r#"{"error":{"type":"invalid_request_error"}}"#;
+        // Below 500 the taxonomy already reads the body for its own reasons, and a 4xx that names an
+        // invalid request is already classified as one — so the hint must not fire and double-count.
+        assert_eq!(detect_invalid_request(400, Some(body)), None);
+        assert_eq!(detect_invalid_request(429, Some(body)), None);
+        assert_eq!(detect_invalid_request(200, Some(body)), None);
+        assert_eq!(detect_invalid_request(500, None), None);
+        assert_eq!(detect_invalid_request(500, Some("")), None);
+    }
+
+    #[test]
+    fn detect_invalid_request_leaves_a_plain_upstream_flap_alone() {
+        // A 5xx that says nothing about the request must stay `SERVER_ERROR`, because that class is
+        // what retries: a false positive here would stop retrying a genuine outage.
+        assert_eq!(detect_invalid_request(503, Some(r#"{"error":{"message":"overloaded"}}"#)), None);
+        assert_eq!(detect_invalid_request(500, Some("internal server error")), None);
     }
 }

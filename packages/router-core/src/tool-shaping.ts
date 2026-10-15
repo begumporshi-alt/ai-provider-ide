@@ -218,9 +218,30 @@ export interface ToolPartTemplates {
 /** Our internal content as an array of parts. Mirrors what `shapeMessageContent` does for a
  *  dialect content field, but on the neutral side: this runs *before* the rename. */
 function asParts(content: unknown): unknown[] {
-  if (Array.isArray(content)) return [...content];
+  // Empty `text` parts are dropped, in both spellings. A text block carrying no text is not
+  // content in any dialect — Anthropic-shaped upstreams reject it outright — and one arrives here
+  // whenever an assistant turn carries `content: ""` beside its `tool_calls`, because Phase F
+  // (`ensureArrayContent`) spells that empty string as `[{type:"text",text:""}]` before this runs.
+  // The string arm below already refused to *make* such a part; the array arm passed one through,
+  // so whether the guard held depended on which layer had normalised the message. Measured
+  // 2026-10-14 (D107): the rendered body carried the empty block ahead of the `tool_use`, and
+  // `agent-router` answered those requests `500 … "invalid_request_error"` with `tokens_in = 0`.
+  if (Array.isArray(content)) return content.filter((part) => !isEmptyTextPart(part));
   if (typeof content === "string" && content !== "") return [{ type: "text", text: content }];
   return [];
+}
+
+/**
+ * Whether a content part is a `text` block carrying no text.
+ *
+ * Only `text` is judged: an `image`, `tool_use` or `tool_result` part legitimately has no `text`
+ * field, and a part type this router does not recognise is left alone rather than silently dropped.
+ */
+function isEmptyTextPart(part: unknown): boolean {
+  if (!part || typeof part !== "object") return false;
+  const p = part as Record<string, unknown>;
+  if (p.type !== "text") return false;
+  return typeof p.text !== "string" || p.text === "";
 }
 
 function callId(call: unknown): string | undefined {

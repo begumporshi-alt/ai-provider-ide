@@ -212,7 +212,78 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   switched off globally on the Skills screen or per conversation in the session drawer, so the
   prompt index stays a decision rather than a tax.
 
+- **A refused request now says what was wrong with it: `body_shape`, a structural report of the
+  outgoing body, logged at the moment the refusal is built.** Four refusals in a row reached the
+  ledger as `500 … "invalid_request_error"` and *nothing else* — D107, D108, D109 and D110. Nothing
+  about the request survives a failure: no outgoing body is persisted anywhere, `failure_detail` is
+  written as `NULL` on every production row, and the refusal text describes the **response**, never
+  the request that caused it. So each of those four was diagnosed by archaeology — reading
+  `agent_steps`, replaying a session transcript through the real shaping pipeline, and probing the
+  upstream by hand — and **D110 is still unexplained, because its request was never written down at
+  all.**
+
+  A body a provider calls invalid is invalid *structurally*, and every such defect is visible in the
+  request the instant it is sent. `core/body_shape.rs` (TS twin `packages/router-core/src/request-shape.ts`)
+  renders them as one line: a role and part census, empty content, parts no dialect can name, and —
+  capitalised, because these are the ones that make a body invalid rather than merely unusual —
+  `UNANSWERED_TOOL_USE`, `ORPHAN_TOOL_RESULT`, `DUPLICATE_TOOL_USE_ID` and `UNDECLARED_TOOL`. The
+  pairing rule is chosen from the body (the part-array shape's *answered in the immediately next
+  message* versus OpenAI's `role:"tool"` replies), so an OpenAI-shaped body is not accused by a rule
+  that does not apply to it, and `shape=clean` is reported too: ruling the shape out in one line is
+  itself an answer, and it is the answer D110 would have needed.
+
+  It is **structural only** — ids, counts, roles, part types; never message text, never an image's
+  bytes — which is what makes it safe to log, and it reports the same defect the upstream names in
+  its own words. Measured against the D109 body, it renders `UNANSWERED_TOOL_USE=["call_2@m1"]`:
+  *"`call_2` at message 1 is unanswered"*, derived from the request side with no external
+  experiment. The gate is stated and tested — `400`/`422`/`5xx` are described, `401`/`402`/`403`/
+  `404`/`429` are not, since those are about the key, the balance, the route or the pace and a shape
+  report there is noise that trains the reader to skip the line that matters. See
+  `docs/dev-book/07-drift-register.md` D110, which this closes the *diagnosability* half of.
+
 ### Changed
+
+- **`sips` is on the command baseline, so the assistant can finally process an image instead of
+  working around not being able to.** The tool surface had two image tools and neither processed
+  anything: `read_image` lets a vision model *see* a file, and `generate_image` *creates* one — but
+  there was no resize, crop, format conversion, compression, thumbnail, rotate, or any way to read
+  an image's real pixel dimensions. `file_info` reports size and mtime only.
+
+  Found in a real build rather than by reading the list. Building `green-energy-site`, the assistant
+  needed a hero at 1920 and 1100 px and three cards at 900, had no local way to produce any of them,
+  and wrote five scripts into the user's own project to compensate — one of which records the gap in
+  its own docstring: *"no local image tooling is required (sips is not allowlisted here and PIL is
+  absent)"*. It then re-requested every image from Wikimedia's thumbnail API at the width the layout
+  wanted. That is a genuine workaround, but it is not a capability: it reaches only images a remote
+  service happens to host, and cannot touch a local file, convert a format, crop, or report what it
+  actually downloaded. The cost is visible in the same build — `wire_photos.py` hardcoded
+  `height="1087"` from the width it *requested*, with nothing able to check the asset it *received*.
+
+  Both halves of that docstring were verified before the change: `sips` exists at `/usr/bin/sips`,
+  and it was absent from `BUILTIN_PROGRAMS` (43 entries, not one of them an image tool) though not
+  from `NEVER_ALLOWED`, so it was already addable by hand through Settings → Tools. `PIL` is
+  genuinely absent (`import PIL` fails on the system `python3`). The argument gate was checked too —
+  it refuses absolute paths and `..` rather than flags, so `sips -Z 1920 in.jpg --out out.jpg` passes
+  — because a list entry the gate would then refuse is not a capability.
+
+  **Discoverability is part of the fix, not a footnote.** The whole reason this went unnoticed is
+  that nothing told the model an image tool existed, so the `run_command` `program` description and
+  the agent system prompt now both name `sips` and the two invocations that matter (`-Z` to scale the
+  long edge, `-g pixelWidth -g pixelHeight` to measure). A silent allowlist entry would have left the
+  gap exactly as it was.
+
+  `sips` acts only on the paths it is given, under the same relative-path argument gate as `cp` and
+  `tar` — neither destructive outside its own output nor network-facing — so it is not the kind of
+  escalation `NEVER_ALLOWED` exists for. Pinned by
+  `tools.rs::sips_resizes_a_real_png_through_the_gate`, which runs the capability rather than reading
+  the list: it writes a real 8×8 PNG, resizes it to 4×4 through the gated path with no extra programs
+  configured (so it proves the baseline, not mere addability), and reads the result's own `IHDR` to
+  confirm the pixels changed. **Falsified:** removing `sips` from the baseline reddens it with
+  `program "sips" is not on the allowlist`. macOS-only, because `sips` is.
+
+  Still open, and not fixable in code: `generate_image` has **no working route** — none of the six
+  active manifests declares an image endpoint, so every image-modality request in the ledger has
+  failed `NO_ROUTE`, the most recent on 2026-10-14. That needs an image-capable provider configured.
 
 - **The Skills screen is a list you can manage in place, modelled on the host app's skills panel.**
   It used to be three stacked sections of cards — Installed, Catalog, and a paste box — with a
@@ -661,9 +732,178 @@ it, and `pnpm check-version-sync` fails the build when one does not.
   exhausts it now fails at ~20 s through the router's own path and is recorded with the class its
   attempts produced, instead of reaching 30 s and being filed as `CANCELLED`.
 
+  **(Superseded 2026-10-13: the budget is 36 s and the gateway bound 40 s — the 26 s window turned
+  out to be too narrow to fund the re-probe rounds added the next day. The reasoning above is
+  unchanged and the ordering still holds; see the re-probe entry below and drift D104.)**
+
   The old invariant test pinned only one candidate's budget and so could not see (3); it now asserts
   the three-constant ordering. All three new tests were falsified against the previous behaviour
   before being trusted. See `docs/dev-book/07-drift-register.md` D73.
+
+- **The same-key re-probe budget was unreachable, and the test that pinned it read a different
+  clock.** `SERVER_ERROR_REPROBES_MAX = 3` was added on 2026-10-12 so a plan-exhausted candidate gets
+  three re-dials instead of one. It never did. A re-probe is admitted only when
+  `elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`, so against the **26 s** plan budget of
+  the day a round had to be *decided* inside **4 s** — and the two keys of one provider had already
+  spent 3.3–3.7 s failing before round one was decided. Round two was refused at ~7.5 s, and round
+  three was unreachable for any timing at all, so the constant behaved as **1** in production. The
+  ledger says so across its whole history: the longest attempt chain ever recorded is **3** dials,
+  and not one row has ever carried four. Rows 4079/4083 (2026-10-13, `agent-router`,
+  `deepseek-v4-flash`) are the user-visible form — `all attempts failed for
+  agent-router/deepseek-v4-flash [key-01:SERVER_ERROR -> key-02:SERVER_ERROR -> key-02:SERVER_ERROR]`,
+  with the upstream's own `500 Upstream rejected the request as invalid` preserved in the chain.
+
+  The regression test could not catch it because **it measured a clock the budget does not read**: it
+  runs `start_paused = true`, which makes `tokio::time::sleep` free, while the plan was stamped with
+  `std::time::Instant`, which the paused clock never moves. Elapsed time stayed near zero, every
+  round was affordable by construction, and the test exercised only the count.
+
+  `PLAN_BUDGET` is now **36 s** and `gateway::FIRST_MSG_TIMEOUT` **40 s** — the pair moves together,
+  because the plan sitting strictly below the gateway bound is what keeps a budget refusal legible as
+  the real error class instead of a gateway `CANCELLED`. That widens the window to 14 s, which funds
+  all three rounds at the measured ~1.83 s per refused dial. `text.rs` now stamps the plan with
+  `tokio::time::Instant`, so the paused clock and the budget agree and the existing count test can
+  actually fail; a new spec pins the arithmetic rather than the intent — three rounds affordable, the
+  fourth not. The cost is bounded and stated: a bridge that never speaks now fails after 40 s rather
+  than 30 s, and a normal request is unaffected because this bounds only the wait for the *first*
+  message.
+
+  Separately, `settings.assistant.model` still held the **qualified** `agent-router/deepseek-v4-flash`.
+  A qualified id resolves to exactly one provider, so `failoverEnabled` was inert for the Assistant
+  and every request during the flap burned an attempt on a host that was returning 500 — with `vice`
+  carrying the same model the whole time (296 successful `deepseek-v4-flash` rows, most recent
+  2026-10-12 20:28:49). It is the bare `deepseek-v4-flash` now, which resolves to agent-router with
+  vice as live failover. See `docs/dev-book/07-drift-register.md` D104.
+
+- **A tool call the model's output cap cut off mid-arguments was executed as an empty call and
+  reported as `missing argument "path"`.** Measured 2026-10-13 from this machine's own
+  `session_messages`: four consecutive `write_file` calls at 24 444 / 31 480 / 31 213 / 30 854
+  characters, every one invalid JSON ending mid-string or mid-tag, each answered `missing argument
+  "path"` — the "showing 3-4 times" report — while the 327-character call in the same turn parsed
+  and wrote 258 bytes. Two halves of the code that should have caught it were unreachable. The
+  provider *had* reported the cap (`finish_reason: "max_tokens"` → `"length"`), but the loop's
+  truncation guard is gated on `collected.length === 0`, so a length cut **carrying** tool calls
+  fell straight through to execution; and `parseArgs` returns `{}` for anything it cannot parse,
+  which `do_write_file` read `path` from first — so the model was told a key was missing when its
+  payload had never finished arriving. The remedy was already known to the model, which found it by
+  experiment at seq 75 — *"Short writes work — the long one was too big. I'll build the file in
+  chunks"* — and the file was then built to 77 118 bytes through `edit_file`.
+
+  A length cut that arrives carrying tool calls is now re-asked once **with the remedy attached**
+  (`TRUNCATED_TOOL_CALL_NOTE`: name the cut, say the call did not run, say to chunk) before anything
+  is replayed or run — the blind re-ask is what produced four identical failures, so the guidance is
+  the fix and not a nicety. A call whose arguments are present, non-empty and unparseable is refused
+  with `argumentProblemMessage` instead of being sent as `{}`, while absent and empty arguments stay
+  legitimate no-argument calls — the control that keeps the refusal from refusing every
+  argument-free tool. Four new specs, all falsified against the previous behaviour before being
+  trusted. See `docs/dev-book/07-drift-register.md` D105.
+
+- **The gateway refused any request body over 2 MB, and said so nowhere.** A client reported
+  `413 Failed to buffer the request body: length limit exceeded` — axum's own `LengthLimitError`
+  wording — on a turn that should simply have been large. The cause is a limit nobody declared:
+  the ingress handlers take their body as a buffering extractor (`chat_h`'s `body: String`), so
+  axum's **default** `DefaultBodyLimit` applied to every route. It was invisible at the point of
+  use and in the logs alike — a grep for `length limit` over both `aiproviderd.log` and
+  `gateway.log` returns nothing, because the extractor refuses *before* the handler and therefore
+  before anything logs a dispatch.
+
+  It was also within one session of ordinary traffic. The ledger's largest recorded request is
+  **238 823** input tokens (next: 236 753 / 234 690 / 233 105 / 232 594), on the order of 1 MB of
+  JSON against a 2 MB default — a bound nobody chose, about a factor of two above this gateway's
+  own measured maximum, on a surface whose clients send whole agent transcripts.
+
+  `MAX_REQUEST_BODY_BYTES` is now **64 MiB**, applied as `DefaultBodyLimit::max(…)` in the router's
+  layer stack and derived rather than picked: ~64× the largest observed request, plus headroom for
+  base64 attachments, since a single binary write is already allowed to be 8 MB and is ~10.7 MB
+  once base64-inflated. It stays a real bound, and the reason it can be generous is the binding —
+  the gateway listens on loopback only. Pinned by a test that posts a 3 MB conversation through the
+  real router and asserts it is not `413` *and* is answered `200`, so it cannot pass by failing
+  somewhere quieter; removing the layer reddens it with the exact client-visible status. One
+  residual is registered rather than hidden: extraction precedes admission control, so bodies are
+  buffered for connections that later queue. **And a second one, deliberately not fixed here:** the
+  refusal is still silent, so a body over the *new* cap reproduces the original symptom — a
+  client-side 413 with nothing in either log. Raising a limit moves the threshold; making the
+  crossing legible needs a middleware plus the tracing-capture helper this repo does not yet have,
+  and an unpinned log claim is worse than a registered gap. See
+  `docs/dev-book/07-drift-register.md` D106.
+
+- **A `500` that says your request was invalid was retried as though the provider were unwell.** A
+  client reported `all attempts failed for agent-router/deepseek-v4-flash [key-03:SERVER_ERROR ->
+  key-03:SERVER_ERROR -> key-03:SERVER_ERROR]` — three to four dials and ~15–19 seconds spent on a
+  refusal that was identical every time. Ledger rows 4280 and 4283 record `SERVER_ERROR` / `http 500`
+  with **`tokens_in = 0`**: the upstream refused *before reading the request*, so the verdict was
+  about the body's shape and could not change between dials. The body said so plainly —
+  `{"error":{"message":"Upstream rejected the request as invalid","type":"invalid_request_error"}}`.
+
+  The taxonomy read the status and never the body: `classify` returned `ServerError` for any
+  `status >= 500`, and `ServerError` is key-retryable, so the engine re-probed the same key and would
+  have failed over. `detect_invalid_request` now supplies `BodyHint::Schema` — a hint the enum
+  already declared and nothing produced — and a 5xx carrying it classifies as `BAD_REQUEST_SCHEMA`:
+  drift, so the key is not burned, and absent from `is_retryable_with_next_key`, so nothing re-probes
+  or rotates. The client is told its request was wrong instead of being told the provider is broken.
+  Mirrored in `packages/router-core`, with the same test in both engines, both falsified: neutralizing
+  the `classify` arm reddens Rust with `left: ServerError, right: BadRequestSchema`, and dropping the
+  TypeScript hint reddens it with `expected 'SERVER_ERROR' to be 'BAD_REQUEST_SCHEMA'`.
+
+  Two things this does **not** do, registered in D107 rather than implied away. It does not make those
+  requests succeed — the bodies agent-router refused would still be refused. And it does not
+  establish *why* they were refused: no outgoing body is persisted anywhere, so the reason string is
+  the whole of the evidence. The leading reading is an aggregator relaying an upstream `400` as a
+  `500` — the shape of the `tool_result` rejection measured on agentrouter.org on 2026-10-02 — and it
+  is named as a hypothesis, not a finding. See `docs/dev-book/07-drift-register.md` D107.
+
+- **The assistant turn of every tool call went out carrying a content part the caller never sent.**
+  This is the cause of the refusals D107 only learned to report quickly. A turn that is nothing but
+  tool calls carries `content: ""` — that is every tool-calling turn in every agent transcript — and
+  Phase F spelled that empty string as `[{type:"text",text:""}]`. The parts assembler then passed
+  the array through unfiltered and appended the `tool_use` beside it, so the body rendered as
+  `[{"type":"text","text":""},{"type":"tool_use",…}]`: an **empty text block**, which
+  Anthropic-shaped upstreams reject.
+
+  It was a guard defeated by a spelling. `as_parts` refuses to *make* a text part out of an empty
+  string (its string arm tests `!s.is_empty()`) while its array arm was a plain `items.clone()` — so
+  whether the guard held depended on which layer had normalised the message, and Phase F always got
+  there first. Reproduced by running the real pipeline order (normalize, then render) over the shape,
+  and the failing requests are the gateway's own UI session (`app_key_id = ak-ui`) against
+  `agent-router`, an Anthropic-dialect manifest: ledger 4280/4283/4340, every one
+  `500 … "invalid_request_error"` with `tokens_in = 0`. The existing test had carried this exact
+  fixture since D101 but asserted only the user and tool messages — never the assistant one.
+
+  Fixed in both layers and both engines, because either alone leaves a path uncovered: Phase F no
+  longer fabricates a part from empty content, and `as_parts`/`asParts` now drop empty `text` parts
+  from an array — the only guard that reaches a client sending the array spelling directly.
+  Falsifying it changed the tests: reverting `asParts` alone did **not** redden the Phase F test,
+  which showed the two guards are not interchangeable and the array spelling needed its own case.
+
+  **⚠ The causal claim above was FALSIFIED on 2026-10-15 and must not be used.** The prediction was
+  made falsifiable on purpose and then tested against the live upstream: `content: ""`, `content: []`
+  and `[{type:"text",text:""}]` — mid-transcript *and* as the final message — **all answer `200`**.
+  The empty block was a real defect that happened not to be the cause. The change above stands as a
+  **correctness** fix (a part the caller never sent is not emitted), but it is **not** what fixed the
+  2026-10-14 refusals. Those were caused by an image part splitting a turn's `tool_result`s — see the
+  D109 entry below and `docs/dev-book/07-drift-register.md` D109.
+
+- **An image part split a turn's `tool_result`s, and the upstream rejected the whole request.** When
+  an agent turn called `read_image` (or `generate_image`) *alongside* any other tool, the loop built
+  the image's own `user` message while walking the results — putting a `user` message **between** two
+  `tool_result`s. Anthropic requires each `tool_use` to be answered in the message **immediately**
+  after it and rejects the entire request when one is not, so every attempt for that request failed
+  and the whole turn was lost (6 tool calls in, 224k prompt tokens, `iterations = 0`).
+
+  Isolated against the live `agentrouter.org`, not inferred: the split order answers **`400`** —
+  *"messages.1:`tool_use` ids were found without `tool_result` blocks immediately after: call_2."* —
+  and the control with both results together answers **`200`**. The fix appends results only, and
+  pushes the image messages after the run, so results stay consecutive and the image still arrives
+  with its note one message later.
+
+  Five other candidates were killed by the same method (all `200`): the empty `text` block and empty
+  assistant turns generally, the full replayed transcript, an image on a second consecutive `user`
+  message, untemplated part shapes the upstream silently ignores, and size (8.39 MB is accepted;
+  23 MB is a different failure — an `nginx` `413`). See `docs/dev-book/07-drift-register.md` D109.
+
+  **Not everything with this signature is fixed.** Ledger 4280/4283 carry the same `500` +
+  `invalid_request_error` but their runs read **no image**, so a second cause exists and is still
+  open — registered as D110, with no fix claimed.
 
 ## [1.2.0] - 2026-09-26
 

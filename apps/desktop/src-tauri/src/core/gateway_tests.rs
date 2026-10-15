@@ -504,6 +504,45 @@ async fn non_stream_reasoning_lands_on_message_reasoning_content() {
     assert_eq!(body["choices"][0]["message"]["reasoning_content"], "Working it out");
 }
 
+/// A request body past axum's **2 MB default** must reach the handler, not be refused at extraction.
+///
+/// Measured 2026-10-13: a client reported `413 Failed to buffer the request body: length limit
+/// exceeded` — axum's own `LengthLimitError` wording — and **neither `aiproviderd.log` nor
+/// `gateway.log` held a line about it**, because the extractor refuses before the handler runs and
+/// therefore before this module logs anything. The ledger's largest recorded request (238 823 input
+/// tokens) is on the order of 1 MB, so the undeclared default sat within one long agent session of
+/// ordinary traffic. See `MAX_REQUEST_BODY_BYTES`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_body_past_axums_default_limit_still_reaches_the_handler() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    // 3 MB — past the old 2 MB default, and paid for in the way real traffic pays for it: one very
+    // long turn of accumulated context rather than a synthetic blob field.
+    let body = json!({
+        "model": "gpt-4o",
+        "messages": [{ "role": "user", "content": "x".repeat(3 * 1024 * 1024) }],
+        "stream": false,
+    });
+    let res = s
+        .client
+        .post(format!("{}/v1/chat/completions", s.base))
+        .header("authorization", "Bearer sk-aip-test")
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_ne!(
+        res.status().as_u16(),
+        413,
+        "a 3 MB conversation must not be refused in the extractor"
+    );
+    // …and the handler really ran to completion rather than the request dying further in: the
+    // synthesised bridge answers, which only a routed request can produce.
+    assert_eq!(res.status(), 200);
+    let answered: Value = res.json().await.unwrap();
+    assert_eq!(answered["choices"][0]["message"]["content"], "Hello");
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn criterion8_wrong_key_401() {
     let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));

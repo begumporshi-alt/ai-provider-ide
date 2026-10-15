@@ -594,9 +594,10 @@ pub const UPSTREAM_FIRST_BYTE_TIMEOUT: Duration = Duration::from_secs(20);
 /// send only events the manifest's delta selector does not match (an OpenAI-shaped stream's
 /// role-only first delta is the common one) before going silent. The interpreter then has no
 /// output, the egress waits out [`UPSTREAM_IDLE_TIMEOUT`] (120s) for an event that never comes,
-/// and the gateway's `FIRST_MSG_TIMEOUT` (30s) wins the race it was always going to win: the
-/// request dies as `CANCELLED` with *"the router produced no response within 30000ms — the
-/// request was abandoned; retry"*, a message that describes our own bound while reading like an
+/// and the gateway's `FIRST_MSG_TIMEOUT` — **30s when this was measured, 40s since 2026-10-13** —
+/// wins the race it was always going to win: the request dies as `CANCELLED` with *"the router
+/// produced no response within 30000ms — the request was abandoned; retry"* (the number in that
+/// message is the bound of the day), a message that describes our own bound while reading like an
 /// upstream's.
 ///
 /// Measured 2026-10-12, ledger rows **3949/3968** (and the same signature at 3557/3632/3653/3855
@@ -2042,8 +2043,17 @@ mod stall_tests {
     /// UPSTREAM_HEADER_TIMEOUT <= UPSTREAM_FIRST_BYTE_TIMEOUT <= UPSTREAM_FIRST_OUTPUT_TIMEOUT
     ///          20s                          20s                         20s
     ///   <= PLAN_BUDGET < FIRST_MSG_TIMEOUT
-    ///       26s              30s
+    ///       36s              40s
     /// ```
+    ///
+    /// **Every term but the middle one is unchanged; `PLAN_BUDGET` moved 26s -> 36s and
+    /// `FIRST_MSG_TIMEOUT` with it, on 2026-10-13.** The pair has to move together — the right
+    /// inequality is what keeps a budget refusal legible as the real error class instead of a
+    /// gateway `CANCELLED` — and the plan budget had to grow because the re-probe admission rule
+    /// (`elapsed + wait + UPSTREAM_HEADER_TIMEOUT <= PLAN_BUDGET`) left only a 4s window at 26s,
+    /// which made more than one same-key re-probe unreachable in production. See
+    /// `engine::SERVER_ERROR_REPROBES_MAX`. The left inequality is unaffected: a full attempt is
+    /// still fundable inside the plan, and it is now fundable with room to re-dial.
     ///
     /// **The leftmost term was added hours after the two beside it, because this ordering was
     /// still one constant short.** It ordered the *header wait* against the plan, but the first

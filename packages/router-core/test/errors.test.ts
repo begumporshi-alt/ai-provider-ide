@@ -4,7 +4,7 @@
  * about the network) — plus the reason passthrough that keeps the provider's own words.
  */
 import { describe, expect, it } from "vitest";
-import { MAX_REASON_CHARS, classify, classifyFailure, classifyHttp, detectStatedTimeout, reasonFromBody } from "../src/errors.js";
+import { DRIFT_CLASSES, MAX_REASON_CHARS, classify, classifyFailure, classifyHttp, detectStatedTimeout, reasonFromBody } from "../src/errors.js";
 import { HealthTracker } from "../src/health-tracker.js";
 import type { ApiKeyRecord } from "../src/domain.js";
 
@@ -63,6 +63,26 @@ describe("classifyHttp (the body-aware wrapper)", () => {
     expect(classifyHttp(401, body)).toBe("CLIENT_GATE");
     // an ordinary bad-key 401 stays AUTH_FAILED — failing toward the status quo
     expect(classifyHttp(401, JSON.stringify({ error: { message: "invalid token" } }))).toBe("AUTH_FAILED");
+  });
+
+  it("reads a 5xx that names an invalid request as a request fault, not a server flap", () => {
+    // Measured 2026-10-14 on agent-router (ledger 4280/4283): **every dial** of a four-dial chain
+    // returned this with `tokens_in = 0`, so the upstream refused before reading the request.
+    const body = JSON.stringify({
+      error: { message: "Upstream rejected the request as invalid", type: "invalid_request_error" },
+      type: "error",
+    });
+    expect(classifyHttp(500, body)).toBe("BAD_REQUEST_SCHEMA");
+    // The consequences are the point, so they are pinned with the class: the request is what was
+    // wrong, so the key is not burned, and asking again cannot help.
+    expect(DRIFT_CLASSES.has("BAD_REQUEST_SCHEMA")).toBe(true);
+  });
+
+  it("leaves a 5xx that says nothing about the request as a retryable server error", () => {
+    // The half that keeps the rule safe: an upstream flap must still rotate.
+    expect(classifyHttp(503, JSON.stringify({ error: { message: "overloaded" } }))).toBe("SERVER_ERROR");
+    expect(classifyHttp(500, undefined)).toBe("SERVER_ERROR");
+    expect(classifyHttp(500, "internal server error")).toBe("SERVER_ERROR");
   });
 });
 

@@ -433,7 +433,12 @@ function ensureArrayContent(messages: NormalizedMessage[]): void {
     // content as string-or-null, and the OpenAI dialect passes messages through verbatim (parity
     // with the Rust normalizer's Phase F skip, measured 2026-10-05).
     if (msg.role === "tool") continue;
-    if (typeof msg.content === "string") {
+    // An empty string is not a content part, so none is made from it (parity with the Rust
+    // normalizer). `asParts` refuses to build a text part out of an empty string, but it sees this
+    // message only after this pass has spelled the empty content as `[{type:"text",text:""}]` — so
+    // the guard was defeated by the spell, and the assistant turn of a tool call (always
+    // `content: ""`) went out carrying a part the caller never sent. Measured 2026-10-14 (D107).
+    if (typeof msg.content === "string" && msg.content !== "") {
       msg.content = [{ type: "text", text: msg.content }];
     }
   }

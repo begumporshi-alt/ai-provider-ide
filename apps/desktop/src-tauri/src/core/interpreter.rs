@@ -625,6 +625,11 @@ impl ManifestInterpreter {
                 (true, Some(p)) => p,
                 _ => &ep.path,
             };
+            // Serialized once, and its length kept: the refusal branch below reports the body's
+            // size, and re-serializing a multi-megabyte request there would double the cost of a
+            // failure for a number already in hand.
+            let payload = serialize(&body);
+            let payload_len = payload.len();
             let res = self
                 .ctx
                 .http
@@ -636,7 +641,7 @@ impl ManifestInterpreter {
                         ),
                         method: HttpMethod::Post,
                         headers: json_headers(&self.view, &ep.headers, &self.ctx.vars),
-                        body: Some(serialize(&body)),
+                        body: Some(payload),
                         secret_ref: Some(secret_ref.to_string()),
                         stream: streaming,
                     },
@@ -646,6 +651,29 @@ impl ManifestInterpreter {
                 .map_err(attempt_error_from)?;
 
             if res.status >= 400 {
+                // **The only moment the outgoing body is still in hand, so the only moment a refusal
+                // can be made to describe its own cause.** Four refusals in a row (D107, D108, D109,
+                // D110) reached the ledger as `500 … "invalid_request_error"` and nothing else —
+                // nothing about the *request* survives a failure, so each was diagnosed by
+                // archaeology and D110 is still unexplained because its request was never written
+                // down at all. `body_shape` renders the structure that decides validity (unanswered
+                // `tool_use`, duplicate ids, undeclared tools, parts no dialect can name) as one
+                // line, and it is structural only — ids and counts, never message text — so it is
+                // safe to log.
+                //
+                // Gated to the statuses where the *body* is what the provider is objecting to. A
+                // 401/402/403/404/429 is about the key, the balance, the route or the pace, and its
+                // shape is not in question; logging it would be noise that trains the reader to skip
+                // the line that matters. `refusal_shape` holds the gate so it is testable without a
+                // logging subscriber; this branch only prints what it decides.
+                if let Some(shape) =
+                    crate::core::body_shape::refusal_shape(res.status, &body, payload_len)
+                {
+                    tracing::warn!(
+                        "the upstream refused the request: status={} {shape}",
+                        res.status
+                    );
+                }
                 let err = ManifestHttpError::new(
                     res.status,
                     res.body,

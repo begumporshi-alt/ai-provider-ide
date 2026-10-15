@@ -156,7 +156,7 @@ export const AGENT_TOOLS: ToolSpec[] = [
         program: {
           type: "string",
           description:
-            "Executable from the allowlist: ls, cat, grep, rg, find, git, gh, node, npm, npx, pnpm, python3, make, tar, sed, awk, …",
+            "Executable from the allowlist: ls, cat, grep, rg, find, git, gh, node, npm, npx, pnpm, python3, make, tar, sed, awk, sips (image work: resize, crop, convert, and report real pixel dimensions), …",
         },
         args: {
           type: "array",
