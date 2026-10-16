@@ -4,7 +4,7 @@
  * against injected ports. Emits events; never touches React.
  */
 import { buildPlainRequestMessages } from "./prompt";
-import { replayHistory } from "./messages";
+import { replayHistory, recalledLight } from "./messages";
 import { clip } from "./graph-record";
 import type { TurnPorts, TurnRequestBase } from "./ports";
 import { attachmentMeta } from "./ports";
@@ -31,7 +31,13 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
   if (ports.lastNode.current) rec.edge(ports.lastNode.current, userNode, "follows");
   // P7: recall before answering. Awaited, because the block has to be in the request.
   const recalled = req.useMemory ? await ports.memory.recall(req.text) : [];
-  if (recalled.length > 0) ports.memory.recordRecall(userNode, recalled);
+  if (recalled.length > 0) {
+    ports.memory.recordRecall(userNode, recalled);
+    // The prompt-side block is invisible to the user — it rides a system message — so the
+    // optimistic assistant bubble is where the visible record lands. Attached before the stream
+    // starts, so the card is there even while the answer is still streaming in.
+    ports.patchMsg(req.assistantMsgId, { recalledMemories: recalledLight(recalled) });
+  }
   let streamed = "";
   let reasoned = "";
   /** What the transcript will record for the assistant turn. Tracks the *bubble*, not the stream:
@@ -153,6 +159,9 @@ export async function runPlainTurn(req: PlainTurnRequest, ports: TurnPorts): Pro
         content: recordedText,
         reasoning: reasoned || null,
         model: turnServed?.model ?? req.model,
+        // A turn with no recall writes null — the column exists so a resumed session can still
+        // show the card, and `null` is what keeps that from costing a JSON parse per old row.
+        memoryRefs: recalled.length > 0 ? JSON.stringify(recalledLight(recalled)) : null,
       },
     ]);
     // P7: remember whatever was actually said, including a failed or stopped turn — an

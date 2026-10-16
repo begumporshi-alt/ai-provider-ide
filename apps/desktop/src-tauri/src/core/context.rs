@@ -637,6 +637,10 @@ pub struct SessionMessageRow {
     pub attachments: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// Serialized `RecalledMemory[]` (0028) — the memories this turn's answer drew on, so a
+    /// resumed session still shows the recall card. `NULL` on a turn that recalled nothing.
+    #[serde(default)]
+    pub memory_refs: Option<String>,
     #[serde(default)]
     pub ts: i64,
 }
@@ -672,12 +676,13 @@ pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Res
         let mut stmt = tx
             .prepare(
                 "INSERT INTO session_messages
-                   (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, ts)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                   (session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT(session_id, seq) DO UPDATE SET
                    role=excluded.role, content=excluded.content, tool_calls=excluded.tool_calls,
                    tool_call_id=excluded.tool_call_id, reasoning=excluded.reasoning,
-                   attachments=excluded.attachments, model=excluded.model, ts=excluded.ts",
+                   attachments=excluded.attachments, model=excluded.model,
+                   memory_refs=excluded.memory_refs, ts=excluded.ts",
             )
             .map_err(|e| e.to_string())?;
         for r in rows {
@@ -691,6 +696,7 @@ pub fn append_session_messages(store: &Store, rows: &[SessionMessageRow]) -> Res
                 r.reasoning,
                 r.attachments,
                 r.model,
+                r.memory_refs,
                 r.ts,
             ])
             .map_err(|e| e.to_string())?;
@@ -709,7 +715,7 @@ pub fn session_messages(store: &Store, session_id: &str) -> Result<Vec<SessionMe
     let conn = store.conn.lock().map_err(|e| e.to_string())?;
     let mut stmt = conn
         .prepare(
-            "SELECT session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, ts
+            "SELECT session_id, seq, role, content, tool_calls, tool_call_id, reasoning, attachments, model, memory_refs, ts
                FROM session_messages WHERE session_id = ?1 ORDER BY seq ASC",
         )
         .map_err(|e| e.to_string())?;
@@ -725,7 +731,8 @@ pub fn session_messages(store: &Store, session_id: &str) -> Result<Vec<SessionMe
                 reasoning: row.get(6)?,
                 attachments: row.get(7)?,
                 model: row.get(8)?,
-                ts: row.get(9)?,
+                memory_refs: row.get(9)?,
+                ts: row.get(10)?,
             })
         })
         .map_err(|e| e.to_string())?
@@ -1253,6 +1260,7 @@ mod context_graph_tests {
             reasoning: None,
             attachments: None,
             model: None,
+            memory_refs: None,
             ts: 1_000 + seq,
         }
     }
@@ -1301,6 +1309,8 @@ mod context_graph_tests {
         assistant.tool_calls = Some(calls.into());
         assistant.model = Some("openrouter/gpt-4o".into());
         assistant.reasoning = Some("let me look".into());
+        assistant.memory_refs =
+            Some(r#"[{"id":"m1","layer":"L1","text":"Tushu lives in Dhaka","at":1,"pinned":false}]"#.into());
         let mut result = msg("s1", 1, "tool", "file body");
         result.tool_call_id = Some("call_1".into());
         append_session_messages(&s, &[assistant, result]).unwrap();
@@ -1311,6 +1321,9 @@ mod context_graph_tests {
         assert_eq!(rows[0].tool_calls.as_deref(), Some(calls));
         assert_eq!(rows[0].model.as_deref(), Some("openrouter/gpt-4o"));
         assert_eq!(rows[0].reasoning.as_deref(), Some("let me look"));
+        // The recall record survives verbatim too: the resumed transcript renders its card
+        // straight from this JSON.
+        assert!(rows[0].memory_refs.as_deref().unwrap_or_default().contains("Tushu lives in Dhaka"));
         assert_eq!(rows[1].tool_call_id.as_deref(), Some("call_1"));
         let _ = std::fs::remove_dir_all(&d);
     }

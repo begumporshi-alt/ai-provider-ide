@@ -63,6 +63,7 @@ import { SessionSkillsDrawer } from "../components/SessionSkillsDrawer";
 import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
 import { ProcessCard } from "../components/ProcessCard";
+import { LearnedStrip, RecallCard } from "../components/MemoryMoments";
 import { ScreenshotPreview } from "../components/ScreenshotPreview";
 import { backgroundJobIdFromResult } from "../lib/tools/processJob";
 import type { WireToolResult } from "../lib/tools/host";
@@ -89,7 +90,8 @@ import { shortcutFor } from "../lib/keys/shortcuts";
 import { activeSession, startSession, type Recorder } from "../lib/context/recorder";
 import { endRun, newRunId, recordStep, registerAbort, startRun } from "../lib/agent/orchestrator";
 import {
-  distilTurn, memoryBlock, recallContext, recordRecall, rememberTurn,
+  distilTurn, memoryBlock, onLearned, recallContext, recordRecall, rememberTurn,
+  type LearnedMemory,
 } from "../lib/memory/engine";
 import { newMsgId, replayHistory, withIds, type Msg } from "../lib/chat/turn/messages";
 import {
@@ -1657,6 +1659,21 @@ function Chat({
   // messages do not both flash "copied"; `editingId` is the user turn currently open in the inline
   // editor.
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  // Learning moments — atoms distillation just stored, shown as chips until dismissed. Capped:
+  // a long session should not be able to grow the strip forever, and the Memory screen is the
+  // complete record.
+  const [learned, setLearned] = useState<LearnedMemory[]>([]);
+  useEffect(() => {
+    // The engine emits from both the chat path and the drain; this screen only renders the ones
+    // its user can still see. Dedup on id — the drain and a chat turn could both distil an atom.
+    return onLearned((ms) =>
+      setLearned((prev) => {
+        const seen = new Set(prev.map((p) => p.id));
+        const fresh = ms.filter((m) => !seen.has(m.id));
+        return fresh.length > 0 ? [...prev, ...fresh].slice(-6) : prev;
+      }),
+    );
+  }, []);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editDraft, setEditDraft] = useState("");
   const [trace, setTrace] = useState<Trace | null>(null);
@@ -2224,6 +2241,7 @@ function Chat({
         reasoning: e.reasoning ?? null,
         attachments: e.attachments ?? null,
         model: e.model ?? null,
+        memoryRefs: e.memoryRefs ?? null,
         ts,
       }));
       void transcriptAppend(rows).catch(() => undefined);
@@ -3347,6 +3365,9 @@ function Chat({
                 histories={artifacts.histories}
               />
             )}
+            {m.role === "assistant" && (m.recalledMemories?.length ?? 0) > 0 && (
+              <RecallCard memories={m.recalledMemories!} />
+            )}
             {editingId !== m.id && (
               <MessageActions
                 disabled={busy}
@@ -3360,6 +3381,15 @@ function Chat({
             )}
           </div>
         ))}
+        {/* What the assistant just learned. Distillation is asynchronous and batched, so an atom
+            can land several turns after the exchange that taught it — the strip is where those
+            late arrivals become visible instead of silent. */}
+        {learned.length > 0 && (
+          <LearnedStrip
+            items={learned}
+            onDismiss={(id) => setLearned((prev) => prev.filter((p) => p.id !== id))}
+          />
+        )}
         </div>
         {/* `msgs.length > 0` — an empty transcript's hero is taller than the chat area on short
             windows, which detached the scroll anchor and floated this pill over the suggestion

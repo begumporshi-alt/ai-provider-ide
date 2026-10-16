@@ -8,6 +8,10 @@
 import { userContent, type ChatMessage, type ContentPart } from "@aiprovider/router-core";
 import { imageContextBlock } from "../vision";
 import type { Attachment, InlinedText } from "../../../components/Composer";
+import { parseRecalledMemoryRefs, recalledLight, type RecalledMemory } from "./memory-refs";
+
+// Re-exported: the turn modules read these from here, the store reads them from the leaf.
+export { parseRecalledMemoryRefs, recalledLight, type RecalledMemory };
 
 export interface Msg {
   /** Stable identity. The transcript is truncated, re-run and forked by position, so rendering
@@ -52,6 +56,13 @@ export interface Msg {
   imagesReadBy?: string;
   /** Names of workspace files inlined into this turn, for the transcript's own labelling. */
   inlined?: InlinedText[];
+  /**
+   * The memories this answer drew on, captured at send time. Recall is silent in the prompt —
+   * the block rides a system message the user never sees — so this is the one visible record of
+   * what the assistant knew before it answered. A light copy, not the store row: the transcript
+   * serializes it as JSON, and the Memory screen stays the live source of truth.
+   */
+  recalledMemories?: RecalledMemory[];
 }
 
 /** Monotonic within a session; combined with a timestamp so a resumed transcript cannot collide

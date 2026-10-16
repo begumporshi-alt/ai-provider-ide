@@ -13,7 +13,7 @@ const complete = vi.spyOn(store, "captureComplete");
 const release = vi.spyOn(store, "captureRelease");
 const requeue = vi.spyOn(store, "captureRequeueStale");
 const purge = vi.spyOn(store, "capturePurgeFinished");
-const captureMemories = vi.spyOn(store, "captureMemories");
+const captureMemory = vi.spyOn(store, "captureMemory");
 const sessionMemories = vi.spyOn(store, "sessionMemories");
 const assignScope = vi.spyOn(store, "assignMemoryScope");
 
@@ -41,7 +41,21 @@ beforeEach(() => {
   release.mockResolvedValue(true);
   requeue.mockResolvedValue(0);
   purge.mockResolvedValue(0);
-  captureMemories.mockResolvedValue(1);
+  // Distillation captures per atom now (each atom gets an id of its own, so the chat can pin or
+  // forget it), so the drain's write is a stream of captureMemory calls, not one batch call.
+  captureMemory.mockImplementation(async (m) => ({
+    id: `m-${m.text.slice(0, 8)}`,
+    layer: m.layer,
+    text: m.text,
+    session_id: m.sessionId ?? null,
+    subject: null,
+    created_at: 1,
+    updated_at: 1,
+    pinned: m.pinned ?? false,
+    scope: { user: "local", project: null, agent: null, global: false },
+    score: -1,
+    superseded_at: null,
+  }));
   sessionMemories.mockResolvedValue([]);
 });
 
@@ -137,9 +151,12 @@ describe("drainOnce", () => {
     const generate = vi.fn().mockResolvedValue('["Uses Postgres"]');
     await drainOnce("openai/gpt-4o", { generate });
 
-    expect(captureMemories).toHaveBeenCalledTimes(1);
-    const items = captureMemories.mock.calls[0]![0];
-    expect(items[0]).toMatchObject({ layer: "L1", text: "Uses Postgres", session_id: "s-42" });
+    expect(captureMemory).toHaveBeenCalledTimes(1);
+    expect(captureMemory.mock.calls[0]![0]).toMatchObject({
+      layer: "L1",
+      text: "Uses Postgres",
+      sessionId: "s-42",
+    });
     // The row carries a project scope, and the drain must not apply it: an atom becomes injectable
     // only when someone scopes it on purpose (§4b).
     expect(assignScope).not.toHaveBeenCalled();

@@ -68,6 +68,12 @@ export interface TranscriptEntry {
   /** Serialized attachment metadata — never bytes. */
   attachments?: string | null;
   model?: string | null;
+  /**
+   * Serialized `RecalledMemory[]` — the memories this turn's answer drew on, so a resumed
+   * transcript can still show the recall card. `null` on a turn that recalled nothing, which is
+   * the common case and costs nothing.
+   */
+  memoryRefs?: string | null;
 }
 
 /**

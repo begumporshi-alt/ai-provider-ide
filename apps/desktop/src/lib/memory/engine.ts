@@ -70,6 +70,43 @@ export interface Exchange {
   assistant: string;
 }
 
+/**
+ * One learning moment: an atom the assistant just stored, as the chat shows it. A separate shape
+ * from the store's `Memory` so a listener cannot accidentally mutate a live row.
+ */
+export interface LearnedMemory {
+  id: string;
+  layer: MemoryLayer;
+  text: string;
+}
+
+const learnedListeners = new Set<(memories: LearnedMemory[]) => void>();
+
+/**
+ * Subscribe to learning moments — emitted whenever distillation stores new atoms, whether that
+ * happened in a chat turn's background distil or the capture-queue drain. Returns the
+ * unsubscribe function. A throwing listener is dropped from that emission, never from the set:
+ * one broken subscriber must not stop the others from hearing about the same atoms.
+ */
+export function onLearned(cb: (memories: LearnedMemory[]) => void): () => void {
+  learnedListeners.add(cb);
+  return () => {
+    learnedListeners.delete(cb);
+  };
+}
+
+function emitLearned(stored: readonly Memory[]): void {
+  if (stored.length === 0) return;
+  const light: LearnedMemory[] = stored.map((m) => ({ id: m.id, layer: m.layer, text: m.text }));
+  for (const cb of learnedListeners) {
+    try {
+      cb(light);
+    } catch {
+      // A listener must never break distillation — dropped for this emission only.
+    }
+  }
+}
+
 /** The exchanges awaiting distillation, oldest first, capped at one batch. */
 const pending: Exchange[] = [];
 let sinceDistil = 0;
@@ -149,13 +186,14 @@ export function parseAtoms(reply: string): string[] {
  * Returns [] without calling out unless a full batch has accumulated — see DISTIL_EVERY. The
  * caller is expected not to await this in the request path: distillation runs after the answer
  * is already on screen, and a slow, misconfigured or offline model must not change what the
- * user sees.
+ * user sees. Each returned row is a stored atom, id included, so a caller can act on what was
+ * just learned.
  */
 export async function distilTurn(
   sessionId: string,
   model: string,
   generate?: Generator,
-): Promise<string[]> {
+): Promise<Memory[]> {
   // No model means distillation can never run; returning without touching the counter keeps a
   // later turn — once a model is configured — from having to wait another full batch.
   if (!model || pending.length === 0) return [];
@@ -194,20 +232,27 @@ async function distillAndStore(
   model: string,
   exchanges: Exchange[],
   generate?: Generator,
-): Promise<string[]> {
+): Promise<Memory[]> {
   const script = exchanges
     .map((t) => `User: ${t.user}\n\nAssistant: ${t.assistant}`)
     .join("\n\n---\n\n");
   const reply = await (generate ?? defaultGenerator)(model, `${DISTIL_PROMPT}${script}`);
   const atoms = parseAtoms(reply);
   if (atoms.length === 0) return [];
-  await captureMemories(
-    atoms.map((text) => ({ layer: "L1" as MemoryLayer, text, session_id: sessionId })),
-  );
+  // One capture per atom, not a batch: `captureMemory` returns the stored row — its id is what
+  // makes a learning moment actionable (pin it, forget it) rather than a notice the reader can
+  // only dismiss. `captureAndRecord` also writes the graph node, which the batch path skipped;
+  // a learned atom now shows up in the Context graph the same way a recalled one does.
+  const stored: Memory[] = [];
+  for (const text of atoms) {
+    const m = await captureAndRecord("L1", text, sessionId);
+    if (m) stored.push(m);
+  }
+  if (stored.length > 0) emitLearned(stored);
   // Scenarios ride along with the atoms that produced them — fire-and-forget, so a slow or
   // failing second call never delays what the user is reading.
   void distilScenarios(sessionId, model, generate);
-  return atoms;
+  return stored;
 }
 
 /**
@@ -224,7 +269,7 @@ export async function distilExchange(
   model: string,
   exchange: Exchange,
   generate?: Generator,
-): Promise<string[]> {
+): Promise<Memory[]> {
   if (!model) return [];
   return distillAndStore(sessionId, model, [exchange], generate);
 }

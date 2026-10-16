@@ -380,7 +380,7 @@ const virtualDirs = new Set<string>();
  */
 const bgJobs = new Map<
   string,
-  { id: string; program: string; out: string; running: boolean; started: number; pid: number }
+  { id: string; program: string; out: string; running: boolean; started: number; pid: number; exit?: number }
 >();
 let bgSeq = 0;
 const bgSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));

@@ -3,6 +3,7 @@
  * re-reads it whenever an action bumps the tick (no duplicated truth, no dirty-checking).
  */
 import { create } from "zustand";
+import type { RecalledMemory } from "./lib/chat/turn/memory-refs";
 
 export type ScreenId = "providers" | "models" | "assistant" | "compare" | "activity" | "context" | "history" | "skills" | "agents" | "subagents" | "memory" | "settings" | "gateway" | "control" | "onboarding";
 
@@ -34,6 +35,8 @@ export type ResumeMsg = {
   content: string;
   tool_calls?: unknown;
   tool_call_id?: string;
+  /** The memories this answer drew on (0028's `memory_refs` column), for the recall card. */
+  recalledMemories?: RecalledMemory[];
 };
 
 /**

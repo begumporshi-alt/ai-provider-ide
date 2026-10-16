@@ -248,7 +248,7 @@ describe("runPlainTurn", () => {
     expect(appended, "one append per turn").toHaveLength(1);
     expect(appended[0]).toEqual([
       { role: "user", content: "hi there", attachments: null },
-      { role: "assistant", content: "ab", reasoning: null, model: "prov-1/model-x" },
+      { role: "assistant", content: "ab", reasoning: null, model: "prov-1/model-x", memoryRefs: null },
     ]);
   });
 
@@ -289,7 +289,47 @@ describe("runPlainTurn", () => {
       content: "⚠ boom",
       reasoning: null,
       model: "prov-1/model-x",
+      memoryRefs: null,
     });
+  });
+
+  /**
+   * The visible half of recall. The prompt-side block is silent by design, so the bubble patch and
+   * the durable row are the two places the turn says what it knew — and they must agree with each
+   * other, or a resumed session would show a card the live one did not (or the reverse).
+   */
+  it("attaches the recall record to the bubble and the durable row, as a light copy", async () => {
+    const remembered: Memory = {
+      id: "m-9",
+      layer: "L1",
+      text: "Tushu lives in Dhaka",
+      session_id: "s-old",
+      subject: null,
+      created_at: 1_700_000_000_000,
+      updated_at: 1_700_000_000_000,
+      pinned: true,
+      scope: { user: "local", project: null, agent: null, global: false },
+      score: -1,
+      superseded_at: null,
+    };
+    const { ports, patches, appended } = makePorts({ chunks: ["got it"], recalled: [remembered] });
+    await runPlainTurn(makeRequest(), ports);
+
+    // The optimistic bubble got the light copy (id, layer, text, age, pinned) — not the store row.
+    const patch = patches.find((p) => "recalledMemories" in p.patch);
+    expect(patch).toMatchObject({ id: "assistant-1", patch: { recalledMemories: [{ id: "m-9", layer: "L1", text: "Tushu lives in Dhaka", at: 1_700_000_000_000, pinned: true }] } });
+
+    // The durable row carries the same record, serialized, for the resume path to restore.
+    const row = appended[0]![1]!;
+    expect(row.memoryRefs).toBeTypeOf("string");
+    expect(JSON.parse(row.memoryRefs!)).toEqual([{ id: "m-9", layer: "L1", text: "Tushu lives in Dhaka", at: 1_700_000_000_000, pinned: true }]);
+  });
+
+  it("writes no recall record when the turn recalled nothing", async () => {
+    const { ports, patches, appended } = makePorts({ chunks: ["ok"] });
+    await runPlainTurn(makeRequest(), ports);
+    expect(patches.some((p) => "recalledMemories" in p.patch)).toBe(false);
+    expect(appended[0]![1]!.memoryRefs).toBeNull();
   });
 });
 

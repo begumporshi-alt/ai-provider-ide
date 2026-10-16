@@ -318,4 +318,42 @@ describe("runAgentTurn", () => {
     expect(ports.onBusy).toHaveBeenLastCalledWith(false);
     expect(ports.clearAbort).toHaveBeenCalled();
   });
+
+  /**
+   * The replace mints fresh ids for every message, so a recall record pinned to the optimistic
+   * bubble would be lost when it lands. The closing assistant message is the one that answered,
+   * so it is the one that carries the record — on the replace (what the user sees) and on the
+   * durable row (what a resume restores), as the same light copy.
+   */
+  it("rides the recall record on the closing turn, through the replace and the durable row", async () => {
+    const { ports, appended } = makePorts({ steps: [{ text: "Here is the answer." }] });
+    const remembered = {
+      id: "m-3",
+      layer: "L2",
+      text: "Tushu prefers terse replies",
+      created_at: 1_700_000_000_000,
+      pinned: false,
+    };
+    ports.memory.recall = vi.fn().mockResolvedValue([remembered]);
+    await runAgentTurn(makeRequest(), ports);
+
+    const replaced = vi.mocked(ports.onReplaceTranscript).mock.calls[0]![0] as { role: string; recalledMemories?: unknown[] }[];
+    const closing = replaced[replaced.length - 1]!;
+    expect(closing.role).toBe("assistant");
+    expect(closing.recalledMemories).toEqual([{ id: "m-3", layer: "L2", text: "Tushu prefers terse replies", at: 1_700_000_000_000, pinned: false }]);
+    // Nothing else in the transcript claims the record — the closing turn answered, nothing else did.
+    expect(replaced.filter((m) => m.recalledMemories)).toHaveLength(1);
+
+    const assistantRows = appended[0]!.filter((e) => e.role === "assistant");
+    expect(assistantRows).toHaveLength(1);
+    expect(JSON.parse(assistantRows[0]!.memoryRefs!)).toEqual(closing.recalledMemories);
+  });
+
+  it("writes no recall record when the run recalled nothing", async () => {
+    const { ports, appended } = makePorts({ steps: [{ text: "done" }] });
+    await runAgentTurn(makeRequest(), ports);
+    const replaced = vi.mocked(ports.onReplaceTranscript).mock.calls[0]![0] as { recalledMemories?: unknown[] }[];
+    expect(replaced.some((m) => m.recalledMemories)).toBe(false);
+    expect(appended[0]!.every((e) => (e.memoryRefs ?? null) === null)).toBe(true);
+  });
 });

@@ -59,6 +59,7 @@ import {
 } from "@aiprovider/router-core";
 import { createHttpPort, createKeyVaultPort } from "./ipc-client";
 import { noteTrailFailure, type TrailId } from "./lib/trail-health";
+import { parseRecalledMemoryRefs } from "./lib/chat/turn/memory-refs";
 import { resolveProviderManifest } from "./lib/providers/profile-select";
 import type { HostContextNode, HostContextEdge } from "./lib/context/engine";
 import {
@@ -1266,6 +1267,8 @@ export interface SessionMessageRow {
   /** Serialized attachment metadata — never bytes. */
   attachments?: string | null;
   model?: string | null;
+  /** Serialized `RecalledMemory[]` (0028) — the memories this turn's answer drew on. */
+  memoryRefs?: string | null;
   ts: number;
 }
 
@@ -1315,6 +1318,10 @@ export async function resumeSession(sessionId: string): Promise<import("./ui-sta
           // message without the calls is honest; inventing an empty array would tell the provider
           // the assistant made no call, which is a different claim.
         }
+      }
+      if (r.memoryRefs) {
+        const recalled = parseRecalledMemoryRefs(r.memoryRefs);
+        if (recalled.length > 0) msg.recalledMemories = recalled;
       }
       return msg;
     });

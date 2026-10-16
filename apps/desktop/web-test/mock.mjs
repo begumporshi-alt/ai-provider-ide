@@ -591,6 +591,19 @@ async function oracle(req, res, path) {
       // No answer at all — the model never got past thinking. `content` must stay empty, or the
       // test would be asserting on a reply the real provider never sends.
       content = "";
+    } else if (/^You distill durable memory/i.test(userPrompt)) {
+      // The memory engine's distillation call (engine.ts DISTIL_PROMPT). Only the engine sends
+      // this, so keying on the prompt prefix cannot collide with a real user's turn. Atoms are
+      // fixed so a spec can assert on the chips they become; the second line exercises the
+      // clamping path nothing else in the harness drives.
+      content = JSON.stringify([
+        "Prefers tests over assertions",
+        "Runs the app from the workspace root and expects PnP to stay quiet",
+      ]);
+    } else if (/^You condense a batch of memory atoms/i.test(userPrompt)) {
+      // The scenario pass rides along after every distillation; nothing asserts on L2 rows yet,
+      // so it condenses nothing — the atoms stay the visible learning.
+      content = "[]";
     } else if (!tools && /html page/i.test(last)) {
       // Plain-chat variant: a whole HTML document in a fenced block — the shape the HtmlPreview
       // card exists for. The prose around the fence proves the splitter keeps surrounding text;

@@ -347,7 +347,22 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0025_agent_runs_tokens", add_agent_runs_tokens),
     ("0026_pending_last_error", add_pending_last_error),
     ("0027_session_messages", create_session_messages),
+    ("0028_session_memory_refs", add_session_memory_refs),
 ];
+
+/// 0028 — the recall record on a transcript row.
+///
+/// Recall was invisible by design: the block rides a system message, so a resumed conversation
+/// had no way to show which memories an answer drew on. This column carries the serialized
+/// `RecalledMemory[]` of the closing assistant turn. Nullable — a turn that recalled nothing,
+/// and every row written before this migration, has none, which is a fact about the turn rather
+/// than a failure.
+fn add_session_memory_refs(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    if !table_has_column(tx, "session_messages", "memory_refs")? {
+        tx.execute_batch("ALTER TABLE session_messages ADD COLUMN memory_refs TEXT;")?;
+    }
+    Ok(())
+}
 
 /// 0027 — the transcript as rows, so a resumed session is restored rather than reconstructed.
 ///
@@ -1534,11 +1549,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0027 data migrations.
-        assert_eq!(info.schema_version, 27);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0028 data migrations.
+        assert_eq!(info.schema_version, 28);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(27, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(28, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run and P7 memory tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns

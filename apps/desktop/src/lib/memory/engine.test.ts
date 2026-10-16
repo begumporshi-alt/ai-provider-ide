@@ -19,6 +19,7 @@ import {
   editCore,
   memoryBlock,
   memoryNodeId,
+  onLearned,
   parseAtoms,
   parseScenarios,
   recallContext,
@@ -57,7 +58,11 @@ describe("memory engine", () => {
     updateMemory.mockReset();
     recordContext.mockReset();
     captureMemories.mockResolvedValue(0);
-    captureMemory.mockResolvedValue(mem("m", "L1", "x"));
+    // Echo the capture back with the id a stored row would carry, so the distilled rows a test
+    // reads are the atoms the model returned, not one fixed fixture row.
+    captureMemory.mockImplementation(async (m) =>
+      mem(`${m.layer}:${m.text}`, m.layer, m.text, (m as { pinned?: boolean }).pinned ?? false),
+    );
     recallMemories.mockResolvedValue([]);
     listMemories.mockResolvedValue([]);
     sessionMemories.mockResolvedValue([]);
@@ -102,14 +107,60 @@ describe("memory engine", () => {
       await rememberTurn("s", "q3", "a3");
     }
 
-    it("stores the atoms the model extracted", async () => {
+    it("stores the atoms the model extracted, each with its own id", async () => {
       const generate = vi.fn().mockResolvedValue('["Lives in Dhaka", "Prefers terse replies"]');
       await threeTurns();
       const got = await distilTurn("s", "m/1", generate);
-      expect(got).toEqual(["Lives in Dhaka", "Prefers terse replies"]);
-      const stored = captureMemories.mock.calls.filter((c) => (c[0][0] as { layer: string }).layer === "L1");
-      expect(stored).toHaveLength(1);
-      expect(stored[0]![0][0]).toMatchObject({ layer: "L1", text: "Lives in Dhaka", session_id: "s" });
+      expect(got.map((m) => m.text)).toEqual(["Lives in Dhaka", "Prefers terse replies"]);
+      // One capture per atom — per-atom is what returns a row with an id, which is what makes a
+      // learning moment actionable instead of a bare count.
+      expect(captureMemory).toHaveBeenCalledTimes(2);
+      expect(captureMemory).toHaveBeenCalledWith(
+        expect.objectContaining({ layer: "L1", text: "Lives in Dhaka", sessionId: "s" }),
+      );
+      expect(got.every((m) => m.id.length > 0)).toBe(true);
+    });
+
+    it("announces what it learned, and keeps announcing after a listener stops listening", async () => {
+      const heard: string[][] = [];
+      const stop = onLearned((ms) => heard.push(ms.map((m) => m.text)));
+      try {
+        const generate = vi.fn().mockResolvedValue('["a durable fact"]');
+        await threeTurns();
+        await distilTurn("s", "m/1", generate);
+        expect(heard).toEqual([["a durable fact"]]);
+
+        // A batch that yields nothing is not learning — no announcement, no empty event.
+        heard.length = 0;
+        const nothing = vi.fn().mockResolvedValue("[]");
+        await threeTurns();
+        await distilTurn("s", "m/1", nothing);
+        expect(heard).toEqual([]);
+      } finally {
+        stop();
+      }
+      const after = vi.fn().mockResolvedValue('["late fact"]');
+      await threeTurns();
+      await distilTurn("s", "m/1", after);
+      expect(heard).toEqual([]);
+    });
+
+    it("a throwing listener does not break the others or the distillation", async () => {
+      const boom = onLearned(() => {
+        throw new Error("listener bug");
+      });
+      const heard: string[] = [];
+      const good = onLearned((ms) => heard.push(...ms.map((m) => m.text)));
+      try {
+        const generate = vi.fn().mockResolvedValue('["surviving fact"]');
+        await threeTurns();
+        const got = await distilTurn("s", "m/1", generate);
+        expect(got.map((m) => m.text)).toEqual(["surviving fact"]);
+        expect(heard).toEqual(["surviving fact"]);
+      } finally {
+        boom();
+        good();
+      }
     });
 
     it("does not call the model until a full batch has accumulated", async () => {
@@ -139,15 +190,15 @@ describe("memory engine", () => {
       await expect(distilTurn("s", "m/1", generate)).resolves.toEqual([]);
       generate.mockResolvedValue('["recovered"]');
       await rememberTurn("s", "q4", "a4");
-      expect(await distilTurn("s", "m/1", generate)).toEqual(["recovered"]);
+      const got = await distilTurn("s", "m/1", generate);
+      expect(got.map((m) => m.text)).toEqual(["recovered"]);
     });
 
     it("writes nothing when the model finds nothing durable", async () => {
       const generate = vi.fn().mockResolvedValue("[]");
       await threeTurns();
       await distilTurn("s", "m/1", generate);
-      const stored = captureMemories.mock.calls.filter((c) => (c[0][0] as { layer: string }).layer === "L1");
-      expect(stored).toHaveLength(0);
+      expect(captureMemory).not.toHaveBeenCalled();
     });
 
     it("does not call out at all when there is no model configured", async () => {

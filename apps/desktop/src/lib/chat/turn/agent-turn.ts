@@ -12,7 +12,7 @@ import { runAgentLoop, withSubagentDefs } from "../../tools";
 import { fetchMcpTools } from "../../tools/mcp-client";
 import { RunCheckpoint, createCheckpointingHost } from "../../tools/changeset";
 import { buildAgentSystem } from "./prompt";
-import { newMsgId, replayHistory } from "./messages";
+import { newMsgId, recalledLight, replayHistory } from "./messages";
 import { clip, recordAgentTurn } from "./graph-record";
 import { attachmentMeta } from "./ports";
 import type { TurnRequestBase } from "./ports";
@@ -110,6 +110,10 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
   // recalled block has to be in the system prompt before the first call.
   const recalled = req.useMemory ? await ports.memory.recall(req.text) : [];
   if (recalled.length > 0) ports.memory.recordRecall(userNode, recalled);
+  // The visible record of that recall. It rides the run's CLOSING assistant message — the replace
+  // below mints fresh ids for every message, so anything pinned to the optimistic bubble would be
+  // lost when it lands — and the closing message is the one the recall card hangs under.
+  const recalledRefs = recalledLight(recalled);
   // Replay prior turns verbatim — including assistant turns that carry tool_calls and the
   // tool-result turns that answer them — so the model keeps its chaining context.
   const history: ChatMessage[] = [
@@ -287,7 +291,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       : finalText;
     const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: closingText }];
     ports.onReplaceTranscript(
-      fullMessages.map((m) => ({
+      fullMessages.map((m, i) => ({
         id: newMsgId(),
         role: m.role as "user" | "assistant" | "tool",
         // `textOfContent`: the agent loop's transcript includes the user turn we sent, which
@@ -296,6 +300,11 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         content: textOfContent(m.content),
         ...(m.tool_calls ? { tool_calls: m.tool_calls } : {}),
         ...(m.tool_call_id ? { tool_call_id: m.tool_call_id } : {}),
+        // The closing turn is what answered, so it is what carries the recall record. `i` is the
+        // index into fullMessages, whose last element is always the assistant closing line.
+        ...(i === fullMessages.length - 1 && recalledRefs.length > 0
+          ? { recalledMemories: recalledRefs }
+          : {}),
       })),
     );
     // Only this turn's messages. `runAgentLoop` seeds its working copy from `history` and returns
@@ -318,12 +327,18 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
         attachments: attachmentMeta(req.attachments),
         model: null,
       },
-      ...fullMessages.slice(history.length).map((m) => ({
+      ...fullMessages.slice(history.length).map((m, i, slice) => ({
         role: m.role as "user" | "assistant" | "tool",
         content: textOfContent(m.content),
         toolCalls: m.tool_calls ? JSON.stringify(m.tool_calls) : null,
         toolCallId: m.tool_call_id ?? null,
         model: m.role === "assistant" ? req.model : null,
+        // The durable copy of the recall record, on the closing assistant row — the same row the
+        // resumed transcript renders the card under.
+        memoryRefs:
+          i === slice.length - 1 && m.role === "assistant" && recalledRefs.length > 0
+            ? JSON.stringify(recalledRefs)
+            : null,
       })),
     ]);
     // P7: remember the exchange, then distil it. Distillation is deliberately not awaited —
