@@ -271,6 +271,10 @@ function RunSwitchRow({
  * the user — typing "12" passes through "1", and clearing the field to retype it would snap back
  * to a number mid-edit. The value is clamped when the edit is finished, not while it is in
  * progress.
+ *
+ * Two states, both stated on screen rather than left to a tooltip: **a number** means the turn is
+ * bounded and carries a clear button, **blank** means it is not counted and says so in words. A
+ * blank box that only a hover explains is how this field misled users twice.
  */
 function StepBudget({
   value,
@@ -301,32 +305,62 @@ function StepBudget({
     // The run-configuration panel's step budget, under the agent switches it belongs to. The
     // accessible name stays "tool steps" (aria-label wins over the label's visible text), so the
     // spec that fills this field keeps matching.
-    <label
+    //
+    // **The blank state is labelled on screen, not only in a tooltip.** "Blank means no limit" lived
+    // in the `title` attribute alone, and a field whose meaning is visible only on hover is how this
+    // one came to be misread twice — once defaulting to 8, once to a 250 backstop nobody could see.
+    // The clear button is the same fix for the action: the stored value is a real `null` rather than
+    // an omission, so emptying the box *is* a setting change and should be one click, not a
+    // select-all. It sits outside the `<label>` because a button nested in a label also activates the
+    // input.
+    <span
       className={`flex items-center gap-1.5 ${disabled ? "opacity-50" : ""}`}
       style={{ color: "var(--text-dim)" }}
       title={
         disabled
           ? "only applies in agent mode — without tools there is nothing to step through"
-          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank to leave it to the loop — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
+          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank for no limit — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
       }
     >
-      <span className="text-[11px]">Steps</span>
-      <input
-        type="number"
-        min={1}
-        max={MAX_ITERATIONS_CAP}
-        value={draft}
-        disabled={disabled}
-        onChange={(e) => setDraft(e.target.value)}
-        onBlur={commit}
-        onKeyDown={(e) => {
-          if (e.key === "Enter") commit();
-        }}
-        aria-label="tool steps"
-        className="no-spin w-14 rounded-full border px-2 py-0.5 text-center text-[11px]"
-        style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
-      />
-    </label>
+      <label className="flex items-center gap-1.5">
+        <span className="text-[11px]">Steps</span>
+        <input
+          type="number"
+          min={1}
+          max={MAX_ITERATIONS_CAP}
+          value={draft}
+          disabled={disabled}
+          onChange={(e) => setDraft(e.target.value)}
+          onBlur={commit}
+          onKeyDown={(e) => {
+            if (e.key === "Enter") commit();
+          }}
+          aria-label="tool steps"
+          className="no-spin w-14 rounded-full border px-2 py-0.5 text-center text-[11px]"
+          style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text)" }}
+        />
+      </label>
+      {value === null ? (
+        // Reads `value`, not `draft`: mid-edit the box can be empty while a number is still stored,
+        // and this label describes what is saved rather than what is being typed.
+        <span className="text-[11px] italic opacity-70">no limit</span>
+      ) : (
+        <button
+          type="button"
+          disabled={disabled}
+          aria-label="clear step budget"
+          title="clear the step budget — a turn will not be counted, and stops when the model answers"
+          onClick={() => {
+            onChange(null);
+            setDraft("");
+          }}
+          className="rounded-full border px-1.5 text-[11px] leading-none"
+          style={{ background: "var(--surface-2)", borderColor: "var(--border)", color: "var(--text-dim)" }}
+        >
+          ×
+        </button>
+      )}
+    </span>
   );
 }
 

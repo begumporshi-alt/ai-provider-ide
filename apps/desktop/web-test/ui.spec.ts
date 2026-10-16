@@ -533,6 +533,12 @@ test("assistant: the tool-step budget is a setting, blank means no limit, and a 
   // tools, paced by the reminder in `agentLoop.ts`. It used to default to 8, which is the
   // gateway's bound for clients this app cannot see, not this screen's.
   await expect(budget).toHaveValue("");
+  // And the blank state says so on screen. It used to be explained only by the `title` tooltip,
+  // which is how a field meaning "unbounded" got read as "unset" — and then bounded twice, once at
+  // 8 and once at 250, by code the field never showed.
+  await expect(page.getByText("no limit", { exact: true })).toBeVisible();
+  // Nothing stored means nothing to clear, so the button is not offered.
+  await expect(page.getByRole("button", { name: "clear step budget" })).toHaveCount(0);
 
   // These edits are deliberately back-to-back with no settling time. The root's write is
   // debounced, and it used to serialise the snapshot from when it was SCHEDULED rather than
@@ -549,6 +555,10 @@ test("assistant: the tool-step budget is a setting, blank means no limit, and a 
   await budget.fill("999");
   await budget.blur();
   await expect(budget).toHaveValue("250");
+  // A stored number means a bounded turn, and the state on screen changes with it: the "no limit"
+  // label is gone and the clear button appears.
+  await expect(page.getByText("no limit", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "clear step budget" })).toBeVisible();
 
   // Typing is not clamped mid-edit: "12" passes through "1", and clamping on the keystroke
   // would make the second digit impossible to enter.
@@ -557,16 +567,32 @@ test("assistant: the tool-step budget is a setting, blank means no limit, and a 
   await budget.blur();
   await expect(budget).toHaveValue("12");
 
-  // Clearing the field asks for no limit again, and that has to be a real stored value rather
-  // than an omission — `JSON.stringify` drops an `undefined`, so a cleared budget saved that way
-  // would leave the old number in the row and silently restore it.
+  // An emptied field also asks for no limit, and that has to be a real stored value rather than an
+  // omission — `JSON.stringify` drops an `undefined`, so a cleared budget saved that way would
+  // leave the old number in the row and silently restore it.
   await budget.fill("");
   await budget.blur();
   await expect(budget).toHaveValue("");
+  await expect(page.getByText("no limit", { exact: true })).toBeVisible();
+
+  // The clear button is the same setting change as emptying the box — the point of it is that a
+  // stored number is removable in one click, without a select-all. Set one, clear it, and read the
+  // state back off the screen.
+  await budget.fill("12");
+  await budget.blur();
+  await expect(budget).toHaveValue("12");
+  await page.getByRole("button", { name: "clear step budget" }).click();
+  await expect(budget, "the click clears the stored number").toHaveValue("");
+  await expect(page.getByText("no limit", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("button", { name: "clear step budget" }),
+    "and there is nothing left to clear",
+  ).toHaveCount(0);
 
   await page.waitForTimeout(700);
   await page.goto(`${APP}?seed=systemai`);
   await page.getByRole("button", { name: "Assistant", exact: true }).click();
   await openRunConfig(page);
   await expect(page.getByLabel("tool steps"), "no limit survives the reload").toHaveValue("");
+  await expect(page.getByText("no limit", { exact: true })).toBeVisible();
 });
