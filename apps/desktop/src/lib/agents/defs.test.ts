@@ -7,6 +7,7 @@
  */
 import { describe, expect, it } from "vitest";
 import { isValidDefId, parseSubagentDef, parseSubagentDefs } from "./defs";
+import { MAX_ITERATIONS_CAP } from "../tools/agentLoop";
 
 const VALID = {
   id: "doc-sweeper",
@@ -52,8 +53,11 @@ describe("parseSubagentDef", () => {
   });
 
   it("clamps maxIterations into the loop's bounds and rejects non-numbers", () => {
+    // Read from the constant rather than repeating `50`: this literal is why the definition guard
+    // and the run-configuration field could disagree. Both ceilings are one number now, and a test
+    // that hardcodes it would let them drift apart again while staying green here.
     const clamped = parseSubagentDef({ ...VALID, maxIterations: 999 });
-    expect("def" in clamped && clamped.def.maxIterations).toBe(50);
+    expect("def" in clamped && clamped.def.maxIterations).toBe(MAX_ITERATIONS_CAP);
     const low = parseSubagentDef({ ...VALID, maxIterations: 0.4 });
     expect("def" in low && low.def.maxIterations).toBe(1);
     const bad = parseSubagentDef({ ...VALID, maxIterations: "twelve" });

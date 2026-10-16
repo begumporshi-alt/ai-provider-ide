@@ -10,7 +10,7 @@ export type { ToolsPolicy } from "./host";
 export { mcpName, mcpToolToSpec, mcpTargetOf } from "./mcp";
 export type { McpServerConfig, McpToolInfo, McpRefreshOutcome } from "./mcp";
 export { fetchMcpTools, mcpFailures, clearMcpCache } from "./mcp-client";
-export { runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, planPathFromResult, resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MAX, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_CONCURRENCY } from "./agentLoop";
+export { runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP, HARD_ITERATION_BACKSTOP, planPathFromResult, resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MAX, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_CONCURRENCY } from "./agentLoop";
 export type { ToolSpec, ToolEffect, ToolHost, GenerateFn, AgentEvent, AgentLoopOptions, PlanPorts } from "./types";
 export {
   APPROVAL_MODES, INITIAL_APPROVAL, decide, withTrustedTool, withAllowAll, planRefusal, modeApprovesWrites,

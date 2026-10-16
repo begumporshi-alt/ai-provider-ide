@@ -542,10 +542,13 @@ test("assistant: the tool-step budget is a setting, blank means no limit, and a 
   await page.getByLabel("agent mode").check();
   await expect(budget).toBeEnabled();
 
-  // 999 is not a different setting from the cap, it is the cap with the answer arriving late.
+  // 999 is not a different setting from the cap, it is the cap with the answer arriving late. The
+  // cap is the loop's own hard bound (`HARD_ITERATION_BACKSTOP`), so the field cannot ask for more
+  // than the loop will actually do — it used to stop at 50 while the loop ran to 250, which made
+  // the ceiling notice's "raise Steps" advice impossible to follow for anyone already at 50.
   await budget.fill("999");
   await budget.blur();
-  await expect(budget).toHaveValue("50");
+  await expect(budget).toHaveValue("250");
 
   // Typing is not clamped mid-edit: "12" passes through "1", and clamping on the keystroke
   // would make the second digit impossible to enter.

@@ -43,6 +43,24 @@ function fakeModel(
   };
 }
 
+/**
+ * A model that calls a tool for `rounds` rounds and only then answers.
+ *
+ * The difference from a model that calls a tool forever is what makes a bound test falsifiable: a
+ * runaway script would *hang* if the bound regressed, and a test that hangs is not evidence. This
+ * one finishes on its own answer, so a lost bound shows up as `hitCeiling: false` and an iteration
+ * count past the bound — a red test, not a stuck suite.
+ */
+function relentlessModel(rounds: number): GenerateFn {
+  return fakeModel([
+    ...Array.from({ length: rounds }, () => ({
+      text: "",
+      calls: [{ id: "c1", name: "read_file", arguments: '{"path":"a"}' }],
+    })),
+    { text: "finally done" },
+  ]);
+}
+
 /** A minimal specialist definition, for the tests that exercise narrowing. */
 function def(over: Partial<SubagentDef> = {}): SubagentDef {
   return {
@@ -1949,6 +1967,63 @@ describe("runAgentLoop", () => {
     const done = events.find((e) => e.type === "done");
     expect(done && done.type === "done" && done.iterations).toBe(3);
     expect(out.text).toBe("loop");
+  });
+
+  it("bounds a turn with no user budget at the backstop, and reports the round it reached", async () => {
+    // The defect this pins (2026-10-16 report: "stopped at 50 iterations — the step budget ran out
+    // while the model was still calling tools. Raise 'Steps'"). Two things were wrong behind that
+    // one sentence. First, a turn with no budget had no bound *at all*: `maxIterations === null`
+    // drove the loop condition, so "blank means no limit" meant a genuinely infinite loop rather
+    // than the paced-but-bounded turn the docs described. Second, the ceiling exit computed its
+    // count as `maxIterations ?? 0`, so a turn that had never set a budget reported `0` — an
+    // iteration count nobody could have reached, which is what made the notice's advice nonsense.
+    //
+    // The script answers *past* the backstop on purpose. A model that never stops would make this
+    // test hang rather than fail if the bound regressed, and a test that cannot go red is not
+    // evidence; this one goes red by finishing on the model's own answer instead of the bound.
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: relentlessModel(HARD_ITERATION_BACKSTOP + 50),
+      host,
+      // No `maxIterations` — the Assistant's own default, the blank Steps field.
+    });
+
+    expect(out.hitCeiling, "an unbounded turn is still bounded").toBe(true);
+    expect(out.iterations, "and reports the round it really reached").toBe(HARD_ITERATION_BACKSTOP);
+    expect(out.iterations, "not the 0 the old `maxIterations ?? 0` would report").not.toBe(0);
+    expect(out.text, "the model never got to its answer — the bound stopped it").not.toContain(
+      "finally done",
+    );
+  });
+
+  it("cannot be configured past the backstop, so the bound and the field's maximum agree", async () => {
+    // A setting whose maximum exceeds the loop's own bound is the same lie one level down: the user
+    // sets 500, the loop stops at 250, and the notice blames a budget of 500. The two are asserted
+    // equal here so that editing either alone fails.
+    expect(MAX_ITERATIONS_CAP).toBe(HARD_ITERATION_BACKSTOP);
+    // One bound for both loops — the sub-agent's insurance and the main turn's are the same number,
+    // because the argument for it ("152 was the largest honest run") was never child-specific.
+    expect(SUBAGENT_HARD_BACKSTOP).toBe(HARD_ITERATION_BACKSTOP);
+
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: relentlessModel(HARD_ITERATION_BACKSTOP + 50),
+      host,
+      // Deliberately past the cap: the loop clamps rather than honouring it, so the number a caller
+      // writes can never exceed the number the notice would report.
+      maxIterations: HARD_ITERATION_BACKSTOP + 1000,
+    });
+
+    expect(out.hitCeiling).toBe(true);
+    expect(out.iterations).toBe(HARD_ITERATION_BACKSTOP);
   });
 
   it("summarizes the last tool activity when the ceiling hits on a tool-only turn", async () => {
