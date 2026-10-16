@@ -997,6 +997,108 @@ describe("runAgentLoop", () => {
     expect(JSON.stringify(out.messages)).not.toContain("READ_IMAGE:");
   });
 
+  it("a browser_screenshot capture rides the same marker protocol — receipt on the wire, image attached", async () => {
+    // The capture's base64 used to flood the transcript as text: browser_screenshot returned the
+    // READ_IMAGE marker, but only read_image/generate_image were extracted from it. The receipt is
+    // what the model and the persisted transcript keep; the image arrives as a real part.
+    const PNG_B64 = "iVBORw==";
+    const host: ToolHost = {
+      async run(_name, _args) {
+        return { ok: true, output: `READ_IMAGE:image/png;base64,${PNG_B64}\npath: images/browser-1.png\nbytes: 4096` };
+      },
+    };
+    const model = fakeModel([
+      { text: "capturing", calls: [{ id: "c1", name: "browser_screenshot", arguments: "{}" }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(typeof toolMsg?.content).toBe("string");
+    expect(toolMsg?.content, "the wire keeps the short receipt").toContain("image captured and saved: images/browser-1.png (4 KB)");
+    expect(JSON.stringify(out.messages), "no base64 floods the transcript").not.toContain("READ_IMAGE:");
+    const attach = out.messages.find((m) => m.role === "user" && Array.isArray(m.content));
+    expect(JSON.stringify(attach), "the capture is attached as an image part").toContain(PNG_B64);
+  });
+
+  it("the receipt carries the session cache's name when the cacheImage port answers", async () => {
+    // The workspace file is the primary source, and exactly the thing a revert or a clean takes
+    // away — the cache line is what lets a replayed transcript still show its picture.
+    const PNG_B64 = "iVBORw==";
+    const host: ToolHost = {
+      async run() {
+        return { ok: true, output: `READ_IMAGE:image/png;base64,${PNG_B64}\npath: images/s.png\nbytes: 4096` };
+      },
+    };
+    const cached: string[] = [];
+    const model = fakeModel([
+      { text: "capturing", calls: [{ id: "c1", name: "browser_screenshot", arguments: "{}" }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      cacheImage: async (mediaType, base64) => {
+        cached.push(`${mediaType}:${base64.length}`);
+        return "abc123.png";
+      },
+    });
+
+    expect(cached).toEqual(["image/png:8"]);
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("cache: abc123.png");
+  });
+
+  it("a failed or absent cache deposit leaves no cache line — never a failed run", async () => {
+    const PNG_B64 = "iVBORw==";
+    const host: ToolHost = {
+      async run() {
+        return { ok: true, output: `READ_IMAGE:image/png;base64,${PNG_B64}\npath: images/s.png\nbytes: 4096` };
+      },
+    };
+    const model = fakeModel([
+      { text: "capturing", calls: [{ id: "c1", name: "browser_screenshot", arguments: "{}" }] },
+      { text: "done" },
+    ]);
+
+    const rejected = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      cacheImage: async () => {
+        throw new Error("cache down");
+      },
+    });
+    const toolMsg = rejected.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content, "the receipt is intact").toContain("image captured and saved: images/s.png");
+    expect(toolMsg?.content, "and says nothing about a cache").not.toContain("cache:");
+
+    const absent = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+    expect(
+      String(absent.messages.find((m) => m.role === "tool")?.content ?? ""),
+      "an absent port is the old behaviour: no cache line",
+    ).not.toContain("cache:");
+  });
+
   it("generate_image refuses with guidance when no image port exists", async () => {
     const ran: string[] = [];
     const host: ToolHost = {

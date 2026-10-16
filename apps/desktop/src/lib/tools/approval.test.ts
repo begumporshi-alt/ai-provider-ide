@@ -31,6 +31,7 @@ describe("toolEffect", () => {
       "browser_fill",
       "browser_navigate",
       "browser_screenshot",
+      "browser_start",
       "edit_file",
       "edit_notebook",
       "generate_image",

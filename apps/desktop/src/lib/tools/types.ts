@@ -180,6 +180,15 @@ export interface AgentLoopOptions {
    */
   loadSkill?: (name: string, signal?: AbortSignal) => Promise<string | null>;
   /**
+   * The session image cache behind the marker receipt: at attach time the loop deposits a copy of
+   * the image bytes app-side so a replayed transcript can still show its picture after the
+   * workspace file is cleaned. Best-effort by contract — an implementation returns the cache
+   * name, or null (and the receipt simply carries no cache line) on any failure. Absent in tests
+   * and bridges; the preview then degrades to nothing once the workspace copy is gone, which is
+   * the behaviour this port exists to fix.
+   */
+  cacheImage?: (mediaType: string, base64: string) => Promise<string | null>;
+  /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`. Absent — tests, the
    * gateway bridge — both tools refuse with a sentence telling the model to present the plan in
    * its answer instead: a planning pass with no approval surface must not pretend it got one.

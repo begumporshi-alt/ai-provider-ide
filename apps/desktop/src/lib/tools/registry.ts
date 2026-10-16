@@ -248,6 +248,74 @@ export const AGENT_TOOLS: ToolSpec[] = [
     },
   },
   {
+    name: "browser_console",
+    effect: "read",
+    description:
+      "Report the console output and uncaught exceptions the connected page has printed since the last browser_console call, oldest first. This is how you learn WHY something did not work — a click that 'did nothing' usually threw. Drains: call it after acting on the page, and it will be quiet the second time.",
+    parameters: {
+      properties: {
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "browser_network",
+    effect: "read",
+    description:
+      "Report requests that failed since the last browser_network call — 4xx/5xx responses, and requests that never got one (refused connection, CORS, DNS). Drains like browser_console. Only failures are kept; a request that loaded is not reported.",
+    parameters: {
+      properties: {
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
+    name: "browser_wait_for",
+    effect: "read",
+    description:
+      "Block until the page's visible text contains the given string (up to 30 000 ms, default 10 000). Use after clicking something asynchronous instead of guessing with repeated snapshots — a wait that times out means the page did not do what you expected.",
+    parameters: {
+      properties: {
+        text: { type: "string", description: "The string to wait for in the page's visible text." },
+        timeout_ms: { type: "number", description: "Optional deadline in ms (250–30 000, default 10 000)." },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: ["text"],
+    },
+  },
+  {
+    name: "browser_expect",
+    effect: "read",
+    description:
+      "Assert that the page satisfies an expectation, retrying until a deadline: kind \"text\" (visible text contains value), \"element\" (a CSS selector matches), \"url\" or \"title\" (contains value). The assertion form of browser_wait_for — a miss reports what the page actually showed (title, URL, or text), so a failed test is a diagnosis, not a guess.",
+    parameters: {
+      properties: {
+        kind: { type: "string", description: "What to assert: \"text\", \"element\", \"url\", or \"title\"." },
+        value: {
+          type: "string",
+          description: "For text/url/title: the string that must appear. For element: a CSS selector.",
+        },
+        timeout_ms: { type: "number", description: "Optional deadline in ms (250–30 000, default 10 000)." },
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: ["kind", "value"],
+    },
+  },
+  {
+    name: "browser_start",
+    effect: "mutate",
+    description:
+      "Start the machine's Chrome (or Chromium/Edge/Brave) with the debugger port so the browser tools can attach, using a dedicated throwaway profile. Use after a browser tool reported that no browser is answering. A browser already answering is reported as success, so calling this twice is safe.",
+    parameters: {
+      properties: {
+        port: { type: "number", description: "Optional debugger port. Defaults to 9222." },
+      },
+      required: [],
+    },
+  },
+  {
     name: "process_output",
     effect: "read",
     description:

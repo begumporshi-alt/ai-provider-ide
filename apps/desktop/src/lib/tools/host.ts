@@ -12,7 +12,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { mcpTargetOf } from "./mcp";
 import type { ToolHost } from "./types";
 
-interface WireToolResult {
+export interface WireToolResult {
   ok: boolean;
   output: string;
   error?: string | null;
@@ -126,6 +126,40 @@ export async function killProcess(root: string, job: string): Promise<{ ok: bool
   });
   if (!res.ok) return { ok: false, output: res.error?.trim() || res.output };
   return { ok: true, output: res.output };
+}
+
+/**
+ * Load a workspace image for display — the same read-only `read_image` sandbox tool the model
+ * uses, invoked from the UI so a screenshot a browser call took can be shown in its row instead
+ * of a path. Returns `null` when the file is gone or unreadable: a replayed transcript whose
+ * images were cleaned up renders no preview rather than an error.
+ */
+export async function fetchWorkspaceImage(
+  root: string,
+  path: string,
+  cacheName?: string,
+): Promise<{ mediaType: string; base64: string } | null> {
+  try {
+    const res = await invoke<WireToolResult>("tool_run", {
+      req: { name: "read_image", arguments: { path }, root },
+    });
+    const m = res.ok ? res.output.match(/^READ_IMAGE:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]+)/m) : null;
+    if (m) return { mediaType: m[1]!, base64: m[2]! };
+  } catch {
+    // Fall through to the cache below.
+  }
+  // The workspace copy is gone (reverted, cleaned, a newer run's workspace) — the session cache
+  // is the transcript's own fallback. A miss here ends the chain: no preview renders.
+  if (cacheName) {
+    try {
+      const marker = await invoke<string>("image_cache_read", { name: cacheName });
+      const m = marker.match(/^READ_IMAGE:(image\/[\w.+-]+);base64,([A-Za-z0-9+/=]+)/m);
+      if (m) return { mediaType: m[1]!, base64: m[2]! };
+    } catch {
+      // Evicted or an old build without the command — no preview.
+    }
+  }
+  return null;
 }
 
 /**

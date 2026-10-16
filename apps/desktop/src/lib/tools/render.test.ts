@@ -3,6 +3,9 @@ import {
   fileChangeFor,
   groupSearchMatches,
   groupToolRuns,
+  browserSetupMiss,
+  imageCacheFromResult,
+  imagePathFromResult,
   indexToolCalls,
   parseStoredToolCalls,
   toolCallArgs,
@@ -115,6 +118,58 @@ describe("groupSearchMatches", () => {  it("groups path:line hits by file, prese
 
   it("returns nothing for output with no path:line lines", () => {
     expect(groupSearchMatches("plain text\nmore text")).toEqual([]);
+  });
+});
+
+describe("imagePathFromResult", () => {
+  it("reads the live marker's path: line", () => {
+    const marker = "READ_IMAGE:image/png;base64,iVBOR\npath: images/browser-1.png\nbytes: 4096";
+    expect(imagePathFromResult(marker)).toBe("images/browser-1.png");
+  });
+
+  it("reads the persisted receipt for each verb", () => {
+    expect(imagePathFromResult("image loaded: shots/a.png (3 KB)")).toBe("shots/a.png");
+    expect(imagePathFromResult("image generated and saved: images/d.png (10 KB)")).toBe("images/d.png");
+    expect(imagePathFromResult("image captured and saved: images/browser-1.png (4 KB)")).toBe(
+      "images/browser-1.png",
+    );
+    // The loop's receipt ends with an em-dash clause; the path still parses out of the middle.
+    expect(
+      imagePathFromResult("image captured and saved: images/browser-fixture.png (0 KB) — attached as an image part below"),
+    ).toBe("images/browser-fixture.png");
+  });
+
+  it("returns null for a result that names no image, so no preview renders", () => {
+    expect(imagePathFromResult("the page's title is Fixture page")).toBeNull();
+    expect(imagePathFromResult("")).toBeNull();
+  });
+});
+
+describe("browserSetupMiss", () => {
+  it("recognises the no-browser error and captures the port it names", () => {
+    const err =
+      "no browser answered on 127.0.0.1:9222 — start Chrome (or Chromium/Edge) with --remote-debugging-port=9222 and open a tab";
+    expect(browserSetupMiss(err)).toEqual({ port: "9222" });
+    expect(browserSetupMiss(`the call could not start.\n${err}`)).toEqual({ port: "9222" });
+  });
+
+  it("returns null for any other result — only a real setup miss earns the hint", () => {
+    expect(browserSetupMiss("READ_IMAGE:image/png;base64,iVBOR\npath: images/x.png\nbytes: 10")).toBeNull();
+    expect(browserSetupMiss("connection lost")).toBeNull();
+    expect(browserSetupMiss("")).toBeNull();
+    expect(browserSetupMiss("no browser answered on example.com:9222")).toBeNull();
+  });
+});
+
+describe("imageCacheFromResult", () => {
+  it("reads the cache name out of a receipt that carries one", () => {
+    const receipt = "image captured and saved: images/s.png (4 KB) — attached as an image part below\ncache: abc123.png";
+    expect(imageCacheFromResult(receipt)).toBe("abc123.png");
+  });
+
+  it("returns null for a receipt without a cache line — old transcripts stay valid", () => {
+    expect(imageCacheFromResult("image loaded: shots/a.png (3 KB)")).toBeNull();
+    expect(imageCacheFromResult("")).toBeNull();
   });
 });
 

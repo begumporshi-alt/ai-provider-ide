@@ -51,6 +51,7 @@ pub mod error;
 pub mod gateway;
 pub mod gateway_normalizer;
 pub mod http_port;
+pub mod image_cache;
 pub mod injection_log;
 pub mod interpreter;
 pub mod js_host;

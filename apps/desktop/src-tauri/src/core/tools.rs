@@ -2344,6 +2344,11 @@ pub fn tool_run_with_call(req: ToolRunRequest, call_id: Option<&str>) -> ToolRes
         "browser_snapshot" => crate::core::browser::browser_snapshot(&args),
         "browser_click" => crate::core::browser::browser_click(&args),
         "browser_fill" => crate::core::browser::browser_fill(&args),
+        "browser_console" => crate::core::browser::browser_console(&args),
+        "browser_network" => crate::core::browser::browser_network(&args),
+        "browser_wait_for" => crate::core::browser::browser_wait_for(&args),
+        "browser_expect" => crate::core::browser::browser_expect(&args),
+        "browser_start" => crate::core::browser::browser_start(&args),
         "browser_screenshot" => do_browser_screenshot(&args, &root),
         other => ToolResult::err(format!("unknown tool \"{other}\"")),
     }

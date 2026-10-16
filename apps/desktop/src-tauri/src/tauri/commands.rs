@@ -744,6 +744,27 @@ pub fn plan_save(
     crate::core::plan_doc::save_plan(&root, &session_id, &markdown).map_err(CommandError)
 }
 
+// ── session image cache (replay-proof previews) ──────────────────────────────
+// The agent loop deposits every image it attaches at marker time; the UI falls back to this
+// cache when a replayed transcript's workspace file is gone. See `core/image_cache.rs`.
+
+#[tauri::command]
+pub fn image_cache_write(
+    store: State<'_, Arc<store::Store>>,
+    media_type: String,
+    base64: String,
+) -> Result<String, CommandError> {
+    crate::core::image_cache::write(&app_data_dir(&store), &media_type, &base64).map_err(CommandError)
+}
+
+#[tauri::command]
+pub fn image_cache_read(
+    store: State<'_, Arc<store::Store>>,
+    name: String,
+) -> Result<String, CommandError> {
+    crate::core::image_cache::read(&app_data_dir(&store), &name).map_err(CommandError)
+}
+
 /// What this app binary was built from, to compare against whatever is serving the gateway.
 ///
 /// The app and `aiproviderd` are separate binaries from one crate, so "is the gateway I am talking
@@ -826,6 +847,8 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         agent_def_set_enabled,
         agent_def_delete,
         plan_save,
+        image_cache_write,
+        image_cache_read,
         crate::tauri::artifact_cmds::artifact_read,
         crate::tauri::gateway_cmds::gateway_status,
         crate::tauri::gateway_cmds::get_tools_enabled,

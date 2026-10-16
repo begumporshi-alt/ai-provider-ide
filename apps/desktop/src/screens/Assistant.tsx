@@ -63,12 +63,17 @@ import { SessionSkillsDrawer } from "../components/SessionSkillsDrawer";
 import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
 import { ProcessCard } from "../components/ProcessCard";
+import { ScreenshotPreview } from "../components/ScreenshotPreview";
 import { backgroundJobIdFromResult } from "../lib/tools/processJob";
+import type { WireToolResult } from "../lib/tools/host";
 import type { SubagentChildProgress } from "../lib/tools/types";
 import {
   fileChangeFor,
   groupSearchMatches,
   groupToolRuns,
+  imagePathFromResult,
+  browserSetupMiss,
+  imageCacheFromResult,
   indexToolCalls,
   isSearchResult,
   type ToolCallRef,
@@ -2473,6 +2478,12 @@ function Chat({
               throw new Error("the provider returned neither image bytes nor a link");
             });
           },
+          // The session image cache: every image the loop attaches gets a second, app-side copy
+          // (content-addressed, capped) so a replayed transcript's preview survives the workspace
+          // file being cleaned. Null on any failure — the receipt then simply carries no cache
+          // line, which is the old behaviour.
+          cacheImage: (mediaType, base64) =>
+            invoke<string>("image_cache_write", { mediaType, base64 }).catch(() => null),
         },
         {
           generate: gatewayGenerate,
@@ -3264,7 +3275,7 @@ function Chat({
                 </div>
               </div>
             ) : m.role === "tool" ? (
-              <ToolResultBubble content={m.content} call={m.tool_call_id ? callById.get(m.tool_call_id) : undefined} />
+              <ToolResultBubble content={m.content} call={m.tool_call_id ? callById.get(m.tool_call_id) : undefined} root={root} />
             ) : m.role === "assistant" ? (
               agentMode && i === msgs.length - 1 && busy ? (
                 <AgentLive
@@ -3736,6 +3747,84 @@ const CHILD_STATE_COLOR: Record<SubagentChildProgress["state"], string> = {
  * label, carries the state — amber while the call runs, green when it returned, red when it
  * failed, dim on a replayed transcript where no status was recorded.
  */
+/**
+ * A browser call failed because nothing is listening on the debugger port. The error text tells
+ * the model the fix in prose; the person gets the exact launch command — and, when the workspace
+ * root is known, a button that starts the browser through the sandbox's own `browser_start`, so
+ * the setup never has to leave the conversation.
+ */
+function BrowserSetupHint({ port, root }: { port: string; root?: string }) {
+  const cmd = /Mac/i.test(navigator.platform)
+    ? `open -a "Google Chrome" --args --remote-debugging-port=${port}`
+    : `google-chrome --remote-debugging-port=${port}`;
+  const [startState, setStartState] = useState<"idle" | "starting" | "started" | "failed">("idle");
+  const [startNote, setStartNote] = useState("");
+
+  const startBrowser = async () => {
+    if (!root) return;
+    setStartState("starting");
+    try {
+      const res = await invoke<WireToolResult>("tool_run", {
+        req: { name: "browser_start", arguments: { port: Number(port) }, root },
+      });
+      if (res.ok) {
+        setStartNote(res.output);
+        setStartState("started");
+      } else {
+        setStartNote(res.error?.trim() || res.output || "the launch failed without a reason");
+        setStartState("failed");
+      }
+    } catch (e) {
+      setStartNote(e instanceof Error ? e.message : String(e));
+      setStartState("failed");
+    }
+  };
+
+  return (
+    <div
+      className="ml-3.5 mt-1 rounded border px-2.5 py-1.5"
+      style={{ borderColor: "var(--warn)", background: "var(--surface-2)" }}
+      data-testid="browser-setup-hint"
+    >
+      <div className="mono text-[11px]" style={{ color: "var(--warn)" }}>
+        no browser is listening on the debugger port
+      </div>
+      <div className="mono mt-1 break-all text-[10px]" style={{ color: "var(--text-dim)" }}>
+        start one and open a tab, then try the call again:
+        <code style={{ color: "var(--text)" }}> {cmd}</code>
+      </div>
+      <div className="mt-1 flex items-center gap-2">
+        {root && (
+          <button
+            type="button"
+            className="mono rounded border px-2 py-0.5 text-[10px]"
+            style={{ color: "var(--text)", borderColor: "var(--border)" }}
+            onClick={() => void startBrowser()}
+            disabled={startState === "starting"}
+            data-testid="browser-start-button"
+          >
+            {startState === "starting" ? "starting…" : "start a browser for me"}
+          </button>
+        )}
+        <div className="mono text-[10px]" style={{ color: "var(--text-faint)" }}>
+          {startNote ||
+            `Chromium or Edge work the same way — any browser started with --remote-debugging-port=${port}`}
+        </div>
+      </div>
+      {startState === "started" && (
+        <div className="mono mt-1 text-[10px]" style={{ color: "var(--success)" }}>
+          the browser is up — ask again and the call will go through
+        </div>
+      )}
+      {startState === "failed" && (
+        <div className="mono mt-1 break-all text-[10px]" style={{ color: "var(--warn)" }}>
+          {startNote}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ToolCallRow({
   step,
   root = "",
@@ -3774,6 +3863,20 @@ function ToolCallRow({
   const bgJob =
     step.name === "run_command" && typeof step.result === "string"
       ? backgroundJobIdFromResult(step.result)
+      : null;
+  // An image-carrying call shows its picture, not the base64 the marker floods the result with —
+  // the same flooding the loop's receipt protocol stops on the wire (browser_screenshot joined
+  // that protocol late; before it did, its rows were megabytes of unreadable text).
+  const shotPath =
+    (step.name === "browser_screenshot" || step.name === "read_image" || step.name === "generate_image") &&
+    typeof step.result === "string"
+      ? imagePathFromResult(step.result)
+      : null;
+  // A browser call that found no debugger endpoint gets the launch hint right in its row — the
+  // user should never have to know the flag the error names.
+  const setupMiss =
+    step.name.startsWith("browser_") && typeof step.result === "string"
+      ? browserSetupMiss(step.result)
       : null;
   // A call in flight has no result to fold yet, and its arguments are the only live evidence of
   // what it is doing — so they show while it runs, then fold like every finished call's.
@@ -3879,6 +3982,16 @@ function ToolCallRow({
         </button>
       ) : null}
       {bgJob && root && <ProcessCard jobId={bgJob} root={root} />}
+      {setupMiss && <BrowserSetupHint port={setupMiss.port} root={root} />}
+      {shotPath && root ? (
+        <div className="ml-3.5 mt-1">
+          <ScreenshotPreview
+            root={root}
+            path={shotPath}
+            cacheName={typeof step.result === "string" ? imageCacheFromResult(step.result) : null}
+          />
+        </div>
+      ) : null}
       {open && hasOutput && (
         <pre className="mono ml-3.5 mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{step.result}</pre>
       )}
@@ -3918,7 +4031,15 @@ function ToolRunGroup({
 }
 
 /** Compact, collapsible view of a tool-result turn persisted in the transcript. */
-function ToolResultBubble({ content, call }: { content: string; call?: ToolCallRef }) {
+function ToolResultBubble({
+  content,
+  call,
+  root,
+}: {
+  content: string;
+  call?: ToolCallRef;
+  root?: string;
+}) {
   const [open, setOpen] = useState(false);
   // An empty result used to render as "tool result · " with nothing after it — indistinguishable
   // from a collapsed result the user simply had not opened, and the reason a run could end with
@@ -3940,10 +4061,28 @@ function ToolResultBubble({ content, call }: { content: string; call?: ToolCallR
     );
   }
 
+  // An image-carrying call renders the picture above its bubble — the persisted transcript keeps
+  // the short receipt (the loop's marker protocol), so the path is what the result names.
+  const shotPath =
+    call && (call.name === "browser_screenshot" || call.name === "read_image" || call.name === "generate_image")
+      ? imagePathFromResult(content)
+      : null;
+  if (shotPath && root) {
+    return (
+      <div>
+        <ScreenshotPreview root={root} path={shotPath} cacheName={imageCacheFromResult(content)} />
+      </div>
+    );
+  }
+
   const groups = call && isSearchResult(call.name) ? groupSearchMatches(content) : [];
+  // A replayed browser call that found no debugger endpoint keeps the same hint the live row
+  // showed — the fix is not something the user does once.
+  const setupMiss = call && call.name.startsWith("browser_") ? browserSetupMiss(content) : null;
 
   return (
     <div className="rounded border px-2.5 py-1.5" style={{ borderColor: empty ? "var(--warn)" : "var(--border)", background: "var(--surface-2)" }}>
+      {setupMiss && <BrowserSetupHint port={setupMiss.port} root={root} />}
       <button className="mono text-[11px]" style={{ color: "var(--text-dim)" }} onClick={() => setOpen((v) => !v)}>
         {open ? "▾" : "▸"} tool result
         {open ? "" : ` · ${empty ? "(no output)" : `${preview}${content.length > 70 ? "…" : ""}`}`}

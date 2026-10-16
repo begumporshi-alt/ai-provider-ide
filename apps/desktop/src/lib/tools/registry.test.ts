@@ -27,6 +27,9 @@ const ASSISTANT_MUTATING = [
   "browser_fill",
   "browser_navigate",
   "browser_screenshot",
+  // Launches a browser process with the debugger port — an action on the machine, not the
+  // workspace, but the approval gate is where "the app started something" belongs.
+  "browser_start",
   "edit_notebook",
   "generate_image",
   "process_kill",
@@ -70,7 +73,11 @@ describe("AGENT_TOOLS", () => {
     // it never touches the workspace — so it belongs on the read-only side.
     const readOnly = AGENT_TOOLS.filter((t) => !MUTATING.includes(t.name)).map((t) => t.name);
     expect(readOnly.sort()).toEqual([
+      "browser_console",
+      "browser_expect",
+      "browser_network",
       "browser_snapshot",
+      "browser_wait_for",
       "dispatch_agent",
       "enter_plan_mode",
       "exit_plan_mode",
@@ -139,6 +146,12 @@ describe("AGENT_TOOLS", () => {
     expect(AGENT_TOOLS.some((t) => t.name === "browser_click")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_fill")).toBe(true);
     expect(AGENT_TOOLS.some((t) => t.name === "browser_screenshot")).toBe(true);
+    // The observers read the same app-session endpoint the drivers do — same reason, same side.
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_console")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_network")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_wait_for")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_expect")).toBe(true);
+    expect(AGENT_TOOLS.some((t) => t.name === "browser_start")).toBe(true);
   });
 
   it("the sub-agent registry is the read-only tools minus delegation, todos and the plan pair", () => {

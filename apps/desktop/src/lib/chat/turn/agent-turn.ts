@@ -40,6 +40,11 @@ export interface AgentTurnRequest extends TurnRequestBase {
   /** The skill port behind `load_skill` — the screen owns the skill store, the engine does not. */
   loadSkill?: Parameters<typeof runAgentLoop>[0]["loadSkill"];
   /**
+   * The session image cache behind the marker receipt — see `AgentLoopOptions.cacheImage`. The
+   * screen owns the Tauri bridge; the loop only decides when a deposit is due.
+   */
+  cacheImage?: Parameters<typeof runAgentLoop>[0]["cacheImage"];
+  /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`: the review modal, the
    * mode switch the gate reads, and the plan file. The screen owns all three — it holds the
    * approval ref, the session id and the workspace root — and the loop only forwards them.
@@ -229,6 +234,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       host,
       generateImage: req.generateImage,
       loadSkill: req.loadSkill,
+      cacheImage: req.cacheImage,
       plan: req.plan,
       subagentMaxIterations: req.subagentMaxIterations,
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,

@@ -42,12 +42,16 @@ const LOAD_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ── the connection ───────────────────────────────────────────────────────────────────────
 
-/// The open page connection, kept across tool calls. A `tokio` mutex, not a std one: the guard
-/// is held across the socket awaits and must cross the `block_on` boundary.
-static CONN: OnceLock<tokio::sync::Mutex<Option<Conn>>> = OnceLock::new();
+/// The open page connections, kept across tool calls — one per debugger port, not one global: two
+/// browsers (two sessions, two ports) must not steal each other's socket, and a steal is worse
+/// than a reconnect because the re-issued `Runtime.enable` makes Chrome replay its buffered
+/// console messages, which would resurrect entries the ledger already reported. A tokio mutex,
+/// not a std one: the guard is held across the socket awaits and must cross the `block_on`
+/// boundary.
+static CONNS: OnceLock<tokio::sync::Mutex<std::collections::HashMap<u16, Conn>>> = OnceLock::new();
 
-fn conn_cell() -> &'static tokio::sync::Mutex<Option<Conn>> {
-    CONN.get_or_init(|| tokio::sync::Mutex::new(None))
+fn conns_cell() -> &'static tokio::sync::Mutex<std::collections::HashMap<u16, Conn>> {
+    CONNS.get_or_init(|| tokio::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
 /// The browser runtime, or an early `ToolResult` refusal.
@@ -141,10 +145,11 @@ async fn list_pages(port: u16) -> Result<Vec<(String, String, String)>, String> 
     Ok(pages)
 }
 
-/// Drop the cached connection — a dead socket is re-established on the next call, never retried.
-fn forget_conn() {
-    if let Ok(mut slot) = conn_cell().try_lock() {
-        *slot = None;
+/// Drop the cached connection for one port — a dead socket is re-established on the next call,
+/// never retried.
+fn forget_conn(port: u16) {
+    if let Ok(mut conns) = conns_cell().try_lock() {
+        conns.remove(&port);
     }
 }
 
@@ -159,28 +164,37 @@ async fn connect(port: u16) -> Result<Conn, String> {
     let (ws, _) = tokio_tungstenite::connect_async(&ws_url)
         .await
         .map_err(|e| format!("connection lost: cannot attach to \"{title}\": {e}"))?;
-    Ok(Conn { ws, next_id: 1, port })
+    let mut conn = Conn { ws, next_id: 1, port };
+    // Turn on the domains the event ledger listens to, before the caller's first command: a page
+    // loads the moment `browser_navigate` runs, and the errors it prints on the way are exactly
+    // what `browser_console` and `browser_network` exist to report — enabled a frame later, they
+    // are already lost.
+    for method in ["Runtime.enable", "Network.enable", "Log.enable"] {
+        command(&mut conn, method, json!({})).await?;
+    }
+    Ok(conn)
 }
 
-/// Run `f` against a live page connection, reconnecting once if the cached socket was dead.
+/// Run `f` against a live page connection for this port, reconnecting once if the cached socket
+/// was dead.
 async fn with_page<T>(
     port: u16,
     mut f: impl FnMut(&mut Conn) -> futures_util::future::BoxFuture<'_, Result<T, String>>,
 ) -> Result<T, String> {
-    let cell = conn_cell();
-    let mut guard = cell.lock().await;
+    let mut conns = conns_cell().lock().await;
     for attempt in 0..2 {
-        if guard.as_ref().map(|c| c.port) != Some(port) {
-            *guard = Some(connect(port).await?);
+        if !conns.contains_key(&port) {
+            let conn = connect(port).await?;
+            conns.insert(port, conn);
         }
         let conn =
-            guard.as_mut().ok_or("the browser connection dropped before the call — call again")?;
+            conns.get_mut(&port).ok_or("the browser connection dropped before the call — call again")?;
         match f(conn).await {
             Ok(v) => return Ok(v),
-            // The cached socket died (tab closed, Chrome restarted). Reconnect and retry once;
-            // a second failure is reported as the truth rather than masked.
+            // The cached socket died (tab closed, Chrome restarted). Drop it and retry once; a
+            // second failure is reported as the truth rather than masked.
             Err(e) if attempt == 0 && e.starts_with("connection lost") => {
-                *guard = None;
+                conns.remove(&port);
             }
             Err(e) => return Err(e),
         }
@@ -211,13 +225,22 @@ async fn command(conn: &mut Conn, method: &str, params: Value) -> Result<Value, 
             if let Message::Text(t) = msg {
                 let v: Value =
                     serde_json::from_str(t.as_str()).map_err(|e| format!("bad CDP frame: {e}"))?;
+                // An event (no `id`) is not noise to discard: console and network entries are
+                // what `browser_console` and `browser_network` exist to report. Classify it into
+                // the ledger and keep waiting for the reply.
+                if v.get("id").is_none() {
+                    if let Some(method) = v.get("method").and_then(|m| m.as_str()) {
+                        record_event(conn.port, method, &v);
+                    }
+                    continue;
+                }
                 if v.get("id").and_then(|i| i.as_u64()) == Some(id) {
                     if let Some(err) = v.get("error") {
                         return Err(format!("{method} failed: {err}"));
                     }
                     return Ok(v.get("result").cloned().unwrap_or(Value::Null));
                 }
-                // An event or an unrelated reply — consume it and keep waiting.
+                // An unrelated reply — consume it and keep waiting.
             }
         }
     })
@@ -238,6 +261,291 @@ async fn evaluate(conn: &mut Conn, expression: &str) -> Result<Value, String> {
         return Err(format!("the page threw: {desc}"));
     }
     Ok(r.get("value").cloned().unwrap_or(Value::Null))
+}
+
+// ── the event ledger ─────────────────────────────────────────────────────────────────────
+
+/// How many entries the ledger keeps. A chatty page can emit hundreds of console lines; beyond
+/// the cap the oldest fall off, because a test session cares about what just happened.
+const EVENT_CAP: usize = 500;
+
+#[derive(Clone, Debug, PartialEq)]
+enum EventKind {
+    Console,
+    Net,
+}
+
+/// One observed page event, merged: identical consecutive entries collapse into a count rather
+/// than spamming the model with the same error twenty times.
+#[derive(Clone, Debug, PartialEq)]
+struct PageEvent {
+    kind: EventKind,
+    /// Console level (`error` / `warning` / `log`), or the HTTP method for net entries.
+    level: String,
+    /// The request URL for net entries; empty for console.
+    url: String,
+    /// The response status for net entries; 0 means the request never got one (transport failure).
+    status: u16,
+    text: String,
+    count: u32,
+}
+
+/// Console and network failures observed while connected, in arrival order, per debugger port —
+/// a second browser (another port) has another page, and its history is not this page's. The read
+/// loop is the only writer (every command drains the socket, so nothing can be recorded out of
+/// order) and the report tools are the only readers. Global, not per-`Conn`: a reconnect must not
+/// erase what the page said before its socket died — only a *different* port starts a fresh
+/// ledger, which falls out of the keying.
+static EVENTS: OnceLock<std::sync::Mutex<std::collections::HashMap<u16, EventLedger>>> =
+    OnceLock::new();
+
+/// Record one event into the port's ledger, created on first use. The whole map locks per event:
+/// events are milliseconds apart and the lock is uncontended, so a per-entry guard (unstable
+/// `MutexGuard::map`) buys nothing.
+fn record_event(port: u16, method: &str, frame: &Value) {
+    let map = EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    map.lock().unwrap().entry(port).or_default().record(method, frame);
+}
+
+/// Take the port's entries of one kind. A page whose entries were all reported leaves an empty
+/// ledger behind, and an empty ledger is dropped — nothing worth keeping resident.
+fn drain_events(port: u16, kind: EventKind) -> Vec<PageEvent> {
+    let map = EVENTS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut guard = map.lock().unwrap();
+    let taken = guard.entry(port).or_default().drain(kind);
+    if guard.get(&port).is_some_and(|l| l.items.is_empty()) {
+        guard.remove(&port);
+    }
+    taken
+}
+
+#[derive(Default)]
+struct EventLedger {
+    items: std::collections::VecDeque<PageEvent>,
+    /// requestId → "METHOD url", so a `loadingFailed` (which carries neither) can be named.
+    net_requests: std::collections::HashMap<String, String>,
+}
+
+impl EventLedger {
+    fn record(&mut self, method: &str, frame: &Value) {
+        let params = frame.get("params").cloned().unwrap_or(Value::Null);
+        let event = match method {
+            "Runtime.consoleAPICalled" => {
+                let level = match params.get("type").and_then(|v| v.as_str()) {
+                    Some("error") | Some("assert") => "error",
+                    Some("warning") => "warning",
+                    _ => "log",
+                };
+                // A RemoteObject carries a plain value, a description, or neither; whatever it
+                // has, stringify it the way DevTools would show it.
+                let text = params
+                    .get("args")
+                    .and_then(|a| a.as_array())
+                    .map(|args| {
+                        args.iter()
+                            .map(|a| {
+                                match a.get("value") {
+                                    Some(Value::String(s)) => s.clone(),
+                                    Some(other) => other.to_string(),
+                                    None => a
+                                        .get("description")
+                                        .and_then(|d| d.as_str())
+                                        .unwrap_or_default()
+                                        .to_string(),
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" ")
+                    })
+                    .unwrap_or_default();
+                if text.is_empty() {
+                    return;
+                }
+                PageEvent {
+                    kind: EventKind::Console,
+                    level: level.into(),
+                    url: String::new(),
+                    status: 0,
+                    text,
+                    count: 1,
+                }
+            }
+            // An uncaught exception is the console error a page never chose to print.
+            "Runtime.exceptionThrown" => {
+                let details = params.get("exceptionDetails").cloned().unwrap_or(Value::Null);
+                let text = details
+                    .pointer("/exception/description")
+                    .and_then(|d| d.as_str())
+                    .or_else(|| details.get("text").and_then(|t| t.as_str()))
+                    .unwrap_or("unknown exception")
+                    .to_string();
+                PageEvent {
+                    kind: EventKind::Console,
+                    level: "error".into(),
+                    url: String::new(),
+                    status: 0,
+                    text,
+                    count: 1,
+                }
+            }
+            "Log.entryAdded" => {
+                let entry = params.get("entry").cloned().unwrap_or(Value::Null);
+                let source = entry.get("source").and_then(|s| s.as_str()).unwrap_or("");
+                // Network-sourced log lines ("Failed to load resource…") restate what
+                // `Network.loadingFailed` already records — `browser_network` is their home.
+                if source == "network" {
+                    return;
+                }
+                PageEvent {
+                    kind: EventKind::Console,
+                    level: entry.get("level").and_then(|l| l.as_str()).unwrap_or("log").into(),
+                    url: String::new(),
+                    status: 0,
+                    text: entry.get("text").and_then(|t| t.as_str()).unwrap_or_default().into(),
+                    count: 1,
+                }
+            }
+            "Network.requestWillBeSent" => {
+                if let (Some(id), Some(req)) = (
+                    params.get("requestId").and_then(|v| v.as_str()),
+                    params.get("request"),
+                ) {
+                    let line = format!(
+                        "{} {}",
+                        req.get("method").and_then(|m| m.as_str()).unwrap_or("GET"),
+                        req.get("url").and_then(|u| u.as_str()).unwrap_or("(unknown)")
+                    );
+                    self.net_requests.insert(id.to_string(), line);
+                }
+                return;
+            }
+            "Network.responseReceived" => {
+                let status = params.pointer("/response/status").and_then(|s| s.as_u64()).unwrap_or(0) as u16;
+                if status < 400 {
+                    return;
+                }
+                let url = params
+                    .pointer("/response/url")
+                    .and_then(|u| u.as_str())
+                    .unwrap_or("(unknown)")
+                    .to_string();
+                let level = params
+                    .get("requestId")
+                    .and_then(|id| id.as_str())
+                    .and_then(|id| self.net_requests.get(id))
+                    .and_then(|line| line.split(' ').next())
+                    .unwrap_or("GET")
+                    .to_string();
+                PageEvent {
+                    kind: EventKind::Net,
+                    level,
+                    url,
+                    status,
+                    text: String::new(),
+                    count: 1,
+                }
+            }
+            "Network.loadingFailed" => {
+                let (level, url) = match params.get("requestId").and_then(|id| id.as_str()) {
+                    Some(id) => match self.net_requests.get(id) {
+                        Some(line) => {
+                            let mut parts = line.splitn(2, ' ');
+                            (
+                                parts.next().unwrap_or("GET").to_string(),
+                                parts.next().unwrap_or("(unknown)").to_string(),
+                            )
+                        }
+                        None => ("GET".into(), "(unknown)".into()),
+                    },
+                    None => ("GET".into(), "(unknown)".into()),
+                };
+                PageEvent {
+                    kind: EventKind::Net,
+                    level,
+                    url,
+                    status: 0,
+                    text: params.get("errorText").and_then(|e| e.as_str()).unwrap_or("failed").into(),
+                    count: 1,
+                }
+            }
+            _ => return,
+        };
+        // Merge identical consecutive entries, then respect the cap by dropping the oldest.
+        if let Some(last) = self.items.back_mut() {
+            if last.kind == event.kind
+                && last.level == event.level
+                && last.url == event.url
+                && last.status == event.status
+                && last.text == event.text
+            {
+                last.count += 1;
+                return;
+            }
+        }
+        self.items.push_back(event);
+        if self.items.len() > EVENT_CAP {
+            self.items.pop_front();
+        }
+    }
+
+    fn drain(&mut self, kind: EventKind) -> Vec<PageEvent> {
+        let mut taken = Vec::new();
+        let mut kept = std::collections::VecDeque::new();
+        for e in self.items.drain(..) {
+            if e.kind == kind {
+                taken.push(e);
+            } else {
+                // The other kind's entries go back, in order — each tool consumes only its own.
+                kept.push_back(e);
+            }
+        }
+        self.items = kept;
+        taken
+    }
+}
+
+/// Render console entries, oldest first — the way a terminal prints a page's life.
+fn format_console(entries: &[PageEvent]) -> String {
+    let mut lines = Vec::new();
+    for e in entries {
+        let times = if e.count > 1 { format!(" ({}×)", e.count) } else { String::new() };
+        lines.push(format!("[{}] {}{}", e.level, e.text, times));
+    }
+    lines.join("\n")
+}
+
+/// Render net entries: `[GET 404] url`, or `[GET failed] url — net::ERR_…` for one that never
+/// got a response.
+fn format_net(entries: &[PageEvent]) -> String {
+    entries
+        .iter()
+        .map(|e| {
+            if e.status > 0 {
+                format!("[{} {}] {}", e.level, e.status, e.url)
+            } else {
+                format!("[{} failed] {} — {}", e.level, e.url, e.text)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Read everything the page has said since the last report of this kind. The pump commands exist
+/// because the socket is only read while a command is in flight: entries that arrived while no
+/// tool was running are still sitting in it, and cheap round trips flush them into the ledger.
+/// Two pumps with a beat between them, because an event Chrome emits just after a navigate can
+/// still be in flight when the first pump's answer lands — the second one is what makes the
+/// report settle instead of racing the page.
+fn pump_and_drain(port: u16, kind: EventKind) -> Result<Vec<PageEvent>, String> {
+    runtime()?.block_on(with_page(port, |conn| {
+        Box::pin(async move {
+            evaluate(conn, "1").await?;
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            evaluate(conn, "1").await
+        })
+    }))?;
+    let taken = drain_events(port, kind);
+    Ok(taken)
 }
 
 // ── the tools ────────────────────────────────────────────────────────────────────────────
@@ -299,11 +607,11 @@ const FILL_JS: &str = r#"((idx, text) => {
   return 'filled';
 })"#;
 
-fn wrap_err(r: Result<String, String>) -> crate::core::tools::ToolResult {
+fn wrap_err(port: u16, r: Result<String, String>) -> crate::core::tools::ToolResult {
     match r {
         Ok(text) => crate::core::tools::ToolResult::ok(text),
         Err(e) => {
-            forget_conn();
+            forget_conn(port);
             crate::core::tools::ToolResult::err(e)
         }
     }
@@ -316,7 +624,7 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
         _ => return crate::core::tools::ToolResult::err("navigate needs a \"url\""),
     };
     let port = port_of(args);
-    wrap_err(rt!().block_on(with_page(port, move |conn| {
+    wrap_err(port, rt!().block_on(with_page(port, move |conn| {
         let url = url.clone();
         Box::pin(async move {
             command(conn, "Page.navigate", json!({ "url": url })).await?;
@@ -342,7 +650,7 @@ pub fn browser_navigate(args: &Value) -> crate::core::tools::ToolResult {
 /// and say to re-snapshot.
 pub fn browser_snapshot(args: &Value) -> crate::core::tools::ToolResult {
     let port = port_of(args);
-    wrap_err(rt!().block_on(with_page(port, |conn| {
+    wrap_err(port, rt!().block_on(with_page(port, |conn| {
         Box::pin(async move {
             evaluate(conn, SNAPSHOT_JS).await.map(|v| v.as_str().unwrap_or_default().to_string())
         })
@@ -361,7 +669,7 @@ pub fn browser_click(args: &Value) -> crate::core::tools::ToolResult {
         }
     };
     let port = port_of(args);
-    wrap_err(rt!().block_on(with_page(port, |conn| {
+    wrap_err(port, rt!().block_on(with_page(port, |conn| {
         Box::pin(async move {
             // The JS stringifies its answer, so `evaluate` hands back a JSON string *inside* a
             // JSON string — the inner one is the coordinates.
@@ -406,7 +714,7 @@ pub fn browser_fill(args: &Value) -> crate::core::tools::ToolResult {
     // serde_json's string encoder is the quoting boundary: whatever the model sent arrives in
     // the expression as a JSON string literal, not as JS source.
     let quoted = serde_json::to_string(text).expect("String always serializes");
-    wrap_err(rt!().block_on(with_page(port, move |conn| {
+    wrap_err(port, rt!().block_on(with_page(port, move |conn| {
         let quoted = quoted.clone();
         Box::pin(async move {
             let raw = evaluate(conn, &format!("{FILL_JS}({idx}, {quoted})")).await?;
@@ -418,6 +726,342 @@ pub fn browser_fill(args: &Value) -> crate::core::tools::ToolResult {
             Ok(format!("filled [{idx}]"))
         })
     })))
+}
+
+/// `browser_console` — the console and log entries the connected page has printed since the last
+/// call of this tool. This is the difference between "the click did nothing" and "the click threw
+/// ReferenceError": a failing page says why, and until now the model could not hear it.
+pub fn browser_console(args: &Value) -> crate::core::tools::ToolResult {
+    let port = port_of(args);
+    match pump_and_drain(port, EventKind::Console) {
+        Ok(entries) if entries.is_empty() => crate::core::tools::ToolResult::ok(
+            "no console output since the last browser_console call — the page has been quiet",
+        ),
+        Ok(entries) => crate::core::tools::ToolResult::ok(format_console(&entries)),
+        Err(e) => crate::core::tools::ToolResult::err(e),
+    }
+}
+
+/// `browser_network` — requests that failed since the last call of this tool: responses with a
+/// 4xx/5xx status, and requests that never got one (refused connection, CORS, DNS). Only
+/// failures: a test session asks "what broke", not "what loaded".
+pub fn browser_network(args: &Value) -> crate::core::tools::ToolResult {
+    let port = port_of(args);
+    match pump_and_drain(port, EventKind::Net) {
+        Ok(entries) if entries.is_empty() => crate::core::tools::ToolResult::ok(
+            "no failed requests since the last browser_network call",
+        ),
+        Ok(entries) => crate::core::tools::ToolResult::ok(format_net(&entries)),
+        Err(e) => crate::core::tools::ToolResult::err(e),
+    }
+}
+
+/// `browser_wait_for` — block until the page's visible text contains `text`, or the deadline
+/// passes. Testing is mostly *waiting for something*; without this tool the model could only poll
+/// `browser_snapshot` on a guess and hope. The poll reads `innerText` (what a reader sees), not
+/// the DOM source, so hidden elements do not count.
+pub fn browser_wait_for(args: &Value) -> crate::core::tools::ToolResult {
+    let text = match args.get("text").and_then(|v| v.as_str()) {
+        Some(t) if !t.is_empty() => t.to_string(),
+        _ => {
+            return crate::core::tools::ToolResult::err(
+                "wait_for needs a \"text\": the string to wait for on the page",
+            )
+        }
+    };
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10_000)
+        .clamp(250, 30_000);
+    let port = port_of(args);
+    // Same quoting boundary as `browser_fill`: the model's text arrives as a JSON string literal,
+    // never as JS source.
+    let quoted = serde_json::to_string(&text).expect("String always serializes");
+    let js = format!(
+        "(() => {{ const t = document.body ? document.body.innerText : ''; return t.includes({quoted}) }})()"
+    );
+    // Not `wrap_err`: a deadline miss is an ordinary outcome, not a dead socket, and forgetting
+    // the connection would re-enable the domains on the next call and orphan the entries the page
+    // printed in between. Only a connection failure is dropped.
+    match rt!().block_on(with_page(port, |conn| {
+        // Cloned per call: the closure is `FnMut` (with_page may run it twice on reconnect), and
+        // an `async move` that owned `js` would leave it moved out on the second run.
+        let js = js.clone();
+        let text = text.clone();
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let found = evaluate(conn, &js).await?.as_bool().unwrap_or(false);
+                if found {
+                    return Ok(format!("\"{text}\" is on the page"));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(format!(
+                        "\"{text}\" never appeared within {}ms — re-check the wording with browser_snapshot, \
+                         or the page may not be doing what you expect",
+                        timeout_ms
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+    })) {
+        Ok(s) => crate::core::tools::ToolResult::ok(s),
+        Err(e) => {
+            if e.starts_with("connection lost") {
+                forget_conn(port);
+            }
+            crate::core::tools::ToolResult::err(e)
+        }
+    }
+}
+
+/// `browser_expect` — assert, retrying until a deadline, that the page satisfies one of four
+/// expectations: visible `text` contains a string, a CSS `element` selector matches, the `url`
+/// or `title` contains a string. `browser_wait_for` answers "is it there yet"; a test wants to
+/// *assert* — and a failed assertion must be a diagnosis, so every miss says what the page
+/// actually showed (its title, its URL, its visible text) instead of a bare "no".
+///
+/// The quoted string is the boundary: the model's `value` arrives as a JSON string literal, never
+/// as JS source — the same rule as `browser_fill` and `browser_wait_for`.
+pub fn browser_expect(args: &Value) -> crate::core::tools::ToolResult {
+    let kind = match args.get("kind").and_then(|v| v.as_str()) {
+        Some(k @ ("text" | "element" | "url" | "title")) => k.to_string(),
+        _ => {
+            return crate::core::tools::ToolResult::err(
+                "expect needs a \"kind\": one of \"text\", \"element\", \"url\", \"title\"",
+            )
+        }
+    };
+    let value = match args.get("value").and_then(|v| v.as_str()) {
+        Some(v) if !v.is_empty() => v.to_string(),
+        _ => {
+            return crate::core::tools::ToolResult::err(format!(
+                "expect needs a \"value\": the {kind} to assert on the page"
+            ))
+        }
+    };
+    let timeout_ms = args
+        .get("timeout_ms")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(10_000)
+        .clamp(250, 30_000);
+    let port = port_of(args);
+    let quoted = serde_json::to_string(&value).expect("String always serializes");
+    // Each poll returns one value the loop can judge: text a bool, element a JSON blob with the
+    // match count AND the page title (the diagnosis travels with every poll, so a miss needs no
+    // second round trip), url/title the current value itself (the contains check happens here,
+    // and the failure message quotes what the page was actually showing).
+    let js = match kind.as_str() {
+        "text" => format!(
+            "(() => {{ const t = document.body ? document.body.innerText : ''; return t.includes({quoted}) }})()"
+        ),
+        "element" => format!(
+            "(() => {{ try {{ return JSON.stringify({{ n: document.querySelectorAll({quoted}).length, title: document.title }}) }} catch (e) {{ return JSON.stringify({{ n: -1, title: document.title }}) }} }})()"
+        ),
+        "url" => "(() => location.href)()".to_string(),
+        "title" => "(() => document.title)()".to_string(),
+        _ => unreachable!(),
+    };
+    // Not `wrap_err`: a deadline miss is an ordinary outcome, not a dead socket — same reason as
+    // `browser_wait_for`.
+    match rt!().block_on(with_page(port, |conn| {
+        let js = js.clone();
+        let kind = kind.clone();
+        let value = value.clone();
+        Box::pin(async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout_ms);
+            loop {
+                let res = evaluate(conn, &js).await?;
+                let mut hit: Option<String> = None;
+                let mut observation = String::new();
+                match kind.as_str() {
+                    "text" => {
+                        if res.as_bool().unwrap_or(false) {
+                            hit = Some(format!("\"{value}\" is on the page"));
+                        }
+                    }
+                    "element" => {
+                        let parsed: Value = serde_json::from_str(res.as_str().unwrap_or("{}"))
+                            .unwrap_or(json!({}));
+                        let n = parsed.get("n").and_then(|x| x.as_i64()).unwrap_or(-2);
+                        let title =
+                            parsed.get("title").and_then(|x| x.as_str()).unwrap_or("");
+                        if n == -1 {
+                            return Err(format!(
+                                "\"{value}\" is not a valid CSS selector — check the syntax \
+                                 (attribute values need quotes)"
+                            ));
+                        }
+                        if n > 0 {
+                            hit = Some(format!(
+                                "{} element{} match{} \"{value}\" (page \"{title}\")",
+                                n,
+                                if n == 1 { "" } else { "s" },
+                                if n == 1 { "es" } else { "" },
+                            ));
+                        } else {
+                            observation = format!("the page is \"{title}\"");
+                        }
+                    }
+                    _ => {
+                        let cur = res.as_str().unwrap_or("");
+                        if cur.contains(&value) {
+                            hit = Some(format!(
+                                "\"{value}\" is in the {kind} (currently \"{cur}\")"
+                            ));
+                        } else {
+                            observation = format!("currently \"{cur}\"");
+                        }
+                    }
+                }
+                if let Some(msg) = hit {
+                    return Ok(msg);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(match kind.as_str() {
+                        "text" => format!(
+                            "\"{value}\" never appeared within {timeout_ms}ms — re-check the wording with browser_snapshot, \
+                             or the page may not be doing what you expect"
+                        ),
+                        "element" => format!(
+                            "no element matches \"{value}\" within {timeout_ms}ms — {observation}"
+                        ),
+                        _ => format!(
+                            "\"{value}\" never appeared in the {kind} within {timeout_ms}ms — {observation}"
+                        ),
+                    });
+                }
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        })
+    })) {
+        Ok(s) => crate::core::tools::ToolResult::ok(s),
+        Err(e) => {
+            if e.starts_with("connection lost") {
+                forget_conn(port);
+            }
+            crate::core::tools::ToolResult::err(e)
+        }
+    }
+}
+
+// ── browser_start ────────────────────────────────────────────────────────────────
+
+/// The binaries a `browser_start` may launch, in preference order. Absolute paths on macOS
+/// (the .app bundles are not on PATH); program names elsewhere, resolved against PATH.
+#[cfg(target_os = "macos")]
+fn browser_candidates() -> Vec<&'static str> {
+    vec![
+        "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+        "/Applications/Chromium.app/Contents/MacOS/Chromium",
+        "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge",
+        "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser",
+    ]
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn browser_candidates() -> Vec<&'static str> {
+    vec!["google-chrome", "chromium", "chromium-browser", "microsoft-edge", "brave-browser"]
+}
+
+#[cfg(windows)]
+fn browser_candidates() -> Vec<&'static str> {
+    vec!["chrome.exe", "msedge.exe", "chromium.exe"]
+}
+
+/// The first candidate that exists — an absolute path as-is, a bare name resolved against PATH.
+fn find_browser(candidates: &[&str]) -> Option<String> {
+    for c in candidates {
+        if c.contains('/') {
+            if std::path::Path::new(c).exists() {
+                return Some(c.to_string());
+            }
+        } else if let Ok(path_var) = std::env::var("PATH") {
+            for dir in std::env::split_paths(&path_var) {
+                let p = dir.join(c);
+                if p.exists() {
+                    return Some(p.to_string_lossy().into_owned());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// `browser_start` — launch the user's browser with the debugger port so the browser tools have
+/// something to attach to. The one browser-setup step the tools cannot do for themselves, done
+/// for them: nothing here *installs* anything, it launches a browser that is already on the
+/// machine.
+///
+/// The dedicated user-data-dir is not optional. Chrome's process singleton is per profile — a
+/// launch that reuses the user's everyday profile while their normal Chrome is running would be
+/// silently absorbed by the existing instance and the debugger port would never come up. A
+/// separate profile dir guarantees a real new process, at the cost of a fresh profile (no
+/// extensions, no history), which is exactly what a test browser should be.
+pub fn browser_start(args: &Value) -> crate::core::tools::ToolResult {
+    let port = port_of(args);
+    browser_start_with(&browser_candidates(), port)
+}
+
+fn browser_start_with(candidates: &[&str], port: u16) -> crate::core::tools::ToolResult {
+    // A browser already answering is a success, not an error — the recovery loop's second call
+    // (start, then navigate again) must not turn into "port already in use".
+    if rt!().block_on(list_pages(port)).is_ok() {
+        return crate::core::tools::ToolResult::ok(format!(
+            "a browser is already answering on 127.0.0.1:{port} — nothing to start, try the call again"
+        ));
+    }
+    let Some(binary) = find_browser(candidates) else {
+        return crate::core::tools::ToolResult::err(
+            "no Chrome, Chromium, Edge or Brave was found on this machine — install one, or start it \
+             yourself with --remote-debugging-port and open a tab",
+        );
+    };
+    let profile = std::env::temp_dir().join(format!("aiprovider-debug-profile-{port}"));
+    if let Err(e) = std::fs::create_dir_all(&profile) {
+        return crate::core::tools::ToolResult::err(format!("cannot create the debug profile directory: {e}"));
+    }
+    let child = std::process::Command::new(&binary)
+        .arg(format!("--remote-debugging-port={port}"))
+        .arg(format!("--user-data-dir={}", profile.display()))
+        .args(["--no-first-run", "--no-default-browser-check"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    let mut child = match child {
+        Ok(c) => c,
+        Err(e) => {
+            return crate::core::tools::ToolResult::err(format!(
+                "could not launch {} — start it yourself with --remote-debugging-port={port}: {e}",
+                binary
+            ))
+        }
+    };
+    // The endpoint answers a beat after the process exists (the same race the test launcher
+    // handles), and a hung launch must not hang the tool: bounded poll, then an honest miss.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if rt!().block_on(list_pages(port)).is_ok() {
+            // Do not leave a zombie handle: the browser outlives this command by design, the
+            // child handle must not keep it reaped-or-not ambiguous.
+            let _ = child.try_wait();
+            return crate::core::tools::ToolResult::ok(format!(
+                "a browser is up on 127.0.0.1:{port} (a fresh debug profile, so the page is blank) — \
+                 navigate to the page you want to test"
+            ));
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            return crate::core::tools::ToolResult::err(format!(
+                "{binary} was launched but never answered on 127.0.0.1:{port} within 15s — it may be \
+                 showing a first-run dialog, or another instance is holding the profile; start it \
+                 yourself with --remote-debugging-port={port} and open a tab"
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
 }
 
 /// Capture the connected page as a base64 PNG for `browser_screenshot` to save.
@@ -433,7 +1077,7 @@ pub fn capture_screenshot(args: &Value) -> Result<String, String> {
         })
     }));
     if out.is_err() {
-        forget_conn();
+        forget_conn(port);
     }
     out
 }
@@ -448,6 +1092,91 @@ mod tests {
     fn the_debugger_url_guard_is_loopback_only() {
         assert!(check_debugger_url(9222).is_ok());
         assert!(check_debugger_url(0).is_err());
+    }
+
+    /// The ledger's classification, fed hand-built CDP frames — no browser needed. This is the
+    /// test that says the read loop's discards became entries, with the shapes the report tools
+    /// format.
+    #[test]
+    fn console_and_net_frames_classify_into_the_ledger() {
+        let mut ledger = EventLedger::default();
+        let console = serde_json::json!({
+            "method": "Runtime.consoleAPICalled",
+            "params": { "type": "error", "args": [{ "type": "string", "value": "boom" }] },
+        });
+        ledger.record("Runtime.consoleAPICalled", &console);
+        ledger.record("Runtime.consoleAPICalled", &console);
+        ledger.record(
+            "Runtime.exceptionThrown",
+            &serde_json::json!({
+                "method": "Runtime.exceptionThrown",
+                "params": { "exceptionDetails": { "exception": { "description": "TypeError: x is not a function" } } },
+            }),
+        );
+        assert_eq!(
+            ledger.items.iter().map(|e| (e.level.as_str(), e.count)).collect::<Vec<_>>(),
+            vec![("error", 2), ("error", 1)],
+            "identical consecutive entries merge, distinct ones stay apart"
+        );
+
+        // A 404 with a known request: method and url both survive.
+        ledger.record(
+            "Network.requestWillBeSent",
+            &serde_json::json!({
+                "method": "Network.requestWillBeSent",
+                "params": { "requestId": "r1", "request": { "method": "POST", "url": "http://x/api" } },
+            }),
+        );
+        ledger.record(
+            "Network.responseReceived",
+            &serde_json::json!({
+                "method": "Network.responseReceived",
+                "params": { "requestId": "r1", "response": { "url": "http://x/api", "status": 404 } },
+            }),
+        );
+        ledger.record(
+            "Network.loadingFailed",
+            &serde_json::json!({
+                "method": "Network.loadingFailed",
+                "params": { "requestId": "r2", "errorText": "net::ERR_CONNECTION_REFUSED" },
+            }),
+        );
+        // A 200 is not a failure: it must never reach the report.
+        ledger.record(
+            "Network.responseReceived",
+            &serde_json::json!({
+                "method": "Network.responseReceived",
+                "params": { "requestId": "r1", "response": { "url": "http://x/api", "status": 200 } },
+            }),
+        );
+
+        let net = ledger.drain(EventKind::Net);
+        assert_eq!(net.len(), 2, "one 404 and one transport failure");
+        assert_eq!((net[0].level.as_str(), net[0].status), ("POST", 404));
+        assert_eq!(net[1].text, "net::ERR_CONNECTION_REFUSED");
+        assert!(ledger.drain(EventKind::Console).len() == 2, "console entries are untouched by the net drain");
+    }
+
+    #[test]
+    fn the_report_formats_are_what_the_model_reads() {
+        let console = vec![PageEvent {
+            kind: EventKind::Console,
+            level: "error".into(),
+            url: String::new(),
+            status: 0,
+            text: "boom".into(),
+            count: 3,
+        }];
+        assert_eq!(format_console(&console), "[error] boom (3×)");
+
+        let net = vec![
+            PageEvent { kind: EventKind::Net, level: "GET".into(), url: "http://x/404".into(), status: 404, text: String::new(), count: 1 },
+            PageEvent { kind: EventKind::Net, level: "GET".into(), url: "http://x/refused".into(), status: 0, text: "net::ERR_CONNECTION_REFUSED".into(), count: 1 },
+        ];
+        assert_eq!(
+            format_net(&net),
+            "[GET 404] http://x/404\n[GET failed] http://x/refused — net::ERR_CONNECTION_REFUSED"
+        );
     }
 
     #[test]
@@ -506,6 +1235,22 @@ mod tests {
                 return None;
             }
         };
+        // "DevTools listening" on stderr precedes the HTTP endpoint actually answering — under
+        // parallel test load the gap is seconds, and a navigate that lands in it reads as "no
+        // browser answered". Poll the endpoint before handing the port out.
+        let rt = runtime().expect("the test runtime");
+        let endpoint = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if rt.block_on(list_pages(port)).is_ok() {
+                break;
+            }
+            if std::time::Instant::now() >= endpoint {
+                eprintln!("skipping: the debugger endpoint never answered");
+                let _ = child.kill();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         Some((port, child))
     }
 
@@ -572,7 +1317,7 @@ mod tests {
         }));
         stop_chrome(&mut child);
         let _ = std::fs::remove_dir_all(&tmp);
-        forget_conn();
+        forget_conn(port);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
@@ -597,9 +1342,195 @@ mod tests {
         }));
         stop_chrome(&mut child);
         let _ = std::fs::remove_dir_all(&tmp);
-        forget_conn();
+        forget_conn(port);
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// The three observers against a real page: a console error printed on load, a fetch that 404s
+    /// against a throwaway local server, and text that appears 400ms in. This is the test that
+    /// says the ledger hears the page — not merely that the frames classify.
+    #[test]
+    fn console_network_and_wait_report_what_the_page_did() {
+        let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-3-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
+        // A one-connection HTTP server that always answers 404 — the network failures need a real
+        // response to fail against.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a local port");
+        let server_port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut s, _)) = listener.accept() {
+                let mut buf = [0u8; 2048];
+                let _ = std::io::Read::read(&mut s, &mut buf);
+                let _ = std::io::Write::write_all(
+                    &mut s,
+                    b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+                );
+            }
+        });
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let page = format!(
+                "data:text/html,<title>observer-test</title><script>\
+                 console.error('boom 42');\
+                 fetch('http://127.0.0.1:{server_port}/missing').catch(()=>{{}});\
+                 setTimeout(() => {{ document.body.textContent = 'ready-now'; }}, 400);\
+                 </script>",
+            );
+            let nav = browser_navigate(&serde_json::json!({ "url": page, "port": port }));
+            assert!(nav.ok, "navigate: {:?}", nav.error);
+
+            let console = browser_console(&serde_json::json!({ "port": port }));
+            assert!(console.ok, "console: {:?}", console.error);
+            assert!(
+                console.output.contains("boom 42"),
+                "the load-time console.error must be in the ledger: {}",
+                console.output
+            );
+
+            let wait = browser_wait_for(&serde_json::json!({ "text": "ready-now", "port": port }));
+            assert!(wait.ok, "the text appears 400ms in, wait_for must see it: {:?}", wait.error);
+            let miss = browser_wait_for(
+                &serde_json::json!({ "text": "never-written-anywhere", "timeout_ms": 500, "port": port }),
+            );
+            assert!(!miss.ok, "an absent text must not 'succeed'");
+            assert!(
+                miss.error.as_deref().unwrap_or_default().contains("never appeared"),
+                "the failure names the deadline: {:?}",
+                miss.error
+            );
+
+            let net = browser_network(&serde_json::json!({ "port": port }));
+            assert!(net.ok, "network: {:?}", net.error);
+            assert!(
+                net.output.contains("127.0.0.1"),
+                "the failed fetch must be reported with its URL: {}",
+                net.output
+            );
+
+            // The drains consumed what they reported: a second console read is quiet.
+            let again = browser_console(&serde_json::json!({ "port": port }));
+            assert!(again.ok);
+            assert!(again.output.contains("no console output"), "got: {}", again.output);
+        }));
+        stop_chrome(&mut child);
+        let _ = std::fs::remove_dir_all(&tmp);
+        forget_conn(port);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// `browser_expect` against a real page: the four kinds hit, a text miss names the deadline,
+    /// an element miss diagnoses the page, and a malformed selector fails fast instead of polling.
+    #[test]
+    fn expect_asserts_the_page_and_misses_say_what_it_showed() {
+        let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-4-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let page = "data:text/html,<title>expect-test</title>\
+                        <button id='go'>go</button>\
+                        <span id='late'></span>\
+                        <script>setTimeout(() => { document.getElementById('late').textContent = 'loaded-late'; }, 300);</script>";
+            let nav = browser_navigate(&serde_json::json!({ "url": page, "port": port }));
+            assert!(nav.ok, "navigate: {:?}", nav.error);
+
+            let text = browser_expect(&serde_json::json!({ "kind": "text", "value": "loaded-late", "port": port }));
+            assert!(text.ok, "late text is retried until it shows: {:?}", text.error);
+            assert!(text.output.contains("loaded-late"), "got: {}", text.output);
+
+            let element = browser_expect(&serde_json::json!({ "kind": "element", "value": "#go", "port": port }));
+            assert!(element.ok, "the selector matches: {:?}", element.error);
+            assert!(
+                element.output.contains("1 element matches") && element.output.contains("expect-test"),
+                "the hit names the count and the page: {}",
+                element.output
+            );
+
+            let title = browser_expect(&serde_json::json!({ "kind": "title", "value": "expect-test", "port": port }));
+            assert!(title.ok, "got: {:?}", title.error);
+            assert!(title.output.contains("expect-test"), "got: {}", title.output);
+
+            let url = browser_expect(&serde_json::json!({ "kind": "url", "value": "data:text/html", "port": port }));
+            assert!(url.ok, "got: {:?}", url.error);
+
+            let miss = browser_expect(&serde_json::json!({
+                "kind": "element", "value": "#absent", "timeout_ms": 500, "port": port,
+            }));
+            assert!(!miss.ok, "an absent element must not 'succeed'");
+            let reason = miss.error.as_deref().unwrap_or_default();
+            assert!(
+                reason.contains("no element matches") && reason.contains("expect-test"),
+                "the miss diagnoses the page: {reason}"
+            );
+
+            let bad = browser_expect(&serde_json::json!({ "kind": "element", "value": "#[unclosed", "port": port }));
+            assert!(!bad.ok, "an invalid selector must fail fast");
+            assert!(
+                bad.error.as_deref().unwrap_or_default().contains("not a valid CSS selector"),
+                "got: {:?}",
+                bad.error
+            );
+
+            let bad_kind = browser_expect(&serde_json::json!({ "kind": "count", "value": "x", "port": port }));
+            assert!(!bad_kind.ok, "an unknown kind must be refused");
+        }));
+        stop_chrome(&mut child);
+        let _ = std::fs::remove_dir_all(&tmp);
+        forget_conn(port);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// `browser_start` with no candidates refuses honestly, and with a browser already answering
+    /// on the port it must not spawn a second one — the recovery loop's "start, then navigate
+    /// again" depends on the second call reading as success.
+    #[test]
+    fn start_refuses_without_a_binary_and_answers_when_one_is_already_up() {
+        let miss = browser_start_with(&[], 59998);
+        assert!(!miss.ok, "no candidate must not 'succeed'");
+        assert!(
+            miss.error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("no Chrome, Chromium, Edge or Brave"),
+            "got: {:?}",
+            miss.error
+        );
+
+        let tmp = std::env::temp_dir().join(format!("aiprovider-chrome-5-{}", std::process::id()));
+        std::fs::create_dir_all(&tmp).unwrap();
+        let Some((port, mut child)) = launch_headless_chrome(&tmp) else { return };
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let up = browser_start_with(&["/no/such/browser"], port);
+            assert!(up.ok, "an answering browser is success: {:?}", up.error);
+            assert!(
+                up.output.contains("already answering"),
+                "and says it started nothing: {}",
+                up.output
+            );
+        }));
+        stop_chrome(&mut child);
+        let _ = std::fs::remove_dir_all(&tmp);
+        forget_conn(port);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
+    }
+
+    /// The binary finder resolves absolute paths and PATH names, and refuses what is not there.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_binary_finder_finds_what_exists() {
+        assert_eq!(find_browser(&["/no/such/beast"]), None);
+        assert_eq!(
+            find_browser(&["/bin/echo"]).as_deref(),
+            Some("/bin/echo"),
+            "an absolute path that exists is taken as-is"
+        );
+        assert!(find_browser(&["ls"]).is_some(), "a PATH name resolves");
     }
 }

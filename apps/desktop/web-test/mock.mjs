@@ -203,7 +203,23 @@ async function oracle(req, res, path) {
      * the last turn they wrote, not the last message on the wire. (Found the hard way: the
      * timeline spec's `think:` trigger fired in round one and silently not in round two.)
      */
-    const userPrompt = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const userPromptRaw = [...messages].reverse().find((m) => m.role === "user")?.content ?? "";
+    const userPrompt =
+      typeof userPromptRaw === "string"
+        ? userPromptRaw
+        : Array.isArray(userPromptRaw)
+          ? userPromptRaw.map((p) => (typeof p === "string" ? p : (p?.text ?? ""))).join(" ")
+          : "";
+    // Did anyone in this conversation ask for X? An image-carrying turn appends its own user
+    // message (the marker protocol's attachment), so the LAST user turn stops being the person's
+    // prompt mid-run — variant branches that must survive an image turn key on this instead.
+    const userText = (m) =>
+      typeof m.content === "string"
+        ? m.content
+        : Array.isArray(m.content)
+          ? m.content.map((p) => (typeof p === "string" ? p : (p?.text ?? ""))).join(" ")
+          : "";
+    const askedFor = (re) => messages.some((m) => m.role === "user" && re.test(userText(m)));
     const stream = body.stream === true;
     const tools = Array.isArray(body.tools) && body.tools.length > 0;
     const sawToolResult = messages.some((m) => m.role === "tool");
@@ -378,6 +394,73 @@ async function oracle(req, res, path) {
       content = "";
     } else if (tools && /watch the bg job/i.test(userPrompt)) {
       content = "Started. The job keeps running on its own.";
+    } else if (tools && askedFor(/screenshot the page/i) && !sawToolResult) {
+      toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://fixture.local/page" }) };
+      content = "";
+    } else if (tools && askedFor(/screenshot the page/i) && toolMsgs.length === 1) {
+      toolCall = { name: "browser_screenshot", arguments: "{}" };
+      content = "";
+    } else if (tools && askedFor(/screenshot the page/i)) {
+      content = "Captured. The page's screenshot is saved in the workspace and shown with the call.";
+    } else if (tools && askedFor(/open the offline page/i) && !sawToolResult) {
+      // Agent mode, BROWSER-SETUP-MISS variant: navigate straight at a page the harness's browser
+      // refuses, so the tool result is the no-browser error — the failure the row's setup hint
+      // exists to explain.
+      toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://offline.local/page" }) };
+      content = "";
+    } else if (tools && askedFor(/open the offline page/i)) {
+      content = "The browser call could not reach a browser — the row's hint names the exact command to start one.";
+    } else if (tools && askedFor(/start the browser and open the page/i) && toolMsgs.length === 0) {
+      // Agent mode, BROWSER-START recovery variant: the first navigate hits the no-browser miss,
+      // then the model does what a person would — start the browser, navigate again. The flow
+      // `browser_start` exists to close.
+      toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://offline.local/page" }) };
+      content = "";
+    } else if (tools && askedFor(/start the browser and open the page/i) && toolMsgs.length === 1) {
+      toolCall = { name: "browser_start", arguments: "{}" };
+      content = "";
+    } else if (tools && askedFor(/start the browser and open the page/i) && toolMsgs.length === 2) {
+      toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://offline.local/page" }) };
+      content = "";
+    } else if (tools && askedFor(/start the browser and open the page/i)) {
+      content = "The browser is up and the page is open — the recovery worked.";
+    } else if (tools && askedFor(/expect the loaded page/i) && !sawToolResult) {
+      // Agent mode, BROWSER-EXPECT variant: navigate, click the working button, then assert the
+      // result with the new assertion tool instead of eyeballing a snapshot — the flow an
+      // "assertion layer" exists for.
+      toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://fixture.local/page" }) };
+      content = "";
+    } else if (tools && askedFor(/expect the loaded page/i) && toolMsgs.length === 1) {
+      toolCall = { name: "browser_click", arguments: JSON.stringify({ element: 0 }) };
+      content = "";
+    } else if (tools && askedFor(/expect the loaded page/i) && toolMsgs.length === 2) {
+      toolCall = {
+        name: "browser_expect",
+        arguments: JSON.stringify({ kind: "text", value: "Data loaded." }),
+      };
+      content = "";
+    } else if (tools && askedFor(/expect the loaded page/i)) {
+      content = "The assertion held — the page's own text says the data loaded.";
+    } else if (tools && /debug the broken page/i.test(userPrompt)) {
+      // Agent mode, BROWSER-DEBUG variant: navigate a fixture page, click the button that throws,
+      // wait for a confirmation that never comes, then read the console — the sequence that ends
+      // in "the click did nothing" becoming "the console says why". Keyed on the tool-message
+      // count because the wait_for round fails (an error result, not a tool turn to branch on).
+      const round = toolMsgs.length;
+      if (round === 0) {
+        toolCall = { name: "browser_navigate", arguments: JSON.stringify({ url: "http://fixture.local/page" }) };
+      } else if (round === 1) {
+        toolCall = { name: "browser_snapshot", arguments: "{}" };
+      } else if (round === 2) {
+        toolCall = { name: "browser_click", arguments: JSON.stringify({ element: 1 }) };
+      } else if (round === 3) {
+        toolCall = { name: "browser_wait_for", arguments: JSON.stringify({ text: "Saved", timeout_ms: 1000 }) };
+      } else if (round === 4) {
+        toolCall = { name: "browser_console", arguments: "{}" };
+      } else {
+        content =
+          "The click threw ReferenceError: saveData is not defined — the page's console says the save handler never ran.";
+      }
     } else if (tools && /background/i.test(userPrompt) && !sawToolResult) {
       // Agent mode, BACKGROUND variant: start a detached job, then poll it by the id the
       // start receipt names.

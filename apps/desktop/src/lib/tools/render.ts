@@ -144,6 +144,39 @@ export function groupToolRuns(messages: readonly TurnLike[]): { byAssistant: Map
  * were never read — so it is presented as an all-additions diff with a note, rather than claiming a
  * diff against content nobody saw.
  */
+/**
+ * Where an image-carrying tool's result says its file lives — the `READ_IMAGE` marker's `path:`
+ * line (the raw result a live step carries) or the short receipt the agent loop leaves in the
+ * persisted transcript (`image captured and saved: images/x.png (12 KB)`). `null` for anything
+ * else, so the caller renders an image only when the result actually names one.
+ */
+export function imagePathFromResult(result: string): string | null {
+  const marker = /^path: (.+)$/m.exec(result);
+  if (marker) return marker[1]!.trim();
+  const receipt = /^image (?:loaded|generated and saved|captured and saved): (.+?) \(\d+ KB\)/m.exec(result);
+  return receipt ? receipt[1]!.trim() : null;
+}
+
+/**
+ * A browser tool that found nothing listening on the debugger port. The error already tells the
+ * model what to start; this recognises it so the UI can tell the *person*, with the port the
+ * error named. `null` for any other result — only a real setup miss earns the hint.
+ */
+export function browserSetupMiss(result: string): { port: string } | null {
+  const m = /^no browser answered on 127\.0\.0\.1:(\d+)/m.exec(result);
+  return m ? { port: m[1]! } : null;
+}
+
+/**
+ * The session image cache's name in an image receipt (`cache: <name>` — the agent loop deposits
+ * a copy of the bytes app-side so a replay survives the workspace file being cleaned). `null`
+ * for receipts written before the cache or by a loop with no cache port.
+ */
+export function imageCacheFromResult(result: string): string | null {
+  const m = /^cache: (\S+)$/m.exec(result);
+  return m ? m[1]! : null;
+}
+
 export function fileChangeFor(name: string, args: Record<string, unknown>): FileChange | null {
   const path = typeof args.path === "string" ? args.path : "";
   if (!path) return null;

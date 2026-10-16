@@ -385,6 +385,33 @@ const bgJobs = new Map<
 let bgSeq = 0;
 const bgSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * The page the `browser_*` tools drive — mirrors the observable surface of core/browser.rs
+ * (snapshot outline, console entries and network failures the page produced, wait_for's text
+ * poll and deadline wording) without a real Chrome over CDP, on the same fidelity line as the
+ * virtual FS: the Rust tests pin the real CDP client, the shim only has to be good enough for an
+ * agent turn to drive the tools. One fixture page with two buttons: one works, one throws and
+ * fails a fetch — the shape a "why didn't this work" debugging turn needs.
+ */
+const vBrowser = {
+  url: "about:blank",
+  title: "",
+  text: "",
+  els: [] as { kind: string; label: string }[],
+  console: [] as { level: string; text: string; count: number }[],
+  net: [] as { method: string; url: string; status: number; error: string }[],
+};
+
+/** The session image cache's shim twin (`image_cache_write` / `image_cache_read` below). */
+const imageCache = new Map<string, string>();
+
+/**
+ * Whether the debugger endpoint is up. The virtual browser always answers EXCEPT for
+ * offline.local navigations while nothing has been started — the setup-miss scenario the
+ * `browser_start` recovery loop exists to close.
+ */
+const debuggerState = { started: false };
+
 /** What `tools_default_root` answers. There is no HOME or filesystem here, so the shim names a
  *  fixed absolute path — the same shape the host returns (`$HOME/AI-Provider-Router-Workspace`). */
 const DEFAULT_WORKSPACE_ROOT = "/Users/tester/AI-Provider-Router-Workspace";
@@ -804,6 +831,11 @@ let eventSeq = 0;
    * is what the sandbox holds, and only the second one can falsify a revert that reported success.
    */
   vfs: (): Record<string, string> => Object.fromEntries(virtualFs),
+  /**
+   * Delete one file from the virtual workspace — the "the workspace copy was cleaned" arrangement
+   * the image-cache fallback exists for. Returns whether the file existed.
+   */
+  dropFile: (rel: string): boolean => virtualFs.delete(rel),
   /**
    * The plan documents `plan_save` wrote (path -> markdown). Plans live OUTSIDE the sandbox — that
    * is the point of the command — so `vfs()` cannot see them, and a spec that wants to prove the
@@ -1666,6 +1698,23 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       planFiles.set(rel, markdown);
       return rel;
     }
+    // ---- Session image cache (core/image_cache.rs): content-addressed second copy so a replayed
+    // transcript's preview survives the workspace file being cleaned. The shim keeps a map keyed
+    // by a crude content hash — the same contract, not the same hash.
+    case "image_cache_write": {
+      const { mediaType, base64 } = args as { mediaType: string; base64: string };
+      let h = 5381;
+      for (let i = 0; i < base64.length; i++) h = ((h * 33) ^ base64.charCodeAt(i)) >>> 0;
+      const name = `${h.toString(16)}.${mediaType === "image/png" ? "png" : "img"}`;
+      imageCache.set(name, String(base64));
+      return name;
+    }
+    case "image_cache_read": {
+      const name = String(args.name ?? "");
+      const data = imageCache.get(name);
+      if (data === undefined) throw new Error(`no cached image named "${name}" — it may have been evicted`);
+      return `READ_IMAGE:image/png;base64,${data}\npath: (cache) ${name}\nbytes: ${Math.ceil((data.length * 3) / 4)}`;
+    }
     case "agent_def_set_enabled": {
       const id = String(args.id ?? "");
       const raw = agentDefs.get(id);
@@ -1965,6 +2014,151 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         return ok(
           `signalled job ${id} to stop (SIGINT, then SIGKILL after 500ms if still running) — poll process_output for the final status`,
         );
+      }
+      if (name === "browser_navigate") {
+        const url = String(toolArgs["url"] ?? "");
+        if (!url) return fail('navigate needs a "url"');
+        // offline.local is the harness's "nothing is listening" page — the setup-miss scenario
+        // the UI hint renders, and the one `browser_start` can fix. Same wording the Rust host
+        // returns when no debugger answers.
+        if (/^https?:\/\/offline\.local\//.test(url) && !debuggerState.started) {
+          return fail(
+            "no browser answered on 127.0.0.1:9222 — start Chrome (or Chromium/Edge) with --remote-debugging-port=9222 and open a tab",
+          );
+        }
+        vBrowser.url = url;
+        vBrowser.title = "Fixture page";
+        vBrowser.text = "Welcome to the fixture page. Nothing saved yet.";
+        vBrowser.els = [
+          { kind: "button", label: "Load data" },
+          { kind: "button", label: "Broken action" },
+        ];
+        vBrowser.console = [];
+        vBrowser.net = [];
+        return ok(JSON.stringify({ title: vBrowser.title, url }));
+      }
+      if (name === "browser_snapshot") {
+        const lines = vBrowser.els.map((e, i) => `[${i}] ${e.kind} "${e.label}"`);
+        return ok(
+          JSON.stringify({ title: vBrowser.title, url: vBrowser.url, count: vBrowser.els.length, lines }),
+        );
+      }
+      if (name === "browser_click" || name === "browser_fill") {
+        const idx = Number(toolArgs["element"]);
+        if (!vBrowser.els[idx]) {
+          return fail(`no element [${idx}] — the page changed since the snapshot; call browser_snapshot again`);
+        }
+        if (name === "browser_fill") return ok(`filled [${idx}]`);
+        const label = vBrowser.els[idx].label;
+        if (label === "Load data") {
+          vBrowser.text += " Data loaded.";
+          vBrowser.console.push({ level: "log", text: "data loaded fine", count: 1 });
+        } else if (label === "Broken action") {
+          vBrowser.console.push({ level: "error", text: "ReferenceError: saveData is not defined", count: 1 });
+          vBrowser.net.push({
+            method: "GET",
+            url: "http://fixture.local/api/save",
+            status: 0,
+            error: "net::ERR_FAILED",
+          });
+        }
+        return ok(`clicked [${idx}]`);
+      }
+      if (name === "browser_console") {
+        const entries = vBrowser.console.splice(0);
+        if (entries.length === 0) {
+          return ok("no console output since the last browser_console call — the page has been quiet");
+        }
+        return ok(
+          entries.map((e) => `[${e.level}] ${e.text}${e.count > 1 ? ` (${e.count}×)` : ""}`).join("\n"),
+        );
+      }
+      if (name === "browser_network") {
+        const entries = vBrowser.net.splice(0);
+        if (entries.length === 0) return ok("no failed requests since the last browser_network call");
+        return ok(
+          entries
+            .map((e) =>
+              e.status > 0 ? `[${e.method} ${e.status}] ${e.url}` : `[${e.method} failed] ${e.url} — ${e.error}`,
+            )
+            .join("\n"),
+        );
+      }
+      if (name === "browser_wait_for") {
+        const text = String(toolArgs["text"] ?? "");
+        if (!text) return fail('wait_for needs a "text": the string to wait for on the page');
+        const timeout = Math.min(Math.max(Number(toolArgs["timeout_ms"] ?? 10_000) || 10_000, 250), 30_000);
+        const deadline = Date.now() + timeout;
+        while (!vBrowser.text.includes(text) && Date.now() < deadline) await bgSleep(100);
+        if (vBrowser.text.includes(text)) return ok(`"${text}" is on the page`);
+        return fail(
+          `"${text}" never appeared within ${timeout}ms — re-check the wording with browser_snapshot, or the page may not be doing what you expect`,
+        );
+      }
+      if (name === "browser_expect") {
+        // The virtual page answers all four kinds from its recorded state, with the Rust tool's
+        // verdict wording — a miss says what the page showed, not just "no".
+        const kind = String(toolArgs["kind"] ?? "");
+        const value = String(toolArgs["value"] ?? "");
+        if (!["text", "element", "url", "title"].includes(kind)) {
+          return fail('expect needs a "kind": one of "text", "element", "url", "title"');
+        }
+        if (!value) return fail(`expect needs a "value": the ${kind} to assert on the page`);
+        const timeout = Math.min(Math.max(Number(toolArgs["timeout_ms"] ?? 10_000) || 10_000, 250), 30_000);
+        const deadline = Date.now() + timeout;
+        const hit = () =>
+          kind === "text"
+            ? vBrowser.text.includes(value)
+            : kind === "element"
+              // The virtual page's elements are outline entries (kind + label), not DOM nodes —
+              // a selector-style value matches when it names one of them.
+              ? vBrowser.els.some((e) => e.label.includes(value.replace(/^[#.]/, "")))
+              : kind === "url"
+                ? vBrowser.url.includes(value)
+                : vBrowser.title.includes(value);
+        while (!hit() && Date.now() < deadline) await bgSleep(100);
+        if (!hit()) {
+          return fail(
+            kind === "text"
+              ? `"${value}" never appeared within ${timeout}ms — re-check the wording with browser_snapshot, or the page may not be doing what you expect`
+              : kind === "element"
+                ? `no element matches "${value}" within ${timeout}ms — the page is "${vBrowser.title}"`
+                : `"${value}" never appeared in the ${kind} within ${timeout}ms — currently "${kind === "url" ? vBrowser.url : vBrowser.title}"`,
+          );
+        }
+        return ok(
+          kind === "text"
+            ? `"${value}" is on the page`
+            : kind === "element"
+              ? `1 element matches "${value}" (page "${vBrowser.title}")`
+              : `"${value}" is in the ${kind} (currently "${kind === "url" ? vBrowser.url : vBrowser.title}")`,
+        );
+      }
+      if (name === "browser_start") {
+        // The virtual browser is always "running" except for the offline.local gate, so the
+        // start either finds nothing to do (already up) or flips the gate. Rust-identical wording.
+        const port = Number(toolArgs["port"] ?? 9222);
+        if (debuggerState.started) {
+          return ok(`a browser is already answering on 127.0.0.1:${port} — nothing to start, try the call again`);
+        }
+        debuggerState.started = true;
+        return ok(
+          `a browser is up on 127.0.0.1:${port} (a fresh debug profile, so the page is blank) — navigate to the page you want to test`,
+        );
+      }
+      if (name === "browser_screenshot") {
+        if (!vBrowser.title) return fail("no browser answered on 127.0.0.1:9222 — start Chrome (or Chromium/Edge) with --remote-debugging-port=9222 and open a tab");
+        // One 1×1 PNG, the smallest image that is honestly an image.
+        const TINY_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        const rel = String(toolArgs["path"] ?? "images/browser-fixture.png");
+        virtualFs.set(rel, TINY_PNG);
+        return ok(`READ_IMAGE:image/png;base64,${TINY_PNG}\npath: ${rel}\nbytes: 70`);
+      }
+      if (name === "read_image") {
+        const p = String(toolArgs["path"] ?? "");
+        const data = virtualFs.get(p);
+        if (data === undefined) return fail(`no such file: ${p}`);
+        return ok(`READ_IMAGE:image/png;base64,${data}\npath: ${p}\nbytes: ${Math.ceil((data.length * 3) / 4)}`);
       }
       return fail(`unknown tool '${name}'`);
     }
