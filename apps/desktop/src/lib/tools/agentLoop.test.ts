@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
-  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult, HARD_ITERATION_BACKSTOP,
+  SUBAGENT_CONCURRENCY, planPathFromResult,
   FINAL_ROUND_NOTE, TRUNCATED_TOOL_CALL_NOTE, argumentProblem,
   resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
 } from "./agentLoop";
@@ -813,9 +813,11 @@ describe("runAgentLoop", () => {
     });
 
     expect(out.text).toBe("final");
-    // The backstop rounds themselves, plus the wrap-up call that ends the child's last tool-only
-    // round with an answer — the same extra call the parent's loop makes at its own ceiling.
-    expect(childRounds, "the child stopped at the backstop, not at 5000").toBe(SUBAGENT_HARD_BACKSTOP + 1);
+    // The clamped budget's rounds, plus the wrap-up call that ends the child's last tool-only round
+    // with an answer — the same extra call the parent's loop makes at its own ceiling. The clamp now
+    // applies to the *configured number*, not to the loop: this same test used to pass with a
+    // backstop that would equally have cut off a child nobody had configured anything for.
+    expect(childRounds, "the child stopped at the cap, not at 5000").toBe(MAX_ITERATIONS_CAP + 1);
   }, 60_000);
 
   it("delegates without a recorder exactly as before", async () => {
@@ -1969,45 +1971,37 @@ describe("runAgentLoop", () => {
     expect(out.text).toBe("loop");
   });
 
-  it("bounds a turn with no user budget at the backstop, and reports the round it reached", async () => {
-    // The defect this pins (2026-10-16 report: "stopped at 50 iterations — the step budget ran out
-    // while the model was still calling tools. Raise 'Steps'"). Two things were wrong behind that
-    // one sentence. First, a turn with no budget had no bound *at all*: `maxIterations === null`
-    // drove the loop condition, so "blank means no limit" meant a genuinely infinite loop rather
-    // than the paced-but-bounded turn the docs described. Second, the ceiling exit computed its
-    // count as `maxIterations ?? 0`, so a turn that had never set a budget reported `0` — an
-    // iteration count nobody could have reached, which is what made the notice's advice nonsense.
+  it("with no step budget, no count stops the turn", async () => {
+    // The rule this pins (2026-10-16): a turn with no budget is bounded by the user's Stop, by the
+    // pacing nudge, and by the context window — **not by a counter**. Two previous builds each
+    // stopped it with a number nobody chose: the field's default used to be 8, and one build made
+    // "blank" mean 250. Both produced the same report — a legitimate task cut off mid-work by a
+    // limit the user never set and could not see.
     //
-    // The script answers *past* the backstop on purpose. A model that never stops would make this
-    // test hang rather than fail if the bound regressed, and a test that cannot go red is not
-    // evidence; this one goes red by finishing on the model's own answer instead of the bound.
+    // The script answers *past* both of those numbers, so a reinstated counter fails this instead of
+    // hanging: 300 rounds is past the old 50 cap and past the old 250 backstop, and the model's own
+    // answer is what must end it.
     const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
 
     const out = await runAgentLoop({
       model: "m",
       messages: [{ role: "user", content: "go" }],
       registry: AGENT_TOOLS,
-      generate: relentlessModel(HARD_ITERATION_BACKSTOP + 50),
+      generate: relentlessModel(300),
       host,
-      // No `maxIterations` — the Assistant's own default, the blank Steps field.
+      // No `maxIterations` — the Assistant's default, the blank Steps field.
     });
 
-    expect(out.hitCeiling, "an unbounded turn is still bounded").toBe(true);
-    expect(out.iterations, "and reports the round it really reached").toBe(HARD_ITERATION_BACKSTOP);
-    expect(out.iterations, "not the 0 the old `maxIterations ?? 0` would report").not.toBe(0);
-    expect(out.text, "the model never got to its answer — the bound stopped it").not.toContain(
-      "finally done",
-    );
+    expect(out.hitCeiling, "nothing counted this turn").toBe(false);
+    expect(out.text, "it ended on the model's own answer").toContain("finally done");
+    expect(out.iterations, "past the old 50 cap and the old 250 backstop").toBe(301);
   });
 
-  it("cannot be configured past the backstop, so the bound and the field's maximum agree", async () => {
-    // A setting whose maximum exceeds the loop's own bound is the same lie one level down: the user
-    // sets 500, the loop stops at 250, and the notice blames a budget of 500. The two are asserted
-    // equal here so that editing either alone fails.
-    expect(MAX_ITERATIONS_CAP).toBe(HARD_ITERATION_BACKSTOP);
-    // One bound for both loops — the sub-agent's insurance and the main turn's are the same number,
-    // because the argument for it ("152 was the largest honest run") was never child-specific.
-    expect(SUBAGENT_HARD_BACKSTOP).toBe(HARD_ITERATION_BACKSTOP);
+  it("a configured budget is honoured and clamped to the cap", async () => {
+    // The other half: a number a person *set* still bounds the turn, and the largest number the field
+    // offers is the largest number the loop acts on — a field asking for 5000 while the loop ran 250
+    // would be a setting that does not describe what happens.
+    expect(MAX_ITERATIONS_CAP).toBeGreaterThanOrEqual(250);
 
     const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
 
@@ -2015,15 +2009,13 @@ describe("runAgentLoop", () => {
       model: "m",
       messages: [{ role: "user", content: "go" }],
       registry: AGENT_TOOLS,
-      generate: relentlessModel(HARD_ITERATION_BACKSTOP + 50),
+      generate: relentlessModel(MAX_ITERATIONS_CAP + 50),
       host,
-      // Deliberately past the cap: the loop clamps rather than honouring it, so the number a caller
-      // writes can never exceed the number the notice would report.
-      maxIterations: HARD_ITERATION_BACKSTOP + 1000,
+      maxIterations: MAX_ITERATIONS_CAP + 1000,
     });
 
-    expect(out.hitCeiling).toBe(true);
-    expect(out.iterations).toBe(HARD_ITERATION_BACKSTOP);
+    expect(out.hitCeiling, "a set budget still stops the turn").toBe(true);
+    expect(out.iterations, "clamped to the cap, not the 5000 it was handed").toBe(MAX_ITERATIONS_CAP);
   });
 
   it("summarizes the last tool activity when the ceiling hits on a tool-only turn", async () => {

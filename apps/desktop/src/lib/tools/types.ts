@@ -163,17 +163,21 @@ export interface AgentLoopOptions {
    */
   plan?: PlanPorts;
   /**
-   * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling the
-   * user set** — which is not the same as no bound. A turn without a user budget is paced by the
-   * loop's own reminder (see `TOOL_CALL_NUDGE_AFTER` in `agentLoop.ts`), ended by the user's Stop,
-   * and still stops at `HARD_ITERATION_BACKSTOP` if it is genuinely stuck. The Assistant's screen
-   * leaves it unset by default: a real task is not a fixed number of rounds, and the measured
-   * failure of the alternative (2026-10-06) was a legitimate long task cut off mid-work by a hard
-   * cap. A number bounds the turn below that backstop, and reaching either is reported as
-   * `hitCeiling` — with the round actually reached — rather than passed off as an answer.
+   * The user's budget for model round-trips in this turn, or `null`/absent for **no step budget at
+   * all**. A turn with no budget is bounded by the user's Stop, by the loop's pacing reminder (see
+   * `TOOL_CALL_NUDGE_AFTER` in `agentLoop.ts`), and by the context window each round grows — not by
+   * a counter. That is the interactive shape Claude Code documents for its own agent loop
+   * (`--max-turns` is *"print mode only … No limit by default"*) and the one `dsh-agent-loop` ships,
+   * which has no turn budget at all and expects a policy to cancel a runaway turn instead. A wrong
+   * stop is worse than a late one: a step count cannot tell "still working" from "stuck", and the
+   * measured failure of a low one (2026-10-06) was a legitimate task cut off mid-work.
    *
-   * The gateway's loop is a different caller with the opposite default: external clients that this
-   * app cannot see must never be unbounded, so it passes `DEFAULT_MAX_ITERATIONS`.
+   * A number still bounds the turn, is clamped to `MAX_ITERATIONS_CAP`, and reaching it is reported
+   * as `hitCeiling` rather than passed off as an answer.
+   *
+   * The gateway's loop is a different caller with the opposite rule: external clients that this app
+   * cannot see have no Stop button, so it passes `DEFAULT_MAX_ITERATIONS` — the same
+   * headless-only bound that Claude Code's `--max-turns` is.
    */
   maxIterations?: number | null;
   /**
@@ -238,9 +242,9 @@ export interface AgentLoopOptions {
   };
   /**
    * The sub-agent's step budget. **Absent means no ceiling** (see `SUBAGENT_MAX_ITERATIONS` in
-   * agentLoop.ts): the child is paced by the nudge and bounded by the concurrency cap, not by a
-   * step count, and only `SUBAGENT_HARD_BACKSTOP` ends a pathological run. A number here is the
-   * user's explicit ceiling from Router Settings → defaults.
+   * agentLoop.ts): the child is paced by the nudge and bounded by the concurrency cap and its
+   * inactivity watchdog, not by a step count — the same rule the main turn follows. A number here is
+   * the user's explicit ceiling from Router Settings → defaults, clamped to `MAX_ITERATIONS_CAP`.
    */
   subagentMaxIterations?: number;
   /**

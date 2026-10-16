@@ -3,7 +3,6 @@ import { runAgentTurn, type AgentTurnRequest } from "./agent-turn";
 import type { AgentTurnPorts, Trace, TranscriptEntry } from "./ports";
 import type { AgentEvent, ToolHost } from "../../tools";
 import type { ServedBy } from "../../gateway-turn";
-import { HARD_ITERATION_BACKSTOP } from "../../tools";
 
 /** A model script like agentLoop.test.ts's, wrapped in the gateway exec shape the engine's
  *  generate wrapper produces (chunks + reasoning + served), with the usage hook the loop offers. */
@@ -178,14 +177,15 @@ describe("runAgentTurn", () => {
   /**
    * The remedy in the notice has to be one the user can perform. This is the report that produced
    * this test (2026-10-16): "⚠ stopped at 50 iterations … Raise 'Steps' in the run configuration" —
-   * shown to a user whose Steps field already held 50, which was the field's maximum. The product's
-   * only instruction on being cut off was impossible to follow. Raising the cap alone would have
-   * moved the same defect up one level (a field asking for 500 while the loop stops at 250), so the
-   * two facts below are asserted together: the advice names the setting the user actually has, and
-   * when there is no such setting the notice says so instead of inventing one.
+   * shown to a user whose Steps field already held 50, which was the field's maximum, so the
+   * product's only instruction on being cut off was impossible to follow.
+   *
+   * Two things changed since. The remedy now offers **clear** as well as raise, so it is followable
+   * at any value including the cap; and a turn with no budget is no longer stopped by a counter at
+   * all, so a ceiling exit can only mean the user's own number ran out — there is no second case for
+   * the notice to guess at.
    */
-  it("offers a ceiling remedy that exists: the user's own budget, or the backstop by name", async () => {
-    // A budget the user set: the notice may name it, because raising or clearing it is real.
+  it("names the budget that actually stopped the turn, with a remedy that can be performed", async () => {
     const budgeted = makePorts({
       steps: [{ text: "", calls: [{ id: "c1", name: "read_file", arguments: "{}" }] }],
     });
@@ -196,27 +196,11 @@ describe("runAgentTurn", () => {
         | undefined
     )!;
     const budgetNotice = withBudget[withBudget.length - 1]!.content;
-    expect(budgetNotice, "the budget it names is the one the user set").toContain("(3)");
-    expect(budgetNotice, "and the remedy is a setting that can move").toContain("Steps");
-
-    // No budget: the turn ended on the loop's own backstop, so "raise Steps" would be a dead end —
-    // there is no number behind this stop to raise. The notice must say that rather than blame a
-    // budget the user never set.
-    const unbounded = makePorts({
-      steps: [{ text: "", calls: [{ id: "c1", name: "read_file", arguments: "{}" }] }],
-    });
-    await runAgentTurn(makeRequest({ maxIterations: null, useMemory: false }), unbounded.ports);
-    const noBudget = (
-      (unbounded.ports.onReplaceTranscript as ReturnType<typeof vi.fn>).mock.calls[0]?.[0] as
-        | { role: string; content: string }[]
-        | undefined
-    )!;
-    const backstopNotice = noBudget[noBudget.length - 1]!.content;
-    expect(backstopNotice, "it names the real cause").toContain("backstop");
-    expect(backstopNotice, "and does not tell the user to raise a setting").not.toContain("Raise");
-    expect(backstopNotice, "the count is the round actually reached").toContain(
-      `stopped at ${HARD_ITERATION_BACKSTOP} iterations`,
-    );
+    expect(budgetNotice, "the budget it names is the one the user set").toContain("was 3");
+    expect(budgetNotice, "the remedy names the setting").toContain("Steps");
+    // Clearing always works, which is what makes the advice followable even at the cap — the failure
+    // mode being repaired here was advice that assumed a number could always go higher.
+    expect(budgetNotice, "and it can be performed at any value").toContain("clear");
   });
 
   it("refuses the run without a workspace root, undoing the optimistic append", async () => {

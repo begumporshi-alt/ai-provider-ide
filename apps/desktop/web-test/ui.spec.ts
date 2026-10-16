@@ -542,10 +542,10 @@ test("assistant: the tool-step budget is a setting, blank means no limit, and a 
   await page.getByLabel("agent mode").check();
   await expect(budget).toBeEnabled();
 
-  // 999 is not a different setting from the cap, it is the cap with the answer arriving late. The
-  // cap is the loop's own hard bound (`HARD_ITERATION_BACKSTOP`), so the field cannot ask for more
-  // than the loop will actually do — it used to stop at 50 while the loop ran to 250, which made
-  // the ceiling notice's "raise Steps" advice impossible to follow for anyone already at 50.
+  // 999 is not a different setting from the cap, it is the cap with the answer arriving late. The cap
+  // bounds a *number a person typed* (`MAX_ITERATIONS_CAP`) — it is not a bound on the loop itself,
+  // because a blank field means the turn is not counted at all. It used to be 50, which made the
+  // ceiling notice's "raise Steps" advice impossible to follow for anyone already holding 50.
   await budget.fill("999");
   await budget.blur();
   await expect(budget).toHaveValue("250");

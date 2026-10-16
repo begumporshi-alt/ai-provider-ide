@@ -262,21 +262,22 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
     // mints fresh ids and the notice vanished: measured 2026-10-06 (run-1791294635622, 40
     // iterations, the step label recorded and the bubble still blank).
     const closedOnCeiling = hitCeiling;
-    // The remedy has to be one the user can actually perform. This notice used to say only "Raise
-    // “Steps” in the run configuration", and the field's maximum was exactly 50 — so a user who had
-    // already set 50 was told to raise a number that could not go higher. That is the report this
-    // answers (2026-10-16). Two facts make the wording honest: a budget below the loop's own bound
-    // can be raised or cleared, while a turn ended by the backstop has no setting behind it to
-    // change at all — the clue there is that the count *equals* the bound. Either way the ceiling
-    // is per turn, so asking again is what actually continues the work.
+    // **A ceiling exit can only mean one thing now: the user set a budget and it ran out.** There is
+    // no loop-side backstop to confuse it with — a turn with no budget is not stopped by a counter at
+    // all — so the notice has exactly one case to describe and one remedy to offer, and the number
+    // in it is always one a setting can change.
+    //
+    // The remedy must list *clear* as well as *raise*: the field's maximum is `MAX_ITERATIONS_CAP`,
+    // and the original report (2026-10-16) came from a user holding a value the notice told them to
+    // raise. Clearing always works, so the advice is followable at any value. The ceiling is also
+    // per turn, so asking again is what actually continues the work.
     const budget = req.maxIterations;
     const closingText = hitCeiling
       ? `${finalText.trim() || "The run stopped without answering."}\n\n⚠ stopped at ${iterations} iterations — ` +
         (budget === null || budget === undefined
-          ? "this is the loop's own backstop for a turn still calling tools far past any real task, " +
-            "not a limit you set. Nothing is misconfigured — ask again to carry on."
-          : `the step budget you set (${budget}). Raise or clear “Steps” in the run configuration to ` +
-            "let one turn go further, then ask again to carry on.")
+          ? "the step budget for this turn ran out. Ask again to carry on."
+          : `the step budget for this turn was ${budget}. Raise or clear “Steps” in the run ` +
+            "configuration to let one turn go further, then ask again to carry on.")
       : finalText;
     const fullMessages: ChatMessage[] = [...messages, { role: "assistant", content: closingText }];
     ports.onReplaceTranscript(
