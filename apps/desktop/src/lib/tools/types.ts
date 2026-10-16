@@ -15,6 +15,23 @@ import type { ChatMessage, TextRequest, TextStream, UsageTokens } from "@aiprovi
  *  of the declaration instead of a second hardcoded list that drifts away from this one. */
 export type ToolEffect = "read" | "mutate";
 
+/**
+ * One delegated child's live state, as the parent loop sees it. Emitted while a
+ * `dispatch_agent` / `fan_out` call runs so the UI can show a delegation working instead of
+ * sitting on a silent "calling" row — a child's transcript is deliberately invisible (isolation
+ * is the point of delegating), but *that it is alive and roughly where it is* costs nothing to
+ * report and is the difference between "watching work" and "wondering if it hung".
+ */
+export interface SubagentChildProgress {
+  /** What to call this child: the task's label (`fan_out`), the specialist's name, or `research`. */
+  label: string;
+  state: "queued" | "running" | "done" | "failed";
+  /** Tool calls the child has made so far. */
+  toolCalls: number;
+  /** The child's most recent tool, when it has made one. */
+  lastTool?: string;
+}
+
 /** A tool the agent may call. Most entries map 1:1 to a handler in the Rust sandbox. A handful do
  *  not: `web_ask`, `dispatch_agent`, `generate_image`, `load_skill`, the notebook composites and
  *  the plan-mode pair are answered by the loop itself (a model call, a nested run, the image
@@ -58,6 +75,12 @@ export type AgentEvent =
   | { type: "reasoning"; text: string }
   | { type: "tool_call"; call: import("@aiprovider/router-core").ToolCall }
   | { type: "tool_result"; call: import("@aiprovider/router-core").ToolCall; result: string; ok: boolean }
+  /**
+   * A full snapshot of one delegation call's children. Carries the whole list, not a delta, so
+   * the fold is idempotent and a UI that missed an earlier event is corrected by the next one.
+   * `callId` is the `dispatch_agent` / `fan_out` call the children belong to.
+   */
+  | { type: "subagent_progress"; callId: string; children: SubagentChildProgress[] }
   /**
    * The model's stream ended before it declared a finish (the provider cut a declared-finish
    * stream short) and the loop is re-asking the same iteration. `attempt` counts re-asks.

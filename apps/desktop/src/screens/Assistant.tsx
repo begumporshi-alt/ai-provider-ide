@@ -62,6 +62,9 @@ import { SubagentsDrawer } from "../components/RunsDrawer";
 import { SessionSkillsDrawer } from "../components/SessionSkillsDrawer";
 import { SessionReferencesDrawer } from "../components/SessionReferencesDrawer";
 import { DiffView } from "../components/DiffView";
+import { ProcessCard } from "../components/ProcessCard";
+import { backgroundJobIdFromResult } from "../lib/tools/processJob";
+import type { SubagentChildProgress } from "../lib/tools/types";
 import {
   fileChangeFor,
   groupSearchMatches,
@@ -3714,6 +3717,13 @@ const STEP_COLOR: Record<ToolStatus, string> = {
   calling: "var(--warn)", ok: "var(--success)", denied: "var(--warn)", error: "var(--danger)",
 };
 
+const CHILD_STATE_COLOR: Record<SubagentChildProgress["state"], string> = {
+  queued: "var(--text-faint)",
+  running: "var(--warn)",
+  done: "var(--success)",
+  failed: "var(--danger)",
+};
+
 /**
  * One tool call, in the shape the coding agents' transcripts converged on (ZCode's own): the call
  * is a single mono line led by a status dot, and what came back folds beneath it.
@@ -3756,6 +3766,15 @@ function ToolCallRow({
   const summary = planDoc ? "" : argSummary(step.args);
   const preview = step.result !== undefined ? step.result.replace(/\s+/g, " ").trim() : null;
   const hasOutput = preview !== null && preview.length > 0;
+  // A background start's result mints a job the sandbox keeps running after this row closes —
+  // the one thing a finished row can still be doing. The card polls it live; on a replayed
+  // transcript whose job is long gone it renders nothing rather than an error. The gate is the
+  // receipt text alone, deliberately not the row's status: a replayed transcript records no
+  // status at all, and the receipt is only ever produced by a start that succeeded.
+  const bgJob =
+    step.name === "run_command" && typeof step.result === "string"
+      ? backgroundJobIdFromResult(step.result)
+      : null;
   // A call in flight has no result to fold yet, and its arguments are the only live evidence of
   // what it is doing — so they show while it runs, then fold like every finished call's.
   const showArgs = open || step.status === "calling";
@@ -3792,6 +3811,31 @@ function ToolCallRow({
             <div key={k} className="mono break-all text-[11px]" style={{ color: "var(--text-dim)" }}>
               <span style={{ color: "var(--text-faint)" }}>{k}: </span>
               {typeof v === "string" ? (v.length > 600 ? `${v.slice(0, 600)}…` : v) : JSON.stringify(v)}
+            </div>
+          ))}
+        </div>
+      )}
+      {step.children && step.children.length > 0 && (
+        <div
+          className="ml-3.5 mt-1 rounded-md border px-2 py-1.5 text-[11px]"
+          style={{ borderColor: "var(--border)" }}
+          data-testid="subagent-strip"
+        >
+          {step.children.map((c, i) => (
+            <div key={i} className="mono flex items-baseline gap-1.5">
+              <span className="shrink-0" style={{ color: CHILD_STATE_COLOR[c.state] }}>
+                ⏺
+              </span>
+              <span style={{ color: "var(--text)" }}>{c.label}</span>
+              <span style={{ color: "var(--text-faint)" }}>
+                {c.state === "queued"
+                  ? "· waiting for a slot"
+                  : c.state === "running"
+                    ? `· running · ${c.toolCalls} call${c.toolCalls === 1 ? "" : "s"}${c.lastTool ? ` · ${c.lastTool}` : ""}`
+                    : c.state === "done"
+                      ? "· done"
+                      : "· failed"}
+              </span>
             </div>
           ))}
         </div>
@@ -3834,6 +3878,7 @@ function ToolCallRow({
             : "⎿ (no output — the tool returned nothing)"}
         </button>
       ) : null}
+      {bgJob && root && <ProcessCard jobId={bgJob} root={root} />}
       {open && hasOutput && (
         <pre className="mono ml-3.5 mt-1 max-h-52 overflow-auto whitespace-pre-wrap text-[11px]" style={{ color: "var(--text-dim)" }}>{step.result}</pre>
       )}
@@ -4098,6 +4143,7 @@ function AgentLive({
           args: seg.args,
           call: { name: seg.name, args: seg.args },
           ...(seg.result !== undefined ? { result: seg.result } : {}),
+          ...(seg.children ? { children: seg.children } : {}),
           status: seg.status,
         };
         return (

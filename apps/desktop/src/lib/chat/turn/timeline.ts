@@ -27,7 +27,7 @@
  * The tool results. A result belongs to its call, the transcript pairs them by call id
  * (`indexToolCalls`), and duplicating that pairing would give two answers to one question.
  */
-import type { AgentEvent } from "../../tools/types";
+import type { AgentEvent, SubagentChildProgress } from "../../tools/types";
 import { tryParseArgs } from "./graph-record";
 import type { Msg } from "./messages";
 
@@ -44,7 +44,17 @@ export type ToolStatus = "calling" | "ok" | "error" | "denied";
 export type TimelineSegment =
   | { kind: "thinking"; text: string }
   | { kind: "text"; text: string }
-  | { kind: "tool"; name: string; args: Record<string, unknown>; status: ToolStatus; result?: string };
+  | {
+      kind: "tool";
+      name: string;
+      args: Record<string, unknown>;
+      status: ToolStatus;
+      result?: string;
+      /** The call's id, when the wire carried one — how a `subagent_progress` event finds its row. */
+      callId?: string;
+      /** Live delegation progress for a `dispatch_agent` / `fan_out` row, last snapshot wins. */
+      children?: SubagentChildProgress[];
+    };
 
 /**
  * The tool calls of a timeline, in order — what the status line and the row list both read.
@@ -91,6 +101,7 @@ export function applyAgentEvent(segments: TimelineSegment[], ev: AgentEvent): Ti
           name: ev.call.name ?? "?",
           args: tryParseArgs(ev.call.arguments),
           status: "calling",
+          ...(ev.call.id ? { callId: ev.call.id } : {}),
         },
       ];
     case "tool_result": {
@@ -108,6 +119,8 @@ export function applyAgentEvent(segments: TimelineSegment[], ev: AgentEvent): Ti
       }
       return next;
     }
+    case "subagent_progress":
+      return foldSubagentProgress(segments, ev.callId, ev.children);
     case "truncation_retry":
       // The abandoned attempt's prose is dropped, not concatenated: the retry's text is the answer
       // being built, and two attempts joined would read as one sentence the model never said. The
@@ -127,6 +140,37 @@ function dropTrailingText(segments: TimelineSegment[]): TimelineSegment[] {
   let end = segments.length;
   while (end > 0 && segments[end - 1]!.kind === "text") end -= 1;
   return end === segments.length ? segments : segments.slice(0, end);
+}
+
+/**
+ * Attach a delegation snapshot to its `dispatch_agent` / `fan_out` row.
+ *
+ * Rows match by call id when the wire carried one. A call without an id — a hand-built `ToolCall`
+ * in a test or a dialect that omits it — matches the most recent *calling* delegation row instead:
+ * the event can only arrive while that row is in flight, and two delegations cannot share the
+ * fallback because concurrent calls in one batch each carry their own id. No match, no change —
+ * a stale snapshot for a row already resolved is dropped, not resurrected.
+ */
+function foldSubagentProgress(
+  segments: TimelineSegment[],
+  callId: string,
+  children: SubagentChildProgress[],
+): TimelineSegment[] {
+  let target = -1;
+  for (let i = segments.length - 1; i >= 0; i--) {
+    const seg = segments[i]!;
+    if (seg.kind !== "tool" || seg.status !== "calling") continue;
+    if (!/^(dispatch_agent|fan_out)$/.test(seg.name)) continue;
+    if (callId && seg.callId && seg.callId !== callId) continue;
+    target = i;
+    break;
+  }
+  if (target === -1) return segments;
+  const seg = segments[target]!;
+  if (seg.kind !== "tool") return segments;
+  const next = [...segments];
+  next[target] = { ...seg, children };
+  return next;
 }
 
 /**

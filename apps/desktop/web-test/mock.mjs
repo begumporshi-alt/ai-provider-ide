@@ -367,6 +367,17 @@ async function oracle(req, res, path) {
         arguments: JSON.stringify({ prompt: "a tiny red pixel", model: "sd-oracle-1", path: "images/drawn.png" }),
       };
       content = "";
+    } else if (tools && /watch the bg job/i.test(userPrompt) && !sawToolResult) {
+      // Agent mode, BG-WATCH variant: start a `node` background job that keeps running ~5s and
+      // end the turn — the job outlives the conversation, which is the state the live process
+      // card renders (the shim keeps such a job running; see its background arm).
+      toolCall = {
+        name: "run_command",
+        arguments: JSON.stringify({ program: "node", args: ["-e", "setTimeout(() => {}, 5000)"], background: true }),
+      };
+      content = "";
+    } else if (tools && /watch the bg job/i.test(userPrompt)) {
+      content = "Started. The job keeps running on its own.";
     } else if (tools && /background/i.test(userPrompt) && !sawToolResult) {
       // Agent mode, BACKGROUND variant: start a detached job, then poll it by the id the
       // start receipt names.

@@ -8,6 +8,7 @@
  */
 import type { ChatMessage } from "@aiprovider/router-core";
 import { toolCallName } from "./wire";
+import type { SubagentChildProgress } from "./types";
 
 export interface ToolCallRef {
   name: string;
@@ -73,6 +74,8 @@ export interface ToolStep {
   args: Record<string, unknown>;
   call: ToolCallRef;
   result?: string;
+  /** Live delegation progress for a `dispatch_agent` / `fan_out` call, when one is in flight. */
+  children?: SubagentChildProgress[];
 }
 
 /** A transcript turn, as much of it as grouping needs. Content is read tolerantly: the Assistant

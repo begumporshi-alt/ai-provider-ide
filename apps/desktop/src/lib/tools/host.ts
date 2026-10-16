@@ -97,6 +97,38 @@ export async function fetchToolsPolicy(): Promise<ToolsPolicy> {
 }
 
 /**
+ * Read a background job's status and output tail — the same read-only `process_output` sandbox
+ * tool the model polls, invoked from the UI so the person can watch a long job live instead of
+ * seeing "running…" until the model happens to poll. Never mutates; a wrong or evicted id comes
+ * back as `ok: false` with the sandbox's own explanation.
+ */
+export async function fetchProcessOutput(
+  root: string,
+  job: string,
+  waitMs = 0,
+): Promise<{ ok: boolean; output: string }> {
+  const res = await invoke<WireToolResult>("tool_run", {
+    req: { name: "process_output", arguments: { job, wait_ms: waitMs }, root },
+  });
+  if (!res.ok) return { ok: false, output: res.error?.trim() || res.output };
+  return { ok: true, output: res.output };
+}
+
+/**
+ * Stop a background job — the same `process_kill` sandbox tool the model is told to use, invoked
+ * from the UI so the person does not have to ask the assistant to stop their own job. SIGINT to
+ * the process group, then SIGKILL after the grace window (tools.rs); the card's next poll reads
+ * the resulting status.
+ */
+export async function killProcess(root: string, job: string): Promise<{ ok: boolean; output: string }> {
+  const res = await invoke<WireToolResult>("tool_run", {
+    req: { name: "process_kill", arguments: { job }, root },
+  });
+  if (!res.ok) return { ok: false, output: res.error?.trim() || res.output };
+  return { ok: true, output: res.output };
+}
+
+/**
  * Replace the sandbox's user-added programs (Settings → Tools), returning the policy now in force.
  *
  * The returned policy — not the requested list — is what the screen must render: the host

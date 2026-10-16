@@ -154,3 +154,39 @@ describe("attachReasoning", () => {
     expect(attachReasoning(msgs, fold([assistant("hello")]))).toBe(msgs);
   });
 });
+
+describe("subagent progress", () => {
+  const delegate = (id = "c1"): AgentEvent => ({
+    type: "tool_call",
+    call: { id, name: "dispatch_agent", arguments: '{"task":"t"}' },
+  });
+  const progress = (callId: string, state: "queued" | "running" | "done" | "failed", calls = 0): AgentEvent => ({
+    type: "subagent_progress",
+    callId,
+    children: [{ label: "research", state, toolCalls: calls, ...(calls > 0 ? { lastTool: "read_file" } : {}) }],
+  });
+
+  it("folds a snapshot onto the delegating row by call id, leaving it calling", () => {
+    const segs = fold([delegate(), progress("c1", "running", 2)]);
+    const tool = toolSegments(segs)[0]!;
+    expect(tool.status).toBe("calling");
+    expect(tool.children).toEqual([
+      { label: "research", state: "running", toolCalls: 2, lastTool: "read_file" },
+    ]);
+  });
+
+  it("matches a delegation row with no call id by position, since only a calling delegation can be the target", () => {
+    const noId: AgentEvent = { type: "tool_call", call: { name: "dispatch_agent", arguments: "{}" } };
+    const segs = fold([noId, progress("", "queued")]);
+    expect(toolSegments(segs)[0]!.children).toEqual([
+      { label: "research", state: "queued", toolCalls: 0 },
+    ]);
+  });
+
+  it("drops a snapshot whose row is resolved or absent, so a late event cannot resurrect a state", () => {
+    const events = [delegate(), result("dispatch_agent", "SUB ANSWER")];
+    const base = fold(events);
+    expect(fold([...events, progress("c1", "done")])).toEqual(base);
+    expect(fold([progress("zz", "running")])).toEqual([]);
+  });
+});

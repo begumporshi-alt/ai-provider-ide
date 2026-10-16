@@ -1901,14 +1901,26 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         // id at once, let `process_output` poll it and `process_kill` stop it.
         if (toolArgs["background"] === true) {
           const id = `bg-${bgSeq++}`;
-          const job = { id, program, out: "", running: true, started: Date.now(), pid: 40000 + bgSeq };
+          const job = { id, program, out: "", running: true, started: Date.now(), pid: 40000 + bgSeq, exit: 0 };
           bgJobs.set(id, job);
           // The one real bit of work the emulation does: an `echo` job's output is its args, the
-          // same convention the foreground arm below keeps. Any other program prints nothing.
+          // same convention the foreground arm below keeps, and it finishes in 400ms. A `node`
+          // job stays running 5s and prints once mid-flight — a job that is observably running
+          // across several polls, which is the state the live process card exists to render.
+          const lifetimeMs = program === "node" ? 5_000 : 400;
+          if (program === "node") {
+            setTimeout(() => {
+              if (job.running) job.out = "starting bg work\n";
+            }, 1_000);
+          }
           setTimeout(() => {
+            // A job the user killed before its lifetime elapsed stays killed — the timer must not
+            // resurrect a status or write output a dead job never produced.
+            if (!job.running) return;
             job.running = false;
             if (program === "echo") job.out = cmdArgs.join(" ") + "\n";
-          }, 400);
+            else if (program === "node") job.out = "bg work done\n";
+          }, lifetimeMs);
           return ok(
             `started background job ${id} (${program}, pid ${job.pid}) — poll its output with process_output, stop it with process_kill`,
           );
@@ -1936,7 +1948,9 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         const waitMs = Math.min(Number(toolArgs["wait_ms"] ?? 0) || 0, 5_000);
         const deadline = Date.now() + waitMs;
         while (job.running && Date.now() < deadline) await bgSleep(100);
-        const label = job.running ? "running" : "exited (code 0)";
+        // A killed job reports `exited (code -1)`, matching tools.rs: on Unix a signal death has
+        // no exit code, and the runner writes `code().unwrap_or(-1)`.
+        const label = job.running ? "running" : `exited (code ${job.exit})`;
         const elapsed = ((Date.now() - job.started) / 1000).toFixed(1);
         const body = job.out || (job.running ? "(no output yet)" : "(no output)");
         return ok(`[status] ${label} · elapsed ${elapsed}s · job ${id}\n${body}`);
@@ -1947,6 +1961,7 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
         if (!job) return fail(`no background job "${id}" — the id is wrong, or the app restarted since it was started`);
         if (!job.running) return ok(`job ${id} has already exited — nothing to stop`);
         job.running = false;
+        job.exit = -1;
         return ok(
           `signalled job ${id} to stop (SIGINT, then SIGKILL after 500ms if still running) — poll process_output for the final status`,
         );

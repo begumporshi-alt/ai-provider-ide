@@ -2642,3 +2642,104 @@ describe("fan_out", () => {
     }
   });
 });
+
+describe("subagent progress events", () => {
+  /** Snapshots of one delegation, in the order the loop announced them. */
+  function progressEvents(events: AgentEvent[], callId?: string) {
+    return events.filter(
+      (e): e is Extract<AgentEvent, { type: "subagent_progress" }> =>
+        e.type === "subagent_progress" && (callId === undefined || e.callId === callId),
+    );
+  }
+
+  it("announces a delegation's life: queued, running, the child's calls, done", async () => {
+    const events: AgentEvent[] = [];
+    // Same script as the isolation test: the outer turn delegates, the child reads one file and
+    // answers, the parent concludes.
+    const model = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"find it"}' }] },
+      { text: "looking", calls: [{ id: "s1", name: "read_file", arguments: '{"path":"a.txt"}' }] },
+      { text: "SUB ANSWER" },
+      { text: "final" },
+    ]);
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "body" }; } },
+      onEvent: (ev) => events.push(ev),
+    });
+
+    const progress = progressEvents(events, "c1");
+    expect(progress.length).toBeGreaterThanOrEqual(3);
+    expect(progress[0]!.children).toEqual([{ label: "research", state: "queued", toolCalls: 0 }]);
+    // The child's work is visible as counts, never as content: no snapshot carries the child's
+    // prose or its tool output — isolation still holds one level down.
+    const worked = progress.find((p) => p.children[0]!.toolCalls === 1);
+    expect(worked?.children[0]).toMatchObject({ state: "running", lastTool: "read_file" });
+    expect(progress[progress.length - 1]!.children[0]).toMatchObject({ state: "done" });
+    const dump = JSON.stringify(progress);
+    expect(dump).not.toContain("looking");
+    expect(dump).not.toContain("SUB ANSWER");
+    expect(dump).not.toContain("body");
+  });
+
+  it("a failed delegation announces failed, not done", async () => {
+    const events: AgentEvent[] = [];
+    // The child's model call throws — a provider dying mid-delegation — so the child run errors
+    // out and the snapshot must say so, not paper over it with "done".
+    const inner = fakeModel([
+      { text: "delegating", calls: [{ id: "c1", name: "dispatch_agent", arguments: '{"task":"t"}' }] },
+      { text: "final" },
+    ]);
+    const model: GenerateFn = async (req, opts) => {
+      const first = req.messages[0];
+      if (first?.role === "system" && String(first.content).includes("research sub-agent")) {
+        throw new Error("provider down");
+      }
+      return inner(req, opts);
+    };
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (ev) => events.push(ev),
+    });
+    const progress = progressEvents(events, "c1");
+    const last = progress[progress.length - 1];
+    expect(last?.children[0]).toMatchObject({ state: "failed" });
+  });
+
+  it("a fan_out pre-creates a slot per task and marks a rejected entry failed", async () => {
+    const events: AgentEvent[] = [];
+    const model = fakeModel([
+      {
+        text: "fanning",
+        calls: [{
+          id: "c2",
+          name: "fan_out",
+          arguments: JSON.stringify({ tasks: [{ label: "alpha", task: "t1" }, { label: "beta" }] }),
+        }],
+      },
+      { text: "ALPHA SUMMARY" },
+      { text: "final" },
+    ]);
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "go" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "" }; } },
+      onEvent: (ev) => events.push(ev),
+    });
+    const fanProgress = progressEvents(events, "c2");
+    const last = fanProgress[fanProgress.length - 1];
+    expect(last?.children).toEqual([
+      { label: "alpha", state: "done", toolCalls: 0 },
+      { label: "beta", state: "failed", toolCalls: 0 },
+    ]);
+  });
+});

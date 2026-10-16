@@ -25,7 +25,7 @@ import type { ChatMessage, ToolCall } from "@aiprovider/router-core";
 import { FAN_OUT_MAX, registryToOpenAI, subagentTools } from "./registry";
 import { runNotebookEdit, runNotebookRead } from "./notebook";
 import { toWireToolCalls } from "./wire";
-import type { AgentEvent, AgentLoopOptions, PlanPorts, ToolHost } from "./types";
+import type { AgentEvent, AgentLoopOptions, PlanPorts, SubagentChildProgress, ToolHost } from "./types";
 
 /**
  * Ceiling on model round-trips in one agent turn — **the gateway's bound, not the Assistant's**.
@@ -912,6 +912,27 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       };
     })();
     /**
+     * Live delegation progress (see `SubagentChildProgress`). One slot list per delegation call,
+     * keyed by the call's id; `runChild` patches only its own slot, and the snapshot goes out
+     * whole each time — idempotent to fold, and a UI that missed an event is corrected by the
+     * next one. A child's transcript stays invisible (isolation is the point of delegating);
+     * what crosses this line is *that it is alive, and roughly where it is*.
+     */
+    const progressTrackers = new Map<string, SubagentChildProgress[]>();
+    const emitProgress = (callId: string) => {
+      if (!onEvent) return;
+      const children = progressTrackers.get(callId);
+      if (!children) return;
+      onEvent({ type: "subagent_progress", callId, children: children.map((c) => ({ ...c })) });
+    };
+    const patchProgress = (callId: string, index: number, patch: Partial<SubagentChildProgress>) => {
+      const child = progressTrackers.get(callId)?.[index];
+      if (!child) return;
+      Object.assign(child, patch);
+      emitProgress(callId);
+    };
+
+    /**
      * Run one delegated child to completion, and return what the parent model reads.
      *
      * **One implementation, two callers.** `dispatch_agent` runs one child; `fan_out` runs many.
@@ -924,6 +945,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     async function runChild(
       task: string,
       def: import("../agents/defs").SubagentDef | undefined,
+      track?: { callId: string; index: number; label: string },
     ): Promise<{
       resultText: string;
       ok: boolean;
@@ -936,6 +958,12 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       let iterations = 0;
       let childIn = 0;
       let childOut = 0;
+      if (track && !progressTrackers.get(track.callId)?.[track.index]) {
+        const list = progressTrackers.get(track.callId) ?? [];
+        list[track.index] = { label: track.label, state: "queued", toolCalls: 0 };
+        progressTrackers.set(track.callId, list);
+        emitProgress(track.callId);
+      }
         // The delegation is a real run, not just a function call: with a recorder on
         // board the child gets its own ledger row under this run's id, one tool_call
         // step per sandbox call it makes, one tool_result step per call that came back
@@ -990,10 +1018,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           }
         }
         const childHost: ToolHost =
-          recorder && childRunId
+          (recorder && childRunId) || track
             ? {
                 run: (n, a, o) => {
-                  recorder.recordStep(childRunId, "tool_call", n);
+                  if (recorder && childRunId) recorder.recordStep(childRunId, "tool_call", n);
+                  if (track) {
+                    const cur = progressTrackers.get(track.callId)?.[track.index];
+                    if (cur) patchProgress(track.callId, track.index, { toolCalls: cur.toolCalls + 1, lastTool: n });
+                  }
                   return host.run(n, a, o);
                 },
               }
@@ -1046,6 +1078,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
           // Queue behind the concurrency cap *before* the child starts, and release in
           // the `finally` so a throw cannot strand a permit and deadlock later children.
           await childPermits.take();
+          if (track) patchProgress(track.callId, track.index, { state: "running" });
           let sub: Awaited<ReturnType<typeof runAgentLoop>>;
           try {
             sub = await runAgentLoop({
@@ -1093,6 +1126,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               childOut,
             );
           }
+          if (track) patchProgress(track.callId, track.index, { state: "done" });
         } catch (e) {
           // A watchdog abort and a user Stop both arrive as AbortError; only the clock
           // knows which one this was, and the model must be told the right story — one
@@ -1113,6 +1147,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
               childOut,
             );
           }
+          if (track) patchProgress(track.callId, track.index, { state: "failed" });
         }
       return { resultText, ok, iterations, tokensIn: childIn, tokensOut: childOut };
     }
@@ -1170,7 +1205,11 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                   'Omit "agent" for the general researcher.';
                 ok = false;
               } else {
-                const child = await runChild(task, def);
+                const child = await runChild(task, def, {
+                  callId: typeof call.id === "string" ? call.id : "",
+                  index: 0,
+                  label: def?.name || "research",
+                });
                 resultText = child.resultText;
                 ok = child.ok;
               }
@@ -1201,6 +1240,23 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                 ok = false;
               } else {
                 const knownIds = (subagentDefs ?? []).map((d) => d.id);
+                const callId = typeof call.id === "string" ? call.id : "";
+                // Every task gets its slot before any child runs — including the ones whose entry
+                // fails validation below — so the progress strip always shows one row per task the
+                // call asked for, with the rejected ones marked failed rather than missing.
+                progressTrackers.set(
+                  callId,
+                  raw.map((entry, i) => {
+                    const e = (entry ?? {}) as Record<string, unknown>;
+                    return {
+                      label:
+                        typeof e.label === "string" && e.label.trim() ? e.label.trim() : `task-${i + 1}`,
+                      state: "queued" as const,
+                      toolCalls: 0,
+                    };
+                  }),
+                );
+                emitProgress(callId);
                 const results = await Promise.all(
                   raw.map(async (entry, i) => {
                     const e = (entry ?? {}) as Record<string, unknown>;
@@ -1215,12 +1271,14 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                     // for the same reason `dispatch_agent` does — a silent fallback would read as a
                     // routing success while running the wrong prompt.
                     if (!task) {
+                      patchProgress(callId, i, { state: "failed" });
                       return { label, ok: false, error: 'this task has no "task" text' };
                     }
                     const def = agentId
                       ? (subagentDefs ?? []).find((d) => d.id === agentId)
                       : undefined;
                     if (agentId && !def) {
+                      patchProgress(callId, i, { state: "failed" });
                       return {
                         label,
                         ok: false,
@@ -1229,7 +1287,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                           `${knownIds.join(", ") || "(none)"}. Omit "agent" for the general researcher.`,
                       };
                     }
-                    const child = await runChild(task, def);
+                    const child = await runChild(task, def, { callId, index: i, label });
                     return {
                       label,
                       ok: child.ok,
