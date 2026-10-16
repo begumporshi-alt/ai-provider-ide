@@ -21,6 +21,8 @@ export interface GraphNode {
   ts?: number;
   /** Degree or count; drives radius and stroke weight. */
   weight?: number;
+  /** Drawn faded, still present — for rows that were replaced but kept (§6.4.3). */
+  dim?: boolean;
   meta?: Record<string, unknown>;
 }
 

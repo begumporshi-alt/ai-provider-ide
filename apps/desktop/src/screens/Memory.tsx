@@ -11,6 +11,8 @@
  */
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { Button, EmptyState, inputCls, inputStyle } from "../components/atoms";
+import { MindAtlas } from "../components/MindAtlas";
+import { ScopeSelect, type MemoryScopeChoice } from "../components/ScopeSelect";
 import { useUi } from "../ui-state";
 import { captureCore, editCore } from "../lib/memory/engine";
 import { drainOnce } from "../lib/memory/drain";
@@ -23,6 +25,7 @@ import {
   gatewayMemoryEnabled,
   gatewayProjectKey,
   listMemories,
+  loadHistorySessions,
   memoryConflicts,
   memoryPrincipalList,
   memoryStats,
@@ -527,54 +530,6 @@ function MemoryWhen({ m, dated }: { m: Memory; dated: boolean }) {
 }
 
 /** One memory. Extracted so the ranked list and the day-grouped timeline cannot drift apart. */
-/**
- * Where a memory may be injected. Every row starts `off`; nothing is injected until someone
- * scopes it on purpose.
- *
- * `project` is disabled when the host has no workspace root, because there is then no project to
- * bind to — offering it would produce a scope that can never match a request.
- */
-function ScopeSelect({
-  m,
-  projectKey,
-  onChange,
-}: {
-  m: Memory;
-  projectKey: string | null;
-  onChange: (
-    m: Memory,
-    scope: { kind: "project"; project: string } | { kind: "global" } | { kind: "unscoped" },
-  ) => void;
-}) {
-  const value = m.scope.global ? "global" : m.scope.project ? "project" : "off";
-  return (
-    <select
-      className="shrink-0 rounded border px-1 py-0.5 text-[10px]"
-      style={{ borderColor: "var(--border)", background: "var(--surface-2)", color: "var(--text-dim)" }}
-      title={
-        value === "off"
-          ? "Capture-only. Never injected into any request."
-          : value === "global"
-            ? "Injected into every request, in every project."
-            : "Injected into requests from this project."
-      }
-      value={value}
-      onChange={(e) => {
-        const v = e.target.value;
-        if (v === "global") onChange(m, { kind: "global" });
-        else if (v === "project" && projectKey) onChange(m, { kind: "project", project: projectKey });
-        else onChange(m, { kind: "unscoped" });
-      }}
-    >
-      <option value="off">capture only</option>
-      <option value="project" disabled={!projectKey}>
-        this project{projectKey ? "" : " (no root)"}
-      </option>
-      <option value="global">everywhere</option>
-    </select>
-  );
-}
-
 function MemoryRow({
   m,
   dated,
@@ -588,10 +543,7 @@ function MemoryRow({
   dated: boolean;
   projectKey: string | null;
   onPin: (m: Memory, pinned: boolean) => void;
-  onScope: (
-    m: Memory,
-    scope: { kind: "project"; project: string } | { kind: "global" } | { kind: "unscoped" },
-  ) => void;
+  onScope: (m: Memory, scope: MemoryScopeChoice) => void;
   onForget: (id: string) => void;
   onUnsupersede: (id: string) => void;
 }) {
@@ -650,6 +602,7 @@ export function MemoryScreen() {
   const [all, setAll] = useState<Memory[]>([]);
   const [stats, setStats] = useState<MemoryStats | null>(null);
   const [projectKey, setProjectKey] = useState<string | null>(null);
+  const [sessionTitles, setSessionTitles] = useState<Map<string, string>>(new Map());
   const [layer, setLayer] = useState<MemoryLayer | null>(null);
   const [query, setQuery] = useState("");
   const [hits, setHits] = useState<Memory[] | null>(null);
@@ -657,11 +610,14 @@ export function MemoryScreen() {
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    Promise.all([listMemories(null, 300), memoryStats(), gatewayProjectKey()])
-      .then(([list, st, key]) => {
+    Promise.all([listMemories(null, 300), memoryStats(), gatewayProjectKey(), loadHistorySessions(200)])
+      .then(([list, st, key, sessions]) => {
         setAll(list);
         setStats(st);
         setProjectKey(key);
+        // The atlas names each cluster after the conversation that produced it; a session with
+        // no title falls back to its first message's preview.
+        setSessionTitles(new Map(sessions.map((s) => [s.session_id, s.title || s.preview])));
       })
       .catch(() => undefined);
   }, [tick]);
@@ -738,7 +694,7 @@ export function MemoryScreen() {
 
   async function doScope(
     m: Memory,
-    scope: { kind: "project"; project: string } | { kind: "global" } | { kind: "unscoped" },
+    scope: MemoryScopeChoice,
   ) {
     setError(null);
     try {
@@ -796,6 +752,16 @@ export function MemoryScreen() {
       </p>
 
       {error && <p className="mb-3 text-[12px]" style={{ color: "var(--danger)" }}>{error}</p>}
+
+      <MindAtlas
+        memories={all}
+        sessionTitles={sessionTitles}
+        projectKey={projectKey}
+        onPin={doPin}
+        onScope={doScope}
+        onForget={doForget}
+        onUnsupersede={doUnsupersede}
+      />
 
       <MemoryLayerSection tick={tick} bump={bump} setError={setError} />
 

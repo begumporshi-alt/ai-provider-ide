@@ -70,6 +70,12 @@ export function ForceGraph({
       requested: cssVar("--warn", "#b45309"),
       "request-ok": cssVar("--success", "#1a7f37"),
       "request-failed": cssVar("--danger", "#b42318"),
+      // The Mind Atlas kinds the memory layers ride on (Memory screen).
+      L0: cssVar("--text-faint", "#999"),
+      L1: cssVar("--info", "#185fa5"),
+      L2: cssVar("--ai", "#7c5cff"),
+      L3: cssVar("--success", "#1a7f37"),
+      session: cssVar("--text-dim", "#666"),
       _muted: cssVar("--text-faint", "#999"),
     }),
     [],
@@ -207,6 +213,7 @@ export function ForceGraph({
 
       for (const b of list) {
         const r = 4 + Math.min(Math.sqrt(b.node.weight ?? 1) * 1.9, 12);
+        ctx.globalAlpha = b.node.dim ? 0.3 : 1;
         ctx.beginPath();
         ctx.arc(b.x, b.y, r, 0, Math.PI * 2);
         ctx.fillStyle = kindColor(b.node.kind, palette);
@@ -216,13 +223,14 @@ export function ForceGraph({
           ctx.strokeStyle = cssVar("--text", "#111");
           ctx.stroke();
         }
+        ctx.globalAlpha = 1;
       }
 
       // Labels only for the heavier nodes — labelling everything turns a graph into a word cloud.
       ctx.fillStyle = cssVar("--text-dim", "#555");
       ctx.font = "11px ui-sans-serif, system-ui, sans-serif";
       for (const b of list) {
-        if ((b.node.weight ?? 0) < 2) continue;
+        if ((b.node.weight ?? 0) < 2 || b.node.dim) continue;
         ctx.fillText(clip(b.node.label, 22), b.x + 10, b.y + 4);
       }
       ctx.restore();
