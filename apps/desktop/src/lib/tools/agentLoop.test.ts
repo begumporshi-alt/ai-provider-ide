@@ -8,7 +8,7 @@ import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
 import {
   runAgentLoop, clampIterations, DEFAULT_MAX_ITERATIONS, MAX_ITERATIONS_CAP,
-  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult,
+  SUBAGENT_CONCURRENCY, SUBAGENT_HARD_BACKSTOP, planPathFromResult, HARD_ITERATION_BACKSTOP,
   FINAL_ROUND_NOTE, TRUNCATED_TOOL_CALL_NOTE, argumentProblem,
   resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
 } from "./agentLoop";

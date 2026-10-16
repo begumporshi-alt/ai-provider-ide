@@ -18,6 +18,7 @@
  * set, so `tools` can only narrow what a sub-agent may call, never widen it.
  */
 import { AGENT_TOOLS } from "../tools/registry";
+import { MAX_ITERATIONS_CAP } from "../tools/agentLoop";
 import type { ToolSpec } from "../tools/types";
 
 /** One user-authored sub-agent definition, as stored on disk and shown in the management UI. */
@@ -112,7 +113,10 @@ export function parseSubagentDef(raw: unknown): { def: SubagentDef } | { error: 
     if (typeof o.maxIterations !== "number" || !Number.isFinite(o.maxIterations)) {
       return { error: `"maxIterations" must be a number` };
     }
-    maxIterations = Math.max(1, Math.min(50, Math.floor(o.maxIterations)));
+    // Clamped to the same cap the run-configuration field honours, read from the same constant:
+    // this was a literal `50` that nothing tied to `MAX_ITERATIONS_CAP`, so editing one ceiling
+    // silently left a specialist definition bounded by the other.
+    maxIterations = Math.max(1, Math.min(MAX_ITERATIONS_CAP, Math.floor(o.maxIterations)));
   }
 
   const model = typeof o.model === "string" && o.model.trim() ? o.model.trim() : null;

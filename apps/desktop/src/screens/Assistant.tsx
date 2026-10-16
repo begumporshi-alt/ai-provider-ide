@@ -307,7 +307,7 @@ function StepBudget({
       title={
         disabled
           ? "only applies in agent mode — without tools there is nothing to step through"
-          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank for no limit — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
+          : `how many rounds of tool calls one turn may take (1–${MAX_ITERATIONS_CAP}), or blank to leave it to the loop — the loop stops as soon as the model answers, and a long turn is reminded to wrap up`
       }
     >
       <span className="text-[11px]">Steps</span>

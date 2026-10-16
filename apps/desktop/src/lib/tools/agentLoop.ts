@@ -28,19 +28,44 @@ import { toWireToolCalls } from "./wire";
 import type { AgentEvent, AgentLoopOptions, PlanPorts, ToolHost } from "./types";
 
 /**
- * Ceiling on model round-trips in one agent turn. A model that will not stop calling tools
- * must not be able to spend without limit; 8 is enough for real work and bounded when
- * something goes wrong.
+ * Ceiling on model round-trips in one agent turn — **the gateway's bound, not the Assistant's**.
+ * A model that will not stop calling tools must not be able to spend without limit, and a client
+ * this app cannot see has no Stop button, so its loop is bounded by a number rather than by a
+ * person watching it. The Assistant's own turn is unbounded by default (see `maxIterations` in
+ * `types.ts`) and paced by `TOOL_CALL_NUDGE_AFTER` instead.
  *
- * Exported because the gateway path bounds its own loop with the same number. Those used to be
- * two separate `= 8` constants kept in step by a comment — the kind of duplication that survives
- * exactly until someone edits one of them.
+ * Exported because the cross-language guard in `agentLoop.test.ts` reads the Rust
+ * `bridge_policy::MAX_TOOL_ITERATIONS` and requires it to equal this. Those were two separate
+ * `= 8` constants kept in step by a comment — the kind of duplication that survives exactly until
+ * someone edits one of them, at which point the gateway and the app disagree about how much a
+ * turn may spend and nothing fails.
  */
 export const DEFAULT_MAX_ITERATIONS = 40;
 
-/** Upper bound when the ceiling is user-set. Not a security control — a value of 5000 would just
- *  be a slow way to burn tokens. */
-export const MAX_ITERATIONS_CAP = 50;
+/**
+ * The unconditional bound on any loop this app runs — the main turn or a sub-agent, whatever the
+ * user asked for. **Insurance against a stuck loop, not a budget.** The largest honest run
+ * measured on this machine is 152 tool calls with every one finishing normally, so a loop that
+ * reaches 250 is not working, it is stuck.
+ *
+ * It exists because "no ceiling" was being read as "no bound at all". The sub-agent path always
+ * had this bound (`SUBAGENT_HARD_BACKSTOP` is this same number); the main turn did not, so a blank
+ * Steps field in the Assistant — the documented way to ask for no limit — was genuinely infinite,
+ * and nothing ended it. That mattered more than usual here, because a cost estimate is unknown for
+ * every model this app has cached and the monthly spend cap therefore cannot fire at all.
+ */
+export const HARD_ITERATION_BACKSTOP = 250;
+
+/**
+ * Upper bound when the ceiling is user-set: **the hard backstop itself.**
+ *
+ * It used to be 50, and that is how the field came to lie. The ceiling notice tells the user to
+ * "raise Steps", and at 50 the field already held its own maximum — so the one instruction the
+ * product gives on being cut off was impossible to follow. A field that may ask for 500 while the
+ * loop stops at 250 would have the same defect one level down: a setting that does not describe
+ * what happens. A user who wants less than the bound sets less; there is nothing to set for more.
+ */
+export const MAX_ITERATIONS_CAP = HARD_ITERATION_BACKSTOP;
 
 /**
  * How many tool calls a turn may make before the loop starts reminding the model to wrap up — and
@@ -173,8 +198,9 @@ export const TRUNCATED_TOOL_CALL_NOTE =
  *      actually matters, and the one ZCode enforces too.
  *
  * A user who wants a firm ceiling still sets one: Router Settings → defaults → subagent
- * iterations, or `maxIterations` on a specialist definition. `SUBAGENT_HARD_BACKSTOP` is the
- * only unconditional bound.
+ * iterations, or `maxIterations` on a specialist definition. `SUBAGENT_HARD_BACKSTOP` is the only
+ * bound a child cannot be configured past — and it is now the main turn's bound too, since the
+ * reasoning here was never specific to a child (see `HARD_ITERATION_BACKSTOP`).
  */
 export const SUBAGENT_MAX_ITERATIONS: number | null = null;
 
@@ -184,8 +210,11 @@ export const SUBAGENT_MAX_ITERATIONS: number | null = null;
  * Reaching it reports `hitCeiling` and the ceiling-exit summary — the same honest ending a
  * user-set budget produces. This is deliberately not a budget; teams that want a real one set
  * `subagentIterations` in Router Settings.
+ *
+ * The number is `HARD_ITERATION_BACKSTOP`, shared with the main turn: one bound for both loops,
+ * because the paragraph above is not an argument about children, it is an argument about loops.
  */
-export const SUBAGENT_HARD_BACKSTOP = 250;
+export const SUBAGENT_HARD_BACKSTOP = HARD_ITERATION_BACKSTOP;
 
 /**
  * How many `dispatch_agent` children may run at once.
@@ -614,15 +643,28 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // instruction from "the user switched the mode off, carry on".
   let planApprovedThisPass = false;
 
-  for (let iter = 1; maxIterations === null || iter <= maxIterations; iter++) {
+  // The turn's actual bound: the user's number, or the hard backstop when they set none. Resolved
+  // once, before the loop, because three things must agree on it — the round the model is told is
+  // its last (`isFinalRound`), the round the loop stops on, and the count the ceiling exit reports.
+  // That last one is why this is not `maxIterations ?? 0` any more: an unbounded turn that reached
+  // the backstop used to report `iterations: 0`, so the notice read "stopped at 0 iterations" and
+  // blamed a budget the user never set.
+  const ceiling =
+    maxIterations === null
+      ? HARD_ITERATION_BACKSTOP
+      : Math.min(maxIterations, HARD_ITERATION_BACKSTOP);
+
+  for (let iter = 1; iter <= ceiling; iter++) {
     if (signal?.aborted) throw new DOMException("Agent loop aborted", "AbortError");
 
     // Pace a long turn: once it has made enough calls, every request carries a reminder to wrap up
     // or ask — at most `TOOL_CALL_NUDGE_MAX` times, so a model that ignores it is not nagged
     // forever and a model that heeds it is not told twice. The final round under budget does not
     // get the nudge — it gets something stronger (see `FINAL_ROUND_NOTE`), and the two would only
-    // repeat each other.
-    const isFinalRound = maxIterations !== null && iter === maxIterations;
+    // repeat each other. That now includes the backstop round: a turn whose budget the user left
+    // blank is told to wrap up on its last round like any other, rather than being cut off
+    // mid-sentence by a bound it was never warned about.
+    const isFinalRound = iter === ceiling;
     const dueForNudge =
       !isFinalRound &&
       toolCallsThisTurn >= TOOL_CALL_NUDGE_AFTER * (nudgesSent + 1) &&
@@ -1471,14 +1513,15 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // flag stays off. It is its own outcome, named: the model was still calling tools when the
   // budget ran out, and the last iteration's text is typically empty (that turn was pure
   // tool_use). The caller reads `hitCeiling` and says so, rather than appending an empty assistant
-  // turn that reads as a hang. Only reachable with an explicit budget: with no ceiling the loop
-  // exits through the terminal branch above, on an answer.
+  // turn that reads as a hang. Reachable with an explicit budget *or* with none: the backstop bound
+  // above is what a blank field resolves to, so an unbounded turn ends here too when it is stuck —
+  // and it reports the round it really reached, which is `ceiling`, not the `maxIterations ?? 0` it
+  // used to report for a turn that never set one.
   //
   // An empty ceiling answer is worse than nothing for a dispatch_agent parent: it reads "(the
   // sub-agent returned an empty summary)" and cannot tell what the child did with its budget.
   // When the final turn produced no text, summarize its tool activity instead — names, ok/fail,
   // the first line of each result — so the parent learns where the steps went.
-  const ceiling = maxIterations ?? 0;
   const text =
     lastText.trim() ||
     (lastTools.length

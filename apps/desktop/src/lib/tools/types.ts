@@ -163,13 +163,14 @@ export interface AgentLoopOptions {
    */
   plan?: PlanPorts;
   /**
-   * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling**.
-   *
-   * The Assistant's screen leaves this unset by default: a real task is not a fixed number of
-   * rounds, and the measured failure of the alternative (2026-10-06) was a legitimate long task cut
-   * off mid-work by a hard cap. A turn without a ceiling is paced by the loop's own reminder (see
-   * `TOOL_CALL_NUDGE_AFTER` in `agentLoop.ts`) and ended by the user's Stop. A number still bounds
-   * a turn, and reaching it is reported as `hitCeiling` rather than passed off as an answer.
+   * The user's budget for model round-trips in this turn, or `null`/absent for **no ceiling the
+   * user set** — which is not the same as no bound. A turn without a user budget is paced by the
+   * loop's own reminder (see `TOOL_CALL_NUDGE_AFTER` in `agentLoop.ts`), ended by the user's Stop,
+   * and still stops at `HARD_ITERATION_BACKSTOP` if it is genuinely stuck. The Assistant's screen
+   * leaves it unset by default: a real task is not a fixed number of rounds, and the measured
+   * failure of the alternative (2026-10-06) was a legitimate long task cut off mid-work by a hard
+   * cap. A number bounds the turn below that backstop, and reaching either is reported as
+   * `hitCeiling` — with the round actually reached — rather than passed off as an answer.
    *
    * The gateway's loop is a different caller with the opposite default: external clients that this
    * app cannot see must never be unbounded, so it passes `DEFAULT_MAX_ITERATIONS`.
