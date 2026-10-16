@@ -282,6 +282,24 @@ async function oracle(req, res, path) {
       // so this is what proves the bridge forwards the reason instead of a blank result.
       toolCall = { name: "read_file", arguments: JSON.stringify({ path: "nope.txt" }) };
       content = "";
+    } else if (tools && askedFor(/fix the login bug and say when it is done/i) && !sawToolResult) {
+      // Agent mode, VERIFICATION-GATE variant. It must sit ABOVE the loose generic branches
+      // (`/again/i` et al.): after the gate fires, the demand is the LAST message on the wire,
+      // and its prose ("…against the affected page…") contains the substring `again` — the loose
+      // branch would answer the demand round with an edit_file and the spec would never see its
+      // check. Write the fix, claim done with no check; the gate should refuse to end there.
+      toolCall = { name: "write_file", arguments: JSON.stringify({ path: "login-fix.txt", content: "fixed" }) };
+      content = "";
+    } else if (tools && askedFor(/fix the login bug and say when it is done/i) &&
+               !messages.some((m) => m.role === "user" && /VERIFICATION GATE/.test(userText(m)))) {
+      // The bare claim: mutation ran, nothing verified it — exactly what the gate exists to catch.
+      content = "Done! The login bug is fixed.";
+    } else if (tools && askedFor(/fix the login bug and say when it is done/i) && toolMsgs.length === 1) {
+      // The demand arrived as its own user turn; the compliant model runs the check it names.
+      toolCall = { name: "run_command", arguments: JSON.stringify({ command: "npm test" }) };
+      content = "";
+    } else if (tools && askedFor(/fix the login bug and say when it is done/i)) {
+      content = "The tests pass — 3 green, the fix is verified.";
     } else if (tools && /The user approved the plan/.test(lastToolResult)) {
       // Agent mode, PLAN-APPROVED variant: the round-trip that follows an approved
       // `exit_plan_mode`. Keyed on the tool RESULT, not on a user turn — the approval is consumed

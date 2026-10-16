@@ -93,6 +93,15 @@ export type AgentEvent =
    */
   | { type: "no_output_retry"; attempt: number }
   /**
+   * The turn's final answer claimed the work was done, the turn changed the workspace, and
+   * nothing ran that proves either — so the loop pushed the claim onto the transcript, followed
+   * it with the automatic verification demand, and is giving the model another round WITH its
+   * tools to produce evidence (see `VERIFICATION_NUDGE_MAX` in agentLoop.ts). At most one per
+   * turn; the transcript carries the claim, the demand, and whatever came after, so a reader
+   * can always see a claim that was never backed.
+   */
+  | { type: "verification_nudge" }
+  /**
    * The loop ended. `truncated` is the provider-side cut (a declared-finish stream closed early);
    * `hitCeiling` is the loop-side stop: the step budget ran out while the model was still calling
    * tools, so the turn ended mid-work and its final text is often empty. The two say different

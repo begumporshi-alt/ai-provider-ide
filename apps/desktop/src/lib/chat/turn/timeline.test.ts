@@ -91,6 +91,25 @@ describe("applyAgentEvent", () => {
     expect(text).toContain("The answer, complete.");
     expect(text, "the abandoned prose is gone").not.toContain("The answer so far is");
   });
+
+  it("the verification nudge drops the claim's prose and announces the demand", () => {
+    const segments = fold([
+      call("write_file"),
+      result("write_file", "written"),
+      assistant("Done — it is fixed."),
+      { type: "verification_nudge" },
+      call("run_command", '{"command":"npm test"}'),
+      result("run_command", "3 passed"),
+      assistant("The tests pass."),
+    ]);
+    const text = segments.filter((s) => s.kind === "text").map((s) => s.text).join("");
+    expect(text).toContain("demanding a check");
+    expect(text).toContain("The tests pass.");
+    // The claim's prose does not stay in the live stream: kept, it would let the next round's
+    // answer stream into the same segment and read as one sentence the model never said. The
+    // persisted transcript carries the claim as its own message, ahead of the demand.
+    expect(text, "the claim is not glued to the answer").not.toContain("Done — it is fixed.The tests pass.");
+  });
 });
 
 describe("attachReasoning", () => {

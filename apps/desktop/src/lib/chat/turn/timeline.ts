@@ -129,6 +129,17 @@ export function applyAgentEvent(segments: TimelineSegment[], ev: AgentEvent): Ti
     case "no_output_retry":
       // No prose to drop: the attempt being retried is the one that answered with nothing.
       return appendProse(segments, "text", "⏳ the model answered with thinking only — re-asking with thinking off…\n\n");
+    case "verification_nudge":
+      // The claim's own prose is dropped from the live view the way an abandoned attempt's is:
+      // the claim is not abandoned (it is on the transcript as its own message, followed by the
+      // demand), but keeping it here would let the next round's text stream INTO the same
+      // segment and read as one sentence the model never said. The end-of-turn transcript
+      // replace redraws it in its rightful place.
+      return appendProse(
+        dropTrailingText(segments),
+        "text",
+        "⚠ the answer claimed the work is done, but nothing this turn verified it — the loop is demanding a check before the claim stands…\n\n",
+      );
     case "done":
       return segments;
   }

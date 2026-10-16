@@ -115,6 +115,86 @@ export const WRAP_UP_NOTE =
   "done, what it produced, and what remains.";
 
 /**
+ * The verification gate: what happens when a turn **claims** success but never **proved** it.
+ *
+ * The measured shape of the gap (the third and last open item of the 2026-10-15 UX audit): a turn
+ * that writes files, answers "done — it's fixed", and ends. Nothing ran — no test, no build, no
+ * assertion — so the claim and its evidence are the same utterance, and a reader has no way to
+ * tell a verified fix from a confident guess.
+ *
+ * The enforcement point is the terminal branch: the round where the model answers with no tool
+ * calls. If that answer claims completion, the turn mutated the workspace, and nothing verified
+ * it, the loop does not end — it pushes the claim onto the transcript, follows it with
+ * `VERIFICATION_DEMAND` (an automatic user turn, self-identified as such), and continues, so the
+ * model's next round-trip sees the demand *with the tools* and can actually run the check. A
+ * model that complies ends the turn with evidence on the record; one that re-claims without
+ * verifying ends anyway (one demand per turn — the gate is an obligation to try, not a
+ * deadlock), and the transcript still shows the claim followed by the demand it never answered.
+ *
+ * Two deliberate scopes:
+ *
+ * **Only a turn that mutated something is held.** "Done, here's my analysis" after a read-only
+ * pass claims nothing about the workspace, and demanding proof of an observation would be noise
+ * on the most common phrasing in the transcript. The dangerous claim is the one about changes —
+ * and a model that says "fixed" without having changed anything at all is caught from the other
+ * side: the demand's escape clause ("if nothing was changed, say exactly that") makes the bare
+ * claim contradict itself out loud.
+ *
+ * **The budget's final round is never held.** A demand there would re-enter the loop past its
+ * own ceiling and land in the ceiling exit with an unanswered demand in the transcript. The
+ * wrap-up round runs with no tools anyway — nothing could be verified even if it were held.
+ */
+export const VERIFICATION_NUDGE_MAX = 1;
+
+/**
+ * The automatic demand itself. It names what is missing (evidence), what counts as evidence
+ * (tests, a build, an assertion), and the one honest way out (say there is nothing to verify) —
+ * so a false-positive trigger costs one cheap round, not a fabricated test run.
+ */
+export const VERIFICATION_DEMAND =
+  "AUTOMATED VERIFICATION GATE — nobody sent this message; the loop did, because the answer above " +
+  "claims the work is done while this turn ran nothing that proves it: no test, no build, no " +
+  "assertion. Do not claim success on evidence you have not produced. Run a check now — the " +
+  "project's tests, a typecheck or build, or browser_expect against the affected page — and report " +
+  "its actual output. If there is genuinely nothing to verify (nothing was changed, or no check " +
+  "exists), say exactly that in one sentence instead of repeating the claim.";
+
+/**
+ * What a `run_command` must look like before it counts as verification. Assertion by shape, not
+ * by outcome: the point is that *something* was executed whose job is checking. A
+ * `browser_screenshot` does not qualify — it shows a page, it asserts nothing; `browser_expect`
+ * is the assertion primitive and always qualifies.
+ */
+const VERIFICATION_COMMAND =
+  /\b(?:tests?|vitest|jest|pytest|playwright|mocha|rspec|spec|go test|cargo (?:test|check|clippy|build)|tsc|type-?check|eslint|biome|ruff|mypy|pylint|lint|make (?:test|check))\b/i;
+
+/** Whether a tool call of this shape counts as verification of the turn's work. */
+export function isVerificationCall(name: string, args: Record<string, unknown>): boolean {
+  if (name === "browser_expect") return true;
+  if (name === "run_command") return VERIFICATION_COMMAND.test(String(args.command ?? ""));
+  return false;
+}
+
+const COMPLETION_CLAIM =
+  /\b(?:done|finished|complete|completed|fixed|works|working now|all (?:tests|checks) (?:pass|passes|passed|passing|green)|(?:tests|checks) (?:pass|passes|passed|passing)|should work|green now|verified)\b/i;
+const COMPLETION_NEGATION =
+  /\b(?:not|isn't|isn’t|aren't|aren’t|won't|won’t|doesn't|doesn’t|didn't|didn’t|can't|can’t|cannot|couldn't|couldn’t|never)\s+(?:be\s+|quite\s+|fully\s+|yet\s+|all\s+)?(?:done|fixed|working|work|complete[d]?|finished|verif(?:y|ied)|passing|green)\b/i;
+
+/**
+ * Whether a final answer reads as a completion claim. Deliberately conservative: the negation
+ * guard first ("not done", "still working" never trigger), then a word list of the phrases a
+ * model uses to close work. False positives are cheap by design — one extra round, and the
+ * demand's escape clause lets the model answer "nothing to verify" — but the guard keeps the
+ * common honest phrasings ("it's not done yet") out of the gate entirely.
+ */
+export function claimsCompletion(text: string): boolean {
+  const t = text.trim();
+  if (!t) return false;
+  if (COMPLETION_NEGATION.test(t)) return false;
+  return COMPLETION_CLAIM.test(t);
+}
+
+/**
  * How many times a NO_OUTPUT turn — the model reasoned through its whole output budget and sent
  * no answer (`NO_OUTPUT`, measured twice 2026-10-03 on agentrouter/deepseek-v4-flash: ~8180
  * thinking deltas, zero text) — is re-asked with **thinking forced off** before the turn is
@@ -621,6 +701,13 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
   // turn carries once the mode is off — "the user approved it, implement it" is a different
   // instruction from "the user switched the mode off, carry on".
   let planApprovedThisPass = false;
+  // The verification gate's three facts, accumulated across the turn's rounds: did the turn
+  // change the workspace, did anything verify the work, and has the demand already been sent.
+  // Per-turn on purpose — a claim in a later turn ("is it done?" → "yes") is not held, because
+  // this loop has no view of what earlier turns changed; the checkpoints and change set are.
+  let mutatedThisTurn = false;
+  let verifiedThisTurn = false;
+  let verificationNudges = 0;
 
   // **No step count bounds this turn unless a person set one.** The loop stops when the model stops
   // calling tools, which is what a real task needs; `isFinalRound` exists only so a *user-set* budget
@@ -779,6 +866,27 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
             "re-asked once with thinking off and it happened again. Raise the model's output " +
             "cap in its manifest, or pick a model that answers without thinking.",
         );
+      }
+      // The verification gate (see `VERIFICATION_NUDGE_MAX`): a turn that changed the workspace,
+      // answers with a completion claim, and ran nothing that checks either, does not end here.
+      // The claim goes on the transcript verbatim, the demand follows it, and the loop continues
+      // — the model's next round sees the demand WITH the tools, so the check it runs is an
+      // ordinary tool round of this turn. `tools` guards the no-registry caller (nothing could
+      // verify anything there), and the budget's final round is never held (see the constant's
+      // note): a demand there would re-enter the loop past its own ceiling.
+      if (
+        tools &&
+        mutatedThisTurn &&
+        !verifiedThisTurn &&
+        verificationNudges < VERIFICATION_NUDGE_MAX &&
+        !isFinalRound &&
+        claimsCompletion(text)
+      ) {
+        verificationNudges += 1;
+        messages.push({ role: "assistant", content: text });
+        messages.push({ role: "user", content: VERIFICATION_DEMAND });
+        onEvent?.({ type: "verification_nudge" });
+        continue;
       }
       onEvent?.({ type: "done", text, iterations: iter, truncated });
       return { text, messages, truncated, hitCeiling: false, iterations: iter };
@@ -1465,6 +1573,16 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
       }),
     );
     lastTools = executed;
+
+    // The gate's inputs, read from what actually ran this round (call order in `executed` matches
+    // `parsed`, so the effect and the args travel with the result). A denied or refused call
+    // changed nothing and proved nothing; only an executed one counts either way.
+    for (let i = 0; i < executed.length; i++) {
+      const name = parsed[i]!.call.name ?? "(unknown)";
+      if (!executed[i]!.ok) continue;
+      if (opts.registry.some((t) => t.name === name && t.effect === "mutate")) mutatedThisTurn = true;
+      if (isVerificationCall(name, parsed[i]!.args)) verifiedThisTurn = true;
+    }
 
     // **Every tool result of this turn goes out before any image does, and that ordering is the
     // whole fix.** The image rides on its own `user` message (see below), so building it inline put

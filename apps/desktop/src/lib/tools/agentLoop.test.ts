@@ -11,6 +11,7 @@ import {
   SUBAGENT_CONCURRENCY, planPathFromResult,
   FINAL_ROUND_NOTE, TRUNCATED_TOOL_CALL_NOTE, argumentProblem,
   resolveSubagentResultCap, SUBAGENT_RESULT_CAP, SUBAGENT_RESULT_CAP_MIN, SUBAGENT_RESULT_CAP_MAX,
+  claimsCompletion,
 } from "./agentLoop";
 import { AGENT_TOOLS, FAN_OUT_MAX } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
@@ -1378,7 +1379,9 @@ describe("runAgentLoop", () => {
     const steps: Array<{ text: string; calls?: ToolCall[] }> = [
       { text: "planning", calls: [{ id: "c1", name: "exit_plan_mode", arguments: '{"plan":"# P"}' }] },
       { text: "implementing", calls: [{ id: "c2", name: "write_file", arguments: '{"path":"a.txt","content":"x"}' }] },
-      { text: "Done." },
+      // Closing line kept free of completion claims ("Done." would trip the verification gate and
+      // add a fourth round) — this test's subject is the plan framing, not the gate.
+      { text: "The write landed and the mode is off." },
     ];
     const model: GenerateFn = async (req) => {
       const first = req.messages?.[0];
@@ -2843,5 +2846,190 @@ describe("subagent progress events", () => {
       { label: "alpha", state: "done", toolCalls: 0 },
       { label: "beta", state: "failed", toolCalls: 0 },
     ]);
+  });
+});
+
+describe("verification gate", () => {
+  const WRITE = { id: "w1", name: "write_file", arguments: '{"path":"a.txt","content":"x"}' };
+  const TEST_CMD = { id: "t1", name: "run_command", arguments: '{"command":"npm test"}' };
+
+  function gateModel(
+    steps: Array<{ text: string; calls?: ToolCall[] }>,
+    seen: ChatMessage[][],
+  ): GenerateFn {
+    let i = 0;
+    return async (req) => {
+      seen.push([...(req.messages ?? [])]);
+      const step = steps[Math.min(i, steps.length - 1)]!;
+      i += 1;
+      step.calls?.forEach((c) => req.onToolCall?.(c));
+      return streamOf(step.text);
+    };
+  }
+
+  it("a turn that writes and claims done with no check is sent back for proof", async () => {
+    const seen: ChatMessage[][] = [];
+    const model = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "Done — it is fixed." },
+        { text: "", calls: [TEST_CMD] },
+        { text: "Done — the tests pass." },
+      ],
+      seen,
+    );
+    const events: AgentEvent[] = [];
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "3 passed" }; } },
+      onEvent: (ev) => events.push(ev),
+    });
+
+    expect(events).toContainEqual({ type: "verification_nudge" });
+    expect(out.text).toBe("Done — the tests pass.");
+    // The demand rode a real request: the model saw its own claim, then the gate's message.
+    const demand = seen[2]!.find(
+      (m) => m.role === "user" && String(m.content).includes("VERIFICATION GATE"),
+    );
+    expect(String(demand?.content)).toContain("Run a check now");
+    // The claim is on the transcript ahead of it — the record shows the claim, the demand,
+    // and the evidence that followed.
+    const roles = out.messages.map((m) => m.role);
+    expect(roles).toContain("user");
+    const claimIdx = out.messages.findIndex(
+      (m) => m.role === "assistant" && m.content === "Done — it is fixed.",
+    );
+    const demandIdx = out.messages.findIndex((m) => String(m.content).includes("VERIFICATION GATE"));
+    expect(claimIdx).toBeGreaterThanOrEqual(0);
+    expect(demandIdx).toBe(claimIdx + 1);
+  });
+
+  it("a turn whose check already ran is not held", async () => {
+    const seen: ChatMessage[][] = [];
+    const model = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "", calls: [TEST_CMD] },
+        { text: "Done — all green." },
+      ],
+      seen,
+    );
+    const events: AgentEvent[] = [];
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "3 passed" }; } },
+      onEvent: (ev) => events.push(ev),
+    });
+    expect(events).not.toContainEqual({ type: "verification_nudge" });
+    expect(out.text).toBe("Done — all green.");
+    expect(JSON.stringify(seen)).not.toContain("VERIFICATION GATE");
+  });
+
+  it("a browser_expect counts as the check, and a read-only turn is never held", async () => {
+    // Read-only claim: no mutation, no gate — analysis answers are not work to prove.
+    const seenRead: ChatMessage[][] = [];
+    const readModel = gateModel(
+      [
+        { text: "", calls: [{ id: "r1", name: "read_file", arguments: '{"path":"a"}' }] },
+        { text: "Done — the analysis is above." },
+      ],
+      seenRead,
+    );
+    const eventsRead: AgentEvent[] = [];
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "analyze" }],
+      registry: AGENT_TOOLS,
+      generate: readModel,
+      host: { async run() { return { ok: true, output: "file text" }; } },
+      onEvent: (ev) => eventsRead.push(ev),
+    });
+    expect(eventsRead).not.toContainEqual({ type: "verification_nudge" });
+
+    // Mutating turn verified by an assertion tool instead of a command.
+    const seenExpect: ChatMessage[][] = [];
+    const expectModel = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "", calls: [{ id: "b1", name: "browser_expect", arguments: '{"kind":"text","value":"Saved"}' }] },
+        { text: "Done — the page shows it." },
+      ],
+      seenExpect,
+    );
+    const eventsExpect: AgentEvent[] = [];
+    await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: expectModel,
+      host: { async run() { return { ok: true, output: '"Saved" is on the page' }; } },
+      onEvent: (ev) => eventsExpect.push(ev),
+    });
+    expect(eventsExpect).not.toContainEqual({ type: "verification_nudge" });
+  });
+
+  it("the demand fires once — a re-claim without verification ends the turn on the record", async () => {
+    const seen: ChatMessage[][] = [];
+    const model = gateModel(
+      [
+        { text: "writing", calls: [WRITE] },
+        { text: "Done." },
+        { text: "Done, trust me." },
+      ],
+      seen,
+    );
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "fix it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host: { async run() { return { ok: true, output: "r" }; } },
+    });
+    const demands = out.messages.filter((m) => String(m.content).includes("VERIFICATION GATE"));
+    expect(demands).toHaveLength(1);
+    expect(out.text).toBe("Done, trust me.");
+    // …and the unanswered demand is still on the transcript: a bare claim never stands silently.
+    const claimIdx = out.messages.findIndex((m) => m.role === "assistant" && m.content === "Done.");
+    const demandIdx = out.messages.findIndex((m) => String(m.content).includes("VERIFICATION GATE"));
+    expect(claimIdx).toBeGreaterThanOrEqual(0);
+    expect(demandIdx).toBe(claimIdx + 1);
+  });
+
+  it("negated and hedged phrasings never trigger the gate", async () => {
+    for (const text of [
+      "It is not done yet — one more step remains.",
+      "The fix is not working; I need another approach.",
+      "I could not verify it — the server is down, so nothing is verified.",
+    ]) {
+      const seen: ChatMessage[][] = [];
+      const model = gateModel(
+        [
+          { text: "writing", calls: [WRITE] },
+          { text },
+        ],
+        seen,
+      );
+      const events: AgentEvent[] = [];
+      const out = await runAgentLoop({
+        model: "m",
+        messages: [{ role: "user", content: "fix it" }],
+        registry: AGENT_TOOLS,
+        generate: model,
+        host: { async run() { return { ok: true, output: "r" }; } },
+        onEvent: (ev) => events.push(ev),
+      });
+      expect(events, text).not.toContainEqual({ type: "verification_nudge" });
+      expect(out.text).toBe(text);
+    }
+    // "should work" is the hedge the gate exists for: it claims success on no evidence.
+    expect(claimsCompletion("This should work now.")).toBe(true);
+    expect(claimsCompletion("All tests pass and the build is green.")).toBe(true);
+    expect(claimsCompletion("")).toBe(false);
   });
 });
