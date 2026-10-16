@@ -686,6 +686,58 @@ async fn anthropic_messages_stream_framing() {
     assert!(acc.contains("Hel"), "delta text missing");
 }
 
+/// **An Anthropic stream owes its client both token counts, and it reported one.**
+///
+/// Anthropic carries usage on `message_delta` — `message_start` is zeros by design, because the
+/// counts are not known until the turn ends. The terminal event here emitted `output_tokens`
+/// alone, so the prompt count the provider had just reported was dropped on the way out; a client
+/// computing spend from this stream saw input as permanently 0. The non-stream sibling has always
+/// sent both (`gateway_anthropic.rs:611-629`), which is what makes the streaming half a defect
+/// rather than a dialect choice.
+///
+/// Measured 2026-10-15: this is the same loss the OpenAI ingress had at its terminal chunk, reached
+/// through the other ingress. Both are the D84 class — a count that was read correctly and then
+/// not written where the client reads it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_anthropic_stream_reports_both_token_counts_on_message_delta() {
+    let key = Arc::new(Mutex::new(Some("sk-aip-test".to_string())));
+    let s = start(key).await;
+    s.bridge.answer_with_usage(true);
+    let res = s
+        .client
+        .post(format!("{}/v1/messages", s.base))
+        .header("x-api-key", "sk-aip-test")
+        .header("anthropic-version", "2023-06-01")
+        .header("content-type", "application/json")
+        .json(&json!({ "model": "mock-fast", "max_tokens": 64, "stream": true,
+                "messages": [{ "role": "user", "content": [{ "type": "text", "text": "hi" }] }] }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+    let mut acc = String::new();
+    let mut stream = res.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        acc.push_str(&String::from_utf8_lossy(&chunk.unwrap()));
+        if acc.contains("message_stop") {
+            break;
+        }
+    }
+    // The `message_delta` payload is the line after that event's name.
+    let delta = acc
+        .lines()
+        .skip_while(|l| !l.trim_end().ends_with("message_delta"))
+        .find_map(|l| l.strip_prefix("data: "))
+        .and_then(|p| serde_json::from_str::<Value>(p).ok())
+        .unwrap_or_else(|| panic!("a message_delta event with a JSON payload exists:\n{acc}"));
+    // The bridge reported (123, 45) — the same fixture the OpenAI terminal-chunk test pins.
+    assert_eq!(
+        delta["usage"]["input_tokens"], 123,
+        "the prompt count the provider reported reaches an Anthropic client: {delta}"
+    );
+    assert_eq!(delta["usage"]["output_tokens"], 45, "and the output count it billed: {delta}");
+}
+
 /// count_tokens returns 200 with input_tokens before any bridge is consulted — no upstream.
 #[tokio::test(flavor = "multi_thread")]
 async fn count_tokens_returns_estimate() {
@@ -2281,12 +2333,38 @@ async fn stream_chat_carries_the_provider_usage_in_the_terminal_chunk() {
     }
     assert_eq!(acc.matches("[DONE]").count(), 1, "one sentinel, at the end: {acc}");
     // The terminal chunk is the one with a finish_reason; it must carry the usage beside it.
-    let terminal =
-        acc.lines().find(|l| l.contains("finish_reason")).expect("a terminal chunk exists: {acc}");
-    assert!(terminal.contains("\"finish_reason\":\"stop\""), "{terminal}");
-    assert!(terminal.contains("\"prompt_tokens\":123"), "{terminal}");
-    assert!(terminal.contains("\"completion_tokens\":45"), "{terminal}");
-    assert!(terminal.contains("\"total_tokens\":168"), "{terminal}");
+    //
+    // **Parsed rather than substring-matched, and that is the point.** The assertions here used to
+    // be `terminal.contains("\"prompt_tokens\":123")` and two siblings, which pass whichever
+    // *parent* the field sits under — so they stayed green while the usage was emitted only inside
+    // `choices[0]`, where no OpenAI-spec client looks. Measured 2026-10-15 against the running
+    // daemon: a streaming request whose upstream plainly billed `input_tokens:229,
+    // output_tokens:18` reached a spec-conforming client as `usage: null`, because the number was
+    // there in the body and not at the address `chunk.usage` reads. The nested copy is kept — the
+    // app's own `gateway-turn.ts:312` reads `choice?.usage` and that is a live contract — but it
+    // is no longer the only one, and this test now names both addresses so neither can go missing
+    // behind the other.
+    let terminal_line = acc
+        .lines()
+        .find(|l| l.contains("finish_reason"))
+        .and_then(|l| l.strip_prefix("data: "))
+        .expect("a terminal chunk exists: {acc}");
+    let terminal: Value =
+        serde_json::from_str(terminal_line).expect("the terminal chunk is JSON: {terminal_line}");
+    assert_eq!(terminal["choices"][0]["finish_reason"], "stop", "{terminal}");
+    // The OpenAI wire position — what an SDK reads as `chunk.usage`, and what the non-stream
+    // sibling has always emitted at the top level.
+    assert_eq!(
+        terminal["usage"],
+        json!({ "prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168 }),
+        "the terminal chunk carries usage where an OpenAI client reads it: {terminal}"
+    );
+    // The app's own position, kept deliberately.
+    assert_eq!(
+        terminal["choices"][0]["usage"],
+        json!({ "prompt_tokens": 123, "completion_tokens": 45, "total_tokens": 168 }),
+        "the nested copy the in-app client reads is still there: {terminal}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

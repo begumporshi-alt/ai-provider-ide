@@ -292,6 +292,29 @@ pub fn anthropic_compat(base_url: &str) -> Value {
                     // read as nothing at all. `select_text` picks the text blocks out of the array.
                     "text": "$.content",
                     "usage": "$.usage",
+                    // Anthropic names its token counts differently from OpenAI, and without these
+                    // the interpreter falls back to `prompt_tokens`/`completion_tokens` — which an
+                    // Anthropic usage block does not have. Mirrors `builtin-templates.ts:187-197`
+                    // exactly, and **this half is the one that was missing.**
+                    //
+                    // D84 recorded the fix on 2026-10-01 and the TypeScript template received it, so
+                    // the reference interpreter has read Anthropic usage correctly since then. The
+                    // Rust port did not, and the daemon serves builtins from *this* file: on
+                    // success `activation::serving_manifest` lets the builtin profile win
+                    // unconditionally over the stored row, so a provider whose DB snapshot carried
+                    // `usageKeys` still served without them. Measured 2026-10-15 against the running
+                    // daemon — the upstream block arrived intact (`input_tokens:229,
+                    // output_tokens:15`) and the interpreter read `prompt=None, completion=None`,
+                    // keeping only `cached`, which `read_cached_tokens` defaults to the Anthropic
+                    // spelling and so survived the omission. That asymmetry is the signature in the
+                    // ledger: `tokens_in == cached_tokens` with `tokens_out = 0` on 774 of 876
+                    // recent gateway rows, and `cost_estimate_micros = 0` on all of them, so no
+                    // spend cap could ever fire.
+                    "usageKeys": {
+                        "prompt": "input_tokens",
+                        "completion": "output_tokens",
+                        "cached": "cache_read_input_tokens"
+                    },
                     // Non-stream: `content` is a MIXED array (text blocks + tool_use blocks), and
                     // the jsonpath subset has no filter expressions, so the interpreter filters by
                     // block type itself.
@@ -667,6 +690,86 @@ mod tests {
         assert!(m.get("modalityRules").is_none(), "no image endpoint means no rules");
         assert_eq!(m["capabilities"], json!({ "text": true, "image": false }));
         assert_eq!(text["stream"]["protocol"], "sse");
+    }
+
+    /// **`usageKeys` is a per-dialect obligation, and this walks every builtin to enforce it.**
+    ///
+    /// The rule: a dialect whose usage block does not speak OpenAI's field names must declare the
+    /// names it does speak. `responseMap.usage` alone reaches the block, so the manifest looks
+    /// right — but without `usageKeys` the reader then hunts for `prompt_tokens` /
+    /// `completion_tokens` inside a block that has neither, finds nothing, and reports **0 in /
+    /// 0 out**. Cost is computed from those counts, so it stays 0 too and no spend cap can fire.
+    ///
+    /// **This is the test that was missing, and its absence is the whole of D84's recurrence.**
+    /// D84 recorded the Anthropic fix on 2026-10-01 and the TypeScript template received it; the
+    /// Rust port did not, and nothing compared the two tables. It could not be caught downstream
+    /// either: `activation::serving_manifest` lets a builtin profile win **unconditionally** over
+    /// the stored row, so the live `agent-router` row carrying correct `usageKeys` since
+    /// 2026-10-02 changed nothing about what the daemon actually served. Measured 2026-10-15: the
+    /// upstream block arrived intact (`input_tokens:229, output_tokens:15`) and the interpreter
+    /// reported `prompt=None, completion=None` — `cached` alone survived, because
+    /// `read_cached_tokens` happens to default to the Anthropic spelling.
+    ///
+    /// A dialect that speaks OpenAI's names is deliberately **not** listed: the reader's defaults
+    /// are its `usageKeys`, and a redundant override there would be a second place to get it
+    /// wrong. `checked` guards the guard — a walk that matched nothing would pass vacuously.
+    #[test]
+    fn every_non_openai_builtin_declares_the_usage_field_names_its_dialect_speaks() {
+        let openai_extras = OpenAiExtras::default();
+        let builtins: [(&str, Value); 3] = [
+            ("openai-chat-v1", openai_compat("https://x.test/v1", openai_extras)),
+            ("anthropic-messages-v1", anthropic_compat("https://x.test/v1")),
+            ("gemini-generate-v1", gemini_compat("https://x.test/v1")),
+        ];
+        // The names each dialect's usage block actually uses, and where that block sits — the
+        // Anthropic column transcribed from `builtin-templates.ts:185-197`, the Gemini column from
+        // `:365-371`. The **selector** is part of the row on purpose: a `usageKeys` override is
+        // meaningless if the selector never reaches the block it names, and Gemini's block is not
+        // where Anthropic's is.
+        let expected: [(&str, &str, &str, &str, &str); 2] = [
+            (
+                "anthropic-messages-v1",
+                "$.usage",
+                "input_tokens",
+                "output_tokens",
+                "cache_read_input_tokens",
+            ),
+            (
+                "gemini-generate-v1",
+                "$.usageMetadata",
+                "promptTokenCount",
+                "candidatesTokenCount",
+                "cachedContentTokenCount",
+            ),
+        ];
+
+        let mut checked = 0;
+        for (dialect, m) in &builtins {
+            assert_eq!(m["dialect"], *dialect, "the fixture names its own dialect");
+            let map = get(m, &["endpoints", "generateText", "responseMap"]);
+            let Some((_, usage_path, prompt, completion, cached)) =
+                expected.iter().find(|(d, ..)| d == dialect)
+            else {
+                // The OpenAI dialect: the reader's own defaults are its `usageKeys`, so an
+                // override here would be a second place to get the same answer wrong.
+                assert_eq!(map["usage"], "$.usage", "{dialect} still has to reach a usage block");
+                assert!(
+                    map.get("usageKeys").is_none(),
+                    "{dialect} speaks OpenAI's names, so it must carry no override: {map}"
+                );
+                continue;
+            };
+            assert_eq!(
+                map["usage"], *usage_path,
+                "{dialect} must reach its usage block — a `usageKeys` override is worthless \
+                 against a selector that never arrives"
+            );
+            assert_eq!(map["usageKeys"]["prompt"], *prompt, "{dialect} prompt key");
+            assert_eq!(map["usageKeys"]["completion"], *completion, "{dialect} completion key");
+            assert_eq!(map["usageKeys"]["cached"], *cached, "{dialect} cached key");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both non-OpenAI dialects were present to check");
     }
 
     /// The base URL is the caller's, which is `withBaseUrl` composed rather than applied.

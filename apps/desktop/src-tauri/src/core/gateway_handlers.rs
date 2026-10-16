@@ -244,6 +244,22 @@ pub(crate) async fn chat_h(
                         if let Some(sb) = served_by.take() {
                             terminal["choices"][0]["served_by"] = sb;
                         }
+                        // **The same usage at the top level, which is where OpenAI puts it.** The
+                        // nested copy above is a live contract — the app's own stream reader takes
+                        // `choice?.usage` (`gateway-turn.ts:312`) — but it is not where a
+                        // spec-conforming client looks: every OpenAI SDK reads `chunk.usage`, and
+                        // finding nothing there reports a zero-cost stream even when the provider
+                        // billed it. Measured 2026-10-15 against the running daemon: a stream whose
+                        // upstream reported `input_tokens:229, output_tokens:18` reached such a
+                        // client as `usage: null`. The non-stream sibling has always emitted both
+                        // (`:393` and `:397`); this is the stream half arriving at the same shape.
+                        if let Some((pt, ct)) = usage {
+                            terminal["usage"] = json!({
+                                "prompt_tokens": pt,
+                                "completion_tokens": ct,
+                                "total_tokens": pt + ct
+                            });
+                        }
                         yield Ok::<Event, std::convert::Infallible>(Event::default().data(
                             terminal.to_string(),
                         ));

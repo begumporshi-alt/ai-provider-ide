@@ -3843,6 +3843,57 @@ mod tests {
         assert_eq!(usage.counts(), (120, 34));
     }
 
+    /// **The real Anthropic wire shape read through the real builtin — the end-to-end guard.**
+    ///
+    /// `anthropic_manifest()` declares no `usageKeys`, so it reads the OpenAI names an Anthropic
+    /// usage block does not have, and every Anthropic-stream test built on that fixture therefore
+    /// exercises a manifest no shipped template resembles. This drives the **actual**
+    /// `anthropic_compat` template — the one `activation::serving_manifest` serves for every
+    /// Anthropic-dialect builtin — against the events `agentrouter.org` really sends: a
+    /// `message_start` whose usage is all zeros, then a `message_delta` carrying
+    /// `usage{input_tokens,output_tokens,cache_read_input_tokens}` and the `error: null` field that
+    /// rides on every event of that dialect.
+    ///
+    /// Measured 2026-10-15 against the running daemon: the same prompt answered by the same provider
+    /// reported `input_tokens:229, output_tokens:15` upstream and `prompt_tokens:0,
+    /// completion_tokens:0` through the gateway — the block was reached and both names missed. The
+    /// `message_start` zeros matter: they are why a reader that fires on "any chunk" cannot be
+    /// trusted to have the last word, and why the merge below is a merge rather than an assignment.
+    #[tokio::test]
+    async fn the_anthropic_builtin_reports_the_provider_s_own_streamed_usage_counts() {
+        let manifest =
+            crate::core::builtin_templates::anthropic_compat("https://agentrouter.org/v1");
+        let http = FakeHttp::new(vec![Scripted::sse(&[
+            r#"data: {"type":"message_start","message":{"content":[],"role":"assistant","usage":{"input_tokens":0,"output_tokens":0}},"error":null}"#,
+            r#"data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"done"},"error":null}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"error":null,"usage":{"input_tokens":229,"output_tokens":15,"cache_creation_input_tokens":0,"cache_read_input_tokens":24064}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ])]);
+        let interp = interpreter(&manifest, http.clone());
+
+        let seen: Arc<Mutex<Option<UsageTokens>>> = Arc::new(Mutex::new(None));
+        let sink = seen.clone();
+        let mut on_usage = move |u: UsageTokens| *sink.lock().unwrap() = Some(u);
+        let mut args = text_args("deepseek-v4-flash");
+        args.on_usage = Some(&mut on_usage);
+
+        let out = drain(interp.generate_text("key:k1", args, &Cancel::new()).await.unwrap()).await;
+
+        assert_eq!(out, vec![Ok("done".to_string())], "the text delta is the only chunk");
+        let usage = seen.lock().unwrap().expect("the message_delta usage block was read");
+        assert_eq!(
+            usage.prompt_tokens, 229,
+            "the provider's own prompt count, under the name its dialect declares — not the \
+             gateway's estimate of the body it sent, and not the cached figure"
+        );
+        assert_eq!(usage.completion_tokens, 15, "and the output count it billed");
+        assert_eq!(
+            usage.cached_tokens,
+            Some(24064),
+            "the cached column stays distinct from the prompt column; both names are read"
+        );
+    }
+
     /// **The cached-token fallback, from the 2026-10-06 measurement.** `agent-router`'s
     /// Anthropic-shaped stream reports only `cache_read_input_tokens` on the block the selector
     /// reads, so every ledger row for a request it plainly billed read `0 in / 0 out` while

@@ -514,9 +514,16 @@ pub(crate) async fn messages_h(
                 // reach an Anthropic client as `max_tokens`, not `end_turn` (drift D86).
                 anthropic_stop_reason(finish_reason.as_deref())
             };
+            // **Both counts, not only the output one.** Anthropic's own `message_delta` carries
+            // `input_tokens` beside `output_tokens` (measured live against `agentrouter.org`,
+            // 2026-10-15), and `message_start` above is zeros by design because neither count is
+            // known until the turn ends — so this event is the client's only chance to learn what
+            // the prompt cost. Sending `output_tokens` alone left every streaming Anthropic client
+            // computing input as 0. The non-stream path has always sent both (`:611-629`).
+            let (pt, ct) = usage.unwrap_or((0, 0));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_delta")
                 .data(json!({ "type": "message_delta", "delta": { "stop_reason": stop_reason, "stop_sequence": null },
-                    "usage": { "output_tokens": usage.as_ref().map(|(_, ct)| ct).unwrap_or(&0) } }).to_string()));
+                    "usage": { "input_tokens": pt, "output_tokens": ct } }).to_string()));
             yield Ok::<Event, std::convert::Infallible>(Event::default().event("message_stop").data(json!({ "type": "message_stop" }).to_string()));
             drop(slot);
         };
