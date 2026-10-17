@@ -2514,6 +2514,82 @@ function Chat({
           // line, which is the old behaviour.
           cacheImage: (mediaType, base64) =>
             invoke<string>("image_cache_write", { mediaType, base64 }).catch(() => null),
+          // The session store behind list_sessions / search_sessions / read_session: the same
+          // history commands the History screen reads, normalized to the loop's camelCase shape.
+          // Mapping here rather than in the loop keeps the loop ignorant of which backend served
+          // the rows — and a failure here surfaces as the tool's "session lookup failed" result,
+          // not as a broken turn.
+          sessions: {
+            list: (limit) =>
+              invoke<
+                {
+                  session_id: string;
+                  started_ts: number;
+                  ended_ts: number;
+                  turns: number;
+                  tool_calls: number;
+                  preview: string;
+                  title: string | null;
+                  model: string | null;
+                }[]
+              >("history_sessions", { limit }).then((rows) =>
+                rows.map((r) => ({
+                  sessionId: r.session_id,
+                  title: r.title,
+                  preview: r.preview,
+                  startedTs: r.started_ts,
+                  endedTs: r.ended_ts,
+                  turns: r.turns,
+                  toolCalls: r.tool_calls,
+                  model: r.model,
+                })),
+              ),
+            search: (query, limit) =>
+              invoke<
+                {
+                  session_id: string;
+                  title: string | null;
+                  preview: string;
+                  seq: number;
+                  role: string;
+                  ts: number;
+                  snippet: string;
+                }[]
+              >("session_search", { query, limit }).then((rows) =>
+                rows.map((r) => ({
+                  sessionId: r.session_id,
+                  title: r.title,
+                  preview: r.preview,
+                  seq: r.seq,
+                  role: r.role,
+                  ts: r.ts,
+                  snippet: r.snippet,
+                })),
+              ),
+            read: (sessionId) =>
+              invoke<
+                {
+                  sessionId: string;
+                  seq: number;
+                  role: string;
+                  content: string;
+                  ts: number;
+                  model: string | null;
+                  toolCalls: string | null;
+                  toolCallId: string | null;
+                }[]
+              >("transcript_list", { sessionId }).then((rows) =>
+                rows.map((r) => ({
+                  seq: r.seq,
+                  role: r.role,
+                  content: r.content,
+                  ts: r.ts,
+                  model: r.model ?? null,
+                  toolCalls: r.toolCalls ?? null,
+                  toolCallId: r.toolCallId ?? null,
+                })),
+              ),
+          },
         },
         {
           generate: gatewayGenerate,

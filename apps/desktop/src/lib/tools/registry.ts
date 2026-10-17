@@ -639,6 +639,48 @@ export const AGENT_TOOLS: ToolSpec[] = [
       required: ["path", "action", "index"],
     },
   },
+  {
+    name: "list_sessions",
+    effect: "read",
+    description:
+      "List the app's past conversation sessions, newest first: id, title, date range, model, turn and tool-call counts, and a one-line preview. Use search_sessions when looking for a topic; use this to browse or to answer 'what did we work on'.",
+    parameters: {
+      properties: {
+        limit: {
+          type: "number",
+          description: "Optional maximum to return (default 25, capped at 100).",
+        },
+      },
+    },
+  },
+  {
+    name: "search_sessions",
+    effect: "read",
+    description:
+      "Full-text search across every past session's transcript — both sides of every conversation, not just titles. Returns hits with the matched words bracketed, so you can judge context before reading a whole session. This is the only way to find where something was said; list_sessions only shows previews.",
+    parameters: {
+      properties: {
+        query: { type: "string", description: "Words to look for. Case and word form don't matter." },
+        limit: {
+          type: "number",
+          description: "Optional maximum hits to return (default 30, capped at 200).",
+        },
+      },
+      required: ["query"],
+    },
+  },
+  {
+    name: "read_session",
+    effect: "read",
+    description:
+      "Read one past session's transcript in order: each turn's role, text and timestamps, with tool calls and their results. Get the session id from list_sessions or search_sessions. Long turns are clipped; ask for a session whose search hits looked relevant rather than reading many whole sessions.",
+    parameters: {
+      properties: {
+        session_id: { type: "string", description: "The session's id, exactly as list_sessions or search_sessions returned it." },
+      },
+      required: ["session_id"],
+    },
+  },
 ];
 
 /**
@@ -657,6 +699,13 @@ const SUBAGENT_NEVER = new Set([
   "todo_write",
   "enter_plan_mode",
   "exit_plan_mode",
+  // The session history is the parent conversation's own knowledge base: a child delegated one
+  // self-contained task has no need to browse past sessions, and every session tool it spends
+  // rounds on is context the parent already has — the parent can search sessions itself and hand
+  // the child exactly the excerpt the task needs.
+  "list_sessions",
+  "search_sessions",
+  "read_session",
 ]);
 
 /**

@@ -264,6 +264,17 @@ pub fn transcript_max_seq(
     context::max_message_seq(&store, &session_id).map_err(CommandError)
 }
 
+/// Full-text search across every stored transcript (0030). Read-only; the query is sanitized
+/// before it reaches FTS5, so arbitrary input returns hits or an empty list, never a syntax error.
+#[tauri::command]
+pub fn session_search(
+    store: State<'_, Arc<Store>>,
+    query: String,
+    limit: Option<usize>,
+) -> Result<Vec<context::SessionSearchHit>, CommandError> {
+    context::search_sessions(&store, &query, limit.unwrap_or(30).min(200)).map_err(CommandError)
+}
+
 // ---------- skills (P5) ----------
 // Skills are procedures, not capabilities: nothing here can widen the agent's tool surface.
 
@@ -960,6 +971,7 @@ pub fn handlers() -> impl Fn(tauri::ipc::Invoke<tauri::Wry>) -> bool + Send + Sy
         transcript_append,
         transcript_list,
         transcript_max_seq,
+        session_search,
         skills_list,
         skills_catalog,
         skills_install,

@@ -157,6 +157,58 @@ export interface PlanPorts {
   persist: (plan: string) => Promise<string | null>;
 }
 
+/**
+ * The session knowledge the `list_sessions` / `search_sessions` / `read_session` tools serve.
+ *
+ * These summaries are the loop's own normalized shape (camelCase), not the raw Tauri wire shape —
+ * the port implementation maps, exactly as `web_ask`'s port hides the fetch. One shape here means
+ * the loop formats for the model without knowing which backend served the rows.
+ */
+export interface SessionSummary {
+  sessionId: string;
+  title: string | null;
+  preview: string;
+  startedTs: number;
+  endedTs: number;
+  turns: number;
+  toolCalls: number;
+  model: string | null;
+}
+
+export interface SessionSearchHit {
+  sessionId: string;
+  title: string | null;
+  preview: string;
+  seq: number;
+  role: string;
+  ts: number;
+  snippet: string;
+}
+
+export interface SessionTurn {
+  seq: number;
+  role: string;
+  content: string;
+  ts: number;
+  model: string | null;
+  /** Serialized `tool_calls` array on an assistant row; null otherwise. */
+  toolCalls: string | null;
+  /** The answered call's id on a tool row; null otherwise. */
+  toolCallId: string | null;
+}
+
+/**
+ * Read-only access to past conversation sessions — the index, a full-text search over every
+ * stored transcript, and one session's turns. Absent — tests, the gateway bridge, AXIOM's own
+ * eval loops — all three tools refuse with that sentence rather than pretending to look: a
+ * caller with no session store must not receive an empty result that reads as "no history".
+ */
+export interface SessionPorts {
+  list(limit: number): Promise<SessionSummary[]>;
+  search(query: string, limit: number): Promise<SessionSearchHit[]>;
+  read(sessionId: string): Promise<SessionTurn[]>;
+}
+
 export interface AgentLoopOptions {
   model: string;
   /** Initial conversation (user turns). The loop appends assistant/tool turns internally. */
@@ -197,6 +249,13 @@ export interface AgentLoopOptions {
    * the behaviour this port exists to fix.
    */
   cacheImage?: (mediaType: string, base64: string) => Promise<string | null>;
+  /**
+   * The session store behind `list_sessions` / `search_sessions` / `read_session`: the index of
+   * past conversations, a full-text search over their transcripts, and one transcript read back.
+   * Absent (tests, the gateway bridge) all three refuse with a sentence saying so — the same
+   * contract `generateImage` has — because an empty list and "no store" are different facts.
+   */
+  sessions?: SessionPorts;
   /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`. Absent — tests, the
    * gateway bridge — both tools refuse with a sentence telling the model to present the plan in

@@ -1555,6 +1555,62 @@ async function dispatch(cmd: string, args: Record<string, unknown>): Promise<unk
       const list = transcriptRows.get(sid) ?? [];
       return list.reduce((m, r) => Math.max(m, Number(r.seq ?? 0)), 0);
     }
+    case "session_search": {
+      // Emulates context.rs `search_sessions` over the transcript rows: OR of the sanitized
+      // tokens, case-insensitive (the real porter stemmer's folding is approximated by matching
+      // the token as a prefix), bracketed snippet, newest first. Title and preview are joined the
+      // same way — title from session_titles, preview the first user message.
+      const query = String(args.query ?? "");
+      const limit = Math.min(Number(args.limit ?? 30) || 30, 200);
+      const tokens = query
+        .split(/[^a-zA-Z0-9]+/)
+        .map((t) => t.toLowerCase())
+        .filter(Boolean);
+      if (!tokens.length) return [];
+      const previewOf = new Map<string, string>();
+      for (const [sid, rows] of transcriptRows) {
+        const firstUser = [...rows]
+          .sort((a, b) => Number(a.seq) - Number(b.seq))
+          .find((r) => r.role === "user");
+        if (firstUser) previewOf.set(sid, String(firstUser.content ?? ""));
+      }
+      const hits: Array<Record<string, unknown>> = [];
+      for (const [sid, rows] of transcriptRows) {
+        for (const r of rows) {
+          const text = String(r.content ?? "");
+          const lower = text.toLowerCase();
+          const at = tokens.reduce<number | null>(
+            (best, t) => {
+              const i = lower.indexOf(t);
+              return i >= 0 && (best === null || i < best) ? i : best;
+            },
+            null,
+          );
+          if (at === null) continue;
+          const from = Math.max(0, at - 60);
+          const to = Math.min(text.length, at + tokens[0]!.length + 60);
+          const snippet =
+            (from > 0 ? "…" : "") +
+            text.slice(from, at) +
+            "[" +
+            text.slice(at, at + tokens[0]!.length) +
+            "]" +
+            text.slice(at + tokens[0]!.length, to) +
+            (to < text.length ? "…" : "");
+          hits.push({
+            session_id: sid,
+            title: sessionTitles.get(sid) ?? null,
+            preview: previewOf.get(sid) ?? "",
+            seq: Number(r.seq ?? 0),
+            role: String(r.role ?? ""),
+            ts: Number(r.ts ?? 0),
+            snippet,
+          });
+        }
+      }
+      hits.sort((a, b) => Number(b.ts) - Number(a.ts));
+      return hits.slice(0, limit);
+    }
     case "history_timeline": {
       const sessionId = String(args.session_id ?? "");
       const nodes = contextNodes

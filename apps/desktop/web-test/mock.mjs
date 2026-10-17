@@ -116,6 +116,12 @@ const TINY_PDF_B64 =
 /** Last request that hit the image bytes endpoint — wire-level truth for the spec. */
 let imgSeen = { path: null };
 
+/**
+ * The search_sessions result the SESSION-HISTORY variant saw on its first round — the spec proves
+ * the tool answer crossed the loop by asserting the final answer quotes it.
+ */
+let sessionSearchSeen = null;
+
 function cors(res, extra = {}) {
   // Authorization must be named explicitly: the "*" wildcard never matches it
   // (Fetch spec), and a preflight that never resolves hangs the whole request.
@@ -608,6 +614,40 @@ async function oracle(req, res, path) {
       // Plain chat: a host the egress policy does not permit, so the card must NOT try to fetch
       // it — it offers the browser instead.
       content = "The upstream docs live at https://example.com/guide — open that in your browser.";
+    } else if (tools && /quixotic bug/i.test(userPrompt)) {
+      // Agent mode, SESSION-HISTORY variant: search_sessions, then read_session by the id the
+      // search returned, then answer quoting what came back — the arc that proves the tools are
+      // served by the session store, not by canned text (the snippet travels through two tool
+      // round-trips before it reaches the transcript).
+      const round = toolMsgs.length;
+      if (round === 0) {
+        toolCall = { name: "search_sessions", arguments: JSON.stringify({ query: "quixotic bug" }) };
+        content = "";
+      } else if (round === 1) {
+        try { sessionSearchSeen = JSON.parse(lastToolResult.split("\n\n").slice(1).join("\n\n"))[0]; } catch { /* answered below */ }
+        const sid = sessionSearchSeen?.session_id ?? "past-1";
+        toolCall = { name: "read_session", arguments: JSON.stringify({ session_id: sid }) };
+        content = "";
+      } else {
+        // The port normalizes rows to camelCase before the loop sees them, so the id rides as
+        // `sessionId` — read both spellings so the answer never says "unknown" on a hit.
+        const hit = sessionSearchSeen ?? {};
+        const sid = hit.sessionId ?? hit.session_id ?? "unknown";
+        const snippet = String(hit.snippet ?? "(no snippet came back)");
+        content = `Found it in session ${sid} — the search snippet was “${snippet}”, and the transcript says the fix was caching the probe result.`;
+      }
+    } else if (tools && /list my past sessions/i.test(userPrompt)) {
+      // Agent mode, SESSION-INDEX variant: one list_sessions round, then an answer that reports
+      // what the index actually held — count and a custom title, both of which only exist if the
+      // port served the seeded store.
+      if (!sawToolResult) {
+        toolCall = { name: "list_sessions", arguments: "{}" };
+        content = "";
+      } else {
+        const count = /found (\d+) session/.exec(lastToolResult)?.[1] ?? "0";
+        const title = /"title":\s*"([^"]+)"/.exec(lastToolResult)?.[1] ?? "";
+        content = `You have ${count} past session(s)${title ? `, including “${title}”` : ""}.`;
+      }
     } else if (tools && /plan the/i.test(userPrompt) && !sawPlanCall) {
       // Agent mode, PLAN-EXIT variant: a planning pass ends the way the real contract says it must
       // — by calling `exit_plan_mode` with the plan document, which is what raises the review.

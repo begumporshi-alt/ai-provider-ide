@@ -672,6 +672,7 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
     generateImage,
     loadSkill,
     cacheImage,
+    sessions,
     plan,
     runId,
     subagentRecorder,
@@ -1546,6 +1547,97 @@ export async function runAgentLoop(opts: AgentLoopOptions): Promise<AgentLoopRes
                   }
                 } catch (e) {
                   resultText = `Skill load failed: ${e instanceof Error ? e.message : String(e)}`;
+                  ok = false;
+                }
+              }
+            } else if (name === "list_sessions" || name === "search_sessions" || name === "read_session") {
+              // The session tools never reach the sandbox: past conversations live in the app's
+              // database, which the sandbox has no handle on, so they are answered here through
+              // the injected session port — the same seam `web_ask` and `load_skill` ride. No
+              // port means no session store is attached to this run, said plainly: an empty
+              // result would read as "no history exists", which is a different fact.
+              if (!sessions) {
+                resultText =
+                  "session history is not available in this run — no session store is attached.";
+                ok = false;
+              } else {
+                try {
+                  const clamp = (v: unknown, dflt: number, max: number) => {
+                    const n = typeof v === "number" ? Math.floor(v) : NaN;
+                    return Number.isFinite(n) && n >= 1 ? Math.min(n, max) : dflt;
+                  };
+                  if (name === "list_sessions") {
+                    const rows = await sessions.list(clamp(args.limit, 25, 100));
+                    resultText = rows.length
+                      ? `found ${rows.length} session(s):\n\n${JSON.stringify(rows, null, 2)}`
+                      : "no sessions are recorded yet.";
+                    ok = true;
+                  } else if (name === "search_sessions") {
+                    const query = typeof args.query === "string" ? args.query.trim() : "";
+                    if (!query) {
+                      resultText = 'search_sessions needs a "query": the words to look for.';
+                      ok = false;
+                    } else {
+                      const hits = await sessions.search(query, clamp(args.limit, 30, 200));
+                      resultText = hits.length
+                        ? `${hits.length} hit(s) for ${JSON.stringify(query)} (most recent first):\n\n${JSON.stringify(hits, null, 2)}`
+                        : `no transcript mentions ${JSON.stringify(query)}.`;
+                      ok = true;
+                    }
+                  } else {
+                    const sessionId =
+                      typeof args.session_id === "string" ? args.session_id.trim() : "";
+                    if (!sessionId) {
+                      resultText =
+                        'read_session needs a "session_id" — get one from list_sessions or search_sessions.';
+                      ok = false;
+                    } else {
+                      const turns = await sessions.read(sessionId);
+                      if (!turns.length) {
+                        resultText = `no transcript is stored for session ${JSON.stringify(sessionId)}.`;
+                        ok = true;
+                      } else {
+                        // Two caps, because a session can be arbitrarily long and a tool row can
+                        // alone be larger than the model's window: each turn's text is clipped,
+                        // and the total stops at ~24 KB with an explicit notice of what was left
+                        // out — a silent cut would read as "that is the whole conversation".
+                        const TURN_CAP = 1200;
+                        const TOTAL_CAP = 24_000;
+                        const clip = (s: string) =>
+                          s.length > TURN_CAP ? `${s.slice(0, TURN_CAP)}…[clipped]` : s;
+                        const out: Record<string, unknown>[] = [];
+                        let total = 0;
+                        let truncated = false;
+                        for (const t of turns) {
+                          const row: Record<string, unknown> = {
+                            seq: t.seq,
+                            role: t.role,
+                            ts: t.ts,
+                            content: clip(t.content),
+                          };
+                          if (t.model) row.model = t.model;
+                          if (t.toolCalls) row.tool_calls = clip(t.toolCalls);
+                          if (t.toolCallId) row.tool_call_id = t.toolCallId;
+                          const line = JSON.stringify(row).length;
+                          if (total + line > TOTAL_CAP) {
+                            truncated = true;
+                            break;
+                          }
+                          total += line;
+                          out.push(row);
+                        }
+                        resultText =
+                          `session ${sessionId}: ${out.length} of ${turns.length} stored message(s)` +
+                          (truncated
+                            ? ` — shown up to the size cap; the rest is still stored, search or narrow to read it`
+                            : "") +
+                          `:\n\n${JSON.stringify(out, null, 2)}`;
+                        ok = true;
+                      }
+                    }
+                  }
+                } catch (e) {
+                  resultText = `session lookup failed: ${e instanceof Error ? e.message : String(e)}`;
                   ok = false;
                 }
               }

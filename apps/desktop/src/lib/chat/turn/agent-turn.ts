@@ -66,6 +66,11 @@ export interface AgentTurnRequest extends TurnRequestBase {
    */
   cacheImage?: Parameters<typeof runAgentLoop>[0]["cacheImage"];
   /**
+   * The session store behind `list_sessions` / `search_sessions` / `read_session` — see
+   * `AgentLoopOptions.sessions`. The screen owns the Tauri bridge; the loop only serves the tools.
+   */
+  sessions?: Parameters<typeof runAgentLoop>[0]["sessions"];
+  /**
    * The plan-mode facilities behind `enter_plan_mode` / `exit_plan_mode`: the review modal, the
    * mode switch the gate reads, and the plan file. The screen owns all three — it holds the
    * approval ref, the session id and the workspace root — and the loop only forwards them.
@@ -269,6 +274,7 @@ export async function runAgentTurn(req: AgentTurnRequest, ports: AgentTurnPorts)
       generateImage: req.generateImage,
       loadSkill: req.loadSkill,
       cacheImage: req.cacheImage,
+      sessions: req.sessions,
       plan: req.plan,
       subagentMaxIterations: req.subagentMaxIterations,
       // The user-authored specialists: the loop resolves `agent` ids to their prompt, toolset,

@@ -194,7 +194,9 @@ fn clamp_text(s: &str) -> String {
  * tokens are OR-ed. That loses phrase and proximity operators, which is an acceptable trade
  * for a recall that cannot throw.
  */
-fn match_expr(query: &str) -> Option<String> {
+/// `pub(crate)`: session-transcript search (`context.rs::search_sessions`) sanitizes its query
+/// with the same function — one tokenizer of last resort, not two that drift.
+pub(crate) fn match_expr(query: &str) -> Option<String> {
     let tokens: Vec<String> = query
         .split(|c: char| !c.is_alphanumeric())
         .filter(|t| !t.is_empty())

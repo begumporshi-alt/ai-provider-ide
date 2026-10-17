@@ -547,6 +547,86 @@ pub fn timeline(store: &Store, session_id: &str) -> Result<HistoryTimeline, Stri
     Ok(HistoryTimeline { session_id: session_id.to_string(), entries })
 }
 
+/// One transcript search hit: where a phrase was said, with enough context to judge it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SessionSearchHit {
+    pub session_id: String,
+    /// Custom title when one is set, else the session's own preview — the same label the
+    /// History index shows, so a hit names the conversation the way the user already sees it.
+    pub title: Option<String>,
+    pub preview: String,
+    pub seq: i64,
+    /// `user` | `assistant` | `tool`.
+    pub role: String,
+    pub ts: i64,
+    /// The matched region with the match bracketed — FTS5's `snippet()`, so a hit shows the
+    /// words around the phrase rather than making the caller re-open the session to judge it.
+    pub snippet: String,
+}
+
+/// Full-text search across every stored transcript.
+///
+/// This is the capability nothing else in the app has: the History screen filters titles and
+/// previews over one loaded page, while this walks the words of every conversation. The query is
+/// sanitized by the same tokenizer memory recall uses (arbitrary model output must not be able to
+/// throw a syntax error at SQLite), matches rank by BM25, and each hit carries a snippet with the
+/// match bracketed so the caller can see the context without re-reading the session.
+///
+/// Rows come back newest-first; a query that tokenizes to nothing (punctuation, empty) returns an
+/// empty list rather than an error — "nothing was asked" is not a failure.
+pub fn search_sessions(
+    store: &Store,
+    query: &str,
+    limit: usize,
+) -> Result<Vec<SessionSearchHit>, String> {
+    let Some(expr) = crate::core::memory::match_expr(query) else {
+        return Ok(Vec::new());
+    };
+    let conn = store.conn.lock().map_err(|e| e.to_string())?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT m.session_id, m.seq, m.role, m.ts,
+                    snippet(session_messages_fts, 0, '[', ']', '…', 18),
+                    t.title, s.preview
+             FROM session_messages_fts f
+             JOIN session_messages m ON m.session_id = f.session_id AND m.seq = f.seq
+             LEFT JOIN session_titles t ON t.session_id = m.session_id
+             LEFT JOIN (
+                 SELECT session_id, preview FROM (
+                     SELECT session_id, content AS preview,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY session_id
+                                ORDER BY CASE WHEN role = 'user' THEN 0 ELSE 1 END, seq
+                            ) AS rn
+                     FROM session_messages
+                 ) WHERE rn = 1
+             ) s ON s.session_id = m.session_id
+             WHERE session_messages_fts MATCH ?1
+             ORDER BY m.ts DESC
+             LIMIT ?2",
+        )
+        .map_err(|e| e.to_string())?;
+    let rows = stmt
+        .query_map(params![expr, limit as i64], |r| {
+            Ok(SessionSearchHit {
+                session_id: r.get(0)?,
+                seq: r.get(1)?,
+                role: r.get(2)?,
+                ts: r.get(3)?,
+                snippet: r.get(4)?,
+                title: {
+                    let t: Option<String> = r.get(5)?;
+                    t.filter(|s| !s.trim().is_empty())
+                },
+                preview: r.get::<_, Option<String>>(6)?.unwrap_or_default(),
+            })
+        })
+        .map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| e.to_string())?;
+    Ok(rows)
+}
+
 /// Set or clear a custom title for a session. Passing `None` removes a custom title, so the
 /// History index falls back to the first user message as preview.
 pub fn set_session_title(
@@ -1389,6 +1469,90 @@ mod context_graph_tests {
             1,
             "and must not touch another session's"
         );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    // --- search_sessions (0030) ---
+
+    #[test]
+    fn search_finds_words_said_in_past_sessions() {
+        let (s, d) = temp_store("search-basic");
+        append_session_messages(
+            &s,
+            &[
+                msg("s1", 0, "user", "we moved the agent router off the 500 flap path"),
+                msg("s1", 1, "assistant", "done — three-round re-probe is in"),
+            ],
+        )
+        .unwrap();
+        let hits = search_sessions(&s, "router flap", 30).unwrap();
+        assert_eq!(hits.len(), 1, "both tokens live in one row; porter stems flap/flaps");
+        assert_eq!(hits[0].session_id, "s1");
+        assert_eq!(hits[0].role, "user");
+        assert!(hits[0].snippet.contains('['), "the match must be bracketed in the snippet");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn search_hits_carry_the_title_a_session_was_given() {
+        let (s, d) = temp_store("search-title");
+        append_session_messages(&s, &[msg("s1", 0, "user", "discussed the axiom suite")]).unwrap();
+        set_session_title(&s, "s1", Some("Axiom planning")).unwrap();
+        let hits = search_sessions(&s, "axiom", 30).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title.as_deref(), Some("Axiom planning"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn search_backfills_older_transcripts_and_tracks_new_and_updated_rows() {
+        let (s, d) = temp_store("search-sync");
+        // Un-apply 0030: no index, no triggers, no version row — the shape of a database that
+        // predates this migration. A row inserted now is history the backfill has never seen.
+        {
+            let conn = s.conn.lock().unwrap();
+            conn.execute_batch(
+                "DROP TRIGGER IF EXISTS session_messages_fts_ai;
+                 DROP TRIGGER IF EXISTS session_messages_fts_ad;
+                 DROP TRIGGER IF EXISTS session_messages_fts_au;
+                 DROP TABLE IF EXISTS session_messages_fts;
+                 DELETE FROM schema_version WHERE version = 30;",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_messages (session_id, seq, role, content, ts)
+                 VALUES ('old', 0, 'user', 'the very first conversation about quixotic bugs', 1)",
+                [],
+            )
+            .unwrap();
+        }
+        s.migrate().unwrap();
+        let hits = search_sessions(&s, "quixotic", 30).unwrap();
+        assert_eq!(hits.len(), 1, "history written before 0030 must be searchable after it");
+
+        // A fresh append is indexed by the trigger, and an upserted row is re-indexed, not doubled.
+        append_session_messages(&s, &[msg("new", 0, "user", "quixotic again")]).unwrap();
+        append_session_messages(&s, &[msg("new", 0, "user", "quixotic reworded")]).unwrap();
+        let hits = search_sessions(&s, "quixotic", 30).unwrap();
+        assert_eq!(hits.len(), 2, "the upsert must replace the fts row, not add a second one");
+
+        // And the delete trigger takes the indexed row with the transcript row.
+        delete_session(&s, "new").unwrap();
+        assert_eq!(search_sessions(&s, "quixotic", 30).unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_malformed_or_empty_search_query_returns_hits_nothing_and_never_an_error() {
+        let (s, d) = temp_store("search-malformed");
+        append_session_messages(&s, &[msg("s1", 0, "user", "plain words here")]).unwrap();
+        for q in ["\"", "*", "AND OR", "a\"b(c)", "   ", "!!!"] {
+            let hits = search_sessions(&s, q, 30).unwrap();
+            assert!(
+                hits.is_empty() || hits.iter().all(|h| h.session_id == "s1"),
+                "query {q:?} must not throw"
+            );
+        }
         let _ = std::fs::remove_dir_all(&d);
     }
 }

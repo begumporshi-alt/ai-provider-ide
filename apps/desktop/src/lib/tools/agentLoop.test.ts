@@ -14,7 +14,7 @@ import {
   claimsCompletion,
   VERIFICATION_NUDGE_MAX, VERIFICATION_NUDGE_MAX_CAP,
 } from "./agentLoop";
-import { AGENT_TOOLS, FAN_OUT_MAX } from "./registry";
+import { AGENT_TOOLS, FAN_OUT_MAX, SUBAGENT_TOOLS } from "./registry";
 import type { AgentEvent, GenerateFn, ToolHost } from "./types";
 import type { SubagentDef } from "../agents/defs";
 import type { ChatMessage, TextRequest, TextStream, ToolCall } from "@aiprovider/router-core";
@@ -1642,6 +1642,134 @@ describe("runAgentLoop", () => {
 
     const toolMsg = out.messages.find((m) => m.role === "tool");
     expect(toolMsg?.content).toContain("no skills are installed");
+  });
+
+  it("the session tools are served by the port, not the sandbox", async () => {
+    const sandboxed: string[] = [];
+    const host: ToolHost = {
+      async run(name) {
+        sandboxed.push(name);
+        return { ok: true, output: "r" };
+      },
+    };
+    const sessions = {
+      list: async (limit: number) => {
+        expect(limit).toBe(25);
+        return [
+          {
+            sessionId: "s-1",
+            title: "Router work",
+            preview: "the router flapped again",
+            startedTs: 1,
+            endedTs: 2,
+            turns: 4,
+            toolCalls: 9,
+            model: "m",
+          },
+        ];
+      },
+      search: async (query: string, limit: number) => {
+        expect(query).toBe("router flap");
+        expect(limit).toBe(30);
+        return [
+          { sessionId: "s-1", title: null, preview: "p", seq: 3, role: "user", ts: 5, snippet: "the [router] flapped" },
+        ];
+      },
+      read: async (sessionId: string) => {
+        expect(sessionId).toBe("s-1");
+        return [
+          { seq: 0, role: "user", content: "hello", ts: 1, model: null, toolCalls: null, toolCallId: null },
+          { seq: 1, role: "assistant", content: "hi", ts: 2, model: "m", toolCalls: null, toolCallId: null },
+        ];
+      },
+    };
+    const model = fakeModel([
+      { text: "", calls: [{ id: "c1", name: "list_sessions", arguments: "{}" }] },
+      { text: "", calls: [{ id: "c2", name: "search_sessions", arguments: '{"query":"router flap"}' }] },
+      { text: "", calls: [{ id: "c3", name: "read_session", arguments: '{"session_id":"s-1"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "what did we do about the router?" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      sessions,
+    });
+
+    expect(sandboxed).toEqual([]); // session history lives in the app's database — the sandbox has no handle on it
+    const toolMsgs = out.messages.filter((m) => m.role === "tool");
+    expect(toolMsgs[0]!.content).toContain("Router work");
+    expect(toolMsgs[1]!.content).toContain("[router]");
+    expect(toolMsgs[2]!.content).toContain("2 of 2 stored message(s)");
+  });
+
+  it("a session tool without a port says so instead of returning an empty history", async () => {
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const model = fakeModel([
+      { text: "", calls: [{ id: "c1", name: "search_sessions", arguments: '{"query":"anything"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "what did we do last week?" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+    });
+
+    const toolMsg = out.messages.find((m) => m.role === "tool");
+    expect(toolMsg?.content).toContain("session history is not available in this run");
+  });
+
+  it("read_session caps a long transcript and says what it left out", async () => {
+    const host: ToolHost = { async run() { return { ok: true, output: "r" }; } };
+    const sessions = {
+      list: async () => [],
+      search: async () => [],
+      read: async () => [
+        ...Array.from({ length: 40 }, (_, i) => ({
+          seq: i,
+          role: "assistant" as const,
+          content: "x".repeat(1100),
+          ts: i + 1,
+          model: null,
+          toolCalls: null,
+          toolCallId: null,
+        })),
+        { seq: 40, role: "user", content: "never shown", ts: 99, model: null, toolCalls: null, toolCallId: null },
+      ],
+    };
+    const model = fakeModel([
+      { text: "", calls: [{ id: "c1", name: "read_session", arguments: '{"session_id":"big"}' }] },
+      { text: "done" },
+    ]);
+
+    const out = await runAgentLoop({
+      model: "m",
+      messages: [{ role: "user", content: "read it" }],
+      registry: AGENT_TOOLS,
+      generate: model,
+      host,
+      sessions,
+    });
+
+    const toolMsg = out.messages.find((m) => m.role === "tool")!;
+    const shown = Number(toolMsg.content.match(/^session big: (\d+) of 41 stored message/m)?.[1]);
+    expect(shown).toBeGreaterThan(0);
+    expect(shown).toBeLessThan(41);
+    expect(toolMsg.content).toContain("size cap");
+    expect(toolMsg.content).not.toContain("never shown");
+  });
+
+  it("sub-agents are never offered the session tools", () => {
+    const names = SUBAGENT_TOOLS.map((t) => t.name);
+    expect(names).not.toContain("list_sessions");
+    expect(names).not.toContain("search_sessions");
+    expect(names).not.toContain("read_session");
   });
 
   it("re-asks a truncated stream and returns the retried answer", async () => {

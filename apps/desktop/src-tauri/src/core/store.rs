@@ -349,6 +349,7 @@ const DATA_MIGRATIONS: &[DataMigration] = &[
     ("0027_session_messages", create_session_messages),
     ("0028_session_memory_refs", add_session_memory_refs),
     ("0029_axiom_evolution", create_axiom_tables),
+    ("0030_session_transcript_search", create_session_messages_fts),
 ];
 
 /// 0029 — AXIOM's four tables: the version chain, the finding register, the eval results and the
@@ -437,6 +438,53 @@ CREATE TABLE IF NOT EXISTS axiom_decisions (
   deltas       TEXT NOT NULL DEFAULT '[]'
 );
 CREATE INDEX IF NOT EXISTS idx_axiom_decisions_candidate ON axiom_decisions(candidate_id);
+"#,
+    )?;
+    Ok(())
+}
+
+/// 0030 — the transcript, searchable.
+///
+/// `session_messages` (0027) holds every word of every past conversation, but nothing could ask a
+/// question of it: the History screen filters titles and previews client-side, and the Assistant —
+/// the one component with the most reason to ask "what did we decide about X last week" — had no
+/// path to the transcripts at all. This index is that path.
+///
+/// A standalone FTS5 table maintained by triggers, not an external-content one: the transcript is
+/// upserted (`append_session_messages` writes `ON CONFLICT DO UPDATE`), and the delete-then-insert
+/// pair in the update trigger is the shape an upserted row needs. `session_id` and `seq` ride
+/// alongside as UNINDEXED columns, so a trigger can find and retire exactly the row it replaces
+/// without a second table mapping rowids the transcript does not have. The porter tokenizer stems,
+/// so "fixed" matches "fixing" — the same courtesy `memories_fts` recall already gets.
+///
+/// The backfill copies every stored row: a database that predates this migration has history that
+/// must be searchable on the first run after it, not only from tomorrow.
+fn create_session_messages_fts(tx: &rusqlite::Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute_batch(
+        r#"
+CREATE VIRTUAL TABLE IF NOT EXISTS session_messages_fts USING fts5(
+  content,
+  session_id UNINDEXED,
+  seq UNINDEXED,
+  role UNINDEXED,
+  tokenize = 'porter unicode61'
+);
+
+CREATE TRIGGER IF NOT EXISTS session_messages_fts_ai AFTER INSERT ON session_messages BEGIN
+  INSERT INTO session_messages_fts (session_id, seq, role, content)
+  VALUES (new.session_id, new.seq, new.role, new.content);
+END;
+CREATE TRIGGER IF NOT EXISTS session_messages_fts_ad AFTER DELETE ON session_messages BEGIN
+  DELETE FROM session_messages_fts WHERE session_id = old.session_id AND seq = old.seq;
+END;
+CREATE TRIGGER IF NOT EXISTS session_messages_fts_au AFTER UPDATE ON session_messages BEGIN
+  DELETE FROM session_messages_fts WHERE session_id = old.session_id AND seq = old.seq;
+  INSERT INTO session_messages_fts (session_id, seq, role, content)
+  VALUES (new.session_id, new.seq, new.role, new.content);
+END;
+
+INSERT INTO session_messages_fts (session_id, seq, role, content)
+  SELECT session_id, seq, role, content FROM session_messages;
 "#,
     )?;
     Ok(())
@@ -1641,11 +1689,11 @@ mod tests {
         let s = Store::open(&dir).expect("open+migrate");
         s.migrate().expect("second migrate is a no-op");
         let info = s.info().unwrap();
-        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0029 data migrations.
-        assert_eq!(info.schema_version, 29);
+        // 0001 schema_v1_1 .. 0006 memories, then the 0007..0030 data migrations.
+        assert_eq!(info.schema_version, 30);
         // The two lists must stay numbered as one sequence: a data migration that reused a SQL
         // version number would be silently skipped on every database that already had it.
-        assert_eq!(29, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
+        assert_eq!(30, MIGRATIONS.len() as i64 + DATA_MIGRATIONS.len() as i64);
         // All v1.1 tables exist (§4), plus the R4 gateway-keys, P4 context-graph, P5 skills,
         // P6 agent-run, P7 memory and AXIOM evolution tables. `memories_fts` is a virtual table, so it shows up
         // in sqlite_master as a table too — assert it, because BM25 recall silently returns
@@ -1676,6 +1724,7 @@ mod tests {
             "session_state",
             "session_titles",
             "session_messages",
+            "session_messages_fts",
             "memory_pending",
             "memory_principal_policy",
             "router_model_context",
@@ -1749,8 +1798,8 @@ mod tests {
             .unwrap();
         }
 
-        s.migrate().expect("re-migrate applies 0029");
-        assert_eq!(s.info().unwrap().schema_version, 29);
+        s.migrate().expect("re-migrate applies 0029..0030");
+        assert_eq!(s.info().unwrap().schema_version, 30);
 
         let conn = s.conn.lock().unwrap();
         let runs: i64 = conn
