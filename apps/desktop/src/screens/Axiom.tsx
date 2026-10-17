@@ -238,21 +238,206 @@ export function AxiomScreen() {
     );
   }, [suiteText, model, repeats, priors, readPorts]);
 
+  /**
+   * The stepper's seven notes, one per stage, each a sentence the report actually backs. Before any
+   * run every stage reads "waiting" — a stepper that pre-filled optimism would be the one lie this
+   * screen is not allowed to tell.
+   */
+  const stages = useMemo(() => {
+    if (!report) return STAGES.map(() => ({ tone: "idle" as StageTone, note: "waiting" }));
+    const t = report.observation.totals;
+    const serious = report.diagnosis.findings.filter(isSerious).length;
+    const partial =
+      report.baseline.attemptSummaries.length < report.baseline.tasks.length * report.baseline.repeats;
+    return [
+      { tone: "done" as const, note: `${t.runs} run(s) read` },
+      {
+        tone: partial ? ("warn" as const) : ("done" as const),
+        note: `${pct(report.baseline.passRate)} pass · ${report.baseline.tasks.length}×${report.baseline.repeats}`,
+      },
+      {
+        tone: report.diagnosis.findings.length === 0 ? ("done" as const) : serious > 0 ? ("fail" as const) : ("warn" as const),
+        note:
+          report.diagnosis.findings.length === 0
+            ? "no detector fired"
+            : `${serious} serious of ${report.diagnosis.findings.length}`,
+      },
+      {
+        tone: report.proposals.length > 0 ? ("done" as const) : ("warn" as const),
+        note: report.proposals.length > 0 ? `${report.proposals.length} proposal(s)` : "nothing to propose",
+      },
+      report.candidate
+        ? { tone: "done" as const, note: `candidate …${report.candidate.id.slice(-6)}` }
+        : { tone: "warn" as const, note: "no candidate built" },
+      report.guardian
+        ? report.guardian.passed
+          ? { tone: "done" as const, note: "guardian passed" }
+          : { tone: "fail" as const, note: "guardian refused" }
+        : { tone: "idle" as const, note: "skipped" },
+      report.decision
+        ? report.decision.decision === "promote"
+          ? { tone: "done" as const, note: "promoted" }
+          : { tone: "fail" as const, note: "rejected" }
+        : { tone: "idle" as const, note: "—" },
+    ];
+  }, [report]);
+
+  /**
+   * The newest stored suite result, used when no report is on screen so the pass-rate card shows the
+   * last thing that was actually measured rather than a dash pretending nothing ever happened — and
+   * labelled with when, because a number without its date reads as today's.
+   */
+  const latestPrior = useMemo(
+    () => priors.reduce<SuiteResult | null>((a, b) => (a === null || b.endedAt > a.endedAt ? b : a), null),
+    [priors],
+  );
+  const measured = report?.baseline ?? latestPrior;
+  const measuredAttempts = measured?.attemptSummaries.length ?? 0;
+
+  /**
+   * The rail's activity feed: the four row kinds the store holds, merged into one timeline. Every
+   * line is a stored fact with its own timestamp — nothing is inferred, and a store with no rows
+   * gets an empty feed rather than a friendly fake.
+   */
+  const activity = useMemo(() => {
+    const evts: { at: number; label: string; detail: string | null; color: string }[] = [];
+    const runTone: Record<RunTrace["status"], string> = {
+      ok: "var(--success)",
+      error: "var(--danger)",
+      stopped: "var(--warn)",
+      running: "var(--info)",
+    };
+    for (const t of traces) {
+      const label =
+        t.status === "ok" ? "Agent run finished"
+        : t.status === "error" ? "Agent run failed"
+        : t.status === "stopped" ? "Agent run stopped"
+        : "Agent run in progress";
+      evts.push({ at: t.startedAt, label, detail: t.prompt ?? `run …${t.id.slice(-6)}`, color: runTone[t.status] ?? "var(--text-faint)" });
+    }
+    for (const d of decisions) {
+      evts.push({
+        at: d.decidedAt,
+        label: d.decision === "promote" ? "Version promoted" : "Candidate rejected",
+        detail: `${d.candidateId} over ${d.baselineId}`,
+        color: d.decision === "promote" ? "var(--success)" : "var(--danger)",
+      });
+    }
+    for (const v of versions) {
+      evts.push({
+        at: v.createdAt,
+        label: `Version ${v.state}`,
+        detail: v.reason,
+        color: v.state === "active" ? "var(--success)" : v.state === "rejected" ? "var(--danger)" : v.state === "candidate" ? "var(--info)" : "var(--text-faint)",
+      });
+    }
+    for (const f of findings) {
+      evts.push({ at: f.recordedAt, label: "Finding recorded", detail: f.title, color: isSerious(f) ? "var(--danger)" : "var(--warn)" });
+    }
+    return evts.sort((a, b) => b.at - a.at).slice(0, 8);
+  }, [traces, decisions, versions, findings]);
+
+  /**
+   * The one thing worth doing next, derived from state the store actually holds — a rejected
+   * decision tells you to read the refusal, a waiting candidate tells you to judge it, findings
+   * tell you to measure a fix. Never more than one live suggestion, so it cannot become a
+   * checklist nobody follows.
+   */
+  const nextStep = useMemo(() => {
+    if (report?.decision) {
+      return report.decision.decision === "promote"
+        ? `${report.decision.candidateId} was promoted — the next Assistant turn runs it. Watch its runs.`
+        : `${report.decision.candidateId} was rejected — read the refusal before proposing it again.`;
+    }
+    if (report) return "The pass ended without a decision — read what AXIOM did not do, and why.";
+    // A decision outlives the run that made it: it is stored, so its guidance should survive a
+    // remount too. Guarded by the version's current state — guidance about a candidate that has
+    // since been promoted or retired by hand is guidance about a world that no longer exists.
+    const latestDecision = decisions.reduce<PromotionDecision | null>(
+      (a, d) => (a === null || d.decidedAt > a.decidedAt ? d : a),
+      null,
+    );
+    if (latestDecision) {
+      const subject = versions.find((v) => v.id === latestDecision.candidateId);
+      if (latestDecision.decision === "reject" && subject?.state === "rejected") {
+        return `${latestDecision.candidateId} was rejected — read the refusal before proposing it again.`;
+      }
+      if (latestDecision.decision === "promote" && subject?.state === "active") {
+        return `${latestDecision.candidateId} was promoted — the next Assistant turn runs it. Watch its runs.`;
+      }
+    }
+    const candidate = versions.find((v) => v.state === "candidate");
+    if (candidate) return `Version ${candidate.id} is still a candidate — promote it or retire it.`;
+    if (findings.length > 0) {
+      return `${findings.length} finding(s) recorded — run an audit to measure a fix against them.`;
+    }
+    if (traces.length > 0) return `${traces.length} run(s) recorded — run an audit to measure them against a suite.`;
+    if (activeId) return "Nothing pending. Use the Assistant — AXIOM reads what it does.";
+    return "Run the first audit: pick a model, then press Audit & improve.";
+  }, [report, decisions, versions, findings, traces, activeId]);
+
+  /** A version proposed but not yet judged — the one state where a decision is still open. */
+  const candidate = versions.find((v) => v.state === "candidate") ?? null;
+
   return (
-    <div className="mx-auto max-w-5xl">
-      <div className="mb-1 flex items-baseline gap-3">
-        <h1 className="text-[20px] font-semibold">AXIOM</h1>
-        <span className="text-[12px]" style={{ color: "var(--text-dim)" }}>
-          {activeId ? `the Assistant is running version ${activeId}` : "the Assistant is running its built-in configuration"}
-        </span>
+    <div className="mx-auto max-w-6xl">
+      <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-start md:justify-between md:gap-4">
+        <div className="min-w-0">
+          <div className="flex items-baseline gap-3">
+            <h1 className="text-[20px] font-semibold">AXIOM</h1>
+            <span className="truncate text-[12px]" style={{ color: "var(--text-faint)" }}>
+              agent intelligence, diagnostics &amp; evolution
+            </span>
+          </div>
+          <p className="mt-1 text-[13px] font-medium" style={{ color: "var(--text-dim)" }}>
+            See how your assistant is really doing — then improve it, one proven change at a time.
+          </p>
+          {/* The one workflow, in the order the screen is used. This is the answer to "how do I use
+              this" sitting at the top, because a first-time reader should never have to derive the
+              loop from the controls. */}
+          <ol
+            data-testid="axiom-how-to"
+            aria-label="How to use AXIOM, in four steps"
+            className="mt-2 flex flex-wrap items-center gap-x-1.5 gap-y-1 text-[12px]"
+            style={{ color: "var(--text-dim)" }}
+          >
+            {HOW_TO.map((step, i) => (
+              <li key={step} className="flex items-center gap-1.5">
+                <span
+                  className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[10px] font-semibold"
+                  style={{ background: "var(--surface-2)", color: "var(--accent)" }}
+                >
+                  {i + 1}
+                </span>
+                <span>{step}</span>
+                {i < HOW_TO.length - 1 && <span aria-hidden style={{ color: "var(--text-faint)" }}>→</span>}
+              </li>
+            ))}
+          </ol>
+          <details className="mt-2 max-w-3xl text-[12px]" style={{ color: "var(--text-faint)" }}>
+            <summary className="cursor-pointer select-none">What happens under the hood</summary>
+            <p className="mt-1 leading-relaxed">
+              Reads what the Assistant actually did, measures it against a task suite whose expectations check the
+              transcript rather than the agent's own account, finds the root cause of what went wrong, proposes one
+              bounded change, re-measures, and promotes it only if the numbers moved past the noise floor and nothing
+              that used to work stopped working. Eval runs are confined to <span className="mono">{EVAL_DIR_NAME}</span>{" "}
+              inside your workspace root and cost real tokens — you are asked before the first call.
+            </p>
+          </details>
+        </div>
+        {/* What the Assistant is running with right now — a version id only if the store holds one as
+            active, never a label that sounds like a version. */}
+        <div
+          data-testid="axiom-active-version"
+          className="shrink-0 rounded-lg border px-3 py-2 text-right"
+          style={{ borderColor: "var(--border)", background: "var(--surface)" }}
+        >
+          <div className="text-[10px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Running version</div>
+          <div className="mono mt-0.5 max-w-[220px] truncate text-[12px]" title={activeId ?? undefined}>
+            {activeId ?? "built-in configuration"}
+          </div>
+        </div>
       </div>
-      <p className="mb-4 max-w-3xl text-[12px] leading-relaxed" style={{ color: "var(--text-faint)" }}>
-        Reads what the Assistant actually did, measures it against a task suite whose expectations check the
-        transcript rather than the agent's own account, finds the root cause of what went wrong, proposes one
-        bounded change, re-measures, and promotes it only if the numbers moved past the noise floor and nothing
-        that used to work stopped working. Eval runs are confined to <span className="mono">{EVAL_DIR_NAME}</span>{" "}
-        inside your workspace root and cost real tokens — you are asked before the first call.
-      </p>
 
       <div className="mb-3 flex flex-wrap items-center gap-2">
         <select
@@ -304,9 +489,196 @@ export function AxiomScreen() {
         </pre>
       )}
 
-      {report ? <Report rep={report} /> : !running ? (
-        <EmptyState title="Pick a model and run an audit. Nothing is changed until a candidate survives the guardian and all four roles." />
-      ) : null}
+      {/* Two columns on wide screens: the pipeline and its numbers on the left, the rail — what
+          just happened and what to do next — on the right. Below the breakpoint the rail drops
+          under, because a summary nobody reaches without scrolling past the tables is worse than
+          no summary. */}
+      <div className="grid items-start gap-4 lg:grid-cols-[minmax(0,1fr)_300px]">
+        <div className="min-w-0">
+          <Stepper stages={stages} />
+
+          <div className="mb-4 grid grid-cols-2 gap-3 lg:grid-cols-4">
+            <MetricCard
+              testId="axiom-metric-pass"
+              label="Baseline pass rate"
+              value={measured ? pct(measured.passRate) : "—"}
+              fraction={measured ? measured.passRate : null}
+              color={
+                measured
+                  ? measured.passRate >= 1
+                    ? "var(--success)"
+                    : measured.passRate === 0
+                      ? "var(--danger)"
+                      : "var(--text)"
+                  : "var(--text-faint)"
+              }
+              sub={
+                report
+                  ? `${report.baseline.tasks.length} task(s) × ${report.baseline.repeats}${
+                      report.candidateResult ? ` · candidate ${pct(report.candidateResult.passRate)}` : ""
+                    }`
+                  : measured
+                    ? `last measured ${fmtTime(measured.endedAt)}`
+                    : "no measurement yet"
+              }
+            />
+            <MetricCard
+              testId="axiom-metric-findings"
+              label="Findings recorded"
+              value={String(findings.length)}
+              fraction={null}
+              color={
+                findings.some(isSerious) ? "var(--danger)" : findings.length > 0 ? "var(--warn)" : "var(--text)"
+              }
+              sub={findings.length === 0 ? "no detector has fired" : `${findings.filter(isSerious).length} major or worse`}
+            />
+            <MetricCard
+              testId="axiom-metric-tokens"
+              label="Tokens per attempt"
+              value={
+                measured && measuredAttempts > 0
+                  ? Math.round((measured.cost.promptTokens + measured.cost.completionTokens) / measuredAttempts).toLocaleString()
+                  : "—"
+              }
+              fraction={null}
+              color={measured && measuredAttempts > 0 ? "var(--text)" : "var(--text-faint)"}
+              sub={measured && measuredAttempts > 0 ? "measured, not assumed" : "run an audit to measure"}
+            />
+            <MetricCard
+              testId="axiom-metric-versions"
+              label="Versions kept"
+              value={String(versions.length)}
+              fraction={null}
+              color="var(--text)"
+              sub={activeId ? `the Assistant runs ${activeId}` : "the Assistant runs its built-in configuration"}
+            />
+          </div>
+
+          {/* The mockup's "Improvement plan": the Design stage's proposals as a table. Impact and
+              Effort in a plan table are usually guesses; here the target metric is the closest real
+              thing to an impact, the effort column is the actuator the proposal would actually
+              touch, and the status is what happened to it this pass — nothing is invented. */}
+          <Section title="Improvement plan">
+            <div data-testid="axiom-plan">
+              {report ? (
+                report.proposals.length > 0 ? (
+                  <table className="w-full">
+                    <thead>
+                      <tr className="h-[28px] text-left text-[11px] uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>
+                        <th className="w-10 font-medium">#</th>
+                        <th className="font-medium">Action</th>
+                        <th className="w-32 font-medium">Target</th>
+                        <th className="w-28 font-medium">Effort</th>
+                        <th className="w-40 font-medium">Status</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {report.proposals.map((p, i) => {
+                        const status = planStatus(report, p);
+                        return (
+                          <tr key={p.id} className="border-t align-top" style={{ borderColor: "var(--border)" }}>
+                            <td className="mono py-1.5 text-[12px]">{i + 1}</td>
+                            <td className="py-1.5 pr-3 text-[12px]">
+                              <b>{p.title}</b>
+                              <div className="text-[11px]" style={{ color: "var(--text-dim)" }}>{p.rationale}</div>
+                            </td>
+                            <td className="mono py-1.5 pr-3 text-[11px]" style={{ color: "var(--text-dim)" }}>{p.targetMetric ?? "—"}</td>
+                            <td className="mono py-1.5 pr-3 text-[11px]" style={{ color: "var(--text-dim)" }}>
+                              {p.patch ? "prompt patch" : p.loop ? `loop.${p.loop.field}` : "—"}
+                            </td>
+                            <td className="py-1.5 text-[11px]" style={{ color: status.color }}>{status.label}</td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                ) : (
+                  <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+                    Nothing was proposed this pass — the diagnosis found nothing worth a bounded change.
+                  </p>
+                )
+              ) : (
+                <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+                  Run an audit — the plan lists what AXIOM proposes to change, most important first.
+                </p>
+              )}
+            </div>
+          </Section>
+
+          {report ? <Report rep={report} /> : !running ? (
+            <EmptyState title="Pick a model and run an audit. Nothing is changed until a candidate survives the guardian and all four roles." />
+          ) : null}
+        </div>
+
+        <aside className="flex min-w-0 flex-col gap-4" aria-label="Recent activity and next steps">
+          <section data-testid="axiom-health" className="rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Agent health</h2>
+            {report && report.capabilityMap.length >= 3 ? (
+              <Radar caps={report.capabilityMap} />
+            ) : (
+              <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+                {report
+                  ? "The radar needs three or more capabilities to draw."
+                  : "Run an audit — the radar draws each capability's measured pass rate."}
+              </p>
+            )}
+          </section>
+
+          <section data-testid="axiom-activity" className="rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Recent activity</h2>
+            {activity.length === 0 ? (
+              <p className="text-[12px]" style={{ color: "var(--text-faint)" }}>
+                Nothing recorded yet. Runs, findings, versions and decisions all land here as they happen.
+              </p>
+            ) : (
+              <ol className="flex flex-col gap-2">
+                {activity.map((e, i) => (
+                  <li key={`${e.at}-${i}`} className="border-l-2 pl-2" style={{ borderColor: e.color }}>
+                    <div className="flex items-baseline justify-between gap-2">
+                      <span className="text-[12px] font-medium" style={{ color: e.color }}>{e.label}</span>
+                      <span className="shrink-0 text-[10px]" style={{ color: "var(--text-faint)" }}>{fmtTime(e.at)}</span>
+                    </div>
+                    {e.detail && (
+                      <div className="truncate text-[11px]" style={{ color: "var(--text-dim)" }} title={e.detail}>{e.detail}</div>
+                    )}
+                  </li>
+                ))}
+              </ol>
+            )}
+          </section>
+
+          {/* Entry points, not new logic: every button calls the same handler its full-page
+              counterpart calls, and one renders only when the state it acts on exists. A quick
+              action that re-implemented its handler would be a second place to get it wrong. */}
+          <section data-testid="axiom-quick-actions" className="rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Quick actions</h2>
+            <div className="flex flex-col gap-1.5">
+              <Button variant="primary" onClick={() => void run()} ariaLabel="Run a full audit" disabled={running}>
+                {running ? "Running…" : "Run full audit"}
+              </Button>
+              <Button onClick={() => setShowSuite(true)} ariaLabel="Edit the task suite">Edit the task suite</Button>
+              {candidate && (
+                <>
+                  <Button onClick={() => void changeState(candidate.id, "active")} ariaLabel={`Promote candidate ${candidate.id}`}>
+                    Promote candidate
+                  </Button>
+                  <Button variant="danger" onClick={() => void changeState(candidate.id, "retired")} ariaLabel={`Retire candidate ${candidate.id}`}>
+                    Retire candidate
+                  </Button>
+                </>
+              )}
+              {versions.length > 0 && (
+                <Button onClick={() => void rollBack()} ariaLabel="Roll back to the previous version">Roll back</Button>
+              )}
+            </div>
+          </section>
+
+          <section data-testid="axiom-next-step" className="rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+            <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>Next step</h2>
+            <p className="text-[12px] leading-relaxed" style={{ color: "var(--text-dim)" }}>{nextStep}</p>
+          </section>
+        </aside>
+      </div>
 
       <Section title={`Capability map${report ? ` (${report.capabilityMapOf})` : ""}`}>
         {report && report.capabilityMap.length > 0 ? (
@@ -605,10 +977,190 @@ export function AxiomScreen() {
 /** One labelled panel. A heading and a border, so the sections below stay readable rather than nested. */
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <section className="mb-5">
-      <h2 className="mb-1.5 text-[12px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>{title}</h2>
+    <section className="mb-4 rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+      <h2 className="mb-2 text-[11px] font-semibold uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>{title}</h2>
       {children}
     </section>
+  );
+}
+
+/** The seven stages in the order the pipeline runs them. Names and hints only — the state under
+ *  each is computed from the report, never assumed. */
+const STAGES = [
+  { n: "1", name: "Observe", hint: "read the recorded runs" },
+  { n: "2", name: "Evaluate", hint: "run the suite" },
+  { n: "3", name: "Diagnose", hint: "find root causes" },
+  { n: "4", name: "Design", hint: "propose one bounded change" },
+  { n: "5", name: "Modify", hint: "build the candidate" },
+  { n: "6", name: "Validate", hint: "guardian + four roles" },
+  { n: "7", name: "Evolve", hint: "promote or reject" },
+] as const;
+
+/** The four steps a first-time reader needs, in the order the screen is used. The dense mechanism
+ *  text moved into a collapsed details — context on demand, not a wall before the first action. */
+const HOW_TO = [
+  "Pick a model",
+  "Press Audit & improve — you approve the cost first",
+  "Read the stepper, cards and plan",
+  "Promote the candidate — or roll back",
+] as const;
+
+/**
+ * The four honest statuses a proposal can carry. A plan table's "Impact" and "Effort" are usually
+ * guesses; here the effort column is the actuator the proposal would actually touch (chosen by the
+ * caller), and the status is what happened to it this pass — proposed, blocked, attempted, or built
+ * into the candidate that came out of it.
+ */
+function planStatus(rep: ImproveReport, p: ImproveReport["proposals"][number]): { label: string; color: string } {
+  if (rep.attempted?.id === p.id) {
+    return rep.candidate
+      ? { label: "built into the candidate", color: "var(--success)" }
+      : { label: "attempted this pass", color: "var(--info)" };
+  }
+  if (p.blockedReason) return { label: `blocked — ${p.blockedReason}`, color: "var(--warn)" };
+  return { label: "proposed", color: "var(--text-dim)" };
+}
+
+type StageTone = "idle" | "done" | "warn" | "fail";
+interface StageState {
+  tone: StageTone;
+  note: string;
+}
+
+const stageToneColor: Record<StageTone, string> = {
+  idle: "var(--text-faint)",
+  done: "var(--success)",
+  warn: "var(--warn)",
+  fail: "var(--danger)",
+};
+
+const isSerious = (f: { severity: string }) => f.severity === "critical" || f.severity === "major";
+
+/** The pipeline drawn as the shape it runs in. Each stage's note is one real sentence — a count, a
+ *  verdict, or "waiting" when no report exists yet. The connecting line is presentation; the states
+ *  are data. */
+function Stepper({ stages }: { stages: StageState[] }) {
+  return (
+    <ol data-testid="axiom-stepper" aria-label="The seven stages of an AXIOM pass" className="mb-4 flex items-start">
+      {STAGES.map((s, i) => {
+        const st = stages[i]!;
+        return (
+          <li key={s.n} className="min-w-0 flex-1">
+            <div className="flex items-center">
+              <span
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-full border text-[11px] font-medium"
+                style={{
+                  borderColor: stageToneColor[st.tone],
+                  color: stageToneColor[st.tone],
+                  background: st.tone === "idle" ? "transparent" : "var(--surface-2)",
+                }}
+              >
+                {s.n}
+              </span>
+              {i < STAGES.length - 1 && (
+                <span aria-hidden className="mx-1.5 h-px min-w-2 flex-1" style={{ background: "var(--border)" }} />
+              )}
+            </div>
+            <div className="mt-1.5 pr-2">
+              <div className="text-[12px] font-medium" style={{ color: st.tone === "idle" ? "var(--text-faint)" : "var(--text)" }}>
+                {s.name}
+              </div>
+              <div className="truncate text-[11px]" style={{ color: "var(--text-faint)" }} title={st.note}>
+                {st.tone === "idle" && st.note === "waiting" ? s.hint : st.note}
+              </div>
+            </div>
+          </li>
+        );
+      })}
+    </ol>
+  );
+}
+
+/**
+ * One metric, drawn as a ring gauge like the reference design. `fraction` is the only thing the arc
+ * is allowed to encode: a real 0..1 measurement, or `null` — and `null` draws a full ring as the
+ * card's frame, the same decorative role the reference design gives its latency and cost rings. A
+ * count has no fraction, so inventing one for visual variety would be the lie this screen exists
+ * to catch.
+ */
+function MetricCard({ label, value, sub, color, testId, fraction }: { label: string; value: string; sub: string; color: string; testId: string; fraction: number | null }) {
+  const R = 20;
+  const C = 2 * Math.PI * R;
+  const frac = fraction === null ? 1 : Math.max(0, Math.min(1, fraction));
+  return (
+    <div data-testid={testId} className="flex items-center gap-3 rounded-lg border p-3" style={{ borderColor: "var(--border)", background: "var(--surface)" }}>
+      <svg width="52" height="52" viewBox="0 0 52 52" className="shrink-0" aria-hidden>
+        <circle cx="26" cy="26" r={R} fill="none" stroke="var(--surface-2)" strokeWidth="5" />
+        <circle
+          cx="26"
+          cy="26"
+          r={R}
+          fill="none"
+          stroke={color}
+          strokeWidth="5"
+          strokeLinecap="round"
+          strokeDasharray={`${frac * C} ${C}`}
+          transform="rotate(-90 26 26)"
+        />
+      </svg>
+      <div className="min-w-0">
+        <div className="text-[10px] font-medium uppercase tracking-wide" style={{ color: "var(--text-faint)" }}>{label}</div>
+        <div className="text-[18px] font-semibold leading-tight" style={{ color }}>{value}</div>
+        <div className="truncate text-[11px]" style={{ color: "var(--text-dim)" }} title={sub}>{sub}</div>
+      </div>
+    </div>
+  );
+}
+
+/** The radar behind the health panel: one axis per capability, radius = its measured pass rate. */
+function Radar({ caps }: { caps: ImproveReport["capabilityMap"] }) {
+  const n = caps.length;
+  const cx = 120;
+  const cy = 120;
+  const R = 84;
+  const pt = (i: number, v: number): [number, number] => {
+    const a = -Math.PI / 2 + (2 * Math.PI * i) / n;
+    return [cx + Math.cos(a) * R * v, cy + Math.sin(a) * R * v];
+  };
+  const worst = caps.some((c) => c.state === "overclaimed" || c.state === "absent")
+    ? "var(--danger)"
+    : caps.some((c) => c.state === "unreliable")
+      ? "var(--warn)"
+      : "var(--success)";
+  const at = (v: number) => caps.map((_, i) => pt(i, v).join(",")).join(" ");
+  return (
+    // The viewBox extends past the drawing on every side so edge axis labels (drawn outside the
+    // R ring at 1.22×) are not clipped by the viewport.
+    <svg viewBox="-28 -6 296 252" width="100%" role="img" aria-label="Radar of pass rate by capability">
+      {[0.25, 0.5, 0.75, 1].map((g) => (
+        <polygon key={g} points={at(g)} fill="none" stroke="var(--border)" strokeWidth="1" />
+      ))}
+      {caps.map((_, i) => {
+        const [x, y] = pt(i, 1);
+        return <line key={i} x1={cx} y1={cy} x2={x} y2={y} stroke="var(--border)" strokeWidth="1" />;
+      })}
+      {/* The 4% floor keeps a zero-pass capability visible as a point at its axis rather than a
+          vertex collapsed onto the center, which would read as "missing axis". */}
+      <polygon
+        points={caps.map((c, i) => pt(i, Math.max(0.04, c.passRate)).join(",")).join(" ")}
+        fill={worst}
+        fillOpacity="0.18"
+        stroke={worst}
+        strokeWidth="2"
+      />
+      {caps.map((c, i) => {
+        const [x, y] = pt(i, Math.max(0.04, c.passRate));
+        return <circle key={i} cx={x} cy={y} r="3" fill={worst} />;
+      })}
+      {caps.map((c, i) => {
+        const [x, y] = pt(i, 1.22);
+        return (
+          <text key={i} x={x} y={y} textAnchor="middle" dominantBaseline="middle" fontSize="9" fill="var(--text-dim)">
+            {c.capability.length > 14 ? `${c.capability.slice(0, 13)}…` : c.capability}
+          </text>
+        );
+      })}
+    </svg>
   );
 }
 
